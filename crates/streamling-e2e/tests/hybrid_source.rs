@@ -1334,3 +1334,294 @@ sinks:
         count
     );
 }
+
+// ============================================================================
+// Scenario 8: Checkpoint marker loss across bounded→unbounded transition
+// ============================================================================
+
+/// Regression test for the PR #743 scenario: a checkpoint Marker emitted
+/// during the bounded→unbounded transition gap is lost because no inner
+/// source is currently subscribed to `CHECKPOINT_COORDINATOR_CHANNEL`.
+///
+/// Conditions to manifest the bug (matching production):
+/// - Populated `kafka_offsets` table → seed_offsets writes per-partition
+///   state → kafka source takes the FROM-STATE branch (not the cold-start
+///   branch our scenario 7 fix handles).
+/// - Non-empty kafka topic with continuous-enough traffic that the unbounded
+///   phase can deliver post-transition markers via its own batches if the
+///   subscription is intact.
+/// - Slow-ish bounded ClickHouse phase so multiple checkpoint epochs fire
+///   during it, increasing the probability that a Marker is emitted at the
+///   exact moment of the transition (when neither inner source is subscribed).
+/// - No `record_limit` — that env enables the test-mode SourceComplete probe
+///   path, which our #742 fix already handles separately.
+///
+/// Pass condition: at least a couple checkpoint epochs finalize AFTER the
+/// `Advanced to next phase` log line.
+///
+/// Without PR #743's fix, the first post-transition Marker can be sent while
+/// the channels map has zero subscribers (ClickHouse already unsubscribed,
+/// Kafka hasn't subscribed yet). `channels::send` no-ops, the sink never
+/// sees that epoch, and the coordinator stalls forever — so subsequent
+/// epochs never fire either. With the fix, the hybrid-level subscription
+/// bridges the gap and every Marker reaches a subscriber.
+///
+/// NOTE: probabilistic. The bug only manifests when a Marker actually lands
+/// in the gap. With CHECKPOINT_INTERVAL_SEC=1 and slow-paginating ClickHouse,
+/// the test should fail reliably on the buggy code, but a lucky run might
+/// pass. Re-runs are cheap — flake-debug by inspecting captured stderr.
+#[tokio::test]
+async fn test_hybrid_source_marker_loss_during_transition() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    // Slow-paginating bounded source. Records are placed at high block values
+    // with a small `block_range` config so the pagination loop scans many
+    // mostly-empty ranges, mimicking the production "tenor-ratifier" shape
+    // referenced in PR #743 (epochs 1–9 finalize during bounded; epoch
+    // around the transition is at risk of being lost).
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_marker_loss_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    let high_start = 5_000_000i64;
+    let row_count = 30i64;
+    let stride = 50_000i64;
+    let mut values = Vec::new();
+    for i in 0..row_count {
+        let block = high_start + i * stride;
+        values.push(format!(
+            "({}, 'ch_{}', 'data_{}', {}, 0)",
+            block,
+            i,
+            i,
+            1_700_000_000 + i
+        ));
+    }
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO hybrid_marker_loss_test (block, id, data, timestamp, is_deleted) VALUES {}",
+            values.join(", ")
+        ))
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    // Register kafka schema and produce a handful of kafka records so the
+    // topic isn't empty when the unbounded phase begins.
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // 400 kafka records → enough to keep the pipeline running past the
+    // 2.5s transition delay AND through 10s+ of post-transition unbounded
+    // processing so CHECKPOINT_INTERVAL_SEC=1 fires several epochs there.
+    // On broken code, STREAMLING__HYBRID__TRANSITION_DELAY_MS=2500 (set in
+    // opts below) guarantees Markers fire inside the subscribe gap, the
+    // coordinator stalls forever, and zero post-transition epochs
+    // finalize.
+    let kafka_records: Vec<TestRecord> = (1..=400)
+        .map(|i| TestRecord {
+            block: 1000 + i,
+            id: format!("kafka_{}", i),
+            data: format!("kafka_data_{}", i),
+            timestamp: 2000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&kafka_records)
+        .await
+        .expect("Failed to produce kafka records");
+
+    // POPULATED offset_table — this is the key production differentiator
+    // from scenarios 1–6. `seed_offsets` writes a per-partition state entry
+    // and the kafka source takes the FROM-STATE branch at startup.
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_marker_loss (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO kafka_offsets_marker_loss VALUES ('{}', 0, 0)",
+            ctx.kafka_topic
+        ))
+        .await
+        .expect("Failed to populate offset table");
+
+    let state_table = format!("hybrid_marker_loss_{}", ctx.test_id.replace('-', "_"));
+    let application_id = format!("hybrid_marker_loss_{}", ctx.test_id);
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_marker_loss_test
+        columns: block,id,data,timestamp
+        start_at: "{high_start}"
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_marker_loss
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: hybrid_marker_loss_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        high_start = high_start,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    // STREAMLING__HYBRID__TRANSITION_DELAY_MS=2500 forces a 2.5s delay inside
+    // `advance_to_next_phase`, which (a) is plenty of time for ClickHouse's
+    // checkpointing_task to fully shut down and unsubscribe before kafka
+    // subscribes, and (b) guarantees at least 2 checkpoint Markers fire
+    // during the gap (at CHECKPOINT_INTERVAL_SEC=1). Without PR-743's
+    // hybrid-level forwarder, those Markers are broadcast to zero
+    // subscribers and the coordinator stalls forever; with it, the
+    // forwarder buffers them and merges them into kafka's first batch.
+    //
+    // record_limit/runtime is sized to give us ~15s of post-transition
+    // observation time AFTER the 2.5s transition delay completes, so on
+    // working code several epochs (≥3) clearly finalize, and on broken
+    // code the stall shows up reliably as "0 epochs finalized after
+    // transition".
+    let opts = PipelineOpts::new()
+        .record_limit(300)
+        .timeout(std::time::Duration::from_secs(90))
+        .env("STREAMLING__APPLICATION_ID", &application_id)
+        .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+            &ctx.postgres.host,
+        )
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+            ctx.postgres.port.to_string(),
+        )
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+            &state_table,
+        )
+        .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+        .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+        // Small page_size / block_range force the bounded phase into many
+        // pagination iterations so several checkpoint epochs finalize
+        // during it (gives the assertion something to compare against).
+        .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1")
+        .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "1000")
+        // Tighten kafka's consumer-fetch loop so its execute() reaches the
+        // checkpoint-channel subscribe quickly.
+        .env("STREAMLING__KAFKA_SOURCE__CONSUMER_FETCH_TIMEOUT_SEC", "2")
+        // Force a deterministic, wide transition gap. See PR #743 for the
+        // race this exercises.
+        .env("STREAMLING__HYBRID__TRANSITION_DELAY_MS", "2500");
+
+    let output = ctx
+        .run_pipeline_raw(&pipeline, opts)
+        .await
+        .expect("Failed to run pipeline");
+
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    let lines: Vec<&str> = combined.lines().collect();
+
+    // Find the bounded→unbounded transition marker in the logs.
+    let transition_idx = lines
+        .iter()
+        .position(|l| l.contains("Advanced to next phase, continuing with new source"));
+
+    let transition_idx = transition_idx.unwrap_or_else(|| {
+        panic!(
+            "Pipeline never logged 'Advanced to next phase' — transition didn't happen. \
+             Pipeline exited with status={}",
+            output.status
+        )
+    });
+
+    // Count epochs finalized BEFORE vs AFTER the transition line.
+    let before_after: (usize, usize) = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("Epoch finalized:"))
+        .map(|(i, _)| if i < transition_idx { (1, 0) } else { (0, 1) })
+        .fold((0, 0), |(a, b), (x, y)| (a + x, b + y));
+
+    let stall_warnings: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("still waiting for finalization"))
+        .take(3)
+        .collect();
+
+    tracing::info!(
+        "Epochs finalized before transition: {}, after transition: {}; \
+         stall warnings observed: {}",
+        before_after.0,
+        before_after.1,
+        stall_warnings.len()
+    );
+
+    // With STREAMLING__HYBRID__TRANSITION_DELAY_MS=2500 forcing the gap
+    // wide open, the bug fires deterministically on broken code: 1–2
+    // post-transition Markers land in the subscribe gap and the
+    // coordinator stalls forever → 0 post-transition epochs finalize.
+    // With PR-743's forwarder, those Markers are buffered and merged
+    // into kafka's first batch, and epochs continue finalizing → 3+
+    // post-transition epochs over the remaining ~10s of unbounded.
+    //
+    // Threshold of 2 cleanly distinguishes the two states: pre-fix gives
+    // 0 deterministically (coordinator stuck on stalled epoch); post-fix
+    // gives 3+ in practice. ≥2 leaves margin against scheduler noise
+    // without weakening the regression signal.
+    assert!(
+        before_after.1 >= 2,
+        "Only {} checkpoint epoch(s) finalized after bounded→unbounded \
+         transition — Marker(s) likely lost in the subscribe gap \
+         (regression of PR #743). Epochs before transition: {}. \
+         Stall warnings: {:?}",
+        before_after.1,
+        before_after.0,
+        stall_warnings
+    );
+}

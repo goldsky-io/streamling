@@ -767,6 +767,26 @@ impl HybridTableProvider {
     }
 
     pub async fn advance_to_next_phase(&self) -> DataFusionResult<()> {
+        // Test-only knob: artificially extend the bounded→unbounded
+        // transition window so the marker-loss scenario covered by PR #743
+        // (Scenario 8 in crates/streamling-e2e/tests/hybrid_source.rs) can
+        // be reproduced deterministically instead of relying on the natural
+        // ~20–50ms gap between ClickHouse's unsubscribe and Kafka's
+        // subscribe. Production never sets this env var, so the path is a
+        // no-op outside of tests.
+        if let Ok(ms_str) = std::env::var("STREAMLING__HYBRID__TRANSITION_DELAY_MS")
+            && let Ok(ms) = ms_str.parse::<u64>()
+            && ms > 0
+        {
+            warn!(
+                "Hybrid source '{}': STREAMLING__HYBRID__TRANSITION_DELAY_MS={} \
+                 — sleeping inside advance_to_next_phase. This knob is intended \
+                 for tests only.",
+                self.reference_name, ms
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+
         let mut state = self.state.write().await;
         let from_phase = state.current_phase;
 
