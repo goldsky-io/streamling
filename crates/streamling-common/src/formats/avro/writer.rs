@@ -321,6 +321,19 @@ fn serialize_column<T: SerializeTarget>(
                 .to_vec())
         }
 
+        DataType::LargeBinary => {
+            write_arrow_value!(ArrayRef::as_binary::<i64>, Value::Bytes, |v: &[u8]| v
+                .to_vec())
+        }
+
+        DataType::FixedSizeBinary(_) => {
+            write_arrow_value!(
+                ArrayRef::as_fixed_size_binary,
+                Value::Bytes,
+                |v: &[u8]| v.to_vec()
+            )
+        }
+
         DataType::List(item) => {
             let schema = get_field_schema(schema, name, nullable);
             let Schema::Array(item_schema) = schema else {
