@@ -1,0 +1,205 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+# Cancel in-progress reviews when new commits are pushed
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 1: Deterministic risk scoring (fast, free)
+  # ──────────────────────────────────────────────────────────────────────
+  risk-scoring:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    outputs:
+      risk_json: ${{ steps.score.outputs.risk_json }}
+      overall_risk: ${{ steps.score.outputs.overall_risk }}
+      risk_level: ${{ steps.score.outputs.risk_level }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Get changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} --name-only > changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+
+      - name: Compute risk scores
+        id: score
+        run: |
+          BASE_REF=$(git merge-base origin/${{ github.event.pull_request.base.ref }} HEAD 2>/dev/null || echo "origin/${{ github.event.pull_request.base.ref }}")
+          echo "Using base ref: $BASE_REF"
+
+          python scripts/ai-review/risk_score.py \
+            --changed-files changed_files.txt \
+            --config scripts/ai-review/review_config.json \
+            --base-ref "$BASE_REF" \
+            --output risk_report.json
+
+          # Pass key values as outputs for downstream jobs
+          echo "overall_risk=$(jq -r .overall_risk risk_report.json)" >> "$GITHUB_OUTPUT"
+          echo "risk_level=$(jq -r .risk_level risk_report.json)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: risk-report
+          path: risk_report.json
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 2: Claude Code review (depends on risk scoring)
+  # ──────────────────────────────────────────────────────────────────────
+  claude-review:
+    needs: [risk-scoring]
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: risk-report
+
+      # Read model from config so it's centrally configurable
+      - name: Read review config
+        id: config
+        run: |
+          MODEL=$(jq -r '.model // "claude-opus-4-20250514"' scripts/ai-review/review_config.json)
+          MAX_TURNS=$(jq -r '.max_turns // 15' scripts/ai-review/review_config.json)
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "max_turns=$MAX_TURNS" >> "$GITHUB_OUTPUT"
+          echo "Using model: $MODEL, max_turns: $MAX_TURNS"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          use_sticky_comment: true
+          claude_args: |
+            --model ${{ steps.config.outputs.model }}
+            --max-turns ${{ steps.config.outputs.max_turns }}
+            --allowedTools Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(cat:*),Bash(jq:*)
+          prompt: |
+            You are an expert Rust code reviewer for the Streamling project — a data
+            processing engine built on Apache Arrow and DataFusion. You review pull
+            requests for correctness, safety, convention compliance, and risk.
+
+            ## Context
+
+            - **Repository:** ${{ github.repository }}
+            - **PR Number:** ${{ github.event.pull_request.number }}
+            - **PR Title:** ${{ github.event.pull_request.title }}
+            - **Overall Risk Level:** ${{ needs.risk-scoring.outputs.risk_level }}
+            - **Overall Risk Score:** ${{ needs.risk-scoring.outputs.overall_risk }}
+
+            ## Step 1: Read context files
+
+            Read these files to understand the project conventions and risk profile:
+            1. `risk_report.json` — per-file risk scores (in the current directory)
+            2. `AGENTS.md` — project development conventions and AI review rules
+
+            Prioritize your review effort on high-risk files from the risk report.
+
+            ## Step 2: Get the PR diff
+
+            Run: `gh pr diff ${{ github.event.pull_request.number }}`
+
+            ## Step 3: Review dimensions
+
+            Evaluate the PR across these dimensions:
+
+            ### A. Convention Compliance (from AGENTS.md)
+            - Does the PR follow the development workflow (test-first for bugs, lint before push)?
+            - Are unit tests present for bug fixes?
+            - Are e2e tests present for pipeline-level features?
+            - Is the change minimal and easy to understand?
+            - If `crates/streamling-plugin/` is touched, were FFI compatibility rules followed?
+
+            ### B. Bug Detection
+            - Logic errors, off-by-one, missing error handling
+            - Rust-specific: `.unwrap()` on fallible operations in non-test code,
+              missing error propagation, potential panics in async contexts
+            - Connector code (kafka, clickhouse, postgres): connection handling,
+              retry logic, resource cleanup
+            - Operator code: Arrow schema mismatches, RecordBatch handling
+
+            ### C. Safety & Correctness
+            - `unsafe` blocks: are they justified and sound? Is there a `// SAFETY:` comment?
+            - Concurrency: race conditions, deadlocks in async code
+            - State management: checkpoint correctness, exactly-once semantics
+            - FFI boundary safety (plugin system uses abi_stable)
+
+            ### D. Performance
+            - Unnecessary allocations or clones in hot paths
+            - Missing batch processing opportunities
+            - Inefficient Arrow operations
+
+            ## Step 4: Format your review
+
+            Post a SINGLE comment on the PR using:
+            `gh pr comment ${{ github.event.pull_request.number }} --body "..."`
+
+            Use this exact format:
+
+            ```
+            ## AI Code Review
+
+            **Risk Level:** RISK_BADGE RISK_LEVEL (score: X.XX/1.00)
+
+            Where RISK_BADGE is:
+            - 🔴 for HIGH (score >= 0.7)
+            - 🟡 for MEDIUM (score >= 0.4)
+            - 🟢 for LOW (score < 0.4)
+
+            ### Findings
+
+            #### 🚫 Blocking (must fix before merge)
+            [List blocking issues with rule IDs from AGENTS.md, or "None"]
+
+            #### 💡 Recommended (should fix)
+            [List recommendations, or "None"]
+
+            #### 📝 Minor (nits)
+            [List minor items, or "None"]
+
+            ### Risk Breakdown
+            | File | Risk | Reason |
+            |------|------|--------|
+            [Top 5 riskiest files from risk_report.json]
+
+            ### Summary
+            [2-3 sentence summary of quality and risk profile]
+            ```
+
+            ## Rules
+            - Only report findings you are confident about (confidence >= 80%)
+            - Reference rule IDs from AGENTS.md when applicable (e.g., RUST-001, CONV-002)
+            - Do NOT flag issues in test code (files matching *_test.rs, test_*, tests/)
+            - Do NOT flag .unwrap() in test code — it's acceptable there
+            - If the PR is low-risk and looks good, say so briefly — don't invent issues

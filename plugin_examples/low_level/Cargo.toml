@@ -1,0 +1,26 @@
+[package]
+name = "plugin_example_low_level"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+
+[workspace]
+
+[lib]
+name = "plugin_example_low_level"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+streamling-plugin = { path = "../../crates/streamling-plugin" }
+
+abi_stable = "0.11.3"
+async-ffi = { version = "0.5", features = ["abi_stable"] }
+arrow = "55.2.0"
+datafusion = "49.0.2"
+datafusion-ffi = "49.0.2"
+futures = "0.3"
+async-trait = "0.1.83"
+arrow-schema = { version = "55.2.0", default-features = false }
+tokio = { version = "1.0", features = ["rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.0", features = ["env-filter", "json"] }

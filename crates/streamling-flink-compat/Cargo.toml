@@ -1,0 +1,22 @@
+[package]
+name = "streamling-flink-compat"
+version = "0.1.0"
+edition = "2024"
+description = "Apache Flink compatibility helpers for Streamling."
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+datafusion = { workspace = true }
+datafusion-expr = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.21"
+simd-json = { version = "0.13", default-features = false, features = ["serde"] }
+regex = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,122 @@
+---
+# Default configuration compiled into the streamling binary via include_str!.
+# These values are the baseline layer; an external config file and STREAMLING__*
+# environment variables override them (precedence: embedded < file < env).
+application_id: "local_app_v1"
+log_format: "text" # "text" or "json"
+pipeline_definition_location: "./pipeline.yaml"
+record_batch_interval_ms: "100"
+record_batch_size: "1000"
+# uncomment for debugging pipeline e2e
+# num_records_before_stop: 1
+# the number of in-flight record batches in internal channels
+internal_buffer_size: "10"
+checkpoint_interval_sec: "5"
+# if false (default), primary keys are NOT enforced and warnings are logged instead of errors
+# if true, missing primary keys will cause pipeline startup to fail
+# enforce_primary_keys: false
+state_backend:
+  backend_type: "Sqlite"
+  sqlite:
+    database_path: "./state.db"
+  postgres:
+    host: "localhost"
+    port: 5432
+    db: "streamling"
+    user: "graph-node"
+    password: ""
+    sslmode: "require" # Options: disable, allow, prefer, require, verify-ca, verify-full (default: require)
+dynamic_table_backend:
+  postgres:
+    host: "localhost"
+    port: 5432
+    db: "streamling"
+    user: "graph-node"
+    password: ""
+    sslmode: "require"
+external_http_handler:
+  trigger_max_count: "2000"
+  operator_timeout_sec: "300"
+  # the number of in-flight record batches executed concurrently by the external HTTP handler
+  buffer_size: "25"
+wasm_script:
+  # The WASM runtime is embedded in the binary; uncomment runtime_wasm_file_path
+  # only to override it with an external .wasm file.
+  # runtime_wasm_file_path: "/path/to/runtime.wasm"
+  # Number of WASM plugin instances in the pool for concurrent processing.
+  # Higher values allow more concurrent batch processing but use more memory.
+  # Default is 4.
+  parallelism: 4
+  # Minimum number of rows to accumulate before processing.
+  # Smaller batches are combined until this threshold is reached.
+  # Set to 0 to disable accumulation and process each batch immediately.
+  # Default is 0 (disabled).
+  batch_size: 0
+plugin: {}
+kafka_source:
+  brokers: "localhost:9092"
+  security_protocol: "plaintext"
+  sasl_mechanism:
+  sasl_username:
+  sasl_password:
+  schema_registry_url: "http://localhost:18081"
+  schema_registry_username:
+  schema_registry_password:
+  consumer_group_id:
+  client_id:
+  lag_report_interval_ms: "60000"
+kafka_sink:
+  brokers: "localhost:9092"
+  security_protocol: "plaintext"
+  sasl_mechanism:
+  sasl_username:
+  sasl_password:
+  schema_registry_url: "http://localhost:18081"
+  schema_registry_username:
+  schema_registry_password:
+  client_id:
+clickhouse_source:
+  url: "http://localhost:8123"
+  user: default
+  password: ""
+  database: default
+  page_size: "10000000"
+clickhouse_sink:
+  url: "http://localhost:8123"
+  user: default
+  password: ""
+  database: default
+print_sink:
+  sample_every: "1"
+postgres_sink:
+  host: 127.0.0.1
+  port: 5432
+  user: "graph-node"
+  pass: ""
+  db: "postgres"
+  sslmode: "disable"
+  batch_flush_interval: "1s"
+  batch_size: 100
+open_telemetry_metrics:
+  # any non-url value will lead to metrics not being recorded and exported
+  # for prometheus running locally, use "http://localhost:9090/api/v1/otlp/v1/metrics"
+  ingestion_endpoint: "none"
+  # acceptable values are "http/json", "http/protobuf"  or "grpc"
+  endpoint_protocol: ""
+  # how often to flush accumulated metrics to the endpoint
+  batch_interval_secs: 15
+  # expected in format "key1:value1,key2:value2"
+  global_tags: ""
+  # comma-separated regex patterns to deny metrics emission - if metric name matches any pattern, it won't be emitted
+  # example: ".*_debug_.*,test_.*,internal_.*"
+  metric_deny_list: "kafka_consumer.msg_decode_latency,kafka_producer.msg_encode_latency"
+test_settings:
+  telemetry_assertions_enabled: true
+  prometheus_max_attempts: 30
+  prometheus_sleep_ms: 500
+live_data_inspect_enabled: false
+live_data_inspect:
+  records_per_topology_node: 15
+  refresh_in_secs: 30
+admin_api_port: 3000
+# job_mode: false  # When true, hybrid sources terminate after bounded phases complete

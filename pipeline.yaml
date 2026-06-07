@@ -1,0 +1,14 @@
+sources:
+  blocks:
+    type: kafka
+    topic: mainnet.raw.blocks
+    primary_key: id
+transforms:
+  filter_blocks:
+    type: sql
+    sql: select * from blocks where number % 2 = 0
+    primary_key: id
+sinks:
+  print_even_blocks:
+    type: print
+    from: filter_blocks

@@ -1,0 +1,260 @@
+use std::fs::read_to_string;
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use streamling::Streamling;
+use streamling::app_config::AppConfig;
+use streamling::error_format::{format_pretty_error, install_global_panic_hook};
+use streamling::topology::PipelineTopology;
+use streamling::validate::{CapturedLog, LogCaptureLayer, ValidationOutput};
+use streamling_config::preprocessors::TopologyPreprocessor;
+use streamling_core::error::{Result, ResultExt, StreamlingError};
+use streamling_core::operators::inspect::LiveDataInspect;
+use streamling_core::plugin::{
+    build_plugin_preprocessors, load_and_initialize_plugins, terminate_all_plugins,
+};
+use tracing::info;
+use tracing::log::warn;
+use tracing_subscriber::EnvFilter;
+
+mod initializations;
+use initializations::{initialize_live_data_inspect, start_admin_api_server};
+use streamling_common::logging::FlatJsonFormat;
+
+fn build_env_filter(default_level: &str) -> EnvFilter {
+    let base = match std::env::var("RUST_LOG") {
+        Ok(val) if !val.is_empty() => EnvFilter::from_default_env(),
+        _ => EnvFilter::new(default_level),
+    };
+    base.add_directive("cranelift_codegen=off".parse().unwrap())
+        .add_directive("wasmtime_cranelift=off".parse().unwrap())
+        .add_directive("wasmtime=off".parse().unwrap())
+        .add_directive("extism::plugin=off".parse().unwrap())
+}
+
+fn init_logging_standard(app_config: &AppConfig) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let failed = if app_config.log_format == "json" {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
+                    .event_format(FlatJsonFormat),
+            )
+            .with(build_env_filter("info"))
+            .try_init()
+            .is_err()
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_thread_ids(true)
+                    .with_thread_names(true),
+            )
+            .with(build_env_filter("info"))
+            .try_init()
+            .is_err()
+    };
+    if failed {
+        eprintln!("Logger already initialized; skipping logging setup.");
+    }
+}
+
+fn init_logging_capture(app_config: &AppConfig) -> Arc<Mutex<Vec<CapturedLog>>> {
+    use tracing_subscriber::prelude::*;
+    let capture_layer = LogCaptureLayer::new();
+    let logs = capture_layer.logs();
+
+    let base = tracing_subscriber::registry()
+        .with(capture_layer)
+        .with(build_env_filter("warn"));
+
+    let init_result = if app_config.log_format == "json" {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
+            .event_format(FlatJsonFormat);
+        base.with(fmt_layer).try_init()
+    } else {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_thread_ids(true)
+            .with_thread_names(true);
+        base.with(fmt_layer).try_init()
+    };
+    if init_result.is_err() {
+        eprintln!("Logger already initialized; skipping logging setup.");
+    }
+
+    logs
+}
+
+async fn run_pipeline(args: &[String], app_config: AppConfig, dry_run: bool) -> Result<()> {
+    load_and_initialize_plugins(&app_config)?;
+
+    let pipeline_definition_location = args
+        .first()
+        .cloned()
+        .unwrap_or(app_config.pipeline_definition_location.clone());
+    let plugin_preprocessors = build_plugin_preprocessors(&app_config);
+    let preprocessor = TopologyPreprocessor::new(plugin_preprocessors);
+    let config_string = read_to_string(&pipeline_definition_location)
+        .streamling_context("failed to read pipeline definition")?;
+    streamling_core::topology_validation::validate_no_orphan_nodes(&config_string)?;
+    let pipeline_topology = preprocessor
+        .preprocess_topology(config_string)
+        .await
+        .streamling_context("failed to preprocess pipeline topology")?;
+    let pipeline_topology = PipelineTopology::load_from_string(&pipeline_topology)?;
+    streamling_core::topology_validation::validate_job_mode(
+        app_config.job_mode,
+        &pipeline_topology,
+    )?;
+
+    let telemetry_provider = if !dry_run {
+        match streamling_core::telemetry::init_telemetry_provider(
+            &app_config.application_id,
+            &app_config.open_telemetry_metrics,
+        ) {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                warn!(
+                    "Failed to initialize open telemetry metrics. Metrics will not be recorded and exported. Error: {:?}",
+                    error
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let live_data_inspect_enabled = !dry_run && app_config.live_data_inspect_enabled;
+    let live_data_inspect = if live_data_inspect_enabled {
+        Some(initialize_live_data_inspect(
+            &app_config.application_id,
+            app_config.live_data_inspect.clone(),
+            &pipeline_topology,
+        ))
+    } else {
+        None
+    };
+
+    let admin_api_handle = if let Some(live_data_inspect_instance) = live_data_inspect {
+        Some(start_admin_api_server(
+            app_config.admin_api_port,
+            live_data_inspect_instance,
+        ))
+    } else {
+        None
+    };
+
+    let streamling = Streamling::new(app_config, pipeline_topology);
+
+    let result = streamling.start_with(dry_run).await;
+
+    terminate_all_plugins().unwrap();
+
+    if let Some(handle) = admin_api_handle {
+        info!("Shutting down Admin API server");
+        handle.abort();
+    }
+
+    if live_data_inspect_enabled && !dry_run {
+        let _ = LiveDataInspect::get_instance().shutdown().await;
+    }
+
+    if let Some(provider) = telemetry_provider {
+        let _ = provider.force_flush();
+        let _ = provider.shutdown();
+    }
+
+    result
+}
+
+fn emit_validation_json(run_error: Option<&StreamlingError>, logs: &[CapturedLog]) -> ExitCode {
+    let output = ValidationOutput::build(run_error, logs);
+    let exit_code = if output.is_valid {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("failed to serialize validation output")
+    );
+    exit_code
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    install_global_panic_hook();
+
+    let mut args = std::env::args().skip(1).collect::<Vec<String>>();
+    let mut dry_run = false;
+    let mut validate = false;
+    args.retain(|arg| match arg.as_str() {
+        "--dry-run" => {
+            dry_run = true;
+            false
+        }
+        "--validate" => {
+            validate = true;
+            false
+        }
+        _ => true,
+    });
+
+    if validate {
+        dry_run = true;
+    }
+
+    let app_config = match AppConfig::load_from_path("config") {
+        Ok(config) => config,
+        Err(e) => {
+            if validate {
+                let se = StreamlingError::from(e);
+                return emit_validation_json(Some(&se), &[]);
+            }
+            panic!("Failed to load config: {:#}", e);
+        }
+    };
+
+    let captured_logs = if validate {
+        Some(init_logging_capture(&app_config))
+    } else {
+        init_logging_standard(&app_config);
+        None
+    };
+
+    let result = run_pipeline(&args, app_config, dry_run).await;
+
+    if let Err(ref e) = result {
+        tracing::error!(
+            target = "streamling",
+            error.internal = e.is_internal(),
+            error.retriable = e.is_retriable(),
+            "{}",
+            format_pretty_error(e),
+        );
+        if let Some(bt) = e.backtrace() {
+            tracing::error!(target = "streamling", "backtrace:\n{:#}", bt);
+        }
+    }
+
+    if validate {
+        let logs_arc = captured_logs.expect("validate mode guarantees captured_logs is Some");
+        let logs = logs_arc.lock().expect("captured logs mutex poisoned");
+        let run_error = result.as_ref().err();
+        return emit_validation_json(run_error, &logs);
+    }
+
+    if result.is_err() {
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
+}

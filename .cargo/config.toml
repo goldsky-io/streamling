@@ -1,0 +1,21 @@
+[profile.dev]
+debug = 1            # lighter debug info than the default 2
+panic = "abort"      # reduces per-crate code size
+incremental = true   # speeds rebuilds, modest disk cost
+
+[profile.release]
+strip = true         # strips symbols from the final binary, reducing size
+
+[profile.release-optimized]
+inherits = "release"
+lto = true           # enables Link-Time Optimization
+codegen-units = 1    # forces to compile as a single unit, allowing more optimization
+
+# panic=abort lets LLVM omit unwind tables, which breaks libunwind-based
+# backtrace capture. This flag re-enables unwind table emission while keeping
+# the abort-on-panic behavior (no landing pad code, smaller binary).
+[target.'cfg(all())']
+rustflags = ["-C", "force-unwind-tables=yes"]
+
+[env]
+RUST_LOG = "info"

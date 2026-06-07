@@ -1,0 +1,38 @@
+[package]
+name = "streamling"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Streamling: Performant and extensible streaming data framework"
+license-file.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "streamling"
+path = "src/main.rs"
+
+[dependencies]
+# Internal dependencies
+streamling-common = { workspace = true }
+streamling-core = { workspace = true }
+streamling-connectors = { workspace = true }
+streamling-config = { workspace = true }
+streamling-state = { workspace = true }
+
+# Core dependencies
+datafusion.workspace = true
+tokio.workspace = true
+humantime.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+arrow-schema.workspace = true
+futures.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# Test dependencies
+serde.workspace = true
+serde_json.workspace = true
+

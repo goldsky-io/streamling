@@ -1,0 +1,90 @@
+[package]
+name = "streamling-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Core streaming execution engine for Streamling, built on Apache DataFusion."
+license-file.workspace = true
+repository.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[dependencies]
+# Internal dependencies
+streamling-common = { workspace = true }
+streamling-config = { workspace = true }
+streamling-plugin = { workspace = true }
+streamling-flink-compat = { workspace = true }
+
+# Core DataFusion ecosystem
+datafusion.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Configuration and logging
+config.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+futures.workspace = true
+crossbeam.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+delegate.workspace = true
+regex.workspace = true
+itertools.workspace = true
+enum-display.workspace = true
+async-stream.workspace = true
+dashmap.workspace = true
+fixed_deque.workspace = true
+indexmap.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+# Async traits
+async-trait.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+reqwest.workspace = true
+indoc.workspace = true
+lazy_static.workspace = true
+uuid.workspace = true
+axum.workspace = true
+tokio-stream.workspace = true
+
+extism.workspace = true
+
+swc.workspace = true
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_lexer.workspace = true
+heck.workspace = true
+
+# Plugins
+abi_stable.workspace = true
+async-ffi.workspace = true
+
+#Telemetry
+opentelemetry_sdk.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+tonic.workspace = true
+
+paste.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

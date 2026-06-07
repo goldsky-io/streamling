@@ -1,0 +1,629 @@
+-- allium: 1
+-- hybrid-source-state.allium
+
+-- Scope: Hybrid source phase state machine and per-component persistence
+-- Includes:
+--   - Phase state machine (bounded[0..N-1] -> unbounded -> finished)
+--   - Three independent persisted state kinds:
+--       (a) hybrid phase state
+--       (b) bounded resume cursor
+--       (c) unbounded per-partition offsets
+--   - Recovery semantics on restart, including the silent fallback when
+--     hybrid phase state is absent
+--   - Phase advancement on bounded stream end
+--   - Offset handoff: fetch + seed unbounded offsets at the
+--     bounded -> unbounded transition
+--   - Job mode termination after the final bounded phase
+-- Excludes:
+--   - General checkpoint protocol (Marker/Ack/Finalizer) -- see
+--     checkpointing.allium
+--   - Inner-source mechanics (Kafka consumer details, ClickHouse query
+--     construction, schema adaptation)
+--   - Schema validation between bounded and unbounded sources (setup-time)
+--   - State backend implementation -- treated as durable key-value storage
+--   - Side outputs, telemetry, plugin sources
+
+-- Background: a hybrid source combines a finite ordered sequence of bounded
+-- phases (typically ClickHouse historical scans) with one unbounded phase
+-- (typically Kafka tailing). The source executes bounded phases in order
+-- and then transitions to unbounded streaming. Three independent kinds of
+-- state are persisted under distinct keys derived from the source's
+-- reference name. Their independence is load-bearing: each piece is
+-- written and loaded by a different component and any one can be present
+-- or absent independently of the others. A common failure mode arises
+-- when only a subset of the three is recovered on restart.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Durable key-value store. Treated as opaque: get and put by key.
+-- Namespaces isolate pipeline instances. See checkpointing.allium for
+-- the broader checkpoint protocol that drives when bounded and unbounded
+-- sources persist their own state.
+external entity StateBackend {
+    namespace: String                       -- application_id
+}
+
+-- A finite source whose stream eventually ends. The resume cursor is
+-- opaque to this spec; the bounded source persists it independently
+-- under its own key (e.g. clickhouse_source:<reference_name>:v1) at
+-- each finalized epoch.
+external entity BoundedSource {
+    name: String
+}
+
+-- An infinite source that tails a topic indefinitely. Persists one
+-- offset per assigned partition under its own keys
+-- (<reference_name>:<topic>:<partition>) at each finalized epoch.
+external entity UnboundedSource {
+    name: String
+    topic: String
+}
+
+-- Side table maintained by the bounded backend that records the
+-- unbounded source's high-watermark partition offsets. Read once at
+-- the bounded -> unbounded handoff. Treated as opaque.
+external entity OffsetProvider {
+    topic: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value PartitionOffset {
+    partition: Integer
+    offset: Integer
+    updated_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A hybrid source orchestrates a sequence of bounded phases followed by
+-- one unbounded phase. It owns the phase state machine and persists it
+-- under a single key. Bounded and unbounded inner sources own their own
+-- state independently and are persisted under their own keys.
+entity HybridSource {
+    reference_name: String
+    bounded_phases: List<BoundedSource>     -- ordered; length N >= 0
+    unbounded_phase: UnboundedSource
+    offset_provider: OffsetProvider?        -- supplies offsets at handoff
+    job_mode: Boolean                       -- terminate after final bounded phase
+
+    -- Live phase state. Persisted as PersistedHybridPhase below.
+    current_phase: Integer                  -- 0..N-1: bounded;
+                                            -- N:     unbounded;
+                                            -- >N:    finished
+    seeded_offsets: Set<PartitionOffset>?   -- recorded at bounded -> unbounded handoff
+
+    -- Persisted phase state (singular: at most one per source)
+    persisted_phase: PersistedHybridPhase with hybrid = this
+
+    -- Derived
+    is_in_bounded_phase:   current_phase < bounded_phases.count
+    is_in_unbounded_phase: current_phase = bounded_phases.count
+    is_finished:           current_phase > bounded_phases.count
+    has_bounded_phases:    bounded_phases.count > 0
+}
+
+-- The hybrid source's phase state, persisted as a single value under
+-- key "hybrid_source_<reference_name>_v1" in the configured namespace.
+-- This entity is independent from any inner source's state. Its presence
+-- or absence on restart determines whether the source resumes mid-flight
+-- or restarts from phase 0.
+entity PersistedHybridPhase {
+    hybrid: HybridSource
+    current_phase: Integer
+    seeded_offsets: Set<PartitionOffset>?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ---- Initialization ----------------------------------------------------
+
+-- A new hybrid source starts in phase 0 with no seeded offsets.
+-- This is also the silent fallback used when persisted phase state is
+-- absent on restart -- see HybridSourceRecoversPhaseState.
+rule HybridSourceCreated {
+    when: hybrid: HybridSource.created
+    ensures: hybrid.current_phase = 0
+    ensures: hybrid.seeded_offsets = null
+}
+
+-- ---- Recovery ----------------------------------------------------------
+
+-- On startup, the hybrid source attempts to load its phase state from
+-- the state backend under the single key
+-- "hybrid_source_<reference_name>_v1". The four rules below cover the
+-- four possible outcomes; their preconditions are mutually exclusive.
+--
+-- If the key is present, resume from the persisted phase (happy path).
+-- If the key is absent, probe per-component state to disambiguate
+-- whether this is a write-path failure (FM1, FM6) or a genuine first
+-- run, then recover from the most advanced observable state. The
+-- previous design retained the initial phase-0 state silently in this
+-- case, with no log distinction; that silent fallback is the failure
+-- this recovery protocol exists to prevent. See
+-- HybridStateReadContract for the logging obligation each outcome
+-- carries.
+
+-- Happy path: persisted phase state exists; resume from it.
+rule HybridSourceRecoversFromPhaseState {
+    when: HybridSourceStartup(hybrid)
+    requires: hybrid.persisted_phase != null
+    let persisted = hybrid.persisted_phase
+    ensures: hybrid.current_phase = persisted.current_phase
+    ensures: hybrid.seeded_offsets = persisted.seeded_offsets
+}
+
+-- Most advanced fallback: hybrid phase state absent, but the
+-- unbounded source has persisted offsets for every configured
+-- partition. The source has already crossed into the unbounded phase
+-- in a prior process; resume there directly without replaying any
+-- bounded phase. Phase state is persisted so the next restart hits
+-- the happy path.
+rule HybridSourceRecoversToUnbounded {
+    when: HybridSourceStartup(hybrid)
+    requires: hybrid.persisted_phase = null
+    requires: has_all_unbounded_offsets(hybrid)
+    ensures: hybrid.current_phase = hybrid.bounded_phases.count
+    ensures: hybrid.seeded_offsets = unbounded_persisted_offsets(hybrid)
+    ensures: HybridPhaseStatePersisted(hybrid)
+}
+
+-- Mid fallback: hybrid phase state absent, unbounded offsets are
+-- absent or partial, but some bounded phase reports its own
+-- persisted resume cursor. Scan bounded_phases from highest index to
+-- lowest and recover from the first index whose source has a cursor.
+-- Phases before that index are treated as completed (they were
+-- completed in a prior process); the recovery target itself is the
+-- phase the source resumes from. Phase state is persisted so the
+-- next restart hits the happy path.
+--
+-- The recovery target is meaningful only when bounded sources honour
+-- StateKeyUniqueness on BoundedResumeContract; otherwise multiple
+-- phases may overwrite each other's state and the highest-indexed
+-- probe reflects the last writer, not the last completed phase.
+rule HybridSourceRecoversToHighestBoundedState {
+    when: HybridSourceStartup(hybrid)
+    requires: hybrid.persisted_phase = null
+    requires: not has_all_unbounded_offsets(hybrid)
+    let recovered_idx = highest_bounded_with_cursor(hybrid)
+    requires: recovered_idx != null
+    ensures: hybrid.current_phase = recovered_idx
+    ensures: HybridPhaseStatePersisted(hybrid)
+}
+
+-- Last resort: no observable state anywhere. This is a true first
+-- run (or all state was wiped). Persist default state so the next
+-- restart distinguishes "we ran this once before" from "fresh
+-- backend".
+rule HybridSourceRecoversAsFirstRun {
+    when: HybridSourceStartup(hybrid)
+    requires: hybrid.persisted_phase = null
+    requires: not has_all_unbounded_offsets(hybrid)
+    requires: highest_bounded_with_cursor(hybrid) = null
+    ensures: hybrid.current_phase = 0
+    ensures: hybrid.seeded_offsets = null
+    ensures: HybridPhaseStatePersisted(hybrid)
+}
+
+-- ---- Phase advancement -------------------------------------------------
+
+-- When the active bounded phase's stream ends, the hybrid source
+-- advances to the next phase. The phase state is persisted to the
+-- state backend immediately after the in-memory advance.
+--
+-- The bounded source's own resume cursor was already saved during the
+-- most recent epoch finalization (see checkpointing.allium). Phase state
+-- and bounded cursors are persisted independently and there is no
+-- atomicity between them.
+rule AdvanceFromBoundedPhase {
+    when: BoundedStreamEnded(hybrid)
+    requires: hybrid.is_in_bounded_phase
+    ensures: hybrid.current_phase = hybrid.current_phase + 1
+    ensures: HybridPhaseStatePersisted(hybrid)
+}
+
+-- When advancing OUT of the last bounded phase, fetch unbounded
+-- partition offsets from the offset provider and seed them into the
+-- unbounded source's per-partition state BEFORE the unbounded phase
+-- begins consuming. The offsets are also recorded in hybrid phase
+-- state for diagnostic purposes.
+--
+-- Seeding ensures the unbounded source resumes from the correct
+-- position relative to where the final bounded phase left off, rather
+-- than from its configured default (earliest/latest). After seeding,
+-- the unbounded source's per-partition state contains a value for each
+-- seeded partition, regardless of whether one already existed.
+rule SeedUnboundedOffsetsAtHandoff {
+    when: BoundedStreamEnded(hybrid)
+    requires: hybrid.is_in_bounded_phase
+    requires: hybrid.current_phase + 1 = hybrid.bounded_phases.count
+    requires: hybrid.offset_provider != null
+    let offsets = hybrid.offset_provider.fetch_offsets(hybrid.unbounded_phase.topic)
+    ensures: hybrid.seeded_offsets = offsets
+    ensures:
+        for offset in offsets:
+            UnboundedPartitionOffsetSeeded(
+                source: hybrid.unbounded_phase,
+                offset: offset
+            )
+}
+
+-- The unbounded source observes seeded offsets via direct write to the
+-- same per-partition state key it reads on its own startup. The
+-- unbounded source itself does not need to be running at the time of
+-- seeding -- the write is durable and is consumed by its next startup.
+-- See checkpointing.allium for the unbounded source's normal commit
+-- path during steady state.
+rule UnboundedAcceptsSeededOffset {
+    when: UnboundedPartitionOffsetSeeded(source, offset)
+    -- Effect: the source's persisted partition offset becomes `offset`.
+    -- Modeled as a contract on UnboundedSource (see
+    -- UnboundedOffsetSeedingContract surface).
+}
+
+-- Job mode terminates the source after the last bounded phase
+-- completes, instead of starting the unbounded phase. The source
+-- shuts down cleanly; no offset seeding is required.
+rule JobModeTerminatesAfterFinalBounded {
+    when: BoundedStreamEnded(hybrid)
+    requires: hybrid.is_in_bounded_phase
+    requires: hybrid.current_phase + 1 = hybrid.bounded_phases.count
+    requires: hybrid.job_mode
+    ensures: hybrid.current_phase = hybrid.bounded_phases.count + 1   -- finished
+    ensures: HybridPhaseStatePersisted(hybrid)
+    ensures: HybridSourceShutdown(hybrid)
+}
+
+-- The unbounded phase has no natural end. If its stream nevertheless
+-- ends (e.g. shutdown, fatal error), the hybrid source moves to the
+-- finished state and exits. Phase state is NOT mutated; the source
+-- remains recoverable as "in unbounded phase" for the next start.
+rule UnboundedStreamEnds {
+    when: UnboundedStreamEnded(hybrid)
+    requires: hybrid.is_in_unbounded_phase
+    ensures: HybridSourceShutdown(hybrid)
+}
+
+-- ---- Persistence -------------------------------------------------------
+
+-- Phase state is persisted as a single value under
+-- "hybrid_source_<reference_name>_v1". This is the only key written by
+-- the hybrid source itself; bounded and unbounded inner sources write
+-- their own keys independently.
+rule HybridPhaseStatePersisted {
+    when: HybridPhaseStatePersisted(hybrid)
+    let p = hybrid.persisted_phase
+    ensures:
+        if p != null:
+            p.current_phase = hybrid.current_phase
+            p.seeded_offsets = hybrid.seeded_offsets
+        else:
+            PersistedHybridPhase.created(
+                hybrid: hybrid,
+                current_phase: hybrid.current_phase,
+                seeded_offsets: hybrid.seeded_offsets
+            )
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Contract for unbounded source implementations consuming seeded
+-- offsets. The hybrid source writes seed offsets to the same per-
+-- partition state keys the unbounded source reads on startup, so this
+-- contract is satisfied implicitly by any unbounded source that
+-- prefers persisted offsets over its configured default.
+surface UnboundedOffsetSeedingContract {
+    facing implementer: UnboundedSource
+
+    context offset: PartitionOffset
+
+    @guarantee UnboundedPrefersPersistedOffset
+        -- An UnboundedSource MUST, on startup, prefer a persisted
+        -- per-partition offset over its configured default
+        -- (earliest/latest). Violation breaks the bounded ->
+        -- unbounded handoff: the unbounded source would resume from
+        -- the wrong position despite seeding.
+}
+
+-- Contract for bounded source implementations exposing resume state.
+-- The bounded source persists its resume cursor under its own key at
+-- each finalized epoch and reads it on its own startup. The hybrid
+-- source does not read or write this key directly, but its highest-
+-- indexed-bounded recovery depends on uniqueness of these keys
+-- across phases.
+surface BoundedResumeContract {
+    facing implementer: BoundedSource
+
+    @guarantee BoundedPrefersPersistedCursor
+        -- A BoundedSource MUST, on startup, prefer its persisted
+        -- resume cursor over restarting from the beginning of the
+        -- bounded range. The hybrid source's phase state alone is
+        -- not sufficient to position a bounded source within its
+        -- range -- the bounded source's own cursor is required.
+
+    @guarantee StateKeyUniqueness
+        -- Every bounded phase implementation MUST persist its state
+        -- under a key uniquely identifying the
+        -- (hybrid reference_name, phase index) pair. Collisions
+        -- across bounded phases of the same HybridSource are
+        -- forbidden: they break
+        -- HybridSourceRecoversToHighestBoundedState because the
+        -- probe cannot tell which phase the surviving state belongs
+        -- to and recovery silently regresses.
+        --
+        -- Today's ClickHouse keying
+        -- ("clickhouse_source:<reference_name>:v1") violates this
+        -- when two or more bounded ClickHouse phases share a
+        -- reference_name; see the open questions for the migration
+        -- plan. Mixed-type topologies (e.g. one ClickHouse + one
+        -- Postgres bounded phase) satisfy the contract by virtue of
+        -- per-type key prefixes.
+}
+
+-- The hybrid source's read-path logging contract. The primary
+-- observation that hybrid phase state is missing MAY log at INFO
+-- (it has not yet resolved into a recoverable outcome). Each
+-- disambiguated outcome of the recovery probe MUST log at WARN
+-- identifying the namespace AND the branch taken (recovered to
+-- unbounded, recovered to bounded phase N, or true first run).
+-- The WARN obligation lives on the outcome, not on the entry
+-- observation, because the entry alone does not tell operators
+-- whether FM1, FM6, or a genuine first run occurred -- only the
+-- disambiguation does.
+surface HybridStateReadContract {
+    facing implementer: HybridSource
+
+    @guarantee WarnOnRecoveryOutcome
+        -- For every restart where hybrid phase state is missing and
+        -- the recovery probe runs, the resolved outcome MUST log at
+        -- WARN severity, including reference_name and the branch
+        -- taken (recovered to unbounded / recovered to bounded
+        -- phase N / true first run). Multiple recovery branches may
+        -- fire per restart (e.g. partial Kafka offsets observed
+        -- followed by bounded-phase recovery); each branch MUST
+        -- WARN independently. Suppressing duplicate WARNs is
+        -- forbidden because it masks whether downstream probes also
+        -- observed the missing state. Topologies with no bounded
+        -- phases (unbounded-only) MAY skip the WARN: there is no
+        -- recovery to perform.
+}
+
+-- The hybrid source's write-path logging contract. Every code path
+-- whose failure can prevent hybrid phase state from being persisted
+-- MUST log at ERROR severity when that failure is terminal. Without
+-- ERROR-level logging at the write site, FM6 is indistinguishable
+-- from FM1 in operator logs.
+surface HybridStateWriteContract {
+    facing implementer: HybridSource
+
+    @guarantee ErrorOnTerminalWriteFailure
+        -- save_state MUST retry on transient backend errors. On
+        -- retry exhaustion it MUST log at ERROR including
+        -- reference_name and the attempt count. Callers that
+        -- propagate or swallow save_state's error MUST also log at
+        -- ERROR; the canonical call site is the advance-to-next-
+        -- phase loop in the source's execution path.
+        --
+        -- Retryable errors before exhaustion MAY log at WARN; the
+        -- terminal failure MUST log ERROR.
+}
+
+------------------------------------------------------------
+-- Failure Modes
+------------------------------------------------------------
+
+-- FM1: Hybrid phase state key missing on restart, both inner-source
+--      states present.
+-- Effect (with recovery protocol): the unbounded source's persisted
+--         partition offsets are observed by
+--         HybridSourceRecoversToUnbounded, which sets current_phase
+--         to the unbounded phase and persists hybrid state so the
+--         next restart hits the happy path. The bounded source is
+--         not replayed. WarnOnRecoveryOutcome MUST fire so the
+--         operator sees that FM1 occurred (the WARN is the only
+--         signal distinguishing FM1 from a normal restart).
+-- Effect (pre-recovery protocol, retained as historical context):
+--         source silently defaulted to phase 0, re-entered bounded
+--         catchup, and ignored its own previous transition to
+--         unbounded. This is the "the pipeline jumped back in time"
+--         failure pattern that motivated the recovery protocol.
+-- Recovery: automatic. The recovery probe persists hybrid state on
+--           the way out, so the failure self-heals after one restart.
+
+-- FM2: Hybrid phase state key missing on restart, bounded source's
+--      cursor also missing.
+-- Effect: HybridSourceRecoversAsFirstRun fires; source defaults to
+--         phase 0 and persists default hybrid state. Bounded source
+--         restarts at the beginning of its configured range. Full
+--         bounded replay. WarnOnRecoveryOutcome MUST fire to mark
+--         this as the first-run branch.
+-- Recovery: automatic over time (bounded replay completes, source
+--           transitions to unbounded). Lag is the duration of the
+--           bounded range.
+
+-- FM3: Phase advancement persisted, but seeded offsets fail to reach
+--      the unbounded source's state backend.
+-- Effect: hybrid source thinks the handoff is complete, but the
+--         unbounded source on next start uses its configured default
+--         (earliest/latest) instead of the seeded position.
+-- Recovery: depends on the configured default. With "earliest" the
+--           unbounded source replays from the topic's retention
+--           start; with "latest" it skips data between handoff and
+--           startup.
+
+-- FM4: Reference name mismatch between writer and reader pods (e.g.
+--      pipeline rename, namespace migration).
+-- Effect: writer wrote under "hybrid_source_<old>_v1"; reader looks
+--         under "hybrid_source_<new>_v1" and finds nothing. Behaves
+--         as FM1 or FM2 depending on whether the bounded source's
+--         keying tracks the rename.
+-- Note: keys for all three persisted state kinds derive from the
+--       same reference_name, so they all move together under a
+--       coordinated rename; partial migrations are the dangerous case.
+
+-- FM5: Different state backend or namespace between writer and
+--      reader pods (e.g. application_id changed, backend swap).
+-- Effect: the reader sees an empty backend. Behaves as FM2 -- full
+--         bounded replay. No way to distinguish "fresh deploy" from
+--         "lost state" without operational context.
+
+-- FM6: Crash or persistence failure between unbounded offset seeding
+--      and hybrid phase state save.
+-- Order in advance_to_next_phase: increment in-memory phase ->
+-- seed unbounded offsets to backend -> save hybrid phase state to
+-- backend. The two backend writes are not atomic; either can succeed
+-- or fail independently of the other.
+-- Effect (with recovery protocol + save_state retry): save_state
+--         retries on transient errors and ERROR-logs on exhaustion
+--         (HybridStateWriteContract / ErrorOnTerminalWriteFailure).
+--         If the write still fails, durable unbounded offsets exist
+--         without a corresponding hybrid phase state row; on the
+--         next restart HybridSourceRecoversToUnbounded observes the
+--         complete offsets and resumes the unbounded phase with a
+--         WARN, instead of replaying bounded. The cost of FM6 is
+--         now one restart + one WARN per occurrence, not an
+--         indefinite stuck-in-bounded state.
+-- Effect (pre-recovery protocol, retained as historical context):
+--         the silent fallback re-entered phase 0, ran bounded
+--         again, and on the next successful transition OVERWROTE
+--         the existing unbounded partition offsets with newer
+--         values from the offset provider. The original first-
+--         insert timestamp on those rows was preserved because
+--         put() is INSERT ... ON CONFLICT DO UPDATE on data only
+--         (postgres backend; see streamling-state/postgres.rs).
+-- Recovery: automatic on next restart via
+--           HybridSourceRecoversToUnbounded. The retry inside
+--           save_state additionally absorbs transient backend
+--           errors before they reach FM6.
+-- Observed: a production state dump showed three first-insert
+--           timestamps under the same reference_name:
+--             kafka partition offset:  T0      (oldest)
+--             clickhouse_source:       T0 + 2d
+--             hybrid_source:           T0 + 2d + 2h (newest)
+--           Reading the timestamps via I5: the bounded source was
+--           DORMANT during the [T0, T0+2d] window (otherwise a
+--           clickhouse_source row would have been first-inserted
+--           within seconds of T0). The source was in unbounded
+--           phase throughout that window -- but with NO hybrid
+--           phase state row to record that fact. The original
+--           bounded -> unbounded transition that put the source
+--           into unbounded phase happened at some unknown earlier
+--           date and its save_state never reached durable storage.
+--           The Apr 30 events are not the original FM6 incident;
+--           they are the recovery: a restart silently fell back to
+--           phase 0 (T0+2d, first clickhouse_source row), bounded
+--           ran through (2 hours), and the second-ever transition
+--           is the one that finally persisted (T0+2d+2h, first
+--           hybrid_source row). The silent fallback was actively
+--           harmful here: it discarded the unbounded position
+--           recorded in Kafka and re-ran bounded catchup that the
+--           system had previously completed.
+
+-- FM7: Asymmetric persistence cadence amplifies single-write
+--      failures of hybrid phase state.
+-- Effect: bounded and unbounded inner sources persist their state on
+--         every finalized epoch. Hybrid phase state persists only at
+--         phase transitions. For the typical bounded -> unbounded
+--         shape, save_state runs exactly once in the entire source
+--         lifetime. There is no retry, no idle re-save, and no
+--         "heartbeat" persistence. A single transient state-backend
+--         error during that one call leaves the hybrid_source row
+--         absent for the remaining lifetime of the deployment.
+-- Note: this is a structural property of the design, not a bug in
+--       any individual code path. It is what turns FM6 from "rare
+--       transient" into "permanent until a future bounded replay
+--       succeeds."
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- I1: The hybrid source persists exactly one key
+--     ("hybrid_source_<reference_name>_v1"). All other keys observed
+--     in the state backend for this source are owned by the inner
+--     bounded or unbounded sources.
+--
+-- I2: current_phase advances monotonically. It never decreases at
+--     runtime; only the silent missing-state fallback at startup
+--     can cause an apparent regression (FM1, FM2).
+--
+-- I3: seeded_offsets, once populated, is only updated again on
+--     subsequent passes through SeedUnboundedOffsetsAtHandoff. In
+--     practice this happens at most once per hybrid source lifetime
+--     because the source advances past the bounded phases only
+--     once per process start.
+--
+-- I4: The three persisted state kinds (hybrid phase, bounded
+--     cursor, unbounded partition offsets) are independent: each
+--     can be present or absent regardless of the others, and there
+--     is no cross-key consistency check at recovery time.
+--
+-- I5: Persistence cadence is asymmetric across the three kinds,
+--     and the inner-source cadences are conditional on phase
+--     activity.
+--       - Bounded inner source: persists on every finalized epoch
+--         WHILE in the bounded phase. While hybrid is in unbounded
+--         phase, the bounded source is dormant -- its scan() is
+--         never called, no checkpoint task is spawned, and no
+--         persistence happens.
+--       - Unbounded inner source: persists on every finalized epoch
+--         WHILE in the unbounded phase. While hybrid is in bounded
+--         phase, the unbounded source is dormant by the same
+--         mechanism.
+--       - Hybrid phase state: persists only at phase transitions,
+--         and is the only one that writes at transition time.
+--     For the typical (one bounded phase, one unbounded phase)
+--     shape, the hybrid_source row is written exactly once per
+--     process lifetime. Whichever inner source is active gets
+--     hundreds-to-millions of natural retries via the checkpoint
+--     loop; the inactive inner source gets zero; hybrid state
+--     gets one. This asymmetry is what turns a single transient
+--     save_state failure into a long-lived production failure
+--     mode (see FM6, FM7).
+--
+--     A useful corollary: a clickhouse_source row that is
+--     first-inserted LATER than a kafka partition offset row
+--     (under the same reference_name) implies that the bounded
+--     source was dormant during the kafka writes -- the source
+--     was in unbounded phase, despite the absence of a hybrid
+--     phase state row to record that fact.
+--
+-- I6: created_at on the postgres state backend is set on first
+--     INSERT only and is not bumped on conflict-update (see
+--     streamling-state/postgres.rs). Operationally this makes the
+--     first-insert timestamp across the three keys a useful
+--     forensic signal:
+--       - If kafka_partition_offset.created_at < clickhouse_source.created_at
+--         for the same reference_name, the source was in unbounded
+--         phase before the bounded phase ever ran (under this
+--         reference_name in this state backend). Because hybrid
+--         phase state is the only durable record of "we are in
+--         unbounded phase", the absence of a hybrid_source row
+--         during that earlier window means FM6 fired at least once
+--         -- the original transition into unbounded never
+--         persisted hybrid state.
+--       - If hybrid_source.created_at > clickhouse_source.created_at,
+--         that interval is the duration of the bounded re-run that
+--         followed the silent fallback.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should hybrid phase state be persisted on a heartbeat (e.g. every finalized epoch the source observes), not only at phase transitions? Today save_state runs exactly once per process lifetime for the typical bounded -> unbounded shape; even with save_state retry on transient errors (HybridStateWriteContract), a heartbeat would absorb a wider class of failures by giving operators multiple natural retry windows."
+
+open question "Should the seed_offsets -> save_state pair be ordered the other way, or made atomic at the state-backend level (single transaction, single key, or two-phase commit)? Current order leaves Kafka rows durable when save_state fails, which is the configuration that produces FM6 in the field. HybridSourceRecoversToUnbounded mitigates FM6 on the next restart, but ordering or atomicity would prevent the inconsistency at write time."
+
+open question "Migration plan for moving the existing single-phase ClickHouse cursor key (clickhouse_source:<reference_name>:v1) to a per-phase-indexed form, as required by BoundedResumeContract / StateKeyUniqueness. Multi-bounded-same-type topologies cannot satisfy the contract today; in-flight pipelines must not lose their existing cursor during the migration."
+
+open question "Should HybridSourceRecoversToHighestBoundedState detect 'gap' topologies where bounded phase N has persisted state but some 0..N-1 do not? Today the rule lands at the highest index with state and treats earlier phases as completed; if an earlier phase's state was lost independently, that assumption is wrong and bounded data is skipped."

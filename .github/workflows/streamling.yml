@@ -1,0 +1,442 @@
+name: streamling
+
+on:
+  push:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Dockerfile*"
+      - ".github/workflows/streamling.yml"
+  workflow_dispatch:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core == 'true' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ github.token }}
+          filters: |
+            core:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'Dockerfile*'
+              - '.github/workflows/streamling.yml'
+
+  validate-and-test:
+    needs: [changes]
+    if: needs.changes.outputs.core == 'true'
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "main"
+            cargo-args: ""
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "10G"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git to use the workflow token for GitHub
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy, rustfmt
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-streamling-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-streamling-${{ runner.os }}-1.90.0-
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "streamling"
+          cache-targets: true
+          cache-on-failure: true
+      - name: Run linters
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings --A clippy::result_large_err
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run unit tests
+        run: cargo nextest run --workspace --locked -P ci --exclude streamling-e2e
+        env:
+          RUST_LOG: info
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+          RUSTC_WRAPPER: sccache
+        timeout-minutes: 15
+
+  # ==========================================================================
+  # Build release binary, share via artifact.
+  # ==========================================================================
+  build-release-main:
+    needs: [changes]
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            os: linux
+            arch: x86_64
+            legacy_arch: amd64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            os: linux
+            arch: aarch64
+            legacy_arch: arm64
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Try to restore a previously-built binary.
+      # Key covers all source inputs that affect the build output.
+      - name: Cache main binary
+        id: main-cache
+        uses: actions/cache@v4
+        with:
+          path: target/release/streamling
+          key: main-bin-v2-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+
+      # Everything below only runs on cache miss
+      - name: Configure git to use the workflow token for GitHub
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install sccache
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-main-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-main-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-
+      - name: Setup rust cache
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "v0-release-main-${{ matrix.os }}-${{ matrix.arch }}"
+          cache-targets: true
+          cache-on-failure: true
+      - name: Build release binary
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        run: cargo build --release --locked
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
+          SCCACHE_CACHE_SIZE: "10G"
+          LIBZ_SYS_STATIC: 1
+          PKG_CONFIG_ALL_STATIC: 1
+      - name: Show sccache stats
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        run: sccache --show-stats || true
+
+      # Always upload — whether from cache or fresh build.
+      # Legacy artifact name kept for build-and-push-image-* jobs.
+      - name: Upload release binary (legacy artifact name)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.legacy_arch }}
+          path: target/release/streamling
+          retention-days: 1
+          if-no-files-found: error
+
+      # New os-arch artifact name for publish-release.
+      - name: Upload release binary (os-arch artifact name)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/release/streamling
+          retention-days: 1
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Publish the rolling `nightly` linux release on every main push
+  # (SHA-suffixed assets). Versioned/tagged releases (all platforms) live in
+  # streamling-release.yml.
+  # ==========================================================================
+  publish-release:
+    needs: [build-release-main, validate-and-test, e2e-tests]
+    if: |
+      always()
+      && needs.build-release-main.result == 'success'
+      && needs.validate-and-test.result != 'failure'
+      && needs.e2e-tests.result != 'failure'
+      && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-binary-*-*
+          path: release-artifacts/
+
+      - name: Package assets for release
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+          dirs=(release-artifacts/release-binary-*-*)
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo "No release-binary-*-* artifacts downloaded; failing." >&2
+            exit 1
+          fi
+          for dir in "${dirs[@]}"; do
+            name="$(basename "$dir")"               # release-binary-linux-x86_64
+            os_arch="${name#release-binary-}"       # linux-x86_64
+            base="streamling-${os_arch}-${GITHUB_SHA}"
+            # Linux artifacts are bare binaries packaged as .tar.gz, flat at the
+            # archive root. (macOS/Windows assets live in streamling-release.yml.)
+            if [[ -f "$dir/streamling" ]]; then
+              chmod +x "$dir/streamling"
+              tar -czf "release-assets/${base}.tar.gz" -C "$dir" streamling
+            else
+              echo "Missing binary in $dir" >&2
+              exit 1
+            fi
+          done
+          ls -la release-assets/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: nightly (rolling main)
+          prerelease: true
+          make_latest: false
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+      - name: Prune old assets on rolling nightly release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/prune-rolling-release.sh nightly 30
+
+  e2e-tests:
+    needs: [changes]
+    if: needs.changes.outputs.core == 'true'
+    uses: ./.github/workflows/e2e.yml
+    with:
+      streamling_ref: ${{ github.sha }}
+    secrets:
+      GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+
+  # ==========================================================================
+  # Image push jobs: download pre-built binary and package into Docker image.
+  # No Rust compilation needed — just checkout (for Dockerfile) + Docker push.
+  # ==========================================================================
+  build-and-push-image-main:
+    needs: [validate-and-test, e2e-tests, build-release-main]
+    if: ${{ always() && github.ref_name == 'main' && needs.build-release-main.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            arch: amd64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            arch: arm64
+    steps: &image_push_steps
+      - name: Mask AWS account ID
+        env:
+          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
+        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
+      - uses: actions/checkout@v4
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binary-${{ matrix.arch }}
+          path: release-artifacts/
+      - name: Install release binaries
+        run: |
+          mkdir -p target/release
+          cp release-artifacts/streamling target/release/
+          chmod +x target/release/streamling
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Generate tags
+        id: generate_tags
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: streamling
+          IMAGE_TAG: ${{ github.sha }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
+          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG-$ARCH
+          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest-$ARCH
+          echo "tags=$TAG_SHA,$TAG_LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=$TAG_LATEST" >> "$GITHUB_OUTPUT"
+      - name: Build and push Docker image (prebuilt artifacts)
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.generate_tags.outputs.tags }}
+          provenance: false
+
+  build-and-push-image-branch:
+    needs: [validate-and-test, build-release-main]
+    if: ${{ always() && github.ref_name != 'main' && needs.validate-and-test.result != 'failure' && needs.build-release-main.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            arch: amd64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            arch: arm64
+    steps: *image_push_steps
+
+  create-manifest-main:
+    needs: [build-and-push-image-main]
+    if: ${{ always() && github.ref_name == 'main' && needs.build-and-push-image-main.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Mask AWS account ID
+        env:
+          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
+        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Create and push multi-arch manifest
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: streamling
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
+          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG
+          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest
+
+          docker manifest create $TAG_SHA \
+            $TAG_SHA-amd64 \
+            $TAG_SHA-arm64
+          docker manifest push $TAG_SHA
+
+          docker manifest create $TAG_LATEST \
+            $TAG_LATEST-amd64 \
+            $TAG_LATEST-arm64
+          docker manifest push $TAG_LATEST
+
+          echo "Created multi-arch manifests:"
+          echo "  - $TAG_SHA"
+          echo "  - $TAG_LATEST"
+
+  create-manifest-branch:
+    needs: [build-and-push-image-branch]
+    if: ${{ always() && github.ref_name != 'main' && needs.build-and-push-image-branch.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Mask AWS account ID
+        env:
+          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
+        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Create and push multi-arch manifest
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: streamling
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
+          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG
+          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest
+
+          docker manifest create $TAG_SHA \
+            $TAG_SHA-amd64 \
+            $TAG_SHA-arm64
+          docker manifest push $TAG_SHA
+
+          docker manifest create $TAG_LATEST \
+            $TAG_LATEST-amd64 \
+            $TAG_LATEST-arm64
+          docker manifest push $TAG_LATEST
+
+          echo "Created multi-arch manifests:"
+          echo "  - $TAG_SHA"
+          echo "  - $TAG_LATEST"

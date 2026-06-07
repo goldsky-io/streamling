@@ -1,0 +1,65 @@
+[package]
+name = "streamling-connectors"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Source and sink connectors for Streamling."
+license-file.workspace = true
+repository.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[dependencies]
+# Internal dependencies
+streamling-core = { workspace = true }
+streamling-config = { workspace = true }
+streamling-state = { workspace = true }
+
+# Core DataFusion ecosystem
+datafusion.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Configuration and logging
+tracing.workspace = true
+
+# Utilities
+futures.workspace = true
+async-stream.workspace = true
+crossbeam.workspace = true
+once_cell.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+
+# Async traits
+async-trait.workspace = true
+
+# Kafka
+rdkafka.workspace = true
+schema_registry_converter.workspace = true
+apache-avro.workspace = true
+dashmap.workspace = true
+
+# Utilities
+uuid.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+reqwest-retry.workspace = true
+reqwest-middleware.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+mockito.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+streamling-state = { workspace = true, features = ["test-utils"] }

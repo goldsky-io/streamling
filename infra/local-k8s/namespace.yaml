@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: streamling-e2e
+  labels:
+    app.kubernetes.io/name: streamling-e2e
+    app.kubernetes.io/part-of: streamling
+

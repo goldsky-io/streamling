@@ -1,0 +1,684 @@
+use crate::dynamic_table::{DynamicTableBackend, DynamicTableBackendError, extract_string_values};
+use crate::error::Result as StreamlingResult;
+use crate::error::ResultExt;
+use crate::retry::retry_forever_with_backoff_async_returning;
+use crate::streamling_user_err;
+use async_trait::async_trait;
+use datafusion::arrow::array::builder::BooleanBuilder;
+use datafusion::arrow::array::{Array, ArrayRef, StringArray};
+use futures::future::join_all;
+use regex::Regex;
+use sqlx::pool::PoolOptions;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Executor, PgPool, Postgres};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use streamling_config::app_config::PostgresDynamicTableBackendConfig;
+use tokio::sync::OnceCell;
+use tracing::{debug, error, info, trace};
+
+const DEFAULT_MAX_CONNECTIONS: u32 = 20;
+const DEFAULT_SCHEMA_NAME: &str = "streamling";
+const IDENTIFIER_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_]*$";
+/// Statement timeout for each individual database query (30 seconds)
+const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// PostgreSQL factory that maintains the connection pool and schema information
+pub struct PostgresDynamicTableBackendFactory {
+    pool: Arc<OnceCell<Arc<PgPool>>>,
+    config: PostgresDynamicTableBackendConfig,
+    dt_schema_name: String,
+}
+
+impl PostgresDynamicTableBackendFactory {
+    pub fn new(
+        config: PostgresDynamicTableBackendConfig,
+    ) -> Result<Self, DynamicTableBackendError> {
+        let dt_schema_name = config
+            .dt_schema_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string());
+
+        Self::validate_identifier(&dt_schema_name).map_err(|e| {
+            DynamicTableBackendError::Initialization(format!("Invalid schema name: {}", e))
+        })?;
+
+        Ok(Self {
+            pool: Arc::new(OnceCell::new()),
+            config,
+            dt_schema_name,
+        })
+    }
+
+    fn validate_identifier(id: &str) -> StreamlingResult<()> {
+        let re = Regex::new(IDENTIFIER_PATTERN).unwrap();
+        if !re.is_match(id) {
+            return Err(streamling_user_err!(
+                "Invalid identifier '{}'. Must match {}",
+                id,
+                IDENTIFIER_PATTERN
+            ));
+        }
+        Ok(())
+    }
+
+    async fn initialize_schema(
+        pool: Arc<PgPool>,
+        dt_schema_name: &str,
+    ) -> Result<(), DynamicTableBackendError> {
+        trace!("Initializing schema: {}", dt_schema_name);
+        let result = sqlx::query(
+            format!(
+                r#"
+                CREATE SCHEMA IF NOT EXISTS "{}";
+            "#,
+                dt_schema_name
+            )
+            .as_str(),
+        )
+        .execute(pool.as_ref())
+        .await;
+
+        match result {
+            Ok(_) => {
+                trace!("Schema {} initialized successfully", dt_schema_name);
+                Ok(())
+            }
+            Err(e) => {
+                let err = DynamicTableBackendError::Initialization(format!(
+                    "Failed to initialize schema '{}': {}",
+                    dt_schema_name, e
+                ));
+                error!("{}", err);
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn ensure_table_exists(
+        pool: Arc<PgPool>,
+        full_table_name: String,
+        column_name: &str,
+    ) -> Result<bool, DynamicTableBackendError> {
+        // Try to query the column to check if table and column exist
+        // We only check the value column since time_column has a default value
+        let check_query = format!(
+            r#"SELECT "{}" FROM {} LIMIT 0"#,
+            column_name, full_table_name
+        );
+        trace!(
+            "Checking table existence: {} with column: {}",
+            full_table_name, column_name
+        );
+        let result = sqlx::query(&check_query).execute(pool.as_ref()).await;
+
+        match result {
+            Ok(_) => {
+                // Table exists and has the column
+                trace!(
+                    "Table {} exists with column {}",
+                    full_table_name, column_name
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                let error_msg = e.to_string().to_lowercase();
+                // Check if error is about missing column (table exists but column doesn't)
+                // PostgreSQL error: "column \"column_name\" does not exist"
+                if error_msg.contains("column") && error_msg.contains("does not exist") {
+                    let err = DynamicTableBackendError::Initialization(format!(
+                        "Table {} may already exist but does not have the expected column '{}'. Please ensure the table exists and has the expected column.",
+                        full_table_name, column_name
+                    ));
+                    error!("{}", err);
+                    Err(err)
+                } else if error_msg.contains("relation") && error_msg.contains("does not exist")
+                    || error_msg.contains("schema") && error_msg.contains("does not exist")
+                {
+                    // If error is about missing table or schema (relation/schema does not exist), return false
+                    // This means we need to create both schema and table
+                    trace!(
+                        "Table or schema does not exist for {}: {}",
+                        full_table_name, e
+                    );
+                    Ok(false)
+                } else {
+                    // Other errors (permissions, etc.) return error
+                    let err = DynamicTableBackendError::Initialization(format!(
+                        "Dynamic table postgres error: Failed to check table existence for {}: {}",
+                        full_table_name, e
+                    ));
+                    error!("{}", err);
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    pub async fn create_backend(
+        &self,
+        backend_entity_name: String,
+        schema: Option<String>,
+        column: Option<String>,
+        time_column: Option<String>,
+        max_batch_size: usize,
+    ) -> Result<PostgresDynamicTableBackend, DynamicTableBackendError> {
+        debug!(
+            "Creating dynamic table backend: entity={}, schema={:?}, column={:?}, time_column={:?}",
+            backend_entity_name, schema, column, time_column
+        );
+
+        Self::validate_identifier(backend_entity_name.as_str()).map_err(|e| {
+            let err =
+                DynamicTableBackendError::Initialization(format!("Invalid table name: {}", e));
+            error!("{}", err);
+            err
+        })?;
+
+        // Use provided schema or fall back to factory's dt_schema_name
+        let schema_name = schema.unwrap_or_else(|| self.dt_schema_name.clone());
+        Self::validate_identifier(&schema_name).map_err(|e| {
+            let err =
+                DynamicTableBackendError::Initialization(format!("Invalid schema name: {}", e));
+            error!("{}", err);
+            err
+        })?;
+
+        // Use provided column or default to "value"
+        let column_name = column.unwrap_or_else(|| "value".to_string());
+        Self::validate_identifier(&column_name).map_err(|e| {
+            let err =
+                DynamicTableBackendError::Initialization(format!("Invalid column name: {}", e));
+            error!("{}", err);
+            err
+        })?;
+
+        // Use provided time_column or default to "updated_at"
+        let time_column_name = time_column.unwrap_or_else(|| "updated_at".to_string());
+        Self::validate_identifier(&time_column_name).map_err(|e| {
+            let err = DynamicTableBackendError::Initialization(format!(
+                "Invalid time column name: {}",
+                e
+            ));
+            error!("{}", err);
+            err
+        })?;
+
+        let full_table_name = format!("{}.{}", schema_name, backend_entity_name);
+        trace!("Full table name: {}", full_table_name);
+
+        // Return backend that will initialize lazily
+        Ok(PostgresDynamicTableBackend::new(
+            self.pool.clone(),
+            self.config.clone(),
+            full_table_name,
+            schema_name,
+            column_name,
+            time_column_name,
+            max_batch_size,
+        ))
+    }
+}
+
+/// A lightweight PostgreSQL backend instance that shares the connection pool
+#[derive(Debug)]
+pub struct PostgresDynamicTableBackend {
+    pool: Arc<OnceCell<Arc<PgPool>>>,
+    config: PostgresDynamicTableBackendConfig,
+    full_table_name: String,
+    dt_schema_name: String,
+    column_name: String,
+    time_column_name: String,
+    max_batch_size: usize,
+}
+
+impl PostgresDynamicTableBackend {
+    fn new(
+        pool: Arc<OnceCell<Arc<PgPool>>>,
+        config: PostgresDynamicTableBackendConfig,
+        full_table_name: String,
+        dt_schema_name: String,
+        column_name: String,
+        time_column_name: String,
+        max_batch_size: usize,
+    ) -> Self {
+        debug!(
+            "Creating PostgreSQL dynamic table backend instance for table: {}",
+            full_table_name
+        );
+
+        Self {
+            pool,
+            config,
+            full_table_name,
+            dt_schema_name,
+            column_name,
+            time_column_name,
+            max_batch_size,
+        }
+    }
+
+    /// Check if a batch of values exist in the table (internal method that doesn't split batches)
+    /// Retries forever with exponential backoff. Statement timeout prevents individual queries from hanging.
+    /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
+    async fn contains_batch(
+        &self,
+        pool: Arc<PgPool>,
+        value_indices: Vec<(usize, String)>,
+    ) -> std::collections::HashSet<String> {
+        if value_indices.is_empty() {
+            return std::collections::HashSet::new();
+        }
+
+        // Wrap in Arc once before the retry loop to avoid cloning Vec on each retry
+        let value_indices: Arc<[(usize, String)]> = Arc::from(value_indices.into_boxed_slice());
+        let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
+        let column_name: Arc<str> = Arc::from(self.column_name.as_str());
+        let operation_name = format!("DynamicTable contains_batch ({})", self.full_table_name);
+
+        retry_forever_with_backoff_async_returning(
+            || {
+                // Arc clones are cheap (just incrementing reference counts)
+                let pool = pool.clone();
+                let value_indices = value_indices.clone();
+                let full_table_name = full_table_name.clone();
+                let column_name = column_name.clone();
+                async move {
+                    // Create batch query using ANY operator
+                    let placeholders: Vec<String> = (1..=value_indices.len())
+                        .map(|i| format!("${}", i))
+                        .collect();
+                    let query = format!(
+                        r#"
+                        SELECT "{}"
+                        FROM {}
+                        WHERE "{}" = ANY(ARRAY[{}])
+                        "#,
+                        column_name,
+                        full_table_name,
+                        column_name,
+                        placeholders.join(", ")
+                    );
+
+                    let mut sqlx_query = sqlx::query_scalar::<_, String>(&query);
+                    for (_, value) in value_indices.iter() {
+                        sqlx_query = sqlx_query.bind(value);
+                    }
+
+                    let existing_values: Vec<String> = sqlx_query
+                        .fetch_all(pool.as_ref())
+                        .await
+                        .streamling_with_context(|| {
+                            format!(
+                                "failed to check if values exist in table {}",
+                                full_table_name
+                            )
+                        })?;
+
+                    Ok(existing_values.into_iter().collect())
+                }
+            },
+            &operation_name,
+        )
+        .await
+    }
+
+    /// Append a batch of values to the table (internal method that doesn't split batches)
+    /// Retries forever with exponential backoff. Statement timeout prevents individual queries from hanging.
+    /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
+    async fn append_batch(&self, pool: Arc<PgPool>, values: Vec<String>) {
+        if values.is_empty() {
+            return;
+        }
+
+        let values_len = values.len();
+        // Wrap in Arc once before the retry loop to avoid cloning Vec on each retry
+        let values: Arc<[String]> = Arc::from(values.into_boxed_slice());
+        let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
+        let column_name: Arc<str> = Arc::from(self.column_name.as_str());
+        let operation_name = format!("DynamicTable append_batch ({})", self.full_table_name);
+
+        retry_forever_with_backoff_async_returning(
+            || {
+                // Arc clones are cheap (just incrementing reference counts)
+                let pool = pool.clone();
+                let values = values.clone();
+                let full_table_name = full_table_name.clone();
+                let column_name = column_name.clone();
+                async move {
+                    // Create batch insert query with UNNEST for multiple values
+                    let placeholders: Vec<String> =
+                        (1..=values.len()).map(|i| format!("${}", i)).collect();
+                    let query = format!(
+                        r#"
+                        INSERT INTO {} ("{}")
+                        SELECT DISTINCT unnest(ARRAY[{}])
+                        ON CONFLICT ("{}") DO NOTHING
+                        "#,
+                        full_table_name,
+                        column_name,
+                        placeholders.join(", "),
+                        column_name
+                    );
+
+                    let mut sqlx_query = sqlx::query(&query);
+                    for value in values.iter() {
+                        sqlx_query = sqlx_query.bind(value);
+                    }
+
+                    sqlx_query
+                        .execute(pool.as_ref())
+                        .await
+                        .streamling_with_context(|| {
+                            format!("failed to append values to table {}", full_table_name)
+                        })?;
+
+                    Ok(())
+                }
+            },
+            &operation_name,
+        )
+        .await;
+
+        trace!(
+            "[append_batch] for table name '{}' with {} values",
+            self.full_table_name, values_len
+        );
+    }
+
+    /// Ensure the pool is initialized and table exists. Called lazily on first use.
+    async fn get_pool(&self) -> Result<Arc<PgPool>, DynamicTableBackendError> {
+        debug!(
+            "Initializing PostgreSQL connection pool for dynamic table: {}",
+            self.full_table_name
+        );
+        self.pool
+            .get_or_try_init(|| async {
+                // Initialize pool
+                trace!(
+                    "Connecting to PostgreSQL for table: {}",
+                    self.full_table_name
+                );
+
+                let connect_options = PgConnectOptions::from_str(
+                    self.config.connection_url().as_str(),
+                )
+                .map_err(|e| {
+                    let err = DynamicTableBackendError::Connection(format!(
+                        "Failed to parse connection URL for table {}: {}",
+                        self.full_table_name, e
+                    ));
+                    error!("{}", err);
+                    err
+                })?;
+
+                // Set statement_timeout via SQL after connect (compatible with Neon and other pooled providers)
+                let statement_timeout_ms = STATEMENT_TIMEOUT.as_millis();
+                let pool_options: PoolOptions<Postgres> = PoolOptions::default()
+                    .max_connections(
+                        self.config
+                            .max_connections
+                            .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+                    )
+                    .after_connect(move |conn: &mut sqlx::PgConnection, _meta| {
+                        Box::pin(async move {
+                            conn.execute(
+                                format!("SET statement_timeout = {}", statement_timeout_ms)
+                                    .as_str(),
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    });
+
+                let pool = pool_options
+                    .connect_with(connect_options)
+                    .await
+                    .map_err(|e| {
+                        let err = DynamicTableBackendError::Connection(format!(
+                            "Failed to connect to Postgres for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+
+                trace!(
+                    "Successfully connected to PostgreSQL for table: {}",
+                    self.full_table_name
+                );
+                let pool_arc = Arc::new(pool);
+
+                // Check if table exists
+                trace!("Checking if table exists: {}", self.full_table_name);
+                let table_exists = PostgresDynamicTableBackendFactory::ensure_table_exists(
+                    pool_arc.clone(),
+                    self.full_table_name.clone(),
+                    &self.column_name,
+                )
+                .await
+                .map_err(|e| {
+                    let err = DynamicTableBackendError::Initialization(format!(
+                        "Failed to check table existence for {}: {}",
+                        self.full_table_name, e
+                    ));
+                    error!("{}", err);
+                    err
+                })?;
+
+                // Create table if it doesn't exist
+                if !table_exists {
+                    // Initialize schema only if table doesn't exist
+                    // This requires less permissions if user prefers to create the table themselves
+                    debug!(
+                        "Table does not exist, initializing schema '{}' for table: {}",
+                        self.dt_schema_name, self.full_table_name
+                    );
+                    PostgresDynamicTableBackendFactory::initialize_schema(
+                        pool_arc.clone(),
+                        &self.dt_schema_name,
+                    )
+                    .await
+                    .map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to initialize schema '{}' for table {}: {}",
+                            self.dt_schema_name, self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+
+                    info!(
+                        "Creating PostgreSQL dynamic table: {}",
+                        self.full_table_name
+                    );
+                    let create_result = sqlx::query(
+                        format!(
+                            r#"
+                            CREATE TABLE IF NOT EXISTS {} (
+                                "{}" TEXT PRIMARY KEY,
+                                "{}" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                            );
+                        "#,
+                            self.full_table_name, self.column_name, self.time_column_name
+                        )
+                        .as_str(),
+                    )
+                    .execute(pool_arc.as_ref())
+                    .await;
+
+                    match create_result {
+                        Ok(_) => {
+                            info!("Successfully created table: {}", self.full_table_name);
+                        }
+                        Err(e) => {
+                            let err = DynamicTableBackendError::Initialization(format!(
+                                "Failed to create table {}: {}",
+                                self.full_table_name, e
+                            ));
+                            error!("{}", err);
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Table {} already exists, skipping creation",
+                        self.full_table_name
+                    );
+                }
+
+                Ok::<Arc<PgPool>, DynamicTableBackendError>(pool_arc)
+            })
+            .await
+            .cloned()
+    }
+}
+
+#[async_trait]
+impl DynamicTableBackend for PostgresDynamicTableBackend {
+    async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError> {
+        trace!("append() called for table: {}", self.full_table_name);
+        let pool = self.get_pool().await.map_err(|e| {
+            error!(
+                "Failed to get pool for table {} in append(): {}",
+                self.full_table_name, e
+            );
+            e
+        })?;
+
+        let values = extract_string_values(values)?;
+        let values_len = values.len();
+        if values_len == 0 {
+            return Ok(());
+        }
+
+        // Split into batches if exceeding max_batch_size
+        if values_len <= self.max_batch_size {
+            // Single batch - process directly
+            self.append_batch(pool, values).await;
+        } else {
+            // Split into multiple batches and process concurrently
+            let chunks: Vec<Vec<String>> = values
+                .chunks(self.max_batch_size)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+
+            let chunks_len = chunks.len();
+            trace!(
+                "Splitting {} values into {} concurrent batches for table {}",
+                values_len, chunks_len, self.full_table_name
+            );
+
+            // Process all chunks concurrently
+            let futures: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let pool = pool.clone();
+                    async move { self.append_batch(pool, chunk).await }
+                })
+                .collect();
+
+            // Wait for all batches to complete
+            join_all(futures).await;
+        }
+
+        trace!(
+            "[append] completed for table name '{}' with {} values",
+            self.full_table_name, values_len
+        );
+
+        Ok(())
+    }
+
+    async fn contains(&self, values: ArrayRef) -> Result<ArrayRef, DynamicTableBackendError> {
+        trace!("contains() called for table: {}", self.full_table_name);
+        let pool = self.get_pool().await.map_err(|e| {
+            error!(
+                "Failed to get pool for table {} in contains(): {}",
+                self.full_table_name, e
+            );
+            e
+        })?;
+
+        // Cast ArrayRef to StringArray
+        let string_array = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(DynamicTableBackendError::StringArrayExpected)?;
+
+        // Collect non-null values with their indices (owned strings for retry)
+        let value_indices: Vec<(usize, String)> = (0..string_array.len())
+            .filter_map(|i| {
+                if !string_array.is_null(i) {
+                    Some((i, string_array.value(i).to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut builder = BooleanBuilder::with_capacity(string_array.len());
+
+        if value_indices.is_empty() {
+            // Handle case where all values are null
+            for _ in 0..string_array.len() {
+                builder.append_null();
+            }
+        } else {
+            // Split into batches if exceeding max_batch_size
+            let existing_set = if value_indices.len() <= self.max_batch_size {
+                // Single batch - process directly
+                self.contains_batch(pool, value_indices).await
+            } else {
+                // Split into multiple batches and process concurrently
+                let chunks: Vec<Vec<(usize, String)>> = value_indices
+                    .chunks(self.max_batch_size)
+                    .map(|chunk| chunk.to_vec())
+                    .collect();
+
+                trace!(
+                    "Splitting {} values into {} concurrent batches for contains() on table {}",
+                    chunks.iter().map(|c| c.len()).sum::<usize>(),
+                    chunks.len(),
+                    self.full_table_name
+                );
+
+                // Process all chunks concurrently
+                let futures: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let pool = pool.clone();
+                        async move { self.contains_batch(pool, chunk).await }
+                    })
+                    .collect();
+
+                // Wait for all batches to complete and combine results
+                let results = join_all(futures).await;
+                let mut combined_set = std::collections::HashSet::new();
+                for chunk_set in results {
+                    combined_set.extend(chunk_set);
+                }
+                combined_set
+            };
+
+            // Build result array maintaining original order
+            for i in 0..string_array.len() {
+                if string_array.is_null(i) {
+                    builder.append_null();
+                } else {
+                    let value = string_array.value(i);
+                    let contains_value = existing_set.contains(value);
+                    builder.append_value(contains_value);
+                    trace!(
+                        "[contains] for table name '{}' with value '{}' result '{:?}'",
+                        self.full_table_name, value, contains_value
+                    );
+                }
+            }
+        }
+
+        let boolean_array = builder.finish();
+        Ok(Arc::new(boolean_array))
+    }
+}

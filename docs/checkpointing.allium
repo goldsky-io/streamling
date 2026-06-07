@@ -1,0 +1,396 @@
+-- allium: 1
+-- checkpointing.allium
+
+-- Scope: Checkpoint protocol for at-least-once delivery
+-- Includes: Epoch lifecycle, Marker → Ack → Finalizer protocol, sequential
+--           epoch ordering, timeout handling, offset commit, recovery
+-- Excludes:
+--   - Operator internals (how Kafka consumes, how Postgres writes)
+--   - Plugin system (plugins conform to the same Source/Sink contracts)
+--   - Metrics and observability
+--   - State backend implementation (treated as durable storage)
+--   - Batch metadata serialization (how checkpoint messages travel through batches)
+
+-- Guarantee: At-least-once delivery. Sources commit positions only after
+-- ALL sinks have durably written data for the epoch. If any sink fails,
+-- the epoch times out, sources never commit, and data is reprocessed on restart.
+
+-- Note: Transforms are transparent to the checkpoint protocol. They propagate
+-- checkpoint markers through batch metadata without modification. The protocol
+-- is strictly Coordinator → Source → (pass-through) → Sink → Coordinator.
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    coordinator: Coordinator
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Sinks are external actors. The checkpoint system receives
+-- acks from them but does not manage their internal state.
+-- See SinkCheckpointContract for the safety guarantee sinks must uphold.
+external entity Sink {
+    name: String
+}
+
+-- Transforms are external actors that propagate checkpoint markers
+-- through the data plane. They are transparent to the protocol.
+-- See MarkerTransportContract for the safety guarantee transforms must uphold.
+external entity Transform {}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A source's read position at a point in time.
+-- Opaque to the checkpoint protocol — could represent Kafka partition
+-- offsets, file cursors, or any other resumable position.
+value Position {}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Source {
+    name: String
+    current_position: Position
+    configured_starting_position: Position
+
+    -- Persisted checkpoint state (at most one — singular relationship)
+    persisted_position: PersistedPosition with source = this
+
+    -- All snapshots for this source across epochs
+    snapshots: OffsetSnapshot with source = this
+}
+
+entity Coordinator {
+    sources: Set<Source>
+    sinks: Set<Sink>
+    next_checkpoint_at: Timestamp
+    next_sequence: Integer
+
+    -- Relationships
+    epochs: Epoch with coordinator = this
+
+    -- Projections
+    pending_epochs: epochs where status = pending
+}
+
+entity Epoch {
+    coordinator: Coordinator
+    sequence: Integer                       -- monotonically increasing, never reused
+    status: pending | finalized | timed_out
+    created_at: Timestamp
+
+    -- Ack tracking
+    acks: Set<Sink>
+
+    -- Relationships
+    snapshots: OffsetSnapshot with epoch = this
+
+    -- Derived
+    expected_acks: coordinator.sinks
+    all_acked: acks = expected_acks
+    is_expired: created_at + config.checkpoint_timeout <= now
+}
+
+-- Snapshot of a source's position when it received an epoch's Marker.
+-- Created during the Marker phase. Not committed until the epoch finalizes.
+entity OffsetSnapshot {
+    epoch: Epoch
+    source: Source
+    position: Position
+    committed: Boolean
+}
+
+-- A source's last committed position, persisted durably across restarts.
+-- At most one per source (enforced by singular relationship on Source).
+-- This is the source of truth for recovery — takes precedence over any
+-- external position tracking (e.g., Kafka consumer group offsets).
+entity PersistedPosition {
+    source: Source
+    position: Position
+    committed_at_epoch: Epoch
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    checkpoint_interval: Duration = 5.seconds   -- time between epoch creation attempts
+    checkpoint_timeout: Duration = 5.minutes    -- max wait before epoch is abandoned
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ── Epoch creation ──────────────────────────────────────
+
+-- The coordinator creates a new epoch on a fixed interval.
+-- Critical invariant: blocks until no epoch is pending.
+-- This ensures strictly sequential, non-overlapping epochs.
+-- A slow or stuck sink stalls ALL future checkpoints until
+-- either the epoch finalizes or the timeout clears it.
+rule CreateEpoch {
+    when: coordinator: Coordinator.next_checkpoint_at <= now
+    requires: coordinator.pending_epochs.count = 0
+    ensures: Epoch.created(
+        coordinator: coordinator,
+        sequence: coordinator.next_sequence,
+        status: pending,
+        created_at: now,
+        acks: {}
+    )
+    ensures: coordinator.next_sequence = coordinator.next_sequence + 1
+    ensures: coordinator.next_checkpoint_at = now + config.checkpoint_interval
+}
+
+-- ── Marker phase ────────────────────────────────────────
+
+-- When an epoch is created (Marker broadcast), each source
+-- snapshots its current read position. The source does NOT
+-- commit at this point — it merely records where it is.
+rule SourceSnapshotsPosition {
+    when: epoch: Epoch.created
+    for source in epoch.coordinator.sources:
+        ensures: OffsetSnapshot.created(
+            epoch: epoch,
+            source: source,
+            position: source.current_position,
+            committed: false
+        )
+}
+
+-- ── Ack phase ───────────────────────────────────────────
+
+-- A sink acknowledges an epoch. The ack means: "I have durably
+-- written all data I received before this epoch's Marker."
+-- See SinkCheckpointContract surface for the safety guarantee.
+rule SinkAcknowledgesEpoch {
+    when: SinkAck(epoch, sink)
+    requires: epoch.status = pending
+    requires: sink in epoch.expected_acks
+    requires: sink not in epoch.acks
+    ensures: epoch.acks = epoch.acks + { sink }
+}
+
+-- ── Finalization phase ──────────────────────────────────
+
+-- When ALL sinks have acknowledged, the epoch is finalized.
+-- This emits EpochFinalized to trigger source commits.
+-- If no sinks exist, the epoch finalizes immediately on creation.
+rule FinalizeEpoch {
+    when: epoch: Epoch.all_acked
+    ensures: epoch.status = finalized
+    ensures: EpochFinalized(epoch)
+}
+
+-- On finalization, each source commits its snapshotted position
+-- to durable storage. This is the point of no return: committed
+-- positions determine where the source resumes after restart.
+rule SourceCommitsPosition {
+    when: EpochFinalized(finalized_epoch)
+    for snapshot in finalized_epoch.snapshots:
+        let persisted = snapshot.source.persisted_position
+        ensures: snapshot.committed = true
+        ensures:
+            if persisted != null:
+                persisted.position = snapshot.position
+                persisted.committed_at_epoch = finalized_epoch
+            else:
+                PersistedPosition.created(
+                    source: snapshot.source,
+                    position: snapshot.position,
+                    committed_at_epoch: finalized_epoch
+                )
+}
+
+-- ── Timeout ─────────────────────────────────────────────
+
+-- TODO: Spec/implementation divergence — resolve which is correct.
+--
+-- This rule models the epoch transitioning to timed_out, but the
+-- current implementation does NOT mutate epoch state on timeout.
+-- The timeout checker task only logs a warning and records a
+-- checkpoint_epochs_failed metric. The EpochState enum has no
+-- TimedOut variant. The producer loop spins on the pending epoch
+-- indefinitely, relying on either late acks arriving or a process
+-- restart to make progress.
+--
+-- Options:
+--   (a) Update implementation to match spec: add a TimedOut state,
+--       transition on timeout, let the producer skip timed-out epochs.
+--   (b) Update spec to match implementation: remove timed_out from
+--       the Epoch status enum and this rule; document that timeout
+--       is observability-only and recovery requires late acks or restart.
+
+-- If an epoch is not finalized within the timeout, it is abandoned.
+-- No EpochFinalized is emitted. Sources do NOT commit positions.
+-- This is the at-least-once safety net: on restart, data from
+-- uncommitted epochs will be reprocessed from the last committed position.
+rule EpochTimesOut {
+    when: epoch: Epoch.is_expired
+    requires: epoch.status = pending
+    ensures: epoch.status = timed_out
+}
+
+-- ── Recovery ────────────────────────────────────────────
+
+-- On startup, a source restores its position from durable storage.
+-- Persisted positions take precedence over any external position
+-- tracking (e.g., Kafka consumer group offsets). If no persisted
+-- position exists (first run), the source uses its configured
+-- starting position (e.g., earliest or latest).
+rule SourceRecoversPosition {
+    when: SourceStartup(source)
+    let persisted = source.persisted_position
+    ensures:
+        if persisted != null:
+            source.current_position = persisted.position
+        else:
+            source.current_position = source.configured_starting_position
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The checkpoint contract for sink implementations.
+-- This is the critical safety boundary for at-least-once delivery.
+surface SinkCheckpointContract {
+    facing implementer: Sink
+
+    context epoch: Epoch where status = pending
+
+    provides:
+        SinkAck(epoch, implementer)
+
+    guarantee:
+        -- A sink MUST NOT send SinkAck until ALL data received
+        -- before this epoch's Marker has been durably committed
+        -- to storage. Violation breaks the at-least-once guarantee:
+        -- the coordinator may finalize the epoch, sources advance
+        -- past data that was never actually persisted, and that
+        -- data will not be redelivered on restart.
+        --
+        -- Correct sequence: receive batch with Marker → flush all
+        -- pending writes to durable storage → send SinkAck.
+        --
+        -- Incorrect: send SinkAck before flush completes.
+        SinkFlushesBeforeAck
+}
+
+------------------------------------------------------------
+-- Marker Transport
+------------------------------------------------------------
+
+-- Checkpoint markers travel through the data plane, piggybacked
+-- on Arrow RecordBatch schema metadata (not a separate channel).
+-- Transforms are transparent: they extract, pass through SQL/WASM,
+-- and re-attach markers to output batches.
+-- Batch accumulation and split deduplication: see batch-accumulator.allium.
+
+-- The transport contract for transforms (not batch accumulators — see
+-- batch-accumulator.allium for AccumulatorCheckpointContract).
+surface MarkerTransportContract {
+    facing implementer: Transform
+
+    context batch: RecordBatch with checkpoint_messages in metadata
+
+    guarantee:
+        -- Transforms MUST propagate checkpoint messages from input
+        -- to output, even when the transform produces zero rows.
+        -- Failure to propagate means sinks never see the Marker,
+        -- the epoch never gets acked, and checkpointing stalls.
+        MarkerPassthrough
+}
+
+------------------------------------------------------------
+-- Back Pressure
+------------------------------------------------------------
+
+-- Back pressure is implicit in the sequential epoch invariant.
+-- Data continues flowing regardless of checkpoint state, but
+-- position commits are gated by epoch finalization.
+
+-- The coordinator producer blocks on finalization of the previous
+-- epoch before creating a new one. This means:
+--   - A slow sink delays ALL future checkpoints (not just its own)
+--   - Data throughput is NOT affected (data plane is decoupled)
+--   - Commit frequency degrades (longer windows of un-committed data)
+--   - The timeout is intended as the escape valve: after 5 min the
+--     epoch should be marked failed so the producer can create a new
+--     epoch (see TODO on EpochTimesOut for current implementation gap)
+--
+-- invariant: at most 1 pending epoch at any time
+-- invariant: data flow never blocks on checkpoint state
+
+------------------------------------------------------------
+-- Failure Modes
+------------------------------------------------------------
+
+-- FM1: Sink crashes before ack
+-- Effect: Epoch stays pending → times out → no Finalizer sent
+--         → sources don't commit → data reprocessed on restart
+-- Recovery: Automatic. At-least-once guarantee holds.
+-- Duplicates: Sink may have partially written data that will be
+--             re-delivered. Sinks must be idempotent (upsert semantics).
+
+-- FM2: Source crashes after Marker, before Finalizer
+-- Effect: Source never committed offsets for this epoch.
+--         On restart, resumes from last persisted position.
+-- Recovery: Automatic. Data since last commit is reprocessed.
+
+-- FM3: Coordinator crashes (process dies)
+-- Effect: All in-flight epochs are lost. No Finalizer sent.
+--         Sources haven't committed (Finalizer never arrived).
+-- Recovery: On restart, coordinator starts fresh. Sources resume
+--           from last persisted position. Sinks re-receive data.
+
+-- FM4: State backend unavailable during Finalizer
+-- Effect: Source cannot persist position. Position not committed.
+--         Next restart will replay from older position.
+-- Recovery: Data is reprocessed (at-least-once holds).
+
+-- FM5: Duplicate ack (same sink, same epoch)
+-- Effect: Coordinator logs warning, no state change.
+--         Already-finalized epoch ignores late acks.
+--         Ack for unknown epoch (already cleared) is warned and ignored.
+
+-- FM6: Unexpected sink ack (sink not in expected_sinks)
+-- Effect: Coordinator logs warning and skips the ack entirely.
+--         Epoch is NOT prematurely finalized.
+
+------------------------------------------------------------
+-- Multiple Sources × Multiple Sinks
+------------------------------------------------------------
+
+-- Sources are independent: each subscribes to the broadcast channel,
+-- snapshots its own position, and commits independently on Finalizer.
+-- The coordinator does NOT track per-source state — only sink acks.
+--
+-- Sinks are tracked by name: the coordinator is initialized with
+-- expected_sinks: Set<String>. An epoch finalizes when ALL expected
+-- sinks have acked. Ack ordering is irrelevant.
+--
+-- Topology example (2 sources, 2 sinks):
+--   Source_A ─┐                ┌─ Sink_X
+--             ├─ Transform(s) ─┤
+--   Source_B ─┘                └─ Sink_Y
+--
+-- Marker broadcast: Coordinator → {Source_A, Source_B} (via channel)
+-- Marker propagation: Source_A batch → Transform → Sink_X, Sink_Y
+--                     Source_B batch → Transform → Sink_X, Sink_Y
+-- Ack collection: Coordinator waits for {Sink_X, Sink_Y}
+-- Finalizer broadcast: Coordinator → {Source_A, Source_B}
+-- Source_A commits its Kafka offsets; Source_B commits its Kafka offsets
+--
+-- Key property: if Sink_Y is slow, BOTH Source_A and Source_B are
+-- blocked from committing. The slowest sink determines checkpoint pace.

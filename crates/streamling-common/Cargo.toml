@@ -1,0 +1,60 @@
+[package]
+name = "streamling-common"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Shared types, formats, and utilities for Streamling."
+license-file.workspace = true
+repository.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[dependencies]
+# Core DataFusion ecosystem
+datafusion.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-json.workspace = true
+datafusion-datasource-avro.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+num-traits.workspace = true
+uint.workspace = true
+chrono.workspace = true
+regex.workspace = true
+bigdecimal.workspace = true
+
+# Serialization
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Kafka and Avro (needed for formats module)
+rdkafka.workspace = true
+apache-avro.workspace = true
+
+uuid.workspace = true
+
+# Encoding dependencies
+bs58.workspace = true
+arrow-buffer.workspace = true
+
+# Hashing and encoding dependencies
+xxhash-rust.workspace = true
+sha3.workspace = true
+hex.workspace = true
+num-bigint.workspace = true
+
+# Windows has no system OpenSSL, and librdkafka's default (mklove) build does not
+# support MSVC. ssl-vendored builds and statically links OpenSSL from source;
+# cmake-build compiles librdkafka via CMake. These extend the workspace rdkafka
+# features above; they apply only on Windows so the Linux/macOS build is
+# unchanged. The Windows builder must provide cmake, nasm, and perl.
+[target.'cfg(windows)'.dependencies]
+rdkafka = { workspace = true, features = ["cmake-build", "ssl-vendored"] }

@@ -1,0 +1,36 @@
+[package]
+name = "streamling-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Configuration types and parsing for Streamling."
+license-file.workspace = true
+repository.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[dependencies]
+# Configuration and serialization
+config.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_yaml.workspace = true
+futures.workspace = true
+
+# Schema registry for Kafka configs
+schema_registry_converter.workspace = true
+
+# JSON parsing (used by PreprocessorError)
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Utilities
+percent-encoding.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

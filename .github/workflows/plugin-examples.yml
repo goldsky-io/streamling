@@ -1,0 +1,55 @@
+name: plugin-examples
+
+on:
+  push:
+    paths:
+      - "plugin_examples/**"
+      - ".github/workflows/plugin-examples.yml"
+  workflow_dispatch:
+
+jobs:
+  validate-and-test:
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "10G"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy, rustfmt
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-plugin_examples-${{ runner.os }}-1.90.0-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            sccache-plugin_examples-${{ runner.os }}-1.90.0-${{ github.ref_name }}-
+            sccache-plugin_examples-${{ runner.os }}-1.90.0-main-
+
+      - name: Setup rust cache (plugin_examples/basic)
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "plugin-examples"
+          workspaces: |
+            plugin_examples/basic -> plugin_examples/basic/target
+            plugin_examples/low_level -> plugin_examples/low_level/target
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Build basic example
+        working-directory: plugin_examples/basic
+        run: cargo build --locked
+
+      - name: Build low_level example
+        working-directory: plugin_examples/low_level
+        run: cargo build --locked

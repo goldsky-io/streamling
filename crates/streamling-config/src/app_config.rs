@@ -1,0 +1,1065 @@
+use anyhow::Context;
+use config::{Config, ConfigError, Environment, File, FileFormat};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use schema_registry_converter::async_impl::schema_registry::SrSettings;
+use serde::{Deserialize as SerdeDeserialize, Deserializer, de::Error as DeError};
+use serde_derive::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::fmt::Formatter;
+
+fn default_sslmode() -> String {
+    "require".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum StateBackendType {
+    InMemory,
+    Postgres,
+    Sqlite,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PostgresStateBackendConfig {
+    pub host: String,
+    pub port: u16,
+    pub db: String,
+    pub user: String,
+    pub password: String,
+    #[serde(default = "default_sslmode")]
+    pub sslmode: String,
+    pub max_connections: Option<u32>,
+    pub state_schema_name: Option<String>,
+    pub state_table_name: Option<String>,
+}
+
+impl std::fmt::Debug for PostgresStateBackendConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let masked_password = if self.password.len() > 5 {
+            format!("*****{}", &self.password[self.password.len() - 5..])
+        } else {
+            "*****".to_string()
+        };
+        f.debug_struct("PostgresStateBackendConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("db", &self.db)
+            .field("user", &self.user)
+            .field("password", &masked_password)
+            .field("sslmode", &self.sslmode)
+            .field("max_connections", &self.max_connections)
+            .field("state_schema_name", &self.state_schema_name)
+            .field("state_table_name", &self.state_table_name)
+            .finish()
+    }
+}
+
+impl PostgresStateBackendConfig {
+    pub fn connection_url(&self) -> String {
+        postgres_connection_url(
+            self.host.clone(),
+            self.port,
+            self.db.clone(),
+            self.user.clone(),
+            self.password.clone(),
+            self.sslmode.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SqliteStateBackendConfig {
+    pub database_path: String,
+    pub max_connections: Option<u32>,
+    pub state_table_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StateBackendConfig {
+    pub backend_type: StateBackendType,
+    pub postgres: Option<PostgresStateBackendConfig>,
+    pub sqlite: Option<SqliteStateBackendConfig>,
+}
+
+impl StateBackendConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self.backend_type {
+            StateBackendType::Postgres => {
+                if self.postgres.is_none() {
+                    return Err(ConfigError::Message(
+                        "Postgres backend type requires postgres configuration".to_string(),
+                    ));
+                }
+            }
+            StateBackendType::Sqlite => {
+                if self.sqlite.is_none() {
+                    return Err(ConfigError::Message(
+                        "Sqlite backend type requires sqlite configuration".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl Default for StateBackendConfig {
+    fn default() -> Self {
+        Self {
+            backend_type: StateBackendType::InMemory,
+            postgres: None,
+            sqlite: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub enum DynamicTableBackendType {
+    InMemory,
+    Postgres,
+}
+
+impl Default for DynamicTableBackendType {
+    fn default() -> Self {
+        Self::Postgres
+    }
+}
+
+impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: String = String::deserialize(deserializer)?;
+        // Normalize to case-insensitive, remove non-alphanumeric to allow "in_memory", "In-Memory", etc.
+        let normalized = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+
+        match normalized.as_str() {
+            "inmemory" => Ok(DynamicTableBackendType::InMemory),
+            "postgres" => Ok(DynamicTableBackendType::Postgres),
+            _ => Err(DeError::custom(format!(
+                "invalid dynamic table backend_type '{}' (expected 'Postgres' or 'InMemory')",
+                s
+            ))),
+        }
+    }
+}
+
+// TODO: perhaps this can be merged with PostgresStateBackendConfig
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PostgresDynamicTableBackendConfig {
+    pub host: String,
+    pub port: u16,
+    pub db: String,
+    pub user: String,
+    pub password: String,
+    #[serde(default = "default_sslmode")]
+    pub sslmode: String,
+    pub max_connections: Option<u32>,
+    pub dt_schema_name: Option<String>,
+}
+
+impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let masked_password = if self.password.len() > 5 {
+            format!("*****{}", &self.password[self.password.len() - 5..])
+        } else {
+            "*****".to_string()
+        };
+        f.debug_struct("PostgresDynamicTableBackendConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("db", &self.db)
+            .field("user", &self.user)
+            .field("password", &masked_password)
+            .field("sslmode", &self.sslmode)
+            .field("max_connections", &self.max_connections)
+            .field("dt_schema_name", &self.dt_schema_name)
+            .finish()
+    }
+}
+
+impl PostgresDynamicTableBackendConfig {
+    pub fn connection_url(&self) -> String {
+        postgres_connection_url(
+            self.host.clone(),
+            self.port,
+            self.db.clone(),
+            self.user.clone(),
+            self.password.clone(),
+            self.sslmode.clone(),
+        )
+    }
+}
+
+pub fn postgres_connection_url(
+    host: String,
+    port: u16,
+    db: String,
+    user: String,
+    password: String,
+    sslmode: String,
+) -> String {
+    let encoded_user = utf8_percent_encode(user.as_str(), NON_ALPHANUMERIC);
+    let encoded_password = utf8_percent_encode(password.as_str(), NON_ALPHANUMERIC);
+
+    let base_url = format!(
+        "postgres://{}:{}@{}:{}/{}",
+        encoded_user, encoded_password, host, port, db
+    );
+
+    if !sslmode.is_empty() {
+        format!("{}?sslmode={}", base_url, sslmode)
+    } else {
+        base_url
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct DynamicTableBackendConfig {
+    pub postgres: Option<PostgresDynamicTableBackendConfig>,
+    /// Maximum number of entries to process in a single query. If a batch exceeds this,
+    /// it will be split into multiple concurrent queries. If None, defaults to 1000.
+    pub max_batch_size: Option<usize>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct KafkaConfig {
+    pub brokers: String,
+    pub security_protocol: String,
+    pub sasl_mechanism: Option<String>,
+    pub sasl_username: Option<String>,
+    pub sasl_password: Option<String>,
+    /// Schema registry URL. Required for Avro format, optional for JSON format.
+    pub schema_registry_url: Option<String>,
+    pub schema_registry_username: Option<String>,
+    pub schema_registry_password: Option<String>,
+    pub consumer_group_id: Option<String>, // Source only property
+    pub client_id: Option<String>,
+    pub lag_report_interval_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for KafkaConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mask = |opt: &Option<String>| -> Option<String> {
+            opt.as_ref().map(|s| {
+                if s.len() > 5 {
+                    format!("*****{}", &s[s.len() - 5..])
+                } else {
+                    "*****".to_string()
+                }
+            })
+        };
+        f.debug_struct("KafkaConfig")
+            .field("brokers", &self.brokers)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &mask(&self.sasl_password))
+            .field("schema_registry_url", &self.schema_registry_url)
+            .field("schema_registry_username", &self.schema_registry_username)
+            .field(
+                "schema_registry_password",
+                &mask(&self.schema_registry_password),
+            )
+            .field("consumer_group_id", &self.consumer_group_id)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+impl KafkaConfig {
+    /// Returns schema registry settings if a schema registry URL is configured.
+    /// Returns None if no schema registry URL is set (e.g., when using JSON format).
+    pub fn get_schema_registry_settings(&self) -> Option<SrSettings> {
+        let url = self.schema_registry_url.as_ref()?;
+        let mut builder = SrSettings::new_builder(url.clone());
+
+        if let (Some(username), Some(password)) = (
+            &self.schema_registry_username,
+            &self.schema_registry_password,
+        ) {
+            builder.set_basic_authorization(username, Some(password.as_str()));
+        }
+
+        Some(
+            builder
+                .build()
+                .expect("failed to build schema registry settings from KafkaConfig"),
+        )
+    }
+}
+
+/// Wire-format compression to apply to outbound HTTP request bodies sent to
+/// ClickHouse. Accepted values: `"none"` (default) or `"gzip"`. Parsing is
+/// case-insensitive so env-var overrides arriving as strings work. The
+/// compression *level* (when applicable) is configured separately via
+/// `compression_level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClickHouseCompression {
+    #[default]
+    None,
+    Gzip,
+}
+
+impl<'de> SerdeDeserialize<'de> for ClickHouseCompression {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.trim().to_lowercase().as_str() {
+            "none" => Ok(ClickHouseCompression::None),
+            "gzip" => Ok(ClickHouseCompression::Gzip),
+            other => Err(DeError::custom(format!(
+                "unknown ClickHouse compression `{}`; expected `none` or `gzip`",
+                other
+            ))),
+        }
+    }
+}
+
+/// gzip compression level, 0–9. flate2's `Compression::default()` is 6, which
+/// is also our default. 0 means no compression (gzip framing only), 1 is
+/// fastest, 9 is best ratio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GzipCompressionLevel(u32);
+
+impl GzipCompressionLevel {
+    pub const MAX: u32 = 9;
+
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for GzipCompressionLevel {
+    fn default() -> Self {
+        Self(6)
+    }
+}
+
+impl<'de> SerdeDeserialize<'de> for GzipCompressionLevel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let level = u32::deserialize(deserializer)?;
+        if level > Self::MAX {
+            return Err(DeError::custom(format!(
+                "compression_level must be 0–{}, got {}",
+                Self::MAX,
+                level
+            )));
+        }
+        Ok(Self(level))
+    }
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ClickHouseConfig {
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    /// Wire compression for INSERTs. Accepts `"none"` (default) or `"gzip"`.
+    /// Set here for the global default; optionally override per sink via the
+    /// pipeline YAML.
+    #[serde(default)]
+    pub compression: ClickHouseCompression,
+    /// gzip compression level, 0–9. Defaults to 6 (`flate2::Compression::default()`).
+    /// Ignored when `compression` is `"none"`.
+    #[serde(default)]
+    pub compression_level: GzipCompressionLevel,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ClickHouseSourceConfig {
+    #[serde(flatten)]
+    pub connection: ClickHouseConfig,
+    pub page_size: Option<usize>,
+    /// Range of the first sorting key (e.g. block_number) to scan per query batch.
+    /// Limits scan width to prevent timeouts on large tables. Automatically halved on timeout.
+    /// Only applies when the first sorting key is a numeric type.
+    /// Default: 1,000,000
+    pub block_range: Option<i64>,
+}
+
+pub type ClickHouseSinkConfig = ClickHouseConfig;
+
+impl std::fmt::Debug for ClickHouseConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let masked_password = if self.password.len() > 5 {
+            format!("*****{}", &self.password[self.password.len() - 5..])
+        } else {
+            "*****".to_string()
+        };
+        f.debug_struct("ClickHouseConfig")
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &masked_password)
+            .field("compression", &self.compression)
+            .field("compression_level", &self.compression_level)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ClickHouseSourceConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseSourceConfig")
+            .field("connection", &self.connection)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PrintSinkConfig {
+    pub sample_every: u32,
+    pub num_records_before_stop: Option<u64>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct PostgresSinkConfig {
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub pass: String,
+    pub db: String,
+    pub sslmode: String,
+    pub batch_flush_interval: String, // milliseconds
+    pub batch_size: u32,
+    #[serde(default = "default_statement_timeout_secs")]
+    pub statement_timeout_secs: u64,
+    #[serde(default = "default_pool_acquire_timeout_secs")]
+    pub pool_acquire_timeout_secs: u64,
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+    #[serde(default = "default_pool_max_lifetime_secs")]
+    pub pool_max_lifetime_secs: u64,
+}
+
+fn default_statement_timeout_secs() -> u64 {
+    60
+}
+fn default_pool_acquire_timeout_secs() -> u64 {
+    30
+}
+fn default_pool_idle_timeout_secs() -> u64 {
+    600
+}
+fn default_pool_max_lifetime_secs() -> u64 {
+    1800
+}
+
+impl std::fmt::Debug for PostgresSinkConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let masked_pass = if self.pass.len() > 5 {
+            format!("*****{}", &self.pass[self.pass.len() - 5..])
+        } else {
+            "*****".to_string()
+        };
+        f.debug_struct("PostgresSinkConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &masked_pass)
+            .field("db", &self.db)
+            .field("sslmode", &self.sslmode)
+            .field("batch_flush_interval", &self.batch_flush_interval)
+            .field("batch_size", &self.batch_size)
+            .field("statement_timeout_secs", &self.statement_timeout_secs)
+            .field("pool_acquire_timeout_secs", &self.pool_acquire_timeout_secs)
+            .field("pool_idle_timeout_secs", &self.pool_idle_timeout_secs)
+            .field("pool_max_lifetime_secs", &self.pool_max_lifetime_secs)
+            .finish()
+    }
+}
+
+impl PostgresSinkConfig {
+    pub fn get_secure_config(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("host".to_string(), self.host.clone()),
+            ("port".to_string(), self.port.clone()),
+            ("user".to_string(), self.user.clone()),
+            ("pass".to_string(), self.pass.clone()),
+            ("db".to_string(), self.db.clone()),
+            (
+                "batch_flush_interval".to_string(),
+                self.batch_flush_interval.clone(),
+            ),
+            ("batch_size".to_string(), self.batch_size.to_string()),
+            ("sslmode".to_string(), self.sslmode.to_string()),
+        ])
+    }
+}
+
+impl Default for PostgresSinkConfig {
+    fn default() -> Self {
+        Self {
+            host: "localhost".to_string(),
+            port: "5432".to_string(),
+            user: "postgres".to_string(),
+            pass: "password".to_string(),
+            db: "postgres".to_string(),
+            sslmode: "disable".to_string(),
+            batch_flush_interval: "1000".to_string(),
+            batch_size: 1000,
+            statement_timeout_secs: default_statement_timeout_secs(),
+            pool_acquire_timeout_secs: default_pool_acquire_timeout_secs(),
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
+            pool_max_lifetime_secs: default_pool_max_lifetime_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExternalHttpHandlerConfig {
+    pub trigger_max_count: u32,
+    pub operator_timeout_sec: u32,
+    pub buffer_size: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WasmScriptConfig {
+    /// Optional override for the embedded WASM runtime. When unset, the runtime
+    /// compiled into the binary is used.
+    #[serde(default)]
+    pub runtime_wasm_file_path: Option<String>,
+    /// Number of WASM plugin instances in the pool for concurrent processing.
+    /// Higher values allow more concurrent batch processing but use more memory.
+    /// Default is 4.
+    #[serde(default = "default_wasm_parallelism")]
+    pub parallelism: usize,
+    /// Minimum number of rows to accumulate before processing.
+    /// Smaller batches are combined until this threshold is reached.
+    /// Set to 0 to disable accumulation and process each batch immediately.
+    /// Default is 0 (disabled).
+    #[serde(default)]
+    pub batch_size: usize,
+}
+
+fn default_wasm_parallelism() -> usize {
+    4
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PluginConfig {
+    pub path: Option<String>,
+    #[serde(default = "default_plugin_channel_capacity")]
+    pub channel_capacity: u32,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub preprocessor_ids: Vec<String>,
+    #[serde(default)]
+    pub preprocessor_options: HashMap<String, HashMap<String, String>>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub side_output_ids: Vec<String>,
+    #[serde(default)]
+    pub side_output_options: HashMap<String, HashMap<String, String>>,
+}
+
+fn default_plugin_channel_capacity() -> u32 {
+    50
+}
+
+/// Accepts either a YAML/JSON list of strings or a single comma-separated string.
+/// Env vars are always strings, so a comma separator is the natural encoding for a list
+/// (e.g. `STREAMLING__PLUGIN__PREPROCESSOR_IDS="a,b,c"`).
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(SerdeDeserialize)]
+    #[serde(untagged)]
+    enum StringOrList {
+        List(Vec<String>),
+        String(String),
+    }
+
+    match StringOrList::deserialize(deserializer)? {
+        StringOrList::List(list) => Ok(list),
+        StringOrList::String(s) => Ok(s
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenTelemetryMetricsConfig {
+    pub ingestion_endpoint: String,
+    pub endpoint_protocol: String,
+    pub batch_interval_secs: u32,
+    pub global_tags: String,
+    #[serde(default)]
+    pub metric_deny_list: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveDataInspectConfig {
+    pub refresh_in_secs: u32,
+    pub records_per_topology_node: u32,
+}
+
+/// A map of named secrets whose values are masked in `Debug` output.
+#[derive(Deserialize, Clone, Default)]
+pub struct SecretMap(HashMap<String, String>);
+
+impl std::fmt::Debug for SecretMap {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let masked: HashMap<&str, &str> = self.0.keys().map(|k| (k.as_str(), "*****")).collect();
+        f.debug_tuple("SecretMap").field(&masked).finish()
+    }
+}
+
+impl std::ops::Deref for SecretMap {
+    type Target = HashMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AppConfig {
+    pub application_id: String,
+    pub log_format: String,
+    pub pipeline_definition_location: String,
+    pub record_batch_interval_ms: u64,
+    pub record_batch_size: u32,
+    pub internal_buffer_size: u32,
+    // Note: only used for integration tests
+    // Some supported sinks will stop polling after this many records have been processed
+    pub num_records_before_stop: Option<u64>,
+    pub checkpoint_interval_sec: u64,
+    #[serde(default)]
+    pub enforce_primary_keys: bool,
+    pub state_backend: StateBackendConfig,
+    pub dynamic_table_backend: DynamicTableBackendConfig,
+
+    pub external_http_handler: ExternalHttpHandlerConfig,
+    pub wasm_script: WasmScriptConfig,
+    pub plugin: PluginConfig,
+    pub kafka_source: KafkaConfig,
+    pub kafka_sink: KafkaConfig,
+    pub clickhouse_source: ClickHouseSourceConfig,
+    pub clickhouse_sink: ClickHouseSinkConfig,
+    pub print_sink: PrintSinkConfig,
+    pub postgres_sink: PostgresSinkConfig,
+    pub open_telemetry_metrics: OpenTelemetryMetricsConfig,
+    pub live_data_inspect_enabled: bool,
+    pub live_data_inspect: LiveDataInspectConfig,
+    pub admin_api_port: u16,
+    /// HTTP header names for named secrets injected by the cloud deployment system.
+    ///
+    /// Populated from `STREAMLING__HTTP_SECRET_HEADER__<NAME>` environment variables (the config
+    /// crate lowercases key names, so `STREAMLING__HTTP_SECRET_HEADER__MY_TOKEN` → `http_secret_header["my_token"]`).
+    /// Referenced in pipeline YAML via `secret_name` on webhook/handler nodes.
+    #[serde(default)]
+    pub http_secret_header: SecretMap,
+    /// HTTP header values for named secrets injected by the cloud deployment system.
+    ///
+    /// Populated from `STREAMLING__HTTP_SECRET_VALUE__<NAME>` environment variables.
+    #[serde(default)]
+    pub http_secret_value: SecretMap,
+    #[serde(default)]
+    pub test_settings: TestSettings,
+    /// When true, hybrid sources terminate after all bounded phases complete
+    /// instead of transitioning to the unbounded source. Defaults to false.
+    /// Set via STREAMLING__JOB_MODE env var by streamling-agent when `job: true`.
+    #[serde(default)]
+    pub job_mode: bool,
+}
+
+impl AppConfig {
+    /// By default, the application ID is used as the namespace for the state backend.
+    /// This can be changed in the future, but be aware that this is a breaking change, and
+    /// it would affect existing state.
+    pub fn state_backend_namespace(&self) -> &str {
+        self.application_id.as_str()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TestSettings {
+    pub telemetry_assertions_enabled: bool,
+    pub prometheus_max_attempts: u32,
+    pub prometheus_sleep_ms: u64,
+}
+
+impl Default for TestSettings {
+    fn default() -> Self {
+        Self {
+            telemetry_assertions_enabled: true,
+            prometheus_max_attempts: 30,
+            prometheus_sleep_ms: 500,
+        }
+    }
+}
+
+/// Default configuration compiled into the binary so streamling runs with no
+/// external config file present. Precedence (low -> high):
+///   embedded defaults < optional external file < STREAMLING__* env vars.
+const EMBEDDED_DEFAULT_CONFIG: &str = include_str!("../default_config.yaml");
+
+impl AppConfig {
+    /// Load using only the embedded defaults plus environment overrides.
+    /// No external file is consulted.
+    pub fn load() -> anyhow::Result<Self> {
+        Self::build(None)
+    }
+
+    /// Load embedded defaults, then layer an optional external file on top
+    /// (ignored if absent), then environment overrides.
+    ///
+    /// `config_path` is passed to `File::with_name`, which resolves it relative
+    /// to the current working directory and auto-appends a known extension
+    /// (.yaml/.yml/.json). A missing file is not an error.
+    pub fn load_from_path(config_path: &str) -> anyhow::Result<Self> {
+        Self::build(Some(config_path))
+    }
+
+    fn build(external_path: Option<&str>) -> anyhow::Result<Self> {
+        let mut builder =
+            Config::builder().add_source(File::from_str(EMBEDDED_DEFAULT_CONFIG, FileFormat::Yaml));
+        if let Some(path) = external_path {
+            builder = builder.add_source(File::with_name(path).required(false));
+        }
+        let config = builder
+            .add_source(Environment::with_prefix("streamling").separator("__"))
+            .build()
+            .context("failed to build configuration")?;
+        let app_config: AppConfig = config
+            .try_deserialize()
+            .context("failed to deserialize configuration")?;
+        app_config
+            .state_backend
+            .validate()
+            .context("invalid state backend configuration")?;
+        Ok(app_config.apply_env_overrides())
+    }
+
+    fn apply_env_overrides(mut self) -> Self {
+        if let Ok(value) = env::var("STREAMLING_ENABLE_TELEMETRY_ASSERTIONS")
+            && let Some(flag) = parse_env_bool(&value)
+        {
+            self.test_settings.telemetry_assertions_enabled = flag;
+        }
+        if let Ok(value) = env::var("STREAMLING_TEST_PROMETHEUS_MAX_ATTEMPTS")
+            && let Ok(parsed) = value.parse::<u32>()
+        {
+            self.test_settings.prometheus_max_attempts = parsed;
+        }
+        if let Ok(value) = env::var("STREAMLING_TEST_PROMETHEUS_SLEEP_MS")
+            && let Ok(parsed) = value.parse::<u64>()
+        {
+            self.test_settings.prometheus_sleep_ms = parsed;
+        }
+        self
+    }
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::Config;
+
+    // Serialize env-var mutation across every test that touches the process environment.
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Verifies that the config crate can populate a HashMap<String, String> field from values
+    /// nested under a key — which is the mechanism used to populate AppConfig::http_secret_header and
+    /// AppConfig::http_secret_value from STREAMLING__HTTP_SECRET_HEADER__* / STREAMLING__HTTP_SECRET_VALUE__*
+    /// environment variables.
+    #[test]
+    fn test_secret_hashmap_populated_from_config_values() {
+        #[derive(serde_derive::Deserialize)]
+        struct TestConfig {
+            #[serde(default)]
+            http_secret_header: HashMap<String, String>,
+            #[serde(default)]
+            http_secret_value: HashMap<String, String>,
+        }
+
+        let config = Config::builder()
+            .set_override("http_secret_header.my_token", "Authorization")
+            .unwrap()
+            .set_override("http_secret_value.my_token", "Bearer abc123")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let test: TestConfig = config.try_deserialize().unwrap();
+        assert_eq!(
+            test.http_secret_header.get("my_token"),
+            Some(&"Authorization".to_string())
+        );
+        assert_eq!(
+            test.http_secret_value.get("my_token"),
+            Some(&"Bearer abc123".to_string())
+        );
+    }
+
+    /// Verifies the full path: STREAMLING__HTTP_SECRET_HEADER__* and STREAMLING__HTTP_SECRET_VALUE__* env
+    /// vars are picked up by the Environment source and land in the respective HashMaps under
+    /// lowercased, normalized keys.
+    #[test]
+    fn test_secret_hashmap_populated_from_env_vars() {
+        #[derive(serde_derive::Deserialize)]
+        struct TestConfig {
+            #[serde(default)]
+            http_secret_header: HashMap<String, String>,
+            #[serde(default)]
+            http_secret_value: HashMap<String, String>,
+        }
+
+        // Serialize env-var tests to prevent concurrent mutation of the process environment.
+        let _guard = env_guard();
+
+        // Save existing values so cleanup is correct even if they were already set.
+        let prev_header = std::env::var("STREAMLING__HTTP_SECRET_HEADER__MY_TOKEN").ok();
+        let prev_value = std::env::var("STREAMLING__HTTP_SECRET_VALUE__MY_TOKEN").ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var("STREAMLING__HTTP_SECRET_HEADER__MY_TOKEN", "Authorization");
+            std::env::set_var("STREAMLING__HTTP_SECRET_VALUE__MY_TOKEN", "Bearer abc123");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let config = Config::builder()
+                .add_source(Environment::with_prefix("streamling").separator("__"))
+                .build()
+                .unwrap();
+            config.try_deserialize::<TestConfig>().unwrap()
+        });
+
+        // Restore previous state regardless of success or failure.
+        // SAFETY: see above.
+        unsafe {
+            match prev_header {
+                Some(v) => std::env::set_var("STREAMLING__HTTP_SECRET_HEADER__MY_TOKEN", v),
+                None => std::env::remove_var("STREAMLING__HTTP_SECRET_HEADER__MY_TOKEN"),
+            }
+            match prev_value {
+                Some(v) => std::env::set_var("STREAMLING__HTTP_SECRET_VALUE__MY_TOKEN", v),
+                None => std::env::remove_var("STREAMLING__HTTP_SECRET_VALUE__MY_TOKEN"),
+            }
+        }
+
+        let test = result.expect("test body panicked");
+        assert_eq!(
+            test.http_secret_header.get("my_token"),
+            Some(&"Authorization".to_string())
+        );
+        assert_eq!(
+            test.http_secret_value.get("my_token"),
+            Some(&"Bearer abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn deserialize_string_list_accepts_yaml_list() {
+        let yaml = "preprocessor_ids:\n  - a\n  - b\n  - c\nchannel_capacity: 10\n";
+        let plugin: PluginConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(plugin.preprocessor_ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn deserialize_string_list_accepts_comma_separated_string() {
+        let yaml = "preprocessor_ids: \"a, b ,c\"\nchannel_capacity: 10\n";
+        let plugin: PluginConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(plugin.preprocessor_ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn deserialize_string_list_treats_empty_string_as_empty_list() {
+        let yaml = "preprocessor_ids: \"\"\nchannel_capacity: 10\n";
+        let plugin: PluginConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(plugin.preprocessor_ids.is_empty());
+    }
+
+    fn clickhouse_yaml(extra: &str) -> String {
+        format!(
+            r#"
+url: "http://localhost:8123"
+database: "default"
+user: "default"
+password: ""
+{}
+"#,
+            extra
+        )
+    }
+
+    #[test]
+    fn clickhouse_compression_accepts_none_and_gzip() {
+        let cfg: ClickHouseConfig =
+            serde_yaml::from_str(&clickhouse_yaml(r#"compression: "none""#)).unwrap();
+        assert_eq!(cfg.compression, ClickHouseCompression::None);
+
+        let cfg: ClickHouseConfig =
+            serde_yaml::from_str(&clickhouse_yaml(r#"compression: "gzip""#)).unwrap();
+        assert_eq!(cfg.compression, ClickHouseCompression::Gzip);
+    }
+
+    #[test]
+    fn clickhouse_compression_is_case_insensitive_for_env_var_compat() {
+        // Env-var overrides arrive as strings; accept common casings/whitespace.
+        for (s, expected) in [
+            ("none", ClickHouseCompression::None),
+            ("NONE", ClickHouseCompression::None),
+            (" None ", ClickHouseCompression::None),
+            ("gzip", ClickHouseCompression::Gzip),
+            ("GZIP", ClickHouseCompression::Gzip),
+        ] {
+            let cfg: ClickHouseConfig =
+                serde_yaml::from_str(&clickhouse_yaml(&format!(r#"compression: "{}""#, s)))
+                    .unwrap();
+            assert_eq!(cfg.compression, expected, "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn clickhouse_compression_defaults_to_none_when_omitted() {
+        let cfg: ClickHouseConfig = serde_yaml::from_str(&clickhouse_yaml("")).unwrap();
+        assert_eq!(cfg.compression, ClickHouseCompression::None);
+    }
+
+    #[test]
+    fn clickhouse_compression_rejects_unknown_method() {
+        let err =
+            serde_yaml::from_str::<ClickHouseConfig>(&clickhouse_yaml(r#"compression: "brotli""#))
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("expected `none` or `gzip`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_compression_rejects_bool() {
+        // Only the strings `"none"` / `"gzip"` are accepted. serde_yaml
+        // coerces bool to its string form on the string visitor, so the
+        // failure path is the same "unknown compression" branch — the point
+        // is that the bool form is no longer a successful disable.
+        for bad in ["compression: false", "compression: true"] {
+            let err = serde_yaml::from_str::<ClickHouseConfig>(&clickhouse_yaml(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("expected `none` or `gzip`"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_compression_level_defaults_to_6() {
+        let cfg: ClickHouseConfig = serde_yaml::from_str(&clickhouse_yaml("")).unwrap();
+        assert_eq!(cfg.compression_level.as_u32(), 6);
+    }
+
+    #[test]
+    fn clickhouse_compression_level_accepts_valid_range() {
+        for level in 0..=9 {
+            let cfg: ClickHouseConfig =
+                serde_yaml::from_str(&clickhouse_yaml(&format!("compression_level: {}", level)))
+                    .unwrap();
+            assert_eq!(cfg.compression_level.as_u32(), level);
+        }
+    }
+
+    #[test]
+    fn clickhouse_compression_level_rejects_out_of_range() {
+        let err =
+            serde_yaml::from_str::<ClickHouseConfig>(&clickhouse_yaml("compression_level: 10"))
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("compression_level must be"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The embedded baseline must let the binary boot with no external file on disk.
+    #[test]
+    fn embedded_config_loads_without_external_file() {
+        let _guard = env_guard();
+
+        let config = AppConfig::load().expect("embedded config must load");
+        assert_eq!(config.application_id, "local_app_v1");
+
+        // A missing external override file is ignored, not an error.
+        let config = AppConfig::load_from_path("definitely-not-a-real-config-file")
+            .expect("missing external file must be ignored");
+        assert_eq!(config.application_id, "local_app_v1");
+    }
+
+    /// An external file layers on top of the embedded baseline (file > embedded).
+    #[test]
+    fn external_file_overrides_embedded() {
+        let _guard = env_guard();
+
+        let base = std::env::temp_dir().join("streamling_test_override_embedded");
+        let yaml_path = base.with_extension("yaml");
+        std::fs::write(&yaml_path, "application_id: \"from_file\"\n").unwrap();
+
+        let config = AppConfig::load_from_path(base.to_str().unwrap())
+            .expect("config with external override must load");
+        std::fs::remove_file(&yaml_path).ok();
+
+        // Overridden key wins; unspecified keys still come from the embedded baseline.
+        assert_eq!(config.application_id, "from_file");
+        assert_eq!(config.checkpoint_interval_sec, 5);
+    }
+
+    /// Environment variables win over both the external file and the embedded baseline
+    /// (env > file > embedded).
+    #[test]
+    fn env_var_overrides_file_and_embedded() {
+        let _guard = env_guard();
+
+        let base = env::temp_dir().join("streamling_test_env_over_file");
+        let yaml_path = base.with_extension("yaml");
+        std::fs::write(&yaml_path, "application_id: \"from_file\"\n").unwrap();
+
+        let prev = env::var("STREAMLING__APPLICATION_ID").ok();
+        // SAFETY: we hold ENV_LOCK, serializing env mutation across the test module.
+        unsafe {
+            env::set_var("STREAMLING__APPLICATION_ID", "from_env");
+        }
+
+        let path = base.to_str().unwrap().to_string();
+        let result = std::panic::catch_unwind(move || {
+            AppConfig::load_from_path(&path).expect("config with env + file override must load")
+        });
+
+        // Restore the environment regardless of the outcome.
+        // SAFETY: see above.
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("STREAMLING__APPLICATION_ID", v),
+                None => env::remove_var("STREAMLING__APPLICATION_ID"),
+            }
+        }
+        std::fs::remove_file(&yaml_path).ok();
+
+        let config = result.expect("test body panicked");
+        assert_eq!(config.application_id, "from_env");
+    }
+}

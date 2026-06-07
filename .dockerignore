@@ -1,0 +1,7 @@
+# Ignore everything by default
+*
+
+# Only include what we need for the Docker build
+!target/release/streamling
+!crates/streamling/config.yaml
+!crates/streamling-core/wasm/runtime.wasm

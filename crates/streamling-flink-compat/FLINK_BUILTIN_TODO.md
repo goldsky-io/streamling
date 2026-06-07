@@ -1,0 +1,249 @@
+# Flink Built-in SQL Functions TODO
+This list is generated from Flink's `BuiltInFunctionDefinitions` and will be used to track porting status.
+
+> Summary
+- JSON (priority): 16/16 ✓
+- String (priority): 57/57 ✓
+- Remaining: 0/164
+## JSON (priority)
+- [x] `IS_JSON`
+- [x] `JSON`
+- [x] `JSON_ARRAY`
+- [x] `JSON_ARRAYAGG_ABSENT_ON_NULL`
+- [x] `JSON_ARRAYAGG_NULL_ON_NULL`
+- [x] `JSON_EXISTS`
+- [x] `JSON_OBJECT`
+- [x] `JSON_OBJECTAGG_ABSENT_ON_NULL`
+- [x] `JSON_OBJECTAGG_NULL_ON_NULL`
+- [x] `JSON_QUERY`
+- [x] `JSON_QUOTE`
+- [x] `JSON_STRING`
+- [x] `JSON_UNQUOTE`
+- [x] `JSON_VALUE`
+- [x] `PARSE_JSON`
+- [x] `TRY_PARSE_JSON`
+
+## String (priority)
+- [x] `COALESCE`
+- [x] `CAST`
+- [x] `TRY_CAST`
+- [x] `||`
+- [x] `leading`
+- [x] `ascii`
+- [x] `bin`
+- [x] `BTRIM`
+- [x] `charLength`
+- [x] `chr`
+- [x] `concat`
+- [x] `concat_ws`
+- [x] `dateFormat`
+- [x] `decode`
+- [x] `ELT`
+- [x] `encode`
+- [x] `ENDSWITH`
+- [x] `hex`
+- [x] `initCap`
+- [x] `instr`
+- [x] `left`
+- [x] `LIKE`
+- [x] `locate`
+- [x] `lower`
+- [x] `lowerCase`
+- [x] `lpad`
+- [x] `ltrim`
+- [x] `overlay`
+- [x] `parseUrl`
+- [x] `position`
+- [x] `regexp`
+- [x] `REGEXP_COUNT`
+- [x] `REGEXP_EXTRACT_ALL`
+- [x] `REGEXP_INSTR`
+- [x] `REGEXP_SUBSTR`
+- [x] `regexpExtract`
+- [x] `regexpReplace`
+- [x] `repeat`
+- [x] `replace`
+- [x] `reverse`
+- [x] `right`
+- [x] `rpad`
+- [x] `rtrim`
+- [x] `similar`
+- [x] `SPLIT`
+- [x] `splitIndex`
+- [x] `STARTSWITH`
+- [x] `substr`
+- [x] `substring`
+- [x] `TRANSLATE3`
+- [x] `trim`
+- [x] `UNHEX`
+- [x] `upper`
+- [x] `upperCase`
+- [x] `URL_DECODE`
+- [x] `URL_ENCODE`
+- [x] `uuid`
+
+## Remaining
+- [ ] `$HASHCODE$1`
+- [ ] `$REPLICATE_ROWS$1`
+- [ ] `$UNNEST_ROWS$1`
+- [ ] `$UNNEST_ROWS_WITH_ORDINALITY$1`
+- [ ] `AGG_DECIMAL_MINUS`
+- [ ] `AGG_DECIMAL_PLUS`
+- [ ] `ARRAY_AGG`
+- [ ] `ARRAY_APPEND`
+- [ ] `ARRAY_CONCAT`
+- [ ] `ARRAY_CONTAINS`
+- [ ] `ARRAY_DISTINCT`
+- [ ] `ARRAY_EXCEPT`
+- [ ] `ARRAY_INTERSECT`
+- [ ] `ARRAY_JOIN`
+- [ ] `ARRAY_MAX`
+- [ ] `ARRAY_MIN`
+- [ ] `ARRAY_POSITION`
+- [ ] `ARRAY_PREPEND`
+- [ ] `ARRAY_REMOVE`
+- [ ] `ARRAY_REVERSE`
+- [ ] `ARRAY_SLICE`
+- [ ] `ARRAY_SORT`
+- [ ] `ARRAY_UNION`
+- [ ] `ASSIGNMENT`
+- [ ] `COALESCE`
+- [ ] `CURRENT_WATERMARK`
+- [ ] `DEFAULT`
+- [ ] `GREATEST`
+- [ ] `HIVE_AGG_DECIMAL_PLUS`
+- [ ] `IFNULL`
+- [ ] `LEAST`
+- [ ] `MAP_ENTRIES`
+- [ ] `MAP_FROM_ARRAYS`
+- [ ] `MAP_KEYS`
+- [ ] `MAP_UNION`
+- [ ] `MAP_VALUES`
+- [ ] `OBJECT_OF`
+- [ ] `OBJECT_UPDATE`
+- [ ] `PERCENTILE`
+- [ ] `PRINTF`
+- [ ] `SOURCE_WATERMARK`
+- [ ] `TO_TIMESTAMP_LTZ`
+- [ ] `TRY_CAST`
+- [ ] `TYPEOF`
+- [ ] `abs`
+- [ ] `acos`
+- [ ] `and`
+- [ ] `array`
+- [ ] `as`
+- [ ] `asc`
+- [ ] `asin`
+- [ ] `at`
+- [ ] `atan`
+- [ ] `atan2`
+- [ ] `avg`
+- [ ] `between`
+- [ ] `cardinality`
+- [ ] `cast`
+- [ ] `ceil`
+- [ ] `collect`
+- [ ] `convertTz`
+- [ ] `cos`
+- [ ] `cosh`
+- [ ] `cot`
+- [ ] `count`
+- [ ] `currentDatabase`
+- [ ] `currentDate`
+- [ ] `currentRowTimestamp`
+- [ ] `currentTime`
+- [ ] `currentTimestamp`
+- [ ] `degrees`
+- [ ] `desc`
+- [ ] `distinct`
+- [ ] `divide`
+- [ ] `e`
+- [ ] `element`
+- [ ] `end`
+- [ ] `equals`
+- [ ] `exp`
+- [ ] `extract`
+- [ ] `first_value`
+- [ ] `flatten`
+- [ ] `floor`
+- [ ] `fromBase64`
+- [ ] `fromUnixtime`
+- [ ] `get`
+- [ ] `greaterThan`
+- [ ] `greaterThanOrEqual`
+- [ ] `ifThenElse`
+- [ ] `in`
+- [ ] `isFalse`
+- [ ] `isNotFalse`
+- [ ] `isNotNull`
+- [ ] `isNotTrue`
+- [ ] `isNull`
+- [ ] `isTrue`
+- [ ] `lag`
+- [ ] `last_value`
+- [ ] `lead`
+- [ ] `lessThan`
+- [ ] `lessThanOrEqual`
+- [ ] `listAgg`
+- [ ] `ln`
+- [ ] `localTime`
+- [ ] `localTimestamp`
+- [ ] `log`
+- [ ] `log10`
+- [ ] `log2`
+- [ ] `map`
+- [ ] `max`
+- [ ] `md5`
+- [ ] `min`
+- [ ] `minus`
+- [ ] `minusPrefix`
+- [ ] `mod`
+- [ ] `not`
+- [ ] `notBetween`
+- [ ] `notEquals`
+- [ ] `now`
+- [ ] `or`
+- [ ] `over`
+- [ ] `pi`
+- [ ] `plus`
+- [ ] `power`
+- [ ] `proctime`
+- [ ] `radians`
+- [ ] `rand`
+- [ ] `randInteger`
+- [ ] `rangeTo`
+- [ ] `reinterpretCast`
+- [ ] `round`
+- [ ] `row`
+- [ ] `rowtime`
+- [ ] `sha1`
+- [ ] `sha2`
+- [ ] `sha224`
+- [ ] `sha256`
+- [ ] `sha384`
+- [ ] `sha512`
+- [ ] `sign`
+- [ ] `sin`
+- [ ] `sinh`
+- [ ] `sqrt`
+- [ ] `start`
+- [ ] `stddevPop`
+- [ ] `stddevSamp`
+- [ ] `strToMap`
+- [ ] `streamRecordTimestamp`
+- [ ] `sum`
+- [ ] `sum0`
+- [ ] `tan`
+- [ ] `tanh`
+- [ ] `temporalOverlaps`
+- [ ] `times`
+- [ ] `timestampDiff`
+- [ ] `toBase64`
+- [ ] `toDate`
+- [ ] `toTimestamp`
+- [ ] `truncate`
+- [ ] `unixTimestamp`
+- [ ] `varPop`
+- [ ] `varSamp`
+- [ ] `withColumns`
+- [ ] `withoutColumns`

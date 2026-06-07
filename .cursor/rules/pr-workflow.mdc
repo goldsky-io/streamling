@@ -1,0 +1,14 @@
+---
+description: PR and CI workflow
+alwaysApply: true
+---
+
+# PR Workflow
+
+When pushing or preparing to push, check that CI/CD has passed for the PR using:
+
+```bash
+gh pr checks 494   # or the relevant PR number
+```
+
+Run the equivalent for the correct PR before considering the push complete.

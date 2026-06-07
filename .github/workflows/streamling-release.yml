@@ -1,0 +1,418 @@
+name: streamling-release
+
+# Manual, versioned release pipeline.
+#   - Builds release-optimized binaries for linux, macOS and Windows.
+#   - Publishes a GitHub release tagged from the `streamling` crate version.
+#   - Publishes every workspace crate to crates.io.
+#
+# Trigger:
+#   gh workflow run streamling-release.yml --ref main
+#
+# Per-push CI (lint/test/Docker images + rolling `nightly` linux release) lives
+# in streamling.yml. This workflow is the only producer of versioned releases.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: streamling-release
+  cancel-in-progress: false
+
+jobs:
+  # workflow_dispatch can target any ref, so enforce main explicitly (and loudly)
+  # instead of silently skipping. Every other job depends on this gate.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce main-only
+        run: |
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::streamling-release must run on main (got ${GITHUB_REF})."
+            exit 1
+          fi
+
+  validate-and-test:
+    needs: [guard]
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "10G"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git to use the workflow token for GitHub
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy, rustfmt
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-release-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-release-${{ runner.os }}-1.90.0-
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "streamling-release-test"
+          cache-targets: true
+          cache-on-failure: true
+      - name: Run linters
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings --A clippy::result_large_err
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run unit tests
+        run: cargo nextest run --workspace --locked -P ci --exclude streamling-e2e
+        env:
+          RUST_LOG: info
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+          RUSTC_WRAPPER: sccache
+        timeout-minutes: 15
+
+  # Resolve the release version/tag from the `streamling` crate and refuse to
+  # overwrite an already-published release.
+  version:
+    needs: [guard]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Resolve version from Cargo metadata
+        id: resolve
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="streamling") | .version')"
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "::error::Could not resolve the streamling crate version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: v$version"
+      - name: Ensure release does not already exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Bump the streamling crate version before releasing." >&2
+            exit 1
+          fi
+          echo "No existing release for $tag; proceeding."
+
+  # ==========================================================================
+  # Release-optimized binaries. Output lives at target/release-optimized/
+  # (custom profile from .cargo/config.toml: inherits release + LTO +
+  # codegen-units=1). Binary cache keyed on all build inputs so re-dispatching
+  # the same commit is cheap.
+  # ==========================================================================
+  build-release-linux:
+    needs: [validate-and-test, version]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            os: linux
+            arch: x86_64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            os: linux
+            arch: aarch64
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache release-optimized binary
+        id: bin-cache
+        uses: actions/cache@v4
+        with:
+          path: target/release-optimized/streamling
+          key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+      - name: Configure git to use the workflow token for GitHub
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install sccache
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - name: Set SCCACHE_DIR env
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
+      - name: Prepare sccache dir
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: mkdir -p "$SCCACHE_DIR"
+      - name: Cache sccache
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-
+      - name: Setup rust cache
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "v0-release-opt-${{ matrix.os }}-${{ matrix.arch }}"
+          cache-targets: true
+          cache-on-failure: true
+      - name: Build release-optimized binary
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: cargo build --profile release-optimized --locked
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
+          SCCACHE_CACHE_SIZE: "10G"
+          LIBZ_SYS_STATIC: 1
+          PKG_CONFIG_ALL_STATIC: 1
+      - name: Show sccache stats
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: sccache --show-stats || true
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/release-optimized/streamling
+          retention-days: 1
+          if-no-files-found: error
+
+  build-release-macos:
+    needs: [validate-and-test, version]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            os: darwin
+            arch: x86_64
+          - runner: macos-14
+            os: darwin
+            arch: aarch64
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache release-optimized binary
+        id: bin-cache
+        uses: actions/cache@v4
+        with:
+          path: target/release-optimized/streamling
+          key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+      - name: Configure git to use the workflow token for GitHub
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Setup rust cache
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "v0-release-opt-darwin-${{ matrix.arch }}"
+          cache-targets: true
+          cache-on-failure: true
+      - name: Build release-optimized binary
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: cargo build --profile release-optimized --locked
+        env:
+          CARGO_INCREMENTAL: 0
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/release-optimized/streamling
+          retention-days: 1
+          if-no-files-found: error
+
+  build-release-windows:
+    needs: [validate-and-test, version]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-windows-2025
+            os: windows
+            arch: x86_64
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache release-optimized binary
+        id: bin-cache
+        uses: actions/cache@v4
+        with:
+          path: target/release-optimized/streamling.exe
+          key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+      - name: Configure git to use the workflow token for GitHub
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Setup rust cache
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "v0-release-opt-windows-${{ matrix.arch }}"
+          cache-targets: true
+          cache-on-failure: true
+      # rdkafka is built with ssl-vendored + cmake-build on Windows
+      # (see crates/streamling-common/Cargo.toml): OpenSSL is compiled from
+      # source (needs nasm + perl) and librdkafka via CMake (needs cmake).
+      # cmake and Strawberry perl ship on the windows-2025 image; nasm does not.
+      - name: Install NASM
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: ilammy/setup-nasm@v1
+      - name: Verify native build tools
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake --version
+          perl --version
+          nasm --version
+      - name: Build release-optimized binary
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: cargo build --profile release-optimized --locked
+        env:
+          CARGO_INCREMENTAL: 0
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/release-optimized/streamling.exe
+          retention-days: 1
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Versioned GitHub release. Assets are named streamling-<os>-<arch> with no
+  # SHA suffix; tag/name come from the resolved Cargo version.
+  # ==========================================================================
+  publish-release:
+    needs: [version, build-release-linux, build-release-macos, build-release-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-binary-*-*
+          path: release-artifacts/
+      - name: Package assets for release
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+          dirs=(release-artifacts/release-binary-*-*)
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo "No release-binary-*-* artifacts downloaded; failing." >&2
+            exit 1
+          fi
+          for dir in "${dirs[@]}"; do
+            name="$(basename "$dir")"               # release-binary-linux-x86_64
+            os_arch="${name#release-binary-}"       # linux-x86_64
+            base="streamling-${os_arch}"
+            # Windows artifacts carry a .exe binary packaged as .zip; all others
+            # are bare binaries packaged as .tar.gz. The binary sits flat at the
+            # archive root.
+            if [[ -f "$dir/streamling.exe" ]]; then
+              zip -j "release-assets/${base}.zip" "$dir/streamling.exe"
+            elif [[ -f "$dir/streamling" ]]; then
+              chmod +x "$dir/streamling"
+              tar -czf "release-assets/${base}.tar.gz" -C "$dir" streamling
+            else
+              echo "Missing binary in $dir" >&2
+              exit 1
+            fi
+          done
+          ls -la release-assets/
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          prerelease: false
+          make_latest: true
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+  # ==========================================================================
+  # Publish every workspace crate to crates.io, in dependency order. cargo waits
+  # for each crate to appear in the registry index before the next one builds,
+  # so downstream crates resolve their just-published siblings. Fail-fast: the
+  # first failure stops the run, but any crates published before it are already
+  # live (crates.io publishes are permanent / yank-only), so a partial release
+  # is possible.
+  # ==========================================================================
+  publish-crates:
+    needs: [publish-release]
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git to use the workflow token for GitHub
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "streamling-release-publish"
+          cache-targets: true
+          cache-on-failure: true
+      - name: cargo publish (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          crates=(
+            streamling-config
+            streamling-common
+            streamling-flink-compat
+            streamling-plugin-derive
+            streamling-state          
+            streamling-plugin
+            streamling-core
+            streamling-connectors
+            streamling
+            streamling-e2e
+          )
+          for crate in "${crates[@]}"; do
+            echo "::group::cargo publish -p $crate"
+            cargo publish -p "$crate" --locked
+            echo "::endgroup::"
+          done

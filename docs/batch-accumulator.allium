@@ -1,0 +1,269 @@
+-- allium: 1
+-- batch-accumulator.allium
+
+-- Scope: BatchAccumulator's checkpoint-aware batching behaviour
+-- Includes: Accumulation, flush triggers, marker preservation,
+--           split deduplication, ordering guarantee
+-- Excludes:
+--   - Sink write internals (Postgres INSERT, ClickHouse INSERT)
+--   - Coordinator epoch lifecycle (see checkpointing.allium)
+--   - Arrow RecordBatch internals (schema, columns, metadata)
+--   - Metrics and telemetry
+
+-- This spec covers the batching layer between transforms and sinks.
+-- The BatchAccumulator must preserve checkpoint markers through
+-- accumulation and splitting to maintain the at-least-once guarantee.
+
+use "./checkpointing.allium" as checkpoint
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A batch of data rows, optionally carrying a checkpoint marker.
+-- The marker travels as metadata, not as row data.
+-- In the implementation, the marker also carries a created_at_ms timestamp
+-- used solely for the checkpoint_marker_arrival latency metric (coordinator
+-- → sink transit time). It has no protocol significance; only the epoch
+-- identifier drives Marker → Ack → Finalizer logic.
+value Batch {
+    row_count: Integer
+    marker: checkpoint/Epoch?        -- checkpoint marker if present
+}
+
+-- An ordered collection of batches ready for a sink to write.
+value FlushResult {
+    batches: List<Batch>
+    total_rows: Integer
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Accumulator {
+    batch_size: Integer              -- max rows per flush window
+    flush_interval: Duration         -- max time before forced flush
+
+    -- Internal state
+    queue: List<Batch>               -- accumulated batches, in arrival order
+    queued_rows: Integer             -- sum of row_count across queue (excludes empty batches)
+    last_flush_at: Timestamp
+
+    -- Derived
+    should_flush_by_size: queued_rows >= batch_size
+    should_flush_by_time: last_flush_at + flush_interval <= now
+    is_empty: queue.count = 0
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    default_batch_size: Integer = 1000
+    default_flush_interval: Duration = 1.second
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ── Push: accepting an incoming batch ─────────────────────
+
+-- Data batch (non-empty, no marker): queue it, maybe trigger size flush.
+rule PushDataBatch {
+    when: BatchArrived(accumulator, batch)
+    requires: batch.row_count > 0
+    requires: batch.marker = null
+
+    ensures: accumulator.queue = accumulator.queue + { batch }
+    ensures: accumulator.queued_rows = accumulator.queued_rows + batch.row_count
+}
+
+-- Data batch with checkpoint marker: queue it, maybe trigger size flush.
+rule PushDataBatchWithMarker {
+    when: BatchArrived(accumulator, batch)
+    requires: batch.row_count > 0
+    requires: batch.marker != null
+
+    ensures: accumulator.queue = accumulator.queue + { batch }
+    ensures: accumulator.queued_rows = accumulator.queued_rows + batch.row_count
+}
+
+-- Empty batch with checkpoint marker: queue it to preserve the marker.
+-- Does NOT increment queued_rows (no data rows).
+-- Does NOT trigger a size-based flush (marker flushes with next data or time trigger).
+rule PushEmptyMarkerBatch {
+    when: BatchArrived(accumulator, batch)
+    requires: batch.row_count = 0
+    requires: batch.marker != null
+
+    ensures: accumulator.queue = accumulator.queue + { batch }
+    -- queued_rows unchanged
+}
+
+-- Empty batch without marker: discard silently.
+rule DiscardEmptyBatch {
+    when: BatchArrived(accumulator, batch)
+    requires: batch.row_count = 0
+    requires: batch.marker = null
+
+    -- no state change; batch is dropped
+}
+
+-- ── Size flush ────────────────────────────────────────────
+
+-- When accumulated rows reach batch_size, flush up to batch_size rows.
+-- Batches are taken in FIFO order. If a batch must be split to fit
+-- the window, the first slice keeps any checkpoint marker; the
+-- remainder is stripped and re-queued.
+rule SizeFlush {
+    when: accumulator: Accumulator.should_flush_by_size
+
+    ensures: Flush(accumulator)
+}
+
+-- ── Time flush ────────────────────────────────────────────
+
+-- When the flush interval elapses and the queue is non-empty,
+-- flush whatever has accumulated (even if below batch_size).
+rule TimeFlush {
+    when: accumulator: Accumulator.should_flush_by_time
+    requires: not accumulator.is_empty
+
+    ensures: Flush(accumulator)
+}
+
+-- ── Flush mechanics ───────────────────────────────────────
+
+-- Flush takes batches from the front of the queue up to batch_size rows.
+-- Key invariant: checkpoint markers are never duplicated or lost.
+rule FlushWindow {
+    when: Flush(accumulator)
+
+    -- Takes up to batch_size rows from the queue (FIFO pop).
+    -- If a batch straddles the boundary:
+    --   first_slice  = batch[0..rows_needed]      (keeps marker)
+    --   remainder    = batch[rows_needed..end]     (marker stripped)
+    --   remainder is re-queued (queue is drained at this point,
+    --   so it becomes the first element for the next flush)
+    -- If prior batches exactly filled batch_size (rows_needed = 0),
+    -- the next batch is NOT sliced — it is kept whole with its
+    -- marker intact and re-queued for the next flush.
+    --
+    -- Note: queued_rows is set to the remainder's row count only.
+    -- If additional batches were still in the queue behind the split
+    -- point, their rows are NOT included in queued_rows. In practice
+    -- this is rare because flush is called when queued_rows >= batch_size
+    -- and the loop drains from the front, but it is a known imprecision
+    -- in the implementation.
+    ensures: FlushResult.created(
+        batches: accumulator.queue.take_up_to(accumulator.batch_size),
+        total_rows: min(accumulator.queued_rows, accumulator.batch_size)
+    )
+    ensures: accumulator.last_flush_at = now
+}
+
+-- ── Stream completion ─────────────────────────────────────
+
+-- When the input stream ends, flush everything remaining
+-- regardless of batch_size. This ensures trailing checkpoint
+-- markers are delivered to the sink.
+rule FlushAllOnCompletion {
+    when: StreamCompleted(accumulator)
+    requires: not accumulator.is_empty
+
+    ensures: FlushResult.created(
+        batches: accumulator.queue,
+        total_rows: accumulator.queued_rows
+    )
+    ensures: accumulator.queue = {}
+    ensures: accumulator.queued_rows = 0
+    ensures: accumulator.last_flush_at = now
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The contract that BatchAccumulator upholds for the checkpoint system.
+surface AccumulatorCheckpointContract {
+    facing implementer: Accumulator
+
+    context batch: Batch with marker != null
+
+    guarantee:
+        -- A checkpoint marker entering the accumulator MUST eventually
+        -- appear in exactly one FlushResult. It must not be lost
+        -- (dropped with an empty batch) or duplicated (copied to
+        -- both halves of a split).
+        MarkerPreservation
+
+        -- A checkpoint marker MUST NOT appear in a FlushResult
+        -- before all data batches that arrived prior to the marker.
+        -- This ensures the sink writes all preceding data before
+        -- it encounters and acks the marker.
+        MarkerOrdering
+
+        -- When a batch carrying a marker is actually sliced at the
+        -- batch_size boundary, the marker MUST appear on exactly the
+        -- first slice. The remainder slice MUST have its marker stripped.
+        -- If the batch is NOT sliced (e.g., prior batches exactly filled
+        -- batch_size so rows_needed = 0), the batch is re-queued whole
+        -- and its marker MUST NOT be stripped.
+        ExactlyOnceOnSplit
+}
+
+-- The contract that sinks uphold when consuming FlushResults.
+surface SinkFlushContract {
+    facing implementer: Sink
+
+    context result: FlushResult
+
+    guarantee:
+        -- The sink MUST extract checkpoint markers from ALL batches
+        -- in the FlushResult BEFORE any concatenation or deduplication,
+        -- because Arrow's concat_batches only preserves metadata from
+        -- the first batch's schema.
+        ExtractBeforeConcatenation
+
+        -- The sink MUST write all data rows from the FlushResult to
+        -- durable storage BEFORE sending Ack for any marker found
+        -- in the FlushResult. This is the critical link in the
+        -- at-least-once chain: premature ack means the coordinator
+        -- may finalize the epoch and sources advance past data that
+        -- was never persisted.
+        FlushBeforeAck
+}
+
+------------------------------------------------------------
+-- Failure Modes
+------------------------------------------------------------
+
+-- FM1: Marker lost due to empty batch discard
+-- If an accumulator discards empty batches without checking for
+-- checkpoint metadata, the marker is lost. The sink never acks.
+-- The epoch stalls until timeout. No data loss (at-least-once holds)
+-- but checkpoint progress halts.
+-- Prevention: PushEmptyMarkerBatch rule — empty batches with markers are queued.
+
+-- FM2: Duplicate ack from split batch
+-- If both halves of a split batch carry the same marker, the sink
+-- sends two acks for the same epoch. The coordinator logs a warning
+-- for the duplicate but does not crash. However, if epochs overlap
+-- (future change), this could cause premature finalization.
+-- Prevention: ExactlyOnceOnSplit guarantee — remainder is stripped.
+
+-- FM3: Premature ack from out-of-order marker delivery
+-- If the accumulator returns a marker batch before prior data batches,
+-- the sink writes only the marker batch's data and acks. Prior data
+-- is still queued and hasn't been written. If the process crashes after
+-- ack but before writing the queued data, that data is lost.
+-- Prevention: MarkerOrdering guarantee — markers flush with prior data.
+
+-- FM4: Trailing marker never delivered
+-- If the input stream ends and the accumulator doesn't flush remaining
+-- batches, a trailing marker (from the last epoch before shutdown) is
+-- never delivered to the sink. The epoch times out.
+-- Prevention: FlushAllOnCompletion rule — stream end triggers full drain.

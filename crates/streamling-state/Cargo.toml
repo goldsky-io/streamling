@@ -1,0 +1,44 @@
+[package]
+name = "streamling-state"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "State management and persistence for Streamling."
+license-file.workspace = true
+repository.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[dependencies]
+# Internal dependencies
+streamling-config = { workspace = true }
+
+# Async runtime
+tokio.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Configuration and logging
+tracing.workspace = true
+
+# Utilities
+parking_lot.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+
+# Async traits
+async-trait.workspace = true
+
+regex.workspace = true
+
+[features]
+test-utils = []
+
+[dev-dependencies]
+serial_test.workspace = true
+tracing-subscriber.workspace = true

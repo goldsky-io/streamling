@@ -1,0 +1,35 @@
+[package]
+name = "streamling-plugin"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Plugin SDK and FFI for extending Streamling."
+license-file.workspace = true
+repository.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[dependencies]
+streamling-plugin-derive = { workspace = true }
+streamling-common = { workspace = true }
+streamling-config = { workspace = true }
+streamling-state = { workspace = true }
+
+arrow.workspace = true
+arrow-data.workspace = true
+datafusion.workspace = true
+async-trait.workspace = true
+crossbeam-channel.workspace = true
+
+tokio.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+datafusion-ffi.workspace = true
+abi_stable.workspace = true
+async-ffi.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true

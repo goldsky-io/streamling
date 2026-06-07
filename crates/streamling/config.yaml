@@ -1,0 +1,21 @@
+---
+# Local development overrides, layered on top of the defaults embedded in the
+# binary (precedence: embedded < this file < STREAMLING__* env vars). Picked up
+# when streamling runs with the repo root as the working directory.
+state_backend:
+  postgres:
+    password: "let-me-in"
+dynamic_table_backend:
+  postgres:
+    password: "let-me-in"
+kafka_source:
+  brokers: "redpanda:19092" # or "localhost:9092"
+kafka_sink:
+  brokers: "localhost:19092"
+clickhouse_source:
+  password: password
+clickhouse_sink:
+  password: password
+postgres_sink:
+  pass: "let-me-in"
+live_data_inspect_enabled: true

@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda
+  namespace: streamling-e2e
+  labels:
+    app: redpanda
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: redpandadata/redpanda:v24.2.4
+          args:
+            - redpanda
+            - start
+            - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:9094
+            - --advertise-kafka-addr=internal://redpanda.streamling-e2e.svc.cluster.local:9092,external://localhost:30092
+            - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:8083
+            - --advertise-pandaproxy-addr=internal://redpanda.streamling-e2e.svc.cluster.local:8082,external://localhost:30082
+            - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+            - --rpc-addr=0.0.0.0:33145
+            - --advertise-rpc-addr=redpanda.streamling-e2e.svc.cluster.local:33145
+            - --mode=dev-container
+            - --overprovisioned
+            - --reserve-memory=0M
+            - --smp=1
+            - --memory=400M
+          ports:
+            - containerPort: 9092
+              name: kafka-internal
+            - containerPort: 9094
+              name: kafka-external
+            - containerPort: 8081
+              name: schema-internal
+            - containerPort: 18081
+              name: schema-external
+            - containerPort: 8082
+              name: proxy-internal
+            - containerPort: 8083
+              name: proxy-external
+            - containerPort: 9644
+              name: admin
+          volumeMounts:
+            - name: redpanda-storage
+              mountPath: /var/lib/redpanda/data
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          readinessProbe:
+            httpGet:
+              path: /v1/status/ready
+              port: 9644
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: redpanda-storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: streamling-e2e
+spec:
+  type: NodePort
+  selector:
+    app: redpanda
+  ports:
+    - name: kafka-external
+      port: 9094
+      targetPort: 9094
+      nodePort: 30092
+    - name: schema-registry
+      port: 18081
+      targetPort: 18081
+      nodePort: 30081
+    - name: proxy-external
+      port: 8083
+      targetPort: 8083
+      nodePort: 30082
+    - name: admin
+      port: 9644
+      targetPort: 9644
+      nodePort: 30644
+    - name: kafka-internal
+      port: 9092
+      targetPort: 9092

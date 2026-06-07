@@ -1,0 +1,35 @@
+{
+  "model": "claude-opus-4-20250514",
+  "max_turns": 15,
+  "weights": {
+    "change_density": 0.20,
+    "historical_volatility": 0.20,
+    "complexity": 0.20,
+    "blast_radius": 0.25,
+    "test_coverage_delta": 0.15
+  },
+  "thresholds": {
+    "high": 0.7,
+    "medium": 0.4
+  },
+  "core_crates": [
+    "streamling-core",
+    "streamling-config",
+    "streamling-state",
+    "streamling-plugin"
+  ],
+  "ignore_patterns": [
+    "*.md",
+    "*.toml",
+    "*.lock",
+    "*.json",
+    "*.yml",
+    "*.yaml",
+    "infra/**",
+    "scripts/**",
+    "grafana-dashboard.json"
+  ],
+  "lookback_days": 180,
+  "max_volatility_commits": 50,
+  "confidence_threshold": 80
+}

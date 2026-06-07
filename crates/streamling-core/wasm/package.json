@@ -1,0 +1,17 @@
+{
+  "name": "streamling-wasm-runtime",
+  "version": "1.0.0",
+  "description": "WASM runtime for Streamling with Arrow IPC support",
+  "type": "module",
+  "scripts": {
+    "build": "npm install && npm run bundle && npm run compile",
+    "bundle": "esbuild runtime.js --bundle --format=esm --outfile=runtime.bundled.js",
+    "compile": "extism-js runtime.bundled.js -i runtime.d.ts -o runtime.wasm"
+  },
+  "dependencies": {
+    "@uwdata/flechette": "^2.2.6"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

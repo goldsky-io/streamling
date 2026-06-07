@@ -1,0 +1,248 @@
+[
+    "null",
+    {
+        "type": "record",
+        "name": "trace_arbitrums",
+        "doc": "{\"primaryKeys\":[\"id\"]}",
+        "fields": [
+            {
+                "name": "id",
+                "type": "string"
+            },
+            {
+                "name": "block_number",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "block_hash",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "transaction_hash",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "transaction_index",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "from_address",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "to_address",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "value",
+                "type": [
+                    "null",
+                    {
+                        "type": "bytes",
+                        "logicalType": "decimal",
+                        "precision": 100,
+                        "scale": 0
+                    }
+                ],
+                "default": null
+            },
+            {
+                "name": "input",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "output",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "trace_type",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "call_type",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "reward_type",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "gas",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "gas_used",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "subtraces",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "trace_address",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "error",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "status",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "trace_id",
+                "type": [
+                    "null",
+                    "string"
+                ],
+                "default": null
+            },
+            {
+                "name": "block_timestamp",
+                "type": [
+                    "null",
+                    "long"
+                ],
+                "default": null
+            },
+            {
+                "name": "after_evm_transfers",
+                "type": [
+                    "null",
+                    {
+                        "type": "array",
+                        "items": [
+                            {
+                                "type": "record",
+                                "name": "ArbitrumTransfer",
+                                "namespace": "arbitrum_transfer",
+                                "doc": "arbitrum_transfer",
+                                "fields": [
+                                    {
+                                        "name": "purpose",
+                                        "type": [
+                                            "string",
+                                            "null"
+                                        ]
+                                    },
+                                    {
+                                        "name": "from_address",
+                                        "type": [
+                                            "string",
+                                            "null"
+                                        ]
+                                    },
+                                    {
+                                        "name": "to_address",
+                                        "type": [
+                                            "string",
+                                            "null"
+                                        ]
+                                    },
+                                    {
+                                        "name": "value",
+                                        "type": [
+                                            "null",
+                                            {
+                                                "type": "bytes",
+                                                "logicalType": "decimal",
+                                                "precision": 100,
+                                                "scale": 0
+                                            }
+                                        ],
+                                        "default": null
+                                    }
+                                ]
+                            },
+                            "null"
+                        ]
+                    }
+                ],
+                "default": null
+            },
+            {
+                "name": "before_evm_transfers",
+                "type": [
+                    "null",
+                    {
+                        "type": "array",
+                        "items": [
+                            "arbitrum_transfer.ArbitrumTransfer",
+                            "null"
+                        ]
+                    }
+                ],
+                "default": null
+            }
+        ]
+    }
+]

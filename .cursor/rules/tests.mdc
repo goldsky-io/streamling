@@ -1,0 +1,9 @@
+---
+alwaysApply: true
+---
+
+Prefer unit tests for quick iteration. E2E tests (just e2e-test) may be run when needed; they require env-setup first (just env-setup) for k3s, Kafka, etc.
+
+After each task, check code by running just fix, followed by just lint.
+
+When fixing an issue, try to write a unit test for the issue first, watch it fail, then fix it, making the change as easy to understand as possible.
