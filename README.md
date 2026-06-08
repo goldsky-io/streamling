@@ -11,22 +11,160 @@
 
 ```
 
-Streamling is a performant and extensible streaming data framework built with Rust, Apache Arrow and Apache DataFusion. 
+Streamling is a data streaming runtime focused on performance, consistency, and extensibility. Write plugins in Rust or WASM, process data with data guarantees. 
+
+Built with Rust, Apache Arrow, and Apache DataFusion. Install with one command — see [Quick start](#quick-start) — or read more at [streamling.dev](https://streamling.dev).
+
+## When to use Streamling
+
+**Streamling is a good fit when you need to:**
+
+- Move and transform **continuous data** from Kafka (or a plugin source) into databases, webhooks, or other sinks
+- Run **bounded batch jobs** — read a finite dataset from a bounded source (e.g. a ClickHouse table), process it, write results, and exit
+- Apply **SQL filters and projections** on streaming Arrow batches without building a custom service
+- Get **checkpointed, at-least-once delivery** — sources don't commit until sinks have flushed
+- Handle **upserts** (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
+- Extend the runtime with **Rust plugins** (custom sources/sinks) or **WASM transforms** (TypeScript/JavaScript)
+
+**Streamling is probably not the right fit when you need:**
+
+- **Distributed stateful processing** — cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes aren't supported today
+- **A library to embed** — it's a standalone runtime you deploy and configure, not a crate you wire into your app
+
+Streamling runs as a **single-node engine**. Scale horizontally via Kafka consumer groups and multiple independent instances — each instance checkpoints and progresses on its own.
+
+## How it works
+
+You define a **pipeline in YAML** with three sections: `sources` (where data comes from), `transforms` (optional processing), and `sinks` (where data goes). The runtime loads the pipeline, wires operators together, and runs until stopped, or until a bounded source finishes.
+
+Data moves between operators as **Arrow RecordBatches**. **Checkpoints** coordinate flush and commit across the whole topology so sources only advance after sinks have durably written their data. See [Checkpointing](#checkpointing) for the full protocol.
+
+**Streaming** pipelines use unbounded sources like Kafka that run indefinitely. **Batch** pipelines use bounded sources that read a finite dataset and terminate — for example, a [ClickHouse source](#clickhouse-source), or a [hybrid source](#hybrid-source) with `STREAMLING__JOB_MODE=true` to stop after the bounded phase completes.
+
+## Quick start
+
+```bash
+# 1. Install the runtime (macOS/Linux)
+curl -fsSL https://www.streamling.dev/install.sh | bash
+
+# 2. Write a pipeline
+cat > pipeline.yaml <<'EOF'
+sources:
+  raw_transactions:
+    type: kafka
+    topic: raw.event.transaction
+    primary_key: id
+transforms:
+  large_transactions:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT *
+      FROM raw_transactions
+      WHERE amount > 1000
+sinks:
+  print_large:
+    type: print
+    from: large_transactions
+EOF
+
+# 3. Run it
+export STREAMLING__PIPELINE_DEFINITION_LOCATION=pipeline.yaml
+export RUST_LOG=info
+streamling
+```
+
+Records flow from source through transforms to sinks. Checkpoints fire periodically; when a sink acks, the source commits its position. Swap the print sink for [Postgres](#postgres-sink) or [webhook](#webhook-http-sink) in production.
+
+To **build from source** or run against local Kafka/Postgres/ClickHouse, see [Development setup](#development-setup).
+
+## Common patterns
+
+Built-in connectors cover most pipelines. Use [plugins](#plugin-system) when you need a source, transform, or sink that Streamling doesn't ship with — e.g. reading from an RPC or object store, domain-specific enrichment, or writing to a proprietary API.
+
+| Pattern | Pipeline shape | Details |
+|---------|---------------|---------|
+| Kafka → SQL → Postgres | source + sql transform + postgres sink | [Kafka Source](#kafka-source), [SQL Transform](#sql-transform), [Postgres Sink](#postgres-sink) |
+| Kafka → WASM → webhook | source + script transform + webhook sink | [WebAssembly Script Transform](#webassembly-script-transform), [Webhook (HTTP) Sink](#webhook-http-sink) |
+| ClickHouse → Postgres (batch) | clickhouse source + postgres sink | [ClickHouse Source](#clickhouse-source) reads a finite table and the pipeline exits when done |
+| Backfill then stream | hybrid source + transforms + sink | [Hybrid Source](#hybrid-source): bounded phase (e.g. ClickHouse) backfills history, then unbounded phase (e.g. Kafka) takes over |
+| Backfill only (batch) | hybrid source + transforms + sink | [Hybrid Source](#hybrid-source) with `STREAMLING__JOB_MODE=true` — runs bounded phases and exits without starting the unbounded phase |
+| Custom source → SQL → Postgres | plugin source + sql + postgres | Plugin ingests from a non-Kafka origin (RPC, S3, REST API); SQL filters and projects; Postgres upserts |
+| Kafka → custom transform → sink | kafka + plugin transform + built-in sink | Plugin transform handles logic SQL/WASM can't — multi-record joins, external lookups, binary decoding |
+| Custom source → custom sink | plugin source + plugin sink | End-to-end custom path when both ends need bespoke I/O (e.g. poll an API, push to a partner webhook with custom auth) |
+
+### Plugin examples
+
+Plugin ids appear as the `type` in pipeline YAML (`namespace.operator_name`). The examples below use the bundled [`basic_plugin`](plugin_examples/basic/) — swap in your own plugin ids for production pipelines.
+
+**Custom source** — generate or poll data the runtime doesn't have a built-in connector for:
+
+```yaml
+sources:
+  orders:
+    type: basic_plugin.random_source   # e.g. acme_api.orders_source in production
+    options:
+      max_rows: "10000"
+      record_batch_size: "1000"
+transforms:
+  filtered:
+    type: sql
+    primary_key: alphanumeric_field
+    sql: SELECT * FROM orders WHERE num_field > 100
+sinks:
+  pg_orders:
+    type: postgres
+    from: filtered
+    schema: public
+    table: orders
+    primary_key: alphanumeric_field
+```
+
+**Custom transform** — enrich or reshape records between built-in operators:
+
+```yaml
+sources:
+  raw_events:
+    type: kafka
+    topic: raw.events
+    primary_key: id
+transforms:
+  enriched:
+    type: basic_plugin.filter_transform   # e.g. enrichment.normalize_events in production
+    from: raw_events
+    options:
+      _gs_op: i                           # keep inserts only
+sinks:
+  pg_events:
+    type: postgres
+    from: enriched
+    schema: public
+    table: events
+    primary_key: id
+```
+
+**Custom sink** — write to a destination without a built-in connector:
+
+```yaml
+sources:
+  raw_events:
+    type: kafka
+    topic: app.events
+    primary_key: id
+transforms: {}
+sinks:
+  partner_out:
+    type: print_sink                      # e.g. partner_api.webhook_sink in production
+    from: raw_events
+    options:
+      mode: batch
+```
+
+A single pipeline can mix all three — plugin source, built-in SQL transform, plugin sink — as long as schemas and `primary_key` line up between stages. See [Plugin Pipeline Configuration](#plugin-pipeline-configuration) for loading plugins and the full options reference.
 
 ## Overview
 
-Streamling uses YAML files to define data pipelines. Each pipeline consists of a set of sources, sinks and,
-optionally, transforms. It supports different types of connectors and processors, e.g.
-
-- Kafka sources and sinks.
-- SQL transforms.
-- HTTP transforms and sinks (webhooks).
-- WebAssembly script transforms.
-- Postgres sinks.
-- ClickHouse sinks.
-
-For example, data can be consumed from a Kafka topic, processed with SQL transformations and written to a Postgres database 
-using the following pipeline definition:
+A pipeline has three sections: `sources`, `transforms` (optional), and `sinks`. Every node exchanges Arrow RecordBatches. Built-in connectors cover Kafka, Postgres, ClickHouse, webhooks, and WASM scripts; anything else can be a [plugin](#plugin-system).
 
 ```yaml
 sources:
@@ -50,9 +188,9 @@ sinks:
     primary_key: id
 ```
 
-More connectors and processors are available via [plugins](#plugin-system).
+## Development setup
 
-## Setup
+This section is for **contributing to or building Streamling**. To run a pipeline, see [Quick start](#quick-start).
 
 - Get [Rust and Cargo](https://www.rust-lang.org/learn/get-started)
 - Install [Kubernetes](https://kubernetes.io/docs/tasks/tools/install-kubectl-macos/) and [OpenSSL](https://formulae.brew.sh/formula/openssl@3)
@@ -122,8 +260,12 @@ cargo test -p streamling-e2e --test print_sink
 Recommended environment variables when running locally:
 
 - `RUST_LOG=debug`. Seeing debug logs is essential.
-- `STREAMLING__PIPELINE_DEFINITION_LOCATION=pipeline.json`. You can switch between existing sample pipelines (or create
+- `STREAMLING__PIPELINE_DEFINITION_LOCATION=pipeline.yaml`. You can switch between existing sample pipelines (or create
   your own).
+
+## Reference
+
+The sections below are the full connector and runtime reference. New here? Start with [Quick start](#quick-start).
 
 ## Topology
 
@@ -165,9 +307,43 @@ Sample configuration:
 
 ```yaml
 sources:
-  ethereum.raw_blocks:
+  raw_events:
     type: kafka
-    topic: mainnet.raw.blocks
+    topic: app.events
+```
+
+#### Hybrid Source
+
+A hybrid source runs one or more **bounded** phases followed by an **unbounded** phase. Bounded phases read a finite dataset (e.g. a ClickHouse table for backfill) and finish; the unbounded phase (e.g. Kafka) then takes over for live streaming.
+
+With `STREAMLING__JOB_MODE=true` (or `job_mode: true` in `config.yaml`), the pipeline terminates after all bounded phases complete instead of transitioning to the unbounded phase. All sources in the pipeline must be hybrid sources when job mode is enabled.
+
+Sample configuration:
+
+```yaml
+sources:
+  orders:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: orders_archive
+    unbounded_source:
+      source_type: kafka
+      topic: orders_live
+      start_at: earliest
+    primary_key: id
+```
+
+#### ClickHouse Source
+
+A standalone ClickHouse source reads a table in paginated chunks and terminates when the table is fully consumed — a bounded source suitable for batch pipelines.
+
+```yaml
+sources:
+  ch_orders:
+    type: clickhouse
+    table_name: orders
+    primary_key: id
 ```
 
 ### Transforms
@@ -199,9 +375,9 @@ Sample configuration:
 
 ```yaml
 transforms:
-  updated_blocks:
+  filtered_events:
     type: sql
-    sql: select id, number, transaction_count, _gs_op from ethereum.raw_blocks
+    sql: SELECT id, event_type, amount, _gs_op FROM raw_events WHERE amount > 0
     primary_key: id
 ```
 
@@ -242,10 +418,10 @@ Sample configuration:
 
 ```yaml
 transforms:
-  enriched_polymarket_account:
+  enriched_accounts:
     type: handler
-    from: updated_account
-    url: http://localhost:8087/sink
+    from: raw_accounts
+    url: http://localhost:8087/enrich
     one_row_per_request: false
     primary_key: id
 ```
@@ -280,12 +456,12 @@ Sample configuration:
 transforms:
   updated_account:
     type: script
-    from: polymarket.account
+    from: raw_accounts
     language: javascript
     script: >
       function process(input) {
-        input.num_trades = 100;
-        input._gs_chain = input._gs_chain + '_updated';
+        input.tier = input.amount > 1000 ? 'premium' : 'standard';
+        input.status = input.status + '_processed';
         return input;
       }
     primary_key: id
@@ -312,7 +488,7 @@ Sample configuration:
 sinks:
   sink:
     type: print
-    from: updated_blocks
+    from: filtered_events
 ```
 
 #### Blackhole Sink
@@ -324,9 +500,9 @@ Sample configuration:
 
 ```yaml
 sinks:
-  blackhole_ethereum_blocks:
+  blackhole_events:
     type: blackhole
-    from: ethereum.raw_blocks
+    from: raw_events
 ```
 
 #### Webhook (HTTP) Sink
@@ -339,10 +515,10 @@ Sample configuration:
 
 ```yaml
 sinks:
-  webhook.polymarket_account:
+  webhook_accounts:
     type: webhook
     from: updated_account
-    url: http://localhost:8087/sink
+    url: http://localhost:8087/notify
 ```
 
 #### Postgres Sink
@@ -559,14 +735,14 @@ transforms:
     backend_entity_name: user_tracking_table
 
   # Dynamic table with SQL - automatically populated from a source
-  market_filter_table:
+  vip_customers_table:
     type: dynamic_table
     backend_type: Postgres
-    backend_entity_name: market_filters
+    backend_entity_name: vip_customers
     sql: |
-      SELECT market
-      FROM polymarket.transaction
-      WHERE market = '0x32810b0a800c280616acc7690d33eb7831e1daa4'
+      SELECT customer_id
+      FROM crm.accounts
+      WHERE tier = 'vip'
 ```
 
 ### Backend Types
@@ -628,44 +804,25 @@ transforms:
     primary_key: event_id
 ```
 
-#### Example: Factory Pattern
+#### Example: Lookup filter
 
 ```yaml
 transforms:
-  factory_addresses:
+  vip_customers:
     type: dynamic_table
     backend_type: Postgres
-    backend_entity_name: factory_addresses
-    sql: >
-      SELECT
-        lower(event_params[5]) AS contract_address
-      FROM
-        base.decoded_logs
-      WHERE
-        address = lower('0x33128a8fC17869897dcE68Ed026d694621f6FDfD')
-        AND event_signature = 'PoolCreated(address,address,uint24,int24,address)'
-  decoded_data:
+    backend_entity_name: vip_customers
+    sql: |
+      SELECT customer_id
+      FROM crm.accounts
+      WHERE tier = 'vip'
+  vip_orders:
     type: sql
-    sql: >
-      SELECT
-        id,
-        raw_log.block_number AS block_num,
-        raw_log.block_timestamp AS block_time,
-        transaction_hash AS tx_hash,
-        'base' as chain,
-        address,
-        event_params[1] AS sender,
-        event_params[2] AS receiver,
-        event_params[3] AS amount0,
-        event_params[4] AS amount1,
-        event_params[5] AS price,
-        event_params[6] AS liquidity,
-        event_params[7] AS tick
-      FROM
-        base.decoded_logs
-      WHERE
-        event_signature = 'Swap(address,address,int256,int256,uint160,uint128,int24)'
-        AND dynamic_table_check('factory_addresses', address)
+    sql: |
+      SELECT id, customer_id, amount, created_at
+      FROM orders.events
+      WHERE dynamic_table_check('vip_customers', customer_id)
+    primary_key: id
 ```
 
 #### UDF Function Signature
@@ -729,18 +886,18 @@ for the `Kafka -> SQL Transform -> Print` topology:
 ```
 2025-12-03T18:10:20.399911Z  INFO tokio-runtime-worker ThreadId(03) streamling_core::checkpoints::checkpoint_management: Sending checkpoint with epoch: 1
 2025-12-03T18:10:20.400262Z DEBUG tokio-runtime-worker ThreadId(07) streamling_connectors::table_providers::kafka: Received epoch marker: CheckpointEpoch(1)
-2025-12-03T18:10:20.400465Z DEBUG tokio-runtime-worker ThreadId(07) streamling_connectors::table_providers::kafka: Current position: TPL {subgraph.123456.event.account/0: offset=Offset(87) metadata="", error=Ok(()); subgraph.123456.event.account/1: offset=Offset(19) metadata="", error=Ok(()); subgraph.123456.event.account/2: offset=Offset(241) metadata="", error=Ok(()); subgraph.123456.event.account/3: offset=Offset(2) metadata="", error=Ok(())}
+2025-12-03T18:10:20.400465Z DEBUG tokio-runtime-worker ThreadId(07) streamling_connectors::table_providers::kafka: Current position: TPL {app.events.account/0: offset=Offset(87) metadata="", error=Ok(()); app.events.account/1: offset=Offset(19) metadata="", error=Ok(()); app.events.account/2: offset=Offset(241) metadata="", error=Ok(()); app.events.account/3: offset=Offset(2) metadata="", error=Ok(())}
 2025-12-03T18:10:20.508865Z DEBUG tokio-runtime-worker ThreadId(11) streamling_core::checkpoints::checkpoint_management: [CheckpointCoordinator] Received checkpoint ACK for epoch: 1 from sink
 2025-12-03T18:10:20.508998Z  INFO tokio-runtime-worker ThreadId(11) streamling_core::checkpoints::checkpoint_management: Epoch finalized: 1
 2025-12-03T18:10:20.613465Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Received epoch finalizer: CheckpointEpoch(1)
-2025-12-03T18:10:20.613503Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Committing position: TPL {subgraph.123456.event.account/0: offset=Offset(87) metadata="", error=Ok(()); subgraph.123456.event.account/1: offset=Offset(19) metadata="", error=Ok(()); subgraph.123456.event.account/2: offset=Offset(241) metadata="", error=Ok(()); subgraph.123456.event.account/3: offset=Offset(2) metadata="", error=Ok(())}
-2025-12-03T18:10:20.620278Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "subgraph.123456.event.account", partition: 0, offset: TopicPartitionOffset { offset: 87, updated_at: 1764785420620 } }
-2025-12-03T18:10:20.620308Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "subgraph.123456.event.account", partition: 1, offset: TopicPartitionOffset { offset: 19, updated_at: 1764785420620 } }
-2025-12-03T18:10:20.620317Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "subgraph.123456.event.account", partition: 2, offset: TopicPartitionOffset { offset: 241, updated_at: 1764785420620 } }
-2025-12-03T18:10:20.620326Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "subgraph.123456.event.account", partition: 3, offset: TopicPartitionOffset { offset: 2, updated_at: 1764785420620 } }
+2025-12-03T18:10:20.613503Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Committing position: TPL {app.events.account/0: offset=Offset(87) metadata="", error=Ok(()); app.events.account/1: offset=Offset(19) metadata="", error=Ok(()); app.events.account/2: offset=Offset(241) metadata="", error=Ok(()); app.events.account/3: offset=Offset(2) metadata="", error=Ok(())}
+2025-12-03T18:10:20.620278Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "app.events.account", partition: 0, offset: TopicPartitionOffset { offset: 87, updated_at: 1764785420620 } }
+2025-12-03T18:10:20.620308Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "app.events.account", partition: 1, offset: TopicPartitionOffset { offset: 19, updated_at: 1764785420620 } }
+2025-12-03T18:10:20.620317Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "app.events.account", partition: 2, offset: TopicPartitionOffset { offset: 241, updated_at: 1764785420620 } }
+2025-12-03T18:10:20.620326Z DEBUG tokio-runtime-worker ThreadId(11) streamling_connectors::table_providers::kafka: Saving position to state backend: TopicPartition { topic: "app.events.account", partition: 3, offset: TopicPartitionOffset { offset: 2, updated_at: 1764785420620 } }
 2025-12-03T18:10:21.466247Z  INFO tokio-runtime-worker ThreadId(03) streamling_core::checkpoints::checkpoint_management: Sending checkpoint with epoch: 2
 2025-12-03T18:10:21.573524Z DEBUG tokio-runtime-worker ThreadId(05) streamling_connectors::table_providers::kafka: Received epoch marker: CheckpointEpoch(2)
-2025-12-03T18:10:21.573603Z DEBUG tokio-runtime-worker ThreadId(05) streamling_connectors::table_providers::kafka: Current position: TPL {subgraph.123456.event.account/0: offset=Offset(87) metadata="", error=Ok(()); subgraph.123456.event.account/1: offset=Offset(19) metadata="", error=Ok(()); subgraph.123456.event.account/2: offset=Offset(241) metadata="", error=Ok(()); subgraph.123456.event.account/3: offset=Offset(2) metadata="", error=Ok(())}
+2025-12-03T18:10:21.573603Z DEBUG tokio-runtime-worker ThreadId(05) streamling_connectors::table_providers::kafka: Current position: TPL {app.events.account/0: offset=Offset(87) metadata="", error=Ok(()); app.events.account/1: offset=Offset(19) metadata="", error=Ok(()); app.events.account/2: offset=Offset(241) metadata="", error=Ok(()); app.events.account/3: offset=Offset(2) metadata="", error=Ok(())}
 2025-12-03T18:10:21.681840Z DEBUG tokio-runtime-worker ThreadId(03) streamling_core::checkpoints::checkpoint_management: [CheckpointCoordinator] Received checkpoint ACK for epoch: 2 from sink
 2025-12-03T18:10:21.681873Z  INFO tokio-runtime-worker ThreadId(03) streamling_core::checkpoints::checkpoint_management: Epoch finalized: 2
 2025-12-03T18:10:21.787167Z DEBUG tokio-runtime-worker ThreadId(03) streamling_connectors::table_providers::kafka: Received epoch finalizer: CheckpointEpoch(2)
@@ -1008,10 +1165,10 @@ impl TableProvider for MyProvider {
 When errors are displayed, the full chain is preserved:
 
 ```
-Error: kafka source 'polymarket.transaction': failed to create Kafka source
+Error: kafka source 'raw_transactions': failed to create Kafka source
 
 Caused by:
-    Execution error: Error: failed to fetch Avro schema from Schema Registry for topic subgraph.123456.event.transaction1
+    Execution error: Error: failed to fetch Avro schema from Schema Registry for topic raw.event.transaction
     
     Caused by:
         Error: Could not get id from response had no other cause, it's retriable: false, it's cached: false
@@ -1629,17 +1786,17 @@ Every source, transform, and sink accepts an optional `telemetry.labels` map. Ea
 
 ```yaml
 sources:
-  blocks:
+  raw_events:
     type: kafka
-    topic: v2.evm.blocks
+    topic: app.events
     telemetry:
       labels:
         tier: critical
-        dataset: v2.evm.blocks
-        team: indexing-core
+        dataset: app.events
+        team: platform
 ```
 
-Query: `streamling_output_rows_total{dataset="v2.evm.blocks",tier="critical"}`.
+Query: `streamling_output_rows_total{dataset="app.events",tier="critical"}`.
 
 **Constraints (validated at pipeline load):**
 
