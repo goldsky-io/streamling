@@ -40,9 +40,6 @@ jobs:
       SCCACHE_CACHE_SIZE: "10G"
     steps:
       - uses: actions/checkout@v4
-      - name: Configure git to use the workflow token for GitHub
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
         with:
@@ -150,10 +147,6 @@ jobs:
         with:
           path: target/release-optimized/streamling
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-      - name: Configure git to use the workflow token for GitHub
-        if: steps.bin-cache.outputs.cache-hit != 'true'
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.90.0
@@ -226,10 +219,6 @@ jobs:
         with:
           path: target/release-optimized/streamling
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-      - name: Configure git to use the workflow token for GitHub
-        if: steps.bin-cache.outputs.cache-hit != 'true'
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.90.0
@@ -273,11 +262,6 @@ jobs:
         with:
           path: target/release-optimized/streamling.exe
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-      - name: Configure git to use the workflow token for GitHub
-        if: steps.bin-cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.90.0
@@ -383,9 +367,6 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v4
-      - name: Configure git to use the workflow token for GitHub
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
       - name: Setup rust cache
