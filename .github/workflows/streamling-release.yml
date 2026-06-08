@@ -8,8 +8,6 @@ name: streamling-release
 # Trigger:
 #   gh workflow run streamling-release.yml --ref main
 #
-# Per-push CI (lint/test/Docker images + rolling `nightly` linux release) lives
-# in streamling.yml. This workflow is the only producer of versioned releases.
 
 on:
   workflow_dispatch:
