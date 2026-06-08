@@ -22,8 +22,7 @@ jobs:
       - name: Checkout streamling
         uses: actions/checkout@v4
         with:
-          # TODO: rename back
-          repository: goldsky-io/streamling-private
+          repository: goldsky-io/streamling
           ref: ${{ inputs.streamling_ref }}
           token: ${{ secrets.GH_READ_TOKEN }}
           path: streamling
