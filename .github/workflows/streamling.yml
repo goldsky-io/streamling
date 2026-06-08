@@ -47,9 +47,6 @@ jobs:
       SCCACHE_CACHE_SIZE: "10G"
     steps:
       - uses: actions/checkout@v4
-      - name: Configure git to use the workflow token for GitHub
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
         with:
@@ -125,10 +122,6 @@ jobs:
           key: main-bin-v2-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
 
       # Everything below only runs on cache miss
-      - name: Configure git to use the workflow token for GitHub
-        if: steps.main-cache.outputs.cache-hit != 'true'
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.GH_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Configure Rust toolchain
         if: steps.main-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.90.0
@@ -258,13 +251,107 @@ jobs:
         run: bash scripts/ci/prune-rolling-release.sh nightly 30
 
   e2e-tests:
-    needs: [changes]
+    needs: [changes, build-release-main]
     if: needs.changes.outputs.core == 'true'
-    uses: ./.github/workflows/e2e.yml
-    with:
-      streamling_ref: ${{ github.sha }}
-    secrets:
-      GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      # Rust toolchain + caching (needed to compile the e2e test crate)
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "v0-streamling-e2e"
+          cache-targets: true
+          cache-on-failure: true
+
+      # Reuse the release binary from build-release-main instead of rebuilding.
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binary-linux-x86_64
+          path: release-artifacts/
+      - name: Install release binary
+        run: |
+          mkdir -p target/release
+          cp release-artifacts/streamling target/release/
+          chmod +x target/release/streamling
+
+      # Infrastructure setup
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Pre-pull e2e images
+        run: |
+          set -euo pipefail
+          images=(
+            "postgres:15-alpine"
+            "mariadb:10.11"
+            "redpandadata/redpanda:v24.2.4"
+            "clickhouse/clickhouse-server:latest-alpine"
+            "prom/prometheus:latest"
+            "rancher/k3s:v1.28.4-k3s1"
+          )
+          for image in "${images[@]}"; do
+            echo "Pulling $image"
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                break
+              fi
+              echo "Retrying $image pull (attempt $attempt/3)..."
+              sleep 5
+            done
+          done
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+      - name: Setup k3s cluster
+        run: ./scripts/k3s-setup.sh
+        timeout-minutes: 5
+
+      # Build and run e2e tests
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Build e2e tests
+        run: cargo test -p streamling-e2e --no-run
+        env:
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+      - name: Run e2e tests
+        run: |
+          set -euo pipefail
+          eval "$(./scripts/k3s-setup.sh --env-only)"
+          export E2E_STREAMLING_BIN="$(pwd)/target/release/streamling"
+          export STREAMLING__PLUGIN__PATH=""
+          export STREAMLING__PLUGIN__PREPROCESSOR_IDS=""
+          cargo nextest run -p streamling-e2e -j 4
+        env:
+          RUST_LOG: info
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        timeout-minutes: 20
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n streamling-e2e -o wide
+          echo ""
+          echo "=== Pod Events ==="
+          kubectl get events -n streamling-e2e --sort-by='.lastTimestamp' | tail -30
+          echo ""
+          echo "=== Pod Logs ==="
+          for pod in $(kubectl get pods -n streamling-e2e -o name); do
+            echo "--- $pod ---"
+            kubectl logs $pod -n streamling-e2e --tail=100 || true
+          done
+          echo ""
+          echo "=== Docker Stats ==="
+          docker stats --no-stream || true
 
   # ==========================================================================
   # Image push jobs: download pre-built binary and package into Docker image.
