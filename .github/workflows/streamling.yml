@@ -102,11 +102,9 @@ jobs:
           - runner: blacksmith-8vcpu-ubuntu-2204
             os: linux
             arch: x86_64
-            legacy_arch: amd64
           - runner: blacksmith-8vcpu-ubuntu-2204-arm
             os: linux
             arch: aarch64
-            legacy_arch: arm64
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -164,91 +162,13 @@ jobs:
         if: steps.main-cache.outputs.cache-hit != 'true'
         run: sccache --show-stats || true
 
-      # Always upload — whether from cache or fresh build.
-      # Legacy artifact name kept for build-and-push-image-* jobs.
-      - name: Upload release binary (legacy artifact name)
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-binary-${{ matrix.legacy_arch }}
-          path: target/release/streamling
-          retention-days: 1
-          if-no-files-found: error
-
-      # New os-arch artifact name for publish-release.
-      - name: Upload release binary (os-arch artifact name)
+      - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
           name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release/streamling
           retention-days: 1
           if-no-files-found: error
-
-  # ==========================================================================
-  # Publish the rolling `nightly` linux release on every main push
-  # (SHA-suffixed assets). Versioned/tagged releases (all platforms) live in
-  # streamling-release.yml.
-  # ==========================================================================
-  publish-release:
-    needs: [build-release-main, validate-and-test, e2e-tests]
-    if: |
-      always()
-      && needs.build-release-main.result == 'success'
-      && needs.validate-and-test.result != 'failure'
-      && needs.e2e-tests.result != 'failure'
-      && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-binary-*-*
-          path: release-artifacts/
-
-      - name: Package assets for release
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          shopt -s nullglob
-          dirs=(release-artifacts/release-binary-*-*)
-          if [[ ${#dirs[@]} -eq 0 ]]; then
-            echo "No release-binary-*-* artifacts downloaded; failing." >&2
-            exit 1
-          fi
-          for dir in "${dirs[@]}"; do
-            name="$(basename "$dir")"               # release-binary-linux-x86_64
-            os_arch="${name#release-binary-}"       # linux-x86_64
-            base="streamling-${os_arch}-${GITHUB_SHA}"
-            # Linux artifacts are bare binaries packaged as .tar.gz, flat at the
-            # archive root. (macOS/Windows assets live in streamling-release.yml.)
-            if [[ -f "$dir/streamling" ]]; then
-              chmod +x "$dir/streamling"
-              tar -czf "release-assets/${base}.tar.gz" -C "$dir" streamling
-            else
-              echo "Missing binary in $dir" >&2
-              exit 1
-            fi
-          done
-          ls -la release-assets/
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          name: nightly (rolling main)
-          prerelease: true
-          make_latest: false
-          files: release-assets/*
-          fail_on_unmatched_files: true
-
-      - name: Prune old assets on rolling nightly release
-        if: github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash scripts/ci/prune-rolling-release.sh nightly 30
 
   e2e-tests:
     needs: [changes, build-release-main]
@@ -369,8 +289,10 @@ jobs:
       matrix:
         include:
           - runner: blacksmith-8vcpu-ubuntu-2204
+            os: linux
             arch: amd64
           - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            os: linux
             arch: arm64
     steps: &image_push_steps
       - name: Mask AWS account ID
@@ -381,7 +303,7 @@ jobs:
       - name: Download release binary
         uses: actions/download-artifact@v4
         with:
-          name: release-binary-${{ matrix.arch }}
+          name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: release-artifacts/
       - name: Install release binaries
         run: |
