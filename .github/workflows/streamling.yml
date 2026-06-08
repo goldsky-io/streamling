@@ -290,10 +290,12 @@ jobs:
         include:
           - runner: blacksmith-8vcpu-ubuntu-2204
             os: linux
-            arch: amd64
+            arch: x86_64
+            image_arch: amd64
           - runner: blacksmith-8vcpu-ubuntu-2204-arm
             os: linux
-            arch: arm64
+            arch: aarch64
+            image_arch: arm64
     steps: &image_push_steps
       - name: Mask AWS account ID
         env:
@@ -328,7 +330,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: streamling
           IMAGE_TAG: ${{ github.sha }}
-          ARCH: ${{ matrix.arch }}
+          ARCH: ${{ matrix.image_arch }}
         run: |
           SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
           TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG-$ARCH
@@ -358,10 +360,12 @@ jobs:
         include:
           - runner: blacksmith-8vcpu-ubuntu-2204
             os: linux
-            arch: amd64
+            arch: x86_64
+            image_arch: amd64
           - runner: blacksmith-8vcpu-ubuntu-2204-arm
             os: linux
-            arch: arm64
+            arch: aarch64
+            image_arch: arm64
     steps: *image_push_steps
 
   create-manifest-main:
