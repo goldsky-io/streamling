@@ -3,7 +3,8 @@ name = "streamling"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90.0"
-description = "Streamling: Performant and extensible streaming data framework"
+description = "Streamling: Performant and extensible streaming data runtime"
+readme = "../../README.md"
 license-file.workspace = true
 repository.workspace = true
 
