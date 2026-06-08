@@ -19,6 +19,8 @@ exclude = [
 [workspace.package]
 license-file = "LICENSE.txt"
 repository = "https://github.com/goldsky-io/streamling"
+homepage = "https://www.streamling.dev"
+keywords = ["streaming", "stream-processing", "arrow", "datafusion"]
 
 [workspace.lints.clippy]
 too_many_arguments = "allow"
