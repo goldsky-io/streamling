@@ -134,6 +134,8 @@ sinks:
 EOF
 
 # 3. Run it
+export STREAMLING__KAFKA_SOURCE__BROKERS=localhost:9092
+export STREAMLING__KAFKA_SOURCE__SCHEMA_REGISTRY_URL=http://localhost:8081
 export STREAMLING__PIPELINE_DEFINITION_LOCATION=pipeline.yaml
 export RUST_LOG=info
 streamling
@@ -386,6 +388,21 @@ sources:
     topic: app.events
 ```
 
+**Connection settings** — override the embedded defaults (local Kafka and Schema Registry) with these environment variables:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `STREAMLING__KAFKA_SOURCE__BROKERS` | `localhost:9092` | Comma-separated bootstrap broker list |
+| `STREAMLING__KAFKA_SOURCE__SECURITY_PROTOCOL` | `plaintext` | Kafka security protocol (e.g. `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`) |
+| `STREAMLING__KAFKA_SOURCE__SASL_MECHANISM` | _(unset)_ | SASL mechanism (applied when the protocol contains `sasl`) |
+| `STREAMLING__KAFKA_SOURCE__SASL_USERNAME` | _(unset)_ | SASL username |
+| `STREAMLING__KAFKA_SOURCE__SASL_PASSWORD` | _(unset)_ | SASL password |
+| `STREAMLING__KAFKA_SOURCE__SCHEMA_REGISTRY_URL` | `http://localhost:18081` | Schema Registry URL (required for Avro) |
+| `STREAMLING__KAFKA_SOURCE__SCHEMA_REGISTRY_USERNAME` | _(unset)_ | Schema Registry basic-auth username |
+| `STREAMLING__KAFKA_SOURCE__SCHEMA_REGISTRY_PASSWORD` | _(unset)_ | Schema Registry basic-auth password |
+| `STREAMLING__KAFKA_SOURCE__CONSUMER_GROUP_ID` | _(unset)_ | Consumer group id (coordinates scaling across instances) |
+| `STREAMLING__KAFKA_SOURCE__CLIENT_ID` | _(unset)_ | Kafka client id |
+
 #### Hybrid Source
 
 A hybrid source runs one or more **bounded** phases followed by an **unbounded** phase. Bounded phases read a finite dataset (e.g. a ClickHouse table for backfill) and finish; the unbounded phase (e.g. Kafka) then takes over for live streaming.
@@ -408,6 +425,8 @@ sources:
     primary_key: id
 ```
 
+Connection settings for each phase come from the same environment variables as the standalone [ClickHouse Source](#clickhouse-source) (bounded phases) and [Kafka Source](#kafka-source) (unbounded phase).
+
 #### ClickHouse Source
 
 A standalone ClickHouse source reads a table in paginated chunks and terminates when the table is fully consumed — a bounded source suitable for batch pipelines.
@@ -419,6 +438,16 @@ sources:
     table_name: orders
     primary_key: id
 ```
+
+**Connection settings** — override the embedded defaults with these environment variables:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `STREAMLING__CLICKHOUSE_SOURCE__URL` | `http://localhost:8123` | ClickHouse HTTP endpoint |
+| `STREAMLING__CLICKHOUSE_SOURCE__USER` | `default` | Username |
+| `STREAMLING__CLICKHOUSE_SOURCE__PASSWORD` | _(empty)_ | Password |
+| `STREAMLING__CLICKHOUSE_SOURCE__DATABASE` | `default` | Database name |
+| `STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE` | `10000000` | Rows fetched per pagination chunk |
 
 ### Transforms
 
@@ -561,6 +590,8 @@ sinks:
     from: filtered_events
 ```
 
+The sampling rate is configurable via `STREAMLING__PRINT_SINK__SAMPLE_EVERY` (default: `1`, prints every record; set to `N` to print only every Nth record).
+
 #### Blackhole Sink
 
 Discards all records without performing any operation. Useful for testing or when you want to measure throughput without
@@ -606,13 +637,16 @@ sinks:
     table: blocks
 ```
 
-The sink requires the following PostgreSQL connection parameters to be configured:
+**Connection settings** — override the embedded defaults with these environment variables:
 
-- `postgres.host`: Database host
-- `postgres.port`: Database port (default: 5432)
-- `postgres.database`: Database name
-- `postgres.username`: Username for authentication
-- `postgres.password`: Password for authentication
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `STREAMLING__POSTGRES_SINK__HOST` | `127.0.0.1` | Database host |
+| `STREAMLING__POSTGRES_SINK__PORT` | `5432` | Database port |
+| `STREAMLING__POSTGRES_SINK__USER` | `graph-node` | Username for authentication |
+| `STREAMLING__POSTGRES_SINK__PASS` | _(empty)_ | Password for authentication |
+| `STREAMLING__POSTGRES_SINK__DB` | `postgres` | Database name |
+| `STREAMLING__POSTGRES_SINK__SSLMODE` | `disable` | SSL mode (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`) |
 
 Behavior for 256-bit integers (U256/I256):
 
@@ -776,6 +810,50 @@ sinks:
     from: updated_account
     data_format: avro
 ```
+
+**Connection settings** — override the embedded defaults with these environment variables:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `STREAMLING__KAFKA_SINK__BROKERS` | `localhost:9092` | Comma-separated bootstrap broker list |
+| `STREAMLING__KAFKA_SINK__SECURITY_PROTOCOL` | `plaintext` | Kafka security protocol (e.g. `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`) |
+| `STREAMLING__KAFKA_SINK__SASL_MECHANISM` | _(unset)_ | SASL mechanism (applied when the protocol contains `sasl`) |
+| `STREAMLING__KAFKA_SINK__SASL_USERNAME` | _(unset)_ | SASL username |
+| `STREAMLING__KAFKA_SINK__SASL_PASSWORD` | _(unset)_ | SASL password |
+| `STREAMLING__KAFKA_SINK__SCHEMA_REGISTRY_URL` | `http://localhost:18081` | Schema Registry URL (required for Avro) |
+| `STREAMLING__KAFKA_SINK__SCHEMA_REGISTRY_USERNAME` | _(unset)_ | Schema Registry basic-auth username |
+| `STREAMLING__KAFKA_SINK__SCHEMA_REGISTRY_PASSWORD` | _(unset)_ | Schema Registry basic-auth password |
+| `STREAMLING__KAFKA_SINK__CLIENT_ID` | _(unset)_ | Kafka client id |
+
+#### ClickHouse Sink
+
+The ClickHouse sink writes records to a ClickHouse table over the HTTP interface. The destination table must already exist; the sink reads its schema and sorting keys at startup rather than creating the table.
+
+- **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
+- **Compression**: INSERT request bodies can be gzip-compressed. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
+
+Sample configuration:
+
+```yaml
+sinks:
+  ch_output:
+    type: clickhouse
+    from: filtered_events
+    table: test_output
+    primary_key: id
+    compression: gzip # optional, overrides clickhouse_sink.compression
+```
+
+**Connection settings** — override the embedded defaults with these environment variables:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `STREAMLING__CLICKHOUSE_SINK__URL` | `http://localhost:8123` | ClickHouse HTTP endpoint |
+| `STREAMLING__CLICKHOUSE_SINK__USER` | `default` | Username |
+| `STREAMLING__CLICKHOUSE_SINK__PASSWORD` | _(empty)_ | Password |
+| `STREAMLING__CLICKHOUSE_SINK__DATABASE` | `default` | Database name |
+| `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `none` | Wire compression for INSERTs (`none` or `gzip`); the per-sink `compression` field overrides it |
+| `STREAMLING__CLICKHOUSE_SINK__COMPRESSION_LEVEL` | `6` | gzip compression level (0–9); ignored unless compression resolves to `gzip` |
 
 ## Dynamic Tables
 
