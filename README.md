@@ -234,6 +234,8 @@ sinks:
 
 A single pipeline can mix all three (plugin source, built-in SQL transform, plugin sink) as long as schemas and `primary_key` line up between stages. Write plugins for the parts that are unique to your domain; let the runtime enforce the parts that must be correct in production (checkpointing, offset commit ordering, upsert propagation, backpressure). See [Plugin Pipeline Configuration](#plugin-pipeline-configuration) for loading plugins and the full options reference.
 
+**Community plugins are available in the [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository**.
+
 ## Overview
 
 A pipeline has three sections: `sources`, `transforms` (optional), and `sinks`. Every node exchanges Arrow RecordBatches. Built-in connectors cover Kafka, Postgres, ClickHouse, webhooks, and WASM scripts; anything else can be a [plugin](#plugin-system).
