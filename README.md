@@ -11,23 +11,36 @@
 
 ```
 
-Streamling is a data processing runtime for data processing scenarios. Ingest from sources (event streams, database changelogs, API polling) and process them through multi-stage topologies with checkpointed at-least-once delivery.
+Streamling is a columnar streaming runtime built for writing your own operators. Everything in a pipeline is the same thing underneath: a DataFusion operator passing Apache Arrow `RecordBatch`es. A Kafka source, a SQL filter, sandboxed TypeScript, an HTTP enrichment, and a plugin you wrote yourself all run on one data plane, so they compose freely and inherit the same guarantees.
 
-Plugins can implement any source, transform, or sink. The runtime enforces backpressure, checkpointing, and data safety across the full pipeline. Built-in connectors for kafka, postgres, clickhouse, and more are included for common data flows.
+You write plugins for what's specific to your domain: polling a partner API, enriching from Postgres, pushing to your warehouse. Reuse them across pipelines by id. A plugin runs at native speed, and the runtime gives it the same guarantees the built-in connectors get: backpressure, checkpoint-coordinated at-least-once delivery, schema validation, and upsert (`_gs_op`) propagation.
+
+Built-in connectors for Kafka, Postgres, ClickHouse, and webhooks cover the common movement patterns, so you only write code for the parts that are yours.
 
 Built with Rust, Apache Arrow, and Apache DataFusion. Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
+
+## Plugins vs. the runtime
+
+The division of labor: you own the logic, the runtime owns correctness.
+
+| You implement in plugins                  | The runtime enforces                                            |
+| ----------------------------------------- | --------------------------------------------------------------- |
+| Custom sources, transforms, sinks         | Checkpoint protocol across the full topology                    |
+| Arbitrary connection and processing logic | At-least-once delivery (sources commit only after sink flush)   |
+| Domain-specific schemas and options       | Schema and `primary_key` validation before startup              |
+| External API calls, decoding, enrichment  | Backpressure, graceful shutdown, retriable error classification |
+| State via the plugin state backend        | Upsert semantics (`_gs_op`) through to sinks                    |
 
 ## When to use Streamling
 
 **Streamling is a good fit when you need to:**
 
-- Run **ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source that emits data over time
-- Build **multi-stage data flows** combining plugins, SQL, WASM, HTTP enrichment, [dynamic tables](#dynamic-tables), and custom sinks; the runtime handles orchestration and consistency
-- Get **at-least-once delivery** with checkpoint-coordinated commit ordering: sources don't advance until sinks have durably flushed
-- Extend the runtime with **Rust plugins** or **WASM transforms**: plugins run arbitrary logic against any system; the runtime still enforces checkpointing, schema validation, and delivery guarantees
-- Use **built-in connectors as conveniences**: Kafka, Postgres, ClickHouse, and webhooks cover common data movement patterns without writing plugins
-- Run **bounded batch jobs**: read a finite dataset from a bounded source (e.g. a ClickHouse table), process it, write results, and exit
-- Handle **upserts** (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
+- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline by id. The runtime enforces checkpointing, schema validation, and delivery guarantees around your code
+- **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source that emits data over time
+- **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in a single topology, all exchanging Arrow `RecordBatch`es
+- **Get at-least-once delivery** with checkpoint-coordinated commit ordering: sources don't advance until sinks have durably flushed
+- **Use built-in connectors as conveniences**: Kafka, Postgres, ClickHouse, and webhooks for common data movement, no plugin required
+- **Run bounded batch jobs** and handle upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
 
 Use Streamling when you need a streaming engine to process continuously arriving data in order through a defined pipeline, not a distributed shuffle or windowed aggregation engine.
 
@@ -93,16 +106,6 @@ sinks:
 ```
 
 Your plugins own the I/O and business logic; the runtime owns execution, backpressure, checkpointing, and recovery.
-
-### Plugins vs. the runtime
-
-| You implement in plugins                  | The runtime enforces                                            |
-| ----------------------------------------- | --------------------------------------------------------------- |
-| Custom sources, transforms, sinks         | Checkpoint protocol across the full topology                    |
-| Arbitrary connection and processing logic | At-least-once delivery (sources commit only after sink flush)   |
-| Domain-specific schemas and options       | Schema and `primary_key` validation before startup              |
-| External API calls, decoding, enrichment  | Backpressure, graceful shutdown, retriable error classification |
-| State via the plugin state backend        | Upsert semantics (`_gs_op`) through to sinks                    |
 
 ## Quick start
 
