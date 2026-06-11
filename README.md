@@ -11,9 +11,9 @@
 
 ```
 
-Streamling is a columnar streaming runtime built for writing your own operators. Everything in a pipeline is the same thing underneath: a DataFusion operator passing Apache Arrow `RecordBatch`es. A Kafka source, a SQL filter, sandboxed TypeScript, an HTTP enrichment, and a plugin you wrote yourself all run on one data plane, so they compose freely and inherit the same guarantees.
+Streamling is a columnar streaming runtime easily extendable with your own operators. Everything in a pipeline is the same thing underneath: a DataFusion operator passing Apache Arrow `RecordBatch`es. A Kafka source, a SQL filter, sandboxed TypeScript, an HTTP enrichment, and a plugin you wrote yourself all run on one data plane, so they compose freely and inherit the same guarantees.
 
-You write plugins for what's specific to your domain: polling a partner API, enriching from Postgres, pushing to your warehouse. Reuse them across pipelines by id. A plugin runs at native speed, and the runtime gives it the same guarantees the built-in connectors get: backpressure, checkpoint-coordinated at-least-once delivery, schema validation, and upsert (`_gs_op`) propagation.
+You can write plugins for what's specific to your domain: polling a partner API, enriching from Postgres, pushing to your warehouse. Reuse them across pipelines by id. A plugin runs at native speed, and the runtime gives it the same guarantees the built-in connectors get: backpressure, checkpoint-coordinated at-least-once delivery, schema validation, and upsert (`_gs_op`) propagation.
 
 Built-in connectors for Kafka, Postgres, ClickHouse, and webhooks cover the common movement patterns, so you only write code for the parts that are yours.
 
