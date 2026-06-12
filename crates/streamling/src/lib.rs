@@ -496,6 +496,10 @@ impl Streamling {
         let mut plugins: BTreeMap<String, InitializedPlugin> = BTreeMap::new();
 
         let mut checkpoint_coordinator = CheckpointCoordinator::new();
+        // Control handle shared with bounded sources (to begin the terminal
+        // checkpoint) and sink futures (to signal completion). Valid before
+        // the coordinator is started since it shares the coordinator's state.
+        let checkpoint_control = checkpoint_coordinator.control();
         let mut checkpoint_sink_names: Vec<String> = Vec::new();
 
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
@@ -713,20 +717,26 @@ impl Streamling {
                     let offset_table = &hybrid.offset_table;
                     let primary_key_opt = &hybrid.primary_key;
 
-                    let hybrid_source_provider = Arc::new(HybridTableProvider::new_from_topology(
-                        reference_name.clone(),
-                        bounded_sources.clone(),
-                        unbounded_source.clone(),
-                        offset_table.clone(),
-                        &app_config,
-                        &state_backend_factory,
-                        session_manager.clone(),
-                        // Per-phase event-time config flows directly to the
-                        // inner WrappingSourceTableProviders (one per bounded
-                        // phase + one for unbounded), each carrying its own
-                        // `metric_key_hybrid_src_*` suffix. R9 falls out.
-                        hybrid.telemetry.as_ref(),
-                    )?);
+                    let hybrid_source_provider = Arc::new(
+                        HybridTableProvider::new_from_topology(
+                            reference_name.clone(),
+                            bounded_sources.clone(),
+                            unbounded_source.clone(),
+                            offset_table.clone(),
+                            &app_config,
+                            &state_backend_factory,
+                            session_manager.clone(),
+                            // Per-phase event-time config flows directly to the
+                            // inner WrappingSourceTableProviders (one per bounded
+                            // phase + one for unbounded), each carrying its own
+                            // `metric_key_hybrid_src_*` suffix. R9 falls out.
+                            hybrid.telemetry.as_ref(),
+                        )?
+                        // In job mode this source emits the terminal checkpoint
+                        // when its bounded phases complete; give it the control
+                        // handle so shutdown can gate on that epoch finalizing.
+                        .with_checkpoint_control(checkpoint_control.clone()),
+                    );
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         hybrid_source_provider.clone(),
@@ -1887,6 +1897,9 @@ impl Streamling {
                     .map(|e| e.name.as_str())
                     .collect::<Vec<&str>>()
                     .join(", ");
+                // Captured for the SinkComplete signal below: one entry per
+                // sink driven by this future (a fan-out future drives several).
+                let sink_names: Vec<String> = sinks.iter().map(|e| e.name.clone()).collect();
                 let sink_plan = if sinks.len() > 1 {
                     // Fan-out: each sink gets its own RebatchExec injected by
                     // the MultiSinkExtensionPlanner, so the raw source_plan
@@ -1925,6 +1938,7 @@ impl Streamling {
 
                 if !dry_run {
                     let session_manager = session_manager.clone();
+                    let checkpoint_control = checkpoint_control.clone();
                     let sink_future = async move {
                         let result = session_manager.new_df(sink_plan).collect().await;
                         if let Err(err) = &result {
@@ -1932,6 +1946,15 @@ impl Streamling {
                                 "Sink future [{}] completed with error: {}",
                                 future_name, err
                             );
+                        }
+                        // The sink has drained its input and will not ack any
+                        // further checkpoint epochs. Tell the coordinator so it
+                        // drops these sinks from the expected-ack set and can
+                        // finalize in-flight epochs the remaining live sinks
+                        // have already acked, instead of blocking on a sink
+                        // that is gone (the multi-source completion case).
+                        for sink_name in &sink_names {
+                            checkpoint_control.sink_completed(sink_name);
                         }
                         result
                     };
@@ -2007,6 +2030,25 @@ impl Streamling {
                 .map(|_| ())
                 .map_err(Into::into)
         };
+
+        // In job mode a completing bounded source emits a terminal checkpoint as
+        // its last act. Before tearing anything down, wait for that epoch to
+        // finalize so the tail is durably checkpointed and its Finalizer reaches
+        // components that commit on it (still alive at this point). Bounded by a
+        // timeout so a sink that died without acking cannot hang shutdown, and
+        // skipped on error (no terminal checkpoint will arrive). A no-op when no
+        // terminal checkpoint was begun (the streaming case).
+        if !dry_run
+            && app_result.is_ok()
+            && timeout(
+                Duration::from_secs(30),
+                checkpoint_control.await_terminal_finalized(),
+            )
+            .await
+            .is_err()
+        {
+            warn!("Terminal checkpoint did not finalize within 30s; proceeding with shutdown");
+        }
 
         // Issue SourceComplete message to plugins. This is needed to fully clean up checkpoint channels when plugins
         // terminate.

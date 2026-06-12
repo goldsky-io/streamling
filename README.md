@@ -1061,6 +1061,38 @@ Finally, the print sink sends the checkpoint ack back to the coordinator. Once t
 number of acks (just 1 in this case, since there is only one sink), it finalizes the epoch and sends the finalizer
 message to the Kafka source. The source then commits the offsets.
 
+### Bounded sources and the terminal checkpoint
+
+Most sources are unbounded (Kafka), so the flow above runs on a timer for as long as the pipeline lives. A bounded
+source is different: it has a definite end. The hybrid source in job mode is the current example. It reads its bounded
+phases and then completes instead of switching to its unbounded phase.
+
+This is a problem for the flow above. Checkpoint markers ride inline on data batches, and an epoch finalizes only once
+every sink acks it. When a bounded source reaches its last batch, the timer may not have emitted a marker after that
+batch, so the final rows can complete without ever being covered by a finalized checkpoint. There is also no later
+batch to carry a marker through the graph once the source has stopped producing.
+
+**Every bounded source must follow this contract when it completes:**
+
+1. Call `CheckpointControl::begin_terminal_checkpoint()` to mint the terminal epoch. This stops the timer producer and
+   registers the epoch so the coordinator waits for it.
+2. Emit that epoch as a `Marker` on a final batch (a synthetic empty batch is fine), after the last real data. Emitting
+   it after the data keeps the marker ordered behind everything so the checkpoint covers a consistent cut.
+3. Then end the stream.
+
+The runtime gates teardown on this. After the sinks drain, it waits (`CheckpointControl::await_terminal_finalized`) for
+the terminal epoch to finalize before it stops the coordinator and terminates plugins. The sinks flush and ack the
+terminal marker as their last batch, the coordinator finalizes the epoch, and the Finalizer reaches any component that
+commits on it while that component is still alive. The wait is bounded by a timeout so a sink that dies without acking
+cannot hang shutdown.
+
+When several sources feed one pipeline and complete at different times, a sink whose only upstream has finished stops
+acking. The coordinator drops such a sink from its expected-ack set (`CheckpointControl::sink_completed`, signalled by
+the runtime as each sink drains) so the remaining epochs, including the terminal one, can still finalize. Without this a
+single finished branch would block finalization for every other branch.
+
+The hybrid source's job-mode termination path is the reference implementation.
+
 ## State Backends
 
 Streamling supports multiple state backend implementations for persisting operator state.

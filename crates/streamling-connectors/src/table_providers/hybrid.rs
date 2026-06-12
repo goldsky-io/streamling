@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use streamling_config::AppConfig;
 use streamling_core::checkpoints::channels::{subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
-    extract_checkpoint_messages,
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointControl, CheckpointMessage,
+    enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
 };
 use streamling_core::data::COLUMN_NAME_OP;
 use streamling_core::error::ResultExt;
@@ -144,6 +144,11 @@ pub struct HybridTableProvider {
     pub state: Arc<RwLock<HybridSourceState>>,
     reference_name: String,
     session_manager: SessionManager,
+    /// Control handle for the checkpoint coordinator. When set and `job_mode`
+    /// is on, the source begins a terminal checkpoint and emits its marker
+    /// inline after the last bounded batch (see the job-mode termination path
+    /// in `execute`). `None` outside a running pipeline (e.g. in tests).
+    checkpoint_control: Option<CheckpointControl>,
 }
 impl Debug for HybridTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -213,9 +218,18 @@ impl HybridTableProvider {
             state: Arc::new(RwLock::new(initial_state)),
             reference_name,
             session_manager,
+            checkpoint_control: None,
         };
 
         Ok(provider)
+    }
+
+    /// Attach the checkpoint control handle so this source can begin the
+    /// terminal checkpoint when it completes in job mode. Builder-style so the
+    /// provider can be configured before being wrapped in an `Arc`.
+    pub fn with_checkpoint_control(mut self, control: CheckpointControl) -> Self {
+        self.checkpoint_control = Some(control);
+        self
     }
 
     pub fn new_from_topology(
@@ -1146,6 +1160,32 @@ impl ExecutionPlan for HybridSourceExec {
                                     "Job mode: all {} bounded phase(s) complete, terminating hybrid source",
                                     provider.config.bounded_sources.len()
                                 );
+
+                                // Emit a terminal checkpoint marker inline,
+                                // after all bounded data, so the sinks flush and
+                                // ack a final epoch covering everything before
+                                // the pipeline tears down. The coordinator gates
+                                // shutdown on this epoch finalizing
+                                // (`await_terminal_finalized`). Reuses the
+                                // synthetic-batch flush path so the marker rides
+                                // the data stream and keeps a consistent cut.
+                                if let Some(control) = &provider.checkpoint_control {
+                                    let terminal = control.begin_terminal_checkpoint();
+                                    pending_for_main.lock().unwrap().push(
+                                        CheckpointMessage::Marker {
+                                            epoch: terminal,
+                                            created_at_ms: now_ms(),
+                                        },
+                                    );
+                                    flush_pending_to_synth_batch(
+                                        &pending_for_main,
+                                        &schema_for_synth,
+                                        &tx,
+                                        &reference_name_for_spawn,
+                                    )
+                                    .await;
+                                }
+
                                 provider.shutdown();
                                 break 'outer;
                             }
@@ -2431,6 +2471,63 @@ mod tests {
         assert!(
             state.completed_phases.iter().all(|&c| c),
             "All bounded phases should be marked complete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_source_emits_terminal_marker_in_job_mode() {
+        use streamling_core::checkpoints::checkpoint_management::CheckpointCoordinator;
+
+        // With a control handle attached, a completing job-mode source must
+        // emit a terminal checkpoint marker on a final (synthetic) batch so the
+        // sinks can flush and ack a checkpoint covering all bounded data before
+        // the pipeline tears down.
+        let coordinator = CheckpointCoordinator::new();
+        let control = coordinator.control();
+
+        let bounded_sources: Vec<Arc<dyn TableProvider>> =
+            vec![Arc::new(FiniteMockTableProvider::new())];
+        let unbounded_source: Arc<dyn TableProvider> = Arc::new(FiniteMockTableProvider::new());
+
+        let config = HybridSourceConfig {
+            bounded_sources,
+            unbounded_source,
+            offset_provider: None,
+            job_mode: true,
+        };
+
+        let state_backend =
+            create_state_backend("test_hybrid_source_emits_terminal_marker_in_job_mode").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_terminal_marker".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+        .with_checkpoint_control(control);
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let context = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        let batches: Vec<_> = stream.collect().await;
+
+        let emitted_markers: Vec<_> = batches
+            .iter()
+            .filter_map(|b| b.as_ref().ok())
+            .flat_map(|b| extract_checkpoint_messages(b.schema().metadata()))
+            .filter(|m| matches!(m, CheckpointMessage::Marker { .. }))
+            .collect();
+
+        assert!(
+            !emitted_markers.is_empty(),
+            "job-mode source should emit a terminal checkpoint marker on completion"
         );
     }
 
