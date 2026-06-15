@@ -40,6 +40,12 @@ struct Cli {
     validate: bool,
 }
 
+impl Cli {
+    fn is_dry_run(&self) -> bool {
+        self.dry_run || self.validate
+    }
+}
+
 fn build_env_filter(default_level: &str) -> EnvFilter {
     let base = match std::env::var("RUST_LOG") {
         Ok(val) if !val.is_empty() => EnvFilter::from_default_env(),
@@ -217,7 +223,7 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let validate = cli.validate;
-    let dry_run = cli.dry_run || cli.validate;
+    let dry_run = cli.is_dry_run();
 
     let app_config = match AppConfig::load_from_path(&cli.config) {
         Ok(config) => config,
@@ -264,4 +270,63 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn defaults_when_no_args() {
+        let cli = Cli::try_parse_from(["streamling"]).unwrap();
+        assert_eq!(cli.pipeline_file, None);
+        assert_eq!(cli.config, "config");
+        assert!(!cli.dry_run);
+        assert!(!cli.validate);
+        assert!(!cli.is_dry_run());
+    }
+
+    #[test]
+    fn pipeline_file_is_captured_positionally() {
+        let cli = Cli::try_parse_from(["streamling", "pipeline.yaml"]).unwrap();
+        assert_eq!(cli.pipeline_file.as_deref(), Some("pipeline.yaml"));
+    }
+
+    #[test]
+    fn config_flag_overrides_default() {
+        let cli = Cli::try_parse_from(["streamling", "--config", "custom.yaml"]).unwrap();
+        assert_eq!(cli.config, "custom.yaml");
+    }
+
+    #[test]
+    fn dry_run_flag_enables_dry_run() {
+        let cli = Cli::try_parse_from(["streamling", "--dry-run"]).unwrap();
+        assert!(cli.dry_run);
+        assert!(!cli.validate);
+        assert!(cli.is_dry_run());
+    }
+
+    #[test]
+    fn validate_implies_dry_run() {
+        let cli = Cli::try_parse_from(["streamling", "--validate"]).unwrap();
+        assert!(cli.validate);
+        assert!(!cli.dry_run);
+        assert!(cli.is_dry_run());
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["streamling", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn extra_positional_is_rejected() {
+        assert!(Cli::try_parse_from(["streamling", "a.yaml", "b.yaml"]).is_err());
+    }
 }
