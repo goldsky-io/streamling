@@ -245,6 +245,64 @@ impl KafkaResource {
         Ok(avg_payload_bytes)
     }
 
+    /// Produce a single Avro record holding a `decimal` logical-type column.
+    ///
+    /// `schema_str` must be a record schema with two fields: an `id` long
+    /// and a `decimal(precision, scale)` field named by `decimal_field`. The
+    /// unscaled decimal value is supplied as a base-10 string (`unscaled_value`).
+    ///
+    /// Uses the schema-registry wire format: `[magic(0)] [schema_id BE u32] [avro_datum]`.
+    pub async fn produce_decimal_record(
+        &self,
+        schema_str: &str,
+        id: i64,
+        decimal_field: &str,
+        unscaled_value: &str,
+    ) -> Result<()> {
+        use apache_avro::types::{Record, Value};
+        use apache_avro::{Decimal, Schema};
+        use num_bigint::BigInt;
+        use rdkafka::message::{Header, OwnedHeaders};
+        use std::str::FromStr;
+
+        // Register schema (idempotent) to fetch the registry id we need.
+        let schema_id = self.register_schema(schema_str).await?;
+
+        let schema = Schema::parse_str(schema_str)
+            .map_err(|e| E2eError::Kafka(format!("invalid schema: {}", e)))?;
+        let mut record = Record::new(&schema)
+            .ok_or_else(|| E2eError::Kafka("schema is not a record".to_string()))?;
+        let unscaled = BigInt::from_str(unscaled_value).map_err(|e| {
+            E2eError::Kafka(format!(
+                "invalid unscaled bigint '{}': {}",
+                unscaled_value, e
+            ))
+        })?;
+        let bytes = unscaled.to_signed_bytes_be();
+        record.put("id", id);
+        record.put(decimal_field, Value::Decimal(Decimal::from(bytes)));
+
+        let datum = apache_avro::to_avro_datum(&schema, record)
+            .map_err(|e| E2eError::Kafka(format!("avro encode failed: {}", e)))?;
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&schema_id.to_be_bytes());
+        payload.extend_from_slice(&datum);
+
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "dbz.op",
+            value: Some("c"),
+        });
+        let kafka_record = FutureRecord::to(&self.topic)
+            .payload(&payload)
+            .key("")
+            .headers(headers);
+        self.producer
+            .send(kafka_record, Timeout::After(Duration::from_secs(15)))
+            .await
+            .map_err(|(e, _)| E2eError::Kafka(e.to_string()))?;
+        Ok(())
+    }
+
     /// Produce raw bytes to the topic
     pub async fn produce_raw(&self, records: &[Vec<u8>]) -> Result<()> {
         for payload in records {

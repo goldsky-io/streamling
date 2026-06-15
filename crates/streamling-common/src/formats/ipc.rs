@@ -738,4 +738,75 @@ mod tests {
         assert_eq!(restored_batch.num_rows(), 0);
         assert_eq!(restored_batch.schema(), target_schema);
     }
+
+    // ------- T031: decimal_arb survives Arrow IPC round-trip -------
+    //
+    // The IPC writer leaves non-u256/i256 fields untouched and Arrow IPC
+    // preserves field metadata natively, so decimal_arb columns flow through
+    // without conversion. The reader's `convert_batch_to_original_schema`
+    // sees matching schemas (LargeBinary + same extension metadata) and
+    // early-returns the batch as-is. This test pins that behavior.
+
+    #[test]
+    fn test_arrow_ipc_arrow_roundtrip_with_decimal_arb() {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+        use std::str::FromStr;
+
+        let field = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        // Build a batch with three values including a 100-digit one,
+        // a NULL, and a negative.
+        let mut s = String::with_capacity(101);
+        s.push('1');
+        for _ in 0..81 {
+            s.push('0');
+        }
+        s.push_str(".000000000000000001");
+
+        let mut b = DecimalArbArrayBuilder::with_capacity(3, "amount", 100, 18).unwrap();
+        b.append_str(&s).unwrap();
+        b.append_null();
+        b.append_str("-99.5").unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let original_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(raw) as ArrayRef]).unwrap();
+
+        // Round-trip: Arrow -> IPC -> Arrow.
+        let to_ipc = FromArrowToIpcConverter::new();
+        let ipc_bytes_vec = to_ipc.convert_from_batch(&original_batch).unwrap();
+        assert_eq!(ipc_bytes_vec.len(), 1);
+
+        let mut from_ipc = FromIpcToArrowConverter::new(schema.clone());
+        from_ipc.buffer(ipc_bytes_vec.into_iter().next().unwrap());
+        let restored_batch = from_ipc.convert_to_batch().unwrap();
+
+        assert_eq!(restored_batch.num_rows(), 3);
+        assert_eq!(restored_batch.num_columns(), 1);
+
+        // Field metadata must round-trip — that's what makes the column a
+        // decimal_arb column rather than plain LargeBinary downstream.
+        let restored_field = restored_batch.schema().field(0).clone();
+        assert!(
+            DecimalArbType::is_decimal_arb_field(&restored_field),
+            "decimal_arb extension metadata must survive Arrow IPC round-trip"
+        );
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&restored_field),
+            Some((100, 18)),
+        );
+
+        // Values must round-trip byte-for-byte (canonical encoding is stable).
+        let restored = restored_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::LargeBinaryArray>()
+            .expect("decimal_arb storage type is LargeBinary");
+
+        let v0 = DecimalArbValue::from_canonical_bytes_at_scale(restored.value(0), 18).unwrap();
+        assert_eq!(v0, DecimalArbValue::from_str(&s).unwrap());
+        assert!(restored.is_null(1));
+        let v2 = DecimalArbValue::from_canonical_bytes_at_scale(restored.value(2), 18).unwrap();
+        assert_eq!(v2, DecimalArbValue::from_str("-99.5").unwrap());
+    }
 }

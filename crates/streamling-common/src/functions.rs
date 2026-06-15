@@ -9,6 +9,14 @@ use crate::functions::coalesce_meta::CoalesceMetaUdf;
 use crate::functions::conv_base::ConvBaseFunc;
 use crate::functions::current_date::VolatileCurrentDateFunc;
 use crate::functions::current_time::VolatileCurrentTimeFunc;
+use crate::functions::decimal_arb_ops::{
+    DecimalArbAbsFunc, DecimalArbAddFunc, DecimalArbDivFunc, DecimalArbEqFunc, DecimalArbGtFunc,
+    DecimalArbGteFunc, DecimalArbLtFunc, DecimalArbLteFunc, DecimalArbModFunc, DecimalArbMulFunc,
+    DecimalArbNegFunc, DecimalArbNeqFunc, DecimalArbSortKeyFunc, DecimalArbSubFunc,
+    DecimalArbToDecimal128Func, DecimalArbToDecimal256Func, DecimalArbToStringFunc,
+    ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
+    ToDecimalArbFromStringFunc,
+};
 use crate::functions::from_base58::create_from_base58_udf;
 use crate::functions::generate_series::GenerateSeriesFunc;
 use crate::functions::gs_map_to_array_struct::create_gs_map_to_array_struct_udf;
@@ -41,6 +49,10 @@ pub mod coalesce_meta;
 pub mod conv_base;
 pub mod current_date;
 pub mod current_time;
+pub mod decimal_arb_aggregates;
+pub mod decimal_arb_coercion;
+pub mod decimal_arb_ops;
+pub mod decimal_arb_sort_optimizer;
 pub mod from_base58;
 pub mod generate_series;
 pub mod gs_map_to_array_struct;
@@ -106,6 +118,31 @@ impl CommonFunctions {
             ScalarUDF::from(I256AbsFunc::new()),
             ScalarUDF::from(ToInt64Func::new()),
             ScalarUDF::from(Uuid7Func::new()),
+            // decimal_arb functions (US1 sink-side helper + US2 arithmetic)
+            ScalarUDF::from(DecimalArbToStringFunc::new()),
+            ScalarUDF::from(DecimalArbAddFunc::new()),
+            ScalarUDF::from(DecimalArbSubFunc::new()),
+            ScalarUDF::from(DecimalArbMulFunc::new()),
+            ScalarUDF::from(DecimalArbDivFunc::new()),
+            ScalarUDF::from(DecimalArbModFunc::new()),
+            ScalarUDF::from(DecimalArbNegFunc::new()),
+            ScalarUDF::from(DecimalArbAbsFunc::new()),
+            // decimal_arb comparisons (US2 / T043)
+            ScalarUDF::from(DecimalArbEqFunc::new()),
+            ScalarUDF::from(DecimalArbNeqFunc::new()),
+            ScalarUDF::from(DecimalArbLtFunc::new()),
+            ScalarUDF::from(DecimalArbLteFunc::new()),
+            ScalarUDF::from(DecimalArbGtFunc::new()),
+            ScalarUDF::from(DecimalArbGteFunc::new()),
+            // decimal_arb sort-key helper (US2 / T046 partial)
+            ScalarUDF::from(DecimalArbSortKeyFunc::new()),
+            // decimal_arb cast UDFs (US4 / T068)
+            ScalarUDF::from(ToDecimalArbFromStringFunc::new()),
+            ScalarUDF::from(ToDecimalArbFromDecimal128Func::new()),
+            ScalarUDF::from(ToDecimalArbFromDecimal256Func::new()),
+            ScalarUDF::from(DecimalArbToDecimal128Func::new()),
+            ScalarUDF::from(DecimalArbToDecimal256Func::new()),
+            ScalarUDF::from(ToDecimalArbFromIntFunc::new()),
         ]
     }
 }

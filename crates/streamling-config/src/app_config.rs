@@ -409,6 +409,61 @@ impl<'de> SerdeDeserialize<'de> for GzipCompressionLevel {
     }
 }
 
+/// Per-column directive on a sink (or hybrid). Today only `coerce_to`
+/// is recognized; the YAML grammar reserves room for future variants.
+///
+/// Example:
+///
+/// ```yaml
+/// sinks:
+///   analytics:
+///     type: clickhouse
+///     columns:
+///       - name: amount
+///         coerce_to: string
+/// ```
+///
+/// `coerce_to: string` is the FR-019 opt-in for emitting a wide-precision
+/// decimal_arb column to a destination that cannot hold it natively
+/// (e.g. ClickHouse `Decimal` capped at 76 digits). Without the
+/// directive, the pipeline is rejected at config load.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnDirective {
+    pub name: String,
+    /// Optional coercion the sink applies when emitting this column.
+    pub coerce_to: Option<CoercionTarget>,
+}
+
+/// Allowed values for `coerce_to:`. Only `string` exists in v1 — future
+/// variants would land here.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoercionTarget {
+    /// Emit the column as a string field on the destination, encoded as
+    /// canonical decimal text. Required for wide-precision decimal_arb
+    /// columns flowing into ClickHouse / Protobuf / other destinations
+    /// that lack native arbitrary-precision decimals.
+    String,
+}
+
+impl ColumnDirective {
+    /// Look up directives for a specific column name in a list. Returns
+    /// `None` if the column has no entry; this is the "no opt-in" case
+    /// and the connector capability matrix decides what to do.
+    pub fn find<'a>(
+        directives: Option<&'a [ColumnDirective]>,
+        column: &str,
+    ) -> Option<&'a ColumnDirective> {
+        directives?.iter().find(|d| d.name == column)
+    }
+
+    /// Convenience: returns true iff this directive sets `coerce_to: string`.
+    pub fn coerces_to_string(&self) -> bool {
+        matches!(self.coerce_to, Some(CoercionTarget::String))
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -425,6 +480,14 @@ pub struct ClickHouseConfig {
     /// default level 3), and `"lz4"` (frame format has no level knob).
     #[serde(default)]
     pub compression_level: GzipCompressionLevel,
+    /// Per-column directives applied to outgoing rows on the sink side.
+    /// See [`ColumnDirective`] for the supported keys.
+    ///
+    /// Accepts either a YAML/JSON list of directives (config-file shape) or
+    /// a JSON-encoded string of the same (env-var shape, e.g.
+    /// `STREAMLING__CLICKHOUSE_SINK__COLUMNS='[{"name":"amount","coerce_to":"string"}]'`).
+    #[serde(default, deserialize_with = "deserialize_optional_column_directives")]
+    pub columns: Option<Vec<ColumnDirective>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -659,6 +722,49 @@ where
             .map(|item| item.trim().to_string())
             .filter(|item| !item.is_empty())
             .collect()),
+    }
+}
+
+/// Accepts either a YAML/JSON sequence of [`ColumnDirective`] entries (the
+/// normal config-file shape) or a JSON-encoded string of the same
+/// (the env-var shape — env vars are always strings, so a list of
+/// structs has to be encoded as JSON text).
+///
+/// Example env-var: `STREAMLING__CLICKHOUSE_SINK__COLUMNS='[{"name":"amount","coerce_to":"string"}]'`
+fn deserialize_optional_column_directives<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ColumnDirective>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(SerdeDeserialize)]
+    #[serde(untagged)]
+    enum ListOrString {
+        List(Vec<ColumnDirective>),
+        String(String),
+        Null,
+    }
+
+    match Option::<ListOrString>::deserialize(deserializer)? {
+        None | Some(ListOrString::Null) => Ok(None),
+        Some(ListOrString::List(list)) => Ok(Some(list)),
+        Some(ListOrString::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::from_str::<Vec<ColumnDirective>>(trimmed)
+                    .map(Some)
+                    .map_err(|e| {
+                        D::Error::custom(format!(
+                            "failed to parse columns as JSON list of ColumnDirective: {}",
+                            e
+                        ))
+                    })
+            }
+        }
     }
 }
 
@@ -1038,6 +1144,123 @@ password: ""
         );
     }
 
+    // ------- T062: ColumnDirective YAML parsing -------
+
+    #[test]
+    fn parse_clickhouse_config_with_column_directives() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns:
+  - name: amount
+    coerce_to: string
+  - name: id
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        let cols = cfg.columns.expect("columns parsed");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "amount");
+        assert_eq!(cols[0].coerce_to, Some(CoercionTarget::String));
+        assert!(cols[0].coerces_to_string());
+        assert_eq!(cols[1].name, "id");
+        assert_eq!(cols[1].coerce_to, None);
+        assert!(!cols[1].coerces_to_string());
+    }
+
+    #[test]
+    fn parse_clickhouse_columns_from_json_string() {
+        // Env-var shape: a JSON-encoded list-of-directives string.
+        // Mirrors `STREAMLING__CLICKHOUSE_SINK__COLUMNS='[...]'`.
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns: '[{"name":"amount","coerce_to":"string"},{"name":"id"}]'
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        let cols = cfg.columns.expect("columns parsed from JSON string");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "amount");
+        assert!(cols[0].coerces_to_string());
+        assert_eq!(cols[1].name, "id");
+        assert!(!cols[1].coerces_to_string());
+    }
+
+    #[test]
+    fn parse_clickhouse_columns_empty_string_is_none() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns: ""
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.columns.is_none());
+    }
+
+    #[test]
+    fn parse_clickhouse_columns_invalid_json_fails() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns: "not json"
+"#;
+        let err = serde_yaml::from_str::<ClickHouseConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("JSON"),
+            "error should mention JSON parsing: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_clickhouse_config_without_columns_is_optional() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.columns.is_none());
+    }
+
+    #[test]
+    fn column_directive_rejects_unknown_keys() {
+        // CONN-002 in AGENTS.md: sink configs use deny_unknown_fields so
+        // typos surface at config load.
+        let yaml = r#"
+name: amount
+coerce_to: string
+extra_typo: oops
+"#;
+        let err = serde_yaml::from_str::<ColumnDirective>(yaml).unwrap_err();
+        assert!(format!("{}", err).contains("extra_typo"));
+    }
+
+    #[test]
+    fn column_directive_rejects_unknown_coerce_to_value() {
+        let yaml = r#"
+name: amount
+coerce_to: bigint_truncated
+"#;
+        // `bigint_truncated` is not in the CoercionTarget enum (only
+        // `string` exists). The parser should reject it.
+        let err = serde_yaml::from_str::<ColumnDirective>(yaml).unwrap_err();
+        assert!(
+            format!("{}", err).contains("bigint_truncated")
+                || format!("{}", err).contains("variant"),
+            "expected error to mention the rejected variant; got: {}",
+            err,
+        );
+    }
+
     #[test]
     fn clickhouse_compression_rejects_bool() {
         // Only the strings `"none"` / `"gzip"` / `"zstd"` / `"lz4"` are
@@ -1225,5 +1448,23 @@ password: ""
             config.client_statement_timeout(),
             Some(std::time::Duration::from_secs(u64::MAX))
         );
+    }
+
+    #[test]
+    fn column_directive_find_by_name() {
+        let directives = vec![
+            ColumnDirective {
+                name: "amount".to_string(),
+                coerce_to: Some(CoercionTarget::String),
+            },
+            ColumnDirective {
+                name: "id".to_string(),
+                coerce_to: None,
+            },
+        ];
+        assert!(ColumnDirective::find(Some(&directives), "amount").is_some());
+        assert!(ColumnDirective::find(Some(&directives), "id").is_some());
+        assert!(ColumnDirective::find(Some(&directives), "missing").is_none());
+        assert!(ColumnDirective::find(None, "amount").is_none());
     }
 }

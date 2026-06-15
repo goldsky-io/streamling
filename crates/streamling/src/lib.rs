@@ -428,6 +428,39 @@ fn wrap_with_rebatch(
     }
 }
 
+/// Walk a sink's resolved schema and reject any decimal_arb column the
+/// connector cannot carry. Surfaces every Reject error at once (not just
+/// the first), prefixed with the sink's reference name so the user knows
+/// which YAML block to fix.
+fn validate_sink_decimal_arb(
+    schema: &arrow_schema::Schema,
+    kind: streamling_common::types::decimal_arb_capability::ConnectorKind,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+    sink_name: &str,
+) -> Result<()> {
+    use streamling_common::types::decimal_arb_capability::{
+        ColumnDirectiveView, validate_pipeline_decimal_arb,
+    };
+    let views: Vec<ColumnDirectiveView<'_>> = directives
+        .into_iter()
+        .flatten()
+        .map(|d| ColumnDirectiveView {
+            name: d.name.as_str(),
+            coerce_to_string: d.coerces_to_string(),
+        })
+        .collect();
+    if let Err(errs) = validate_pipeline_decimal_arb(schema, kind, &views) {
+        let joined = errs
+            .into_inner()
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        streamling_user_bail!("sink '{}': {}", sink_name, joined);
+    }
+    Ok(())
+}
+
 pub struct Streamling {
     pub app_config: AppConfig,
     pub pipeline_topology: PipelineTopology,
@@ -1609,6 +1642,13 @@ impl Streamling {
                         validate_update_where(uw, &source_schema, &reference_name)?;
                     }
 
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+                        None,
+                        &reference_name,
+                    )?;
+
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
@@ -1726,6 +1766,13 @@ impl Streamling {
                             .create_trigger_and_tables(&app_config.postgres_sink)
                             .await?;
                     }
+
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+                        None,
+                        &reference_name,
+                    )?;
 
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
@@ -1856,6 +1903,13 @@ impl Streamling {
                         &source_schema,
                     )?;
 
+                    let kafka_kind = match data_format.to_lowercase().as_str() {
+                        "avro" => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaAvro { declared_bytes: None },
+                        "json" => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+                        _ => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+                    };
+                    validate_sink_decimal_arb(&source_schema, kafka_kind, None, &reference_name)?;
+
                     let kafka_sink_provider = Arc::new(KafkaSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema,
@@ -1921,6 +1975,12 @@ impl Streamling {
                         Some(raw_batch_flush_interval.unwrap_or_else(|| {
                             Duration::from_millis(app_config.record_batch_interval_ms)
                         }));
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+                        app_config.clickhouse_sink.columns.as_deref(),
+                        &reference_name,
+                    )?;
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),
                         table.as_str(),
@@ -1973,6 +2033,13 @@ impl Streamling {
                         from.clone(),
                         reference_name.clone(),
                         &source_schema,
+                    )?;
+
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
+                        None,
+                        &reference_name,
                     )?;
 
                     let mut plugin_opts = options.clone().unwrap_or_default();
@@ -2589,6 +2656,106 @@ impl Streamling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- validate_sink_decimal_arb -----
+
+    fn arb_schema(precision: u32, scale: u32) -> arrow_schema::Schema {
+        let f = streamling_common::types::decimal_arb::DecimalArbType::field(
+            "amount", precision, scale, false,
+        )
+        .unwrap();
+        arrow_schema::Schema::new(vec![f])
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_postgres_native() {
+        let schema = arb_schema(100, 18);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+            None,
+            "pg_sink",
+        )
+        .expect("Postgres at p=100 should be Native");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_clickhouse_rejects_without_directive() {
+        let schema = arb_schema(100, 18);
+        let err = validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            None,
+            "ch_sink",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ch_sink"), "error names sink: {}", msg);
+        assert!(msg.contains("amount"), "error names column: {}", msg);
+        assert!(
+            msg.contains("coerce_to: string"),
+            "error suggests directive: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_clickhouse_passes_with_directive() {
+        let schema = arb_schema(100, 18);
+        let directives = vec![streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        }];
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            Some(&directives),
+            "ch_sink",
+        )
+        .expect("ClickHouse with coerce_to: string should be OptInOnly (OK)");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_kafka_json_native() {
+        let schema = arb_schema(200, 50);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+            None,
+            "kafka_sink",
+        )
+        .expect("Kafka JSON should accept any precision");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_plugin_rejects_by_default() {
+        let schema = arb_schema(50, 10);
+        let err = validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
+            None,
+            "my_plugin",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("my_plugin"));
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_no_decimal_arb_columns_passes() {
+        // Schema with only plain types — no decimal_arb fields, validator is a no-op.
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            None,
+            "any_sink",
+        )
+        .expect("schema without decimal_arb columns is always OK");
+    }
 
     #[test]
     fn test_normalize_secret_name_hyphens_and_dots() {

@@ -23,7 +23,7 @@ use streamling_core::checkpoints::checkpoint_management::{
     extract_checkpoint_messages,
 };
 use streamling_core::data::COLUMN_NAME_OP;
-use streamling_core::error::ResultExt;
+use streamling_core::error::{ResultExt, StreamlingError};
 use streamling_core::operators::wrapping::WrappingSourceTableProvider;
 use streamling_core::session::SessionManager;
 use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
@@ -1406,6 +1406,68 @@ impl ClickHouseSchemaAdapter {
         Ok(columns)
     }
 
+    /// Directive-aware top-level type-mapping entry point for the
+    /// Hybrid connector (ClickHouse-backed).
+    ///
+    /// Mirrors [`ClickHouseClient::clickhouse_column_type`] but tags the
+    /// capability lookup with [`ConnectorKind::Hybrid`] so error messages
+    /// surface the right connector to the user.
+    ///
+    /// Returns:
+    /// - `Ok("Decimal(p, s)")` for `decimal_arb` columns where the
+    ///   declared precision (≤76) fits ClickHouse's native decimal range.
+    /// - `Ok("String")` for wider `decimal_arb` columns when the user has
+    ///   set `coerce_to: string` on this column (explicit FR-019 opt-in).
+    /// - `Err(...)` for wider `decimal_arb` columns without the opt-in
+    ///   (FR-011: pipeline rejected at config load with an actionable
+    ///   error naming the column, the destination, the declared
+    ///   `(precision, scale)`, and the remediation hint).
+    /// - For all other types, delegates to
+    ///   [`ClickHouseClient::arrow_field_to_clickhouse`].
+    ///
+    /// Short-circuits before the `LargeBinary` fallback inside
+    /// `arrow_field_to_clickhouse` so wide-precision decimal_arb columns
+    /// never silently route to `String`.
+    ///
+    /// Currently only consumed by unit tests; the pipeline-startup
+    /// validator wiring is the deferred follow-up tracked alongside
+    /// `clickhouse_column_type` in T064.
+    #[allow(dead_code)]
+    pub fn hybrid_column_type(
+        field: &arrow::datatypes::Field,
+        directive: Option<&streamling_config::ColumnDirective>,
+    ) -> std::result::Result<String, StreamlingError> {
+        use streamling_core::types::decimal_arb_capability::{
+            CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
+        };
+
+        if let Some((precision, scale)) =
+            streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
+        {
+            let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
+            return match capability_for_decimal_arb(
+                ConnectorKind::Hybrid,
+                precision,
+                scale,
+                coerce_to_string,
+            ) {
+                CapabilityResult::Native => Ok(format!("Decimal({}, {})", precision, scale)),
+                CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
+                CapabilityResult::Reject(reason) => Err(config_load_error(
+                    field.name(),
+                    ConnectorKind::Hybrid,
+                    precision,
+                    scale,
+                    &reason,
+                )),
+            };
+        }
+
+        // Non-decimal_arb fields: delegate to the existing ClickHouse
+        // mapping which covers every Arrow type the Hybrid sink supports.
+        Ok(ClickHouseClient::arrow_field_to_clickhouse(field))
+    }
+
     fn convert_field_type(table_field: &Field, target_field: &Field) -> String {
         let mut clickhouse_type = ClickHouseClient::arrow_field_to_clickhouse(target_field);
         let can_be_nullable = !clickhouse_type.starts_with("Array(")
@@ -1652,6 +1714,71 @@ mod tests {
             expr,
             "CAST(toDecimal256(`src_amount`, 0) AS String) AS `amount_big`"
         );
+    }
+
+    // ------- T052 hard-rejection: hybrid_column_type -------
+
+    #[test]
+    fn hybrid_column_type_native_for_decimal_arb_within_cap() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 50, 5, false)
+                .unwrap();
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
+        assert_eq!(out, "Decimal(50, 5)");
+    }
+
+    #[test]
+    fn hybrid_column_type_rejects_wide_decimal_arb_without_opt_in() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let err = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("amount"), "error must name the column: {msg}");
+        // ConnectorKind::Hybrid Display is "hybrid"; the Hybrid sink is
+        // ClickHouse-backed so either identifier is acceptable, but at
+        // minimum the connector name must surface to the user.
+        assert!(
+            msg.contains("hybrid") || msg.contains("clickhouse"),
+            "error must identify the connector: {msg}"
+        );
+        assert!(
+            msg.contains("76"),
+            "error must mention the 76-digit cap: {msg}"
+        );
+        assert!(
+            msg.contains("coerce_to: string"),
+            "error must point at the remediation: {msg}"
+        );
+    }
+
+    #[test]
+    fn hybrid_column_type_routes_to_string_with_opt_in() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let directive = streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        };
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, Some(&directive)).unwrap();
+        assert_eq!(out, "String");
+    }
+
+    #[test]
+    fn hybrid_column_type_passes_non_decimal_arb_through() {
+        // Hybrid (ClickHouse-backed) maps Boolean to UInt8 via the
+        // existing `arrow_field_to_clickhouse` helper. The directive-aware
+        // wrapper must delegate to it for non-decimal_arb fields.
+        let field = Field::new("flag", DataType::Boolean, false);
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
+        let baseline = ClickHouseClient::arrow_field_to_clickhouse(&field);
+        assert_eq!(out, baseline);
+
+        // Existing Decimal128 path: the wrapper delegates correctly.
+        let field = Field::new("price", DataType::Decimal128(20, 5), false);
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
+        assert_eq!(out, "Decimal(20, 5)");
     }
 
     #[test]
