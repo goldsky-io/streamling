@@ -1,3 +1,4 @@
+use clap::Parser;
 use std::fs::read_to_string;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,25 @@ use tracing_subscriber::EnvFilter;
 mod initializations;
 use initializations::{initialize_live_data_inspect, start_admin_api_server};
 use streamling_common::logging::FlatJsonFormat;
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Pipeline definition file; overrides pipeline_definition_location from config.
+    pipeline_file: Option<String>,
+
+    /// Config file base name or path (.yaml/.yml/.json auto-detected).
+    #[arg(long, default_value = "config")]
+    config: String,
+
+    /// Build and validate the pipeline without running it (no data is processed).
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Validate the pipeline definition (implies --dry-run). Emits JSON results.
+    #[arg(long)]
+    validate: bool,
+}
 
 fn build_env_filter(default_level: &str) -> EnvFilter {
     let base = match std::env::var("RUST_LOG") {
@@ -92,13 +112,15 @@ fn init_logging_capture(app_config: &AppConfig) -> Arc<Mutex<Vec<CapturedLog>>> 
     logs
 }
 
-async fn run_pipeline(args: &[String], app_config: AppConfig, dry_run: bool) -> Result<()> {
+async fn run_pipeline(
+    pipeline_file: Option<String>,
+    app_config: AppConfig,
+    dry_run: bool,
+) -> Result<()> {
     load_and_initialize_plugins(&app_config)?;
 
-    let pipeline_definition_location = args
-        .first()
-        .cloned()
-        .unwrap_or(app_config.pipeline_definition_location.clone());
+    let pipeline_definition_location =
+        pipeline_file.unwrap_or_else(|| app_config.pipeline_definition_location.clone());
     let plugin_preprocessors = build_plugin_preprocessors(&app_config);
     let preprocessor = TopologyPreprocessor::new(plugin_preprocessors);
     let config_string = read_to_string(&pipeline_definition_location)
@@ -193,26 +215,11 @@ fn emit_validation_json(run_error: Option<&StreamlingError>, logs: &[CapturedLog
 async fn main() -> ExitCode {
     install_global_panic_hook();
 
-    let mut args = std::env::args().skip(1).collect::<Vec<String>>();
-    let mut dry_run = false;
-    let mut validate = false;
-    args.retain(|arg| match arg.as_str() {
-        "--dry-run" => {
-            dry_run = true;
-            false
-        }
-        "--validate" => {
-            validate = true;
-            false
-        }
-        _ => true,
-    });
+    let cli = Cli::parse();
+    let validate = cli.validate;
+    let dry_run = cli.dry_run || cli.validate;
 
-    if validate {
-        dry_run = true;
-    }
-
-    let app_config = match AppConfig::load_from_path("config") {
+    let app_config = match AppConfig::load_from_path(&cli.config) {
         Ok(config) => config,
         Err(e) => {
             if validate {
@@ -230,7 +237,7 @@ async fn main() -> ExitCode {
         None
     };
 
-    let result = run_pipeline(&args, app_config, dry_run).await;
+    let result = run_pipeline(cli.pipeline_file, app_config, dry_run).await;
 
     if let Err(ref e) = result {
         tracing::error!(

@@ -21,6 +21,7 @@ streamling-config = { workspace = true }
 streamling-state = { workspace = true }
 
 # Core dependencies
+clap.workspace = true
 datafusion.workspace = true
 tokio.workspace = true
 humantime.workspace = true
