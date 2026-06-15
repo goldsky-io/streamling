@@ -21,18 +21,14 @@ use crate::functions::from_base58::create_from_base58_udf;
 use crate::functions::generate_series::GenerateSeriesFunc;
 use crate::functions::gs_map_to_array_struct::create_gs_map_to_array_struct_udf;
 use crate::functions::hex_to_byte::HexToByteFunc;
-use crate::functions::i256_ops::{
-    I256AbsFunc, I256AddFunc, I256DivFunc, I256ModFunc, I256MulFunc, I256NegFunc, I256SubFunc,
-    I256ToStringFunc, ToI256Func, ToInt64Func,
-};
+// Feature 002 (Retire U256/I256): u256_ops / i256_ops UDFs removed. Wide
+// integers now flow through decimal_arb's UDF surface (decimal_arb_add,
+// decimal_arb_to_string, etc., registered below).
 use crate::functions::json_objects_to_clickhouse_tuples::JsonObjectsToClickhouseTuplesFunc;
 use crate::functions::keccak256::Keccak256Func;
 use crate::functions::now::VolatileNowFunc;
 use crate::functions::split_string_to_array::SplitStringToArrayFunc;
 use crate::functions::to_large_list::ToLargeListFunc;
-use crate::functions::u256_ops::{
-    ToU256Func, U256AddFunc, U256DivFunc, U256ModFunc, U256MulFunc, U256SubFunc, U256ToStringFunc,
-};
 use crate::functions::uuid7::Uuid7Func;
 use crate::functions::xxhash::XxHashFunc;
 use crate::functions::zip_arrays::ZipArraysFunc;
@@ -57,14 +53,14 @@ pub mod from_base58;
 pub mod generate_series;
 pub mod gs_map_to_array_struct;
 pub mod hex_to_byte;
-pub mod i256_ops;
+// Feature 002: i256_ops module deleted alongside the I256Type retirement.
 pub mod json_objects_to_clickhouse_tuples;
 pub mod json_string;
 pub mod keccak256;
 pub mod now;
 pub mod split_string_to_array;
 pub mod to_large_list;
-pub mod u256_ops;
+// Feature 002: u256_ops module deleted alongside the U256Type retirement.
 pub mod util;
 pub mod uuid7;
 pub mod xxhash;
@@ -98,25 +94,8 @@ impl CommonFunctions {
             ScalarUDF::from(ByteToHexFunc::new()),
             ScalarUDF::from(ReverseBytes32Func::new()),
             create_gs_map_to_array_struct_udf(),
-            // U256 functions
-            ScalarUDF::from(ToU256Func::new()),
-            ScalarUDF::from(U256ToStringFunc::new()),
-            ScalarUDF::from(U256AddFunc::new()),
-            ScalarUDF::from(U256SubFunc::new()),
-            ScalarUDF::from(U256MulFunc::new()),
-            ScalarUDF::from(U256DivFunc::new()),
-            ScalarUDF::from(U256ModFunc::new()),
-            // I256 functions
-            ScalarUDF::from(ToI256Func::new()),
-            ScalarUDF::from(I256ToStringFunc::new()),
-            ScalarUDF::from(I256AddFunc::new()),
-            ScalarUDF::from(I256SubFunc::new()),
-            ScalarUDF::from(I256MulFunc::new()),
-            ScalarUDF::from(I256DivFunc::new()),
-            ScalarUDF::from(I256ModFunc::new()),
-            ScalarUDF::from(I256NegFunc::new()),
-            ScalarUDF::from(I256AbsFunc::new()),
-            ScalarUDF::from(ToInt64Func::new()),
+            // U256/I256 UDFs retired in feature 002. Wide-int arithmetic
+            // and conversion now happens through the decimal_arb UDFs below.
             ScalarUDF::from(Uuid7Func::new()),
             // decimal_arb functions (US1 sink-side helper + US2 arithmetic)
             ScalarUDF::from(DecimalArbToStringFunc::new()),

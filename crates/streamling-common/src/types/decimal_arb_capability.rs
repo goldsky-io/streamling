@@ -127,7 +127,10 @@ pub fn avro_bytes_required(precision: u32) -> u32 {
 
 /// Decide whether a sink (`kind`) can carry a `decimal_arb` column with
 /// declared `(precision, scale)`, given the user's `coerce_to_string`
-/// opt-in (`true` if `coerce_to: string` is set on the sink column).
+/// opt-in (`true` if `coerce_to: string` is set on the sink column) and an
+/// optional `native_int_kind` origin hint (feature 002 — set when the
+/// column originated as a fixed-width native integer like ClickHouse
+/// `UInt256` / `Int256`).
 ///
 /// The same decision applies on the source side: a source advertises this
 /// capability for the column it produces, and the validator rejects
@@ -137,6 +140,7 @@ pub fn capability_for_decimal_arb(
     precision: u32,
     scale: u32,
     coerce_to_string: bool,
+    native_int_kind: Option<crate::types::decimal_arb::NativeIntKind>,
 ) -> CapabilityResult {
     match kind {
         ConnectorKind::Postgres => {
@@ -153,6 +157,20 @@ pub fn capability_for_decimal_arb(
             }
         }
         ConnectorKind::ClickHouse | ConnectorKind::Hybrid => {
+            // Feature 002: a native_int_kind hint at (≤78, 0) routes the
+            // column through ClickHouse's first-class fixed-width
+            // UInt256 / Int256 types — Native without coerce_to: string.
+            // Preserves storage compactness for existing wide-int tables.
+            use crate::types::decimal_arb::NativeIntKind;
+            if scale == 0
+                && precision <= 78
+                && matches!(
+                    native_int_kind,
+                    Some(NativeIntKind::U256) | Some(NativeIntKind::I256)
+                )
+            {
+                return CapabilityResult::Native;
+            }
             if precision <= MAX_CLICKHOUSE_DECIMAL_PRECISION {
                 CapabilityResult::Native
             } else if coerce_to_string {
@@ -287,7 +305,9 @@ pub fn validate_pipeline_decimal_arb(
             .find(|d| d.name == field.name())
             .map(|d| d.coerce_to_string)
             .unwrap_or(false);
-        match capability_for_decimal_arb(kind, precision, scale, coerce_to_string) {
+        let native_int_kind = DecimalArbType::native_int_kind_from_field(field);
+        match capability_for_decimal_arb(kind, precision, scale, coerce_to_string, native_int_kind)
+        {
             CapabilityResult::Native | CapabilityResult::OptInOnly(_) => {}
             CapabilityResult::Reject(reason) => {
                 errors.push(config_load_error(
@@ -315,7 +335,7 @@ mod tests {
 
     #[test]
     fn postgres_native_within_cap() {
-        let r = capability_for_decimal_arb(ConnectorKind::Postgres, 100, 18, false);
+        let r = capability_for_decimal_arb(ConnectorKind::Postgres, 100, 18, false, None);
         assert_eq!(r, CapabilityResult::Native);
     }
 
@@ -326,6 +346,7 @@ mod tests {
             MAX_POSTGRES_NUMERIC_PRECISION,
             0,
             false,
+            None,
         );
         assert_eq!(r, CapabilityResult::Native);
     }
@@ -337,6 +358,7 @@ mod tests {
             MAX_POSTGRES_NUMERIC_PRECISION + 1,
             0,
             false,
+            None,
         );
         match r {
             CapabilityResult::Reject(msg) => {
@@ -354,6 +376,7 @@ mod tests {
             MAX_POSTGRES_NUMERIC_PRECISION + 1,
             0,
             true,
+            None,
         );
         assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
     }
@@ -364,7 +387,7 @@ mod tests {
     fn clickhouse_native_at_or_below_76() {
         for p in [38, 50, 76] {
             assert_eq!(
-                capability_for_decimal_arb(ConnectorKind::ClickHouse, p, 0, false),
+                capability_for_decimal_arb(ConnectorKind::ClickHouse, p, 0, false, None),
                 CapabilityResult::Native,
                 "precision {} should be Native",
                 p,
@@ -374,7 +397,7 @@ mod tests {
 
     #[test]
     fn clickhouse_above_76_rejects_without_opt_in() {
-        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, false);
+        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, false, None);
         match r {
             CapabilityResult::Reject(msg) => {
                 assert!(msg.contains("ClickHouse"));
@@ -387,7 +410,7 @@ mod tests {
 
     #[test]
     fn clickhouse_above_76_with_opt_in_routes_to_string() {
-        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, true);
+        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, true, None);
         assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
     }
 
@@ -395,11 +418,11 @@ mod tests {
     fn hybrid_mirrors_clickhouse() {
         // Hybrid is ClickHouse-backed; same rules.
         assert_eq!(
-            capability_for_decimal_arb(ConnectorKind::Hybrid, 76, 0, false),
+            capability_for_decimal_arb(ConnectorKind::Hybrid, 76, 0, false, None),
             CapabilityResult::Native,
         );
         assert_eq!(
-            capability_for_decimal_arb(ConnectorKind::Hybrid, 100, 18, true),
+            capability_for_decimal_arb(ConnectorKind::Hybrid, 100, 18, true, None),
             CapabilityResult::OptInOnly(CoercionDirective::String),
         );
     }
@@ -410,7 +433,7 @@ mod tests {
     fn kafka_json_native_at_any_precision() {
         for p in [1, 76, 1000, 65_535] {
             assert_eq!(
-                capability_for_decimal_arb(ConnectorKind::KafkaJson, p, 0, false),
+                capability_for_decimal_arb(ConnectorKind::KafkaJson, p, 0, false, None),
                 CapabilityResult::Native,
             );
         }
@@ -426,6 +449,7 @@ mod tests {
                 1000,
                 18,
                 false,
+                None,
             ),
             CapabilityResult::Native,
         );
@@ -443,6 +467,7 @@ mod tests {
                 38,
                 10,
                 false,
+                None,
             ),
             CapabilityResult::Native,
         );
@@ -458,6 +483,7 @@ mod tests {
             38,
             10,
             false,
+            None,
         );
         match r {
             CapabilityResult::Reject(msg) => {
@@ -478,13 +504,14 @@ mod tests {
             38,
             10,
             true,
+            None,
         );
         assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
     }
 
     #[test]
     fn kafka_protobuf_rejects_without_opt_in() {
-        let r = capability_for_decimal_arb(ConnectorKind::KafkaProtobuf, 38, 10, false);
+        let r = capability_for_decimal_arb(ConnectorKind::KafkaProtobuf, 38, 10, false, None);
         match r {
             CapabilityResult::Reject(msg) => {
                 assert!(msg.contains("Protobuf"));
@@ -497,7 +524,7 @@ mod tests {
     #[test]
     fn kafka_protobuf_with_opt_in_routes_to_string() {
         assert_eq!(
-            capability_for_decimal_arb(ConnectorKind::KafkaProtobuf, 38, 10, true),
+            capability_for_decimal_arb(ConnectorKind::KafkaProtobuf, 38, 10, true, None),
             CapabilityResult::OptInOnly(CoercionDirective::String),
         );
     }
@@ -506,7 +533,7 @@ mod tests {
 
     #[test]
     fn plugin_default_rejects() {
-        let r = capability_for_decimal_arb(ConnectorKind::Plugin, 100, 18, false);
+        let r = capability_for_decimal_arb(ConnectorKind::Plugin, 100, 18, false, None);
         match r {
             CapabilityResult::Reject(msg) => {
                 assert!(msg.contains("Plugin"));
@@ -518,7 +545,7 @@ mod tests {
     #[test]
     fn sqs_json_is_native() {
         assert_eq!(
-            capability_for_decimal_arb(ConnectorKind::SqsJson, 100, 18, false),
+            capability_for_decimal_arb(ConnectorKind::SqsJson, 100, 18, false, None),
             CapabilityResult::Native,
         );
     }
@@ -650,5 +677,76 @@ mod tests {
         let msg = format!("{}", errs);
         assert!(msg.contains("supply"));
         assert!(!msg.contains("`amount`"));
+    }
+
+    // ------- T006: native_int_kind hint affects ClickHouse / Hybrid matrix -------
+
+    #[test]
+    fn clickhouse_native_for_decimal_arb_78_0_with_u256_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::ClickHouse,
+            78,
+            0,
+            false,
+            Some(NativeIntKind::U256),
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn clickhouse_native_for_decimal_arb_78_0_with_i256_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::ClickHouse,
+            78,
+            0,
+            false,
+            Some(NativeIntKind::I256),
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn hybrid_native_for_decimal_arb_with_native_int_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::Hybrid,
+            78,
+            0,
+            false,
+            Some(NativeIntKind::U256),
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn clickhouse_native_int_hint_does_not_bypass_precision_cap_for_fractional_scale() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // (100, 18) is wide and fractional — the hint is set but should be
+        // ignored (the matrix only honors the hint at scale 0, ≤78).
+        // Without coerce_to: string, this stays Reject.
+        let r = capability_for_decimal_arb(
+            ConnectorKind::ClickHouse,
+            100,
+            18,
+            false,
+            Some(NativeIntKind::U256),
+        );
+        match r {
+            CapabilityResult::Reject(_) => {}
+            other => panic!(
+                "expected Reject (hint should not apply for scale>0); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn clickhouse_existing_coerce_to_path_unaffected_by_absent_hint() {
+        // No hint, p > 76, coerce_to=string: still OptInOnly. Regression
+        // guard for feature 001 behavior.
+        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, true, None);
+        assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
     }
 }

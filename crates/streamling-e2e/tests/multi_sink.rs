@@ -296,8 +296,9 @@ async fn test_multi_sink_fails_fast_when_one_sink_errors() {
         .expect("Failed to produce records");
 
     // Intentionally use a transform that fails at runtime:
-    // `to_u256(value)` expects a numeric string, but test records contain "value_N".
-    // One blackhole sink consumes the healthy branch, another consumes the failing branch.
+    // `to_decimal_arb_from_string(value, 0)` expects a numeric string, but test records
+    // contain "value_N". One blackhole sink consumes the healthy branch, another consumes
+    // the failing branch.
     let pipeline = format!(
         r#"
 sources:
@@ -309,7 +310,7 @@ sources:
 
 transforms:
   broken_transform:
-    sql: "SELECT id, to_u256(value) as amount FROM kafka_source"
+    sql: "SELECT id, to_decimal_arb_from_string(value, 0) as amount FROM kafka_source"
 
 sinks:
   healthy_blackhole_sink:

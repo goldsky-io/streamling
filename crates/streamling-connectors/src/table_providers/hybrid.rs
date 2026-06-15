@@ -408,21 +408,17 @@ impl HybridTableProvider {
                 .fields()
                 .iter()
                 .filter(|field| field.name() != COLUMN_NAME_OP)
-                .map(|field| (field.name().clone(), field.data_type().clone()))
+                .cloned()
                 .collect::<Vec<_>>()
         };
 
         let bounded_fields = get_fields(&bounded_schema);
         let unbounded_fields = get_fields(&unbounded_schema);
 
-        let bounded_column_names: Vec<String> = bounded_fields
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
-        let unbounded_column_names: Vec<String> = unbounded_fields
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
+        let bounded_column_names: Vec<String> =
+            bounded_fields.iter().map(|f| f.name().clone()).collect();
+        let unbounded_column_names: Vec<String> =
+            unbounded_fields.iter().map(|f| f.name().clone()).collect();
         debug!(
             "Hybrid source schema validation - bounded source columns ({}): {:?}",
             bounded_column_names.len(),
@@ -434,28 +430,54 @@ impl HybridTableProvider {
             unbounded_column_names
         );
 
-        for (col_name, col_type) in &unbounded_fields {
-            match bounded_fields.iter().find(|(name, _)| name == col_name) {
-                Some((_, bounded_type)) => {
-                    if !Self::is_compatible_data_type(bounded_type, col_type) {
+        for unbounded_field in &unbounded_fields {
+            match bounded_fields
+                .iter()
+                .find(|f| f.name() == unbounded_field.name())
+            {
+                Some(bounded_field) => {
+                    let compatible = Self::is_compatible_data_type(
+                        bounded_field.data_type(),
+                        unbounded_field.data_type(),
+                    ) || Self::is_clickhouse_native_wide_int(
+                        bounded_field.data_type(),
+                        unbounded_field,
+                    );
+                    if !compatible {
                         streamling_user_bail!(
                             "column '{}' type mismatch: bounded source has {:?}, unbounded source has {:?}",
-                            col_name,
-                            bounded_type,
-                            col_type
+                            unbounded_field.name(),
+                            bounded_field.data_type(),
+                            unbounded_field.data_type()
                         );
                     }
                 }
                 None => {
                     streamling_user_bail!(
                         "unbounded source column '{}' not found in bounded source",
-                        col_name
+                        unbounded_field.name()
                     );
                 }
             }
         }
 
         Ok(unbounded_schema)
+    }
+
+    /// A bounded ClickHouse column fetched as native `UInt256`/`Int256` arrives
+    /// as Arrow `FixedSizeBinary(32)`, while the unbounded (target) schema
+    /// declares the same column as `decimal_arb` (`LargeBinary`) with a
+    /// `native_int_kind` hint. These are the same logical wide integer:
+    /// `normalize_batch_from_clickhouse` reinterprets the 32 little-endian bytes
+    /// into decimal_arb canonical form at read time, so they're compatible.
+    fn is_clickhouse_native_wide_int(
+        bounded_type: &arrow_schema::DataType,
+        unbounded_field: &Field,
+    ) -> bool {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        matches!(bounded_type, arrow_schema::DataType::FixedSizeBinary(32))
+            && DecimalArbType::is_decimal_arb_field(unbounded_field)
+            && DecimalArbType::native_int_kind_from_field(unbounded_field).is_some()
     }
 
     fn is_compatible_data_type(
@@ -1444,14 +1466,28 @@ impl ClickHouseSchemaAdapter {
         if let Some((precision, scale)) =
             streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
         {
+            use streamling_core::types::decimal_arb::NativeIntKind;
             let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
+            let native_int_kind =
+                streamling_core::types::decimal_arb::DecimalArbType::native_int_kind_from_field(
+                    field,
+                );
             return match capability_for_decimal_arb(
                 ConnectorKind::Hybrid,
                 precision,
                 scale,
                 coerce_to_string,
+                native_int_kind,
             ) {
-                CapabilityResult::Native => Ok(format!("Decimal({}, {})", precision, scale)),
+                CapabilityResult::Native => match native_int_kind {
+                    Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
+                        Ok("UInt256".to_string())
+                    }
+                    Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
+                        Ok("Int256".to_string())
+                    }
+                    _ => Ok(format!("Decimal({}, {})", precision, scale)),
+                },
                 CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
                 CapabilityResult::Reject(reason) => Err(config_load_error(
                     field.name(),
@@ -1468,8 +1504,31 @@ impl ClickHouseSchemaAdapter {
         Ok(ClickHouseClient::arrow_field_to_clickhouse(field))
     }
 
+    /// ClickHouse type to CAST a bounded-source column to so it lines up with
+    /// the target (unbounded) field. For `decimal_arb` columns carrying a
+    /// `native_int_kind` hint — the wide blockchain-integer case — CAST to the
+    /// native `UInt256`/`Int256` so ClickHouse ships the raw 32-byte value as
+    /// Arrow `FixedSizeBinary(32)`, which `normalize_batch_from_clickhouse`
+    /// reinterprets as `decimal_arb` on read. Every other field keeps the
+    /// existing `arrow_field_to_clickhouse` mapping (wide decimal_arb without a
+    /// hint still routes to `String`).
+    fn clickhouse_read_type(target_field: &Field) -> String {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(target_field)
+            && scale == 0
+            && precision <= 78
+        {
+            match DecimalArbType::native_int_kind_from_field(target_field) {
+                Some(NativeIntKind::U256) => return "UInt256".to_string(),
+                Some(NativeIntKind::I256) => return "Int256".to_string(),
+                _ => {}
+            }
+        }
+        ClickHouseClient::arrow_field_to_clickhouse(target_field)
+    }
+
     fn convert_field_type(table_field: &Field, target_field: &Field) -> String {
-        let mut clickhouse_type = ClickHouseClient::arrow_field_to_clickhouse(target_field);
+        let mut clickhouse_type = Self::clickhouse_read_type(target_field);
         let can_be_nullable = !clickhouse_type.starts_with("Array(")
             && !clickhouse_type.starts_with("Tuple(")
             && !clickhouse_type.starts_with("Map(");

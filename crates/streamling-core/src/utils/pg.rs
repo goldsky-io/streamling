@@ -1,7 +1,10 @@
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
 use crate::types::decimal_arb::DecimalArbType;
-use crate::types::{i256::I256Type, u256::U256Type};
+// Feature 002 (Retire U256/I256): U256/I256 imports removed; wide-int
+// values flow through decimal_arb. Postgres NUMERIC(78, 0) source columns
+// are auto-promoted to decimal_arb(78, 0) + native_int_kind=u256 in
+// `postgres_type_to_arrow_field` above.
 use crate::utils::parse_primary_key_columns;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use sqlx::Executor;
@@ -170,14 +173,14 @@ pub struct PostgresTypeInfo {
 /// Get PostgreSQL type information for an Arrow field
 /// This is the single source of truth for Arrow → PostgreSQL type mapping
 pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
-    // Check for U256/I256 types that become NUMERIC(78,0)
-    if matches!(field.data_type(), DataType::FixedSizeBinary(32))
-        && (U256Type::is_u256_metadata(field.metadata())
-            || I256Type::is_i256_metadata(field.metadata()))
-    {
+    // Feature 002 (Retire U256/I256): decimal_arb fields with the
+    // `streamling.decimal_arb` extension metadata route to
+    // `NUMERIC(p, s)`. Pre-checked before the LargeBinary catch-all so
+    // wide-integer columns don't fall through to BYTEA.
+    if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) {
         return PostgresTypeInfo {
-            column_type: "NUMERIC(78,0)".to_string(),
-            string_cast_sql: Some("numeric(78,0)".to_string()),
+            column_type: format!("NUMERIC({}, {})", precision, scale),
+            string_cast_sql: Some(format!("numeric({},{})", precision, scale)),
         };
     }
 
@@ -413,7 +416,21 @@ pub fn postgres_type_to_arrow_field(pg_type: &str, name: &str, nullable: bool) -
                     pg_type, scale,
                 )));
             }
-            return DecimalArbType::field(name, precision, scale as u32, nullable);
+            let field = DecimalArbType::field(name, precision, scale as u32, nullable)?;
+            // Feature 002: NUMERIC(78, 0) is the conventional unsigned
+            // 256-bit storage shape (Ethereum uint256 in blockchain data).
+            // Stamp the u256 hint so ClickHouse sinks downstream can emit
+            // UInt256 natively (preserving storage compactness on existing
+            // wide-int tables). Postgres NUMERIC has no native unsigned
+            // distinction, so no equivalent i256 path on this side — see
+            // contracts/postgres-wide-int.md §"Why no i256 hint".
+            if precision == 78 && scale == 0 {
+                return DecimalArbType::with_native_int_kind(
+                    field,
+                    crate::types::decimal_arb::NativeIntKind::U256,
+                );
+            }
+            return Ok(field);
         }
     }
 
@@ -568,15 +585,14 @@ pub async fn truncate_finalized_checkpoint_data(
     }
 }
 
-/// Override schema for PostgreSQL inserts: convert U256/I256 and nested types to Utf8
+/// Override schema for PostgreSQL inserts: convert nested types to Utf8
+/// (decimal_arb columns are handled separately via `build_projection_for_postgres`).
 pub fn override_schema_for_postgres_insert(source_schema: &SchemaRef) -> Schema {
     let fields: Vec<Field> = source_schema
         .fields()
         .iter()
         .map(|f| {
-            if U256Type::is_u256_field(f) || I256Type::is_i256_field(f) {
-                Field::new(f.name(), DataType::Utf8, f.is_nullable())
-            } else if matches!(
+            if matches!(
                 f.data_type(),
                 DataType::Struct(_)
                     | DataType::List(_)
@@ -753,16 +769,14 @@ mod tests {
         );
     }
 
+    // Feature 002: tests for U256/I256 → NUMERIC(78, 0) deleted along
+    // with the retired types. Wide-integer fields now arrive as decimal_arb
+    // and route through the decimal_arb branch in get_postgres_type_info.
     #[test]
-    fn test_u256_type() {
-        let field = Field::new("u256", U256Type::new(), false).with_metadata(U256Type::metadata());
-        assert_eq!(arrow_field_to_postgres_type(&field), "NUMERIC(78,0)");
-    }
-
-    #[test]
-    fn test_i256_type() {
-        let field = Field::new("i256", I256Type::new(), false).with_metadata(I256Type::metadata());
-        assert_eq!(arrow_field_to_postgres_type(&field), "NUMERIC(78,0)");
+    fn test_decimal_arb_78_0_maps_to_numeric_78_0() {
+        let field =
+            crate::types::decimal_arb::DecimalArbType::field("amount", 78, 0, false).unwrap();
+        assert_eq!(arrow_field_to_postgres_type(&field), "NUMERIC(78, 0)");
     }
 
     #[test]
