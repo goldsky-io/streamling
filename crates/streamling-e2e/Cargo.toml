@@ -30,6 +30,7 @@ rdkafka = { version = "0.37", features = ["ssl"] }
 
 # Avro encoding for Kafka messages
 apache-avro = { version = "0.17", default-features = false }
+num-bigint = "0.4"
 schema_registry_converter = { version = "4.3.0", features = ["avro"] }
 
 # AWS SDK (for SQS ElasticMQ tests).

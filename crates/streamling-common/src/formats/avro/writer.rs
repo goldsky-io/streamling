@@ -12,6 +12,7 @@ use datafusion::arrow::array::types::{
 };
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{Decimal256Type, i256};
+use num_bigint::{BigInt, Sign};
 use regex::Regex;
 use serde_json::json;
 use std::sync::OnceLock;
@@ -60,7 +61,23 @@ pub fn to_avro(name: &str, fields: &Fields) -> Schema {
 
 fn field_to_avro(name: &str, field: &Field) -> serde_json::value::Value {
     let next_name = format!("{}_{}", name, &field.name());
-    let mut schema = arrow_to_avro(&next_name, field.data_type());
+    // T060: decimal_arb fields are LargeBinary at the DataType level but
+    // carry extension metadata that promotes them to Avro's `decimal`
+    // logical type with the user-declared (precision, scale). Detect and
+    // route here before falling through to the generic LargeBinary →
+    // bytes mapping, which would otherwise lose numeric semantics.
+    let mut schema = if let Some((precision, scale)) =
+        crate::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
+    {
+        json!({
+            "type": "bytes",
+            "logicalType": "decimal",
+            "scale": scale,
+            "precision": precision,
+        })
+    } else {
+        arrow_to_avro(&next_name, field.data_type())
+    };
 
     if field.is_nullable() {
         schema = json!({
@@ -198,6 +215,33 @@ fn sanitize_field(s: &str) -> String {
     re.replace_all(s, "_").replace('.', "__")
 }
 
+/// Convert canonical decimal_arb bytes (`[sign][big-endian unsigned magnitude]`,
+/// per `contracts/arrow-extension-type.md` §3) into Avro's signed two's-complement
+/// big-endian representation of the unscaled integer (`value × 10^scale`),
+/// which the Avro `decimal` logical type expects under §9.
+///
+/// Canonical bytes already store the value at the column's declared scale,
+/// so the BigInt decoded here is exactly the unscaled magnitude that Avro
+/// expects — no further rescaling is required at write time.
+fn decimal_arb_canonical_to_avro_bytes(canonical: &[u8]) -> Vec<u8> {
+    // Empty payload guards against malformed cells; treat as zero so we
+    // never panic on a row-by-row encode. Validity bitmap is the
+    // authoritative null source per §4.
+    if canonical.is_empty() {
+        return vec![0x00];
+    }
+    let sign_byte = canonical[0];
+    let magnitude = &canonical[1..];
+    let bigint = match (sign_byte, magnitude.is_empty()) {
+        (0xFF, false) => BigInt::from_bytes_be(Sign::Minus, magnitude),
+        (_, true) => BigInt::from(0),
+        // Treat any non-0xFF sign byte as non-negative; canonical encoder
+        // only ever emits 0x00 or 0xFF.
+        (_, false) => BigInt::from_bytes_be(Sign::Plus, magnitude),
+    };
+    bigint.to_signed_bytes_be()
+}
+
 #[allow(clippy::redundant_closure_call)]
 fn serialize_column<T: SerializeTarget>(
     schema: &Schema,
@@ -205,7 +249,44 @@ fn serialize_column<T: SerializeTarget>(
     name: &str,
     column: &ArrayRef,
     nullable: bool,
+    field: Option<&Field>,
 ) {
+    // T060: decimal_arb columns store canonical bytes in a LargeBinary
+    // array but must surface as Avro's `decimal` logical type (§9). We
+    // detect via the field's extension metadata before falling through
+    // to the generic LargeBinary → Bytes mapping below.
+    if let Some(f) = field
+        && crate::types::decimal_arb::DecimalArbType::precision_scale_from_field(f).is_some()
+    {
+        let array = column.as_binary::<i64>();
+        for (i, v) in array.iter().enumerate() {
+            if !values.is_some(i) {
+                continue;
+            }
+            let avro_value = v.map(|bytes| {
+                let avro_bytes = decimal_arb_canonical_to_avro_bytes(bytes);
+                Value::Decimal(apache_avro::Decimal::from(avro_bytes))
+            });
+            if nullable {
+                values.add(
+                    i,
+                    name,
+                    Value::Union(
+                        avro_value.is_some() as u32,
+                        Box::new(avro_value.unwrap_or(Value::Null)),
+                    ),
+                );
+            } else {
+                values.add(
+                    i,
+                    name,
+                    avro_value.expect("non-nullable decimal_arb column has null cell"),
+                );
+            }
+        }
+        return;
+    }
+
     macro_rules! write_arrow_value {
         ($as_call:path, $value_variant:path, $converter:expr) => {{
             $as_call(column).iter().enumerate().for_each(|(i, v)| {
@@ -369,6 +450,7 @@ fn serialize_column<T: SerializeTarget>(
                         "",
                         &column.expect("unmasked null in list"),
                         item.is_nullable(),
+                        Some(item.as_ref()),
                     )
                 }
 
@@ -414,6 +496,7 @@ fn serialize_column<T: SerializeTarget>(
                         &name,
                         column,
                         field.is_nullable(),
+                        Some(field.as_ref()),
                     );
                 }
 
@@ -445,6 +528,7 @@ fn serialize_column<T: SerializeTarget>(
                         &name,
                         column,
                         field.is_nullable(),
+                        Some(field.as_ref()),
                     );
                 }
 
@@ -468,7 +552,14 @@ pub fn serialize(schema: &Schema, batch: &RecordBatch) -> Vec<Value> {
         let field = &batch.schema().fields[i];
 
         let name = sanitize_field(field.name());
-        serialize_column(schema, &mut values, &name, column, field.is_nullable());
+        serialize_column(
+            schema,
+            &mut values,
+            &name,
+            column,
+            field.is_nullable(),
+            Some(field.as_ref()),
+        );
     }
 
     values.into_iter().flatten().map(|r| r.into()).collect()
@@ -1188,5 +1279,216 @@ mod tests {
                 )]),
             ]
         );
+    }
+
+    // ------- T060: decimal_arb Avro schema generation -------
+
+    #[test]
+    fn decimal_arb_field_emits_avro_decimal_logical_type() {
+        // A `decimal_arb(100, 18)` field on the Arrow side must surface as
+        // an Avro `bytes` logical-type `decimal` with the declared
+        // precision and scale. The previous behavior (LargeBinary → plain
+        // "bytes") would have lost numeric semantics on the consumer side.
+        let field =
+            crate::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false).unwrap();
+        let avro_field = field_to_avro("payload", &field);
+        // The schema is: { "name": "amount", "type": { ... decimal logical ... } }
+        let type_field = avro_field.get("type").unwrap();
+        assert_eq!(type_field.get("type").unwrap(), "bytes");
+        assert_eq!(type_field.get("logicalType").unwrap(), "decimal");
+        assert_eq!(type_field.get("precision").unwrap(), 100);
+        assert_eq!(type_field.get("scale").unwrap(), 18);
+    }
+
+    #[test]
+    fn decimal_arb_nullable_field_wraps_in_union() {
+        // Nullable Avro fields wrap the schema in a union with "null".
+        // The decimal logical type → outer union gets the inner schema
+        // under the second variant (whose 'type' contains the bytes/
+        // logicalType/precision/scale shape directly, NOT under a "type"
+        // key).
+        let field =
+            crate::types::decimal_arb::DecimalArbType::field("amount", 80, 30, true).unwrap();
+        let avro_field = field_to_avro("payload", &field);
+        let nested_type = avro_field.get("type").unwrap();
+        // {"type": ["null", { ... decimal ... }]}
+        let outer = nested_type.get("type").unwrap();
+        let arr = outer.as_array().expect("nullable type is union array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], "null");
+        assert_eq!(arr[1].get("logicalType").unwrap(), "decimal");
+        assert_eq!(arr[1].get("precision").unwrap(), 80);
+        assert_eq!(arr[1].get("scale").unwrap(), 30);
+    }
+
+    #[test]
+    fn plain_large_binary_field_still_maps_to_bytes() {
+        // Regression guard: LargeBinary without decimal_arb metadata stays
+        // as plain Avro `bytes` (no logical type promotion). The shape is
+        // {"type": "bytes"} (the avro schema for primitive types is itself
+        // wrapped in an object by arrow_to_avro).
+        let field = Field::new("blob", DataType::LargeBinary, false);
+        let avro_field = field_to_avro("payload", &field);
+        let nested_type = avro_field.get("type").unwrap();
+        // No logicalType key — stays as plain bytes.
+        assert!(nested_type.get("logicalType").is_none());
+        assert_eq!(nested_type.get("type").unwrap(), "bytes");
+    }
+
+    // ------- T060: decimal_arb Avro value serialization -------
+
+    use std::str::FromStr;
+
+    /// Decode an Avro `Value::Decimal` payload back into a canonical
+    /// decimal_arb byte payload at `scale`. Mirrors
+    /// `arrow_array_reader::resolve_decimal_arb_canonical_bytes` so these
+    /// writer tests stay self-contained while still exercising the
+    /// symmetric encoder/decoder contract from
+    /// `contracts/arrow-extension-type.md` §3 + §9.
+    fn avro_decimal_value_to_canonical_bytes(v: &Value, scale: u32) -> Vec<u8> {
+        use crate::types::decimal_arb::DecimalArbValue;
+        let inner = if let Value::Union(_, b) = v { b } else { v };
+        match inner {
+            Value::Decimal(d) => {
+                let bytes = <Vec<u8>>::try_from(d).expect("decimal -> bytes");
+                let bigint = BigInt::from_signed_bytes_be(&bytes);
+                let value = DecimalArbValue::from_bigint_and_scale(bigint, scale as i64);
+                value.to_canonical_bytes_at_scale(scale)
+            }
+            other => panic!("expected Value::Decimal, got {:?}", other),
+        }
+    }
+
+    /// Build a single-column `RecordBatch` of `decimal_arb(precision, scale)`
+    /// from a list of canonical decimal text values (or NULL).
+    fn build_decimal_arb_batch(
+        precision: u32,
+        scale: u32,
+        nullable: bool,
+        values: &[Option<&str>],
+    ) -> (Arc<Schema>, RecordBatch) {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType};
+
+        let mut builder =
+            DecimalArbArrayBuilder::with_capacity(values.len(), "amount", precision, scale)
+                .expect("builder");
+        for v in values {
+            match v {
+                Some(s) => builder.append_str(s).expect("append"),
+                None => builder.append_null(),
+            }
+        }
+        let (raw, _, _) = builder.finish().into_inner();
+        let field = DecimalArbType::field("amount", precision, scale, nullable).expect("field");
+        let arrow_schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(raw)]).expect("batch");
+        (arrow_schema, batch)
+    }
+
+    #[test]
+    fn decimal_arb_round_trips_positive_value() {
+        // precision/scale chosen to exercise the > Decimal256 (76) regime.
+        let (arrow_schema, batch) = build_decimal_arb_batch(80, 4, false, &[Some("123.4500")]);
+
+        let avro_schema = to_avro("Test", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        let Value::Record(fields) = &result[0] else {
+            panic!("expected Record, got {:?}", result[0]);
+        };
+        let (_, decimal_value) = &fields[0];
+        let canonical = avro_decimal_value_to_canonical_bytes(decimal_value, 4);
+
+        // Expected canonical bytes for 123.45 at scale=4 → unscaled 1234500.
+        let expected = crate::types::decimal_arb::DecimalArbValue::from_str("123.4500")
+            .unwrap()
+            .to_canonical_bytes_at_scale(4);
+        assert_eq!(canonical, expected);
+        // Sign byte should be 0x00 (non-negative) and magnitude non-empty.
+        assert_eq!(canonical[0], 0x00);
+        assert!(canonical.len() > 1);
+    }
+
+    #[test]
+    fn decimal_arb_round_trips_negative_value() {
+        let (arrow_schema, batch) = build_decimal_arb_batch(80, 6, false, &[Some("-0.000123")]);
+
+        let avro_schema = to_avro("Test", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        let Value::Record(fields) = &result[0] else {
+            panic!("expected Record");
+        };
+        let (_, decimal_value) = &fields[0];
+        let canonical = avro_decimal_value_to_canonical_bytes(decimal_value, 6);
+
+        let expected = crate::types::decimal_arb::DecimalArbValue::from_str("-0.000123")
+            .unwrap()
+            .to_canonical_bytes_at_scale(6);
+        assert_eq!(canonical, expected);
+        // Negative-value canonical bytes start with the sign byte 0xFF.
+        assert_eq!(canonical[0], 0xFF);
+    }
+
+    #[test]
+    fn decimal_arb_round_trips_null_value() {
+        let (arrow_schema, batch) =
+            build_decimal_arb_batch(80, 4, true, &[Some("1.0000"), None, Some("-2.5000")]);
+
+        let avro_schema = to_avro("Test", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        // Row 0: positive
+        let Value::Record(fields0) = &result[0] else {
+            panic!("expected Record");
+        };
+        let Value::Union(branch_idx, payload) = &fields0[0].1 else {
+            panic!("nullable decimal_arb should be encoded as a Union");
+        };
+        assert_eq!(
+            *branch_idx, 1,
+            "non-null cell takes the second union branch"
+        );
+        assert!(matches!(payload.as_ref(), Value::Decimal(_)));
+
+        // Row 1: NULL
+        let Value::Record(fields1) = &result[1] else {
+            panic!("expected Record");
+        };
+        let Value::Union(branch_idx, payload) = &fields1[0].1 else {
+            panic!("nullable decimal_arb should be encoded as a Union");
+        };
+        assert_eq!(*branch_idx, 0, "null cell takes the first union branch");
+        assert!(matches!(payload.as_ref(), Value::Null));
+
+        // Row 2: negative — round-trips
+        let Value::Record(fields2) = &result[2] else {
+            panic!("expected Record");
+        };
+        let canonical2 = avro_decimal_value_to_canonical_bytes(&fields2[0].1, 4);
+        let expected2 = crate::types::decimal_arb::DecimalArbValue::from_str("-2.5000")
+            .unwrap()
+            .to_canonical_bytes_at_scale(4);
+        assert_eq!(canonical2, expected2);
+    }
+
+    #[test]
+    fn decimal_arb_round_trips_wide_precision_value() {
+        // A 100-digit integer value — well outside Decimal128/Decimal256
+        // range — proves we don't depend on a fixed-width integer path.
+        let big = "1".to_string() + &"0".repeat(99); // 1e99 (100-digit integer)
+        let (arrow_schema, batch) = build_decimal_arb_batch(120, 0, false, &[Some(&big)]);
+
+        let avro_schema = to_avro("Test", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        let Value::Record(fields) = &result[0] else {
+            panic!("expected Record");
+        };
+        let canonical = avro_decimal_value_to_canonical_bytes(&fields[0].1, 0);
+        let expected = crate::types::decimal_arb::DecimalArbValue::from_str(&big)
+            .unwrap()
+            .to_canonical_bytes_at_scale(0);
+        assert_eq!(canonical, expected);
     }
 }

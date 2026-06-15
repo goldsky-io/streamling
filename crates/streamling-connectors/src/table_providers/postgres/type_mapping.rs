@@ -1,5 +1,6 @@
 use arrow_schema::Field;
 use datafusion::arrow::datatypes::DataType;
+use streamling_core::types::decimal_arb::DecimalArbType;
 use streamling_core::types::{i256::I256Type, u256::U256Type};
 
 /// PostgreSQL type information for an Arrow field
@@ -23,6 +24,16 @@ pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
         return PostgresTypeInfo {
             column_type: "NUMERIC(78,0)".to_string(),
             string_cast_sql: Some("numeric(78,0)".to_string()),
+        };
+    }
+
+    // decimal_arb (LargeBinary + extension metadata) becomes NUMERIC(precision, scale).
+    // Scale-aligned canonical bytes are pre-projected to canonical decimal strings
+    // by `build_projection_for_postgres`, so the bind path sees Utf8 here.
+    if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) {
+        return PostgresTypeInfo {
+            column_type: format!("NUMERIC({}, {})", precision, scale),
+            string_cast_sql: Some(format!("numeric({},{})", precision, scale)),
         };
     }
 
@@ -180,6 +191,23 @@ mod tests {
         let info = get_postgres_type_info(&field);
         assert_eq!(info.column_type, "NUMERIC(78,0)");
         assert_eq!(info.string_cast_sql, Some("numeric(78,0)".to_string()));
+    }
+
+    #[test]
+    fn test_decimal_arb_mapping_to_numeric() {
+        let field = DecimalArbType::field("amount", 100, 18, false).unwrap();
+        let info = get_postgres_type_info(&field);
+        assert_eq!(info.column_type, "NUMERIC(100, 18)");
+        assert_eq!(info.string_cast_sql, Some("numeric(100,18)".to_string()));
+    }
+
+    #[test]
+    fn test_plain_large_binary_is_not_decimal_arb() {
+        // Without the extension metadata, LargeBinary stays BYTEA.
+        let field = Field::new("blob", DataType::LargeBinary, false);
+        let info = get_postgres_type_info(&field);
+        assert_eq!(info.column_type, "BYTEA");
+        assert_eq!(info.string_cast_sql, None);
     }
 
     #[test]
