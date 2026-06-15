@@ -6,8 +6,10 @@
 //! choice — confirmed by the T005 spike. Once the planner is registered
 //! via `SessionContext::register_expr_planner`, an author can write:
 //!
-//!     SELECT a + b FROM src;
-//!     SELECT * FROM src WHERE a < threshold;
+//! ```text
+//! SELECT a + b FROM src;
+//! SELECT * FROM src WHERE a < threshold;
+//! ```
 //!
 //! and the rewriter substitutes the corresponding `decimal_arb_<op>` UDF
 //! call. The fallback (`PlannerResult::Original`) lets DataFusion handle

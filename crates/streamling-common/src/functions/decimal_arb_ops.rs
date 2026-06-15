@@ -27,7 +27,6 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use num_traits::Zero;
-use std::any::Any;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -196,7 +195,7 @@ fn downcast_decimal_arb_array(
 /// closure-style `BigDecimal × BigDecimal → BigDecimal` body.
 macro_rules! decimal_arb_binary_op {
     ($struct_name:ident, $sql_name:literal, $kind:expr, $op:expr) => {
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, Eq, Hash)]
         pub struct $struct_name {
             signature: Signature,
         }
@@ -222,9 +221,6 @@ macro_rules! decimal_arb_binary_op {
         }
 
         impl ScalarUDFImpl for $struct_name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn name(&self) -> &str {
                 $sql_name
             }
@@ -332,7 +328,7 @@ where
     Ok(ColumnarValue::Array(Arc::new(raw)))
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbNegFunc {
     signature: Signature,
 }
@@ -355,9 +351,6 @@ impl DecimalArbNegFunc {
 }
 
 impl ScalarUDFImpl for DecimalArbNegFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "decimal_arb_neg"
     }
@@ -376,7 +369,7 @@ impl ScalarUDFImpl for DecimalArbNegFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbAbsFunc {
     signature: Signature,
 }
@@ -399,9 +392,6 @@ impl DecimalArbAbsFunc {
 }
 
 impl ScalarUDFImpl for DecimalArbAbsFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "decimal_arb_abs"
     }
@@ -471,7 +461,7 @@ where
 
 macro_rules! decimal_arb_cmp_op {
     ($struct_name:ident, $sql_name:literal, $cmp:expr) => {
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, Eq, Hash)]
         pub struct $struct_name {
             signature: Signature,
         }
@@ -497,9 +487,6 @@ macro_rules! decimal_arb_cmp_op {
         }
 
         impl ScalarUDFImpl for $struct_name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn name(&self) -> &str {
                 $sql_name
             }
@@ -547,7 +534,7 @@ decimal_arb_cmp_op!(DecimalArbGteFunc, "decimal_arb_gte", |o: Ordering| o
 /// extension metadata (per `contracts/arrow-extension-type.md` §2). Without
 /// the metadata the function errors — the caller must thread the metadata
 /// through (see `postgres/projection.rs` for the typical wiring).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbToStringFunc {
     signature: Signature,
 }
@@ -572,10 +559,6 @@ impl DecimalArbToStringFunc {
 }
 
 impl ScalarUDFImpl for DecimalArbToStringFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "decimal_arb_to_string"
     }
@@ -667,7 +650,7 @@ impl ScalarUDFImpl for DecimalArbToStringFunc {
 // order for negatives.
 // =====================================================================
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbSortKeyFunc {
     signature: Signature,
 }
@@ -690,9 +673,6 @@ impl DecimalArbSortKeyFunc {
 }
 
 impl ScalarUDFImpl for DecimalArbSortKeyFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "decimal_arb_to_sort_key"
     }
@@ -750,7 +730,7 @@ impl ScalarUDFImpl for DecimalArbSortKeyFunc {
 // the DecimalArbArray helpers (T011) already exist for them.
 // =====================================================================
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToDecimalArbFromStringFunc {
     signature: Signature,
 }
@@ -830,9 +810,6 @@ impl ToDecimalArbFromStringFunc {
 }
 
 impl ScalarUDFImpl for ToDecimalArbFromStringFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "to_decimal_arb_from_string"
     }
@@ -885,7 +862,7 @@ impl ScalarUDFImpl for ToDecimalArbFromStringFunc {
 
 // ---------- Widening: from_decimal128 / from_decimal256 ----------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToDecimalArbFromDecimal128Func {
     signature: Signature,
 }
@@ -942,9 +919,6 @@ fn nonneg_scale(scale: i8, op_name: &str) -> Result<u32> {
 }
 
 impl ScalarUDFImpl for ToDecimalArbFromDecimal128Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "to_decimal_arb_from_decimal128"
     }
@@ -1001,7 +975,7 @@ impl ScalarUDFImpl for ToDecimalArbFromDecimal128Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToDecimalArbFromDecimal256Func {
     signature: Signature,
 }
@@ -1021,9 +995,6 @@ impl ToDecimalArbFromDecimal256Func {
 }
 
 impl ScalarUDFImpl for ToDecimalArbFromDecimal256Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "to_decimal_arb_from_decimal256"
     }
@@ -1088,7 +1059,7 @@ impl ScalarUDFImpl for ToDecimalArbFromDecimal256Func {
 /// otherwise). The integer is treated as having scale 0; declared `scale`
 /// just becomes the column's storage scale (the value is padded
 /// internally on encoding).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToDecimalArbFromIntFunc {
     signature: Signature,
 }
@@ -1124,9 +1095,6 @@ impl ToDecimalArbFromIntFunc {
 }
 
 impl ScalarUDFImpl for ToDecimalArbFromIntFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "to_decimal_arb_from_int"
     }
@@ -1284,7 +1252,7 @@ fn read_return_field_precision_scale(args: &ReturnFieldArgs, op_name: &str) -> R
     Ok((p as u8, s as i8))
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbToDecimal128Func {
     signature: Signature,
 }
@@ -1311,9 +1279,6 @@ impl DecimalArbToDecimal128Func {
 }
 
 impl ScalarUDFImpl for DecimalArbToDecimal128Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "decimal_arb_to_decimal128"
     }
@@ -1366,7 +1331,7 @@ impl ScalarUDFImpl for DecimalArbToDecimal128Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbToDecimal256Func {
     signature: Signature,
 }
@@ -1393,9 +1358,6 @@ impl DecimalArbToDecimal256Func {
 }
 
 impl ScalarUDFImpl for DecimalArbToDecimal256Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "decimal_arb_to_decimal256"
     }
@@ -1476,6 +1438,7 @@ mod tests {
             arg_fields: vec![Arc::new(field.clone())],
             number_rows: 4,
             return_field: Arc::new(Field::new("out", DataType::Utf8, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         let strings = match out {
@@ -1499,6 +1462,7 @@ mod tests {
             arg_fields: vec![Arc::new(field)],
             number_rows: 1,
             return_field: Arc::new(Field::new("out", DataType::Utf8, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         assert!(func.invoke_with_args(args).is_err());
     }
@@ -1549,6 +1513,7 @@ mod tests {
             arg_fields,
             number_rows: n,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args)?;
         let arr = match out {
@@ -1722,6 +1687,7 @@ mod tests {
             arg_fields,
             number_rows: 4,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = match func.invoke_with_args(args).unwrap() {
             ColumnarValue::Array(a) => a,
@@ -1750,6 +1716,7 @@ mod tests {
             arg_fields,
             number_rows: 3,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = match func.invoke_with_args(args).unwrap() {
             ColumnarValue::Array(a) => a,
@@ -1787,6 +1754,7 @@ mod tests {
             arg_fields,
             number_rows: n,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         match out {
@@ -1949,6 +1917,7 @@ mod tests {
             arg_fields,
             number_rows: 4,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         let arr = match out {
@@ -1989,6 +1958,7 @@ mod tests {
             arg_fields,
             number_rows: 1,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         assert!(func.invoke_with_args(args).is_err());
     }
@@ -2020,6 +1990,7 @@ mod tests {
             arg_fields,
             number_rows: 1,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         assert!(func.invoke_with_args(args).is_err());
     }
@@ -2047,6 +2018,7 @@ mod tests {
             arg_fields,
             number_rows: 3,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         let arr = match out {
@@ -2081,6 +2053,7 @@ mod tests {
             arg_fields,
             number_rows: 2,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         let arr = match out {
@@ -2138,6 +2111,7 @@ mod tests {
             arg_fields,
             number_rows: 1,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args)?;
         match out {
@@ -2205,6 +2179,7 @@ mod tests {
             arg_fields,
             number_rows: 1,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         let arr = match out {
@@ -2247,6 +2222,7 @@ mod tests {
             arg_fields,
             number_rows: 3,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         match out {
@@ -2324,6 +2300,7 @@ mod tests {
             arg_fields,
             number_rows: 1,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         assert!(func.invoke_with_args(args).is_err());
     }
@@ -2344,5 +2321,77 @@ mod tests {
             scalar_arguments: &[None, None],
         };
         assert!(func.return_field_from_args(ret_args).is_err());
+    }
+
+    // ------- Feature 002: native_int_kind hint propagation through ops -------
+    //
+    // These tests lock the *current* behavior: `build_output_field` calls
+    // `DecimalArbType::field(...)` which produces a fresh field with the
+    // decimal_arb extension keys and no `native_int_kind` hint. So the hint
+    // is dropped on every binary-op output, regardless of whether the two
+    // inputs agreed.
+    //
+    // This is acceptable because the hint exists to round-trip a column's
+    // *origin* (UInt256 / Int256 source) to a matching native sink — once a
+    // value goes through arithmetic, the result is no longer "the original
+    // ClickHouse-side bytes," so dropping the hint and falling back to the
+    // generic `Decimal(p, s)` (or `coerce_to: string`) sink path is the
+    // safe default. The data-model documents this behavior under E1.
+
+    use crate::types::decimal_arb::NativeIntKind;
+
+    fn hinted_field(name: &str, precision: u32, scale: u32, kind: NativeIntKind) -> FieldRef {
+        let field = DecimalArbType::field(name, precision, scale, true).unwrap();
+        let with_hint = DecimalArbType::with_native_int_kind(field, kind).unwrap();
+        Arc::new(with_hint)
+    }
+
+    fn run_add_return_field(lhs: FieldRef, rhs: FieldRef) -> FieldRef {
+        let arg_fields = vec![lhs, rhs];
+        let ret_args = ReturnFieldArgs {
+            arg_fields: &arg_fields,
+            scalar_arguments: &[None, None],
+        };
+        DecimalArbAddFunc::new()
+            .return_field_from_args(ret_args)
+            .unwrap()
+    }
+
+    #[test]
+    fn add_drops_native_int_kind_when_both_inputs_share_u256_hint() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = hinted_field("b", 78, 0, NativeIntKind::U256);
+        let out = run_add_return_field(lhs, rhs);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            None,
+            "current behavior: binary-op output does not carry a native_int_kind \
+             hint even when both inputs agreed — the result represents a new \
+             value, not the original ClickHouse UInt256 bytes"
+        );
+    }
+
+    #[test]
+    fn add_drops_native_int_kind_when_inputs_have_mixed_hints() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = hinted_field("b", 78, 0, NativeIntKind::I256);
+        let out = run_add_return_field(lhs, rhs);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            None,
+            "mixed-hint output drops the hint (ambiguous origin)"
+        );
+    }
+
+    #[test]
+    fn add_drops_native_int_kind_when_only_one_input_is_hinted() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = Arc::new(DecimalArbType::field("b", 78, 0, true).unwrap());
+        let out = run_add_return_field(lhs, rhs);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            None,
+            "single-hinted input does not propagate the hint to the output"
+        );
     }
 }

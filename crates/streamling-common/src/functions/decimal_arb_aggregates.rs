@@ -29,7 +29,6 @@ use datafusion::logical_expr::{
     SetMonotonicity, Signature, StatisticsArgs, Volatility,
 };
 use datafusion::scalar::ScalarValue;
-use std::any::Any;
 use std::sync::Arc;
 
 /// Helper: read the input field from accumulator-style args and check whether
@@ -88,6 +87,60 @@ fn require_decimal_arb(field: &Field, op_name: &str) -> Result<(u32, u32)> {
     })
 }
 
+/// Replicate the built-in `sum` numeric coercion for the non-decimal_arb path.
+/// DF54's `sum` encodes coercion in its `Coercible` signature rather than
+/// `coerce_types`, so delegating to `builtin.coerce_types` errors with
+/// "does not implement coerce_types"; mirror the Postgres-style rules here.
+fn builtin_sum_coerce(arg_types: &[DataType]) -> Result<Vec<DataType>> {
+    fn coerced(dt: &DataType) -> Result<DataType> {
+        match dt {
+            DataType::Dictionary(_, v) => coerced(v),
+            DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _) => Ok(dt.clone()),
+            d if d.is_signed_integer() => Ok(DataType::Int64),
+            d if d.is_unsigned_integer() => Ok(DataType::UInt64),
+            d if d.is_floating() => Ok(DataType::Float64),
+            other => Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!("sum is not supported for input type {other:?}"),
+            )),
+        }
+    }
+    let Some(arg) = arg_types.first() else {
+        return Err(datafusion::error::DataFusionError::from(
+            streamling_user_err!("sum expects exactly one argument"),
+        ));
+    };
+    Ok(vec![coerced(arg)?])
+}
+
+/// Replicate the built-in `avg` numeric coercion for the non-decimal_arb path
+/// (same DF54 caveat as [`builtin_sum_coerce`]): integers/floats → Float64,
+/// decimals and durations pass through unchanged.
+fn builtin_avg_coerce(arg_types: &[DataType]) -> Result<Vec<DataType>> {
+    fn coerced(dt: &DataType) -> Result<DataType> {
+        match dt {
+            DataType::Dictionary(_, v) => coerced(v),
+            DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Duration(_) => Ok(dt.clone()),
+            d if d.is_integer() || d.is_floating() => Ok(DataType::Float64),
+            other => Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!("avg is not supported for input type {other:?}"),
+            )),
+        }
+    }
+    let Some(arg) = arg_types.first() else {
+        return Err(datafusion::error::DataFusionError::from(
+            streamling_user_err!("avg expects exactly one argument"),
+        ));
+    };
+    Ok(vec![coerced(arg)?])
+}
+
 // =====================================================================
 // SUM
 // =====================================================================
@@ -97,7 +150,7 @@ fn require_decimal_arb(field: &Field, op_name: &str) -> Result<(u32, u32)> {
 /// Decimal128/256, …), the wrapped DataFusion built-in `sum`
 /// is delegated to so existing pipelines that aggregate
 /// non-decimal_arb columns continue to plan and run.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbSumUdaf {
     builtin: Arc<AggregateUDF>,
     signature: Signature,
@@ -126,9 +179,6 @@ impl DecimalArbSumUdaf {
 }
 
 impl AggregateUDFImpl for DecimalArbSumUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "sum"
     }
@@ -143,7 +193,7 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
         if matches!(arg_types.first(), Some(DataType::LargeBinary)) {
             Ok(vec![DataType::LargeBinary])
         } else {
-            self.builtin.inner().coerce_types(arg_types)
+            builtin_sum_coerce(arg_types)
         }
     }
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
@@ -313,7 +363,7 @@ impl Accumulator for SumAccumulator {
 // MIN / MAX
 // =====================================================================
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Extreme {
     Min,
     Max,
@@ -336,7 +386,7 @@ impl Extreme {
 
 /// `min` / `max` UDAF wrapper: decimal_arb inputs use `ExtremeAccumulator`;
 /// any other input type delegates to the wrapped DataFusion built-in.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbExtremeUdaf {
     extreme: Extreme,
     builtin: Arc<AggregateUDF>,
@@ -364,9 +414,6 @@ impl DecimalArbExtremeUdaf {
 }
 
 impl AggregateUDFImpl for DecimalArbExtremeUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.extreme.name()
     }
@@ -549,7 +596,7 @@ impl Accumulator for ExtremeAccumulator {
 
 /// `avg` UDAF wrapper: decimal_arb inputs use `AvgAccumulator`; any other
 /// input type delegates to the wrapped DataFusion built-in.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DecimalArbAvgUdaf {
     builtin: Arc<AggregateUDF>,
     signature: Signature,
@@ -574,9 +621,6 @@ impl DecimalArbAvgUdaf {
 }
 
 impl AggregateUDFImpl for DecimalArbAvgUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "avg"
     }
@@ -587,7 +631,7 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
         if matches!(arg_types.first(), Some(DataType::LargeBinary)) {
             Ok(vec![DataType::LargeBinary])
         } else {
-            self.builtin.inner().coerce_types(arg_types)
+            builtin_avg_coerce(arg_types)
         }
     }
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
