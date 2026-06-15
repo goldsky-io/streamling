@@ -1,7 +1,7 @@
 use arrow_schema::Field;
 use datafusion::arrow::datatypes::DataType;
 use streamling_core::types::decimal_arb::DecimalArbType;
-use streamling_core::types::{i256::I256Type, u256::U256Type};
+// Feature 002 (Retire U256/I256): U256/I256 imports removed.
 
 /// PostgreSQL type information for an Arrow field
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,16 +16,9 @@ pub struct PostgresTypeInfo {
 /// Get PostgreSQL type information for an Arrow field
 /// This is the single source of truth for Arrow → PostgreSQL type mapping
 pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
-    // Check for U256/I256 types that become NUMERIC(78,0)
-    if matches!(field.data_type(), DataType::FixedSizeBinary(32))
-        && (U256Type::is_u256_metadata(field.metadata())
-            || I256Type::is_i256_metadata(field.metadata()))
-    {
-        return PostgresTypeInfo {
-            column_type: "NUMERIC(78,0)".to_string(),
-            string_cast_sql: Some("numeric(78,0)".to_string()),
-        };
-    }
+    // Feature 002 (Retire U256/I256): FSB(32)+U256/I256-metadata fields
+    // no longer arrive here after the Phase 3 routing flip. Wide integers
+    // flow through the decimal_arb branch below.
 
     // decimal_arb (LargeBinary + extension metadata) becomes NUMERIC(precision, scale).
     // Scale-aligned canonical bytes are pre-projected to canonical decimal strings
@@ -177,21 +170,8 @@ mod tests {
         assert_eq!(info.string_cast_sql, Some("numeric(30,6)".to_string()));
     }
 
-    #[test]
-    fn test_u256_mapping() {
-        let field = Field::new("u256", U256Type::new(), false).with_metadata(U256Type::metadata());
-        let info = get_postgres_type_info(&field);
-        assert_eq!(info.column_type, "NUMERIC(78,0)");
-        assert_eq!(info.string_cast_sql, Some("numeric(78,0)".to_string()));
-    }
-
-    #[test]
-    fn test_i256_mapping() {
-        let field = Field::new("i256", I256Type::new(), false).with_metadata(I256Type::metadata());
-        let info = get_postgres_type_info(&field);
-        assert_eq!(info.column_type, "NUMERIC(78,0)");
-        assert_eq!(info.string_cast_sql, Some("numeric(78,0)".to_string()));
-    }
+    // Feature 002: U256/I256 mapping tests deleted with the retired types.
+    // Wide-int columns now route via the decimal_arb mapping test below.
 
     #[test]
     fn test_decimal_arb_mapping_to_numeric() {

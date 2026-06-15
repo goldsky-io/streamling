@@ -13,18 +13,18 @@
 //!   2. [`coerce_batch_to_target`] — recursively coerce arrow-avro's decoded batch so its column
 //!      data types exactly match streamling's *target* Arrow schema (the one
 //!      `convert_avro_schema_to_arrow` produces and the rest of the pipeline expects). This is
-//!      what reinterprets the downgraded `Binary` columns back into `FixedSizeBinary(32)` u256/i256
-//!      (top-level) or `Decimal128(p,0)` (nested), rebuilds `List`/`Struct` columns to match the
-//!      target field names/types, and casts anything else (e.g. enum dictionaries → `Utf8`).
+//!      what reinterprets the downgraded `Binary` columns back into `streamling.decimal_arb`
+//!      (top-level wide decimals → canonical `LargeBinary`) or `Decimal128(p,0)` (nested),
+//!      rebuilds `List`/`Struct` columns to match the target field names/types, and casts
+//!      anything else (e.g. enum dictionaries → `Utf8`).
 //!
 //! Schemas using avro named-type references (`AvroSchema::Ref`) are NOT supported — streamling's
 //! `convert_avro_schema_to_arrow` itself `todo!()`s on them, so there's no target to coerce to.
 
-use crate::types::i256::I256Type;
-use crate::types::u256::U256Type;
+use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue};
 use apache_avro::Schema as ApacheAvroSchema;
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeBinaryBuilder, LargeStringArray,
     ListArray, PrimitiveArray, StringArray, StructArray, new_null_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -37,6 +37,7 @@ use arrow_schema::{DataType, Field, FieldRef, Fields, SchemaRef};
 use bigdecimal::BigDecimal;
 use bigdecimal::num_bigint::BigInt;
 use datafusion::error::{DataFusionError, Result};
+use num_bigint::BigInt;
 use serde_json::Value as Json;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -157,12 +158,10 @@ pub fn coerce_batch_to_target(batch: &RecordBatch, target: &SchemaRef) -> Result
 /// Coerce a single decoded array to `target`'s data type, recursing into list/struct children.
 fn coerce_array(src: &ArrayRef, target: &Field) -> Result<ArrayRef> {
     match target.data_type() {
-        // u256 / i256: arrow-avro decoded the (downgraded) high-precision decimal as raw bytes.
-        DataType::FixedSizeBinary(32) if U256Type::is_u256_metadata(target.metadata()) => {
-            binary_to_fixed256(src, BigIntKind::U256)
-        }
-        DataType::FixedSizeBinary(32) if I256Type::is_i256_metadata(target.metadata()) => {
-            binary_to_fixed256(src, BigIntKind::I256)
+        // Wide blockchain integers / high-precision decimals: arrow-avro decoded the (downgraded)
+        // decimal as raw bytes; reinterpret them as streamling.decimal_arb (canonical LargeBinary).
+        DataType::LargeBinary if DecimalArbType::is_decimal_arb_field(target) => {
+            binary_to_decimal_arb(src, target)
         }
         DataType::Decimal128(p, s) => binary_or_passthrough_decimal128(src, *p, *s),
         DataType::Decimal256(p, s) => binary_or_passthrough_decimal256(src, *p, *s),
@@ -305,12 +304,6 @@ fn format_decimal_bytes_with_scale(bytes: &[u8], scale: i64) -> String {
 // Leaf conversions: raw avro decimal bytes -> streamling number types.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BigIntKind {
-    U256,
-    I256,
-}
-
 fn as_binary_iter(src: &ArrayRef) -> Result<Vec<Option<Vec<u8>>>> {
     if let Some(b) = src.as_any().downcast_ref::<BinaryArray>() {
         Ok((0..b.len())
@@ -335,21 +328,33 @@ fn as_binary_iter(src: &ArrayRef) -> Result<Vec<Option<Vec<u8>>>> {
     }
 }
 
-fn binary_to_fixed256(src: &ArrayRef, kind: BigIntKind) -> Result<ArrayRef> {
+/// Reinterpret raw avro decimal bytes (two's-complement big-endian, unscaled) as a
+/// `streamling.decimal_arb` column: each value becomes the canonical `(sign, magnitude)` byte
+/// payload at the field's declared scale, stored in a `LargeBinaryArray`. This is the decimal_arb
+/// successor to the retired u256/i256 `FixedSizeBinary(32)` reinterpretation — wide blockchain
+/// integers (avro decimal precision 77–100) now land losslessly as decimal_arb. Mirrors the avro
+/// writer's byte handling (`BigInt::from_signed_bytes_be` → `from_bigint_and_scale`).
+fn binary_to_decimal_arb(src: &ArrayRef, target: &Field) -> Result<ArrayRef> {
+    let (_precision, scale) =
+        DecimalArbType::precision_scale_from_field(target).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "arrow-avro: target field '{}' is LargeBinary but carries no decimal_arb metadata",
+                target.name()
+            ))
+        })?;
     let rows = as_binary_iter(src)?;
-    let out: Vec<Option<[u8; 32]>> = rows
-        .iter()
-        .map(|b| match b {
-            None => Ok(None),
-            Some(bytes) => match kind {
-                BigIntKind::U256 => u256_be_bytes(bytes).map(Some),
-                BigIntKind::I256 => i256_be_bytes(bytes).map(Some),
-            },
-        })
-        .collect::<Result<_>>()?;
-    let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(out.into_iter(), 32)
-        .map_err(arrow_err)?;
-    Ok(Arc::new(arr))
+    let mut builder = LargeBinaryBuilder::with_capacity(rows.len(), 0);
+    for row in &rows {
+        match row {
+            None => builder.append_null(),
+            Some(bytes) => {
+                let bigint = BigInt::from_signed_bytes_be(bytes);
+                let value = DecimalArbValue::from_bigint_and_scale(bigint, scale as i64);
+                builder.append_value(value.to_canonical_bytes_at_scale(scale));
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 fn binary_or_passthrough_decimal128(src: &ArrayRef, p: u8, s: i8) -> Result<ArrayRef> {
@@ -445,54 +450,6 @@ fn be_bytes_to_i256(bytes: &[u8]) -> i256 {
     let n = bytes.len().min(32);
     ext[32 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
     i256::from_be_bytes(ext)
-}
-
-/// Big-endian two's-complement avro decimal bytes → 32-byte big-endian u256 (zero-extended).
-/// Rejects negative values. (Extracted from `arrow_array_reader::resolve_u256`.)
-pub fn u256_be_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
-    if !bytes.is_empty() && (bytes[0] & 0x80) != 0 {
-        return Err(DataFusionError::Internal(
-            "Failed to convert negative decimal to U256 - negative values not supported"
-                .to_string(),
-        ));
-    }
-    let mut bytes = bytes.to_vec();
-    while bytes.len() > 32 && bytes[0] == 0x00 {
-        bytes.remove(0);
-    }
-    if bytes.len() > 32 {
-        return Err(DataFusionError::Internal(format!(
-            "Failed to convert decimal to U256 - data too large ({} bytes, max 32)",
-            bytes.len()
-        )));
-    }
-    let mut result = [0u8; 32];
-    result[32 - bytes.len()..].copy_from_slice(&bytes);
-    Ok(result)
-}
-
-/// Big-endian two's-complement avro decimal bytes → 32-byte big-endian i256 (sign-extended).
-/// (Extracted from `arrow_array_reader::resolve_i256`.)
-pub fn i256_be_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
-    let mut bytes = bytes.to_vec();
-    let negative = !bytes.is_empty() && (bytes[0] & 0x80) != 0;
-    let padding_byte = if negative { 0xFF } else { 0x00 };
-    while bytes.len() > 32 && bytes[0] == padding_byte {
-        if bytes.len() > 1 && ((bytes[1] & 0x80) != 0) == negative {
-            bytes.remove(0);
-        } else {
-            break;
-        }
-    }
-    if bytes.len() > 32 {
-        return Err(DataFusionError::Internal(format!(
-            "Failed to convert decimal to I256 - data too large ({} bytes, max 32)",
-            bytes.len()
-        )));
-    }
-    let mut result = [padding_byte; 32];
-    result[32 - bytes.len()..].copy_from_slice(&bytes);
-    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_u256_decode_via_arrow_avro() {
+    fn end_to_end_wide_decimal_decode_via_arrow_avro() {
         let mut payload = [0u8; 32];
         payload[0] = 0x12;
         payload[1] = 0x34;
@@ -938,19 +895,24 @@ mod tests {
 
         let field = batch.schema().field(0).clone();
         assert!(
-            U256Type::is_u256_field(&field),
-            "field not tagged u256: {field:?}"
+            DecimalArbType::is_decimal_arb_field(&field),
+            "field not tagged decimal_arb: {field:?}"
         );
         let col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("FixedSizeBinary(32)");
-        assert_eq!(col.value(0), &payload, "u256 bytes round-trip");
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("decimal_arb storage is LargeBinary");
+        // The wide value round-trips losslessly: canonical bytes at scale 0 == the big-endian
+        // unsigned integer carried on the wire.
+        let decoded = DecimalArbValue::from_canonical_bytes_at_scale(col.value(0), 0).unwrap();
+        let expected =
+            DecimalArbValue::from_bigint_and_scale(BigInt::from_signed_bytes_be(&payload), 0);
+        assert_eq!(decoded, expected, "wide decimal round-trip");
     }
 
     #[test]
-    fn confluent_decoder_u256_end_to_end() {
+    fn confluent_decoder_wide_decimal_end_to_end() {
         let mut payload = [0u8; 32];
         payload[0] = 0x12;
         payload[15] = 0x55;
@@ -974,16 +936,20 @@ mod tests {
         decoder.decode(&framed).unwrap();
         let batch = decoder.flush().unwrap().expect("a batch");
 
-        assert!(U256Type::is_u256_field(&batch.schema().field(0).clone()));
+        assert!(DecimalArbType::is_decimal_arb_field(
+            &batch.schema().field(0).clone()
+        ));
         let col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("FixedSizeBinary(32)");
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("decimal_arb storage is LargeBinary");
+        let decoded = DecimalArbValue::from_canonical_bytes_at_scale(col.value(0), 0).unwrap();
+        let expected =
+            DecimalArbValue::from_bigint_and_scale(BigInt::from_signed_bytes_be(&payload), 0);
         assert_eq!(
-            col.value(0),
-            &payload,
-            "u256 round-trips through Confluent decode"
+            decoded, expected,
+            "wide decimal round-trips through Confluent decode"
         );
     }
 
@@ -1027,8 +993,21 @@ mod tests {
         decoder.decode(&framed).unwrap();
         let batch = decoder.flush().unwrap().expect("a batch");
 
-        // top-level field is u256
-        assert!(U256Type::is_u256_field(&batch.schema().field(0).clone()));
+        // top-level field is a wide decimal → streamling.decimal_arb
+        assert!(DecimalArbType::is_decimal_arb_field(
+            &batch.schema().field(0).clone()
+        ));
+        let top_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("decimal_arb storage is LargeBinary");
+        let top_val = DecimalArbValue::from_canonical_bytes_at_scale(top_col.value(0), 0).unwrap();
+        assert_eq!(
+            top_val.to_canonical_string(),
+            "7",
+            "top-level u256 value == 7"
+        );
 
         // xfers is List<Struct{who: Utf8, amt: Decimal128(100,0)}>
         let xfers = batch.schema().field(1).clone();
