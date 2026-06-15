@@ -28,9 +28,9 @@ use apache_avro::{
 };
 use bigdecimal::BigDecimal;
 use datafusion::arrow::array::{
-    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, LargeStringArray,
-    ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StringBuilder,
-    StringDictionaryBuilder, make_array,
+    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, LargeBinaryBuilder,
+    LargeStringArray, ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray,
+    StringBuilder, StringDictionaryBuilder, make_array,
 };
 use datafusion::arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
 use datafusion::arrow::buffer::{Buffer, MutableBuffer};
@@ -670,6 +670,56 @@ impl AvroArrowArrayReader {
                             })
                             .collect::<ArrowResult<StringArray>>()?,
                     ) as ArrayRef,
+                    DataType::LargeBinary
+                        if crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(
+                            field,
+                        ) =>
+                    {
+                        // Decode Avro decimal values into canonical decimal_arb bytes
+                        // at the column's declared scale.
+                        let (_, scale) =
+                            crate::types::decimal_arb::DecimalArbType::precision_scale_from_field(
+                                field,
+                            )
+                            .ok_or_else(|| {
+                                SchemaError(format!(
+                                    "decimal_arb field '{}' missing precision/scale metadata",
+                                    field.name()
+                                ))
+                            })?;
+                        let mut builder = LargeBinaryBuilder::with_capacity(rows.len(), 0);
+                        for row in rows {
+                            // Match `build_decimal_array`'s nullability semantics:
+                            // a missing field on a non-nullable column is a schema
+                            // error, not a silent null. The prior `.unwrap()` here
+                            // panicked unconditionally for any missing field, which
+                            // was wrong for nullable columns; this resolves both.
+                            match self.field_lookup(&field_path, row) {
+                                Some(v) => match resolve_decimal_arb_canonical_bytes(v, scale)? {
+                                    Some(bytes) => builder.append_value(&bytes),
+                                    None => {
+                                        if !field.is_nullable() {
+                                            return Err(SchemaError(format!(
+                                                "Unexpected null value for non-nullable decimal_arb field '{}'",
+                                                field.name()
+                                            )));
+                                        }
+                                        builder.append_null();
+                                    }
+                                },
+                                None => {
+                                    if !field.is_nullable() {
+                                        return Err(SchemaError(format!(
+                                            "Missing non-nullable decimal_arb field '{}'",
+                                            field.name()
+                                        )));
+                                    }
+                                    builder.append_null();
+                                }
+                            }
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
+                    }
                     DataType::Binary | DataType::LargeBinary => Arc::new(
                         rows.iter()
                             .map(|row| {
@@ -1140,6 +1190,34 @@ fn resolve_decimal(v: &Value) -> ArrowResult<Option<i128>> {
     }
 }
 
+/// Decode an Avro `Value::Decimal` into canonical decimal_arb bytes
+/// (`[sign_byte][big-endian unsigned magnitude]` per
+/// `contracts/arrow-extension-type.md` §3) at the column's declared scale.
+fn resolve_decimal_arb_canonical_bytes(v: &Value, scale: u32) -> ArrowResult<Option<Vec<u8>>> {
+    let v = if let Value::Union(_, b) = v { b } else { v };
+    match v {
+        Value::Decimal(d) => {
+            let bytes = <Vec<u8>>::try_from(d).map_err(|e| {
+                SchemaError(format!("Failed to convert avro decimal to bytes: {:?}", e))
+            })?;
+            // Avro Decimal stores the value × 10^scale as signed two's-complement
+            // big-endian bytes. Convert to BigInt, wrap as DecimalArbValue at the
+            // column scale, then emit canonical bytes.
+            let bigint = BigInt::from_signed_bytes_be(&bytes);
+            let value = crate::types::decimal_arb::DecimalArbValue::from_bigint_and_scale(
+                bigint,
+                scale as i64,
+            );
+            Ok(Some(value.to_canonical_bytes_at_scale(scale)))
+        }
+        Value::Null => Ok(None),
+        other => Err(SchemaError(format!(
+            "Expected Decimal value for decimal_arb, got {:?}",
+            other
+        ))),
+    }
+}
+
 fn resolve_u256(v: &Value) -> ArrowResult<Option<[u8; 32]>> {
     let v = if let Value::Union(_, b) = v { b } else { v };
     match v {
@@ -1349,6 +1427,94 @@ mod tests {
 
         let u256_val = bytes_to_u256(&result);
         assert_eq!(u256_to_string(&u256_val), "511");
+    }
+
+    // ------- T018: decimal_arb resolver -------
+
+    #[test]
+    fn test_resolve_decimal_arb_positive() {
+        // Avro decimal stores `value × 10^scale` as signed two's-complement.
+        // value = 12345.678 at scale 3 → BigInt(12_345_678) → signed BE bytes.
+        let bd: BigDecimal = "12345.678".parse().unwrap();
+        let (bigint, _) = bd.into_bigint_and_exponent();
+        let bytes = bigint.to_signed_bytes_be();
+        let value = Value::Decimal(AvroDecimal::from(bytes));
+
+        let canonical = resolve_decimal_arb_canonical_bytes(&value, 3)
+            .unwrap()
+            .unwrap();
+        // Round-trip through DecimalArbValue at scale 3.
+        let decoded = crate::types::decimal_arb::DecimalArbValue::from_canonical_bytes_at_scale(
+            &canonical, 3,
+        )
+        .unwrap();
+        assert_eq!(decoded.to_canonical_string(), "12345.678");
+    }
+
+    #[test]
+    fn test_resolve_decimal_arb_negative() {
+        let bd: BigDecimal = "-99.5".parse().unwrap();
+        let (bigint, _) = bd.into_bigint_and_exponent();
+        let bytes = bigint.to_signed_bytes_be();
+        let value = Value::Decimal(AvroDecimal::from(bytes));
+
+        let canonical = resolve_decimal_arb_canonical_bytes(&value, 1)
+            .unwrap()
+            .unwrap();
+        let decoded = crate::types::decimal_arb::DecimalArbValue::from_canonical_bytes_at_scale(
+            &canonical, 1,
+        )
+        .unwrap();
+        assert_eq!(decoded.to_canonical_string(), "-99.5");
+    }
+
+    #[test]
+    fn test_resolve_decimal_arb_100_digits() {
+        // 100-digit integer with scale 0 — beyond Decimal256's reach.
+        let mut s = String::with_capacity(101);
+        s.push('1');
+        for _ in 0..99 {
+            s.push('0');
+        }
+        let bd: BigDecimal = s.parse().unwrap();
+        let (bigint, _) = bd.into_bigint_and_exponent();
+        let bytes = bigint.to_signed_bytes_be();
+        let value = Value::Decimal(AvroDecimal::from(bytes));
+
+        let canonical = resolve_decimal_arb_canonical_bytes(&value, 0)
+            .unwrap()
+            .unwrap();
+        let decoded = crate::types::decimal_arb::DecimalArbValue::from_canonical_bytes_at_scale(
+            &canonical, 0,
+        )
+        .unwrap();
+        assert_eq!(decoded.to_canonical_string(), s);
+    }
+
+    #[test]
+    fn test_resolve_decimal_arb_null() {
+        assert!(
+            resolve_decimal_arb_canonical_bytes(&Value::Null, 0)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_resolve_decimal_arb_with_union() {
+        let bd: BigDecimal = "1.23".parse().unwrap();
+        let (bigint, _) = bd.into_bigint_and_exponent();
+        let bytes = bigint.to_signed_bytes_be();
+        let value = Value::Union(0, Box::new(Value::Decimal(AvroDecimal::from(bytes))));
+
+        let canonical = resolve_decimal_arb_canonical_bytes(&value, 2)
+            .unwrap()
+            .unwrap();
+        let decoded = crate::types::decimal_arb::DecimalArbValue::from_canonical_bytes_at_scale(
+            &canonical, 2,
+        )
+        .unwrap();
+        assert_eq!(decoded.to_canonical_string(), "1.23");
     }
 
     #[test]

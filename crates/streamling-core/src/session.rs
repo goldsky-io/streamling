@@ -9,12 +9,17 @@ use datafusion::catalog::{SchemaProvider, Session, TableProvider};
 use datafusion::common::{config::ConfigExtension, extensions_options};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::execution::{FunctionRegistry, SessionState, SessionStateBuilder};
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
+use streamling_common::functions::decimal_arb_aggregates::{
+    DecimalArbAvgUdaf, DecimalArbExtremeUdaf, DecimalArbSumUdaf,
+};
+use streamling_common::functions::decimal_arb_coercion::DecimalArbExprPlanner;
+use streamling_common::functions::decimal_arb_sort_optimizer::DecimalArbSortRewriteRule;
 use streamling_flink_compat::{register_json_functions, register_string_aliases};
 
 pub static DEFAULT_CATALOG_NAME: &str = "default";
@@ -109,9 +114,14 @@ impl SessionManager {
             .with_runtime_env(runtime)
             .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
             .with_physical_optimizer_rules(StreamlingPhysicalOptimizerRules::rules())
+            // T046: rewrite ORDER BY decimal_arb_col -> ORDER BY
+            // decimal_arb_to_sort_key(...) so DataFusion's bytewise
+            // sort over the canonical encoding produces correct
+            // numeric ordering across signs (FR-005).
+            .with_optimizer_rule(Arc::new(DecimalArbSortRewriteRule::new()))
             .build();
 
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
 
         register_json_functions(&ctx)?;
         register_string_aliases(&ctx)?;
@@ -120,6 +130,19 @@ impl SessionManager {
             // This can override a built-in function with the same name
             ctx.register_udf(udf);
         }
+
+        // T047: register decimal_arb aggregate UDAFs (override built-in
+        // sum/min/max/avg for decimal_arb input columns) and the
+        // ExprPlanner (auto-bind native +/-/*/`/`%/=/!=/</<=/>/`>=` to
+        // decimal_arb_<op> ScalarUDFs when both operands are decimal_arb).
+        // The T007 spike confirmed register_udaf overrides the built-in
+        // for that name; the T005 spike confirmed register_expr_planner
+        // wires the planner into SQL frontend planning.
+        ctx.register_udaf(DecimalArbSumUdaf::into_udaf());
+        ctx.register_udaf(DecimalArbExtremeUdaf::min_udaf());
+        ctx.register_udaf(DecimalArbExtremeUdaf::max_udaf());
+        ctx.register_udaf(DecimalArbAvgUdaf::into_udaf());
+        ctx.register_expr_planner(Arc::new(DecimalArbExprPlanner::new()))?;
 
         crate::plugin::udf::register_plugin_udfs(&ctx);
 
@@ -406,6 +429,8 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
     fn test_extract_schema_and_table_names() {
@@ -417,5 +442,69 @@ mod tests {
             SessionManager::extract_schema_and_table_names("table_c"),
             (DEFAULT_SCHEMA_NAME, "table_c")
         );
+    }
+
+    /// Regression test (code-reviewer-pro: SUM/MIN/MAX/AVG UDAFs are
+    /// registered under built-in names, so a pipeline calling SUM on a
+    /// plain Int64/Float64 column must still resolve via the built-in
+    /// aggregate — not error with a coerce-to-LargeBinary type mismatch.
+    #[tokio::test]
+    async fn builtin_aggregates_still_work_for_non_decimal_arb_columns() {
+        let registry = DynamicTableRegistry::new();
+        let sm = SessionManager::new(1024, 64, registry).unwrap();
+        let ctx = sm.session_context();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+                Arc::new(Float64Array::from(vec![1.5_f64, 2.5, 3.5, 4.5, 5.5])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("t", batch).unwrap();
+
+        for (sql, expected_col, expected_val) in [
+            ("SELECT SUM(i) AS s FROM t", "s", "15"),
+            ("SELECT MIN(i) AS m FROM t", "m", "1"),
+            ("SELECT MAX(i) AS m FROM t", "m", "5"),
+            ("SELECT AVG(f) AS a FROM t", "a", "3.5"),
+            // The `mean` alias for AVG is registered by DataFusion's built-in
+            // and must be preserved through the wrapper's `aliases` delegation.
+            ("SELECT MEAN(f) AS a FROM t", "a", "3.5"),
+        ] {
+            let df = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("plan failed for `{sql}`: {e}"));
+            let batches = df
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("collect failed for `{sql}`: {e}"));
+            assert_eq!(
+                batches.len(),
+                1,
+                "expected one output batch for `{sql}`, got {}",
+                batches.len()
+            );
+            assert_eq!(batches[0].num_rows(), 1, "expected one row for `{sql}`");
+            let col = batches[0]
+                .column_by_name(expected_col)
+                .unwrap_or_else(|| panic!("missing output column `{expected_col}` for `{sql}`"));
+            let formatter = arrow::util::display::ArrayFormatter::try_new(
+                col,
+                &arrow::util::display::FormatOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                formatter.value(0).to_string(),
+                expected_val,
+                "wrong result for `{sql}`"
+            );
+        }
     }
 }

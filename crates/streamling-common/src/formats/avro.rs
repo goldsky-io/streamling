@@ -1168,8 +1168,11 @@ mod tests {
     }
 
     #[test]
-    fn test_large_decimal_to_string_conversion() {
-        // The schema will be automatically converted to use Utf8 for this unsupported decimal type
+    fn test_large_decimal_routes_to_decimal_arb() {
+        // FR-018: previously precision > 76 with non-zero scale fell back to
+        // Utf8; it now routes to streamling.decimal_arb so the value is
+        // preserved as a numeric column. Round-trip Avro decimal bytes →
+        // decimal_arb LargeBinary → canonical decimal string and verify.
         let avro_schema = AvroSchema::parse_str(
             r#"
             {
@@ -1177,7 +1180,7 @@ mod tests {
                 "name": "test",
                 "fields": [
                     {"name": "id", "type": "int"},
-                    {"name": "unsupported_decimal", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 5}}
+                    {"name": "wide_decimal", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 5}}
                 ]
             }
         "#,
@@ -1186,34 +1189,31 @@ mod tests {
 
         let arrow_schema = convert_avro_schema_to_arrow(avro_schema.clone());
 
-        // Verify the schema conversion resulted in Utf8 type
         assert_eq!(arrow_schema.fields().len(), 2);
         assert_eq!(arrow_schema.field(0).name(), "id");
         assert_eq!(arrow_schema.field(0).data_type(), &DataType::Int32);
-        assert_eq!(arrow_schema.field(1).name(), "unsupported_decimal");
-        assert_eq!(
-            arrow_schema.field(1).data_type(),
-            &DataType::Utf8,
-            "Decimal with precision > 76 and scale > 0 should fall back to Utf8"
+        assert_eq!(arrow_schema.field(1).name(), "wide_decimal");
+        assert!(
+            crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(arrow_schema.field(1)),
+            "wide-precision decimal must route to streamling.decimal_arb"
         );
 
         let mut converter = AvroToArrowConverter::new(arrow_schema.clone(), avro_schema, None);
 
-        // Using small decimal values for easier verification
         let data = vec![
             Value::Record(vec![
                 ("id".to_string(), Value::Int(1)),
                 (
-                    "unsupported_decimal".to_string(),
-                    // Represents 123.45000 with scale 5 (integer value: 12,345,000 = 0xBC5EA8)
+                    "wide_decimal".to_string(),
+                    // 123.45000 with scale 5 = integer 12_345_000 = 0xBC5EA8
                     Value::Decimal(Decimal::from(vec![0, 0, 0, 0, 0, 0, 0xBC, 0x5E, 0xA8])),
                 ),
             ]),
             Value::Record(vec![
                 ("id".to_string(), Value::Int(2)),
                 (
-                    "unsupported_decimal".to_string(),
-                    // Represents 987.65000 with scale 5 (integer value: 98,765,000 = 0x05E308C8)
+                    "wide_decimal".to_string(),
+                    // 987.65000 with scale 5 = integer 98_765_000 = 0x05E308C8
                     Value::Decimal(Decimal::from(vec![0, 0, 0, 0, 0x05, 0xE3, 0x08, 0xC8])),
                 ),
             ]),
@@ -1236,17 +1236,25 @@ mod tests {
         assert_eq!(id_array.value(0), 1);
         assert_eq!(id_array.value(1), 2);
 
-        let string_array = batch
+        // Decode each row's canonical bytes at scale 5 and verify the value.
+        let lba = batch
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Column should be StringArray since decimal precision > 76 with scale > 0");
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("decimal_arb storage type is LargeBinary");
 
-        let value_0 = string_array.value(0);
-        let value_1 = string_array.value(1);
-
-        assert_eq!(value_0, "123.45");
-        assert_eq!(value_1, "987.65");
+        let v0 = crate::types::decimal_arb::DecimalArbValue::from_canonical_bytes_at_scale(
+            lba.value(0),
+            5,
+        )
+        .unwrap();
+        let v1 = crate::types::decimal_arb::DecimalArbValue::from_canonical_bytes_at_scale(
+            lba.value(1),
+            5,
+        )
+        .unwrap();
+        assert_eq!(v0.to_canonical_string(), "123.45000");
+        assert_eq!(v1.to_canonical_string(), "987.65000");
     }
 
     // ===========================================

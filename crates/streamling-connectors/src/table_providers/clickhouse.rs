@@ -150,6 +150,126 @@ struct SinkParams {
     telemetry: Option<Telemetry>,
 }
 
+/// How a `decimal_arb` column must be converted before the ClickHouse sink
+/// serializes it, mirroring the DDL decision in
+/// [`ClickHouseClient::clickhouse_column_type`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickHouseDecimalArbConversion {
+    /// Narrow `decimal_arb(p, s)` → `Decimal128(p, s)` (p ≤ 38) or
+    /// `Decimal256(p, s)`.
+    Decimal { precision: u32, scale: u32 },
+    /// Wide `decimal_arb` opted into `coerce_to: string` → canonical decimal
+    /// text (`Utf8`).
+    CanonicalString,
+}
+
+/// Decide how a `decimal_arb` field is converted for the ClickHouse sink.
+/// Returns `Ok(None)` for non-`decimal_arb` fields (pass through unchanged)
+/// and `Err` for columns ClickHouse cannot represent (defense in depth for
+/// paths that bypass the config-load validator).
+fn clickhouse_decimal_arb_conversion(
+    field: &arrow::datatypes::Field,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> Result<Option<ClickHouseDecimalArbConversion>> {
+    use streamling_core::types::decimal_arb::DecimalArbType;
+    use streamling_core::types::decimal_arb_capability::{
+        CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
+    };
+
+    let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) else {
+        return Ok(None);
+    };
+    let coerce_to_string = streamling_config::ColumnDirective::find(directives, field.name())
+        .map(|d| d.coerces_to_string())
+        .unwrap_or(false);
+
+    match capability_for_decimal_arb(
+        ConnectorKind::ClickHouse,
+        precision,
+        scale,
+        coerce_to_string,
+    ) {
+        CapabilityResult::Native => Ok(Some(ClickHouseDecimalArbConversion::Decimal {
+            precision,
+            scale,
+        })),
+        CapabilityResult::OptInOnly(_) => Ok(Some(ClickHouseDecimalArbConversion::CanonicalString)),
+        CapabilityResult::Reject(reason) => Err(DataFusionError::from(config_load_error(
+            field.name(),
+            ConnectorKind::ClickHouse,
+            precision,
+            scale,
+            &reason,
+        ))),
+    }
+}
+
+/// Build a projection that converts each `decimal_arb` column to the concrete
+/// Arrow type the ClickHouse sink stores (see
+/// [`ClickHouseDecimalArbConversion`]).
+///
+/// Without this conversion the DDL declares `Decimal`/`String` but the raw
+/// canonical `LargeBinary` bytes are shipped over `FORMAT Arrow`, silently
+/// corrupting the column.
+fn build_decimal_arb_projection_for_clickhouse(
+    state: &dyn Session,
+    input: Arc<dyn ExecutionPlan>,
+    input_schema: &SchemaRef,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::common::{Column, ToDFSchema};
+    use datafusion::logical_expr::{Expr, ScalarUDF, expr::ScalarFunction, lit};
+    use streamling_core::functions::decimal_arb_ops::{
+        DecimalArbToDecimal128Func, DecimalArbToDecimal256Func, DecimalArbToStringFunc,
+    };
+
+    let df_schema = input_schema.clone().to_dfschema()?;
+    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(input_schema.fields().len());
+    let mut needs_projection = false;
+
+    for f in input_schema.fields() {
+        let name = f.name();
+        let col_expr = Expr::Column(Column::from_name(name));
+
+        let logical = match clickhouse_decimal_arb_conversion(f, directives)? {
+            None => col_expr,
+            Some(ClickHouseDecimalArbConversion::Decimal { precision, scale }) => {
+                needs_projection = true;
+                // ClickHouse Decimal(p, s): Arrow Decimal128 carries p ≤ 38,
+                // Decimal256 carries 38 < p ≤ 76.
+                let func = if precision <= 38 {
+                    ScalarUDF::from(DecimalArbToDecimal128Func::new())
+                } else {
+                    ScalarUDF::from(DecimalArbToDecimal256Func::new())
+                };
+                Expr::ScalarFunction(ScalarFunction {
+                    func: Arc::new(func),
+                    args: vec![col_expr, lit(precision as i64), lit(scale as i64)],
+                })
+                .alias(name)
+            }
+            Some(ClickHouseDecimalArbConversion::CanonicalString) => {
+                needs_projection = true;
+                Expr::ScalarFunction(ScalarFunction {
+                    func: Arc::new(ScalarUDF::from(DecimalArbToStringFunc::new())),
+                    args: vec![col_expr],
+                })
+                .alias(name)
+            }
+        };
+
+        let phys = state.create_physical_expr(logical, &df_schema)?;
+        exprs.push((phys, name.to_string()));
+    }
+
+    if needs_projection {
+        Ok(Arc::new(ProjectionExec::try_new(exprs, input)?))
+    } else {
+        Ok(input)
+    }
+}
+
 impl ClickHouseTableProvider {
     const DEFAULT_BLOCK_RANGE: i64 = 1_000_000;
     const DEFAULT_PAGE_SIZE: usize = 10_000_000;
@@ -463,7 +583,7 @@ impl TableProvider for ClickHouseTableProvider {
 
     async fn insert_into(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -559,7 +679,19 @@ impl TableProvider for ClickHouseTableProvider {
                 .collect()
         };
 
-        let projection_exec = Arc::new(ProjectionExec::try_new(projection_exprs?, input)?);
+        let projection_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new(projection_exprs?, input)?);
+
+        // Convert decimal_arb columns to the concrete type the ClickHouse DDL
+        // declares (Decimal128/256 or canonical String) before the batch is
+        // serialized; otherwise the raw canonical bytes are shipped verbatim.
+        let input_schema = projection_exec.schema();
+        let projection_exec = build_decimal_arb_projection_for_clickhouse(
+            state,
+            projection_exec,
+            &input_schema,
+            self.client.creds.columns.as_deref(),
+        )?;
 
         let input_schema = projection_exec.schema();
         let schema = Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
@@ -2059,6 +2191,58 @@ impl ClickHouseClient {
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
+    /// Top-level entry point: map an Arrow `Field` to a ClickHouse column
+    /// type, consulting the optional column directive for FR-019
+    /// `coerce_to: string` opt-in and the capability matrix from T032.
+    ///
+    /// Returns:
+    /// - `Ok("Decimal(p, s)")` for `decimal_arb` columns where ClickHouse
+    ///   can natively hold the declared precision (≤76).
+    /// - `Ok("String")` for wider `decimal_arb` columns when the user has
+    ///   set `coerce_to: string` on this column (explicit FR-019 opt-in).
+    /// - `Err(...)` for wider `decimal_arb` columns without the opt-in
+    ///   (FR-011: pipeline rejected at config load with an actionable
+    ///   error naming the column, the destination, the declared
+    ///   `(precision, scale)`, and the remediation hint).
+    /// - For all other types, delegates to [`arrow_field_to_clickhouse`].
+    ///
+    /// Replaces the silent `String` fallback that
+    /// [`arrow_field_to_clickhouse`] retains for backwards compatibility.
+    pub fn clickhouse_column_type(
+        field: &arrow::datatypes::Field,
+        directive: Option<&streamling_config::ColumnDirective>,
+    ) -> std::result::Result<String, StreamlingError> {
+        use streamling_core::types::decimal_arb_capability::{
+            CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
+        };
+
+        if let Some((precision, scale)) =
+            streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
+        {
+            let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
+            return match capability_for_decimal_arb(
+                ConnectorKind::ClickHouse,
+                precision,
+                scale,
+                coerce_to_string,
+            ) {
+                CapabilityResult::Native => Ok(format!("Decimal({}, {})", precision, scale)),
+                CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
+                CapabilityResult::Reject(reason) => Err(config_load_error(
+                    field.name(),
+                    ConnectorKind::ClickHouse,
+                    precision,
+                    scale,
+                    &reason,
+                )),
+            };
+        }
+
+        // Non-decimal_arb fields: delegate to the existing mapping which
+        // covers every Arrow type that ClickHouse supports.
+        Ok(Self::arrow_field_to_clickhouse(field))
+    }
+
     pub fn arrow_field_to_clickhouse(field: &arrow::datatypes::Field) -> String {
         let ch_type = match field.data_type() {
             arrow::datatypes::DataType::Null => "Nullable(Nothing)".to_string(),
@@ -2078,6 +2262,24 @@ impl ClickHouseClient {
                 "String".to_string()
             }
             arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::LargeBinary => {
+                // decimal_arb is encoded as LargeBinary + extension metadata.
+                // Route narrow-precision (≤76) columns to ClickHouse Decimal
+                // here. Wider columns are rejected at config load by the
+                // pipeline-startup validator (T033/T064) when no
+                // `coerce_to: string` directive is present, so reaching this
+                // arm with `p > 76` only happens via direct callers (e.g.
+                // tests). The directive-aware emission path lives in
+                // [`Self::clickhouse_column_type`].
+                if let Some((precision, scale)) =
+                    streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(
+                        field,
+                    )
+                {
+                    if precision <= 76 {
+                        return format!("Decimal({}, {})", precision, scale);
+                    }
+                    return "String".to_string();
+                }
                 "String".to_string()
             }
             arrow::datatypes::DataType::FixedSizeBinary(size) => {
@@ -2239,6 +2441,7 @@ impl ClickHouseClient {
         let has_custom_version_column = version_column_name.is_some();
         let version_column_name = version_column_name.unwrap_or("insert_time");
 
+        let directives = self.creds.columns.as_deref();
         let column_defs: Vec<String> = schema
             .fields()
             .iter()
@@ -2250,7 +2453,7 @@ impl ClickHouseClient {
                 }
                 true
             })
-            .map(|field| {
+            .map(|field| -> streamling_core::error::Result<String> {
                 let clickhouse_type = if let Some(overrides) = schema_override {
                     if let Some(override_type) = overrides.get(field.name()) {
                         info!(
@@ -2260,15 +2463,19 @@ impl ClickHouseClient {
                         );
                         override_type.clone()
                     } else {
-                        Self::arrow_field_to_clickhouse(field)
+                        let directive =
+                            streamling_config::ColumnDirective::find(directives, field.name());
+                        Self::clickhouse_column_type(field, directive)?
                     }
                 } else {
-                    Self::arrow_field_to_clickhouse(field)
+                    let directive =
+                        streamling_config::ColumnDirective::find(directives, field.name());
+                    Self::clickhouse_column_type(field, directive)?
                 };
 
-                format!("`{}` {}", field.name(), clickhouse_type)
+                Ok(format!("`{}` {}", field.name(), clickhouse_type))
             })
-            .collect();
+            .collect::<streamling_core::error::Result<Vec<_>>>()?;
 
         let primary_key_clause = primary_keys.join(", ");
 
@@ -2436,6 +2643,106 @@ mod tests {
     }
 
     #[test]
+    fn build_create_table_query_rejects_wide_decimal_arb_without_directive() {
+        let client = create_test_client("http://localhost:8123");
+        let amount =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            amount,
+        ]));
+
+        let err = client
+            .build_create_table_query(
+                "test_output",
+                &schema,
+                vec!["id".to_string()],
+                false,
+                None,
+                None,
+            )
+            .expect_err("CREATE TABLE must reject decimal_arb(>76) without coerce_to: string");
+        let msg = err.to_string();
+        assert!(msg.contains("amount"), "error names column: {}", msg);
+        assert!(
+            msg.contains("coerce_to: string"),
+            "actionable hint: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn build_create_table_query_emits_string_for_wide_decimal_arb_with_directive() {
+        let mut config = ClickHouseConfig {
+            url: "http://localhost:8123".to_string(),
+            database: "test_db".to_string(),
+            user: "default".to_string(),
+            password: "".to_string(),
+            compression: ClickHouseCompression::None,
+            compression_level: GzipCompressionLevel::default(),
+            columns: Some(vec![streamling_config::ColumnDirective {
+                name: "amount".to_string(),
+                coerce_to: Some(streamling_config::CoercionTarget::String),
+            }]),
+        };
+        // Tighten lifetime: client borrows config via clone.
+        let _ = &mut config;
+        let client = ClickHouseClient::new(config);
+        let amount =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            amount,
+        ]));
+
+        let query = client
+            .build_create_table_query(
+                "test_output",
+                &schema,
+                vec!["id".to_string()],
+                false,
+                None,
+                None,
+            )
+            .expect("CREATE TABLE must accept decimal_arb(>76) with coerce_to: string");
+        assert!(
+            query.contains("`amount` String"),
+            "wide decimal_arb with coerce_to: string emits as String: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn build_create_table_query_emits_decimal_for_narrow_decimal_arb() {
+        let client = create_test_client("http://localhost:8123");
+        let amount =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 38, 10, false)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            amount,
+        ]));
+
+        let query = client
+            .build_create_table_query(
+                "test_output",
+                &schema,
+                vec!["id".to_string()],
+                false,
+                None,
+                None,
+            )
+            .expect("narrow decimal_arb must produce a Decimal column");
+        assert!(
+            query.contains("`amount` Decimal(38, 10)"),
+            "narrow decimal_arb emits as Decimal(p, s): {}",
+            query
+        );
+    }
+
+    #[test]
     fn test_build_create_table_query_rejects_missing_custom_version_column() {
         let client = create_test_client("http://localhost:8123");
         let schema = Arc::new(Schema::new(vec![
@@ -2582,6 +2889,87 @@ mod tests {
             ClickHouseClient::arrow_field_to_clickhouse(&field_large_binary),
             "String"
         );
+
+        // decimal_arb (LargeBinary + extension metadata) maps to ClickHouse
+        // Decimal(p, s) when p ≤ 76, falls back to String otherwise (with
+        // a WARN log; hard-rejection-at-config-load lands when the
+        // coerce_to: string directive infrastructure ships).
+        let field_decimal_arb_in_band =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 50, 18, false)
+                .unwrap();
+        assert_eq!(
+            ClickHouseClient::arrow_field_to_clickhouse(&field_decimal_arb_in_band),
+            "Decimal(50, 18)",
+        );
+
+        let field_decimal_arb_above_cap =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        assert_eq!(
+            ClickHouseClient::arrow_field_to_clickhouse(&field_decimal_arb_above_cap),
+            "String",
+            "wide-precision decimal_arb falls back to String until the \
+             coerce_to: string YAML directive lands"
+        );
+    }
+
+    // ------- T059 hard-rejection: clickhouse_column_type -------
+
+    #[test]
+    fn clickhouse_column_type_native_for_decimal_arb_within_cap() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 50, 5, false)
+                .unwrap();
+        let out = ClickHouseClient::clickhouse_column_type(&field, None).unwrap();
+        assert_eq!(out, "Decimal(50, 5)");
+    }
+
+    #[test]
+    fn clickhouse_column_type_rejects_wide_decimal_arb_without_opt_in() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let err = ClickHouseClient::clickhouse_column_type(&field, None).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("amount"), "error must name the column: {msg}");
+        assert!(msg.contains("clickhouse"));
+        assert!(
+            msg.contains("76"),
+            "error must mention the 76-digit cap: {msg}"
+        );
+        assert!(
+            msg.contains("coerce_to: string"),
+            "error must point at the remediation: {msg}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_column_type_routes_to_string_with_opt_in() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let directive = streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        };
+        let out = ClickHouseClient::clickhouse_column_type(&field, Some(&directive)).unwrap();
+        assert_eq!(out, "String");
+    }
+
+    #[test]
+    fn clickhouse_column_type_passes_non_decimal_arb_through() {
+        // ClickHouse maps Boolean to UInt8 in this codebase (the existing
+        // `arrow_field_to_clickhouse` behavior). The directive-aware
+        // wrapper must delegate to it for non-decimal_arb fields.
+        let field = Field::new("flag", DataType::Boolean, false);
+        let out = ClickHouseClient::clickhouse_column_type(&field, None).unwrap();
+        let baseline = ClickHouseClient::arrow_field_to_clickhouse(&field);
+        assert_eq!(out, baseline);
+
+        // Existing Decimal128 path: the wrapper delegates correctly.
+        let field = Field::new("price", DataType::Decimal128(20, 5), false);
+        let out = ClickHouseClient::clickhouse_column_type(&field, None).unwrap();
+        assert_eq!(out, "Decimal(20, 5)");
 
         let field_date32 = Field::new("test", DataType::Date32, false);
         assert_eq!(
@@ -3122,6 +3510,7 @@ mod tests {
             password: "".to_string(),
             compression,
             compression_level: GzipCompressionLevel::default(),
+            columns: None,
         };
         ClickHouseClient::new(config)
     }
@@ -3244,6 +3633,7 @@ mod tests {
                 password: "".to_string(),
                 compression: ClickHouseCompression::None,
                 compression_level: GzipCompressionLevel::default(),
+                columns: None,
             }),
             source_params: Some(SourceParams {
                 query_builder,
@@ -3786,5 +4176,52 @@ mod schema_overrides {
             // Non-DateTime overrides are DDL-only (ClickHouse handles the conversion)
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod decimal_arb_conversion_tests {
+    use super::*;
+    use streamling_core::types::decimal_arb::DecimalArbType;
+
+    #[test]
+    fn conversion_none_for_non_decimal_arb() {
+        let field = arrow::datatypes::Field::new("x", arrow::datatypes::DataType::Int64, true);
+        assert_eq!(
+            clickhouse_decimal_arb_conversion(&field, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn conversion_narrow_maps_to_decimal() {
+        let field = DecimalArbType::field("amount", 38, 10, false).unwrap();
+        assert_eq!(
+            clickhouse_decimal_arb_conversion(&field, None).unwrap(),
+            Some(ClickHouseDecimalArbConversion::Decimal {
+                precision: 38,
+                scale: 10
+            })
+        );
+    }
+
+    #[test]
+    fn conversion_wide_without_directive_rejects() {
+        let field = DecimalArbType::field("amount", 100, 18, false).unwrap();
+        let err = clickhouse_decimal_arb_conversion(&field, None).unwrap_err();
+        assert!(err.to_string().contains("amount"), "names column: {err}");
+    }
+
+    #[test]
+    fn conversion_wide_with_coerce_directive_maps_to_string() {
+        let field = DecimalArbType::field("amount", 100, 18, false).unwrap();
+        let directives = vec![streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        }];
+        assert_eq!(
+            clickhouse_decimal_arb_conversion(&field, Some(&directives)).unwrap(),
+            Some(ClickHouseDecimalArbConversion::CanonicalString)
+        );
     }
 }

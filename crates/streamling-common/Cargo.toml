@@ -58,3 +58,6 @@ num-bigint.workspace = true
 # unchanged. The Windows builder must provide cmake, nasm, and perl.
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build", "ssl-vendored"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

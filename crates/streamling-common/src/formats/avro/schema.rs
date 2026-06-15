@@ -1,4 +1,5 @@
 use crate::formats::avro::MAX_SCHEMA_PRECISION;
+use crate::types::decimal_arb::DecimalArbType;
 use crate::types::u256::U256Type;
 use apache_avro::schema::{
     DecimalSchema, RecordField, RecordSchema, Schema as AvroSchema, UnionSchema,
@@ -68,6 +69,22 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                             DataType::Decimal128(p as u8, s as i8),
                             field.is_nullable(),
                         ))
+                    }
+                    // p > 76 with non-zero scale: route to streamling.decimal_arb
+                    // (FR-018 — replaces the prior Utf8 fallback that lost numeric semantics).
+                    // Negative scales are documented as unsupported for decimal_arb; leave
+                    // the (still-lossy) Utf8 fallback in place for that edge case so the
+                    // field at least transmits.
+                    (p, s) if p > 76 => {
+                        DecimalArbType::field(field.name(), p as u32, s as u32, field.is_nullable())
+                            .map(Arc::new)
+                            .unwrap_or_else(|_| {
+                                Arc::new(Field::new(
+                                    field.name(),
+                                    DataType::Utf8,
+                                    field.is_nullable(),
+                                ))
+                            })
                     }
                     _ => Arc::new(Field::new(
                         field.name(),
@@ -319,15 +336,19 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_avro_schema_decimal_with_scale_to_string() {
-        // Test decimal with precision > 76 and scale > 0 falls back to Utf8
+    fn test_convert_avro_schema_decimal_with_scale_routes_to_decimal_arb() {
+        // FR-018: previously precision > 76 with non-zero scale fell back to
+        // Utf8 (lossy — broke arithmetic semantics on the destination side).
+        // It now routes to the streamling.decimal_arb extension type so the
+        // value is preserved as a numeric column end-to-end.
         let avro_schema = AvroSchema::parse_str(
             r#"
             {
                 "type": "record",
                 "name": "test",
                 "fields": [
-                    {"name": "unsupported_decimal", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 1}}
+                    {"name": "wide_decimal", "type": {"type": "bytes", "logicalType": "decimal", "precision": 100, "scale": 18}},
+                    {"name": "boundary_77", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 1}}
                 ]
             }
         "#,
@@ -336,9 +357,17 @@ mod tests {
 
         let arrow_schema = convert_avro_schema_to_arrow(avro_schema);
 
-        assert_eq!(arrow_schema.fields().len(), 1);
-        assert_eq!(arrow_schema.field(0).name(), "unsupported_decimal");
-        assert_eq!(arrow_schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(arrow_schema.fields().len(), 2);
+        assert!(DecimalArbType::is_decimal_arb_field(arrow_schema.field(0)));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(arrow_schema.field(0)),
+            Some((100, 18))
+        );
+        assert!(DecimalArbType::is_decimal_arb_field(arrow_schema.field(1)));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(arrow_schema.field(1)),
+            Some((77, 1))
+        );
     }
 
     #[test]
