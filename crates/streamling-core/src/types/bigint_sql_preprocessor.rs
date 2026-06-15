@@ -828,19 +828,36 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     let sql = DECIMAL_TRY_RE
         .replace_all(sql, |caps: &regex::Captures| {
             let expr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let precision: u8 = caps
+            // Parse precision as u32 — decimal_arb supports declared
+            // precision well beyond u8::MAX. Scale parses as u32 too because
+            // negative scale isn't representable for decimal_arb.
+            let precision: u32 = caps
                 .get(2)
                 .and_then(|m| m.as_str().parse().ok())
                 .unwrap_or(0);
-            let scale: i8 = caps
+            let scale: i32 = caps
                 .get(3)
                 .and_then(|m| m.as_str().parse().ok())
                 .unwrap_or(0);
-            if precision > 76 && scale == 0 {
-                if precision <= 78 {
+            if precision > 76 {
+                if precision <= 78 && scale == 0 {
+                    // Preserve the existing u256 fast path for the
+                    // narrow window — it's lossless and faster than
+                    // a string detour.
                     format!("to_u256({})", expr)
+                } else if scale >= 0 {
+                    // T070 / FR-018: route wide-precision CAST through
+                    // the decimal_arb cast UDF instead of the lossy
+                    // VARCHAR fallback. The inner CAST AS VARCHAR is
+                    // universal — it works for any source type.
+                    format!(
+                        "to_decimal_arb_from_string(TRY_CAST({} AS VARCHAR), {}, {})",
+                        expr, precision, scale
+                    )
                 } else {
-                    format!("TRY_CAST({} AS VARCHAR)", expr)
+                    // Negative scale — not representable for decimal_arb;
+                    // leave as-is so DataFusion surfaces the original error.
+                    caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
                 }
             } else {
                 caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
@@ -858,6 +875,37 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         let inner_sql = inner.to_string();
         let cast_sql = format!("SELECT CAST({} AS VARCHAR)", inner_sql);
         let mut stmts = Parser::parse_sql(&dialect, cast_sql.as_str()).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        if let Statement::Query(query) = stmts.remove(0)
+            && let SetExpr::Select(select) = query.body.as_ref()
+            && let Some(item) = select.projection.first()
+        {
+            return match item {
+                SelectItem::UnnamedExpr(e) => Some(e.clone()),
+                SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Build `to_decimal_arb_from_string(CAST({inner} AS VARCHAR), {precision}, {scale})`
+    /// as an `SqlExpr`. Falls back to the inner cast-to-varchar (lossy) if
+    /// the function-call shape can't be parsed for some reason.
+    fn parse_to_decimal_arb_from_string(
+        inner: &SqlExpr,
+        precision: u64,
+        scale: u64,
+    ) -> Option<SqlExpr> {
+        let dialect = GenericDialect {};
+        let inner_sql = inner.to_string();
+        let call_sql = format!(
+            "SELECT to_decimal_arb_from_string(CAST({} AS VARCHAR), {}, {})",
+            inner_sql, precision, scale
+        );
+        let mut stmts = Parser::parse_sql(&dialect, call_sql.as_str()).ok()?;
         if stmts.len() != 1 {
             return None;
         }
@@ -901,17 +949,26 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                         ),
                         _ => (0, -1),
                     };
-                    if p > 76 && s == 0 {
-                        if p <= 78 {
+                    if p > 76 && s >= 0 {
+                        if p <= 78 && s == 0 {
+                            // Preserve existing u256 fast path.
                             if let Some(func) = parse_wrapped_fn("to_u256", inner) {
                                 **inner = func;
                             }
-                            // Replace the Cast node with its inner (now to_u256(inner))
                             if let Some(replacement) = Some((**inner).clone()) {
                                 *expr = replacement;
                                 return;
                             }
+                        } else if let Some(call) =
+                            parse_to_decimal_arb_from_string(inner, p, s as u64)
+                        {
+                            // T070 / FR-018: route wide-precision CAST through
+                            // the decimal_arb cast UDF, replacing the prior
+                            // lossy CAST AS VARCHAR fallback.
+                            *expr = call;
+                            return;
                         } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
+                            // Defensive fallback — should not fire in practice.
                             *expr = cast_varchar;
                             return;
                         }
@@ -992,10 +1049,15 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_decimal_100_to_varchar() {
+    fn test_preprocess_decimal_100_to_decimal_arb() {
+        // T070 / FR-018: previously fell back to lossy `CAST(... AS VARCHAR)`;
+        // now routes to the lossless decimal_arb cast UDF.
         let sql = "SELECT CAST(large_num AS DECIMAL(100, 0)) FROM data";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT CAST(large_num AS VARCHAR) FROM data");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(large_num AS VARCHAR), 100, 0) FROM data"
+        );
     }
 
     #[test]
@@ -1033,9 +1095,13 @@ mod tests {
 
     #[test]
     fn test_preprocess_try_cast_100() {
+        // T070 / FR-018: TRY_CAST routes through the same lossless path.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(100, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT TRY_CAST(balance AS VARCHAR) FROM accounts");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 100, 0) FROM accounts"
+        );
     }
 
     #[test]
@@ -1046,17 +1112,28 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_decimal_with_scale_unchanged() {
+    fn test_preprocess_decimal_with_scale_routes_to_decimal_arb() {
+        // T070 / FR-018: previously this case was left untouched (and would
+        // fail at DataFusion's CAST resolution because Decimal128 caps at
+        // 38). It now routes through the decimal_arb cast UDF.
         let sql = "SELECT CAST(price AS DECIMAL(78,2)) FROM products";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, sql);
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(price AS VARCHAR), 78, 2) FROM products"
+        );
     }
 
     #[test]
     fn test_preprocess_multiple_casts() {
+        // u256 fast path stays for (78, 0); wide-precision routes to
+        // decimal_arb instead of the lossy VARCHAR fallback.
         let sql = "SELECT CAST(a AS DECIMAL(78, 0)), CAST(b AS DECIMAL(100, 0)) FROM t";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT to_u256(a), CAST(b AS VARCHAR) FROM t");
+        assert_eq!(
+            result,
+            "SELECT to_u256(a), to_decimal_arb_from_string(CAST(b AS VARCHAR), 100, 0) FROM t"
+        );
     }
 
     #[test]
@@ -1634,7 +1711,7 @@ mod tests {
             vec![("id", false), ("call_type", false), ("value", true)],
         );
 
-        // Reproduces STRM-5695: `value > 0` involves a u256 column but the AND
+        // Reproduces the boolean-predicate regression: `value > 0` involves a u256 column but the AND
         // combines two boolean predicates. The preprocessor must NOT wrap the
         // boolean side (`call_type <> 'delegatecall'`) with to_u256().
         let sql = "SELECT * FROM traces WHERE call_type <> 'delegatecall' AND `value` > 0";
