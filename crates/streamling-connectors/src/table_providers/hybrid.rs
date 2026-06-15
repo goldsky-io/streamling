@@ -1435,14 +1435,28 @@ impl ClickHouseSchemaAdapter {
         if let Some((precision, scale)) =
             streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
         {
+            use streamling_core::types::decimal_arb::NativeIntKind;
             let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
+            let native_int_kind =
+                streamling_core::types::decimal_arb::DecimalArbType::native_int_kind_from_field(
+                    field,
+                );
             return match capability_for_decimal_arb(
                 ConnectorKind::Hybrid,
                 precision,
                 scale,
                 coerce_to_string,
+                native_int_kind,
             ) {
-                CapabilityResult::Native => Ok(format!("Decimal({}, {})", precision, scale)),
+                CapabilityResult::Native => match native_int_kind {
+                    Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
+                        Ok("UInt256".to_string())
+                    }
+                    Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
+                        Ok("Int256".to_string())
+                    }
+                    _ => Ok(format!("Decimal({}, {})", precision, scale)),
+                },
                 CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
                 CapabilityResult::Reject(reason) => Err(config_load_error(
                     field.name(),

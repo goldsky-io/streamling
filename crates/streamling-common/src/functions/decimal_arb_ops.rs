@@ -2345,4 +2345,76 @@ mod tests {
         };
         assert!(func.return_field_from_args(ret_args).is_err());
     }
+
+    // ------- Feature 002: native_int_kind hint propagation through ops -------
+    //
+    // These tests lock the *current* behavior: `build_output_field` calls
+    // `DecimalArbType::field(...)` which produces a fresh field with the
+    // decimal_arb extension keys and no `native_int_kind` hint. So the hint
+    // is dropped on every binary-op output, regardless of whether the two
+    // inputs agreed.
+    //
+    // This is acceptable because the hint exists to round-trip a column's
+    // *origin* (UInt256 / Int256 source) to a matching native sink — once a
+    // value goes through arithmetic, the result is no longer "the original
+    // ClickHouse-side bytes," so dropping the hint and falling back to the
+    // generic `Decimal(p, s)` (or `coerce_to: string`) sink path is the
+    // safe default. The data-model documents this behavior under E1.
+
+    use crate::types::decimal_arb::NativeIntKind;
+
+    fn hinted_field(name: &str, precision: u32, scale: u32, kind: NativeIntKind) -> FieldRef {
+        let field = DecimalArbType::field(name, precision, scale, true).unwrap();
+        let with_hint = DecimalArbType::with_native_int_kind(field, kind).unwrap();
+        Arc::new(with_hint)
+    }
+
+    fn run_add_return_field(lhs: FieldRef, rhs: FieldRef) -> FieldRef {
+        let arg_fields = vec![lhs, rhs];
+        let ret_args = ReturnFieldArgs {
+            arg_fields: &arg_fields,
+            scalar_arguments: &[None, None],
+        };
+        DecimalArbAddFunc::new()
+            .return_field_from_args(ret_args)
+            .unwrap()
+    }
+
+    #[test]
+    fn add_drops_native_int_kind_when_both_inputs_share_u256_hint() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = hinted_field("b", 78, 0, NativeIntKind::U256);
+        let out = run_add_return_field(lhs, rhs);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            None,
+            "current behavior: binary-op output does not carry a native_int_kind \
+             hint even when both inputs agreed — the result represents a new \
+             value, not the original ClickHouse UInt256 bytes"
+        );
+    }
+
+    #[test]
+    fn add_drops_native_int_kind_when_inputs_have_mixed_hints() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = hinted_field("b", 78, 0, NativeIntKind::I256);
+        let out = run_add_return_field(lhs, rhs);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            None,
+            "mixed-hint output drops the hint (ambiguous origin)"
+        );
+    }
+
+    #[test]
+    fn add_drops_native_int_kind_when_only_one_input_is_hinted() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = Arc::new(DecimalArbType::field("b", 78, 0, true).unwrap());
+        let out = run_add_return_field(lhs, rhs);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            None,
+            "single-hinted input does not propagate the hint to the output"
+        );
+    }
 }

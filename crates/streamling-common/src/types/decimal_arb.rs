@@ -50,6 +50,20 @@ impl DecimalArbType {
     pub const EXTENSION_NAME_KEY: &'static str = "ARROW:extension:name";
     pub const EXTENSION_METADATA_KEY: &'static str = "ARROW:extension:metadata";
 
+    /// Field metadata key for the optional `native_int_kind` hint introduced
+    /// by feature 002 (Retire U256/I256). Carries a value of `"u256"` or
+    /// `"i256"` indicating which fixed-width native integer this decimal_arb
+    /// column originated from, so sinks with matching native channels
+    /// (ClickHouse `UInt256` / `Int256`) can preserve storage compactness.
+    ///
+    /// The hint is a property of the column's origin — *not* a constraint on
+    /// runtime values. A `native_int_kind=u256` column whose value happens to
+    /// be negative is legal in memory; it surfaces as an error only on a sink
+    /// that has a matching native channel and cannot encode the negative.
+    /// See `specs/002-retire-u256-i256/data-model.md` §E1 for the full
+    /// semantics.
+    pub const NATIVE_INT_KIND_KEY: &'static str = "streamling.native_int_kind";
+
     /// Storage type for the extension. Always `LargeBinary` in v1.
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> DataType {
@@ -106,6 +120,93 @@ impl DecimalArbType {
         }
         let raw = field.metadata().get(Self::EXTENSION_METADATA_KEY)?;
         parse_precision_scale_json(raw).ok()
+    }
+
+    /// Stamp the `native_int_kind` origin hint on a `decimal_arb` field.
+    /// Returns the new `Field` with the hint added to its metadata.
+    /// Rejects (with an internal error) if `field` is not a `decimal_arb`
+    /// field — only decimal_arb columns may carry the hint per §E1.
+    pub fn with_native_int_kind(field: Field, kind: NativeIntKind) -> Result<Field> {
+        if !Self::is_decimal_arb_field(&field) {
+            return Err(streamling_err!(
+                "native_int_kind hint may only be applied to decimal_arb fields; got {:?}",
+                field.data_type(),
+            ));
+        }
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            Self::NATIVE_INT_KIND_KEY.to_string(),
+            kind.as_str().to_string(),
+        );
+        Ok(field.with_metadata(metadata))
+    }
+
+    /// Read the `native_int_kind` origin hint from a field's metadata.
+    /// Returns `None` if the hint is absent (the common case for
+    /// generic decimal_arb columns) or if the field is not decimal_arb.
+    pub fn native_int_kind_from_field(field: &Field) -> Option<NativeIntKind> {
+        if !Self::is_decimal_arb_field(field) {
+            return None;
+        }
+        let raw = field.metadata().get(Self::NATIVE_INT_KIND_KEY)?;
+        NativeIntKind::parse(raw)
+    }
+
+    /// Read the `native_int_kind` origin hint from a raw metadata map.
+    /// Used by code paths that need to inspect the hint *after* a field's
+    /// `DataType` has been transformed away from `LargeBinary` (e.g. the
+    /// ClickHouse sink normalizes hinted decimal_arb columns to
+    /// `FixedSizeBinary(32)` for wire-format compatibility, but keeps the
+    /// metadata so the CREATE TABLE path can still consult the hint).
+    pub fn native_int_kind_from_field_metadata(
+        metadata: &HashMap<String, String>,
+    ) -> Option<NativeIntKind> {
+        if !Self::is_decimal_arb_metadata(metadata) {
+            return None;
+        }
+        let raw = metadata.get(Self::NATIVE_INT_KIND_KEY)?;
+        NativeIntKind::parse(raw)
+    }
+}
+
+/// Origin hint for a `decimal_arb` column whose values were originally
+/// carried as a fixed-width native integer in a wire format that supports
+/// it (today: ClickHouse `UInt256` / `Int256`, Avro `decimal(p ≥ 77, 0)`,
+/// Postgres `NUMERIC(78, 0)`). Sinks with matching native channels consult
+/// this hint to preserve storage compactness; sinks without a matching
+/// native channel ignore it.
+///
+/// Semantics: this is a *hint about origin*, not a *constraint on values*.
+/// See `specs/002-retire-u256-i256/data-model.md` §E1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeIntKind {
+    /// Originated as an unsigned 256-bit integer (Ethereum-style uint256,
+    /// ClickHouse `UInt256`, Postgres `NUMERIC(78, 0)` by convention).
+    U256,
+    /// Originated as a signed 256-bit integer (Ethereum-style int256,
+    /// ClickHouse `Int256`).
+    I256,
+}
+
+impl NativeIntKind {
+    /// String form used as the value of `streamling.native_int_kind` in
+    /// Arrow field metadata.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            NativeIntKind::U256 => "u256",
+            NativeIntKind::I256 => "i256",
+        }
+    }
+
+    /// Parse the string form (case-insensitive). Returns `None` for any
+    /// unrecognized value — callers treat that as "no hint" per the
+    /// forward-compatibility rule.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "u256" => Some(NativeIntKind::U256),
+            "i256" => Some(NativeIntKind::I256),
+            _ => None,
+        }
     }
 }
 
@@ -1450,5 +1551,90 @@ mod tests {
         assert!(kn257 < kn256);
         assert!(kn256 < kn2);
         assert!(kn2 < kn1);
+    }
+
+    // ------- T002/T003: native_int_kind hint -------
+
+    #[test]
+    fn native_int_kind_round_trips_through_field_metadata() {
+        let base = DecimalArbType::field("gas_used", 78, 0, false).unwrap();
+        for kind in [NativeIntKind::U256, NativeIntKind::I256] {
+            let stamped = DecimalArbType::with_native_int_kind(base.clone(), kind).unwrap();
+            assert_eq!(
+                DecimalArbType::native_int_kind_from_field(&stamped),
+                Some(kind),
+                "stamp+read round-trip for {:?}",
+                kind,
+            );
+            // The hint must not break the existing helpers.
+            assert!(DecimalArbType::is_decimal_arb_field(&stamped));
+            assert_eq!(
+                DecimalArbType::precision_scale_from_field(&stamped),
+                Some((78, 0)),
+            );
+        }
+    }
+
+    #[test]
+    fn native_int_kind_absent_when_not_stamped() {
+        let base = DecimalArbType::field("amount", 100, 18, false).unwrap();
+        assert_eq!(DecimalArbType::native_int_kind_from_field(&base), None);
+    }
+
+    #[test]
+    fn native_int_kind_refused_on_non_decimal_arb_field() {
+        let plain = Field::new("blob", DataType::LargeBinary, false);
+        let err = DecimalArbType::with_native_int_kind(plain, NativeIntKind::U256).unwrap_err();
+        assert!(
+            err.to_string().contains("decimal_arb"),
+            "error should name decimal_arb: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn native_int_kind_parse_is_case_insensitive() {
+        assert_eq!(NativeIntKind::parse("u256"), Some(NativeIntKind::U256));
+        assert_eq!(NativeIntKind::parse("U256"), Some(NativeIntKind::U256));
+        assert_eq!(NativeIntKind::parse(" I256 "), Some(NativeIntKind::I256));
+        assert_eq!(NativeIntKind::parse("decimal_arb"), None);
+        assert_eq!(NativeIntKind::parse(""), None);
+    }
+
+    #[test]
+    fn native_int_kind_survives_arrow_ipc_round_trip() {
+        use arrow::array::LargeBinaryArray;
+        use arrow::ipc::reader::StreamReader;
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // Build a one-column batch with a hinted decimal_arb field, write
+        // through Arrow IPC, read back, and verify the hint key survives.
+        let field = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("amount", 78, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+        let array = LargeBinaryArray::from(vec![None as Option<&[u8]>]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let reader = StreamReader::try_new(buf.as_slice(), None).unwrap();
+        let out_schema = reader.schema();
+        let out_field = out_schema.field(0);
+        assert!(DecimalArbType::is_decimal_arb_field(out_field));
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(out_field),
+            Some(NativeIntKind::U256),
+            "native_int_kind hint must survive Arrow IPC round-trip",
+        );
     }
 }

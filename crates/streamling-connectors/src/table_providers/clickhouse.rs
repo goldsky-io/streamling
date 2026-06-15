@@ -7,16 +7,19 @@ use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::logical_expr::{ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
+// ColumnarValue/ReturnFieldArgs/ScalarFunctionArgs/ScalarUDFImpl retired with U256/I256 paths.
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::{Arc, Mutex};
 use streamling_core::error::{ResultExt, StreamlingError};
-use streamling_core::functions::byte_reverse::ReverseBytes32Func;
+// ReverseBytes32Func retired with U256/I256 endian-flip path.
 use streamling_core::streamling_err;
-use streamling_core::types::{i256::I256Type, u256::U256Type};
+// Feature 002 (Retire U256/I256): U256/I256 imports removed; wide
+// integers flow through decimal_arb + native_int_kind hint. ClickHouse
+// UInt256/Int256 sink emission lives in `clickhouse_column_type` and
+// `decimal_arb_to_clickhouse_native` below.
 use streamling_core::utils::parse_primary_key_columns;
 
 use crate::util::parallel::parallel_execute;
@@ -155,6 +158,10 @@ struct SinkParams {
 /// [`ClickHouseClient::clickhouse_column_type`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClickHouseDecimalArbConversion {
+    /// `native_int_kind`-hinted (UInt256/Int256): leave as canonical
+    /// `decimal_arb` `LargeBinary`; the byte-level
+    /// [`ClickHouseClient::normalize_batch_for_clickhouse`] path converts it.
+    NativeIntBytes,
     /// Narrow `decimal_arb(p, s)` → `Decimal128(p, s)` (p ≤ 38) or
     /// `Decimal256(p, s)`.
     Decimal { precision: u32, scale: u32 },
@@ -171,7 +178,7 @@ fn clickhouse_decimal_arb_conversion(
     field: &arrow::datatypes::Field,
     directives: Option<&[streamling_config::ColumnDirective]>,
 ) -> Result<Option<ClickHouseDecimalArbConversion>> {
-    use streamling_core::types::decimal_arb::DecimalArbType;
+    use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
     use streamling_core::types::decimal_arb_capability::{
         CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
     };
@@ -179,6 +186,7 @@ fn clickhouse_decimal_arb_conversion(
     let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) else {
         return Ok(None);
     };
+    let native_int_kind = DecimalArbType::native_int_kind_from_field(field);
     let coerce_to_string = streamling_config::ColumnDirective::find(directives, field.name())
         .map(|d| d.coerces_to_string())
         .unwrap_or(false);
@@ -188,11 +196,23 @@ fn clickhouse_decimal_arb_conversion(
         precision,
         scale,
         coerce_to_string,
+        native_int_kind,
     ) {
-        CapabilityResult::Native => Ok(Some(ClickHouseDecimalArbConversion::Decimal {
-            precision,
-            scale,
-        })),
+        CapabilityResult::Native => {
+            if matches!(
+                native_int_kind,
+                Some(NativeIntKind::U256) | Some(NativeIntKind::I256)
+            ) && scale == 0
+                && precision <= 78
+            {
+                Ok(Some(ClickHouseDecimalArbConversion::NativeIntBytes))
+            } else {
+                Ok(Some(ClickHouseDecimalArbConversion::Decimal {
+                    precision,
+                    scale,
+                }))
+            }
+        }
         CapabilityResult::OptInOnly(_) => Ok(Some(ClickHouseDecimalArbConversion::CanonicalString)),
         CapabilityResult::Reject(reason) => Err(DataFusionError::from(config_load_error(
             field.name(),
@@ -233,7 +253,7 @@ fn build_decimal_arb_projection_for_clickhouse(
         let col_expr = Expr::Column(Column::from_name(name));
 
         let logical = match clickhouse_decimal_arb_conversion(f, directives)? {
-            None => col_expr,
+            None | Some(ClickHouseDecimalArbConversion::NativeIntBytes) => col_expr,
             Some(ClickHouseDecimalArbConversion::Decimal { precision, scale }) => {
                 needs_projection = true;
                 // ClickHouse Decimal(p, s): Arrow Decimal128 carries p ≤ 38,
@@ -684,7 +704,8 @@ impl TableProvider for ClickHouseTableProvider {
 
         // Convert decimal_arb columns to the concrete type the ClickHouse DDL
         // declares (Decimal128/256 or canonical String) before the batch is
-        // serialized; otherwise the raw canonical bytes are shipped verbatim.
+        // serialized; native-int-hinted columns are left for the byte-level
+        // normalizer below.
         let input_schema = projection_exec.schema();
         let projection_exec = build_decimal_arb_projection_for_clickhouse(
             state,
@@ -1835,11 +1856,44 @@ impl ClickHouseClient {
         schema: &arrow::datatypes::Schema,
     ) -> arrow::datatypes::Schema {
         use arrow::datatypes::{DataType, Field};
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
 
         let normalized_fields: Vec<arrow::datatypes::FieldRef> = schema
             .fields()
             .iter()
             .map(|field| {
+                // Feature 002 (Retire U256/I256): a decimal_arb column with
+                // a native_int_kind hint round-trips to ClickHouse via its
+                // first-class UInt256/Int256 native types. ClickHouse wire
+                // format expects 32 LE bytes; normalize the Arrow shape from
+                // LargeBinary (decimal_arb canonical) to FixedSizeBinary(32)
+                // so the byte conversion happens in normalize_batch_for_clickhouse.
+                //
+                // PRESERVE the field metadata (decimal_arb extension keys +
+                // native_int_kind hint) so the downstream CREATE TABLE path
+                // (`clickhouse_column_type`) can still decide UInt256/Int256
+                // emission from the hint. `is_decimal_arb_field` requires
+                // LargeBinary so it returns false on the normalized field —
+                // the CREATE TABLE path must inspect the hint independently.
+                if DecimalArbType::is_decimal_arb_field(field)
+                    && let (Some((precision, scale)), Some(kind)) = (
+                        DecimalArbType::precision_scale_from_field(field),
+                        DecimalArbType::native_int_kind_from_field(field),
+                    )
+                    && scale == 0
+                    && matches!(kind, NativeIntKind::U256 | NativeIntKind::I256)
+                    && precision <= 78
+                {
+                    return Arc::new(
+                        Field::new(
+                            field.name(),
+                            DataType::FixedSizeBinary(32),
+                            field.is_nullable(),
+                        )
+                        .with_metadata(field.metadata().clone()),
+                    );
+                }
+
                 let normalized_type = match field.data_type() {
                     DataType::Utf8View => DataType::Utf8,
                     DataType::BinaryView => DataType::Binary,
@@ -1886,30 +1940,19 @@ impl ClickHouseClient {
                         Ok(cast(column.as_ref(), &DataType::Binary)
                             .streamling_context("failed to cast BinaryView to Binary")?)
                     }
-                    // Perform endian conversion for U256/I256. We store as big endian and clickhouse needs little.
-                    (DataType::FixedSizeBinary(32), DataType::FixedSizeBinary(32))
-                        if U256Type::is_u256_metadata(original_field.metadata())
-                            || I256Type::is_i256_metadata(original_field.metadata()) =>
-                    {
-                        // Call the reverse_bytes32 UDF directly using invoke_with_args
-                        let func = ReverseBytes32Func::new();
-                        let args = ScalarFunctionArgs {
-                            args: vec![ColumnarValue::Array(column.clone())],
-                            arg_fields: vec![original_field.clone()],
-                            number_rows: batch.num_rows(),
-                            return_field: ScalarUDFImpl::return_field_from_args(
-                                &func,
-                                ReturnFieldArgs {
-                                    arg_fields: std::slice::from_ref(original_field),
-                                    scalar_arguments: &[None],
-                                },
-                            )?,
-                        };
-                        let result = ScalarUDFImpl::invoke_with_args(&func, args)?;
-                        match result {
-                            ColumnarValue::Array(arr) => Ok(arr),
-                            ColumnarValue::Scalar(s) => Ok(s.to_array()?),
-                        }
+                    // Feature 002 (Retire U256/I256): the FSB(32)+U256/I256
+                    // endian-flip arm is gone — no source produces those
+                    // fields anymore. Wide-int columns now flow as decimal_arb
+                    // LargeBinary; the next arm converts them to FSB(32) LE
+                    // via the canonical encoding path.
+
+                    // Feature 002: decimal_arb LargeBinary with native_int_kind
+                    // hint → ClickHouse-native UInt256/Int256 storage.
+                    // Convert canonical decimal_arb bytes (sign byte + BE
+                    // magnitude) into 32-byte little-endian for ClickHouse.
+                    (DataType::LargeBinary, DataType::FixedSizeBinary(32)) => {
+                        decimal_arb_to_clickhouse_native(column.as_ref(), original_field)
+                            .map_err(DataFusionError::from)
                     }
                     _ => Ok(column.clone()),
                 }
@@ -2212,21 +2255,52 @@ impl ClickHouseClient {
         field: &arrow::datatypes::Field,
         directive: Option<&streamling_config::ColumnDirective>,
     ) -> std::result::Result<String, StreamlingError> {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
         use streamling_core::types::decimal_arb_capability::{
             CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
         };
 
-        if let Some((precision, scale)) =
-            streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
+        // Feature 002: also recognize the normalized-FSB(32) shape from
+        // `normalize_schema_for_clickhouse`. Those fields carry the
+        // decimal_arb extension metadata + native_int_kind hint even
+        // though the data_type is FixedSizeBinary(32). `is_decimal_arb_field`
+        // returns false for FSB(32), so we must read the metadata directly.
+        let normalized_shape = matches!(
+            field.data_type(),
+            arrow::datatypes::DataType::FixedSizeBinary(32)
+        ) && DecimalArbType::is_decimal_arb_metadata(field.metadata());
+        if normalized_shape
+            && let Some(kind) =
+                DecimalArbType::native_int_kind_from_field_metadata(field.metadata())
         {
+            return Ok(match kind {
+                NativeIntKind::U256 => "UInt256".to_string(),
+                NativeIntKind::I256 => "Int256".to_string(),
+            });
+        }
+        // Normalized FSB(32) without a hint should not happen — the
+        // normalizer only converts when the hint is present. Falls through
+        // to the generic FSB(32) handling below.
+
+        if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) {
             let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
+            let native_int_kind = DecimalArbType::native_int_kind_from_field(field);
             return match capability_for_decimal_arb(
                 ConnectorKind::ClickHouse,
                 precision,
                 scale,
                 coerce_to_string,
+                native_int_kind,
             ) {
-                CapabilityResult::Native => Ok(format!("Decimal({}, {})", precision, scale)),
+                CapabilityResult::Native => match native_int_kind {
+                    Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
+                        Ok("UInt256".to_string())
+                    }
+                    Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
+                        Ok("Int256".to_string())
+                    }
+                    _ => Ok(format!("Decimal({}, {})", precision, scale)),
+                },
                 CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
                 CapabilityResult::Reject(reason) => Err(config_load_error(
                     field.name(),
@@ -2283,15 +2357,11 @@ impl ClickHouseClient {
                 "String".to_string()
             }
             arrow::datatypes::DataType::FixedSizeBinary(size) => {
-                // Check metadata to detect U256/I256 types
-                if *size == 32 {
-                    if U256Type::is_u256_metadata(field.metadata()) {
-                        return "UInt256".to_string();
-                    } else if I256Type::is_i256_metadata(field.metadata()) {
-                        return "Int256".to_string();
-                    }
-                }
-                // Regular fixed binary - use FixedString
+                // Feature 002 (Retire U256/I256): FSB(32)+U256/I256-metadata
+                // fields no longer exist after the Phase 3 source routing
+                // flip. The decimal_arb hint-aware UInt256/Int256 emission
+                // lives in `clickhouse_column_type` (the directive-aware
+                // top-level entry point).
                 format!("FixedString({})", size)
             }
             arrow::datatypes::DataType::Date32 => "Date".to_string(),
@@ -2769,33 +2839,15 @@ mod tests {
         );
     }
 
+    // Feature 002 (Retire U256/I256): U256/I256-specific tests deleted with
+    // the retired types. UInt256/Int256 emission for hinted decimal_arb
+    // columns is covered by `clickhouse_column_type_native_for_decimal_arb*`
+    // and `build_create_table_query_emits_*` tests below.
     #[test]
-    fn test_u256_i256_to_clickhouse() {
-        // Test U256 with metadata
-        let u256_field = Field::new("u256_col", DataType::FixedSizeBinary(32), false)
-            .with_metadata(U256Type::metadata());
-        let clickhouse_type = ClickHouseClient::arrow_field_to_clickhouse(&u256_field);
-        assert_eq!(
-            clickhouse_type, "UInt256",
-            "U256 with metadata should be converted to UInt256"
-        );
-
-        // Test I256 with metadata
-        let i256_field = Field::new("i256_col", DataType::FixedSizeBinary(32), false)
-            .with_metadata(I256Type::metadata());
-        let clickhouse_type = ClickHouseClient::arrow_field_to_clickhouse(&i256_field);
-        assert_eq!(
-            clickhouse_type, "Int256",
-            "I256 with metadata should be converted to Int256"
-        );
-
-        // Test regular FixedSizeBinary(32) without metadata
+    fn test_plain_fsb32_clickhouse_type_is_fixedstring() {
         let regular_field = Field::new("fixed_col", DataType::FixedSizeBinary(32), false);
         let clickhouse_type = ClickHouseClient::arrow_field_to_clickhouse(&regular_field);
-        assert_eq!(
-            clickhouse_type, "FixedString(32)",
-            "FixedSizeBinary(32) without metadata should be converted to FixedString(32)"
-        );
+        assert_eq!(clickhouse_type, "FixedString(32)");
     }
 
     #[test]
@@ -4179,10 +4231,419 @@ mod schema_overrides {
     }
 }
 
-#[cfg(test)]
-mod decimal_arb_conversion_tests {
-    use super::*;
+// ============================================================================
+// Feature 002 (Retire U256/I256): decimal_arb → ClickHouse native byte format
+// ============================================================================
+
+/// Convert a column of `decimal_arb` values (canonical encoding: sign byte
+/// followed by big-endian magnitude bytes at the column's declared scale)
+/// into a ClickHouse-native `FixedSizeBinary(32)` column with 32-byte
+/// little-endian values, suitable for direct INSERT into a ClickHouse
+/// `UInt256` / `Int256` column.
+///
+/// The hint (`native_int_kind=u256` or `i256`) on the source field
+/// determines the conversion:
+///
+/// - **U256**: rows must be non-negative (sign byte = `0x00`). Magnitude
+///   bytes are padded left with zeros to exactly 32 bytes BE, then
+///   reversed to produce 32 LE bytes. A negative value with the U256 hint
+///   is a contract violation (decimal_arb invariant from data-model.md
+///   §E1) — surfaces a clear error naming the column and row index.
+/// - **I256**: rows may be negative (sign byte = `0xFF`). Negative
+///   values are two's-complemented (invert magnitude, add 1) to produce
+///   the 256-bit signed BE representation; then reversed to LE. Non-
+///   negative rows match the U256 path.
+///
+/// NULL rows are preserved as NULL in the output array.
+pub fn decimal_arb_to_clickhouse_native(
+    column: &dyn arrow::array::Array,
+    field: &arrow_schema::FieldRef,
+) -> std::result::Result<arrow::array::ArrayRef, StreamlingError> {
+    use arrow::array::{Array, LargeBinaryArray};
     use streamling_core::types::decimal_arb::DecimalArbType;
+
+    let kind = DecimalArbType::native_int_kind_from_field(field).ok_or_else(|| {
+        streamling_err!(
+            "decimal_arb column '{}' is missing native_int_kind hint required for \
+             ClickHouse UInt256/Int256 emission",
+            field.name(),
+        )
+    })?;
+    let lb = column
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            streamling_err!(
+                "expected LargeBinaryArray for decimal_arb column '{}', got {:?}",
+                field.name(),
+                column.data_type(),
+            )
+        })?;
+
+    let mut builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(lb.len(), 32);
+    for row_idx in 0..lb.len() {
+        if lb.is_null(row_idx) {
+            builder.append_null();
+            continue;
+        }
+        let canonical = lb.value(row_idx);
+        let le_bytes = canonical_to_clickhouse_le(canonical, kind, field.name(), row_idx)?;
+        builder.append_value(le_bytes).map_err(|e| {
+            streamling_err!(
+                "failed to append FixedSizeBinary(32) row {} for column '{}': {}",
+                row_idx,
+                field.name(),
+                e
+            )
+        })?;
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Convert one canonical decimal_arb byte slice to a 32-byte LE buffer
+/// for ClickHouse `UInt256` / `Int256` insertion. See
+/// `decimal_arb_to_clickhouse_native` for the semantic contract.
+fn canonical_to_clickhouse_le(
+    canonical: &[u8],
+    kind: streamling_core::types::decimal_arb::NativeIntKind,
+    column: &str,
+    row_idx: usize,
+) -> std::result::Result<[u8; 32], StreamlingError> {
+    use streamling_core::types::decimal_arb::NativeIntKind;
+
+    if canonical.is_empty() {
+        return Err(streamling_err!(
+            "decimal_arb column '{}' row {}: canonical bytes are empty",
+            column,
+            row_idx,
+        ));
+    }
+    let sign_byte = canonical[0];
+    let magnitude = &canonical[1..];
+
+    if magnitude.len() > 32 {
+        return Err(streamling_err!(
+            "decimal_arb column '{}' row {}: magnitude exceeds 32 bytes ({} bytes) — \
+             value is out of range for ClickHouse {} native storage",
+            column,
+            row_idx,
+            magnitude.len(),
+            match kind {
+                NativeIntKind::U256 => "UInt256",
+                NativeIntKind::I256 => "Int256",
+            },
+        ));
+    }
+
+    // Pad magnitude left with zeros to exactly 32 bytes BE.
+    let mut be_buf = [0u8; 32];
+    be_buf[32 - magnitude.len()..].copy_from_slice(magnitude);
+
+    let is_negative = matches!(sign_byte, 0xFF);
+
+    if is_negative {
+        if matches!(kind, NativeIntKind::U256) {
+            return Err(streamling_err!(
+                "decimal_arb column '{}' row {}: value is negative but column declares \
+                 native_int_kind=u256 (which round-trips as ClickHouse UInt256, unsigned). \
+                 Change the column's hint to i256, or route through a wider non-native \
+                 ClickHouse type via `coerce_to: string`.",
+                column,
+                row_idx,
+            ));
+        }
+        // Two's complement of the magnitude: invert all bits, then add 1.
+        for b in be_buf.iter_mut() {
+            *b = !*b;
+        }
+        let mut carry: u16 = 1;
+        for b in be_buf.iter_mut().rev() {
+            let sum = *b as u16 + carry;
+            *b = (sum & 0xFF) as u8;
+            carry = sum >> 8;
+            if carry == 0 {
+                break;
+            }
+        }
+        // A valid negative Int256 (−2^255 ≤ v ≤ −1) always has its sign bit
+        // set after the two's-complement. If it's clear, the magnitude
+        // exceeded 2^255 (v < −2^255) and writing these bytes verbatim would
+        // silently flip the value positive on the ClickHouse side — the
+        // negative-side mirror of the positive ≥ 2^255 guard below.
+        if be_buf[0] & 0x80 == 0 {
+            return Err(streamling_err!(
+                "decimal_arb column '{}' row {}: negative value exceeds Int256's signed range \
+                 (< -2^255). Route through a wider non-native ClickHouse type via \
+                 `coerce_to: string`.",
+                column,
+                row_idx,
+            ));
+        }
+    } else if sign_byte != 0x00 {
+        return Err(streamling_err!(
+            "decimal_arb column '{}' row {}: invalid canonical sign byte 0x{:02X} \
+             (expected 0x00 or 0xFF)",
+            column,
+            row_idx,
+            sign_byte,
+        ));
+    } else if matches!(kind, NativeIntKind::I256) && be_buf[0] & 0x80 != 0 {
+        // Positive value whose magnitude needs the top bit of byte 0. In
+        // two's-complement Int256 that bit is the sign bit, so writing
+        // these bytes verbatim would silently flip the value negative on
+        // the ClickHouse side. Range: 2^255 ≤ v < 10^78 (≈ 5.79e76 to 1e78).
+        return Err(streamling_err!(
+            "decimal_arb column '{}' row {}: positive value exceeds Int256's signed range \
+             (≥ 2^255). Change the column's hint to u256, or route through a wider \
+             non-native ClickHouse type via `coerce_to: string`.",
+            column,
+            row_idx,
+        ));
+    }
+
+    // Reverse BE → LE for ClickHouse.
+    be_buf.reverse();
+    Ok(be_buf)
+}
+
+#[cfg(test)]
+mod feature_002_byte_conversion_tests {
+    use super::*;
+    use arrow::array::{Array, LargeBinaryArray};
+    use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+
+    fn build_decimal_arb_field(name: &str, kind: NativeIntKind) -> arrow_schema::FieldRef {
+        let f = DecimalArbType::field(name, 78, 0, true).unwrap();
+        let f = DecimalArbType::with_native_int_kind(f, kind).unwrap();
+        Arc::new(f)
+    }
+
+    fn canonical_for_unscaled(unscaled: &str, scale: u32) -> Vec<u8> {
+        use std::str::FromStr;
+        use streamling_core::types::decimal_arb::DecimalArbValue;
+        let value = DecimalArbValue::from_str(unscaled).unwrap();
+        value.to_canonical_bytes_at_scale(scale)
+    }
+
+    #[test]
+    fn u256_zero_round_trips() {
+        let field = build_decimal_arb_field("v", NativeIntKind::U256);
+        let arr = LargeBinaryArray::from(vec![Some(&canonical_for_unscaled("0", 0)[..])]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(fsb.value(0), [0u8; 32]);
+    }
+
+    #[test]
+    fn u256_one_lo_byte_is_le() {
+        let field = build_decimal_arb_field("v", NativeIntKind::U256);
+        let arr = LargeBinaryArray::from(vec![Some(&canonical_for_unscaled("1", 0)[..])]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        let bytes = fsb.value(0);
+        assert_eq!(bytes[0], 1, "LE: low byte is at position 0");
+        assert!(bytes[1..].iter().all(|&b| b == 0), "all other bytes zero");
+    }
+
+    #[test]
+    fn u256_negative_value_rejected() {
+        let field = build_decimal_arb_field("balance", NativeIntKind::U256);
+        let arr = LargeBinaryArray::from(vec![Some(&canonical_for_unscaled("-1", 0)[..])]);
+        let err = decimal_arb_to_clickhouse_native(&arr, &field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("balance"), "names column: {}", msg);
+        assert!(
+            msg.contains("native_int_kind=u256"),
+            "names the contract: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn i256_negative_one_is_all_ones_le() {
+        let field = build_decimal_arb_field("v", NativeIntKind::I256);
+        let arr = LargeBinaryArray::from(vec![Some(&canonical_for_unscaled("-1", 0)[..])]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        // Two's-complement -1 is 0xFF...FF; reversed to LE is still 0xFF...FF.
+        assert_eq!(fsb.value(0), [0xFFu8; 32]);
+    }
+
+    #[test]
+    fn i256_positive_one_round_trips() {
+        let field = build_decimal_arb_field("v", NativeIntKind::I256);
+        let arr = LargeBinaryArray::from(vec![Some(&canonical_for_unscaled("1", 0)[..])]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        let bytes = fsb.value(0);
+        assert_eq!(bytes[0], 1);
+        assert!(bytes[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn nulls_are_preserved() {
+        let field = build_decimal_arb_field("v", NativeIntKind::U256);
+        let arr = LargeBinaryArray::from(vec![
+            Some(&canonical_for_unscaled("1", 0)[..]),
+            None,
+            Some(&canonical_for_unscaled("2", 0)[..]),
+        ]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(fsb.len(), 3);
+        assert!(!fsb.is_null(0));
+        assert!(fsb.is_null(1));
+        assert!(!fsb.is_null(2));
+    }
+
+    // ----- Range-extreme tests (regression guard for the I256 silent-overflow
+    //       finding from the code-reviewer-pro pass) -----
+
+    /// 2^256 − 1, the maximum unsigned 256-bit value, encoded as the canonical
+    /// 78-digit decimal: 115792089237316195423570985008687907853269984665640564039457584007913129639935.
+    const TWO_POW_256_MINUS_1: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+
+    /// 2^255, the first positive value that doesn't fit in a signed Int256.
+    /// Equals 57896044618658097711785492504343953926634992332820282019728792003956564819968.
+    const TWO_POW_255: &str =
+        "57896044618658097711785492504343953926634992332820282019728792003956564819968";
+
+    /// 2^255 − 1, the maximum signed Int256 value.
+    /// Equals 57896044618658097711785492504343953926634992332820282019728792003956564819967.
+    const TWO_POW_255_MINUS_1: &str =
+        "57896044618658097711785492504343953926634992332820282019728792003956564819967";
+
+    /// −2^255, the minimum signed Int256 value.
+    /// Equals -57896044618658097711785492504343953926634992332820282019728792003956564819968.
+    const NEG_TWO_POW_255: &str =
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+
+    /// −(2^255 + 1), one below the minimum signed Int256 value. Fits in
+    /// decimal_arb(78, 0) but is out of range for Int256.
+    /// Equals -57896044618658097711785492504343953926634992332820282019728792003956564819969.
+    const NEG_TWO_POW_255_MINUS_EXTRA: &str =
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819969";
+
+    #[test]
+    fn u256_max_value_is_all_ones_le() {
+        let field = build_decimal_arb_field("v", NativeIntKind::U256);
+        let arr = LargeBinaryArray::from(vec![Some(
+            &canonical_for_unscaled(TWO_POW_256_MINUS_1, 0)[..],
+        )]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(fsb.value(0), [0xFFu8; 32]);
+    }
+
+    #[test]
+    fn i256_max_signed_value_round_trips() {
+        let field = build_decimal_arb_field("v", NativeIntKind::I256);
+        let arr = LargeBinaryArray::from(vec![Some(
+            &canonical_for_unscaled(TWO_POW_255_MINUS_1, 0)[..],
+        )]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        let bytes = fsb.value(0);
+        // 2^255 − 1 in BE is 0x7FFF...FF. Reversed to LE is 0xFF...FF7F.
+        assert_eq!(bytes[31], 0x7F, "top BE byte (== last LE byte) is 0x7F");
+        assert!(
+            bytes[..31].iter().all(|&b| b == 0xFF),
+            "all other bytes are 0xFF"
+        );
+    }
+
+    #[test]
+    fn i256_min_signed_value_round_trips() {
+        let field = build_decimal_arb_field("v", NativeIntKind::I256);
+        let arr =
+            LargeBinaryArray::from(vec![Some(&canonical_for_unscaled(NEG_TWO_POW_255, 0)[..])]);
+        let out = decimal_arb_to_clickhouse_native(&arr, &field).unwrap();
+        let fsb = out
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .unwrap();
+        let bytes = fsb.value(0);
+        // −2^255 in two's-complement is 0x80 00...00. Reversed to LE is 0x00..00 80.
+        assert_eq!(bytes[31], 0x80, "top BE byte (== last LE byte) is 0x80");
+        assert!(
+            bytes[..31].iter().all(|&b| b == 0x00),
+            "all other bytes are 0x00"
+        );
+    }
+
+    #[test]
+    fn i256_rejects_2_pow_255_high_bit_overflow() {
+        // 2^255 is one past the signed Int256 ceiling. The magnitude bytes
+        // have the top bit set, which would silently flip to a negative
+        // value if we passed them through. Must reject.
+        let field = build_decimal_arb_field("balance", NativeIntKind::I256);
+        let arr = LargeBinaryArray::from(vec![Some(&canonical_for_unscaled(TWO_POW_255, 0)[..])]);
+        let err = decimal_arb_to_clickhouse_native(&arr, &field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("balance"), "names column: {}", msg);
+        assert!(
+            msg.contains("Int256") || msg.contains("2^255") || msg.contains("u256"),
+            "names the constraint: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn i256_rejects_u256_max_as_too_large() {
+        // 2^256 − 1 has the top bit set; if hinted i256, must reject.
+        let field = build_decimal_arb_field("balance", NativeIntKind::I256);
+        let arr = LargeBinaryArray::from(vec![Some(
+            &canonical_for_unscaled(TWO_POW_256_MINUS_1, 0)[..],
+        )]);
+        let err = decimal_arb_to_clickhouse_native(&arr, &field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("balance"), "names column: {}", msg);
+    }
+
+    #[test]
+    fn i256_rejects_neg_below_min_signed_range() {
+        // −(2^255 + 1) is one below the signed Int256 floor. After the
+        // two's-complement conversion the sign bit clears, so writing the
+        // bytes verbatim would silently flip the value positive. This is the
+        // negative-side mirror of `i256_rejects_2_pow_255_high_bit_overflow`
+        // and must reject rather than corrupt.
+        let field = build_decimal_arb_field("balance", NativeIntKind::I256);
+        let arr = LargeBinaryArray::from(vec![Some(
+            &canonical_for_unscaled(NEG_TWO_POW_255_MINUS_EXTRA, 0)[..],
+        )]);
+        let err = decimal_arb_to_clickhouse_native(&arr, &field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("balance"), "names column: {}", msg);
+        assert!(
+            msg.contains("Int256") || msg.contains("-2^255") || msg.contains("negative"),
+            "names the constraint: {}",
+            msg
+        );
+    }
+
+    // ----- decimal_arb → ClickHouse sink-type disposition (C1 data-path fix) -----
 
     #[test]
     fn conversion_none_for_non_decimal_arb() {
@@ -4222,6 +4683,17 @@ mod decimal_arb_conversion_tests {
         assert_eq!(
             clickhouse_decimal_arb_conversion(&field, Some(&directives)).unwrap(),
             Some(ClickHouseDecimalArbConversion::CanonicalString)
+        );
+    }
+
+    #[test]
+    fn conversion_native_int_hint_stays_bytes() {
+        // A UInt256-hinted decimal_arb(78, 0) is converted by the byte-level
+        // normalizer, not this SQL projection.
+        let field = build_decimal_arb_field("balance", NativeIntKind::U256);
+        assert_eq!(
+            clickhouse_decimal_arb_conversion(&field, None).unwrap(),
+            Some(ClickHouseDecimalArbConversion::NativeIntBytes)
         );
     }
 }
