@@ -213,17 +213,19 @@ async fn handle_read_only_error(
     if guard.1 == my_gen {
         warn!(
             "[{}] READ_ONLY error (SQLSTATE 25006) — pool is stale after failover; recreating (gen {} → {})",
-            operation_name, my_gen, my_gen + 1
+            operation_name,
+            my_gen,
+            my_gen + 1
         );
-        guard.0.close().await;
         match PostgresConnection::new_with_parallelism(config, parallelism).await {
             Ok(conn) => {
-                guard.0 = conn.pool().clone();
+                let old_pool = std::mem::replace(&mut guard.0, conn.pool().clone());
                 guard.1 = my_gen + 1;
+                old_pool.close().await;
             }
             Err(e) => {
                 warn!(
-                    "[{}] Failed to recreate pool: {:?}; will retry",
+                    "[{}] Failed to recreate pool: {:?}; will retry with existing pool",
                     operation_name, e
                 );
             }
