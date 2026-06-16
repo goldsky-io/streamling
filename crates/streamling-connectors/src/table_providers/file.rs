@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::ScalarValue;
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::file_format::avro::AvroFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
@@ -18,7 +18,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{TableProvider, ViewTable, provider_as_source};
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, col, lit};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, lit};
 
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::error::Result;
@@ -143,7 +143,14 @@ pub async fn build_file_source_provider(
         return Ok(listing_table);
     }
 
-    let mut projection: Vec<Expr> = schema.fields().iter().map(|f| col(f.name())).collect();
+    // Reference each column by its exact name. `col(name)` would parse the name as a
+    // SQL identifier and lowercase it (so `fieldName` -> `fieldname`), breaking case-sensitive
+    // columns; `Column::new_unqualified` stores the name verbatim.
+    let mut projection: Vec<Expr> = schema
+        .fields()
+        .iter()
+        .map(|f| Expr::Column(Column::new_unqualified(f.name())))
+        .collect();
     projection.push(lit(ScalarValue::Utf8(Some(RowKind::Insert.to_str()))).alias(COLUMN_NAME_OP));
     let plan = LogicalPlanBuilder::scan(
         reference_name,
