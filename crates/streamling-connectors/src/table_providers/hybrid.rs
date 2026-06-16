@@ -1161,22 +1161,58 @@ impl ExecutionPlan for HybridSourceExec {
                                     provider.config.bounded_sources.len()
                                 );
 
-                                // Emit a terminal checkpoint marker inline,
-                                // after all bounded data, so the sinks flush and
-                                // ack a final epoch covering everything before
-                                // the pipeline tears down. The coordinator gates
-                                // shutdown on this epoch finalizing
-                                // (`await_terminal_finalized`). Reuses the
-                                // synthetic-batch flush path so the marker rides
-                                // the data stream and keeps a consistent cut.
+                                // Terminal checkpoint round-trip. The marker and
+                                // finalizer ride synthetic batches on the data
+                                // stream, so they keep a consistent cut and reach
+                                // inline consumers (e.g. the Postgres sink) the
+                                // same way every other checkpoint does.
                                 if let Some(control) = &provider.checkpoint_control {
                                     let terminal = control.begin_terminal_checkpoint();
+
+                                    // Batch #1: the terminal marker, after all
+                                    // bounded data, so the sinks flush and ack a
+                                    // final epoch covering everything.
                                     pending_for_main.lock().unwrap().push(
                                         CheckpointMessage::Marker {
-                                            epoch: terminal,
+                                            epoch: terminal.clone(),
                                             created_at_ms: now_ms(),
                                         },
                                     );
+                                    flush_pending_to_synth_batch(
+                                        &pending_for_main,
+                                        &schema_for_synth,
+                                        &tx,
+                                        &reference_name_for_spawn,
+                                    )
+                                    .await;
+
+                                    // Wait for the sinks to ack and the
+                                    // coordinator to finalize. The send above is
+                                    // buffered and the sinks pull concurrently,
+                                    // so this await does not block their
+                                    // consumption. Bounded so a sink that never
+                                    // acks cannot hang the source task.
+                                    if tokio::time::timeout(
+                                        Duration::from_secs(30),
+                                        control.await_terminal_finalized(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        warn!(
+                                            "Hybrid source '{}': terminal checkpoint did not finalize within 30s; emitting finalizer best-effort",
+                                            reference_name_for_spawn
+                                        );
+                                    }
+
+                                    // Batch #2: carry the finalizer back inline
+                                    // so inline consumers run their finalize work
+                                    // (e.g. Postgres staging truncation) before
+                                    // their stream ends.
+                                    pending_for_main
+                                        .lock()
+                                        .unwrap()
+                                        .push(CheckpointMessage::Finalizer(terminal));
                                     flush_pending_to_synth_batch(
                                         &pending_for_main,
                                         &schema_for_synth,
@@ -2475,14 +2511,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_hybrid_source_emits_terminal_marker_in_job_mode() {
+    async fn test_hybrid_source_terminal_checkpoint_round_trip() {
+        use streamling_core::checkpoints::channels::send;
         use streamling_core::checkpoints::checkpoint_management::CheckpointCoordinator;
 
-        // With a control handle attached, a completing job-mode source must
-        // emit a terminal checkpoint marker on a final (synthetic) batch so the
-        // sinks can flush and ack a checkpoint covering all bounded data before
-        // the pipeline tears down.
-        let coordinator = CheckpointCoordinator::new();
+        // A completing job-mode source emits the terminal Marker, waits for the
+        // sinks to ack it and the coordinator to finalize, then carries the
+        // Finalizer back inline on a second synthetic batch so inline consumers
+        // (e.g. the Postgres sink) run their finalize work before teardown.
+        let mut coordinator = CheckpointCoordinator::new();
+        coordinator.start(3600, vec!["roundtrip_sink".to_string()]);
         let control = coordinator.control();
 
         let bounded_sources: Vec<Arc<dyn TableProvider>> =
@@ -2497,9 +2535,9 @@ mod tests {
         };
 
         let state_backend =
-            create_state_backend("test_hybrid_source_emits_terminal_marker_in_job_mode").await;
+            create_state_backend("test_hybrid_source_terminal_checkpoint_round_trip").await;
         let hybrid_provider = HybridTableProvider::new(
-            "test_terminal_marker".to_string(),
+            "test_terminal_round_trip".to_string(),
             config,
             create_test_schema(),
             state_backend,
@@ -2515,19 +2553,39 @@ mod tests {
             .expect("scan should succeed");
 
         let context = Arc::new(TaskContext::default());
-        let stream = plan.execute(0, context).expect("execute should succeed");
-        let batches: Vec<_> = stream.collect().await;
+        let mut stream = plan.execute(0, context).expect("execute should succeed");
 
-        let emitted_markers: Vec<_> = batches
-            .iter()
-            .filter_map(|b| b.as_ref().ok())
-            .flat_map(|b| extract_checkpoint_messages(b.schema().metadata()))
-            .filter(|m| matches!(m, CheckpointMessage::Marker { .. }))
-            .collect();
+        // Drive the stream like a sink would: ack the terminal Marker so the
+        // coordinator finalizes, which lets the source emit the Finalizer batch.
+        let mut saw_marker = false;
+        let mut saw_finalizer = false;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("stream batch should not be an error");
+            for msg in extract_checkpoint_messages(batch.schema().metadata()) {
+                match msg {
+                    CheckpointMessage::Marker { epoch, .. } => {
+                        saw_marker = true;
+                        send(
+                            CHECKPOINT_COORDINATOR_CHANNEL,
+                            CheckpointMessage::Ack {
+                                epoch,
+                                sink_id: "roundtrip_sink".to_string(),
+                            },
+                        )
+                        .unwrap();
+                    }
+                    CheckpointMessage::Finalizer(_) => saw_finalizer = true,
+                    _ => {}
+                }
+            }
+        }
 
+        coordinator.stop().await;
+
+        assert!(saw_marker, "source should emit the terminal Marker");
         assert!(
-            !emitted_markers.is_empty(),
-            "job-mode source should emit a terminal checkpoint marker on completion"
+            saw_finalizer,
+            "source should carry the Finalizer back inline once the terminal epoch finalizes"
         );
     }
 

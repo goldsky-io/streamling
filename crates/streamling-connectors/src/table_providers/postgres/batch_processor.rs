@@ -92,6 +92,29 @@ async fn handle_checkpoint_truncation(context: &BatchProcessorContext, truncate_
     .await;
 }
 
+/// Decide which epoch to drain when the input stream ends. Per-epoch
+/// truncation lags by one (`Finalizer(N)` deletes `<= N-1`), so the last
+/// finalized epoch's rows are still in the landing table at EOF. With no more
+/// data coming, those rows are safe to delete too. Returns `None` when
+/// truncation is disabled or no checkpoint has run.
+fn eof_truncation_epoch(checkpoint_truncation: bool, current_epoch: u64) -> Option<u64> {
+    if checkpoint_truncation && current_epoch > 0 {
+        Some(current_epoch)
+    } else {
+        None
+    }
+}
+
+/// Drain the landing table's last epoch once the input stream has ended. This
+/// completes the per-epoch truncation, which otherwise leaves the final epoch's
+/// rows behind. Best-effort, like the per-finalizer truncation it mirrors.
+pub async fn finalize_landing_on_eof(context: &BatchProcessorContext) {
+    let current_epoch = *context.current_checkpoint_epoch.lock().unwrap();
+    if let Some(epoch) = eof_truncation_epoch(context.checkpoint_truncation, current_epoch) {
+        handle_checkpoint_truncation(context, epoch).await;
+    }
+}
+
 /// Process checkpoint messages with metrics and handle Finalizer for truncation.
 /// This is a PostgreSQL-specific version that extends the standard process_checkpoint_acks
 /// to handle Finalizer messages for checkpoint truncation.
@@ -460,6 +483,18 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_eof_truncation_epoch() {
+        // Truncation disabled: never delete on EOF.
+        assert_eq!(eof_truncation_epoch(false, 5), None);
+        // Enabled but no checkpoint ever ran (epoch 0): nothing to delete.
+        assert_eq!(eof_truncation_epoch(true, 0), None);
+        // Enabled with a finalized epoch: drain it. Per-epoch truncation lags
+        // by one (Finalizer(N) deletes <= N-1), so the last epoch's rows are
+        // still present at EOF and must be cleaned now that no data follows.
+        assert_eq!(eof_truncation_epoch(true, 5), Some(5));
     }
 
     #[tokio::test]

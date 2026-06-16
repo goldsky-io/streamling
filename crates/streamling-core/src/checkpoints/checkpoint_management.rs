@@ -1,4 +1,4 @@
-use crate::checkpoints::channels::{send, subscribe};
+use crate::checkpoints::channels::{SubscriberId, send, subscribe_with_id, unsubscribe};
 use crate::telemetry::recorder::{
     ControlPlaneMetricsRecorder, MetricsRecorder, get_control_plane_metrics_recorder,
 };
@@ -133,6 +133,10 @@ pub struct CheckpointCoordinator {
     terminal_epoch: Arc<Mutex<Option<CheckpointEpoch>>>,
     running: Arc<AtomicBool>,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// The subscriber id for the coordinator's channel subscription, so
+    /// [`CheckpointCoordinator::stop`] can unsubscribe and not leave a dead
+    /// sender in the global channel map.
+    subscriber_id: Option<SubscriberId>,
     timeout_sec: u64,
 }
 
@@ -303,6 +307,7 @@ impl CheckpointCoordinator {
             terminal_epoch: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
+            subscriber_id: None,
             timeout_sec,
         }
     }
@@ -335,7 +340,8 @@ impl CheckpointCoordinator {
         *self.expected_sinks.lock() = expected_sinks.into_iter().collect();
         let expected_sinks = Arc::clone(&self.expected_sinks);
 
-        let receiver = subscribe(CHECKPOINT_COORDINATOR_CHANNEL);
+        let (receiver, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+        self.subscriber_id = Some(subscriber_id);
         let epochs = Arc::clone(&self.epochs);
         let running = Arc::clone(&self.running);
         let expected_sinks_sub = Arc::clone(&expected_sinks);
@@ -741,6 +747,13 @@ impl CheckpointCoordinator {
             let _ = handle.await;
         }
 
+        // The subscriber task has exited and dropped its receiver; remove the
+        // now-dead sender from the global channel map so later sends don't fail
+        // against it.
+        if let Some(subscriber_id) = self.subscriber_id.take() {
+            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, subscriber_id);
+        }
+
         info!("Checkpoint coordinator stopped");
     }
 }
@@ -792,6 +805,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Fields};
+    use serial_test::serial;
     use tokio::time::sleep;
 
     fn create_test_batch_with_metadata(
@@ -858,6 +872,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_unexpected_ack_does_not_finalize_epoch() {
         let mut coordinator = CheckpointCoordinator::with_timeout(300);
         let epoch = CheckpointEpoch(42);
@@ -913,6 +928,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_sink_completion_unblocks_finalization() {
         // Two sinks are expected. The epoch is acked by sink_b only, so it
         // stays in progress waiting on sink_a. When sink_a's branch finishes
@@ -976,6 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_terminal_checkpoint_blocks_until_acked() {
         // A bounded source, on completion, begins a terminal checkpoint and the
         // pipeline must not tear down until that epoch finalizes. The await must
@@ -989,9 +1006,12 @@ mod tests {
         // No sink has acked the terminal marker yet, so the await must not
         // return.
         assert!(
-            tokio::time::timeout(Duration::from_millis(150), control.await_terminal_finalized())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                control.await_terminal_finalized()
+            )
+            .await
+            .is_err(),
             "await_terminal_finalized must block until the terminal epoch is acked"
         );
 

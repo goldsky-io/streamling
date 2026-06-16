@@ -13,7 +13,7 @@ pub use query_builder::PostgresQueryBuilder;
 // Main implementations
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use batch_processor::{BatchProcessorContext, process_batch};
+use batch_processor::{BatchProcessorContext, finalize_landing_on_eof, process_batch};
 use columns::ColumnInfo;
 use datafusion::catalog::Session;
 use datafusion::common::{Result, not_impl_err};
@@ -346,6 +346,10 @@ impl DataSink for PostgresSinkExec {
                 break;
             }
         }
+
+        // Stream ended: drain the landing table's final epoch, which the
+        // per-finalizer truncation leaves behind (it deletes <= N-1).
+        finalize_landing_on_eof(&processor_context).await;
 
         info!(
             "[{}] write_all completed with {} rows (table '{}.{}')",
