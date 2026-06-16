@@ -74,7 +74,9 @@ static CLICKHOUSE_ERROR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"Code: \d+\. \w+::\w*Exception:").unwrap());
 
 mod query_builder;
+mod range_controller;
 use query_builder::{ClickHousePaginationConfig, ClickHouseQueryBuilder};
+use range_controller::RangeController;
 
 fn scalar_to_i128(value: &ScalarValue) -> Option<i128> {
     match value {
@@ -102,7 +104,7 @@ fn i128_to_scalar_like(value: i128, template: &ScalarValue) -> ScalarValue {
         ScalarValue::UInt32(_) => ScalarValue::UInt32(Some(value as u32)),
         ScalarValue::UInt64(_) => ScalarValue::UInt64(Some(value as u64)),
         other => panic!(
-            "unsupported scalar type for block range arithmetic: {:?}",
+            "unsupported scalar type for sort key range arithmetic: {:?}",
             other
         ),
     }
@@ -130,7 +132,7 @@ struct SourceParams {
     initial_split_args: Vec<ScalarValue>,
     state_store: Arc<ClickHouseSourceStateStore>,
     datafusion_buffer_size: usize,
-    block_range: i64,
+    sort_key_range: i64,
     table_name: String,
     has_persisted_split: bool,
 }
@@ -151,9 +153,9 @@ struct SinkParams {
 }
 
 impl ClickHouseTableProvider {
-    const DEFAULT_BLOCK_RANGE: i64 = 1_000_000;
+    const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
     const DEFAULT_PAGE_SIZE: usize = 10_000_000;
-    const MIN_BLOCK_RANGE: i64 = 100;
+    const MIN_SORT_KEY_RANGE: i64 = 100;
     const SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
 
     pub fn new_source(
@@ -169,7 +171,7 @@ impl ClickHouseTableProvider {
     ) -> Result<Self, DataFusionError> {
         let database_name = config.connection.database.clone();
         let page_size = config.page_size.unwrap_or(Self::DEFAULT_PAGE_SIZE);
-        let block_range_config = config.block_range;
+        let sort_key_range_config = config.sort_key_range;
         let client = ClickHouseClient::new(config.connection.clone());
 
         let columns_copy = columns.clone();
@@ -203,9 +205,9 @@ impl ClickHouseTableProvider {
             page_size,
         };
 
-        // Require a wide numeric first sorting key for block range pagination.
+        // Require a wide numeric first sorting key for sort key range pagination.
         // Narrow types (Int8, UInt8, Int16, UInt16) would silently overflow in
-        // i128_to_scalar_like when computing block range boundaries.
+        // i128_to_scalar_like when computing sort key range boundaries.
         let first_key_name = sorting_keys.first().unwrap();
         let first_key_type = schema
             .field_with_name(first_key_name)
@@ -222,20 +224,20 @@ impl ClickHouseTableProvider {
 
         if !is_wide_integer {
             return Err(streamling_err!(
-                "ClickHouse source requires a 32-bit or wider integer first sorting key for block range \
+                "ClickHouse source requires a 32-bit or wider integer first sorting key for sort key range \
                  pagination, but '{}' on table {}.{} has type {:?}",
                 first_key_name, database_name, table_name, first_key_type
             )
             .into());
         }
 
-        let block_range = block_range_config
-            .map(|br| br.max(Self::MIN_BLOCK_RANGE))
-            .unwrap_or(Self::DEFAULT_BLOCK_RANGE);
+        let sort_key_range = sort_key_range_config
+            .map(|br| br.max(Self::MIN_SORT_KEY_RANGE))
+            .unwrap_or(Self::DEFAULT_SORT_KEY_RANGE);
 
         info!(
-            "[{}] block range pagination configured (block_range={}, page_size={})",
-            reference_name, block_range, page_size
+            "[{}] sort key range pagination configured (sort_key_range={}, page_size={})",
+            reference_name, sort_key_range, page_size
         );
 
         let mut query_builder = ClickHouseQueryBuilder::of(
@@ -285,7 +287,7 @@ impl ClickHouseTableProvider {
             initial_split_args,
             state_store,
             datafusion_buffer_size,
-            block_range,
+            sort_key_range,
             table_name: table_name.to_string(),
             has_persisted_split,
         };
@@ -999,10 +1001,11 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .pagination_config()
             .expect("pagination config must be set")
             .page_size;
-        let sorting_keys = self.split.sorting_keys.clone();
-        let default_block_range = source_params.block_range;
+        let default_sort_key_range = source_params.sort_key_range;
         let table_name_for_exec = source_params.table_name.clone();
-        let first_sorting_key_name = sorting_keys
+        let first_sorting_key_name = self
+            .split
+            .sorting_keys
             .first()
             .cloned()
             .expect("sorting keys must not be empty");
@@ -1080,14 +1083,6 @@ impl ExecutionPlan for ClickHouseSourceExec {
 
             debug!("Starting ClickHouse execution with continuous pagination");
 
-            struct BlockRangeState {
-                block_range: i128,
-                default_block_range: i128,
-                max_key: i128,
-                range_start: i128,
-                template: ScalarValue,
-            }
-
             let max_val = client
                 .fetch_max_sorting_key(&table_name_for_exec, &first_sorting_key_name)
                 .await
@@ -1098,51 +1093,117 @@ impl ExecutionPlan for ClickHouseSourceExec {
                 .map_err(DataFusionError::from)?;
             // When the table is empty, SELECT max(first_key) returns NULL. In that case
             // scalar_to_i128 returns None; treat this as "no rows to scan" by defaulting to 0,
-            // so the pagination loop will immediately terminate (next_start > max_key).
+            // so the pagination loop terminates immediately (range_start > max_key).
             let max_key = scalar_to_i128(&max_val).unwrap_or(0);
 
-            let initial_keyset = {
+            // The persisted cursor (split.args) holds [range_start] — the start of the
+            // range to resume from. Ranges are disjoint half-open block_number windows,
+            // so restarting at range_start re-reads at most the in-progress range
+            // (at-least-once, covered by downstream dedup).
+            // Resume from the persisted cursor. Only the first sorting key matters;
+            // see ClickHouseSourceSplit::range_start for checkpoint compatibility.
+            let range_start = {
                 let guard = split.lock().unwrap();
-                if !guard.args.is_empty() { Some(guard.args.clone()) } else { None }
+                guard.range_start().unwrap_or(0)
             };
-            let range_start = initial_keyset.as_ref()
-                .and_then(|ks| ks.first().and_then(scalar_to_i128))
-                .unwrap_or(0);
             let template = i128_to_scalar_like(0, &max_val);
 
-            let default_block_range = default_block_range as i128;
-            let upper = i128_to_scalar_like(range_start + default_block_range, &template);
-            query_builder.set_block_range_upper_bound(Some(upper));
+            let default_sort_key_range = default_sort_key_range as i128;
+            // Let width grow well past the default for sparse filters: cap at the
+            // remaining span so an ultra-sparse table can be covered in few queries.
+            // The page_size + 1 tripwire still shrinks a too-dense range. The lower
+            // floor (one key) lives in RangeController; see RangeController::MIN_WIDTH.
+            let max_width = (max_key - range_start).max(default_sort_key_range);
 
-            info!(
-                "[{}] block range pagination enabled (block_range={}, max_key={}, start={})",
-                reference_name, default_block_range, max_key, range_start
-            );
-            let mut block_state = BlockRangeState {
-                block_range: default_block_range,
-                default_block_range,
-                max_key,
-                range_start,
-                template,
+            let source_query_timeout =
+                Duration::from_secs(ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS);
+            // Shrink proactively at half the hard timeout, before the query is killed.
+            let soft_time_budget = source_query_timeout / 2;
+
+            // Up-front count probe: size the first range to ~page_size rows from the
+            // observed density over the remaining span. A probe failure is non-fatal —
+            // fall back to the widest range and let the controller adapt.
+            let where_clause_for_exec = query_builder.where_clause().map(|s| s.to_string());
+            let scan_span = (max_key - range_start + 1).max(1);
+            let total_count = match client
+                .fetch_count(
+                    &table_name_for_exec,
+                    where_clause_for_exec.as_deref(),
+                    Some(range_start),
+                    &first_sorting_key_name,
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[{}] count probe failed ({}); using widest initial range", reference_name, e);
+                    0
+                }
+            };
+            let initial_width = if total_count == 0 {
+                max_width
+            } else {
+                // RangeController clamps this into [MIN_WIDTH, max_width].
+                let density = total_count as f64 / scan_span as f64;
+                (page_size as f64 / density) as i128
             };
 
-            let mut has_more_data = true;
+            let mut controller = RangeController::new(
+                page_size as u64,
+                range_start,
+                max_key,
+                initial_width,
+                max_width,
+                soft_time_budget,
+            );
+            info!(
+                "[{}] adaptive range pagination (max_key={}, start={}, count={}, initial_width={}, page_size={})",
+                reference_name, max_key, range_start, total_count, controller.width(), page_size
+            );
+
             let mut page_count = 0;
             let mut query_retry_attempts: u32 = 0;
             let mut query_retry_backoff_ms: u64 = 100;
 
-            let source_query_timeout = Duration::from_secs(ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS);
-            let recovery_threshold = source_query_timeout / 4;
+            // Attach any buffered checkpoint messages to a batch about to be emitted.
+            // Clears the buffer after attaching, so messages ride exactly one batch.
+            let attach_checkpoints = {
+                let buffer_arc = checkpoint_buffer_for_data.clone();
+                move |batch: RecordBatch| -> RecordBatch {
+                    let mut buffer = buffer_arc.lock().unwrap();
+                    if buffer.is_empty() {
+                        return batch;
+                    }
+                    debug!("Attaching {} buffered checkpoint messages to batch", buffer.len());
+                    let mut metadata = batch.schema().metadata().clone();
+                    enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
+                    let enriched = enrich_batch_with_metadata(batch, metadata)
+                        .expect("Failed to enrich batch with checkpoint metadata");
+                    buffer.clear();
+                    enriched
+                }
+            };
 
-            while has_more_data {
+            while !controller.is_done() {
                 page_count += 1;
+                let (range_start, upper_bound) = controller.current_range();
+                query_builder
+                    .set_sort_key_range_upper_bound(Some(i128_to_scalar_like(upper_bound, &template)));
+                query_builder.start_at_page(vec![i128_to_scalar_like(range_start, &template)]);
                 let current_query = query_builder.get_query();
-                trace!("ClickHouseSourceExec: executing page {} with query: {}", page_count, current_query);
+                trace!(
+                    "ClickHouseSourceExec: page {} range [{}, {}) width {} query: {}",
+                    page_count, range_start, upper_bound, controller.width(), current_query
+                );
 
                 let page_start = std::time::Instant::now();
+                // LIMIT page_size + 1 is a tripwire, not a cursor: page_size + 1 rows
+                // means the range overflowed and must be re-read smaller. run() buffers
+                // the whole response before we emit, so an overflow is discarded with no
+                // duplicates.
                 let run_result = tokio::time::timeout(
                     source_query_timeout,
-                    Self::run(client.clone(), current_query, Some(page_size)),
+                    Self::run(client.clone(), current_query, Some(page_size + 1)),
                 ).await;
 
                 let run_result = match run_result {
@@ -1159,148 +1220,109 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     Ok(mut stream) => {
                         query_retry_attempts = 0;
                         query_retry_backoff_ms = 100;
-                        let mut batch_count = 0;
-                        let mut total_rows_in_page = 0;
-                        let mut last_batch_keyset: Option<Vec<ScalarValue>> = None;
 
+                        // Buffer the whole page before emitting so the overflow tripwire
+                        // can discard a too-dense range without sending duplicates. The
+                        // response is already fully in memory inside run(), so this only
+                        // holds parsed batches, bounded by page_size + 1 rows.
+                        let mut batches: Vec<RecordBatch> = Vec::new();
+                        let mut total_rows_in_page: usize = 0;
+                        let mut stream_failed = false;
                         while let Some(item_result) = stream.next().await {
                             match item_result {
                                 Ok(batch) => {
-                                    batch_count += 1;
                                     total_rows_in_page += batch.num_rows();
-
-                                    let args = match Self::extract_keyset_from_batch(&batch, &sorting_keys) {
-                                        Ok(keyset_values) => keyset_values,
-                                        Err(e) => {
-                                            error!("Failed to extract keyset from batch: {}", e);
-                                            let df_error: DataFusionError = e.into();
-                                            if tx.send(Err(df_error)).await.is_err() {
-                                                warn!("ClickHouseSourceExec: receiver dropped");
-                                            }
-                                            has_more_data = false;
-                                            break;
-                                        }
-                                    };
-
-                                    last_batch_keyset = Some(args.clone());
-
-                                    let enriched_batch = {
-                                        let mut buffer = checkpoint_buffer_for_data.lock().unwrap();
-                                        if !buffer.is_empty() {
-                                            debug!("Attaching {} buffered checkpoint messages to batch", buffer.len());
-                                            let mut metadata = batch.schema().metadata().clone();
-                                            enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
-                                            let enriched = enrich_batch_with_metadata(batch, metadata)
-                                                .expect("Failed to enrich batch with checkpoint metadata");
-                                            buffer.clear();
-                                            enriched
-                                        } else {
-                                            batch
-                                        }
-                                    };
-
-                                    if tx.send(Ok(enriched_batch)).await.is_err() {
-                                        warn!("ClickHouseSourceExec: receiver dropped during batch {} of page {}", batch_count, page_count);
-                                        has_more_data = false;
-                                        break;
-                                    } else {
-                                        if let Ok(mut split_guard) = split.lock() {
-                                            split_guard.update_args(args.clone());
-                                        }
-                                        trace!("ClickHouseSourceExec: batch {} completed successfully", batch_count);
-                                    }
+                                    batches.push(batch);
                                 }
                                 Err(e) => {
                                     error!("Error processing ClickHouse batch: {}", e);
                                     if tx.send(Err(DataFusionError::ArrowError(Box::new(e), None))).await.is_err() {
                                         warn!("ClickHouseSourceExec: receiver dropped while sending error");
                                     }
-                                    has_more_data = false;
+                                    stream_failed = true;
                                     break;
                                 }
                             }
                         }
-
-                        trace!("ClickHouseSourceExec: page {} summary - total_rows: {}, page_size: {}, batch_count: {}", page_count, total_rows_in_page, page_size, batch_count);
-
-                        // Emit an empty batch on empty scans so downstream operators
-                        // still receive a batch and buffered checkpoint messages can flow.
-                        if total_rows_in_page == 0 {
-                            let empty_batch = {
-                                let batch = RecordBatch::new_empty(empty_batch_schema.clone());
-                                let mut buffer = checkpoint_buffer_for_data.lock().unwrap();
-                                if !buffer.is_empty() {
-                                    debug!("Attaching {} buffered checkpoint messages to empty batch", buffer.len());
-                                    let mut metadata = batch.schema().metadata().clone();
-                                    enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
-                                    let enriched = enrich_batch_with_metadata(batch, metadata)
-                                        .expect("Failed to enrich empty batch with checkpoint metadata");
-                                    buffer.clear();
-                                    enriched
-                                } else {
-                                    batch
-                                }
-                            };
-                            info!("[{}] empty scan on block range [{}, {})",
-                                reference_name, block_state.range_start, block_state.range_start + block_state.block_range);
-                            if tx.send(Ok(empty_batch)).await.is_err() {
-                                warn!("ClickHouseSourceExec: receiver dropped while sending empty batch");
-                                has_more_data = false;
-                                continue;
-                            }
+                        if stream_failed {
+                            break;
                         }
 
-                        let page_exhausted = total_rows_in_page < page_size;
+                        trace!("ClickHouseSourceExec: page {} read {} rows (page_size {})", page_count, total_rows_in_page, page_size);
 
-                        if page_exhausted {
-                            let next_start = block_state.range_start + block_state.block_range;
-                            if next_start > block_state.max_key {
-                                has_more_data = false;
-                                info!("[{}] scanned past max_key {} — done", reference_name, block_state.max_key);
-                            } else {
-                                block_state.range_start = next_start;
+                        // Overflow: the range holds more than page_size rows. Shrink and
+                        // re-read the SAME range. Nothing was emitted, so no duplicates
+                        // and no advance.
+                        if total_rows_in_page > page_size {
+                            if controller.at_min_width() {
+                                // A min-width range still overflows: a single key holds more
+                                // than page_size matching rows and cannot be split further.
+                                // Surface it rather than silently skip data.
+                                let _ = tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
+                                    "ClickHouse source: range [{}, {}) at min width still exceeds page_size {} ({} rows); increase page_size",
+                                    range_start, upper_bound, page_size, total_rows_in_page
+                                )))).await;
+                                break;
+                            }
+                            controller.on_overflow(None);
+                            info!(
+                                "[{}] range [{}, {}) overflowed page_size {} ({} rows); width -> {}",
+                                reference_name, range_start, upper_bound, page_size, total_rows_in_page, controller.width()
+                            );
+                            page_count -= 1;
+                            continue;
+                        }
 
-                                let page_elapsed = page_start.elapsed();
-                                if block_state.block_range < block_state.default_block_range
-                                    && page_elapsed < recovery_threshold
-                                {
-                                    block_state.block_range = (block_state.block_range * 2).min(block_state.default_block_range);
-                                    info!("[{}] recovering block range to {} (page took {:?})", reference_name, block_state.block_range, page_elapsed);
-                                }
-
-                                let upper = i128_to_scalar_like(next_start + block_state.block_range, &block_state.template);
-                                query_builder.set_block_range_upper_bound(Some(upper));
-                                let start_val = i128_to_scalar_like(next_start, &block_state.template);
-                                query_builder.start_at_page(vec![start_val]);
-
-                                info!("[{}] advancing to next block range [{}, {})", reference_name, next_start, next_start + block_state.block_range);
+                        // Complete page. Emit all buffered batches, emitting one empty
+                        // batch for an empty scan so buffered checkpoint messages flow.
+                        let mut receiver_dropped = false;
+                        if total_rows_in_page == 0 {
+                            info!("[{}] empty scan on range [{}, {})", reference_name, range_start, upper_bound);
+                            let empty_batch = attach_checkpoints(RecordBatch::new_empty(empty_batch_schema.clone()));
+                            if tx.send(Ok(empty_batch)).await.is_err() {
+                                receiver_dropped = true;
                             }
                         } else {
-                            // More rows in this range — continue keyset pagination
-                            if let Some(keyset) = last_batch_keyset {
-                                query_builder.update_keyset(keyset);
-                            } else {
-                                has_more_data = false;
+                            for batch in batches.into_iter() {
+                                let batch = attach_checkpoints(batch);
+                                if tx.send(Ok(batch)).await.is_err() {
+                                    receiver_dropped = true;
+                                    break;
+                                }
                             }
                         }
+                        if receiver_dropped {
+                            warn!("ClickHouseSourceExec: receiver dropped during page {}", page_count);
+                            break;
+                        }
 
-                        trace!("ClickHouseSourceExec: done reading page {} (batches: {}, has_more: {})", page_count, batch_count, has_more_data);
+                        // Completed range: advance the cursor and persist it. on_complete
+                        // moves range_start past this range; the while condition (is_done)
+                        // ends the scan once the cursor passes max_key. On restart we re-read
+                        // from the persisted cursor.
+                        let page_elapsed = page_start.elapsed();
+                        controller.on_complete(total_rows_in_page, page_elapsed);
+                        if let Ok(mut split_guard) = split.lock() {
+                            split_guard.update_args(vec![i128_to_scalar_like(controller.range_start(), &template)]);
+                        }
+                        if controller.is_done() {
+                            info!("[{}] scanned past max_key {} — done", reference_name, max_key);
+                        } else {
+                            trace!(
+                                "[{}] advanced to [{}, {}) ({} rows in {:?})",
+                                reference_name, controller.range_start(), controller.current_range().1, total_rows_in_page, page_elapsed
+                            );
+                        }
                     }
                     Err(df_error) => {
                         if is_timeout_error(&df_error) {
-                            let old_br = block_state.block_range;
-                            block_state.block_range = (block_state.block_range / 2).max(ClickHouseTableProvider::MIN_BLOCK_RANGE as i128);
+                            let old_width = controller.width();
+                            // Too slow: shrink and re-read the same range (no advance).
+                            controller.on_timeout();
                             warn!(
-                                "[{}] timeout on page {}; reducing block range {} -> {}",
-                                reference_name, page_count, old_br, block_state.block_range
+                                "[{}] timeout on page {}; reducing width {} -> {}",
+                                reference_name, page_count, old_width, controller.width()
                             );
-                            let upper = i128_to_scalar_like(block_state.range_start + block_state.block_range, &block_state.template);
-                            query_builder.set_block_range_upper_bound(Some(upper));
-                            // Reset keyset to retry from the start of the current block range,
-                            // otherwise the stale keyset can contradict the new upper bound.
-                            let start_val = i128_to_scalar_like(block_state.range_start, &block_state.template);
-                            query_builder.start_at_page(vec![start_val]);
-
                             page_count -= 1;
                             tokio::time::sleep(Duration::from_millis(1_000)).await;
                             continue;
@@ -1696,6 +1718,47 @@ impl ClickHouseClient {
         let max_val = ScalarValue::try_from_array(&batch.column(0), 0)
             .streamling_context("failed to extract max sorting key value")?;
         Ok(max_val)
+    }
+
+    /// Count rows matching the source filter at or above `lower_bound` on the
+    /// first sorting key. Used as an up-front density probe to size the first
+    /// pagination range. Carries no ORDER BY, so a matching projection serves it
+    /// cheaply; a slow probe is itself a signal that the filter is scan-bound.
+    pub async fn fetch_count(
+        &self,
+        table_name: &str,
+        where_clause: Option<&str>,
+        lower_bound: Option<i128>,
+        first_key: &str,
+    ) -> streamling_core::error::Result<u64> {
+        let mut conditions: Vec<String> = Vec::new();
+        if let Some(w) = where_clause {
+            conditions.push(format!("({})", w));
+        }
+        if let Some(lb) = lower_bound {
+            conditions.push(format!("{} >= {}", first_key, lb));
+        }
+        let where_sql = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let query = format!(
+            "SELECT count() FROM {}{} FORMAT Arrow",
+            table_name, where_sql
+        );
+        let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+        let response_bytes = self
+            .process_http_response(response_result, query.as_str(), "count")
+            .await?;
+
+        let mut reader = self.create_arrow_reader(response_bytes, &query)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| streamling_err!("no rows returned for count query"))??;
+        let scalar = ScalarValue::try_from_array(&batch.column(0), 0)
+            .streamling_context("failed to extract count value")?;
+        Ok(scalar_to_i128(&scalar).unwrap_or(0).max(0) as u64)
     }
 
     /// Normalize schema for ClickHouse Arrow IPC: convert view types to standard types
@@ -2331,6 +2394,41 @@ impl ClickHouseClient {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn split_range_start_reads_first_sorting_key() {
+        // New-format checkpoint stores [range_start].
+        let split = ClickHouseSourceSplit {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            args: vec![ScalarValue::Int64(Some(1000))],
+        };
+        assert_eq!(split.range_start(), Some(1000));
+    }
+
+    #[test]
+    fn split_range_start_is_backwards_compatible_with_full_keyset() {
+        // Checkpoints written before sort-key-range pagination stored the full
+        // last-row keyset. The new code must resume at the first sorting key,
+        // re-reading from there rather than skipping rows.
+        let old_split = ClickHouseSourceSplit {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            args: vec![ScalarValue::Int64(Some(1000)), ScalarValue::Int64(Some(50))],
+        };
+        assert_eq!(
+            old_split.range_start(),
+            Some(1000),
+            "old full-keyset checkpoint must resume at the first sorting key"
+        );
+    }
+
+    #[test]
+    fn split_range_start_empty_is_none() {
+        let split = ClickHouseSourceSplit {
+            sorting_keys: vec![],
+            args: vec![],
+        };
+        assert_eq!(split.range_start(), None);
+    }
 
     #[test]
     fn test_schema_normalization() {
@@ -3251,7 +3349,7 @@ mod tests {
                 initial_split_args: initial_split_args.clone(),
                 state_store,
                 datafusion_buffer_size: 16,
-                block_range: 1_000_000,
+                sort_key_range: 1_000_000,
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
             }),
@@ -3673,6 +3771,20 @@ impl ClickHouseSourceSplit {
     pub fn update_args(&mut self, args: Vec<ScalarValue>) {
         self.args = args;
     }
+
+    /// The first sorting-key value to resume scanning from, or `None` if no cursor
+    /// has been persisted yet.
+    ///
+    /// Only `args[0]` is read. Checkpoints written before sort-key-range pagination
+    /// stored the full last-row keyset `[k0, k1, ...]`; current ones store just
+    /// `[range_start]`. `args[0]` is the first sorting key in both, so an older
+    /// checkpoint resumes at that key and re-reads from there (at-least-once,
+    /// covered by downstream dedup) rather than skipping rows. Keep the persisted
+    /// format (`Vec<ScalarValue>`) and the state-store VERSION stable so existing
+    /// checkpoints stay loadable.
+    pub fn range_start(&self) -> Option<i128> {
+        self.args.first().and_then(scalar_to_i128)
+    }
 }
 
 #[derive(Debug)]
@@ -3682,6 +3794,9 @@ struct ClickHouseSourceStateStore {
 }
 
 impl ClickHouseSourceStateStore {
+    // Bumping this discards existing checkpoints (sources restart from the
+    // beginning). The persisted format stayed compatible across the keyset ->
+    // sort-key-range change (see ClickHouseSourceSplit::range_start), so keep "v1".
     const VERSION: &str = "v1";
 
     pub async fn save_split(&self, split: ClickHouseSourceSplit) -> Result<(), StateBackendError> {

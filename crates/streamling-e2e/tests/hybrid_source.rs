@@ -576,9 +576,9 @@ sinks:
 
 /// Regression test for hybrid bounded ClickHouse resume:
 /// when resuming from a high saved split, execution must start from that
-/// cursor (not from block range origin 0).
+/// cursor (not from sort key range origin 0).
 ///
-/// This uses a high `start_at` and a small `block_range` so any reset to 0
+/// This uses a high `start_at` and a small `sort_key_range` so any reset to 0
 /// would require scanning a very large number of empty ranges and likely time out.
 #[tokio::test]
 async fn test_hybrid_clickhouse_resume_from_high_saved_split() {
@@ -618,7 +618,7 @@ async fn test_hybrid_clickhouse_resume_from_high_saved_split() {
         })
         .collect();
 
-    // High range is intentionally far from zero. With block_range=100, a reset to 0
+    // High range is intentionally far from zero. With sort_key_range=100, a reset to 0
     // would require scanning many empty ranges before reaching this cursor.
     let high_start = 5_000_000i64;
     let high_rows = 20_000i64;
@@ -740,7 +740,7 @@ sinks:
                 )
                 .env("STREAMLING__RECORD_BATCH_SIZE", "1")
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
                 .env("STREAMLING__JOB_MODE", "true"),
         )
         .await
@@ -857,7 +857,7 @@ sinks:
                 .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
                 .env("STREAMLING__RECORD_BATCH_SIZE", "1")
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "20")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
                 .env("STREAMLING__JOB_MODE", "true"),
         )
         .await

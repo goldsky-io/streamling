@@ -382,7 +382,7 @@ pub struct ClickHouseSourceConfig {
     /// Limits scan width to prevent timeouts on large tables. Automatically halved on timeout.
     /// Only applies when the first sorting key is a numeric type.
     /// Default: 1,000,000
-    pub block_range: Option<i64>,
+    pub sort_key_range: Option<i64>,
 }
 
 pub type ClickHouseSinkConfig = ClickHouseConfig;

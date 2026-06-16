@@ -24,7 +24,7 @@ async fn test_clickhouse_source_boundary() {
 
     let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
 
-    // Create source table — first sorting key must be numeric for block range pagination
+    // Create source table — first sorting key must be numeric for sort key range pagination
     clickhouse
         .execute(
             "CREATE TABLE boundary_test (
@@ -155,7 +155,7 @@ async fn test_clickhouse_source_keyset_pagination() {
 
     let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
 
-    // Create table with compound sorting key — first sorting key must be numeric for block range pagination
+    // Create table with compound sorting key — first sorting key must be numeric for sort key range pagination
     clickhouse
         .execute(
             "CREATE TABLE keyset_test (
@@ -258,14 +258,14 @@ sinks:
 }
 
 // ============================================================================
-// Scenario 3: Block range with inner keyset pagination
+// Scenario 3: Sort key range with inner keyset pagination
 // ============================================================================
 
-/// Test that when a single block range contains more rows than page_size,
-/// inner keyset pagination correctly pages through them before advancing
-/// to the next block range.
+/// Test that when a sort key range contains more rows than page_size, the source
+/// shrinks the range until each page fits and still delivers every row across
+/// all ranges.
 #[tokio::test]
-async fn test_clickhouse_source_block_range_exceeds_page_size() {
+async fn test_clickhouse_source_sort_key_range_exceeds_page_size() {
     init_tracing();
 
     let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
@@ -276,7 +276,7 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
 
     clickhouse
         .execute(
-            "CREATE TABLE block_range_paging_test (
+            "CREATE TABLE sort_key_range_paging_test (
                 block_number UInt64,
                 id UInt64,
                 data String,
@@ -287,8 +287,8 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
         .expect("Failed to create table");
 
     // Insert 500 rows: block_number 0..499, each with a unique id.
-    // With block_range=100, we get 5 block ranges: [0,100), [100,200), ...
-    // With page_size=30, each block range (100 rows) needs ~4 keyset pages.
+    // page_size=30 forces the adaptive controller to shrink ranges below the
+    // dense regions until each page fits; all 500 rows must still arrive.
     let total_records: u64 = 500;
     let mut values = Vec::new();
     for i in 0..total_records {
@@ -297,7 +297,7 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
 
     for chunk in values.chunks(200) {
         let insert_query = format!(
-            "INSERT INTO block_range_paging_test (block_number, id, data, is_deleted) VALUES {}",
+            "INSERT INTO sort_key_range_paging_test (block_number, id, data, is_deleted) VALUES {}",
             chunk.join(", ")
         );
         clickhouse
@@ -310,7 +310,7 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
 sources:
   ch_source:
     type: clickhouse
-    table_name: block_range_paging_test
+    table_name: sort_key_range_paging_test
     primary_key: id
 
 transforms: {}
@@ -319,7 +319,7 @@ sinks:
   pg_sink:
     type: postgres
     from: ch_source
-    table: block_range_paging_results
+    table: sort_key_range_paging_results
     schema: public
     primary_key: id
     on_conflict: update
@@ -330,7 +330,7 @@ sinks:
             pipeline,
             PipelineOpts::new()
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
                 .record_limit(total_records)
                 .timeout(std::time::Duration::from_secs(60)),
         )
@@ -341,49 +341,51 @@ sinks:
 
     let count = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.block_range_paging_results")
+        .count("SELECT COUNT(*) FROM public.sort_key_range_paging_results")
         .await
         .expect("Failed to query count");
 
     assert_eq!(
         count, total_records as i64,
-        "Should have processed all {} records across multiple block ranges with inner keyset pagination",
+        "Should have processed all {} records across multiple sort key ranges with inner keyset pagination",
         total_records
     );
 
-    // Verify rows from different block ranges made it through
+    // Verify rows from different sort key ranges made it through
     let first_range = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.block_range_paging_results WHERE block_number < 100")
+        .count("SELECT COUNT(*) FROM public.sort_key_range_paging_results WHERE block_number < 100")
         .await
         .unwrap();
     assert_eq!(
         first_range, 100,
-        "First block range [0,100) should have 100 rows"
+        "First sort key range [0,100) should have 100 rows"
     );
 
     let last_range = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.block_range_paging_results WHERE block_number >= 400")
+        .count(
+            "SELECT COUNT(*) FROM public.sort_key_range_paging_results WHERE block_number >= 400",
+        )
         .await
         .unwrap();
     assert_eq!(
         last_range, 100,
-        "Last block range [400,500) should have 100 rows"
+        "Last sort key range [400,500) should have 100 rows"
     );
 }
 
 // ============================================================================
-// Scenario 4: Checkpoint flow across sparse block ranges
+// Scenario 4: Checkpoint flow across sparse sort key ranges
 // ============================================================================
 
-/// Test that checkpoints flow correctly when block range pagination scans
+/// Test that checkpoints flow correctly when sort key range pagination scans
 /// through a mix of populated and empty ranges. Verifies:
 /// 1. Pipeline 1 processes the first cluster and checkpoints its position
 /// 2. Pipeline 2 resumes from the checkpoint and processes the second cluster
 ///    without re-reading the first cluster
 ///
-/// Data layout with block_range=100:
+/// Data layout with sort_key_range=100:
 ///   [0,100)   → 50 rows (cluster 1)
 ///   [100,500) → empty (4 empty ranges)
 ///   [500,600) → 50 rows (cluster 2)
@@ -451,7 +453,7 @@ sinks:
 "#;
 
     // Run 1: process only the first 50 records (cluster 1).
-    // With block_range=100 and page_size=30 the source will also scan
+    // With sort_key_range=100 and page_size=30 the source will also scan
     // empty ranges [100,200)…[400,500) before reaching cluster 2,
     // but record_limit will stop it after 50 records.
     let status_1 = ctx
@@ -481,7 +483,7 @@ sinks:
                 .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
                 .env("STREAMLING__RECORD_BATCH_SIZE", "10")
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100"),
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100"),
         )
         .await
         .expect("Pipeline run 1 failed");
@@ -558,7 +560,7 @@ sinks:
                 .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
                 .env("STREAMLING__RECORD_BATCH_SIZE", "10")
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100"),
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100"),
         )
         .await
         .expect("Pipeline run 2 failed");
