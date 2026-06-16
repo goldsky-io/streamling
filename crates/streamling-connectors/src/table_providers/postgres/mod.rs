@@ -311,7 +311,8 @@ impl DataSink for PostgresSinkExec {
 
         // Create batch processor context
         let processor_context = BatchProcessorContext {
-            pool: connection.pool().clone(),
+            pool: Arc::new(tokio::sync::Mutex::new((connection.pool().clone(), 0u64))),
+            config: self.config.clone(),
             schema_name: self.schema_name.clone(),
             table: self.table.clone(),
             primary_key_columns: primary_key_columns.clone(),

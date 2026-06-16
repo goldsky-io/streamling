@@ -17,10 +17,11 @@ use streamling_core::telemetry::recorder::MetricsRecorder;
 use streamling_core::utils::arrow::{build_schema_from_columns, safe_take};
 
 use crate::table_providers::postgres::execution::{
-    SinkContext, execute_batch_delete, execute_batch_insert,
+    SharedPool, SinkContext, execute_batch_delete, execute_batch_insert,
 };
 use crate::table_providers::postgres::query_builder::PostgresQueryBuilder;
 use crate::table_providers::util::parallel::parallel_execute;
+use streamling_config::PostgresSinkConfig;
 use streamling_core::utils::pg::truncate_finalized_checkpoint_data;
 
 /// Filter a RecordBatch to only include rows at the specified indices
@@ -50,7 +51,8 @@ fn filter_batch_by_indices(batch: &RecordBatch, indices: &[usize]) -> Result<Rec
 /// Context for batch processing
 #[derive(Clone)]
 pub struct BatchProcessorContext {
-    pub pool: sqlx::PgPool,
+    pub pool: SharedPool,
+    pub config: PostgresSinkConfig,
     pub schema_name: String,
     pub table: String,
     pub primary_key_columns: Vec<String>,
@@ -82,9 +84,14 @@ async fn handle_checkpoint_truncation(context: &BatchProcessorContext, truncate_
         context.table
     );
 
+    let pool = {
+        let g = context.pool.lock().await;
+        g.0.clone()
+    };
+
     // Truncate finalized data (best-effort, errors are logged but don't fail pipeline)
     let _ = truncate_finalized_checkpoint_data(
-        &context.pool,
+        &pool,
         &context.schema_name,
         &context.table,
         truncate_epoch,
@@ -177,6 +184,8 @@ async fn execute_insert_slice(
 
     execute_batch_insert(
         &context.pool,
+        &context.config,
+        context.parallelism,
         &query,
         &columns,
         &context.column_indices,
@@ -212,6 +221,8 @@ async fn execute_delete_slice(context: &BatchProcessorContext, slice: &RecordBat
 
     execute_batch_delete(
         &context.pool,
+        &context.config,
+        context.parallelism,
         &query,
         &columns,
         &context.primary_key_indices,
@@ -414,6 +425,23 @@ mod tests {
 
     use std::sync::Arc;
 
+    fn test_config() -> PostgresSinkConfig {
+        PostgresSinkConfig {
+            host: "localhost".to_string(),
+            port: "5432".to_string(),
+            user: "test".to_string(),
+            pass: "test".to_string(),
+            db: "test".to_string(),
+            sslmode: "disable".to_string(),
+            batch_flush_interval: "1000".to_string(),
+            batch_size: 1000,
+            statement_timeout_secs: 60,
+            pool_acquire_timeout_secs: 30,
+            pool_idle_timeout_secs: 600,
+            pool_max_lifetime_secs: 1800,
+        }
+    }
+
     #[tokio::test]
     async fn test_process_batch_empty_batch() {
         // Test that an empty batch returns Ok(true) and processes checkpoint
@@ -429,7 +457,8 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgresql://test:test@localhost/test").unwrap();
 
         let context = BatchProcessorContext {
-            pool,
+            pool: Arc::new(tokio::sync::Mutex::new((pool, 0u64))),
+            config: test_config(),
             schema_name: "test_schema".to_string(),
             table: "test_table".to_string(),
             primary_key_columns: vec!["id".to_string()],
@@ -472,7 +501,8 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgresql://test:test@localhost/test").unwrap();
 
         let context = BatchProcessorContext {
-            pool,
+            pool: Arc::new(tokio::sync::Mutex::new((pool, 0u64))),
+            config: test_config(),
             schema_name: "test_schema".to_string(),
             table: "test_table".to_string(),
             primary_key_columns: vec![],
