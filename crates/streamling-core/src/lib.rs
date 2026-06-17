@@ -28,6 +28,7 @@ pub mod session;
 pub mod side_output;
 pub mod sql_parse;
 pub mod telemetry;
+pub mod preview;
 pub mod topology;
 pub mod topology_validation;
 
