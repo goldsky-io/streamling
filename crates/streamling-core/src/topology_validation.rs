@@ -130,6 +130,91 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
     }
 }
 
+/// Returns the names (original case) of sources/transforms that have no
+/// downstream consumer. Used by the preview rewriter to attach blackhole sinks
+/// when the submitted config has no sinks.
+///
+/// Mirrors the consumer analysis in [`validate_no_orphan_nodes`]. If a SQL
+/// transform cannot be parsed for table references, analysis is unreliable, so
+/// every candidate node is returned (attaching a blackhole to each is always
+/// valid and keeps data flowing through every block).
+pub fn find_terminal_nodes(config: &str) -> crate::error::Result<Vec<String>> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(config).map_err(|e| streamling_user_err!("invalid YAML: {}", e))?;
+
+    let root = if let Some(def) = value.get("definition") {
+        if def.is_mapping() { def } else { &value }
+    } else {
+        &value
+    };
+
+    // Candidate nodes: all sources + non-dynamic-table transforms, original case.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(m) = root.get("sources").and_then(|v| v.as_mapping()) {
+        for k in m.keys() {
+            if let Some(name) = k.as_str() {
+                candidates.push(name.to_string());
+            }
+        }
+    }
+    let transforms: Vec<(String, serde_yaml::Value)> = root
+        .get("transforms")
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| k.as_str().map(|s| (s.to_string(), v.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (name, transform_val) in &transforms {
+        let is_dynamic_table = transform_val
+            .as_mapping()
+            .and_then(|m| m.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("dynamic_table");
+        if !is_dynamic_table {
+            candidates.push(name.clone());
+        }
+    }
+
+    // Build the set of consumed node names (lowercased), from transform SQL
+    // table refs / `from` fields and sink `from` fields.
+    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, transform_val) in &transforms {
+        let mapping = match transform_val.as_mapping() {
+            Some(m) => m,
+            None => continue,
+        };
+        if let Some(sql) = mapping.get("sql").and_then(|v| v.as_str()) {
+            match extract_table_references_from_sql(sql) {
+                Ok(table_names) => {
+                    for name in table_names {
+                        consumed.insert(strip_sql_quotes(&name).to_lowercase());
+                    }
+                }
+                Err(_) => {
+                    // Unanalyzable: be conservative, treat every node as terminal.
+                    return Ok(candidates);
+                }
+            }
+        } else if let Some(from) = mapping.get("from").and_then(|v| v.as_str()) {
+            consumed.insert(from.to_lowercase());
+        }
+    }
+    if let Some(m) = root.get("sinks").and_then(|v| v.as_mapping()) {
+        for (_, v) in m {
+            if let Some(from) = v.get("from").and_then(|f| f.as_str()) {
+                consumed.insert(from.to_lowercase());
+            }
+        }
+    }
+
+    Ok(candidates
+        .into_iter()
+        .filter(|name| !consumed.contains(&name.to_lowercase()))
+        .collect())
+}
+
 /// Validates that job_mode is only enabled when every source supports it.
 ///
 /// Job mode requires bounded sources that terminate on their own: hybrid sources
@@ -770,5 +855,66 @@ sinks:
             validate_job_mode(true, &topology).is_ok(),
             "job_mode with all hybrid sources should succeed"
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_node_tests {
+    use super::find_terminal_nodes;
+
+    #[test]
+    fn single_sink_terminal_is_the_unconsumed_transform() {
+        let yaml = r#"
+sources:
+  src:
+    type: kafka
+    topic: t
+    primary_key: id
+transforms:
+  filt:
+    type: sql
+    sql: select * from src
+    primary_key: id
+"#;
+        // `src` is consumed by `filt`; `filt` is consumed by nothing -> terminal.
+        let terminals = find_terminal_nodes(yaml).unwrap();
+        assert_eq!(terminals, vec!["filt".to_string()]);
+    }
+
+    #[test]
+    fn multiple_independent_terminals_both_returned() {
+        let yaml = r#"
+sources:
+  a:
+    type: kafka
+    topic: t1
+    primary_key: id
+  b:
+    type: kafka
+    topic: t2
+    primary_key: id
+transforms: {}
+"#;
+        let mut terminals = find_terminal_nodes(yaml).unwrap();
+        terminals.sort();
+        assert_eq!(terminals, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn node_consumed_by_sink_is_not_terminal() {
+        let yaml = r#"
+sources:
+  src:
+    type: kafka
+    topic: t
+    primary_key: id
+transforms: {}
+sinks:
+  out:
+    type: print
+    from: src
+"#;
+        let terminals = find_terminal_nodes(yaml).unwrap();
+        assert!(terminals.is_empty());
     }
 }
