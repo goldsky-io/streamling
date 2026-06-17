@@ -191,4 +191,53 @@ transforms: {}
     fn invalid_yaml_errors() {
         assert!(rewrite_sinks_to_blackhole("::: not yaml :::").is_err());
     }
+
+    #[test]
+    fn definition_wrapper_rewrites_sinks_preserving_from() {
+        let yaml = r#"
+definition:
+  sources:
+    src:
+      type: kafka
+      topic: t
+      primary_key: id
+  transforms: {}
+  sinks:
+    out:
+      type: postgres
+      from: src
+      table: foo
+      primary_key: id
+"#;
+        let rewritten = rewrite_sinks_to_blackhole(yaml).unwrap();
+        let v = parse(&rewritten);
+        let out = &v["definition"]["sinks"]["out"];
+        assert_eq!(out["type"], Value::from("blackhole"));
+        assert_eq!(out["from"], Value::from("src"));
+        assert!(out.get("table").is_none());
+        assert!(out.get("primary_key").is_none());
+    }
+
+    #[test]
+    fn empty_sinks_mapping_appends_blackhole_for_terminal_nodes() {
+        let yaml = r#"
+sources:
+  src:
+    type: kafka
+    topic: t
+    primary_key: id
+transforms:
+  filt:
+    type: sql
+    sql: select * from src
+    primary_key: id
+sinks: {}
+"#;
+        let v = parse(&rewrite_sinks_to_blackhole(yaml).unwrap());
+        let sinks = v["sinks"].as_mapping().unwrap();
+        assert_eq!(sinks.len(), 1);
+        let (_, sink) = sinks.iter().next().unwrap();
+        assert_eq!(sink["type"], Value::from("blackhole"));
+        assert_eq!(sink["from"], Value::from("filt"));
+    }
 }
