@@ -1,6 +1,6 @@
 use std::cmp::{self, Ordering};
+use std::sync::Arc;
 use std::task::{Poll, ready};
-use std::{any::Any, sync::Arc};
 
 use crate::checkpoints::checkpoint_management::{CheckpointMessage, extract_checkpoint_messages};
 use arrow::array::{
@@ -53,7 +53,7 @@ pub struct StreamingUnnestExec {
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Cache holding plan properties like equivalences, output partitioning etc.
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
     /// Copy of the original DataFusion UnnestExec for method delegation
     original_unnest: DataFusionUnnestExec,
 }
@@ -77,7 +77,7 @@ impl StreamingUnnestExec {
             struct_column_indices,
             options,
             metrics: Default::default(),
-            cache,
+            cache: Arc::new(cache),
             original_unnest,
         }
     }
@@ -107,7 +107,7 @@ impl StreamingUnnestExec {
             struct_column_indices,
             options,
             metrics: Default::default(),
-            cache,
+            cache: Arc::new(cache),
             original_unnest,
         })
     }
@@ -160,11 +160,7 @@ impl ExecutionPlan for StreamingUnnestExec {
         "UnnestExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 

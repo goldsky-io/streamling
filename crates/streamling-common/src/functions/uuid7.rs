@@ -8,13 +8,12 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{streamling_err, streamling_user_bail};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Uuid7Func {
     signature: Signature,
 }
@@ -34,10 +33,6 @@ impl Uuid7Func {
 }
 
 impl ScalarUDFImpl for Uuid7Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "uuid7"
     }
@@ -85,6 +80,7 @@ mod tests {
             arg_fields: vec![],
             number_rows: 3,
             return_field: Field::new("uuid7", DataType::Utf8, false).into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -122,6 +118,7 @@ mod tests {
             arg_fields: vec![Field::new("arg", DataType::Utf8, false).into()],
             number_rows: 1,
             return_field: Field::new("uuid7", DataType::Utf8, false).into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args);

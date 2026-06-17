@@ -15,7 +15,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 /// array_filter(list<struct>, field_name_utf8, value_utf8) -> list<struct>
@@ -23,7 +22,7 @@ use std::sync::Arc;
 /// Filters each list, keeping only elements where the named struct field (Utf8)
 /// equals the provided value (Utf8), or both are NULL. If the list is null, the result is null.
 /// If the field is missing or not Utf8, an error is returned.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ArrayFilterFunc {
     signature: Signature,
 }
@@ -747,10 +746,6 @@ pub fn eval_array_filter(
 }
 
 impl ScalarUDFImpl for ArrayFilterFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "array_filter"
     }
@@ -771,7 +766,15 @@ impl ScalarUDFImpl for ArrayFilterFunc {
         }
         let input_field = &args.arg_fields[0];
         let list_dt = match input_field.data_type() {
-            DataType::List(field) => DataType::List(field.clone()),
+            // The execution path rebuilds the list element field as a non-nullable
+            // "item" field (see `out_field` in the filter implementation). df54 strictly
+            // asserts the produced array type matches the type promised here, so mirror
+            // that element field exactly rather than cloning the input field.
+            DataType::List(field) => DataType::List(Arc::new(SchemaField::new(
+                "item",
+                field.data_type().clone(),
+                false,
+            ))),
             other => {
                 streamling_user_bail!(
                     "array_filter expects first argument to be a list/array, got {:?}",
@@ -855,6 +858,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -943,6 +947,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -1005,6 +1010,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

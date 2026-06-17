@@ -532,6 +532,8 @@ impl MetricsRecorder {
                 MetricValue::StartTimestamp(_) => {}
                 MetricValue::EndTimestamp(_) => {}
                 MetricValue::Custom { .. } => {}
+                // Variants added in datafusion 54; not currently exported as telemetry.
+                _ => {}
             };
         }
     }

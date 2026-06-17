@@ -11,7 +11,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::{Count, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
-use std::any::Any;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -61,10 +60,6 @@ impl PrintSink {
 
 #[async_trait]
 impl DataSink for PrintSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -204,10 +199,6 @@ impl PrintTableProvider {
 
 #[async_trait]
 impl TableProvider for PrintTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

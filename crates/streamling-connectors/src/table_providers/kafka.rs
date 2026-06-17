@@ -74,7 +74,6 @@ use schema_registry_converter::schema_registry_common::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
-use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
@@ -376,7 +375,7 @@ struct KafkaSourceExec {
     topic: String,
     start_at: Option<String>,
     filter: Option<String>,
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
     record_batch_interval_ms: u64,
     record_batch_size: u32,
     internal_buffer_size: u32,
@@ -469,7 +468,7 @@ impl KafkaSourceExec {
             topic,
             start_at,
             filter,
-            cached_properties,
+            cached_properties: Arc::new(cached_properties),
             record_batch_interval_ms,
             record_batch_size,
             internal_buffer_size,
@@ -917,11 +916,7 @@ impl ExecutionPlan for KafkaSourceExec {
         "KafkaSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -1904,10 +1899,6 @@ impl KafkaSourceTableProvider {
 
 #[async_trait]
 impl TableProvider for KafkaSourceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -2430,10 +2421,6 @@ impl KafkaSink {
 
 #[async_trait]
 impl DataSink for KafkaSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -2667,10 +2654,6 @@ impl KafkaSinkTableProvider {
 
 #[async_trait]
 impl TableProvider for KafkaSinkTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

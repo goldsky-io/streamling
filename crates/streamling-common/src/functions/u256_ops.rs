@@ -8,7 +8,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 // ================================
@@ -16,7 +15,7 @@ use std::sync::Arc;
 // ================================
 
 /// Convert string or other types to U256
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToU256Func {
     signature: Signature,
 }
@@ -51,10 +50,6 @@ impl ToU256Func {
 }
 
 impl ScalarUDFImpl for ToU256Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "to_u256"
     }
@@ -222,7 +217,7 @@ impl ScalarUDFImpl for ToU256Func {
 }
 
 /// Convert U256 to decimal string
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct U256ToStringFunc {
     signature: Signature,
 }
@@ -242,10 +237,6 @@ impl U256ToStringFunc {
 }
 
 impl ScalarUDFImpl for U256ToStringFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "u256_to_string"
     }
@@ -308,7 +299,7 @@ impl ScalarUDFImpl for U256ToStringFunc {
 
 macro_rules! impl_u256_binary_op {
     ($name:ident, $func_name:expr, $op:ident) => {
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, Eq, Hash)]
         pub struct $name {
             signature: Signature,
         }
@@ -331,10 +322,6 @@ macro_rules! impl_u256_binary_op {
         }
 
         impl ScalarUDFImpl for $name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-
             fn name(&self) -> &str {
                 $func_name
             }
@@ -475,6 +462,7 @@ mod tests {
             ))],
             number_rows: 2,
             return_field: Arc::new(arrow_schema::Field::new("result", U256Type::new(), false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -512,6 +500,7 @@ mod tests {
             ))],
             number_rows: 2,
             return_field: Arc::new(arrow_schema::Field::new("result", U256Type::new(), true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -552,6 +541,7 @@ mod tests {
             ))],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let ColumnarValue::Array(arr) = func.invoke_with_args(args).unwrap() else {
             panic!("expected array result");
@@ -586,6 +576,7 @@ mod tests {
             ))],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let ColumnarValue::Array(arr) = func.invoke_with_args(args).unwrap() else {
             panic!("expected array result");
@@ -624,6 +615,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", U256Type::new(), false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

@@ -351,6 +351,7 @@ fn rewrite_case_kind<K: BigIntKind>(e: &mut SqlExpr, cols: &HashSet<String>) {
             operand,
             conditions,
             else_result,
+            ..
         } = e
         else {
             return;
@@ -880,6 +881,7 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                 data_type,
                 kind: _,
                 format: _,
+                ..
             } => {
                 // Attempt to parse DECIMAL(p,s) from data_type.to_string()
                 let dt = data_type.to_string();
