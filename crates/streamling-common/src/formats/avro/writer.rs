@@ -321,6 +321,19 @@ fn serialize_column<T: SerializeTarget>(
                 .to_vec())
         }
 
+        DataType::LargeBinary => {
+            write_arrow_value!(ArrayRef::as_binary::<i64>, Value::Bytes, |v: &[u8]| v
+                .to_vec())
+        }
+
+        DataType::FixedSizeBinary(_) => {
+            write_arrow_value!(
+                ArrayRef::as_fixed_size_binary,
+                Value::Bytes,
+                |v: &[u8]| v.to_vec()
+            )
+        }
+
         DataType::List(item) => {
             let schema = get_field_schema(schema, name, nullable);
             let Schema::Array(item_schema) = schema else {
@@ -995,6 +1008,113 @@ mod tests {
                             ])]),
                         ),
                     ])]),
+                )]),
+            ]
+        );
+    }
+
+    /// Regression test for the `unimplemented!("unsupported data type:
+    /// FixedSizeBinary(32)")` panic. A Kafka avro decimal with precision > 76
+    /// is read in as a U256, backed by `FixedSizeBinary(32)`; serializing it
+    /// back out must not panic and should emit the raw bytes.
+    #[test]
+    fn test_fixed_size_binary_serialization() {
+        use apache_avro::types::Value::*;
+        use datafusion::arrow::array::FixedSizeBinaryArray;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "balance",
+            DataType::FixedSizeBinary(32),
+            false,
+        )]));
+
+        // Two 32-byte big-endian values, as a U256 column would hold.
+        let row0 = [0u8; 32];
+        let mut row1 = [0u8; 32];
+        row1[30] = 0x01;
+        row1[31] = 0x00; // == 256
+
+        let array = FixedSizeBinaryArray::try_from_iter(vec![row0, row1].into_iter()).unwrap();
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        let avro_schema = to_avro("U256Record", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        assert_eq!(
+            result,
+            vec![
+                Record(vec![("balance".to_string(), Bytes(row0.to_vec()))]),
+                Record(vec![("balance".to_string(), Bytes(row1.to_vec()))]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fixed_size_binary_nullable_serialization() {
+        use apache_avro::types::Value::*;
+        use datafusion::arrow::array::FixedSizeBinaryArray;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "maybe_hash",
+            DataType::FixedSizeBinary(4),
+            true,
+        )]));
+
+        let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(vec![1u8, 2, 3, 4]), None, Some(vec![5u8, 6, 7, 8])].into_iter(),
+            4,
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        let avro_schema = to_avro("MaybeHash", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        assert_eq!(
+            result,
+            vec![
+                Record(vec![(
+                    "maybe_hash".to_string(),
+                    Union(1, Box::new(Bytes(vec![1, 2, 3, 4])))
+                )]),
+                Record(vec![("maybe_hash".to_string(), Union(0, Box::new(Null)))]),
+                Record(vec![(
+                    "maybe_hash".to_string(),
+                    Union(1, Box::new(Bytes(vec![5, 6, 7, 8])))
+                )]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_large_binary_serialization() {
+        use apache_avro::types::Value::*;
+        use datafusion::arrow::array::LargeBinaryArray;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::LargeBinary,
+            true,
+        )]));
+
+        let array =
+            LargeBinaryArray::from(vec![Some(b"hello".as_ref()), None, Some(b"world".as_ref())]);
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        let avro_schema = to_avro("Payload", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        assert_eq!(
+            result,
+            vec![
+                Record(vec![(
+                    "payload".to_string(),
+                    Union(1, Box::new(Bytes(b"hello".to_vec())))
+                )]),
+                Record(vec![("payload".to_string(), Union(0, Box::new(Null)))]),
+                Record(vec![(
+                    "payload".to_string(),
+                    Union(1, Box::new(Bytes(b"world".to_vec())))
                 )]),
             ]
         );
