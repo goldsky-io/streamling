@@ -1796,43 +1796,53 @@ impl ClickHouseClient {
     /// `FixedSizeBinary(32)` without the streamling u256/i256 extension metadata.
     /// Streamling's internal convention is big-endian + extension metadata, so a
     /// raw passthrough corrupts every value (a logical 1 reads as 2^248, which
-    /// overflows U256 on multiplication). For each column whose target field is
-    /// u256/i256 but whose incoming field lacks that metadata, reverse the bytes
-    /// and adopt the target field on that column only.
+    /// overflows U256 on multiplication). For each incoming column whose target
+    /// field is u256/i256 but whose own field lacks that metadata, reverse the
+    /// bytes and adopt the target field on that column only.
     ///
-    /// Crucially, untouched columns keep their original Field rather than
-    /// being rewritten against `target_schema`. The hybrid layer deliberately
-    /// tolerates List inner-field-name differences (e.g. ClickHouse's `item`
-    /// vs Kafka/Avro's `element`); forcing target_schema onto every column
-    /// would reject those List columns at `RecordBatch::try_new`.
+    /// Columns are paired against `target_schema` **by name**, not position.
+    /// This keeps the normalizer robust against subset projections and column
+    /// reordering — both invariants the bounded ClickHouse source currently
+    /// upholds but that an upstream change (e.g. real projection pushdown)
+    /// could break silently. Columns without a target match pass through
+    /// unchanged.
+    ///
+    /// Untouched columns keep their original Field rather than being rewritten
+    /// against `target_schema`. The hybrid layer deliberately tolerates List
+    /// inner-field-name differences (e.g. ClickHouse's `item` vs Kafka/Avro's
+    /// `element`); forcing target_schema onto every column would reject those
+    /// List columns at `RecordBatch::try_new`.
     pub(crate) fn normalize_batch_from_clickhouse(
         batch: &RecordBatch,
         target_schema: &SchemaRef,
     ) -> Result<RecordBatch, DataFusionError> {
         use arrow::datatypes::DataType;
+        use std::collections::HashMap;
 
-        if batch.num_columns() != target_schema.fields().len() {
-            return Ok(batch.clone());
-        }
+        let target_by_name: HashMap<&str, &FieldRef> = target_schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f))
+            .collect();
 
         let original_schema = batch.schema();
         let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
         let mut new_fields: Vec<FieldRef> = Vec::with_capacity(batch.num_columns());
         let mut changed = false;
 
-        for ((column, original_field), target_field) in batch
-            .columns()
-            .iter()
-            .zip(original_schema.fields().iter())
-            .zip(target_schema.fields().iter())
+        for (column, original_field) in batch.columns().iter().zip(original_schema.fields().iter())
         {
-            let needs_reverse = matches!(
-                (original_field.data_type(), target_field.data_type()),
-                (DataType::FixedSizeBinary(32), DataType::FixedSizeBinary(32))
-            ) && (U256Type::is_u256_metadata(target_field.metadata())
-                || I256Type::is_i256_metadata(target_field.metadata()))
-                && !U256Type::is_u256_metadata(original_field.metadata())
-                && !I256Type::is_i256_metadata(original_field.metadata());
+            let target_field = target_by_name.get(original_field.name().as_str()).copied();
+
+            let needs_reverse = target_field.is_some_and(|tf| {
+                matches!(
+                    (original_field.data_type(), tf.data_type()),
+                    (DataType::FixedSizeBinary(32), DataType::FixedSizeBinary(32))
+                ) && (U256Type::is_u256_metadata(tf.metadata())
+                    || I256Type::is_i256_metadata(tf.metadata()))
+                    && !U256Type::is_u256_metadata(original_field.metadata())
+                    && !I256Type::is_i256_metadata(original_field.metadata())
+            });
 
             if !needs_reverse {
                 new_columns.push(column.clone());
@@ -1859,7 +1869,8 @@ impl ClickHouseClient {
                 ColumnarValue::Scalar(s) => s.to_array()?,
             };
             new_columns.push(arr);
-            new_fields.push(target_field.clone());
+            // Safe: needs_reverse implied target_field.is_some().
+            new_fields.push(target_field.unwrap().clone());
             changed = true;
         }
 
@@ -2800,6 +2811,113 @@ mod tests {
         let out = normalized
             .column_by_name("balance")
             .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let mut row = [0u8; 32];
+        row.copy_from_slice(out.value(0));
+        assert_eq!(bytes_to_u256(&row), U256::from(1u64));
+    }
+
+    #[test]
+    fn test_normalize_batch_from_clickhouse_handles_reordered_columns() {
+        // Defense-in-depth: pairing columns by position would silently reverse
+        // the wrong column when the bounded source emits fields in a different
+        // order than target_schema. Today the ClickHouseSourceExec ignores
+        // pushed-down projection so the orders coincide, but a future change
+        // could break that invariant. Pin name-based pairing.
+        use arrow::array::{FixedSizeBinaryArray, Int64Array};
+        use streamling_core::types::u256::{U256, bytes_to_u256};
+
+        // Incoming order: [id, balance]. Target order: [balance, id].
+        let incoming_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("balance", DataType::FixedSizeBinary(32), false),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("balance", DataType::FixedSizeBinary(32), false)
+                .with_metadata(U256Type::metadata()),
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let mut le_one = [0u8; 32];
+        le_one[0] = 1;
+        let balance = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(le_one.to_vec())].into_iter(),
+            32,
+        )
+        .unwrap();
+        let id = Int64Array::from(vec![42i64]);
+        let batch =
+            RecordBatch::try_new(incoming_schema, vec![Arc::new(id), Arc::new(balance)]).unwrap();
+
+        let normalized =
+            ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target_schema).unwrap();
+
+        // Balance column found by name, reversed, metadata attached.
+        assert!(U256Type::is_u256_field(
+            normalized.schema().field_with_name("balance").unwrap()
+        ));
+        let out = normalized
+            .column_by_name("balance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let mut row = [0u8; 32];
+        row.copy_from_slice(out.value(0));
+        assert_eq!(bytes_to_u256(&row), U256::from(1u64));
+
+        // The id column is untouched, in its original position.
+        let id_out = normalized
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_out.value(0), 42);
+    }
+
+    #[test]
+    fn test_normalize_batch_from_clickhouse_handles_subset_projection() {
+        // If the incoming batch carries only a subset of the target schema's
+        // columns (e.g. projection pushdown), the u256 columns that ARE present
+        // must still be reversed and metadata-tagged. Target columns missing
+        // from the batch just aren't in the output — no silent passthrough of
+        // little-endian bytes.
+        use arrow::array::FixedSizeBinaryArray;
+        use streamling_core::types::u256::{U256, bytes_to_u256};
+
+        let incoming_schema = Arc::new(Schema::new(vec![Field::new(
+            "balance",
+            DataType::FixedSizeBinary(32),
+            false,
+        )]));
+        // Target carries an extra `extra_col` field that the batch doesn't
+        // include. Previously the count-mismatch guard would silently bail
+        // here and leave balance unreversed.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("balance", DataType::FixedSizeBinary(32), false)
+                .with_metadata(U256Type::metadata()),
+            Field::new("extra_col", DataType::Utf8, true),
+        ]));
+
+        let mut le_one = [0u8; 32];
+        le_one[0] = 1;
+        let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(le_one.to_vec())].into_iter(),
+            32,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(incoming_schema, vec![Arc::new(arr)]).unwrap();
+
+        let normalized =
+            ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target_schema).unwrap();
+        assert!(U256Type::is_u256_field(
+            normalized.schema().field_with_name("balance").unwrap()
+        ));
+        let out = normalized
+            .column(0)
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .unwrap();
