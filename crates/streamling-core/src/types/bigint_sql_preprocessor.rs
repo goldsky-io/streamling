@@ -241,6 +241,20 @@ fn is_bigint_expr<K: BigIntKind>(expr: &SqlExpr, cols: &HashSet<String>) -> bool
             }
             false
         }
+        // A CASE produces a bigint value iff any of its result branches does.
+        // The WHEN conditions and operand do not affect the result type.
+        SqlExpr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions
+                .iter()
+                .any(|when| is_bigint_expr::<K>(&when.result, cols))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| is_bigint_expr::<K>(e, cols))
+        }
         _ => false,
     }
 }
@@ -281,7 +295,97 @@ fn contains_bigint_operations<K: BigIntKind>(expr: &SqlExpr, cols: &HashSet<Stri
             }
             false
         }
+        SqlExpr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions
+                .iter()
+                .any(|when| contains_bigint_operations::<K>(&when.result, cols))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| contains_bigint_operations::<K>(e, cols))
+        }
         _ => false,
+    }
+}
+
+/// Returns true when a NULL literal — these are left untouched in CASE branches
+/// because DataFusion coerces NULL to any branch type, whereas to_<kind>() would
+/// reject it.
+fn is_null_literal(e: &SqlExpr) -> bool {
+    matches!(
+        e,
+        SqlExpr::Value(v)
+            if matches!(v.value, datafusion::logical_expr::sqlparser::ast::Value::Null)
+    )
+}
+
+/// Coerce a single CASE result branch to the bigint kind when needed. Branches
+/// that are already kind-typed (columns, to_<kind>() calls, bigint expressions)
+/// and NULL literals are left as-is; everything else (e.g. an integer literal
+/// `0`) is wrapped in to_<kind>() so all branches share the FixedSizeBinary(32)
+/// type and DataFusion's CASE type-coercion succeeds.
+fn coerce_case_branch<K: BigIntKind>(branch: &mut SqlExpr, cols: &HashSet<String>) {
+    if is_kind_func_call::<K>(branch)
+        || is_bigint_expr::<K>(branch, cols)
+        || is_null_literal(branch)
+    {
+        return;
+    }
+    if let Some(wrapped) = parse_wrapped_fn(K::TO_NAME, branch) {
+        *branch = wrapped;
+    }
+}
+
+/// Rewrite a CASE expression for the given bigint kind. Recurses into every
+/// sub-expression, and when the CASE produces a bigint value: coerces literal
+/// result branches to the kind, then wraps the whole CASE in to_<kind>(). The
+/// outer wrap is an identity passthrough for FixedSizeBinary(32) that re-declares
+/// the extension metadata which native CASE drops — the Postgres sink relies on
+/// that metadata to cast to numeric(78,0).
+fn rewrite_case_kind<K: BigIntKind>(e: &mut SqlExpr, cols: &HashSet<String>) {
+    let result_is_kind = {
+        let SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } = e
+        else {
+            return;
+        };
+
+        if let Some(op) = operand.as_mut() {
+            rewrite_expr_kind::<K>(op, cols);
+        }
+        for when in conditions.iter_mut() {
+            rewrite_expr_kind::<K>(&mut when.condition, cols);
+            rewrite_expr_kind::<K>(&mut when.result, cols);
+        }
+        if let Some(er) = else_result.as_mut() {
+            rewrite_expr_kind::<K>(er, cols);
+        }
+
+        let is_kind = conditions.iter().any(|when| {
+            is_kind_func_call::<K>(&when.result) || is_bigint_expr::<K>(&when.result, cols)
+        }) || else_result
+            .as_ref()
+            .is_some_and(|er| is_kind_func_call::<K>(er) || is_bigint_expr::<K>(er, cols));
+
+        if is_kind {
+            for when in conditions.iter_mut() {
+                coerce_case_branch::<K>(&mut when.result, cols);
+            }
+            if let Some(er) = else_result.as_mut() {
+                coerce_case_branch::<K>(er, cols);
+            }
+        }
+        is_kind
+    };
+
+    if result_is_kind && let Some(wrapped) = parse_wrapped_fn(K::TO_NAME, e) {
+        *e = wrapped;
     }
 }
 
@@ -317,6 +421,7 @@ fn rewrite_expr_kind<K: BigIntKind>(e: &mut SqlExpr, cols: &HashSet<String>) {
                 }
             }
         }
+        SqlExpr::Case { .. } => rewrite_case_kind::<K>(e, cols),
         SqlExpr::Nested(inner) => rewrite_expr_kind::<K>(inner.as_mut(), cols),
         SqlExpr::UnaryOp { op, expr } => {
             if matches!(op, UnaryOperator::Minus) {
@@ -1660,6 +1765,101 @@ mod tests {
             "COALESCE should not be rewritten to coalesce_meta when \
              the result is Utf8, got: {}",
             rewritten
+        );
+    }
+
+    #[tokio::test]
+    async fn test_case_literal_branch_is_wrapped() {
+        let ctx = setup_session_context();
+        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
+
+        // A bare integer literal branch (`ELSE 0`) alongside a u256 branch would
+        // fail DataFusion type-coercion. The preprocessor must wrap the literal
+        // with to_u256() so both branches share the u256 type.
+        let sql = "SELECT CASE WHEN flag = 1 THEN value ELSE 0 END AS x FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT to_u256(CASE WHEN flag = 1 THEN value ELSE to_u256(0) END) AS x FROM t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_case_over_u256_is_wrapped_to_preserve_metadata() {
+        let ctx = setup_session_context();
+        register_u256_table(&ctx, "t", vec![("a", true), ("b", true), ("flag", false)]);
+
+        // Even when both branches are u256, the whole CASE is wrapped in to_u256
+        // so the result field re-declares the u256 extension metadata (native
+        // CASE drops it).
+        let sql = "SELECT CASE WHEN flag = 1 THEN a ELSE b END AS x FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT to_u256(CASE WHEN flag = 1 THEN a ELSE b END) AS x FROM t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_case_inside_u256_to_string() {
+        let ctx = setup_session_context();
+        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
+
+        let sql = "SELECT u256_to_string(CASE WHEN flag = 1 THEN value ELSE 0 END) AS x FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT u256_to_string(to_u256(CASE WHEN flag = 1 THEN value ELSE to_u256(0) END)) AS x FROM t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_case_arithmetic_branch_is_rewritten() {
+        let ctx = setup_session_context();
+        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
+
+        // Arithmetic inside a branch must be rewritten to the u256 UDF form.
+        let sql = "SELECT CASE WHEN flag = 1 THEN value * 2 ELSE value END AS x FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT to_u256(CASE WHEN flag = 1 THEN u256_mul(value, to_u256(2)) ELSE value END) AS x FROM t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_u256_case_is_unchanged() {
+        let ctx = setup_session_context();
+        register_u256_table(&ctx, "t", vec![("value", false), ("flag", false)]);
+
+        // No u256 columns involved -> CASE must be left exactly as-is.
+        let sql = "SELECT CASE WHEN flag = 1 THEN value ELSE 0 END AS x FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert_eq!(rewritten, sql);
+    }
+
+    #[tokio::test]
+    async fn test_i256_case_literal_branch_is_wrapped() {
+        let ctx = setup_session_context();
+        register_i256_table(&ctx, "t", vec![("balance", true), ("flag", false)]);
+
+        let sql = "SELECT CASE WHEN flag = 1 THEN balance ELSE 0 END AS x FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT to_i256(CASE WHEN flag = 1 THEN balance ELSE to_i256(0) END) AS x FROM t"
         );
     }
 }

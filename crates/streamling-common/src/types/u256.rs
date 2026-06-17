@@ -96,7 +96,7 @@ pub fn add(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let b_val = bytes_to_u256(b);
     let result = a_val
         .checked_add(b_val)
-        .ok_or_else(|| streamling_err!("U256 addition overflow"))?;
+        .ok_or_else(|| streamling_err!("U256 addition overflow: {} + {}", a_val, b_val))?;
     Ok(u256_to_bytes(&result))
 }
 
@@ -106,7 +106,7 @@ pub fn sub(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let b_val = bytes_to_u256(b);
     let result = a_val
         .checked_sub(b_val)
-        .ok_or_else(|| streamling_err!("U256 subtraction underflow"))?;
+        .ok_or_else(|| streamling_err!("U256 subtraction underflow: {} - {}", a_val, b_val))?;
     Ok(u256_to_bytes(&result))
 }
 
@@ -116,7 +116,7 @@ pub fn mul(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let b_val = bytes_to_u256(b);
     let result = a_val
         .checked_mul(b_val)
-        .ok_or_else(|| streamling_err!("U256 multiplication overflow"))?;
+        .ok_or_else(|| streamling_err!("U256 multiplication overflow: {} * {}", a_val, b_val))?;
     Ok(u256_to_bytes(&result))
 }
 
@@ -180,6 +180,90 @@ mod tests {
         let max = u256_to_bytes(&U256::max_value());
         let one = u256_to_bytes(&U256::from(1u64));
         assert!(add(&max, &one).is_err());
+    }
+
+    #[test]
+    fn test_byte_order_is_big_endian() {
+        // U256 storage is big-endian: the least-significant byte lives at index 31,
+        // not index 0. Pinning this prevents a silent corruption where a producer
+        // writes Arrow's native little-endian i256/Decimal256 bytes into the
+        // FixedSizeBinary(32) buffer, since every read here assumes big-endian.
+        let bytes = u256_to_bytes(&U256::from(1u64));
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(bytes, expected);
+
+        let bytes = u256_to_bytes(&U256::from(0x0102_0304_0506_0708u64));
+        assert_eq!(
+            &bytes[24..32],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+        assert_eq!(&bytes[..24], &[0u8; 24]);
+    }
+
+    #[test]
+    fn test_misendian_bytes_blow_up_value() {
+        // ClickHouse stores UInt256 little-endian and emits its Arrow output in
+        // that layout, while streamling stores big-endian. Without a reversal at
+        // the read boundary (see normalize_batch_from_clickhouse), a logical 1
+        // arrives as [0x01, 0;31], which bytes_to_u256 reads as 2^248. Squaring
+        // that overflows U256, matching the user-visible "u256 multiplication
+        // overflow" failure mode this test was added for.
+        let mut le_one = [0u8; 32];
+        le_one[0] = 1;
+        let mis_read = bytes_to_u256(&le_one);
+        assert_eq!(mis_read, U256::from(1u64) << 248);
+        assert_ne!(mis_read, U256::from(1u64));
+
+        // Squaring the mis-read value overflows U256.
+        let mis = u256_to_bytes(&mis_read);
+        assert!(mul(&mis, &mis).is_err());
+    }
+
+    #[test]
+    fn test_wei_squared_does_not_overflow() {
+        // 1 ETH = 1e18 wei; (1e18)^2 = 1e36, well inside U256::MAX (~1.16e77).
+        // Correctly stored wei-scale values must not raise false overflow.
+        let one_eth = string_to_u256("1000000000000000000").unwrap();
+        let bytes = u256_to_bytes(&one_eth);
+        let product = mul(&bytes, &bytes).expect("1e18 * 1e18 fits in U256");
+        assert_eq!(
+            u256_to_string(&bytes_to_u256(&product)),
+            "1000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn test_mul_at_max_boundary() {
+        let max = u256_to_bytes(&U256::max_value());
+        let zero = u256_to_bytes(&U256::zero());
+        let one = u256_to_bytes(&U256::from(1u64));
+        let two = u256_to_bytes(&U256::from(2u64));
+        let half_max = u256_to_bytes(&(U256::max_value() / U256::from(2u64)));
+
+        assert_eq!(bytes_to_u256(&mul(&max, &zero).unwrap()), U256::zero());
+        assert_eq!(bytes_to_u256(&mul(&max, &one).unwrap()), U256::max_value());
+        // floor(MAX/2) * 2 = MAX - 1 (MAX = 2^256 - 1 is odd).
+        assert_eq!(
+            bytes_to_u256(&mul(&half_max, &two).unwrap()),
+            U256::max_value() - U256::from(1u64)
+        );
+        assert!(mul(&max, &two).is_err());
+    }
+
+    #[test]
+    fn test_mul_overflow_error_includes_operands() {
+        // 2^200 * 2^200 = 2^400, well over U256::MAX. The error must name the
+        // operands so an overflowing row can be identified without guessing.
+        let big_val = U256::from(1u64) << 200;
+        let big = u256_to_bytes(&big_val);
+        let err = mul(&big, &big).unwrap_err();
+        let msg = format!("{err}");
+        let operand = u256_to_string(&big_val);
+        assert!(
+            msg.contains(&operand),
+            "overflow error should include the operand value {operand}, got: {msg}"
+        );
     }
 
     #[test]
