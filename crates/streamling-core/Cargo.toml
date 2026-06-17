@@ -86,6 +86,8 @@ tonic.workspace = true
 
 paste.workspace = true
 tempfile = "3"
+bytes.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+tower = { version = "0.5", features = ["util"] }
