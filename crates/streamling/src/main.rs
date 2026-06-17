@@ -38,6 +38,14 @@ struct Cli {
     /// Validate the pipeline definition (implies --dry-run). Emits JSON results.
     #[arg(long)]
     validate: bool,
+
+    /// Run as a preview HTTP server (POST /preview) instead of running a pipeline.
+    #[arg(long)]
+    preview_server: bool,
+
+    /// Port for the preview server (with --preview-server).
+    #[arg(long, default_value_t = 8088)]
+    preview_server_port: u16,
 }
 
 impl Cli {
@@ -225,6 +233,23 @@ async fn main() -> ExitCode {
     let validate = cli.validate;
     let dry_run = cli.is_dry_run();
 
+    if cli.preview_server {
+        // The preview server doesn't load a pipeline AppConfig; init basic logging directly.
+        use tracing_subscriber::prelude::*;
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(build_env_filter("info"))
+            .try_init();
+
+        return match streamling_core::preview::run_preview_server(cli.preview_server_port).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("preview server exited with error: {}", format_pretty_error(&e));
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let app_config = match AppConfig::load_from_path(&cli.config) {
         Ok(config) => config,
         Err(e) => {
@@ -328,5 +353,25 @@ mod tests {
     #[test]
     fn extra_positional_is_rejected() {
         assert!(Cli::try_parse_from(["streamling", "a.yaml", "b.yaml"]).is_err());
+    }
+
+    #[test]
+    fn preview_server_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "streamling",
+            "--preview-server",
+            "--preview-server-port",
+            "9100",
+        ])
+        .unwrap();
+        assert!(cli.preview_server);
+        assert_eq!(cli.preview_server_port, 9100);
+    }
+
+    #[test]
+    fn preview_server_port_has_default() {
+        let cli = Cli::try_parse_from(["streamling", "--preview-server"]).unwrap();
+        assert!(cli.preview_server);
+        assert_eq!(cli.preview_server_port, 8088);
     }
 }
