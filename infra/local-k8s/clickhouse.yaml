@@ -19,6 +19,25 @@ data:
         </default>
       </users>
     </clickhouse>
+  memory.xml: |
+    <?xml version="1.0"?>
+    <!--
+      Bound ClickHouse memory to the container cgroup. By default ClickHouse 24.8
+      sizes its caches off the *host* RAM (the k3d node reports ~7.6 GiB), not the
+      1Gi container limit, so mark_cache (5 GiB) + uncompressed_cache (8 GiB) alone
+      blow past the cgroup and OOM-kill the pod. Cap the server's tracked memory and
+      shrink the caches so it stays well inside the limit regardless of host RAM.
+    -->
+    <clickhouse>
+      <!-- Absolute cap (1 GiB), well under the 1536Mi cgroup. We set the absolute
+           value rather than the *_to_ram_ratio because the ratio is computed against
+           host RAM (~7.6 GiB on the k3d node), not the container limit. Leaving the
+           ratio at its default is fine: a non-zero absolute max_server_memory_usage
+           takes precedence. -->
+      <max_server_memory_usage>1073741824</max_server_memory_usage>
+      <mark_cache_size>134217728</mark_cache_size>
+      <uncompressed_cache_size>134217728</uncompressed_cache_size>
+    </clickhouse>
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -62,12 +81,17 @@ spec:
             - name: clickhouse-config
               mountPath: /etc/clickhouse-server/users.d/users.xml
               subPath: users.xml
+            - name: clickhouse-config
+              mountPath: /etc/clickhouse-server/config.d/memory.xml
+              subPath: memory.xml
           resources:
             requests:
               memory: "256Mi"
               cpu: "250m"
             limits:
-              memory: "1Gi"
+              # Server memory is capped at 1Gi via config.d/memory.xml; the extra
+              # headroom covers untracked allocations (page cache, threads).
+              memory: "1536Mi"
               cpu: "1000m"
           readinessProbe:
             httpGet:
