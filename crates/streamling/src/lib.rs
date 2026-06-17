@@ -10,6 +10,7 @@ use std::time::Duration;
 use streamling_config::AppConfig;
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
 use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
+use streamling_connectors::table_providers::file::build_file_source_provider;
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
 use streamling_connectors::table_providers::kafka::KafkaSourceTableProvider;
@@ -767,6 +768,57 @@ impl Streamling {
 
                     pk_registry.track_primary_key_for_source(
                         primary_key_opt,
+                        reference_name.clone(),
+                        logical_plan.schema().inner(),
+                        PrimaryKeySource::TopologyDefined,
+                    )?;
+
+                    if let Some(_existing_plan) =
+                        pipeline_plans.insert(reference_name.clone(), logical_plan)
+                    {
+                        streamling_user_bail!("{}: duplicate node name", ctx.format());
+                    }
+                }
+                topology::Source::file(file) => {
+                    let ctx = node_contexts
+                        .get(reference_name)
+                        .expect("node context must exist");
+
+                    let provider = build_file_source_provider(
+                        reference_name,
+                        &file.path,
+                        file.format,
+                        &session_manager,
+                    )
+                    .await
+                    .map_err(|e| {
+                        e.context(format!("{}: failed to create file source", ctx.format()))
+                    })?;
+
+                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
+                        provider,
+                        metric_key(&application_id, reference_name.as_str()),
+                        scan_sharing.clone(),
+                        file.telemetry.as_ref(),
+                    ));
+
+                    self.register_operator_for_side_outputs(
+                        reference_name.as_str(),
+                        provider_with_telemetry.clone(),
+                    );
+
+                    session_manager
+                        .register_table(reference_name.as_str(), provider_with_telemetry.clone())?;
+
+                    let logical_plan = LogicalPlanBuilder::scan(
+                        reference_name.clone(),
+                        provider_as_source(provider_with_telemetry.clone()),
+                        None,
+                    )?
+                    .build()?;
+
+                    pk_registry.track_primary_key_for_source(
+                        &file.primary_key,
                         reference_name.clone(),
                         logical_plan.schema().inner(),
                         PrimaryKeySource::TopologyDefined,
@@ -2196,6 +2248,7 @@ impl Streamling {
                 topology::Source::kafka(_) => "kafka",
                 topology::Source::clickhouse(_) => "clickhouse",
                 topology::Source::hybrid(_) => "hybrid",
+                topology::Source::file(_) => "file",
                 topology::Source::plugin(_) => "plugin",
             };
             contexts.insert(
@@ -2260,6 +2313,7 @@ impl Streamling {
                     metric_tags([("table", clickhouse.table_name.as_str())])
                 }
                 topology::Source::hybrid(_) => metric_tags([]),
+                topology::Source::file(file) => metric_tags([("path", file.path.as_str())]),
                 topology::Source::plugin(plugin) => metric_tags([("type", plugin.r#type.as_str())]),
             };
             merge_labels(

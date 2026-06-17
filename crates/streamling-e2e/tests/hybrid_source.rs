@@ -1504,3 +1504,178 @@ sinks:
         count
     );
 }
+
+// ============================================================================
+// Scenario: Hybrid source ClickHouse Nullable(UInt128) → u256 endianness
+// ============================================================================
+
+/// Avro schema with a Decimal logical type at precision > 76 — converts to
+/// streamling u256 (FixedSizeBinary(32) + u256 extension metadata).
+const U256_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "U256TestMessage",
+    "fields": [
+        {"name": "block", "type": "long"},
+        {"name": "id", "type": "string"},
+        {"name": "wei_value", "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}], "default": null}
+    ]
+}"#;
+
+/// Regression for the ClickHouse → streamling u256 endianness asymmetry.
+///
+/// ClickHouse stores UInt128/UInt256 little-endian and the hybrid layer's
+/// schema adapter widens `Nullable(UInt128)` to `Nullable(UInt256)` via a
+/// server-side CAST. ClickHouse emits UInt256 as Arrow `FixedSizeBinary(32)`
+/// in little-endian, while streamling stores big-endian. Before
+/// `normalize_batch_from_clickhouse` was added on the read side, a logical
+/// `1` arrived as `2^248` and downstream u256 arithmetic / serialization
+/// produced garbage.
+///
+/// Job mode lets the bounded phase finish and exits without consuming Kafka,
+/// so the unbounded source is only present to declare the u256 schema (which
+/// drives the bounded CAST + the read-side normalization).
+#[tokio::test]
+async fn test_hybrid_clickhouse_uint128_widened_to_u256_preserves_value() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_u256_test (
+                block Int64,
+                id String,
+                wei_value Nullable(UInt128),
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    // Spread of magnitudes that would all collapse to ~2^248-range garbage if
+    // the LE-stored bytes were re-read big-endian.
+    clickhouse
+        .execute(
+            "INSERT INTO hybrid_u256_test (block, id, wei_value, is_deleted) VALUES
+            (1, 'one',  1, 0),
+            (2, 'eth',  1000000000000000000, 0),
+            (3, 'gwei', 100000000000, 0),
+            (4, 'null', NULL, 0)",
+        )
+        .await
+        .expect("Failed to insert");
+
+    // Register the unbounded schema. We never produce Kafka records — job mode
+    // terminates after the bounded phase — but the topic + schema must exist
+    // because the hybrid validates the unbounded schema at startup and uses it
+    // as the source of truth for u256 metadata.
+    ctx.kafka
+        .register_schema(U256_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_u256 (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_u256_test
+        columns: block,id,wei_value
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_u256
+    primary_key: id
+
+transforms:
+  stringify:
+    type: sql
+    primary_key: id
+    sql: "SELECT block, id, u256_to_string(wei_value) AS wei_str FROM hybrid_source"
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: stringify
+    table: hybrid_u256_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__JOB_MODE", "true")
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    assert!(
+        status.success(),
+        "Pipeline should exit successfully in job mode"
+    );
+
+    let rows: Vec<(String, Option<String>)> = ctx
+        .postgres
+        .query("SELECT id, wei_str FROM public.hybrid_u256_results ORDER BY id")
+        .await
+        .expect("Failed to query postgres");
+
+    let by_id: std::collections::HashMap<String, Option<String>> = rows.into_iter().collect();
+
+    // Logical 1 must arrive as "1", not "452312848583266388373324160190187140051835877600158453279131187530910662656"
+    // (which is 2^248, the value bytes_to_u256 yields when fed LE bytes for 1).
+    assert_eq!(
+        by_id.get("one"),
+        Some(&Some("1".to_string())),
+        "Bounded ClickHouse u256 value 1 must arrive intact, got {:?}",
+        by_id.get("one")
+    );
+    assert_eq!(
+        by_id.get("eth"),
+        Some(&Some("1000000000000000000".to_string())),
+        "Bounded ClickHouse u256 value 1e18 must arrive intact, got {:?}",
+        by_id.get("eth")
+    );
+    assert_eq!(
+        by_id.get("gwei"),
+        Some(&Some("100000000000".to_string())),
+        "Bounded ClickHouse u256 value 1e11 must arrive intact, got {:?}",
+        by_id.get("gwei")
+    );
+    assert_eq!(
+        by_id.get("null"),
+        Some(&None),
+        "Nullable u256 must propagate NULL, got {:?}",
+        by_id.get("null")
+    );
+}
