@@ -530,6 +530,72 @@ mod tests {
     }
 
     #[test]
+    fn test_u256_to_string_decodes_bytes_as_big_endian() {
+        // u256_to_string is the only public path from the FixedSizeBinary(32)
+        // buffer to a human-readable decimal — if it ever switched to little-
+        // endian decoding (or a producer ever wrote LE bytes), value 1 would
+        // surface as 2^248 and most multiplications would overflow.
+        let bytes = u256::u256_to_bytes(&U256::from(1u64));
+        let input = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(bytes.to_vec())].into_iter(),
+            32,
+        )
+        .unwrap();
+
+        let func = U256ToStringFunc::new();
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(input))],
+            arg_fields: vec![Arc::new(arrow_schema::Field::new(
+                "value",
+                U256Type::new(),
+                true,
+            ))],
+            number_rows: 1,
+            return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, true)),
+        };
+        let ColumnarValue::Array(arr) = func.invoke_with_args(args).unwrap() else {
+            panic!("expected array result");
+        };
+        let s = arr.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(s.value(0), "1");
+    }
+
+    #[test]
+    fn test_u256_to_string_misread_le_bytes_yields_2_pow_248() {
+        // Anti-regression for the ClickHouse hybrid endianness gap: ClickHouse
+        // emits UInt256 columns as FixedSizeBinary(32) in little-endian, and
+        // streamling stores big-endian. If the read-side normalizer
+        // (normalize_batch_from_clickhouse) ever stops reversing those bytes,
+        // u256_to_string reads 1 as 2^248 and downstream multiplication
+        // overflows. Pin the symptom so a regression is loud.
+        let mut le_one = [0u8; 32];
+        le_one[0] = 1;
+        let input = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(le_one.to_vec())].into_iter(),
+            32,
+        )
+        .unwrap();
+
+        let func = U256ToStringFunc::new();
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(input))],
+            arg_fields: vec![Arc::new(arrow_schema::Field::new(
+                "value",
+                U256Type::new(),
+                true,
+            ))],
+            number_rows: 1,
+            return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, true)),
+        };
+        let ColumnarValue::Array(arr) = func.invoke_with_args(args).unwrap() else {
+            panic!("expected array result");
+        };
+        let s = arr.as_any().downcast_ref::<StringArray>().unwrap();
+        let expected = u256::u256_to_string(&(U256::from(1u64) << 248));
+        assert_eq!(s.value(0), expected);
+    }
+
+    #[test]
     fn test_u256_add() {
         let func = U256AddFunc::new();
 
