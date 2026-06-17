@@ -9,12 +9,55 @@
 use crate::sql_parse::extract_table_references_from_sql;
 use crate::streamling_user_err;
 use crate::topology::{PipelineTopology, Source};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 fn strip_sql_quotes(name: &str) -> &str {
     name.strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(name)
+}
+
+/// Returns the set of lowercased node names consumed by at least one transform
+/// (via SQL table refs or `from`) or sink (`from`).
+///
+/// Returns `Err(())` if a SQL transform could not be parsed, signalling that
+/// consumer analysis is unreliable. Callers decide how to handle this:
+/// - `validate_no_orphan_nodes` skips validation entirely (preserves existing behavior).
+/// - `find_terminal_nodes` returns all candidate nodes (conservative / safe for preview).
+fn collect_consumed_nodes(
+    transforms: &[(String, serde_yaml::Value)],
+    sinks: Option<&serde_yaml::Mapping>,
+) -> Result<HashSet<String>, ()> {
+    let mut consumed: HashSet<String> = HashSet::new();
+
+    for (_, transform_val) in transforms {
+        let mapping = match transform_val.as_mapping() {
+            Some(m) => m,
+            None => continue,
+        };
+        if let Some(sql) = mapping.get("sql").and_then(|v| v.as_str()) {
+            match extract_table_references_from_sql(sql) {
+                Ok(table_names) => {
+                    for name in table_names {
+                        consumed.insert(strip_sql_quotes(&name).to_lowercase());
+                    }
+                }
+                Err(_) => return Err(()),
+            }
+        } else if let Some(from) = mapping.get("from").and_then(|v| v.as_str()) {
+            consumed.insert(from.to_lowercase());
+        }
+    }
+
+    if let Some(m) = sinks {
+        for (_, v) in m {
+            if let Some(from) = v.get("from").and_then(|f| f.as_str()) {
+                consumed.insert(from.to_lowercase());
+            }
+        }
+    }
+
+    Ok(consumed)
 }
 
 /// Validates that all sources and transforms have at least one consumer.
@@ -51,19 +94,10 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
         })
         .unwrap_or_default();
 
-    let sinks: Vec<String> = root
-        .get("sinks")
-        .and_then(|v| v.as_mapping())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(_, v)| v.get("from").and_then(|f| f.as_str().map(String::from)))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let mut node_consumers: HashMap<String, usize> = HashMap::new();
+    // Candidate nodes: sources + non-dynamic-table transforms (lowercased for comparison).
+    let mut candidates: HashSet<String> = HashSet::new();
     for name in &sources {
-        node_consumers.insert(name.to_lowercase(), 0);
+        candidates.insert(name.to_lowercase());
     }
     for (name, transform_val) in &transforms {
         // Skip dynamic_table transforms — they are consumed via dynamic_table_check()
@@ -75,48 +109,23 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
             .and_then(|v| v.as_str())
             == Some("dynamic_table");
         if !is_dynamic_table {
-            node_consumers.insert(name.to_lowercase(), 0);
+            candidates.insert(name.to_lowercase());
         }
     }
 
-    for (_, transform_val) in &transforms {
-        let mapping = match transform_val.as_mapping() {
-            Some(m) => m,
-            None => continue,
-        };
-        if let Some(sql) = mapping.get("sql").and_then(|v| v.as_str()) {
-            match extract_table_references_from_sql(sql) {
-                Ok(table_names) => {
-                    for name in table_names {
-                        let key = strip_sql_quotes(&name).to_lowercase();
-                        if let Some(count) = node_consumers.get_mut(&key) {
-                            *count += 1;
-                        }
-                    }
-                }
-                Err(_) => {
-                    // SQL parser can't handle this query (recursive CTEs, JOINs, etc.).
-                    // Skip validation entirely — false positives would block valid pipelines.
-                    return Ok(());
-                }
-            }
-        } else if let Some(from) = mapping.get("from").and_then(|v| v.as_str())
-            && let Some(count) = node_consumers.get_mut(&from.to_lowercase())
-        {
-            *count += 1;
+    let sinks_mapping = root.get("sinks").and_then(|v| v.as_mapping());
+    let consumed = match collect_consumed_nodes(&transforms, sinks_mapping) {
+        Ok(c) => c,
+        Err(()) => {
+            // SQL parser can't handle this query (recursive CTEs, JOINs, etc.).
+            // Skip validation entirely — false positives would block valid pipelines.
+            return Ok(());
         }
-    }
+    };
 
-    for from in &sinks {
-        if let Some(count) = node_consumers.get_mut(&from.to_lowercase()) {
-            *count += 1;
-        }
-    }
-
-    let mut orphans: Vec<_> = node_consumers
+    let mut orphans: Vec<String> = candidates
         .into_iter()
-        .filter(|(_, count)| *count == 0)
-        .map(|(name, _)| name)
+        .filter(|name| !consumed.contains(name))
         .collect();
 
     if orphans.is_empty() {
@@ -134,10 +143,9 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
 /// downstream consumer. Used by the preview rewriter to attach blackhole sinks
 /// when the submitted config has no sinks.
 ///
-/// Mirrors the consumer analysis in [`validate_no_orphan_nodes`]. If a SQL
-/// transform cannot be parsed for table references, analysis is unreliable, so
-/// every candidate node is returned (attaching a blackhole to each is always
-/// valid and keeps data flowing through every block).
+/// If a SQL transform cannot be parsed for table references, analysis is
+/// unreliable, so every candidate node is returned (attaching a blackhole to
+/// each is always valid and keeps data flowing through every block).
 pub fn find_terminal_nodes(config: &str) -> crate::error::Result<Vec<String>> {
     let value: serde_yaml::Value =
         serde_yaml::from_str(config).map_err(|e| streamling_user_err!("invalid YAML: {}", e))?;
@@ -177,37 +185,14 @@ pub fn find_terminal_nodes(config: &str) -> crate::error::Result<Vec<String>> {
         }
     }
 
-    // Build the set of consumed node names (lowercased), from transform SQL
-    // table refs / `from` fields and sink `from` fields.
-    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (_, transform_val) in &transforms {
-        let mapping = match transform_val.as_mapping() {
-            Some(m) => m,
-            None => continue,
-        };
-        if let Some(sql) = mapping.get("sql").and_then(|v| v.as_str()) {
-            match extract_table_references_from_sql(sql) {
-                Ok(table_names) => {
-                    for name in table_names {
-                        consumed.insert(strip_sql_quotes(&name).to_lowercase());
-                    }
-                }
-                Err(_) => {
-                    // Unanalyzable: be conservative, treat every node as terminal.
-                    return Ok(candidates);
-                }
-            }
-        } else if let Some(from) = mapping.get("from").and_then(|v| v.as_str()) {
-            consumed.insert(from.to_lowercase());
+    let sinks_mapping = root.get("sinks").and_then(|v| v.as_mapping());
+    let consumed = match collect_consumed_nodes(&transforms, sinks_mapping) {
+        Ok(c) => c,
+        Err(()) => {
+            // Unanalyzable: be conservative, treat every node as terminal.
+            return Ok(candidates);
         }
-    }
-    if let Some(m) = root.get("sinks").and_then(|v| v.as_mapping()) {
-        for (_, v) in m {
-            if let Some(from) = v.get("from").and_then(|f| f.as_str()) {
-                consumed.insert(from.to_lowercase());
-            }
-        }
-    }
+    };
 
     Ok(candidates
         .into_iter()
@@ -877,7 +862,8 @@ transforms:
     primary_key: id
 "#;
         // `src` is consumed by `filt`; `filt` is consumed by nothing -> terminal.
-        let terminals = find_terminal_nodes(yaml).unwrap();
+        let mut terminals = find_terminal_nodes(yaml).unwrap();
+        terminals.sort();
         assert_eq!(terminals, vec!["filt".to_string()]);
     }
 
@@ -916,5 +902,34 @@ sinks:
 "#;
         let terminals = find_terminal_nodes(yaml).unwrap();
         assert!(terminals.is_empty());
+    }
+
+    #[test]
+    fn unparseable_sql_returns_all_candidates() {
+        // A JOIN causes extract_table_references_from_sql to return Err, so
+        // find_terminal_nodes must conservatively return ALL candidate nodes.
+        let yaml = r#"
+sources:
+  a:
+    type: kafka
+    topic: t1
+    primary_key: id
+  b:
+    type: kafka
+    topic: t2
+    primary_key: id
+transforms:
+  joined:
+    type: sql
+    primary_key: id
+    sql: "SELECT a.id FROM a JOIN b ON a.id = b.id"
+"#;
+        let mut terminals = find_terminal_nodes(yaml).unwrap();
+        terminals.sort();
+        // All three candidates (a, b, joined) should be returned when SQL is unanalyzable.
+        assert_eq!(
+            terminals,
+            vec!["a".to_string(), "b".to_string(), "joined".to_string()]
+        );
     }
 }
