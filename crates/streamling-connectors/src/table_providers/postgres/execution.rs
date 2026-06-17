@@ -60,7 +60,7 @@ pub async fn execute_batch_insert(
 
         let result = {
             let mut q = sqlx::query(query);
-            let bind_result: std::result::Result<_, _> = (|| {
+            let bind_result: streamling_core::error::Result<_> = (|| {
                 for row_idx in 0..num_rows {
                     for &batch_col_idx in column_indices {
                         let array = &batch_columns[batch_col_idx];
@@ -146,7 +146,7 @@ pub async fn execute_batch_delete(
 
         let result = {
             let mut q = sqlx::query(query);
-            let bind_result: std::result::Result<_, _> = (|| {
+            let bind_result: streamling_core::error::Result<_> = (|| {
                 for row_idx in 0..num_rows {
                     for &pk_idx in primary_key_indices {
                         let array = &batch_columns[pk_idx];
@@ -287,6 +287,8 @@ mod tests {
             write!(f, "{}", self.message)
         }
     }
+
+    impl std::error::Error for TestDbError {}
 
     impl sqlx::error::DatabaseError for TestDbError {
         fn message(&self) -> &str {
