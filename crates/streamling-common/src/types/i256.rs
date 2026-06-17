@@ -292,9 +292,13 @@ pub fn i256_to_string(value: &I256) -> String {
 pub fn add(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let a_val = bytes_to_i256(a);
     let b_val = bytes_to_i256(b);
-    let result = a_val
-        .checked_add(&b_val)
-        .ok_or_else(|| streamling_err!("I256 addition overflow"))?;
+    let result = a_val.checked_add(&b_val).ok_or_else(|| {
+        streamling_err!(
+            "I256 addition overflow: {} + {}",
+            i256_to_string(&a_val),
+            i256_to_string(&b_val)
+        )
+    })?;
     Ok(i256_to_bytes(&result))
 }
 
@@ -302,9 +306,13 @@ pub fn add(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
 pub fn sub(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let a_val = bytes_to_i256(a);
     let b_val = bytes_to_i256(b);
-    let result = a_val
-        .checked_sub(&b_val)
-        .ok_or_else(|| streamling_err!("I256 subtraction overflow"))?;
+    let result = a_val.checked_sub(&b_val).ok_or_else(|| {
+        streamling_err!(
+            "I256 subtraction overflow: {} - {}",
+            i256_to_string(&a_val),
+            i256_to_string(&b_val)
+        )
+    })?;
     Ok(i256_to_bytes(&result))
 }
 
@@ -312,9 +320,13 @@ pub fn sub(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
 pub fn mul(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let a_val = bytes_to_i256(a);
     let b_val = bytes_to_i256(b);
-    let result = a_val
-        .checked_mul(&b_val)
-        .ok_or_else(|| streamling_err!("I256 multiplication overflow"))?;
+    let result = a_val.checked_mul(&b_val).ok_or_else(|| {
+        streamling_err!(
+            "I256 multiplication overflow: {} * {}",
+            i256_to_string(&a_val),
+            i256_to_string(&b_val)
+        )
+    })?;
     Ok(i256_to_bytes(&result))
 }
 
@@ -389,6 +401,21 @@ mod tests {
         let result = add(&a, &b).unwrap();
         let result_val = bytes_to_i256(&result);
         assert_eq!(result_val, I256::from_i64(50));
+    }
+
+    #[test]
+    fn test_mul_overflow_error_includes_operands() {
+        // 2^200 * 2^200 = 2^400, over I256::MAX. The error must name the
+        // operands so an overflowing row can be identified without guessing.
+        let big_val = I256::from_u256(U256::from(1u64) << 200);
+        let big = i256_to_bytes(&big_val);
+        let err = mul(&big, &big).unwrap_err();
+        let msg = format!("{err}");
+        let operand = i256_to_string(&big_val);
+        assert!(
+            msg.contains(&operand),
+            "overflow error should include the operand value {operand}, got: {msg}"
+        );
     }
 
     #[test]

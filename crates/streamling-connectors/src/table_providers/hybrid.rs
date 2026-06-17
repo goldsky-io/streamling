@@ -1054,6 +1054,7 @@ impl ExecutionPlan for HybridSourceExec {
         });
 
         let schema_for_synth = schema.clone();
+        let schema_for_main = schema.clone();
         let pending_for_main = pending_markers.clone();
 
         let reference_name_for_spawn = self.provider.reference_name.clone();
@@ -1101,7 +1102,23 @@ impl ExecutionPlan for HybridSourceExec {
                 while let Some(batch_result) = stream.next().await {
                     match batch_result {
                         Ok(batch) => {
-                            let merged = merge_pending_markers(batch, &pending_for_main);
+                            // Bounded sources (ClickHouse) emit u256/i256 columns as
+                            // FixedSizeBinary(32) without extension metadata and in
+                            // little-endian. Reverse the bytes and adopt the target
+                            // schema's metadata so downstream arithmetic UDFs (which
+                            // assume big-endian + metadata) see correct values.
+                            // No-op for sources that already match (e.g. Kafka/Avro).
+                            let normalized = match ClickHouseClient::normalize_batch_from_clickhouse(
+                                &batch,
+                                &schema_for_main,
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    break 'outer;
+                                }
+                            };
+                            let merged = merge_pending_markers(normalized, &pending_for_main);
                             if tx.send(Ok(merged)).await.is_err() {
                                 break 'outer;
                             }
