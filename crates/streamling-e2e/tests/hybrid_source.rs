@@ -571,6 +571,176 @@ sinks:
 }
 
 // ============================================================================
+// Scenario 3b: Job mode terminal checkpoint persists state at bounded completion
+// ============================================================================
+
+/// Regression test for terminal-checkpoint finalization on a job-mode hybrid
+/// source. Contract: when the bounded phase completes, the hybrid source mints
+/// and emits a single terminal checkpoint marker on a synthetic final batch,
+/// and the pipeline waits for that epoch to finalize before tearing down.
+/// Without it, the last batches of bounded data can land in the sink without
+/// any finalized checkpoint covering their state.
+///
+/// To isolate the terminal path from timer-driven checkpoints, this test sets
+/// `CHECKPOINT_INTERVAL_SEC=3600` — no timer can fire during a three-record
+/// scan. The only checkpoint that can finalize is the terminal one, so the
+/// presence of `clickhouse_source:` split keys in the state table after a
+/// clean exit is a direct post-condition on terminal-finalize having fired.
+#[tokio::test]
+async fn test_hybrid_source_job_mode_persists_terminal_checkpoint() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_terminal_ckpt_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    clickhouse
+        .execute(
+            "INSERT INTO hybrid_terminal_ckpt_test VALUES
+            (1, 'terminal_a', 'data_a', 100, 0),
+            (2, 'terminal_b', 'data_b', 200, 0),
+            (3, 'terminal_c', 'data_c', 300, 0)",
+        )
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_terminal_ckpt (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let state_table = format!("hybrid_terminal_ckpt_{}", ctx.test_id.replace('-', "_"));
+    let application_id = format!("hybrid_terminal_ckpt_{}", ctx.test_id);
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_terminal_ckpt_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_terminal_ckpt
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: hybrid_terminal_ckpt_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    // No `record_limit`: termination is driven by bounded-phase completion +
+    // job mode. The 1-hour checkpoint interval guarantees no timer-driven
+    // checkpoint can fire during the sub-second bounded scan.
+    let opts = PipelineOpts::new()
+        .timeout(std::time::Duration::from_secs(120))
+        .env("STREAMLING__JOB_MODE", "true")
+        .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+        .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "3600")
+        .env("STREAMLING__APPLICATION_ID", &application_id)
+        .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+            &ctx.postgres.host,
+        )
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+            ctx.postgres.port.to_string(),
+        )
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+            &state_table,
+        );
+
+    let status = ctx
+        .run_pipeline_with_opts(&pipeline, opts)
+        .await
+        .expect("Pipeline execution failed");
+    assert!(
+        status.success(),
+        "Job-mode pipeline should terminate cleanly after the terminal checkpoint finalizes"
+    );
+
+    // All bounded records should land in the sink. Without the terminal
+    // checkpoint round-trip the synthetic final batch can race shutdown and
+    // the tail records drop.
+    let count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hybrid_terminal_ckpt_results")
+        .await
+        .expect("Failed to query sink count");
+    assert_eq!(count, 3, "Sink should contain all 3 bounded records");
+
+    // Direct post-condition on terminal-finalize: with the timer disabled, the
+    // only way clickhouse split state reaches the state backend is through the
+    // terminal checkpoint's finalizer flush.
+    let state_keys: Vec<(String,)> = ctx
+        .postgres
+        .query(&format!(
+            "SELECT \"key\" FROM streamling.\"{}\" ORDER BY \"key\"",
+            state_table
+        ))
+        .await
+        .expect("Failed to query state keys");
+    let has_clickhouse_split = state_keys
+        .iter()
+        .any(|row| row.0.starts_with("clickhouse_source:"));
+    assert!(
+        has_clickhouse_split,
+        "Terminal checkpoint should have persisted clickhouse split state; \
+         observed keys: {:?}",
+        state_keys.iter().map(|r| &r.0).collect::<Vec<_>>()
+    );
+}
+
+// ============================================================================
 // Scenario 4: Hybrid resume from high savepoint/checkpoint
 // ============================================================================
 
