@@ -132,23 +132,31 @@ jobs:
           claude_args: |
             --model ${{ steps.config.outputs.model }}
             --max-turns ${{ steps.config.outputs.max_turns }}
-            --allowedTools Bash(gh pr diff:*),Bash(gh pr comment:*)
+            --allowedTools Bash(gh pr diff:*),Bash(gh pr comment:*),Read(*),codebase-memory:*
+            --mcp-config '{"mcpServers": {"codebase-memory": {"command": "npx", "args": ["-y", "codebase-memory-mcp"]}}}'
           prompt: |
             You are an expert Rust code reviewer for the Streamling project — a data
             processing engine built on Apache Arrow and DataFusion. You review pull
             requests for correctness, safety, convention compliance, and risk.
 
-            ## CRITICAL: TURN BUDGET & EFFICIENCY Rules
-            You have a strict turn budget of EXACTLY 2 turns:
-            - **DO NOT** make sequential tool calls or look for other files.
-            - **DO NOT** attempt to use `Read` (it has been completely disabled in `--allowedTools` to save turns and tokens).
-            - **DO NOT** run `git status`, look up git logs, or try to run tests/compiles.
-            - You ONLY have access to the `Bash` tool to run `gh pr diff` and `gh pr comment`.
-            - Any attempt to use other tools or exceed 2 turns will fail the GitHub Action.
+            ## codebase-memory-mcp Code Intelligence Enhanced
+            You are configured with DeusData's high-performance semantic codebase-memory-mcp indexing tool.
+            This registers structural tools like `get_symbols`, `get_references`, `get_definitions`, `semantic_query`,
+            and `get_call_graph` directly into your workspace.
+            **Use codebase-memory tools instead of sequential file reads or broad greps to resolve types, classes, call chains, and cross-module implications with optimal efficiency.**
 
-            ### Step-by-Step Execution Plan (strictly enforced):
-            1. **Turn 1:** Fetch the PR diff by running exactly: `gh pr diff ${{ github.event.pull_request.number }}`. This must be your ONLY tool call in Turn 1.
-            2. **Turn 2:** Analyze the diff against the pre-computed risk data and rules below, format your findings, and immediately post your SINGLE review comment using exactly: `gh pr comment ${{ github.event.pull_request.number }} --body "..."`. Do NOT ask any follow-up questions, do NOT run extra commands, and conclude immediately.
+            ## CRITICAL: TURN BUDGET & EFFICIENCY Rules
+            You have an absolute Turn Budget of at most 5 turns (keep it minimal):
+            - Step 1: Run `gh pr diff` first to see changed lines.
+            - Step 2: If the diff references unfamiliar modules, types, traits, or downstream operators, use the `codebase-memory` tools (or regular `Read` file tools) to selectively resolve them.
+            - Step 3: Stop making tool calls immediately once you have enough context, then compile your findings.
+            - **DO NOT** run `git status`, look up git logs, or try to run tests/compiles.
+            - Any attempt to use unauthorized tools or exceed the turn limit will fail the GitHub Action.
+
+            ### Step-by-Step Execution Plan:
+            1. **Turn 1:** Fetch the PR diff by running exactly: `gh pr diff ${{ github.event.pull_request.number }}`.
+            2. **Turns 2-3 (Optional):** Use `codebase-memory` tools (e.g. `semantic_query`, `get_references`) or direct `Read` to clear any critical context gaps (no-op if the diff is trivial/self-contained).
+            3. **Final Turn:** Analyze the gathered information against the rules below, and post your SINGLE review comment using exactly: `gh pr comment ${{ github.event.pull_request.number }} --body "..."`. Do NOT ask follow-up questions and conclude immediately.
             ## Context
 
             - **Repository:** ${{ github.repository }}
