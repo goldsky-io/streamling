@@ -132,9 +132,10 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
 
 /// Validates that job_mode is only enabled when every source supports it.
 ///
-/// Currently only hybrid sources support job mode (they terminate after all bounded
-/// phases complete). If any source is not hybrid, we fail early with a clear message
-/// listing the unsupported sources.
+/// Job mode requires bounded sources that terminate on their own: hybrid sources
+/// (they terminate after all bounded phases complete) and file sources (they read
+/// their files once and complete). If any source is neither, we fail early with a
+/// clear message listing the unsupported sources.
 pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::error::Result<()> {
     if !job_mode {
         return Ok(());
@@ -143,7 +144,7 @@ pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::
     let mut unsupported: Vec<&String> = topology
         .sources
         .iter()
-        .filter(|(_, s)| !matches!(s, Source::hybrid(_)))
+        .filter(|(_, s)| !matches!(s, Source::hybrid(_) | Source::file(_)))
         .map(|(name, _)| name)
         .collect();
 
@@ -151,7 +152,8 @@ pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::
         unsupported.sort();
         return Err(streamling_user_err!(
             "job_mode is enabled but the following source(s) do not support it: {}. \
-             Job mode is only supported for pipelines where every source is a hybrid source.",
+             Job mode is only supported for pipelines where every source is a hybrid or \
+             file (bounded) source.",
             unsupported
                 .iter()
                 .map(|s| format!("'{s}'"))
@@ -674,6 +676,61 @@ sinks:
         assert!(
             !err.contains("'hybrid_src'"),
             "error should not name the hybrid source: {err}"
+        );
+    }
+
+    #[test]
+    fn job_mode_with_file_source_ok() {
+        let config = r#"
+sources:
+  src:
+    type: file
+    path: /tmp/events
+    format: parquet
+    primary_key: id
+transforms: {}
+sinks:
+  out:
+    type: print
+    from: src
+"#;
+        let topology = PipelineTopology::load_from_string(config).unwrap();
+        assert!(
+            validate_job_mode(true, &topology).is_ok(),
+            "job_mode with a file source should succeed"
+        );
+    }
+
+    #[test]
+    fn job_mode_mixed_hybrid_and_file_ok() {
+        let config = r#"
+sources:
+  file_src:
+    type: file
+    path: /tmp/events
+    format: json
+  hybrid_src:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: test_table
+    unbounded_source:
+      source_type: kafka
+      topic: test_topic
+    primary_key: id
+transforms: {}
+sinks:
+  out1:
+    type: print
+    from: file_src
+  out2:
+    type: print
+    from: hybrid_src
+"#;
+        let topology = PipelineTopology::load_from_string(config).unwrap();
+        assert!(
+            validate_job_mode(true, &topology).is_ok(),
+            "job_mode with hybrid + file sources should succeed"
         );
     }
 
