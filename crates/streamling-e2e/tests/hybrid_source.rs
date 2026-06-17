@@ -1443,7 +1443,6 @@ transforms:
   stringify:
     type: sql
     primary_key: id
-    from: hybrid_source
     sql: "SELECT block, id, u256_to_string(wei_value) AS wei_str FROM hybrid_source"
 
 sinks:
