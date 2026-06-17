@@ -97,6 +97,34 @@ jobs:
           echo "max_turns=$MAX_TURNS" >> "$GITHUB_OUTPUT"
           echo "Using model: $MODEL, max_turns: $MAX_TURNS"
 
+      - name: Format Risk Data
+        id: risk_data
+        run: |
+          python3 -c "
+          import json, os
+          with open('risk_report.json') as f:
+              r = json.load(f)
+          
+          lines = []
+          mapping = {
+              'historical_volatility': 'high churn',
+              'complexity': 'complex file',
+              'blast_radius': 'high blast radius',
+              'change_density': 'large change',
+              'test_coverage_delta': 'undertested'
+          }
+          for path, details in list(r.get('files', {}).items())[:5]:
+              composite = details['composite']
+              reasons = [mapping.get(k, k.replace('_', ' ')) for k, v in details['signals'].items() if v >= 0.5]
+              reason_str = ', '.join(reasons) if reasons else 'multiple moderate signals'
+              lines.append(f'| {path} | {composite:.2f}/1.00 | {reason_str} |')
+          
+          table = '\n'.join(lines) if lines else '| None | 0.00 | No changed files scored |'
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('risk_table<<EOF\n' + table + '\nEOF\n')
+          "
+
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -104,12 +132,23 @@ jobs:
           claude_args: |
             --model ${{ steps.config.outputs.model }}
             --max-turns ${{ steps.config.outputs.max_turns }}
-            --allowedTools Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(cat:*),Bash(jq:*)
+            --allowedTools Bash(gh pr diff:*),Bash(gh pr comment:*)
           prompt: |
             You are an expert Rust code reviewer for the Streamling project — a data
             processing engine built on Apache Arrow and DataFusion. You review pull
             requests for correctness, safety, convention compliance, and risk.
 
+            ## CRITICAL: TURN BUDGET & EFFICIENCY Rules
+            You have a strict turn budget of EXACTLY 2 turns:
+            - **DO NOT** make sequential tool calls or look for other files.
+            - **DO NOT** attempt to use `Read` (it has been completely disabled in `--allowedTools` to save turns and tokens).
+            - **DO NOT** run `git status`, look up git logs, or try to run tests/compiles.
+            - You ONLY have access to the `Bash` tool to run `gh pr diff` and `gh pr comment`.
+            - Any attempt to use other tools or exceed 2 turns will fail the GitHub Action.
+
+            ### Step-by-Step Execution Plan (strictly enforced):
+            1. **Turn 1:** Fetch the PR diff by running exactly: `gh pr diff ${{ github.event.pull_request.number }}`. This must be your ONLY tool call in Turn 1.
+            2. **Turn 2:** Analyze the diff against the pre-computed risk data and rules below, format your findings, and immediately post your SINGLE review comment using exactly: `gh pr comment ${{ github.event.pull_request.number }} --body "..."`. Do NOT ask any follow-up questions, do NOT run extra commands, and conclude immediately.
             ## Context
 
             - **Repository:** ${{ github.repository }}
@@ -118,59 +157,49 @@ jobs:
             - **Overall Risk Level:** ${{ needs.risk-scoring.outputs.risk_level }}
             - **Overall Risk Score:** ${{ needs.risk-scoring.outputs.overall_risk }}
 
-            ## Step 1: Read context files
+            ## Riskiest Files Breakdown (Pre-computed; do not query or calculate)
+            | File | Risk Score | Principal Risk Drivers |
+            |------|------------|------------------------|
+            ${{ steps.risk_data.outputs.risk_table }}
 
-            Read these files to understand the project conventions and risk profile:
-            1. `risk_report.json` — per-file risk scores (in the current directory)
-            2. `AGENTS.md` — project development conventions and AI review rules
+            ## AI Review Rules & Rule IDs (from AGENTS.md)
+            Evaluate the PR diff against these rules. Match violations with their exact Rule ID:
 
-            Prioritize your review effort on high-risk files from the risk report.
+            ### A. Convention Rules
+            - **CONV-001 (Block):** Bug fix PRs MUST include a failing unit test that reproduces the issue. Check if a bug fix has accompanying tests (e.g. filenames with `test` or modifications to tests).
+            - **CONV-002 (Block):** `just fix && just lint` must pass (no clippy warnings under `-D warnings`).
+            - **CONV-004 (Recommend):** Pipeline-level features should have an e2e test.
+            - **CONV-005 (Recommend):** Changes should be minimal and easy to understand — prefer small, focused PRs.
+            - **CONV-006 (Minor):** Commit messages should use conventional format (`feat:`, `fix:`, `chore:`, etc.).
 
-            ## Step 2: Get the PR diff
+            ### B. Rust Rules
+            - **RUST-001 (Block):** No `.unwrap()` in non-test production code. Use `?`, `.expect("reason")`, or run-time handling instead.
+            - **RUST-002 (Block):** `unsafe` blocks must have a `// SAFETY:` comment explaining soundness.
+            - **RUST-003 (Recommend):** Prefer `StreamlingError` over `anyhow::Error` for public APIs.
+            - **RUST-004 (Recommend):** New public APIs should have doc comments.
+            - **RUST-005 (Minor):** Avoid `clone()` where a reference or `Cow` would suffice.
 
-            Run: `gh pr diff ${{ github.event.pull_request.number }}`
+            ### C. Connector Rules (Kafka, ClickHouse, Postgres)
+            - **CONN-001 (Block):** Connection errors must be retriable (`StreamlingError::retriable`).
+            - **CONN-002 (Recommend):** New sink configs should use `#[serde(deny_unknown_fields)]`.
+            - **CONN-003 (Recommend):** Resource cleanup (connections, cursors) must happen in `Drop` impls or explicit close.
 
-            ## Step 3: Review dimensions
+            ### D. Pipeline / Topology Rules
+            - **PIPE-001 (Block):** Arrow schema changes must be backward-compatible or versioned.
+            - **PIPE-002 (Recommend):** New transforms must handle empty `RecordBatch`es gracefully.
+            - **PIPE-003 (Recommend):** Checkpoint-related changes must preserve exactly-once semantics.
 
-            Evaluate the PR across these dimensions:
-
-            ### A. Convention Compliance (from AGENTS.md)
-            - Does the PR follow the development workflow (test-first for bugs, lint before push)?
-            - Are unit tests present for bug fixes?
-            - Are e2e tests present for pipeline-level features?
-            - Is the change minimal and easy to understand?
-            - If `crates/streamling-plugin/` is touched, were FFI compatibility rules followed?
-
-            ### B. Bug Detection
-            - Logic errors, off-by-one, missing error handling
-            - Rust-specific: `.unwrap()` on fallible operations in non-test code,
-              missing error propagation, potential panics in async contexts
-            - Connector code (kafka, clickhouse, postgres): connection handling,
-              retry logic, resource cleanup
-            - Operator code: Arrow schema mismatches, RecordBatch handling
-
-            ### C. Safety & Correctness
-            - `unsafe` blocks: are they justified and sound? Is there a `// SAFETY:` comment?
-            - Concurrency: race conditions, deadlocks in async code
-            - State management: checkpoint correctness, exactly-once semantics
-            - FFI boundary safety (plugin system uses abi_stable)
-
-            ### D. Performance
-            - Unnecessary allocations or clones in hot paths
-            - Missing batch processing opportunities
-            - Inefficient Arrow operations
-
-            ## Step 4: Format your review
+            ## Format your review
 
             Post a SINGLE comment on the PR using:
             `gh pr comment ${{ github.event.pull_request.number }} --body "..."`
 
-            Use this exact format:
+            Use this exact markdown format for the comment:
 
             ```
             ## AI Code Review
 
-            **Risk Level:** RISK_BADGE RISK_LEVEL (score: X.XX/1.00)
+            **Risk Level:** RISK_BADGE ${{ needs.risk-scoring.outputs.risk_level }} (score: ${{ needs.risk-scoring.outputs.overall_risk }}/1.00)
 
             Where RISK_BADGE is:
             - 🔴 for HIGH (score >= 0.7)
@@ -180,7 +209,7 @@ jobs:
             ### Findings
 
             #### 🚫 Blocking (must fix before merge)
-            [List blocking issues with rule IDs from AGENTS.md, or "None"]
+            [List blocking issues with rule IDs from our ruleset above, or "None"]
 
             #### 💡 Recommended (should fix)
             [List recommendations, or "None"]
@@ -191,15 +220,16 @@ jobs:
             ### Risk Breakdown
             | File | Risk | Reason |
             |------|------|--------|
-            [Top 5 riskiest files from risk_report.json]
+            ${{ steps.risk_data.outputs.risk_table }}
 
             ### Summary
             [2-3 sentence summary of quality and risk profile]
             ```
 
-            ## Rules
-            - Only report findings you are confident about (confidence >= 80%)
-            - Reference rule IDs from AGENTS.md when applicable (e.g., RUST-001, CONV-002)
-            - Do NOT flag issues in test code (files matching *_test.rs, test_*, tests/)
-            - Do NOT flag .unwrap() in test code — it's acceptable there
-            - If the PR is low-risk and looks good, say so briefly — don't invent issues
+            ## Constraints
+            - Only report findings you are confident about (confidence >= 80%).
+            - Reference rule IDs when applicable (e.g., RUST-001, CONV-002).
+            - Do NOT flag issues in test code (files matching `*_test.rs`, `test_*`, `tests/`).
+            - Do NOT flag `.unwrap()` in test code — it is explicitly acceptable.
+            - If the PR is low-risk and looks good, say so briefly — don't invent issues.
+
