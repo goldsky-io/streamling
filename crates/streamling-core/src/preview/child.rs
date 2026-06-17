@@ -25,7 +25,7 @@ fn streamling_exe() -> Result<std::path::PathBuf> {
     std::env::current_exe().streamling_context("failed to resolve current exe")
 }
 
-/// Runs `streamling --validate --config <config_path>` and returns `Ok(())` if
+/// Runs `streamling --validate <config_path>` and returns `Ok(())` if
 /// the pipeline validates, or `Err(message)` with the captured output otherwise.
 pub async fn validate_config(config_path: &Path) -> std::result::Result<(), String> {
     let exe = streamling_exe().map_err(|e| e.to_string())?;
@@ -57,7 +57,7 @@ pub struct RunChild {
 }
 
 impl RunChild {
-    /// Gracefully terminates the child. `kill_on_drop` is also set as a backstop.
+    /// Forcefully kills the child via SIGKILL and reaps it. `kill_on_drop` is also set as a backstop.
     pub async fn kill(mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -69,7 +69,7 @@ impl RunChild {
 pub async fn spawn_run_child(config_path: &Path) -> Result<RunChild> {
     let admin_port = pick_free_port()?;
     let exe = streamling_exe()?;
-    let child = Command::new(exe)
+    let mut child = Command::new(exe)
         .arg(config_path)
         .env("STREAMLING__LIVE_DATA_INSPECT_ENABLED", "true")
         .env("STREAMLING__ADMIN_API_PORT", admin_port.to_string())
@@ -77,18 +77,21 @@ pub async fn spawn_run_child(config_path: &Path) -> Result<RunChild> {
         .spawn()
         .streamling_context("failed to spawn preview child")?;
 
-    wait_for_port(admin_port, Duration::from_secs(30)).await?;
+    wait_for_port(&mut child, admin_port, Duration::from_secs(30)).await?;
     Ok(RunChild { child, admin_port })
 }
 
 /// Polls `127.0.0.1:port` until a TCP connection succeeds or `timeout` elapses.
-async fn wait_for_port(port: u16, timeout: Duration) -> Result<()> {
+/// Fails fast if the child process exits before the port becomes reachable.
+async fn wait_for_port(child: &mut Child, port: u16, timeout: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
+        if let Some(status) = child.try_wait().streamling_context("failed to poll child status")? {
+            return Err(streamling_err!(
+                "preview child exited before its admin API came up (status: {status})"
+            ));
+        }
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
