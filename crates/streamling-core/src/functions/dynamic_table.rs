@@ -9,7 +9,6 @@ use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
@@ -19,6 +18,21 @@ use tracing::debug;
 pub struct DynamicTableCheckFunc {
     registry: DynamicTableRegistry,
     signature: Signature,
+}
+
+// `DynamicTableRegistry` wraps runtime state (`Arc<RwLock<HashMap<..>>>`) that is
+// not comparable, so UDF identity (required by df54's `ScalarUDFImpl: DynEq + DynHash`)
+// is defined purely by the signature.
+impl PartialEq for DynamicTableCheckFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+}
+impl Eq for DynamicTableCheckFunc {}
+impl std::hash::Hash for DynamicTableCheckFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+    }
 }
 
 impl DynamicTableCheckFunc {
@@ -131,10 +145,6 @@ impl DynamicTableCheckFunc {
 }
 
 impl ScalarUDFImpl for DynamicTableCheckFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "dynamic_table_check"
     }

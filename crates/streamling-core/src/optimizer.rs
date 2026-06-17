@@ -34,7 +34,7 @@ impl PhysicalOptimizerRule for StreamingFilterRewritePhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
-            if let Some(original_filter) = input_plan.as_any().downcast_ref::<FilterExec>() {
+            if let Some(original_filter) = input_plan.downcast_ref::<FilterExec>() {
                 let streaming_filter =
                     StreamingFilterExec::from_original(original_filter.clone()).unwrap();
                 Ok(Transformed::yes(Arc::new(streaming_filter)))
@@ -77,8 +77,7 @@ impl PhysicalOptimizerRule for StreamingProjectionRewritePhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
-            if let Some(original_projection) = input_plan.as_any().downcast_ref::<ProjectionExec>()
-            {
+            if let Some(original_projection) = input_plan.downcast_ref::<ProjectionExec>() {
                 let streaming_projection =
                     StreamingProjectionExec::from_original(original_projection.clone()).unwrap();
                 Ok(Transformed::yes(Arc::new(streaming_projection)))
@@ -121,7 +120,7 @@ impl PhysicalOptimizerRule for StreamingUnnestRewritePhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
-            if let Some(original_unnest) = input_plan.as_any().downcast_ref::<UnnestExec>() {
+            if let Some(original_unnest) = input_plan.downcast_ref::<UnnestExec>() {
                 let streaming_unnest =
                     StreamingUnnestExec::from_original(original_unnest.clone()).unwrap();
                 Ok(Transformed::yes(Arc::new(streaming_unnest)))

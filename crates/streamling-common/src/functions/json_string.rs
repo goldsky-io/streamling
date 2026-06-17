@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::{streamling_err, streamling_user_bail, streamling_user_err};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct JsonStringFunc {
     signature: Signature,
 }
@@ -33,10 +33,6 @@ impl JsonStringFunc {
 }
 
 impl ScalarUDFImpl for JsonStringFunc {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "json_string"
     }
@@ -127,6 +123,7 @@ mod tests {
             arg_fields: vec![arg_field],
             number_rows: 1,
             return_field,
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         }
     }
 
@@ -138,6 +135,7 @@ mod tests {
             arg_fields: vec![Arc::new(Field::new("v", DataType::Int64, true))],
             number_rows: 1,
             return_field: Arc::new(Field::new("r", DataType::Utf8, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
         let out = func.invoke_with_args(args).unwrap();
         let arr = match out {

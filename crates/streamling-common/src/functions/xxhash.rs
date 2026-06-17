@@ -5,7 +5,6 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -22,7 +21,7 @@ use xxhash_rust::xxh3::xxh3_128;
 ///
 /// # Examples
 /// * `xxhash('hello')` returns a 32-character hex string
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct XxHashFunc {
     signature: Signature,
 }
@@ -42,10 +41,6 @@ impl XxHashFunc {
 }
 
 impl ScalarUDFImpl for XxHashFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_xxhash"
     }
@@ -94,6 +89,7 @@ mod tests {
             ))],
             number_rows: 3,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

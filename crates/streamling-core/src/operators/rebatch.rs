@@ -16,7 +16,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use delegate::delegate;
-use std::any::Any;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -59,7 +58,7 @@ impl ExecutionPlan for RebatchExec {
         to self.inner {
             fn name(&self) -> &str;
             fn schema(&self) -> arrow_schema::SchemaRef;
-            fn properties(&self) -> &PlanProperties;
+            fn properties(&self) -> &Arc<PlanProperties>;
             fn check_invariants(&self, check: InvariantLevel) -> Result<()>;
             fn required_input_distribution(&self) -> Vec<Distribution>;
             fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>>;
@@ -72,7 +71,7 @@ impl ExecutionPlan for RebatchExec {
                 config: &ConfigOptions,
             ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
             fn metrics(&self) -> Option<MetricsSet>;
-            fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
+            fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
             fn supports_limit_pushdown(&self) -> bool;
             fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>>;
             fn cardinality_effect(&self) -> CardinalityEffect;
@@ -81,10 +80,6 @@ impl ExecutionPlan for RebatchExec {
                 projection: &ProjectionExec,
             ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn with_new_children(

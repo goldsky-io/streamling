@@ -6,7 +6,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::functions::util::{get_optional_arg_or_default, get_typed_array, validate_arg_count};
@@ -26,7 +25,7 @@ use crate::functions::util::{get_optional_arg_or_default, get_typed_array, valid
 /// # Examples
 /// * `split_string_to_array('1 2 34 5')` returns `['1', '2', '34', '5']`
 /// * `split_string_to_array('1-2-5', '-')` returns `['1', '2', '5']`
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SplitStringToArrayFunc {
     signature: Signature,
     aliases: Vec<String>,
@@ -54,10 +53,6 @@ impl SplitStringToArrayFunc {
 }
 
 impl ScalarUDFImpl for SplitStringToArrayFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_split_string_to_array"
     }
@@ -155,6 +150,7 @@ mod tests {
                 ))),
                 false,
             )),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -206,6 +202,7 @@ mod tests {
                 ))),
                 false,
             )),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -31,7 +30,7 @@ pub(crate) fn json_objectagg_udaf(
     udf.with_aliases(aliases)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonArrayAggUdf {
     signature: Signature,
     name: &'static str,
@@ -49,10 +48,6 @@ impl JsonArrayAggUdf {
 }
 
 impl AggregateUDFImpl for JsonArrayAggUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -173,7 +168,7 @@ impl Accumulator for JsonArrayAggAccumulator {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonObjectAggUdf {
     signature: Signature,
     name: &'static str,
@@ -191,10 +186,6 @@ impl JsonObjectAggUdf {
 }
 
 impl AggregateUDFImpl for JsonObjectAggUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }

@@ -36,7 +36,6 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use delegate::delegate;
 use futures::StreamExt;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Debug;
@@ -237,7 +236,7 @@ impl WrappingSourceTableProvider {
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
     ) -> Arc<dyn ExecutionPlan> {
-        if let Some(filter_exec) = inner_exec.as_any().downcast_ref::<StreamingFilterExec>() {
+        if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
             let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
                 source_exec,
@@ -287,10 +286,6 @@ impl SupportsSideOutputs for WrappingSourceTableProvider {
 
 #[async_trait]
 impl TableProvider for WrappingSourceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -319,16 +314,22 @@ impl TableProvider for WrappingSourceTableProvider {
                         "Reusing existing shared source handle for: {}",
                         reference_name
                     );
-                    return Ok(Arc::new(BroadcastingExec::new(handle.clone())));
+                    return Ok(Arc::new(BroadcastingExec::new(
+                        handle.clone(),
+                        projection.cloned(),
+                    )?));
                 }
             }
 
-            // First scan - call inner.scan and create the handle
+            // First scan - call inner.scan and create the handle.
+            // The shared source broadcasts full rows so each consumer can apply its own
+            // projection independently (see `project_broadcast`); pass `None` here so the
+            // first consumer's projection isn't baked into the shared scan.
             debug!(
                 "First scan for source: {}, calling inner.scan",
                 reference_name
             );
-            let inner_exec = self.inner.scan(state, projection, filters, limit).await?;
+            let inner_exec = self.inner.scan(state, None, filters, limit).await?;
 
             let side_outputs: Vec<Arc<dyn SourceSideOutput>> = self
                 .side_outputs
@@ -368,7 +369,10 @@ impl TableProvider for WrappingSourceTableProvider {
                 }
             };
 
-            Ok(Arc::new(BroadcastingExec::new(handle)))
+            Ok(Arc::new(BroadcastingExec::new(
+                handle,
+                projection.cloned(),
+            )?))
         } else {
             // No scan sharing - use the old behavior
             let inner_exec = self.inner.scan(state, projection, filters, limit).await?;
@@ -468,7 +472,7 @@ impl ExecutionPlan for WrappingExec {
     delegate! {
         to self.inner {
             fn name(&self) -> &str;
-            fn properties(&self) -> &PlanProperties;
+            fn properties(&self) -> &Arc<PlanProperties>;
             fn check_invariants(&self, check: InvariantLevel) -> Result<()>;
             fn required_input_distribution(&self) -> Vec<Distribution>;
             fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>>;
@@ -481,7 +485,7 @@ impl ExecutionPlan for WrappingExec {
                 config: &ConfigOptions,
             ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
             fn metrics(&self) -> Option<MetricsSet>;
-            fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
+            fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
             fn supports_limit_pushdown(&self) -> bool;
             fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>>;
             fn cardinality_effect(&self) -> CardinalityEffect;
@@ -494,10 +498,6 @@ impl ExecutionPlan for WrappingExec {
 
     fn schema(&self) -> SchemaRef {
         self.adjusted_schema.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn with_new_children(
@@ -688,9 +688,6 @@ impl DataSink for WrappingDataSink {
             fn metrics(&self) -> Option<MetricsSet>;
             fn schema(&self) -> &SchemaRef;
         }
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     async fn write_all(
@@ -926,7 +923,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             "Transform '{}' using scan sharing (reusing existing handle)",
                             reference_name
                         );
-                        return Ok(Some(Arc::new(BroadcastingExec::new(handle.clone()))));
+                        return Ok(Some(Arc::new(BroadcastingExec::new(handle.clone(), None)?)));
                     }
                 }
 
@@ -977,7 +974,8 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                         );
                         Ok(Some(Arc::new(BroadcastingExec::new(
                             existing_handle.clone(),
-                        ))))
+                            None,
+                        )?)))
                     } else {
                         // Create and store the handle for this transform
                         let schema = exec.schema();
@@ -998,7 +996,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             "Transform '{}' has {} consumers - created shared handle",
                             reference_name, expected_count
                         );
-                        Ok(Some(Arc::new(BroadcastingExec::new(handle))))
+                        Ok(Some(Arc::new(BroadcastingExec::new(handle, None)?)))
                     };
                 }
 
@@ -1088,10 +1086,7 @@ mod tests {
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
         assert!(
-            result
-                .as_any()
-                .downcast_ref::<StreamingFilterExec>()
-                .is_some(),
+            result.downcast_ref::<StreamingFilterExec>().is_some(),
             "Expected top-level plan to be StreamingFilterExec, got: {}",
             result.name()
         );
@@ -1100,10 +1095,7 @@ mod tests {
         let filter_children = result.children();
         assert_eq!(filter_children.len(), 1);
         assert!(
-            filter_children[0]
-                .as_any()
-                .downcast_ref::<WrappingExec>()
-                .is_some(),
+            filter_children[0].downcast_ref::<WrappingExec>().is_some(),
             "Expected filter's child to be WrappingExec, got: {}",
             filter_children[0].name()
         );
@@ -1133,7 +1125,7 @@ mod tests {
 
         // Without a filter, the top-level plan should be WrappingExec directly
         assert!(
-            result.as_any().downcast_ref::<WrappingExec>().is_some(),
+            result.downcast_ref::<WrappingExec>().is_some(),
             "Expected top-level plan to be WrappingExec, got: {}",
             result.name()
         );
@@ -1318,7 +1310,6 @@ mod tests {
 
         let rebuilt = original.with_new_children(vec![source_exec]).unwrap();
         let rebuilt_wrapping = rebuilt
-            .as_any()
             .downcast_ref::<WrappingExec>()
             .expect("with_new_children must return a WrappingExec");
         let rebuilt_inst = rebuilt_wrapping
@@ -1366,7 +1357,6 @@ mod tests {
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.
         let filter_children = result.children();
         let wrapping = filter_children[0]
-            .as_any()
             .downcast_ref::<WrappingExec>()
             .expect("expected WrappingExec under filter");
         let inst = wrapping

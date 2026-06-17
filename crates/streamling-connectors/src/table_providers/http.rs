@@ -11,7 +11,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -85,10 +84,6 @@ impl HttpSink {
 
 #[async_trait]
 impl DataSink for HttpSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -274,10 +269,6 @@ impl HttpTableProvider {
 
 #[async_trait]
 impl TableProvider for HttpTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

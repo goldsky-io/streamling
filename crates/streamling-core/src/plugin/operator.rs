@@ -26,7 +26,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::StreamExt;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -172,8 +171,8 @@ impl ExtensionPlanner for PluginExtensionPlanner {
 
                 let out_arrow_schema: SchemaRef = Arc::new(
                     UserDefinedLogicalNodeCore::schema(plugin_node)
-                        .as_ref()
-                        .into(),
+                        .as_arrow()
+                        .clone(),
                 );
 
                 let plugin_exec = Arc::new(PluginExec::new(
@@ -196,7 +195,7 @@ struct PluginExec {
     output_schema: SchemaRef,
     internal_buffer_size: u32,
     plugin_channels: Arc<PluginChannels>,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
     metric_metadata_id: String,
 }
 
@@ -214,7 +213,7 @@ impl PluginExec {
             output_schema,
             internal_buffer_size,
             plugin_channels,
-            cache,
+            cache: Arc::new(cache),
             metric_metadata_id,
         }
     }
@@ -254,11 +253,7 @@ impl ExecutionPlan for PluginExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -441,7 +436,7 @@ impl ExecutionPlan for PluginExec {
         Ok(builder.build())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 }

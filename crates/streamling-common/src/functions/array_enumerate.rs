@@ -31,14 +31,13 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
 use crate::{streamling_err, streamling_user_bail, streamling_user_err};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ArrayEnumerateFunc {
     signature: Signature,
 }
@@ -65,10 +64,6 @@ impl ArrayEnumerateFunc {
 }
 
 impl ScalarUDFImpl for ArrayEnumerateFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "array_enumerate"
     }
@@ -226,6 +221,7 @@ mod tests {
             ],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

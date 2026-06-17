@@ -11,7 +11,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -25,7 +24,7 @@ use std::sync::Arc;
 /// ```sql
 /// array_filter_in(changes, 'ledger_entry_type', ARRAY['account', 'trustline'])
 /// ```
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ArrayFilterInFunc {
     signature: Signature,
 }
@@ -45,10 +44,6 @@ impl ArrayFilterInFunc {
 }
 
 impl ScalarUDFImpl for ArrayFilterInFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "array_filter_in"
     }
@@ -438,6 +433,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -514,6 +510,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

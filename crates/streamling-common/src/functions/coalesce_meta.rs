@@ -6,13 +6,12 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::{streamling_user_bail, streamling_user_err};
 
 /// coalesce_meta(arg1, arg2, ...) -> first non-null, preserving first arg Field metadata
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct CoalesceMetaUdf {
     signature: Signature,
 }
@@ -33,10 +32,6 @@ impl Default for CoalesceMetaUdf {
 }
 
 impl ScalarUDFImpl for CoalesceMetaUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "coalesce_meta"
     }

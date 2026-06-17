@@ -191,10 +191,32 @@ pub async fn build_bounded_file_source_provider(
         infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
     let listing_options =
         ListingOptions::new(file_format).with_table_partition_cols(partition_cols);
-    let config = ListingTableConfig::new(table_url)
-        .with_listing_options(listing_options)
-        .infer_schema(&state)
-        .await?;
+    // Partition columns are detected ourselves above (`infer_partition_columns`),
+    // not via DataFusion's `infer_partitions_from_path` (which treats every parent
+    // directory as a partition level and errors on plain nested subfolders).
+    let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
+
+    // DataFusion 54 errors out of `infer_schema` when the path matches no files
+    // ("No files found at ... Cannot infer schema from an empty location") rather
+    // than returning an empty schema. Translate that into a clear fail-fast message
+    // (older DataFusion returned an empty schema, handled by the `is_empty()` check
+    // below, which is kept as a defensive fallback).
+    let config = match config.infer_schema(&state).await {
+        Ok(config) => config,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No files found") || msg.contains("empty location") {
+                streamling_user_bail!(
+                    "file source '{}': no files matching format {:?} found at path '{}'. \
+                     Check the path and that the files use the format's extension.",
+                    reference_name,
+                    format,
+                    path
+                );
+            }
+            return Err(e.into());
+        }
+    };
     let listing_table = Arc::new(ListingTable::try_new(config)?);
 
     let schema = listing_table.schema();
