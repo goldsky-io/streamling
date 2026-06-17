@@ -139,11 +139,10 @@ async fn process_checkpoint_messages_with_truncation(
                 );
 
                 let sink_id = get_reference_name_from_metric_key(&context.metric_metadata_id);
-                send(
+                let _ = send(
                     CHECKPOINT_COORDINATOR_CHANNEL,
                     CheckpointMessage::Ack { epoch, sink_id },
-                )
-                .unwrap();
+                );
 
                 // Record sink flush time (time from batch arrival to ack sent)
                 context.metrics_recorder.record_time(

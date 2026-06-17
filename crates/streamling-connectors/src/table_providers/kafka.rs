@@ -2525,11 +2525,10 @@ impl DataSink for KafkaSink {
                     }
 
                     let sink_id = get_reference_name_from_metric_key(&self.metric_metadata_id);
-                    send(
+                    let _ = send(
                         CHECKPOINT_COORDINATOR_CHANNEL,
                         CheckpointMessage::Ack { epoch, sink_id },
-                    )
-                    .unwrap();
+                    );
                     metrics_recorder.record_time(
                         "checkpoint_sink_flush",
                         ack_start.elapsed(),

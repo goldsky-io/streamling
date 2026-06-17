@@ -467,14 +467,13 @@ impl DataSink for PluginSink {
                         let sink_id =
                             metric_metadata_id_to_reference_name(&self.metric_metadata_id)
                                 .unwrap_or_else(|| self.metric_metadata_id.clone());
-                        send(
+                        let _ = send(
                             CHECKPOINT_COORDINATOR_CHANNEL,
                             CheckpointMessage::Ack {
                                 epoch: CheckpointEpoch(epoch.0),
                                 sink_id,
                             },
-                        )
-                        .unwrap();
+                        );
                     }
                     _ => {
                         warn!("Received unexpected message from plugin channel");

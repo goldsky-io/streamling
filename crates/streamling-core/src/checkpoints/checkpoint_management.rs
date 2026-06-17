@@ -73,14 +73,13 @@ pub fn process_checkpoint_acks(
                 Duration::from_millis(arrival_latency_ms),
                 metric_metadata_id,
             );
-            send(
+            let _ = send(
                 CHECKPOINT_COORDINATOR_CHANNEL,
                 CheckpointMessage::Ack {
                     epoch,
                     sink_id: sink_id.to_string(),
                 },
-            )
-            .unwrap();
+            );
             metrics_recorder.record_time(
                 "checkpoint_sink_flush",
                 ack_start.elapsed(),
@@ -190,11 +189,10 @@ impl CheckpointControl {
             metrics_recorder.record_count("checkpoint_epochs_succeeded", 1);
             metrics_recorder.record_count("checkpoint_finalizers_sent", 1);
             info!("Epoch {} finalized after sink completion", epoch.0);
-            send(
+            let _ = send(
                 CHECKPOINT_COORDINATOR_CHANNEL,
                 CheckpointMessage::Finalizer(epoch),
-            )
-            .unwrap();
+            );
         }
         record_in_flight_gauge(&self.epochs, &metrics_recorder);
     }
@@ -245,6 +243,17 @@ impl CheckpointControl {
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Returns true if the terminal checkpoint has finalized.
+    pub fn is_terminal_finalized(&self) -> bool {
+        let terminal = self.terminal_epoch.lock().clone();
+        match terminal {
+            None => false,
+            Some(epoch) => {
+                matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized))
+            }
         }
     }
 }
@@ -463,11 +472,10 @@ impl CheckpointCoordinator {
                             metrics_recorder.record_count("checkpoint_finalizers_sent", 1);
 
                             info!("Epoch finalized: {}", epoch.0);
-                            send(
+                            let _ = send(
                                 CHECKPOINT_COORDINATOR_CHANNEL,
                                 CheckpointMessage::Finalizer(epoch),
-                            )
-                            .unwrap();
+                            );
 
                             record_in_flight_gauge(&epochs, &metrics_recorder);
                         }
@@ -1039,5 +1047,58 @@ mod tests {
         }
 
         coordinator.stop().await;
+    }
+
+    #[test]
+    fn test_sink_completion_unblocks_finalization_synchronous() {
+        // Two sinks are expected. The epoch is acked by sink_b only, so it
+        // is InProgress waiting on sink_a. When sink_a's branch finished and
+        // is marked completed, it should finalize synchronously.
+        let coordinator = CheckpointCoordinator::with_timeout(300);
+        let epoch = CheckpointEpoch(1042);
+
+        // Seed expected sinks.
+        {
+            let mut expected = coordinator.expected_sinks.lock();
+            expected.insert("sink_a_dereg".to_string());
+            expected.insert("sink_b_dereg".to_string());
+        }
+
+        // Seed epoch as InProgress { acked: {sink_b_dereg} } directly.
+        {
+            let mut epochs = coordinator.epochs.lock();
+            let mut acked_sinks = HashSet::new();
+            acked_sinks.insert("sink_b_dereg".to_string());
+            epochs.insert(
+                epoch.clone(),
+                EpochState::InProgress {
+                    acked_sinks,
+                    created_at: Instant::now(),
+                },
+            );
+        }
+
+        let control = coordinator.control();
+
+        // Assert it is in progress initially.
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                matches!(epochs.get(&epoch), Some(EpochState::InProgress { .. })),
+                "epoch should still be in progress waiting on sink_a"
+            );
+        }
+
+        // Mark sink_a completed synchronously.
+        control.sink_completed("sink_a_dereg");
+
+        // Assert it is Finalized.
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                matches!(epochs.get(&epoch), Some(EpochState::Finalized)),
+                "epoch should finalize synchronously once the only outstanding sink completes"
+            );
+        }
     }
 }

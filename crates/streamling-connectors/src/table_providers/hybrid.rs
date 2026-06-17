@@ -2512,7 +2512,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_hybrid_source_terminal_checkpoint_round_trip() {
-        use streamling_core::checkpoints::channels::send;
         use streamling_core::checkpoints::checkpoint_management::CheckpointCoordinator;
 
         // A completing job-mode source emits the terminal Marker, waits for the
@@ -2544,7 +2543,7 @@ mod tests {
             SESSION_MANAGER.clone(),
         )
         .unwrap()
-        .with_checkpoint_control(control);
+        .with_checkpoint_control(control.clone());
 
         let session_state = SESSION_MANAGER.session_state();
         let plan = hybrid_provider
@@ -2563,16 +2562,13 @@ mod tests {
             let batch = batch.expect("stream batch should not be an error");
             for msg in extract_checkpoint_messages(batch.schema().metadata()) {
                 match msg {
-                    CheckpointMessage::Marker { epoch, .. } => {
+                    CheckpointMessage::Marker { .. } => {
                         saw_marker = true;
-                        send(
-                            CHECKPOINT_COORDINATOR_CHANNEL,
-                            CheckpointMessage::Ack {
-                                epoch,
-                                sink_id: "roundtrip_sink".to_string(),
-                            },
-                        )
-                        .unwrap();
+                        control.sink_completed("roundtrip_sink");
+                        assert!(
+                            control.is_terminal_finalized(),
+                            "terminal epoch should be finalized synchronously after sink completion"
+                        );
                     }
                     CheckpointMessage::Finalizer(_) => saw_finalizer = true,
                     _ => {}
