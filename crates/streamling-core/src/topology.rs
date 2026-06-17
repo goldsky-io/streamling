@@ -221,6 +221,32 @@ pub struct PluginSource {
     pub telemetry: Option<Telemetry>,
 }
 
+/// Bounded source that reads files from `path` in the given `format` via
+/// DataFusion's `ListingTable`. `path` may be a local path or a remote object
+/// store URL (`s3://`, `gs://`); remote credentials come from the environment.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct FileSource {
+    pub path: String,
+    pub format: FileSourceFormat,
+    pub primary_key: Option<String>,
+    pub telemetry: Option<Telemetry>,
+}
+
+/// Named `FileSourceFormat` to avoid colliding with DataFusion's `FileFormat`
+/// trait. A closed enum so unknown formats fail at config-parse time.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSourceFormat {
+    Parquet,
+    Csv,
+    /// Newline-delimited JSON (one object per line / JSONL) — NOT a top-level
+    /// JSON array. `ndjson` and `jsonl` are accepted as aliases.
+    #[serde(alias = "ndjson", alias = "jsonl")]
+    Json,
+    Avro,
+}
+
 // ============================================================================
 // Type-based deserialization helpers
 // ============================================================================
@@ -382,6 +408,7 @@ define_typed_enum!(
         kafka(KafkaSource),
         clickhouse(ClickhouseSource),
         hybrid(HybridSource),
+        file(FileSource),
     }
 );
 
@@ -394,6 +421,7 @@ impl Source {
             Source::kafka(s) => s.telemetry.as_ref(),
             Source::clickhouse(s) => s.telemetry.as_ref(),
             Source::hybrid(s) => s.telemetry.as_ref(),
+            Source::file(s) => s.telemetry.as_ref(),
             Source::plugin(s) => s.telemetry.as_ref(),
         }
     }
@@ -760,6 +788,7 @@ fn source_per_type_reserved_keys(source: &Source) -> &'static [&'static str] {
         Source::kafka(_) => &["topic"],
         Source::clickhouse(_) => &["table"],
         Source::hybrid(_) => &["table", "topic"],
+        Source::file(_) => &["path"],
         Source::plugin(_) => &["type"],
     }
 }
@@ -1684,6 +1713,69 @@ sinks: {}
         let event_time = source_event_time(source).unwrap();
         assert_eq!(event_time.column, "block_timestamp");
         assert_eq!(event_time.unit, None);
+    }
+
+    #[test]
+    fn test_file_source_parses_path_and_format() {
+        let yaml = r#"
+sources:
+  events:
+    type: file
+    path: s3://my-bucket/events/
+    format: parquet
+    primary_key: id
+transforms: {}
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        let source = topology.sources.get("events").unwrap();
+        match source {
+            Source::file(file) => {
+                assert_eq!(file.path, "s3://my-bucket/events/");
+                assert_eq!(file.format, FileSourceFormat::Parquet);
+                assert_eq!(file.primary_key.as_deref(), Some("id"));
+            }
+            other => panic!("expected file source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_file_source_json_accepts_ndjson_aliases() {
+        for alias in ["json", "ndjson", "jsonl"] {
+            let yaml = format!(
+                r#"
+sources:
+  events:
+    type: file
+    path: /tmp/events
+    format: {alias}
+transforms: {{}}
+sinks: {{}}
+"#
+            );
+            let topology = PipelineTopology::load_from_string(&yaml).unwrap();
+            match topology.sources.get("events").unwrap() {
+                Source::file(file) => assert_eq!(file.format, FileSourceFormat::Json),
+                other => panic!("expected file source for alias '{alias}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_source_rejects_unknown_format() {
+        let yaml = r#"
+sources:
+  events:
+    type: file
+    path: /tmp/events
+    format: orc
+transforms: {}
+sinks: {}
+"#;
+        assert!(
+            PipelineTopology::load_from_string(yaml).is_err(),
+            "unknown file format should be rejected at parse time"
+        );
     }
 
     #[test]
