@@ -42,6 +42,7 @@ impl ToU256Func {
                     TypeSignature::Exact(vec![DataType::UInt16]),
                     TypeSignature::Exact(vec![DataType::Int8]),
                     TypeSignature::Exact(vec![DataType::UInt8]),
+                    TypeSignature::Exact(vec![DataType::FixedSizeBinary(32)]),
                 ],
                 Volatility::Immutable,
             ),
@@ -201,6 +202,10 @@ impl ScalarUDFImpl for ToU256Func {
                     let bytes = u256::u256_to_bytes(&value);
                     builder.push(Some(bytes.to_vec()));
                 }
+            }
+            DataType::FixedSizeBinary(32) => {
+                // Passthrough: input is already U256
+                return Ok(ColumnarValue::Array(array));
             }
             _ => {
                 streamling_user_bail!(
@@ -482,6 +487,46 @@ mod tests {
         } else {
             panic!("Expected array result");
         }
+    }
+
+    #[test]
+    fn test_to_u256_fixed_size_binary_passthrough() {
+        // to_u256 over already-encoded u256 bytes (FixedSizeBinary(32)) must pass
+        // the value through unchanged. The preprocessor relies on this to wrap
+        // CASE results so the u256 extension metadata is re-declared on the output
+        // field (mirrors to_i256, which already supports this).
+        let func = ToU256Func::new();
+        let bytes = u256::u256_to_bytes(&U256::from(12345u64));
+        let input = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(bytes.to_vec()), None].into_iter(),
+            32,
+        )
+        .unwrap();
+
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(input))],
+            arg_fields: vec![Arc::new(arrow_schema::Field::new(
+                "value",
+                U256Type::new(),
+                true,
+            ))],
+            number_rows: 2,
+            return_field: Arc::new(arrow_schema::Field::new("result", U256Type::new(), true)),
+        };
+
+        let result = func.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array result");
+        };
+        let binary = arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("result should be FixedSizeBinary");
+        assert_eq!(binary.len(), 2);
+        let mut recovered = [0u8; 32];
+        recovered.copy_from_slice(binary.value(0));
+        assert_eq!(u256::bytes_to_u256(&recovered), U256::from(12345u64));
+        assert!(binary.is_null(1), "null should pass through");
     }
 
     #[test]

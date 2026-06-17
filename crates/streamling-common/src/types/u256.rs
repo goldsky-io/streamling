@@ -96,7 +96,7 @@ pub fn add(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let b_val = bytes_to_u256(b);
     let result = a_val
         .checked_add(b_val)
-        .ok_or_else(|| streamling_err!("U256 addition overflow"))?;
+        .ok_or_else(|| streamling_err!("U256 addition overflow: {} + {}", a_val, b_val))?;
     Ok(u256_to_bytes(&result))
 }
 
@@ -106,7 +106,7 @@ pub fn sub(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let b_val = bytes_to_u256(b);
     let result = a_val
         .checked_sub(b_val)
-        .ok_or_else(|| streamling_err!("U256 subtraction underflow"))?;
+        .ok_or_else(|| streamling_err!("U256 subtraction underflow: {} - {}", a_val, b_val))?;
     Ok(u256_to_bytes(&result))
 }
 
@@ -116,7 +116,7 @@ pub fn mul(a: &[u8; 32], b: &[u8; 32]) -> crate::error::Result<[u8; 32]> {
     let b_val = bytes_to_u256(b);
     let result = a_val
         .checked_mul(b_val)
-        .ok_or_else(|| streamling_err!("U256 multiplication overflow"))?;
+        .ok_or_else(|| streamling_err!("U256 multiplication overflow: {} * {}", a_val, b_val))?;
     Ok(u256_to_bytes(&result))
 }
 
@@ -180,6 +180,21 @@ mod tests {
         let max = u256_to_bytes(&U256::max_value());
         let one = u256_to_bytes(&U256::from(1u64));
         assert!(add(&max, &one).is_err());
+    }
+
+    #[test]
+    fn test_mul_overflow_error_includes_operands() {
+        // 2^200 * 2^200 = 2^400, well over U256::MAX. The error must name the
+        // operands so an overflowing row can be identified without guessing.
+        let big_val = U256::from(1u64) << 200;
+        let big = u256_to_bytes(&big_val);
+        let err = mul(&big, &big).unwrap_err();
+        let msg = format!("{err}");
+        let operand = u256_to_string(&big_val);
+        assert!(
+            msg.contains(&operand),
+            "overflow error should include the operand value {operand}, got: {msg}"
+        );
     }
 
     #[test]
