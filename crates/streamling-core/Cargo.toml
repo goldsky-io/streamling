@@ -23,7 +23,7 @@ arrow.workspace = true
 arrow-schema.workspace = true
 
 # Async runtime
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "time", "net"] }
 
 # Database
 sqlx.workspace = true
@@ -85,6 +85,7 @@ opentelemetry-otlp.workspace = true
 tonic.workspace = true
 
 paste.workspace = true
+tempfile = "3"
 
 [dev-dependencies]
 rand.workspace = true
