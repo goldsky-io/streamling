@@ -18,6 +18,7 @@ streamling-state = { workspace = true }
 
 # Core DataFusion ecosystem
 datafusion.workspace = true
+object_store.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 

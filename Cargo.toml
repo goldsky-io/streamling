@@ -46,6 +46,8 @@ arrow = "55.2.0"
 arrow-schema = { version = "55.2.0", default-features = false }
 arrow-data = "55.2.0"
 arrow-json = "55.2.0"
+# Pinned to 0.12 to match DataFusion 49's `object_store = "0.12.3"`
+object_store = { version = "0.12", features = ["aws", "gcp"] }
 
 tokio = { version = "1.0", features = ["rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
