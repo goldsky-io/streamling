@@ -7,7 +7,9 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::de;
 use serde::{Deserialize, Deserializer};
-use streamling_config::{ClickHouseCompression, DynamicTableBackendType, GzipCompressionLevel};
+use streamling_config::{
+    ClickHouseCompression, DynamicTableBackendType, GzipCompressionLevel, KafkaCompression,
+};
 use tracing::log::info;
 
 // ============================================================================
@@ -651,6 +653,10 @@ pub struct KafkaSink {
     /// Number of parallel Kafka producers. Each producer has independent connections
     /// and queues, multiplying broker throughput. Defaults to 1.
     pub parallelism: Option<usize>,
+    /// Producer compression codec (`none`, `gzip`, or `lz4`). Defaults to `lz4`.
+    /// Set `gzip` or `none` for brokers that reject lz4.
+    #[serde(default)]
+    pub compression: KafkaCompression,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -1007,6 +1013,30 @@ impl PipelineTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kafka_sink_yaml(extra: &str) -> String {
+        format!(
+            r#"
+from: src
+topic: out
+data_format: avro
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn kafka_sink_parses_compression() {
+        let sink: KafkaSink = serde_yaml::from_str(&kafka_sink_yaml("compression: gzip")).unwrap();
+        assert_eq!(sink.compression, KafkaCompression::Gzip);
+    }
+
+    #[test]
+    fn kafka_sink_compression_defaults_to_lz4_when_omitted() {
+        // Preserves the historical producer default when YAML omits the field.
+        let sink: KafkaSink = serde_yaml::from_str(&kafka_sink_yaml("")).unwrap();
+        assert_eq!(sink.compression, KafkaCompression::Lz4);
+    }
 
     #[test]
     fn test_plugin_options_nested_format() {
