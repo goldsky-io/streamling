@@ -128,6 +128,92 @@ sinks:
 }
 
 // ============================================================================
+// Scenario 1b: Kafka sink with gzip compression
+// ============================================================================
+
+/// Read from Kafka and write to a Kafka sink configured with `compression: gzip`.
+/// Exercises the non-default producer codec end-to-end: a successful
+/// produce-then-consume round-trip proves gzip-encoded messages are written and
+/// readable — the codec needed for brokers that reject the default lz4.
+#[tokio::test]
+async fn test_kafka_sink_gzip_compression() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let output_topic = ctx
+        .create_kafka_topic("output")
+        .await
+        .expect("Failed to create output topic");
+
+    let records_to_produce = 50;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {input_topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  kafka_sink:
+    type: kafka
+    from: kafka_source
+    topic: {output_topic}
+    topic_partitions: 1
+    data_format: avro
+    compression: gzip
+"#,
+        input_topic = ctx.kafka_topic,
+        output_topic = output_topic.topic,
+    );
+
+    let status = ctx
+        .run_pipeline(&pipeline, records_to_produce as u64)
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let messages = ctx
+        .consume_kafka_messages(&output_topic.topic, records_to_produce as usize + 10)
+        .await
+        .expect("Failed to consume gzip-compressed messages from output topic");
+
+    assert!(
+        messages.len() >= records_to_produce as usize,
+        "Expected at least {} gzip-compressed messages in output topic, got {}",
+        records_to_produce,
+        messages.len()
+    );
+}
+
+// ============================================================================
 // Scenario 2: Multiple batches through Kafka sink
 // ============================================================================
 

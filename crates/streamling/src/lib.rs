@@ -1773,6 +1773,7 @@ impl Streamling {
                         batch_flush_interval_ms,
                         kafka_sink.message_max_bytes,
                         kafka_sink.parallelism,
+                        kafka_sink.compression,
                         sink_telemetry.clone(),
                     ));
                     session_manager
