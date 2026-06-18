@@ -1,4 +1,5 @@
 mod arrow_array_reader;
+pub mod arrow_avro;
 mod schema;
 mod writer;
 
