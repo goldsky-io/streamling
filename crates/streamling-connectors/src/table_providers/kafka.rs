@@ -17,17 +17,19 @@ use streamling_core::{
 use crate::table_providers::kafka::config_optimizer::KafkaConfigOptimizer;
 use crate::table_providers::kafka::metadata::KafkaMetadata;
 use crate::table_providers::kafka::schema_registry::{
-    SubjectVersionsClient, patch_schema_id_with_overrides, resolve_schema,
+    SubjectVersionsClient, is_writer_schema_ahead, patch_schema_id_with_overrides,
+    retry_registry_call,
 };
 use apache_avro::Schema as AvroSchema;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::arrow::array::{RecordBatch, StringArray};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, not_impl_err};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
@@ -40,11 +42,12 @@ use datafusion::physical_plan::{
     project_schema,
 };
 use streamling_core::formats::avro::{
-    AvroToArrowConverter, FromArrowToAvroConverter, convert_avro_schema_to_arrow,
-    post_process_avro_schema_for_writing, to_avro,
+    FromArrowToAvroConverter, convert_avro_schema_to_arrow, post_process_avro_schema_for_writing,
+    to_avro,
 };
+use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
 use streamling_core::formats::json::FromArrowToJsonConverter;
-use streamling_core::formats::{FromArrowConverter, ToArrowConverter};
+use streamling_core::formats::FromArrowConverter;
 use streamling_core::operators::filter::StreamingFilterExec;
 use streamling_core::session::SessionManager;
 use streamling_core::topology::SchemaIdOverride;
@@ -67,8 +70,10 @@ use rdkafka::util::Timeout;
 use rdkafka::{
     ClientConfig, ClientContext, Message, Offset, TopicPartitionList as KafkaTopicPartitionList,
 };
-use schema_registry_converter::async_impl::avro::{AvroDecoder, AvroEncoder};
-use schema_registry_converter::async_impl::schema_registry::{get_schema_by_subject, post_schema};
+use schema_registry_converter::async_impl::avro::AvroEncoder;
+use schema_registry_converter::async_impl::schema_registry::{
+    get_schema_by_id, get_schema_by_subject, post_schema,
+};
 use schema_registry_converter::schema_registry_common::{
     SchemaType, SubjectNameStrategy, SuppliedSchema,
 };
@@ -538,22 +543,6 @@ impl KafkaSourceExec {
         builder.create().expect("Failed to create client")
     }
 
-    fn create_decoder<'a>(config: KafkaConfig) -> AvroDecoder<'a> {
-        AvroDecoder::new(
-            config
-                .get_schema_registry_settings()
-                .expect("schema_registry_url is required for Avro format"),
-        )
-    }
-
-    fn create_converter(
-        schema: SchemaRef,
-        avro_schema: AvroSchema,
-        projection: Option<Vec<usize>>,
-    ) -> AvroToArrowConverter {
-        AvroToArrowConverter::new(schema, avro_schema, projection)
-    }
-
     fn extract_op_from_headers(headers: Option<&BorrowedHeaders>) -> Option<&str> {
         headers.and_then(|headers| {
             // no API to get a header by value >_<
@@ -959,12 +948,25 @@ impl ExecutionPlan for KafkaSourceExec {
         // local cache for the state backend
         let mut committed_offsets: Option<KafkaTopicPartitionList> = None;
 
-        let mut converter = Self::create_converter(
-            self.payload_schema.clone(),
-            self.avro_schema.clone(),
-            self.payload_projection.clone(),
-        );
-        let decoder = Self::create_decoder(self.kafka_config.clone());
+        // arrow-avro decode: the reader schema drives arrow-avro's schema resolution and supplies
+        // the target Arrow schema (== self.payload_schema). Writer schemas are registered by their
+        // Confluent registry id on demand (fetched from the registry the first time an id is seen);
+        // the reader schema is pre-registered under its own id so the common same-id case decodes
+        // without a fetch.
+        let sr_settings = self
+            .kafka_config
+            .get_schema_registry_settings()
+            .expect("schema_registry_url is required for Avro format");
+        let reader_schema_json = serde_json::to_string(&self.avro_schema)
+            .expect("reader avro schema serializes to JSON");
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&self.avro_schema)
+            .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?;
+        decoder
+            .register_writer_schema(self.reader_schema_id, &reader_schema_json)
+            .map_err(|e| streamling_err!("failed to register reader schema in arrow-avro store: {e}"))?;
+        let payload_schema = self.payload_schema.clone();
+        let payload_projection = self.payload_projection.clone();
 
         let full_schema = self.full_schema_projected.clone();
 
@@ -993,7 +995,6 @@ impl ExecutionPlan for KafkaSourceExec {
             &self.reference_name,
             true,
         );
-        let reader_avro_schema = self.avro_schema.clone();
         let reader_schema_id = self.reader_schema_id;
         let topic = self.topic.clone();
         // Subject convention: TopicNameStrategy with is_key=false yields "{topic}-value".
@@ -1014,7 +1015,13 @@ impl ExecutionPlan for KafkaSourceExec {
             // Unfortunately, the high-level StreamConsumer doesn't expose this method
             // So, instead, we trigger it indirectly by calling "next" on the stream
             // We'll seek to the correct position afterward based on state backend or config
-            Self::wait_for_initial_assignment_or_message(&consumer, &topic).await?;
+            // Anchor the spawned task's error type to DataFusionError. StreamlingError and
+            // DataFusionError convert both ways, so `?`'s `From::from` is ambiguous and the first
+            // `?` would otherwise pin the block to StreamlingError; `spawn` requires
+            // `Result<(), DataFusionError>`. An explicit typed `return Err(...)` fixes the type.
+            if let Err(e) = Self::wait_for_initial_assignment_or_message(&consumer, &topic).await {
+                return Err(DataFusionError::from(e));
+            }
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
@@ -1158,6 +1165,14 @@ impl ExecutionPlan for KafkaSourceExec {
 
                 let mut row_kinds = Vec::new();
                 let mut batch_row_count = 0u64;
+                // arrow-avro buffers decoded rows inside the Decoder until flush. Registering a new
+                // writer schema rebuilds the Decoder (the SchemaStore clone is a snapshot), which
+                // would drop rows buffered under the previous generation — so before each rebuild
+                // we flush the buffered rows into `pending_payload_batches` and concatenate them at
+                // the end of the batch. In the common case (one writer schema per batch) this is a
+                // single flush and no concat.
+                let mut pending_payload_batches: Vec<RecordBatch> = Vec::new();
+                let mut rows_in_current_decoder = 0u64;
 
                 loop {
                     tokio::select! {
@@ -1225,47 +1240,85 @@ impl ExecutionPlan for KafkaSourceExec {
                                         payload,
                                         &schema_id_overrides,
                                     );
-                                    let decoded = decoder
-                                        .decode_with_schema(patched.as_deref().or(payload))
-                                        .await
-                                        .streamling_with_context(|| format!(
-                                            "Avro decoding failed\n  topic: {}\n  partition: {}\n  offset: {}\n  patched: {}",
-                                            message.topic(),
-                                            message.partition(),
-                                            message.offset(),
-                                            patched.is_some()
-                                        ))?
-                                        .ok_or_else(|| streamling_err!(
-                                            "Avro decoder returned None (empty payload?)\n  topic: {}\n  partition: {}\n  offset: {}",
+                                    let frame = patched.as_deref().or(payload).ok_or_else(|| streamling_err!(
+                                        "Kafka message has empty payload\n  topic: {}\n  partition: {}\n  offset: {}",
+                                        message.topic(),
+                                        message.partition(),
+                                        message.offset()
+                                    ))?;
+                                    // Confluent wire format: 0x00 magic + 4-byte big-endian schema id.
+                                    if frame.len() < 5 || frame[0] != 0x00 {
+                                        return Err(DataFusionError::from(streamling_err!(
+                                            "payload is not Confluent-framed avro (len {}, first byte {:?})\n  topic: {}\n  partition: {}\n  offset: {}",
+                                            frame.len(),
+                                            frame.first(),
                                             message.topic(),
                                             message.partition(),
                                             message.offset()
-                                        ))?;
+                                        )));
+                                    }
+                                    let writer_schema_id =
+                                        u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
 
-                                    let resolved_value = if skip_schema_resolution {
-                                        decoded.value
-                                    } else {
-                                        match resolve_schema(
-                                            decoded.value,
-                                            &subject,
+                                    // Fetch + register the writer schema on first sight. Flush rows
+                                    // buffered under the current Decoder generation before the
+                                    // rebuild so they aren't lost.
+                                    if !decoder.has_writer_schema(writer_schema_id) {
+                                        if rows_in_current_decoder > 0 {
+                                            if let Some(b) = decoder.flush().streamling_with_context(|| format!(
+                                                "arrow-avro flush before schema {writer_schema_id} registration failed (topic: {topic})"
+                                            ))? {
+                                                pending_payload_batches.push(b);
+                                            }
+                                            rows_in_current_decoder = 0;
+                                        }
+                                        let registered = retry_registry_call(
+                                            format!("schema-registry get_schema_by_id(id={writer_schema_id})"),
+                                            || get_schema_by_id(writer_schema_id, &sr_settings),
+                                        ).await?;
+                                        decoder
+                                            .register_writer_schema(writer_schema_id, &registered.schema)
+                                            .streamling_with_context(|| format!(
+                                                "failed to register writer schema id {writer_schema_id} (topic: {topic})"
+                                            ))?;
+                                    }
+
+                                    // Preserve the writer-ahead fail-fast: when validation is on and
+                                    // the writer schema is newer than the reader for this subject,
+                                    // crash so the pod restarts and refetches the latest schema.
+                                    if !skip_schema_resolution
+                                        && validate_writer_schema_ordering
+                                        && writer_schema_id != reader_schema_id
+                                        && match is_writer_schema_ahead(
                                             &versions_client,
-                                            decoded.schema.id,
+                                            &subject,
+                                            writer_schema_id,
                                             reader_schema_id,
-                                            &reader_avro_schema,
-                                            validate_writer_schema_ordering,
                                         ).await {
-                                            Ok(value) => value,
+                                            Ok(ahead) => ahead,
                                             Err(e) => {
-                                                // fail fast to crash k8s pod and fetch latest schema
-                                                // TODO: look into graceful shutdown
-                                                tracing::error!(topic = %topic, "Schema resolution failed: {e}");
+                                                tracing::error!(topic = %topic, "writer-schema ordering check failed: {e}");
                                                 std::process::exit(1);
                                             }
                                         }
-                                    };
-                                    converter.buffer(resolved_value);
+                                    {
+                                        tracing::error!(
+                                            topic = %topic,
+                                            "writer_schema_id={writer_schema_id} is newer than reader_schema_id={reader_schema_id}. Restarting to fetch the newest schema"
+                                        );
+                                        std::process::exit(1);
+                                    }
+
+                                    decoder.decode(frame).streamling_with_context(|| format!(
+                                        "Avro decoding failed\n  topic: {}\n  partition: {}\n  offset: {}\n  patched: {}",
+                                        message.topic(),
+                                        message.partition(),
+                                        message.offset(),
+                                        patched.is_some()
+                                    ))?;
                                     watchdog.on_record();
                                     batch_row_count += 1;
+                                    rows_in_current_decoder += 1;
                                     metrics_recorder.record_count("input_rows", 1, metric_metadata_id.as_str());
                                     if batch_row_count >= batch_size_limit {
                                         break;
@@ -1294,7 +1347,29 @@ impl ExecutionPlan for KafkaSourceExec {
                     }
                 }
 
-                let payload_batch = converter.convert_to_batch()?;
+                // Drain any rows still buffered in the current Decoder generation, then assemble
+                // the full (unprojected) payload batch from all partials collected this batch.
+                if rows_in_current_decoder > 0 {
+                    if let Some(b) = decoder.flush().streamling_with_context(|| format!(
+                        "arrow-avro flush failed (topic: {topic})"
+                    ))? {
+                        pending_payload_batches.push(b);
+                    }
+                }
+                let payload_batch_full = match pending_payload_batches.len() {
+                    0 => RecordBatch::new_empty(payload_schema.clone()),
+                    1 => pending_payload_batches.pop().unwrap(),
+                    _ => concat_batches(&payload_schema, &pending_payload_batches)
+                        .map_err(DataFusionError::from)?,
+                };
+                pending_payload_batches.clear();
+                // Project to the requested payload columns (metadata/op columns are appended below).
+                let payload_batch = match &payload_projection {
+                    Some(projection) => payload_batch_full
+                        .project(projection)
+                        .map_err(DataFusionError::from)?,
+                    None => payload_batch_full,
+                };
 
                 let mut record_columns = payload_batch.columns().to_vec();
                 if should_enrich_op_column {
@@ -1469,7 +1544,7 @@ impl ExecutionPlan for KafkaSourceExec {
             // SafeKafkaConsumer's Drop impl handles early returns (errors) safely via spawn_blocking.
             consumer.forget();
 
-            Ok(())
+            Ok::<(), DataFusionError>(())
         });
 
         Ok(builder.build())

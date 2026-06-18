@@ -119,7 +119,10 @@ impl SubjectVersionsClient {
 /// `SRCError`'s own `retriable` flag (which the crate already sets for HTTP-layer failures and
 /// clears for non-retryable cases like parse errors). The retry helper applies exponential
 /// backoff with jitter and stops as soon as a non-retriable error surfaces.
-async fn retry_registry_call<F, Fut, T>(op_name: String, op: F) -> streamling_core::error::Result<T>
+pub(crate) async fn retry_registry_call<F, Fut, T>(
+    op_name: String,
+    op: F,
+) -> streamling_core::error::Result<T>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, SRCError>>,
@@ -146,6 +149,11 @@ where
 /// - When `validate_writer_schema_ordering` is true and the writer is newer than the reader for
 ///   the subject, return an error so the pipeline can fail-fast and refetch the latest schema.
 /// - Otherwise, apply Avro schema resolution against the reader's schema.
+///
+/// Superseded by arrow-avro's native writer→reader resolution in the Kafka decode path (the
+/// writer-ahead fail-fast is preserved separately via [`is_writer_schema_ahead`]). Retained with
+/// its unit tests pending the vendored-avro-path removal; remove together with `AvroArrowArrayReader`.
+#[allow(dead_code)]
 pub async fn resolve_schema(
     value: Value,
     subject: &str,
