@@ -45,6 +45,7 @@ arrow = "58.3.0"
 arrow-schema = { version = "58.3.0", default-features = false }
 arrow-data = "58.3.0"
 arrow-json = "58.3.0"
+arrow-avro = "58.3.0"
 # Bumped to 0.13 to match DataFusion 54's `object_store = "0.13.x"`
 object_store = { version = "0.13", features = ["aws", "gcp"] }
 
