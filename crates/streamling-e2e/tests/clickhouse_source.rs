@@ -601,3 +601,177 @@ sinks:
         );
     }
 }
+
+// ============================================================================
+// Scenario 5: Version-aware dedup activates when columns omit the version col
+// ============================================================================
+
+/// Regression: source-side ReplacingMergeTree dedup must activate even when
+/// the configured `columns` omit the inferred version column. This is the
+/// hybrid-source path — `ClickHouseSchemaAdapter::get_columns` projects
+/// ClickHouse to the unbounded source's (Kafka) target schema, which excludes
+/// ClickHouse housekeeping columns like `insert_timestamp` and `is_deleted`.
+///
+/// The fix force-includes the inferred version column in the internal scan
+/// and projects it back out before emission, so:
+///   1. dedup picks the max-`insert_timestamp` row per ORDER BY key,
+///   2. tombstone winners (`is_deleted=1`) drop the key entirely (FINAL),
+///   3. the external schema stays exactly the configured columns (no leaked
+///      `insert_timestamp` in the postgres sink table).
+#[tokio::test]
+async fn test_clickhouse_source_replacing_dedup_when_version_column_not_selected() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE replacing_dedup_test (
+                block_number UInt64,
+                id String,
+                payload String,
+                insert_timestamp DateTime,
+                is_deleted UInt8
+            ) ENGINE = ReplacingMergeTree(insert_timestamp, is_deleted)
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    // 5 distinct (block_number, id) keys, 9 raw rows. Each scenario probes a
+    // different dedup property; together they catch the activation regression
+    // regardless of ClickHouse part-read order.
+    //
+    //   (1, 'a')  — single version, sanity (must arrive once).
+    //   (2, 'b')  — newer insert_timestamp inserted second; dedup picks 'b_new'.
+    //   (3, 'c')  — newer insert_timestamp inserted FIRST; position-based dedup
+    //               would pick the wrong row, version-aware picks 'c_new'.
+    //   (4, 'd')  — tombstone has the max insert_timestamp → whole key dropped.
+    //   (5, 'e')  — tombstone is older than the live row → key kept as 'e_alive'.
+    clickhouse
+        .execute(
+            "INSERT INTO replacing_dedup_test VALUES
+                (1, 'a', 'a1',        toDateTime(1000), 0),
+                (2, 'b', 'b_old',     toDateTime(1000), 0),
+                (2, 'b', 'b_new',     toDateTime(2000), 0),
+                (3, 'c', 'c_new',     toDateTime(2000), 0),
+                (3, 'c', 'c_old',     toDateTime(1000), 0),
+                (4, 'd', 'd_alive',   toDateTime(1000), 0),
+                (4, 'd', 'd_deleted', toDateTime(2000), 1),
+                (5, 'e', 'e_alive',   toDateTime(2000), 0),
+                (5, 'e', 'e_deleted', toDateTime(1000), 1)",
+        )
+        .await
+        .expect("Failed to insert source data");
+
+    // The pipeline's `columns` deliberately OMIT `insert_timestamp` and
+    // `is_deleted` — replaying the hybrid-source projection that previously
+    // silently disabled dedup. (Comma-separated, no spaces: the topology
+    // parser splits on ',' without trimming.)
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: replacing_dedup_test
+    columns: "block_number,id,payload"
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: replacing_dedup_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            // Upper bound: 9 raw rows would be emitted without dedup. Bounded
+            // source completes naturally; the limit is a safety net.
+            PipelineOpts::new()
+                .record_limit(9)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    // (a) FINAL row count: 5 keys − 1 tombstoned key ('d') = 4.
+    let total = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.replacing_dedup_results")
+        .await
+        .expect("count query failed");
+    assert_eq!(
+        total, 4,
+        "ReplacingMergeTree FINAL semantics: 5 keys minus 1 tombstoned = 4"
+    );
+
+    // (b) Position-vs-version: 'c_new' has the higher `insert_timestamp` but
+    // was inserted FIRST, so a position-based or non-deduped reader would
+    // either pick 'c_old' or vary by scan order. Version-aware dedup picks
+    // 'c_new' deterministically.
+    let c_new = ctx
+        .postgres
+        .count(
+            "SELECT COUNT(*) FROM public.replacing_dedup_results \
+             WHERE id = 'c' AND payload = 'c_new'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        c_new, 1,
+        "max insert_timestamp must win for id='c' (got != 'c_new')"
+    );
+
+    // (c) Tombstone winner: key 'd' must be entirely absent.
+    let d = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.replacing_dedup_results WHERE id = 'd'")
+        .await
+        .unwrap();
+    assert_eq!(d, 0, "tombstoned key 'd' must be dropped (FINAL)");
+
+    // (d) Tombstone non-winner: 'e' survives as alive — an older delete must
+    // not displace a newer live row.
+    let e_alive = ctx
+        .postgres
+        .count(
+            "SELECT COUNT(*) FROM public.replacing_dedup_results \
+             WHERE id = 'e' AND payload = 'e_alive'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        e_alive, 1,
+        "older tombstone must not delete a newer live row for id='e'"
+    );
+
+    // (e) External schema contract: the force-included version column is
+    // projected out before emission, so the postgres table only carries the
+    // configured columns (plus any standard sink columns) — never
+    // `insert_timestamp` or `is_deleted`.
+    let cols = ctx
+        .postgres
+        .get_column_names("replacing_dedup_results")
+        .await
+        .unwrap();
+    assert!(
+        !cols.iter().any(|c| c == "insert_timestamp"),
+        "insert_timestamp must be projected out before emission (got columns: {:?})",
+        cols
+    );
+    assert!(
+        !cols.iter().any(|c| c == "is_deleted"),
+        "is_deleted must not leak into the external schema (got columns: {:?})",
+        cols
+    );
+}
