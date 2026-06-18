@@ -17,6 +17,7 @@ use streamling_core::error::{ResultExt, StreamlingError};
 use streamling_core::functions::byte_reverse::ReverseBytes32Func;
 use streamling_core::streamling_err;
 use streamling_core::types::{i256::I256Type, u256::U256Type};
+use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
 use streamling_core::utils::parse_primary_key_columns;
 
 use crate::util::parallel::parallel_execute;
@@ -114,6 +115,93 @@ fn is_timeout_error(error: &DataFusionError) -> bool {
     let error_msg = error.to_string().to_lowercase();
     error_msg.contains("timeout") || error_msg.contains("timed out")
 }
+/// Version / is_deleted columns inferred from a ReplacingMergeTree-family
+/// `engine_full` string. Either may be `None` (e.g. plain `ReplacingMergeTree()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplacingMergeTreeDedup {
+    pub version_column: Option<String>,
+    pub is_deleted_column: Option<String>,
+}
+
+/// Parse the version and is_deleted column names out of a `system.tables.engine_full`
+/// value for a ReplacingMergeTree-family engine.
+///
+/// Example: `SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', insert_timestamp, is_deleted)`
+/// The quoted path/replica literals are dropped; the remaining bare identifiers
+/// are, in order, the version column and the is_deleted column. This holds for
+/// every variant (`ReplacingMergeTree`, `ReplicatedReplacingMergeTree`,
+/// `SharedReplacingMergeTree`): the path/replica args are always quoted, while
+/// the version/is_deleted args are always bare column identifiers.
+///
+/// Returns `None` for non-ReplacingMergeTree engines (no version concept).
+pub(crate) fn parse_replacing_merge_tree_dedup(
+    engine_full: &str,
+) -> Option<ReplacingMergeTreeDedup> {
+    let engine_full = engine_full.trim();
+    let open = engine_full.find('(')?;
+    let engine_name = engine_full[..open].trim();
+    if !engine_name.to_ascii_lowercase().contains("replacing") {
+        return None;
+    }
+    let close = engine_full.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let args = &engine_full[open + 1..close];
+
+    // Bare identifiers (version, is_deleted), in order: every token that isn't a
+    // quoted string literal.
+    let bare: Vec<String> = tokenize_engine_args(args)
+        .into_iter()
+        .filter(|tok| !tok.starts_with('\''))
+        .map(|tok| tok.trim().to_string())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+
+    let mut iter = bare.into_iter();
+    Some(ReplacingMergeTreeDedup {
+        version_column: iter.next(),
+        is_deleted_column: iter.next(),
+    })
+}
+
+/// Split engine args on top-level commas, preserving single-quoted string
+/// literals (with `''` escapes). Quoted tokens keep their quotes so callers can
+/// distinguish them from bare identifiers.
+fn tokenize_engine_args(args: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = args.chars().peekable();
+    let mut in_quote = false;
+    while let Some(c) = chars.next() {
+        if in_quote {
+            current.push(c);
+            if c == '\'' && matches!(chars.peek(), Some('\'')) {
+                // '' is an escaped quote; stay inside the literal.
+                chars.next();
+                current.push('\'');
+            } else if c == '\'' {
+                in_quote = false;
+            }
+        } else {
+            match c {
+                '\'' => {
+                    in_quote = true;
+                    current.push(c);
+                }
+                ',' => {
+                    tokens.push(current.trim().to_string());
+                    current = String::new();
+                }
+                _ => current.push(c),
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        tokens.push(current.trim().to_string());
+    }
+    tokens
+}
 
 #[derive(Clone, Debug)]
 pub struct ClickHouseTableProvider {
@@ -135,6 +223,9 @@ struct SourceParams {
     sort_key_range: i64,
     table_name: String,
     has_persisted_split: bool,
+    /// Inferred ReplacingMergeTree version column. When `Some`, each fully-read
+    /// page is coalesced and deduplicated by max version before emission.
+    dedup_version_column: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +372,37 @@ impl ClickHouseTableProvider {
             }
         };
 
+        // Infer the ReplacingMergeTree version column from engine_full so the
+        // scan can deduplicate by max version (keyed on the table's ORDER BY),
+        // not by row position. Dedup only engages when the inferred version
+        // column is actually present in the fetched schema; otherwise the scan
+        // emits raw rows as before.
+        let dedup_version_column = match client.fetch_engine_full(&database_name, table_name) {
+            Ok(engine_full) => {
+                let inferred = parse_replacing_merge_tree_dedup(&engine_full)
+                    .and_then(|d| d.version_column)
+                    .filter(|col| schema.field_with_name(col).is_ok());
+                match &inferred {
+                    Some(col) => info!(
+                        "[{}] ReplacingMergeTree version-aware dedup enabled (version_column={})",
+                        reference_name, col
+                    ),
+                    None => debug!(
+                        "[{}] no ReplacingMergeTree version column inferred; emitting raw rows",
+                        reference_name
+                    ),
+                }
+                inferred
+            }
+            Err(e) => {
+                warn!(
+                    "[{}] could not fetch engine_full for dedup inference ({}); version-aware dedup disabled",
+                    reference_name, e
+                );
+                None
+            }
+        };
+
         let source_params = SourceParams {
             query_builder: query_builder.clone(),
             sorting_keys,
@@ -290,6 +412,7 @@ impl ClickHouseTableProvider {
             sort_key_range,
             table_name: table_name.to_string(),
             has_persisted_split,
+            dedup_version_column,
         };
         Ok(ClickHouseTableProvider {
             reference_name: reference_name.clone(),
@@ -1014,6 +1137,11 @@ impl ExecutionPlan for ClickHouseSourceExec {
             args: self.split.args.clone(),
         }));
         let state_store = source_params.state_store.clone();
+        // Version-aware dedup (inferred from engine_full in new_source). The
+        // dedup key is the table's full ORDER BY, so all duplicate versions of a
+        // key share a `block_number` and land in the same page.
+        let dedup_version_column = source_params.dedup_version_column.clone();
+        let dedup_key = source_params.sorting_keys.join(",");
         let empty_batch_schema = schema.clone();
 
         // Shared checkpoint buffer for metadata propagation
@@ -1283,7 +1411,44 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 receiver_dropped = true;
                             }
                         } else {
-                            for batch in batches.into_iter() {
+                            // When a version column was inferred, coalesce the
+                            // whole page and deduplicate by max version before
+                            // emitting: versions of one ORDER BY key can be split
+                            // across the page's IPC blocks, so per-batch dedup
+                            // would miss them. Keys whose winner is a tombstone
+                            // (_gs_op='d') are dropped (ReplacingMergeTree FINAL).
+                            let emit_batches: Vec<RecordBatch> = match &dedup_version_column {
+                                Some(version_col) => {
+                                    match deduplicate_record_batches_by_version(
+                                        &batches,
+                                        &dedup_key,
+                                        version_col,
+                                        Some(&TombstoneRule {
+                                            column: "_gs_op".to_string(),
+                                            value: "d".to_string(),
+                                        }),
+                                    ) {
+                                        Ok(deduped) if deduped.num_rows() == 0 => {
+                                            vec![RecordBatch::new_empty(empty_batch_schema.clone())]
+                                        }
+                                        Ok(deduped) => vec![deduped],
+                                        Err(e) => {
+                                            let _ = tx
+                                                .send(Err(DataFusionError::from(
+                                                    streamling_err!(
+                                                        "ClickHouse source dedup failed: {}",
+                                                        e
+                                                    ),
+                                                )))
+                                                .await;
+                                            break;
+                                        }
+                                    }
+                                }
+                                None => batches,
+                            };
+
+                            for batch in emit_batches.into_iter() {
                                 let batch = attach_checkpoints(batch);
                                 if tx.send(Ok(batch)).await.is_err() {
                                     receiver_dropped = true;
@@ -1698,6 +1863,32 @@ impl ClickHouseClient {
             .filter(|s| !s.is_empty())
             .collect::<Vec<String>>();
         Ok(sorting_keys)
+    }
+    /// Fetch the full engine declaration string (e.g.
+    /// `SharedReplacingMergeTree('...', '{replica}', insert_timestamp, is_deleted)`)
+    /// from `system.tables`. Used to infer the ReplacingMergeTree version and
+    /// is_deleted columns for source-side dedup.
+    pub fn fetch_engine_full(
+        &self,
+        database_name: &str,
+        table_name: &str,
+    ) -> streamling_core::error::Result<String> {
+        let query = format!(
+            "SELECT engine_full FROM system.tables WHERE database = '{}' AND name = '{}' FORMAT Arrow",
+            database_name, table_name
+        );
+        let response_bytes = block_on(async {
+            let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+            self.process_http_response(response_result, query.as_str(), "engine_full")
+                .await
+        })?;
+        let mut reader = self.create_arrow_reader(response_bytes, &query)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| streamling_err!("no rows returned for engine_full query"))??;
+        let scalar = ScalarValue::try_from_array(&batch.column(0), 0)
+            .streamling_context("failed to extract engine_full from query result")?;
+        Ok(scalar.to_string())
     }
 
     pub async fn fetch_max_sorting_key(
@@ -2499,6 +2690,59 @@ mod tests {
             args: vec![ScalarValue::Int64(Some(1000))],
         };
         assert_eq!(split.range_start(), Some(1000));
+    }
+
+    #[test]
+    fn parse_shared_replacing_mergetree_full() {
+        let d = parse_replacing_merge_tree_dedup(
+            "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', insert_timestamp, is_deleted)",
+        )
+        .expect("Replacing variant should parse");
+        assert_eq!(d.version_column.as_deref(), Some("insert_timestamp"));
+        assert_eq!(d.is_deleted_column.as_deref(), Some("is_deleted"));
+    }
+
+    #[test]
+    fn parse_replicated_replacing_mergetree() {
+        let d = parse_replacing_merge_tree_dedup(
+            "ReplicatedReplacingMergeTree('/clickhouse/path', 'replica1', version_col)",
+        )
+        .expect("Replicated variant should parse");
+        assert_eq!(d.version_column.as_deref(), Some("version_col"));
+        assert_eq!(d.is_deleted_column, None);
+    }
+
+    #[test]
+    fn parse_plain_replacing_mergetree() {
+        let d = parse_replacing_merge_tree_dedup("ReplacingMergeTree(insert_time)")
+            .expect("plain variant should parse");
+        assert_eq!(d.version_column.as_deref(), Some("insert_time"));
+        assert_eq!(d.is_deleted_column, None);
+    }
+
+    #[test]
+    fn parse_plain_replacing_mergetree_no_args() {
+        let d = parse_replacing_merge_tree_dedup("ReplacingMergeTree()")
+            .expect("no-arg variant should still parse");
+        assert_eq!(d.version_column, None);
+        assert_eq!(d.is_deleted_column, None);
+    }
+
+    #[test]
+    fn parse_non_replacing_engine_returns_none() {
+        assert!(parse_replacing_merge_tree_dedup("MergeTree()").is_none());
+        assert!(parse_replacing_merge_tree_dedup("CollapsingMergeTree(sign)").is_none());
+    }
+
+    #[test]
+    fn parse_engine_with_comma_in_path() {
+        // A zk path with a comma inside the quoted literal must not be split.
+        let d = parse_replacing_merge_tree_dedup(
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard},weird,name', '{replica}', v, d)",
+        )
+        .expect("quoted commas must be ignored");
+        assert_eq!(d.version_column.as_deref(), Some("v"));
+        assert_eq!(d.is_deleted_column.as_deref(), Some("d"));
     }
 
     #[test]
@@ -3787,6 +4031,7 @@ mod tests {
                 sort_key_range: 1_000_000,
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
+                dedup_version_column: None,
             }),
             sink_params: None,
             metric_metadata_id: "test_metric".to_string(),
