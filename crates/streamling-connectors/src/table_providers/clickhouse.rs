@@ -115,6 +115,24 @@ fn is_timeout_error(error: &DataFusionError) -> bool {
     let error_msg = error.to_string().to_lowercase();
     error_msg.contains("timeout") || error_msg.contains("timed out")
 }
+
+/// Drop the column at `drop_idx` and re-tag the batch with `target_schema`.
+/// Strips a dedup-only version column (force-included because the configured
+/// columns omit it) before emission, so the external schema is unchanged.
+fn project_out_column(
+    batch: RecordBatch,
+    drop_idx: usize,
+    target_schema: SchemaRef,
+) -> Result<RecordBatch, DataFusionError> {
+    let kept: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != drop_idx)
+        .map(|(_, c)| Arc::clone(c))
+        .collect();
+    RecordBatch::try_new(target_schema, kept).map_err(Into::into)
+}
 /// Version / is_deleted columns inferred from a ReplacingMergeTree-family
 /// `engine_full` string. Either may be `None` (e.g. plain `ReplacingMergeTree()`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +244,10 @@ struct SourceParams {
     /// Inferred ReplacingMergeTree version column. When `Some`, each fully-read
     /// page is coalesced and deduplicated by max version before emission.
     dedup_version_column: Option<String>,
+    /// Index of the dedup-only version column within the scan batch, when it
+    /// was force-included (not part of the configured columns). Such a column
+    /// is projected back out before emission so the external schema is unchanged.
+    project_out_version_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,15 +287,76 @@ impl ClickHouseTableProvider {
         let sort_key_range_config = config.sort_key_range;
         let client = ClickHouseClient::new(config.connection.clone());
 
-        let columns_copy = columns.clone();
-        let schema = client
-            .fetch_schema(table_name, columns)
-            .streamling_with_context(|| {
-                format!(
-                    "failed to fetch schema from ClickHouse for table '{}'",
-                    table_name
-                )
-            })?;
+        // Infer the ReplacingMergeTree version column from engine_full so the
+        // scan can deduplicate by max version (keyed on the table's ORDER BY),
+        // not by row position.
+        let inferred_version_column: Option<String> = match client
+            .fetch_engine_full(&database_name, table_name)
+        {
+            Ok(engine_full) => {
+                parse_replacing_merge_tree_dedup(&engine_full).and_then(|d| d.version_column)
+            }
+            Err(e) => {
+                warn!(
+                    "[{}] could not fetch engine_full for dedup inference ({}); version-aware dedup disabled",
+                    reference_name, e
+                );
+                None
+            }
+        };
+
+        // The version column is force-included in the scan for dedup even when
+        // the configured columns omit it — a hybrid source projects ClickHouse
+        // to the Kafka schema, which excludes insert_timestamp/is_deleted. It
+        // is projected back out before emission, so the external schema contract
+        // is unchanged. `*` already selects every column, so nothing is added.
+        let user_columns = columns.clone().unwrap_or_else(|| vec!["*".to_string()]);
+        let star_select = user_columns.iter().any(|c| c == "*");
+        let mut scan_columns = user_columns.clone();
+        let mut added_version = false;
+        if let Some(vc) = &inferred_version_column {
+            let already_selected = star_select || user_columns.iter().any(|c| c == vc);
+            if !already_selected {
+                scan_columns.push(vc.clone());
+                added_version = true;
+            }
+        }
+
+        // Fetch the schema the scan will produce. If we appended an inferred
+        // version column that doesn't actually exist, the fetch errors and we
+        // fall back to the configured columns with dedup disabled.
+        let (scan_schema, scan_columns, dedup_version_column, project_out_version_index) =
+            match client.fetch_schema(table_name, Some(scan_columns.clone())) {
+                Ok(s) => {
+                    let dvc = inferred_version_column
+                        .clone()
+                        .filter(|vc| s.field_with_name(vc).is_ok());
+                    let pvi = if added_version {
+                        dvc.as_ref().and_then(|vc| s.index_of(vc).ok())
+                    } else {
+                        None
+                    };
+                    (s, scan_columns, dvc, pvi)
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] inferred version column '{}' not selectable; dedup disabled ({})",
+                        reference_name,
+                        inferred_version_column.as_deref().unwrap_or("?"),
+                        e
+                    );
+                    let fallback = user_columns.clone();
+                    let s = client
+                        .fetch_schema(table_name, Some(fallback.clone()))
+                        .streamling_with_context(|| {
+                            format!(
+                                "failed to fetch schema from ClickHouse for table '{}'",
+                                table_name
+                            )
+                        })?;
+                    (s, fallback, None, None)
+                }
+            };
         let sorting_keys = client
             .fetch_sorting_keys(&database_name, table_name)
             .streamling_with_context(|| {
@@ -300,7 +383,7 @@ impl ClickHouseTableProvider {
         // Narrow types (Int8, UInt8, Int16, UInt16) would silently overflow in
         // i128_to_scalar_like when computing sort key range boundaries.
         let first_key_name = sorting_keys.first().unwrap();
-        let first_key_type = schema
+        let first_key_type = scan_schema
             .field_with_name(first_key_name)
             .ok()
             .map(|f| f.data_type().clone());
@@ -333,7 +416,7 @@ impl ClickHouseTableProvider {
 
         let mut query_builder = ClickHouseQueryBuilder::of(
             table_name.to_string(),
-            columns_copy.unwrap_or(vec!["*".to_string()]),
+            scan_columns.clone(),
             filter.clone(),
             Some(pagination_config),
         );
@@ -372,36 +455,39 @@ impl ClickHouseTableProvider {
             }
         };
 
-        // Infer the ReplacingMergeTree version column from engine_full so the
-        // scan can deduplicate by max version (keyed on the table's ORDER BY),
-        // not by row position. Dedup only engages when the inferred version
-        // column is actually present in the fetched schema; otherwise the scan
-        // emits raw rows as before.
-        let dedup_version_column = match client.fetch_engine_full(&database_name, table_name) {
-            Ok(engine_full) => {
-                let inferred = parse_replacing_merge_tree_dedup(&engine_full)
-                    .and_then(|d| d.version_column)
-                    .filter(|col| schema.field_with_name(col).is_ok());
-                match &inferred {
-                    Some(col) => info!(
-                        "[{}] ReplacingMergeTree version-aware dedup enabled (version_column={})",
-                        reference_name, col
-                    ),
-                    None => debug!(
-                        "[{}] no ReplacingMergeTree version column inferred; emitting raw rows",
-                        reference_name
-                    ),
-                }
-                inferred
+        // Provider schema exposed downstream: the scan schema with a
+        // dedup-only version column (force-included because the configured
+        // columns omit it) projected back out, so the external contract — e.g.
+        // a hybrid source's Kafka-matching schema — is unchanged.
+        let schema: SchemaRef = match project_out_version_index {
+            Some(idx) => {
+                let fields: Vec<arrow_schema::Field> = scan_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, f)| f.as_ref().clone())
+                    .collect();
+                Arc::new(arrow_schema::Schema::new_with_metadata(
+                    fields,
+                    scan_schema.metadata().clone(),
+                ))
             }
-            Err(e) => {
-                warn!(
-                    "[{}] could not fetch engine_full for dedup inference ({}); version-aware dedup disabled",
-                    reference_name, e
-                );
-                None
-            }
+            None => scan_schema.clone(),
         };
+
+        match &dedup_version_column {
+            Some(col) => info!(
+                "[{}] ReplacingMergeTree version-aware dedup enabled (version_column={}, force_included={})",
+                reference_name,
+                col,
+                project_out_version_index.is_some()
+            ),
+            None => debug!(
+                "[{}] no ReplacingMergeTree version column inferred; emitting raw rows",
+                reference_name
+            ),
+        }
 
         let source_params = SourceParams {
             query_builder: query_builder.clone(),
@@ -413,6 +499,7 @@ impl ClickHouseTableProvider {
             table_name: table_name.to_string(),
             has_persisted_split,
             dedup_version_column,
+            project_out_version_index,
         };
         Ok(ClickHouseTableProvider {
             reference_name: reference_name.clone(),
@@ -1142,6 +1229,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
         // key share a `block_number` and land in the same page.
         let dedup_version_column = source_params.dedup_version_column.clone();
         let dedup_key = source_params.sorting_keys.join(",");
+        let project_out_version_index = source_params.project_out_version_index;
         let empty_batch_schema = schema.clone();
 
         // Shared checkpoint buffer for metadata propagation
@@ -1417,42 +1505,74 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             // across the page's IPC blocks, so per-batch dedup
                             // would miss them. Keys whose winner is a tombstone
                             // (_gs_op='d') are dropped (ReplacingMergeTree FINAL).
-                            let emit_batches: Vec<RecordBatch> = match &dedup_version_column {
-                                Some(version_col) => {
-                                    match deduplicate_record_batches_by_version(
-                                        &batches,
-                                        &dedup_key,
-                                        version_col,
-                                        Some(&TombstoneRule {
-                                            column: "_gs_op".to_string(),
-                                            value: "d".to_string(),
-                                        }),
-                                    ) {
-                                        Ok(deduped) if deduped.num_rows() == 0 => {
-                                            vec![RecordBatch::new_empty(empty_batch_schema.clone())]
+                            let (mut emit_batches, deduped_to_empty): (Vec<RecordBatch>, bool) =
+                                match &dedup_version_column {
+                                    Some(version_col) => {
+                                        match deduplicate_record_batches_by_version(
+                                            &batches,
+                                            &dedup_key,
+                                            version_col,
+                                            Some(&TombstoneRule {
+                                                column: "_gs_op".to_string(),
+                                                value: "d".to_string(),
+                                            }),
+                                        ) {
+                                            Ok(deduped) if deduped.num_rows() == 0 => {
+                                                (Vec::new(), true)
+                                            }
+                                            Ok(deduped) => (vec![deduped], false),
+                                            Err(e) => {
+                                                let _ = tx
+                                                    .send(Err(DataFusionError::from(
+                                                        streamling_err!(
+                                                            "ClickHouse source dedup failed: {}",
+                                                            e
+                                                        ),
+                                                    )))
+                                                    .await;
+                                                break;
+                                            }
                                         }
-                                        Ok(deduped) => vec![deduped],
+                                    }
+                                    None => (batches, false),
+                                };
+
+                            if deduped_to_empty {
+                                // Every key in this page was tombstoned. Emit one
+                                // empty provider_schema batch so any buffered
+                                // checkpoint messages still flow.
+                                let empty_batch = attach_checkpoints(RecordBatch::new_empty(
+                                    empty_batch_schema.clone(),
+                                ));
+                                if tx.send(Ok(empty_batch)).await.is_err() {
+                                    receiver_dropped = true;
+                                }
+                            } else {
+                                // Strip the dedup-only version column (if it was
+                                // force-included) so the emitted batches match
+                                // the external schema. Projection is total — a
+                                // failure here is unrecoverable for the scan.
+                                if let Some(drop_idx) = project_out_version_index {
+                                    match emit_batches
+                                        .into_iter()
+                                        .map(|b| {
+                                            project_out_column(b, drop_idx, schema.clone())
+                                        })
+                                        .collect::<Result<Vec<_>>>()
+                                    {
+                                        Ok(p) => emit_batches = p,
                                         Err(e) => {
-                                            let _ = tx
-                                                .send(Err(DataFusionError::from(
-                                                    streamling_err!(
-                                                        "ClickHouse source dedup failed: {}",
-                                                        e
-                                                    ),
-                                                )))
-                                                .await;
+                                            let _ = tx.send(Err(e)).await;
                                             break;
                                         }
                                     }
                                 }
-                                None => batches,
-                            };
-
-                            for batch in emit_batches.into_iter() {
-                                let batch = attach_checkpoints(batch);
-                                if tx.send(Ok(batch)).await.is_err() {
-                                    receiver_dropped = true;
-                                    break;
+                                for batch in emit_batches.into_iter() {
+                                    let batch = attach_checkpoints(batch);
+                                    if tx.send(Ok(batch)).await.is_err() {
+                                        receiver_dropped = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -4032,6 +4152,7 @@ mod tests {
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
                 dedup_version_column: None,
+                project_out_version_index: None,
             }),
             sink_params: None,
             metric_metadata_id: "test_metric".to_string(),
