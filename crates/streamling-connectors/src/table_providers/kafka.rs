@@ -17,12 +17,14 @@ use streamling_core::{
 use crate::table_providers::kafka::config_optimizer::KafkaConfigOptimizer;
 use crate::table_providers::kafka::metadata::KafkaMetadata;
 use crate::table_providers::kafka::schema_registry::{
-    SubjectVersionsClient, patch_schema_id_with_overrides, resolve_schema,
+    SubjectVersionsClient, is_writer_schema_ahead, patch_schema_id_with_overrides,
+    retry_registry_call,
 };
 use apache_avro::Schema as AvroSchema;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::arrow::array::{RecordBatch, StringArray};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, not_impl_err};
@@ -41,9 +43,10 @@ use datafusion::physical_plan::{
     project_schema,
     projection::ProjectionExec,
 };
+use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
 use streamling_core::formats::avro::{
-    AvroToArrowConverter, FromArrowToAvroConverter, convert_avro_schema_to_arrow,
-    post_process_avro_schema_for_writing, to_avro,
+    FromArrowToAvroConverter, convert_avro_schema_to_arrow, post_process_avro_schema_for_writing,
+    to_avro,
 };
 use streamling_core::formats::json::{FromArrowToJsonConverter, JsonToArrowConverter};
 use streamling_core::formats::{FromArrowConverter, ToArrowConverter};
@@ -71,8 +74,10 @@ use rdkafka::util::Timeout;
 use rdkafka::{
     ClientConfig, ClientContext, Message, Offset, TopicPartitionList as KafkaTopicPartitionList,
 };
-use schema_registry_converter::async_impl::avro::{AvroDecoder, AvroEncoder};
-use schema_registry_converter::async_impl::schema_registry::{get_schema_by_subject, post_schema};
+use schema_registry_converter::async_impl::avro::AvroEncoder;
+use schema_registry_converter::async_impl::schema_registry::{
+    SrSettings, get_schema_by_id, get_schema_by_subject, post_schema,
+};
 use schema_registry_converter::schema_registry_common::{
     SchemaType, SubjectNameStrategy, SuppliedSchema,
 };
@@ -306,87 +311,167 @@ pub(crate) struct AvroSourceDecoding {
 /// Per-stream payload decoder, built from [`KafkaSourceDecoding`] when the consumer task
 /// starts. Mirrors the sink-side `KafkaSinkConverter`: each variant owns exactly the state
 /// its format needs. The Avro state is boxed to keep the variant sizes balanced.
-enum KafkaSourceConverter<'a> {
-    Avro(Box<AvroStreamConverter<'a>>),
+enum KafkaSourceConverter {
+    Avro(Box<AvroStreamConverter>),
     Json(Box<JsonToArrowConverter>),
 }
 
-struct AvroStreamConverter<'a> {
-    converter: AvroToArrowConverter,
-    decoder: AvroDecoder<'a>,
+/// Confluent-framed Avro decode via arrow-avro. Writer schemas are registered by their
+/// registry id on demand (fetched the first time an id is seen); the reader schema is
+/// pre-registered under its own id so the common same-id case decodes without a fetch.
+///
+/// arrow-avro's `Decoder` buffers rows across `decode` calls; a batch is materialized by
+/// `flush`. Because a `Decoder` is bound to a single writer schema, a new writer id forces
+/// a rebuild — we flush the current "generation" into `pending_payload_batches` first so no
+/// rows are lost, and concatenate all generations when the source batch is assembled.
+struct AvroStreamConverter {
+    decoder: ConfluentAvroDecoder,
+    sr_settings: SrSettings,
     versions_client: Arc<SubjectVersionsClient>,
     subject: String,
     reader_schema_id: u32,
-    reader_avro_schema: AvroSchema,
     skip_schema_resolution: bool,
     validate_writer_schema_ordering: bool,
     schema_id_overrides: HashMap<u32, u32>,
+    topic: String,
+    /// Full (unprojected) payload schema the decoder emits into; also the concat schema.
+    payload_schema: SchemaRef,
+    payload_projection: Option<Vec<usize>>,
+    /// Batches flushed from earlier writer-schema generations in the current source batch.
+    pending_payload_batches: Vec<RecordBatch>,
+    /// Rows buffered in the current `Decoder` generation but not yet flushed.
+    rows_in_current_decoder: u64,
 }
 
-impl KafkaSourceConverter<'_> {
+impl AvroStreamConverter {
+    async fn decode_and_buffer(&mut self, message: &BorrowedMessage<'_>) -> Result<()> {
+        let payload = message.payload();
+        let patched = patch_schema_id_with_overrides(payload, &self.schema_id_overrides);
+        let frame = patched.as_deref().or(payload).ok_or_else(|| {
+            streamling_err!(
+                "Kafka message has empty payload\n  topic: {}\n  partition: {}\n  offset: {}",
+                message.topic(),
+                message.partition(),
+                message.offset()
+            )
+        })?;
+        // Confluent wire format: 0x00 magic + 4-byte big-endian schema id.
+        if frame.len() < 5 || frame[0] != 0x00 {
+            return Err(datafusion::error::DataFusionError::from(streamling_err!(
+                "payload is not Confluent-framed avro (len {}, first byte {:?})\n  topic: {}\n  partition: {}\n  offset: {}",
+                frame.len(),
+                frame.first(),
+                message.topic(),
+                message.partition(),
+                message.offset()
+            )));
+        }
+        let writer_schema_id = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+
+        // Fetch + register the writer schema on first sight. Flush rows buffered under the
+        // current Decoder generation before the rebuild so they aren't lost.
+        if !self.decoder.has_writer_schema(writer_schema_id) {
+            if self.rows_in_current_decoder > 0 {
+                if let Some(b) = self.decoder.flush().streamling_with_context(|| {
+                    format!(
+                        "arrow-avro flush before schema {writer_schema_id} registration failed (topic: {})",
+                        self.topic
+                    )
+                })? {
+                    self.pending_payload_batches.push(b);
+                }
+                self.rows_in_current_decoder = 0;
+            }
+            let registered = retry_registry_call(
+                format!("schema-registry get_schema_by_id(id={writer_schema_id})"),
+                || get_schema_by_id(writer_schema_id, &self.sr_settings),
+            )
+            .await?;
+            self.decoder
+                .register_writer_schema(writer_schema_id, &registered.schema)
+                .streamling_with_context(|| {
+                    format!(
+                        "failed to register writer schema id {writer_schema_id} (topic: {})",
+                        self.topic
+                    )
+                })?;
+        }
+
+        // Preserve the writer-ahead fail-fast: when validation is on and the writer schema is
+        // newer than the reader for this subject, crash so the pod restarts and refetches the
+        // latest schema.
+        if !self.skip_schema_resolution
+            && self.validate_writer_schema_ordering
+            && writer_schema_id != self.reader_schema_id
+            && match is_writer_schema_ahead(
+                &self.versions_client,
+                &self.subject,
+                writer_schema_id,
+                self.reader_schema_id,
+            )
+            .await
+            {
+                Ok(ahead) => ahead,
+                Err(e) => {
+                    error!(topic = %self.topic, "writer-schema ordering check failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        {
+            error!(
+                topic = %self.topic,
+                "writer_schema_id={writer_schema_id} is newer than reader_schema_id={}. Restarting to fetch the newest schema",
+                self.reader_schema_id
+            );
+            std::process::exit(1);
+        }
+
+        self.decoder.decode(frame).streamling_with_context(|| {
+            format!(
+                "Avro decoding failed\n  topic: {}\n  partition: {}\n  offset: {}\n  patched: {}",
+                message.topic(),
+                message.partition(),
+                message.offset(),
+                patched.is_some()
+            )
+        })?;
+        self.rows_in_current_decoder += 1;
+        Ok(())
+    }
+
+    /// Drain any rows still buffered in the current Decoder generation, assemble the full
+    /// (unprojected) payload batch from all generations collected this source batch, then
+    /// apply the payload column projection.
+    fn convert_to_batch(&mut self) -> Result<RecordBatch> {
+        if self.rows_in_current_decoder > 0 {
+            if let Some(b) = self.decoder.flush().streamling_with_context(|| {
+                format!("arrow-avro flush failed (topic: {})", self.topic)
+            })? {
+                self.pending_payload_batches.push(b);
+            }
+            self.rows_in_current_decoder = 0;
+        }
+        let payload_batch_full = match self.pending_payload_batches.len() {
+            0 => RecordBatch::new_empty(self.payload_schema.clone()),
+            1 => self.pending_payload_batches.pop().unwrap(),
+            _ => concat_batches(&self.payload_schema, &self.pending_payload_batches)
+                .map_err(datafusion::error::DataFusionError::from)?,
+        };
+        self.pending_payload_batches.clear();
+        match &self.payload_projection {
+            Some(projection) => payload_batch_full
+                .project(projection)
+                .map_err(datafusion::error::DataFusionError::from),
+            None => Ok(payload_batch_full),
+        }
+    }
+}
+
+impl KafkaSourceConverter {
     /// Decode a single Kafka message payload and buffer it for the next batch.
     async fn decode_and_buffer(&mut self, message: &BorrowedMessage<'_>) -> Result<()> {
         match self {
-            KafkaSourceConverter::Avro(avro) => {
-                let AvroStreamConverter {
-                    converter,
-                    decoder,
-                    versions_client,
-                    subject,
-                    reader_schema_id,
-                    reader_avro_schema,
-                    skip_schema_resolution,
-                    validate_writer_schema_ordering,
-                    schema_id_overrides,
-                } = avro.as_mut();
-                let payload = message.payload();
-                let patched = patch_schema_id_with_overrides(payload, schema_id_overrides);
-                let decoded = decoder
-                    .decode_with_schema(patched.as_deref().or(payload))
-                    .await
-                    .streamling_with_context(|| {
-                        format!(
-                            "Avro decoding failed\n  topic: {}\n  partition: {}\n  offset: {}\n  patched: {}",
-                            message.topic(),
-                            message.partition(),
-                            message.offset(),
-                            patched.is_some()
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        streamling_err!(
-                            "Avro decoder returned None (empty payload?)\n  topic: {}\n  partition: {}\n  offset: {}",
-                            message.topic(),
-                            message.partition(),
-                            message.offset()
-                        )
-                    })?;
-
-                let resolved_value = if *skip_schema_resolution {
-                    decoded.value
-                } else {
-                    match resolve_schema(
-                        decoded.value,
-                        subject.as_str(),
-                        versions_client.as_ref(),
-                        decoded.schema.id,
-                        *reader_schema_id,
-                        reader_avro_schema,
-                        *validate_writer_schema_ordering,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(e) => {
-                            // fail fast to terminate and fetch latest schema
-                            // TODO: look into graceful shutdown
-                            error!(topic = %message.topic(), "Schema resolution failed: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                };
-                converter.buffer(resolved_value);
-            }
+            KafkaSourceConverter::Avro(avro) => avro.decode_and_buffer(message).await,
             KafkaSourceConverter::Json(converter) => {
                 let json = json_payload_to_string(
                     message.payload().unwrap_or_default(),
@@ -395,14 +480,14 @@ impl KafkaSourceConverter<'_> {
                     message.offset(),
                 )?;
                 converter.buffer(json);
+                Ok(())
             }
         }
-        Ok(())
     }
 
     fn convert_to_batch(&mut self) -> Result<RecordBatch> {
         match self {
-            KafkaSourceConverter::Avro(avro) => avro.converter.convert_to_batch(),
+            KafkaSourceConverter::Avro(avro) => avro.convert_to_batch(),
             KafkaSourceConverter::Json(converter) => converter.convert_to_batch(),
         }
     }
@@ -684,22 +769,6 @@ impl KafkaSourceExec {
             });
 
         builder.create().expect("Failed to create client")
-    }
-
-    fn create_decoder<'a>(config: KafkaConfig) -> AvroDecoder<'a> {
-        AvroDecoder::new(
-            config
-                .get_schema_registry_settings()
-                .expect("schema_registry_url is required for Avro format"),
-        )
-    }
-
-    fn create_converter(
-        schema: SchemaRef,
-        avro_schema: AvroSchema,
-        projection: Option<Vec<usize>>,
-    ) -> AvroToArrowConverter {
-        AvroToArrowConverter::new(schema, avro_schema, projection)
     }
 
     fn extract_op_from_headers(headers: Option<&BorrowedHeaders>) -> Option<&str> {
@@ -1109,22 +1178,40 @@ impl ExecutionPlan for KafkaSourceExec {
 
         let mut converter = match &self.decoding {
             KafkaSourceDecoding::Avro(avro) => {
+                // arrow-avro decode: the reader schema drives arrow-avro's schema resolution and
+                // supplies the target Arrow schema (== self.payload_schema). Writer schemas are
+                // registered by their Confluent registry id on demand; the reader schema is
+                // pre-registered under its own id so the common same-id case decodes without a fetch.
+                let sr_settings = self
+                    .kafka_config
+                    .get_schema_registry_settings()
+                    .expect("schema_registry_url is required for Avro format");
+                let reader_schema_json = serde_json::to_string(&avro.avro_schema)
+                    .expect("reader avro schema serializes to JSON");
+                let mut decoder = ConfluentAvroDecoder::new()
+                    .with_reader_schema(&avro.avro_schema)
+                    .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?;
+                decoder
+                    .register_writer_schema(avro.reader_schema_id, &reader_schema_json)
+                    .map_err(|e| {
+                        streamling_err!("failed to register reader schema in arrow-avro store: {e}")
+                    })?;
                 KafkaSourceConverter::Avro(Box::new(AvroStreamConverter {
-                    converter: Self::create_converter(
-                        self.payload_schema.clone(),
-                        avro.avro_schema.clone(),
-                        self.payload_projection.clone(),
-                    ),
-                    decoder: Self::create_decoder(self.kafka_config.clone()),
+                    decoder,
+                    sr_settings,
                     versions_client: avro.versions_client.clone(),
                     // Subject convention: TopicNameStrategy with is_key=false yields "{topic}-value".
                     // See SubjectNameStrategy::get_subject in schema_registry_converter.
                     subject: format!("{}-value", self.topic),
                     reader_schema_id: avro.reader_schema_id,
-                    reader_avro_schema: avro.avro_schema.clone(),
                     skip_schema_resolution: avro.skip_schema_resolution,
                     validate_writer_schema_ordering: avro.validate_writer_schema_ordering,
                     schema_id_overrides: avro.schema_id_overrides.clone(),
+                    topic: self.topic.clone(),
+                    payload_schema: self.payload_schema.clone(),
+                    payload_projection: self.payload_projection.clone(),
+                    pending_payload_batches: Vec::new(),
+                    rows_in_current_decoder: 0,
                 }))
             }
             KafkaSourceDecoding::Json => {
