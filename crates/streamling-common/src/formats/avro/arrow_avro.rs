@@ -21,6 +21,8 @@ use crate::types::i256::I256Type;
 use crate::types::u256::U256Type;
 use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray};
 use arrow::record_batch::RecordBatch;
+use arrow_avro::reader::{Decoder, ReaderBuilder};
+use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use serde_json::Value as Json;
@@ -229,6 +231,102 @@ pub fn i256_be_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
     Ok(result)
 }
 
+/// A Confluent-framed avro → Arrow decoder built on arrow-avro, with streamling's u256/i256
+/// reinterpret applied to each flushed batch.
+///
+/// Writer schemas are registered by their Confluent registry id (the high-precision `decimal`
+/// logicalType is stripped before registration so arrow-avro can decode them — see
+/// [`rewrite_writer_schema`]). An optional reader schema drives schema resolution and the output
+/// column layout; the u256/i256 reinterpret overrides are taken from the reader schema, or — when
+/// no reader schema is set — from the first registered writer schema.
+///
+/// This is the reusable decode core the Kafka source plugs into (replacing the
+/// `schema_registry_converter` + `AvroArrowArrayReader` path).
+pub struct ConfluentAvroDecoder {
+    store: SchemaStore,
+    reader_schema_json: Option<String>,
+    overrides: Vec<DecimalOverride>,
+    overrides_from_reader: bool,
+    decoder: Option<Decoder>,
+}
+
+impl Default for ConfluentAvroDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfluentAvroDecoder {
+    pub fn new() -> Self {
+        Self {
+            store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
+            reader_schema_json: None,
+            overrides: Vec::new(),
+            overrides_from_reader: false,
+            decoder: None,
+        }
+    }
+
+    /// Set the reader schema (the topic's current schema). The reinterpret overrides are computed
+    /// from it, and the rewritten reader schema drives arrow-avro's schema resolution.
+    pub fn with_reader_schema(mut self, reader_json: &str) -> Result<Self> {
+        let (rewritten, overrides) = rewrite_writer_schema(reader_json)?;
+        self.reader_schema_json = Some(rewritten);
+        self.overrides = overrides;
+        self.overrides_from_reader = true;
+        self.decoder = None;
+        Ok(self)
+    }
+
+    /// Register a writer schema under its Confluent registry id (high-precision decimals stripped).
+    pub fn register_writer_schema(&mut self, id: u32, writer_json: &str) -> Result<()> {
+        let (rewritten, overrides) = rewrite_writer_schema(writer_json)?;
+        if !self.overrides_from_reader && self.overrides.is_empty() {
+            self.overrides = overrides;
+        }
+        self.store
+            .set(Fingerprint::Id(id), AvroSchema::new(rewritten))
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        self.decoder = None; // force rebuild so the new schema is visible
+        Ok(())
+    }
+
+    fn ensure_decoder(&mut self) -> Result<&mut Decoder> {
+        if self.decoder.is_none() {
+            let mut builder = ReaderBuilder::new().with_writer_schema_store(self.store.clone());
+            if let Some(js) = &self.reader_schema_json {
+                builder = builder.with_reader_schema(AvroSchema::new(js.clone()));
+            }
+            self.decoder = Some(
+                builder
+                    .build_decoder()
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+            );
+        }
+        Ok(self.decoder.as_mut().unwrap())
+    }
+
+    /// Decode one Confluent-framed message: `0x00` + 4-byte big-endian schema id + avro body.
+    pub fn decode(&mut self, framed: &[u8]) -> Result<usize> {
+        self.ensure_decoder()?
+            .decode(framed)
+            .map_err(|e| DataFusionError::Internal(format!("arrow-avro decode failed: {e}")))
+    }
+
+    /// Flush accumulated rows into a `RecordBatch`, reinterpreting u256/i256 columns.
+    pub fn flush(&mut self) -> Result<Option<RecordBatch>> {
+        let overrides = self.overrides.clone();
+        let batch = self
+            .ensure_decoder()?
+            .flush()
+            .map_err(|e| DataFusionError::Internal(format!("arrow-avro flush failed: {e}")))?;
+        match batch {
+            Some(b) => Ok(Some(reinterpret_batch(b, &overrides)?)),
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +398,42 @@ mod tests {
             .expect("FixedSizeBinary(32)");
         assert_eq!(col.value_length(), 32);
         assert_eq!(col.value(0), &payload, "u256 bytes round-trip");
+    }
+
+    #[test]
+    fn confluent_decoder_u256_end_to_end() {
+        // Top byte high bit must be clear (positive two's-complement) for a valid u256.
+        let mut payload = [0u8; 32];
+        payload[0] = 0x12;
+        payload[15] = 0x55;
+        payload[31] = 0xBB;
+
+        let decimal_schema = AvroWriterSchema::parse_str(DECIMAL_SCHEMA).unwrap();
+        let mut rec = Record::new(&decimal_schema).unwrap();
+        rec.put("v", Value::Decimal(Decimal::from(payload.to_vec())));
+        let body = to_avro_datum(&decimal_schema, rec).unwrap();
+
+        // Register the writer schema under a Confluent registry id.
+        let schema_id: u32 = 42;
+        let mut decoder = ConfluentAvroDecoder::new();
+        decoder
+            .register_writer_schema(schema_id, DECIMAL_SCHEMA)
+            .unwrap();
+
+        // Confluent wire format: 0x00 + 4-byte big-endian schema id + avro body.
+        let mut framed = vec![0x00];
+        framed.extend_from_slice(&schema_id.to_be_bytes());
+        framed.extend_from_slice(&body);
+
+        decoder.decode(&framed).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+
+        assert!(U256Type::is_u256_field(&batch.schema().field(0).clone()));
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(32)");
+        assert_eq!(col.value(0), &payload, "u256 round-trips through Confluent decode");
     }
 }
