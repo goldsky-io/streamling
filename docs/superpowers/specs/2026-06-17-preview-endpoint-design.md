@@ -1,146 +1,112 @@
 # Preview Endpoint Design (APP-4884)
 
 **Linear:** https://linear.app/goldsky/issue/APP-4884
-**Date:** 2026-06-17
-**Status:** Draft for review
+**Date:** 2026-06-17 (revised 2026-06-18)
+**Status:** Architecture revised — streamling portion implemented
 
 ## Problem
 
-The frontend is building a feature that lets users preview a pipeline at any
-stage of development — seeing data flow through each block of their config —
-regardless of how complete the config is. To power this, we need a streamling
-endpoint that takes a pipeline YAML, swaps its sinks for a blackhole sink,
-validates it, runs it for a short bounded duration, and streams the resulting
-data back to the caller (the same shape as the existing `inspect` / live-data
-feature).
+Users developing a pipeline on the frontend (or via the CLI) want to preview it
+at any stage of development — seeing live data flow through each block of their
+config — regardless of how complete the config is, **without writing to any real
+sink**.
 
-## Key constraint: preserve the existing single-pipeline model
+## Architecture (revised)
 
-Today `streamling` runs as a single process bound to **one** pipeline. The
-live-data ("inspect") plumbing is a process-global singleton (`LiveDataInspect`,
-an `OnceLock`) wired up once at startup. The engine assumes one pipeline,
-run-once semantics, and has no built-in run-duration limit.
+The original design baked deploy + timed-kill + an SSE proxy into a streamling
+HTTP endpoint. That was the wrong tier: it reimplemented orchestration the
+Goldsky control plane already owns, and bound the data plane to control-plane
+concerns. The revised design splits preview into **mechanisms** (data plane) and
+a **workflow** (control plane), composing primitives that already exist.
 
-Rather than re-engineer those assumptions, **each preview runs as its own
-fresh `streamling` child process.** Every child is still "one program = one
-pipeline," so the existing engine, inspect singleton, blackhole sink, and
-validation paths are reused **unchanged**. The only genuinely new code is a
-thin orchestration layer that rewrites config, spawns/kills the child, and
-proxies its data stream.
+Three tiers are involved:
 
-## Architecture overview
+1. **streamling runtime** (this repo) — the per-pipeline execution engine.
+   Already exposes per-pipeline live-data SSE at `/admin/live-data`.
+2. **streamling cloud control API** (separate service) — exposes
+   `/pipeline/{projectId}/...` deploy / validate / pause / delete, and proxies
+   each pipeline's `/admin/live-data`.
+3. **api-server** (goldsky BFF) — what the CLI and frontend call. Proxies the
+   control API, adds auth/permissions/billing, and runs Temporal workflows.
 
-A new `streamling preview-server` subcommand runs a small Axum HTTP server.
-On request it:
+### Request flow ("pre-deploy rewrite")
 
-1. Receives a pipeline YAML.
-2. Rewrites sinks → blackhole (config rewriter).
-3. Validates via a fast `--validate` child process.
-4. Runs the pipeline as a child `streamling` process for a bounded duration,
-   with the admin/inspect API enabled on an internal port.
-5. Proxies the child's `GET /admin/live-data` SSE stream back to the caller.
-6. Kills the child when the duration elapses, the client disconnects, or a new
-   preview replaces it.
+```
+CLI / frontend
+   │  pipeline YAML
+   ▼
+api-server  POST /…/pipelines/preview
+   │ 1. rewrite:   YAML ──▶ streamling POST /rewrite ──▶ blackhole-swapped YAML
+   │ 2. validate:  swapped YAML ──▶ existing validate primitive  (422 on failure)
+   │ 3. deploy:    swapped YAML ──▶ existing deploy primitive as `_preview_<uuid>`
+   │ 4. schedule:  Temporal workflow → sleep(ttl) → existing delete primitive
+   │ 5. return:    { pipelineName, ttlSeconds }
+   ▼
+CLI / frontend  ──▶ existing  GET /…/streamling/v1/{name}/live-data?topology_node_keys=…  (SSE)
+```
 
-Concurrency is **one preview at a time**: a new request replaces the in-flight
-one.
+The deployed config already has blackhole sinks, so the preview pipeline
+**cannot write to any real destination — safe by construction**. The deploy
+machinery is unchanged: it just deploys a normal config that happens to have
+blackhole sinks. Nothing in the control-plane tier needs to learn the word
+"preview".
 
-## Components
+## Component responsibilities
 
-Each component has a single purpose and is independently testable.
+### streamling runtime (this repo) — IMPLEMENTED
+- **Pure sink-swap**: `rewrite_sinks_to_blackhole(yaml) -> yaml` — replaces every
+  sink with a `blackhole` (preserving its `from`); if there are no sinks,
+  appends a blackhole per terminal node so data flows through every block and
+  the config validates. Topology-aware, so it lives here (in Rust, next to the
+  topology types) rather than being reimplemented in api-server TypeScript.
+- **`find_terminal_nodes`** in `topology_validation.rs`, sharing
+  `collect_consumed_nodes` with the existing orphan check.
+- Exposed as `POST /rewrite` (`--preview-server` mode) — stateless: YAML in →
+  swapped YAML out, or `422` on unparseable YAML. Also a public library fn so
+  the control API can call it in-process if it imports these crates.
+- **No** deploy, validation invocation, TTL, or SSE proxy in streamling.
 
-### 1. Config rewriter
-Pure function: `String (yaml) -> Result<String (yaml)>`. Parses the topology,
-applies the blackhole rules below, re-serializes. No I/O. Lives alongside the
-topology types (`streamling-core/src/topology.rs` or a sibling module in
-`streamling-config`).
+### streamling cloud control API (separate service)
+- Reuses existing `deploy` / `validate` / `pause` / `delete`.
+- Must support deploying an **ephemeral** pipeline under a generated name. (v1
+  accepts a transient real pipeline that is auto-deleted; a fully invisible
+  preview mode — excluded from lists/billing/quota — is a later enhancement.)
 
-**Blackhole rules:**
-- **Sinks present** → replace *every* sink with a `blackhole` sink,
-  **preserving each original sink's `from:`** so data still flows through the
-  upstream nodes the inspect tap reads from.
-- **No sinks** → append blackhole sink(s) pointed at the **terminal node(s)**
-  (sources/transforms with no downstream consumer), so orphan-node validation
-  passes and data flows all the way through every block.
+### api-server (goldsky BFF) — TO BUILD
+- New preview route: rewrite → validate → deploy-ephemeral → schedule TTL
+  teardown → return the pipeline name.
+- **TTL** via a Temporal workflow (`deploy → sleep(ttl) → delete`), mirroring the
+  existing auto-pause/delete pattern. Default 180s, cap 600s.
+- Reuses the existing live-data SSE proxy for the actual data (no new transport).
 
-Notes:
-- The blackhole sink (`type: blackhole`) already exists and requires a `from:`.
-- Other sink options (primary_key, batch_size, etc.) are dropped on swap; only
-  `from:` is carried over.
+### CLI — TO BUILD
+- `preview` command: submit a local config, then stream live-data rows in the
+  terminal (per node) until the TTL or Ctrl-C. (`--no-follow`/`--web` to just
+  print a link is a possible later option.)
 
-### 2. Preview orchestrator
-A single-slot async process manager. Responsibilities:
-- Hold at most one running child (the "current preview").
-- Write the rewritten config to a temp file.
-- Spawn the child with the admin/inspect API enabled on an internal port,
-  waiting for readiness before streaming.
-- Arm a duration timer (default 180s). On expiry, gracefully kill the child,
-  then force-kill if needed; remove the temp file.
-- **Replace semantics:** when a new preview arrives, gracefully kill the
-  existing child first (its SSE client receives a terminal event), then start
-  the new one.
-- Clean up on client disconnect.
+## Edge cases (unchanged from the ticket)
+- No sinks provided → rewrite appends a blackhole per terminal node (not an
+  error).
+- Missing data source / broken transform / any validation failure → `422`,
+  surfaced by api-server from the existing validate primitive (run on the
+  **swapped** YAML, after rewrite).
 
-### 3. SSE proxy
-Connects to the child's `GET /admin/live-data` SSE endpoint and forwards events
-to the HTTP caller verbatim, plus a terminal event on shutdown.
-
-### 4. HTTP handler
-`POST /preview` — ties the above together and maps failures to status codes.
-
-## HTTP contract
-
-### `POST /preview`
-- **Body:** raw pipeline YAML (`Content-Type: text/yaml`).
-- **Query param:** `duration_seconds` (optional, integer). Omitted → default
-  **180**. Capped at **600** (values above the cap are clamped to 600).
-- **Success:** `200`, `text/event-stream` (SSE). Events use the same shape as
-  `/admin/live-data` (per-node JSON rows), so the frontend reuses existing
-  inspect rendering. The stream ends when the duration elapses, the pipeline
-  finishes, or the preview is replaced; a terminal event signals close.
-- **Validation failure:** `422 Unprocessable Entity` with a JSON error body
-  describing the failure (child stderr surfaced).
-
-## Validation & edge cases
-
-Two-phase, reusing existing machinery:
-
-- **Phase 1 — validate:** spawn `streamling --validate --config <tmp>` — a
-  fast, no-execution dry run that builds physical plans. Catches missing data
-  source, broken transforms (e.g. bad SQL), schema/primary-key failures, and
-  orphan nodes. Non-zero exit → `422` with stderr in the error body.
-- **Phase 2 — run:** only if Phase 1 passed, spawn the real run + stream.
-
-| Issue edge case          | Handling                                            |
-| ------------------------ | --------------------------------------------------- |
-| No sinks provided        | rewriter appends blackhole to terminal nodes (ok)   |
-| Data source missing      | Phase-1 validate fails → 422                         |
-| Transform has error      | Phase-1 validate fails → 422                         |
-| Any validation fails     | Phase-1 validate fails → 422                         |
-
-## Lifecycle / bounded duration
-
-The orchestrator owns a `tokio::time::timeout` (default 180s, max 600s). On
-expiry — or on client disconnect, or on replacement by a new preview — it sends
-the child a graceful kill, waits briefly, then force-kills, and removes the temp
-config. Because each preview is its own process, "kill" is process teardown; no
-engine changes are required.
-
-## Testing
-
-- **Config rewriter (unit):** sinks present (single + multiple), no sinks
-  (single + multiple terminal nodes), preserves `from:`, drops other options.
-- **Validation mapping (integration):** each bad-config case yields `422` with
-  a useful message; valid config proceeds to streaming.
-- **Orchestrator (integration):** POST a valid config → SSE rows arrive →
-  process is gone after the window; `duration_seconds` honored and clamped at
-  600; a second concurrent request replaces the first (first stream gets a
-  terminal event, second streams).
+## Decisions
+- **Swap location:** pre-deploy rewrite (sanitize the config, then deploy
+  normally) — smallest blast radius; the deploy tier is untouched.
+- **TTL:** api-server Temporal workflow.
+- **Ephemeral semantics (v1):** transient real pipeline (`_preview_<uuid>`),
+  auto-deleted; invisible/un-billed preview mode deferred.
+- **CLI UX:** stream rows in the terminal.
 
 ## Out of scope
+- Auth/permissions (handled by api-server's existing middleware).
+- A fully invisible/un-billed ephemeral deploy mode (control-plane enhancement).
+- Multi-tenant concurrency limits on previews (policy in api-server if needed).
 
-- Multi-tenant concurrency beyond one-at-a-time (deferred; subprocess model
-  already supports it later by lifting the single-slot constraint).
-- Authentication/authorization on the endpoint (assumed handled by the caller /
-  upstream layer).
-- Persisting preview results.
+## Superseded
+The original in-streamling orchestrator (child-process spawn + duration timer +
+SSE proxy) and its implementation plan
+(`docs/superpowers/plans/2026-06-17-preview-endpoint.md`) are superseded by this
+revision. The streamling code has been reduced to the stateless `/rewrite`
+endpoint + `rewrite_sinks_to_blackhole`.

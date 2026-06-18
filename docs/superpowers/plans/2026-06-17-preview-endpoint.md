@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-06-18):** This plan implemented an in-streamling orchestrator (child-process spawn + duration timer + SSE proxy). The architecture was revised — streamling now only does the stateless sink-swap (`POST /rewrite` + `rewrite_sinks_to_blackhole`); deploy + TTL move to api-server, and live-data reuses the existing `/admin/live-data` proxy. See the revised design doc. This plan is kept for history only.
+
 # Preview Endpoint Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
