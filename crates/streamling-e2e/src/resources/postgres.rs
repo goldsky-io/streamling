@@ -155,6 +155,15 @@ impl PostgresResource {
         Ok(())
     }
 
+    /// Execute SQL on the cluster-level admin connection (the `postgres` DB),
+    /// not on the isolated test database. Used for cross-database operations like
+    /// `ALTER DATABASE ... SET default_transaction_read_only = on` and
+    /// `pg_terminate_backend(...)` in failover tests.
+    pub async fn admin_execute(&self, sql: &str) -> Result<()> {
+        sqlx::query(sql).execute(&self.admin_pool).await?;
+        Ok(())
+    }
+
     /// Execute a count query and return the result
     pub async fn count(&self, query: &str) -> Result<i64> {
         let row = sqlx::query(query).fetch_one(&self.pool).await?;
