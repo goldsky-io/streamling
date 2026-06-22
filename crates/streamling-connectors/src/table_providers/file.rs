@@ -77,27 +77,21 @@ fn file_format_for(format: FileSourceFormat) -> Arc<dyn FileFormat> {
 
 /// The DataFusion [`FileSource`] (per-format reader) the continuous source feeds
 /// to its runtime `FileScanConfig`.
-///
-/// CSV must be special-cased. `CsvFormat::file_source()` returns
-/// `CsvSource::default()`, whose `delimiter` and `quote` are NUL bytes
-/// (`u8::default()`) and `has_header` is `false` — a reader that finds no
-/// delimiters and so treats each whole line as a single field (yielding
-/// "incorrect number of fields" against the inferred multi-column schema). The
-/// real settings are only wired by `CsvFormat::create_physical_plan`, which the
-/// bounded `ListingTable` path goes through but a hand-built `FileScanConfig`
-/// does not. We rebuild the CSV source the same way: the `CsvFormat::default()`
-/// comma/double-quote dialect with `has_header` resolved from the catalog config,
-/// matching the startup schema inference. Other formats carry no such byte
-/// options, so their `file_source()` default is correct.
 fn file_source_for(
     format: FileSourceFormat,
     file_format: &Arc<dyn FileFormat>,
-    csv_has_header: bool,
 ) -> Arc<dyn FileSource> {
-    const CSV_DELIMITER: u8 = b',';
-    const CSV_QUOTE: u8 = b'"';
     match format {
-        FileSourceFormat::Csv => Arc::new(CsvSource::new(csv_has_header, CSV_DELIMITER, CSV_QUOTE)),
+        // CsvSource::default() has incorrect defaults, passing proper ones from CsvFormat::default()
+        FileSourceFormat::Csv => {
+            const DEFAULT_HAS_HEADER: bool = true;
+            let default_options = CsvFormat::default().options().clone();
+            Arc::new(CsvSource::new(
+                default_options.has_header.unwrap_or(DEFAULT_HAS_HEADER),
+                default_options.delimiter,
+                default_options.quote,
+            ))
+        }
         _ => file_format.file_source(),
     }
 }
@@ -374,8 +368,7 @@ impl FileSourceTableProvider {
         };
 
         let file_extension = file_format.get_ext();
-        let csv_has_header = state.config_options().catalog.has_header;
-        let file_source = file_source_for(format, &file_format, csv_has_header);
+        let file_source = file_source_for(format, &file_format);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Arc::new(Self {
@@ -772,7 +765,7 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
         ]));
         let file_format = file_format_for(FileSourceFormat::Csv);
-        let file_source = file_source_for(FileSourceFormat::Csv, &file_format, true);
+        let file_source = file_source_for(FileSourceFormat::Csv, &file_format);
 
         let url = ListingTableUrl::parse(format!("{}/", dir.to_str().unwrap())).unwrap();
         let object_store_url = url.object_store();
