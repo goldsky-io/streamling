@@ -24,7 +24,6 @@ use apache_avro::Schema as AvroSchema;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::arrow::array::{RecordBatch, StringArray};
-use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, not_impl_err};
@@ -320,10 +319,9 @@ enum KafkaSourceConverter {
 /// registry id on demand (fetched the first time an id is seen); the reader schema is
 /// pre-registered under its own id so the common same-id case decodes without a fetch.
 ///
-/// arrow-avro's `Decoder` buffers rows across `decode` calls; a batch is materialized by
-/// `flush`. Because a `Decoder` is bound to a single writer schema, a new writer id forces
-/// a rebuild — we flush the current "generation" into `pending_payload_batches` first so no
-/// rows are lost, and concatenate all generations when the source batch is assembled.
+/// `ConfluentAvroDecoder` handles mid-batch writer-schema changes internally (it finalizes the
+/// current generation and concatenates all generations on `flush`), so this converter just
+/// decodes each message and flushes once per source batch.
 struct AvroStreamConverter {
     decoder: ConfluentAvroDecoder,
     sr_settings: SrSettings,
@@ -334,13 +332,9 @@ struct AvroStreamConverter {
     validate_writer_schema_ordering: bool,
     schema_id_overrides: HashMap<u32, u32>,
     topic: String,
-    /// Full (unprojected) payload schema the decoder emits into; also the concat schema.
+    /// Full (unprojected) payload schema the decoder emits into; used for the empty-batch case.
     payload_schema: SchemaRef,
     payload_projection: Option<Vec<usize>>,
-    /// Batches flushed from earlier writer-schema generations in the current source batch.
-    pending_payload_batches: Vec<RecordBatch>,
-    /// Rows buffered in the current `Decoder` generation but not yet flushed.
-    rows_in_current_decoder: u64,
 }
 
 impl AvroStreamConverter {
@@ -368,20 +362,10 @@ impl AvroStreamConverter {
         }
         let writer_schema_id = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
 
-        // Fetch + register the writer schema on first sight. Flush rows buffered under the
-        // current Decoder generation before the rebuild so they aren't lost.
+        // Fetch + register the writer schema on first sight. The decoder handles mid-batch
+        // writer-schema changes internally (it finalizes the current generation and
+        // concatenates on flush), so heterogeneous-writer batches (schema evolution) are safe.
         if !self.decoder.has_writer_schema(writer_schema_id) {
-            if self.rows_in_current_decoder > 0 {
-                if let Some(b) = self.decoder.flush().streamling_with_context(|| {
-                    format!(
-                        "arrow-avro flush before schema {writer_schema_id} registration failed (topic: {})",
-                        self.topic
-                    )
-                })? {
-                    self.pending_payload_batches.push(b);
-                }
-                self.rows_in_current_decoder = 0;
-            }
             let registered = retry_registry_call(
                 format!("schema-registry get_schema_by_id(id={writer_schema_id})"),
                 || get_schema_by_id(writer_schema_id, &self.sr_settings),
@@ -435,29 +419,17 @@ impl AvroStreamConverter {
                 patched.is_some()
             )
         })?;
-        self.rows_in_current_decoder += 1;
         Ok(())
     }
 
-    /// Drain any rows still buffered in the current Decoder generation, assemble the full
-    /// (unprojected) payload batch from all generations collected this source batch, then
-    /// apply the payload column projection.
+    /// Flush the decoder into one batch for this interval (it concatenates across any
+    /// writer-schema generations internally), then apply the payload column projection.
     fn convert_to_batch(&mut self) -> Result<RecordBatch> {
-        if self.rows_in_current_decoder > 0 {
-            if let Some(b) = self.decoder.flush().streamling_with_context(|| {
-                format!("arrow-avro flush failed (topic: {})", self.topic)
-            })? {
-                self.pending_payload_batches.push(b);
-            }
-            self.rows_in_current_decoder = 0;
-        }
-        let payload_batch_full = match self.pending_payload_batches.len() {
-            0 => RecordBatch::new_empty(self.payload_schema.clone()),
-            1 => self.pending_payload_batches.pop().unwrap(),
-            _ => concat_batches(&self.payload_schema, &self.pending_payload_batches)
-                .map_err(datafusion::error::DataFusionError::from)?,
-        };
-        self.pending_payload_batches.clear();
+        let payload_batch_full = self
+            .decoder
+            .flush()
+            .streamling_with_context(|| format!("arrow-avro flush failed (topic: {})", self.topic))?
+            .unwrap_or_else(|| RecordBatch::new_empty(self.payload_schema.clone()));
         match &self.payload_projection {
             Some(projection) => payload_batch_full
                 .project(projection)
@@ -1210,8 +1182,6 @@ impl ExecutionPlan for KafkaSourceExec {
                     topic: self.topic.clone(),
                     payload_schema: self.payload_schema.clone(),
                     payload_projection: self.payload_projection.clone(),
-                    pending_payload_batches: Vec::new(),
-                    rows_in_current_decoder: 0,
                 }))
             }
             KafkaSourceDecoding::Json => {

@@ -28,7 +28,7 @@ use arrow::array::{
     PrimitiveArray, StructArray,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::compute::cast;
+use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{Decimal128Type, Decimal256Type, i256};
 use arrow::record_batch::RecordBatch;
 use arrow_avro::reader::{Decoder, ReaderBuilder};
@@ -393,6 +393,12 @@ pub fn i256_be_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
 /// [`rewrite_writer_schema`]). An optional reader schema drives arrow-avro's schema resolution and
 /// supplies the target Arrow schema; when no reader schema is set, the target is derived from the
 /// first registered writer schema.
+///
+/// A single arrow-avro `Decoder` cannot accumulate rows from more than one writer schema into one
+/// batch (mixing writer ids silently drops rows). So when the incoming writer id changes, we
+/// finalize the current arrow `Decoder` into a per-generation batch (coerced to the target schema)
+/// and rebuild; [`flush`](Self::flush) concatenates all generations. Heterogeneous-writer batches
+/// (the Confluent schema-evolution case) are therefore handled transparently.
 pub struct ConfluentAvroDecoder {
     store: SchemaStore,
     reader_schema_json: Option<String>,
@@ -402,6 +408,13 @@ pub struct ConfluentAvroDecoder {
     /// unwrapped record and strip the leading union-branch varint from each body. This holds the
     /// avro union index of the record branch (what the wire prefix must equal).
     union_record_index: Option<i64>,
+    /// The writer id the live `decoder` is currently accumulating (its "generation"). `None` when
+    /// no decoder is live (start, or just after a flush). Invariant: `active_writer_id.is_some()`
+    /// iff a decoder exists and is bound to that single writer schema.
+    active_writer_id: Option<u32>,
+    /// Finalized per-generation batches (each from a single writer schema, coerced to the target),
+    /// concatenated by `flush`.
+    pending: Vec<RecordBatch>,
     decoder: Option<Decoder>,
 }
 
@@ -466,6 +479,8 @@ impl ConfluentAvroDecoder {
             reader_schema_json: None,
             target_schema: None,
             union_record_index: None,
+            active_writer_id: None,
+            pending: Vec::new(),
             decoder: None,
         }
     }
@@ -498,7 +513,9 @@ impl ConfluentAvroDecoder {
         self.store
             .set(Fingerprint::Id(id), AvroSchema::new(record_json))
             .map_err(arrow_err)?;
-        self.decoder = None; // force rebuild so the new schema is visible
+        // Do NOT drop the live decoder here: it may be mid-generation for a *different* writer id
+        // with buffered rows that would be lost. `decode` rebuilds (from this updated store) when
+        // the active writer id actually changes.
         Ok(())
     }
 
@@ -525,14 +542,28 @@ impl ConfluentAvroDecoder {
 
     /// Decode one Confluent-framed message: `0x00` + 4-byte big-endian schema id + avro body.
     pub fn decode(&mut self, framed: &[u8]) -> Result<usize> {
+        if framed.len() < 5 {
+            return Err(DataFusionError::Internal(
+                "Confluent frame shorter than 5 bytes".into(),
+            ));
+        }
+        let id = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]);
+
+        // A single arrow-avro Decoder can't mix writer schemas in one batch. When the writer id
+        // changes, finalize the current generation and rebuild for the new schema.
+        if let Some(active) = self.active_writer_id
+            && active != id
+        {
+            if let Some(b) = self.flush_inner()? {
+                self.pending.push(b);
+            }
+            self.decoder = None;
+        }
+        self.active_writer_id = Some(id);
+
         // For union-rooted writer schemas, strip the leading union-branch varint so the body lines
         // up with the unwrapped record schema registered in the store.
         if let Some(record_index) = self.union_record_index {
-            if framed.len() < 5 {
-                return Err(DataFusionError::Internal(
-                    "Confluent frame shorter than 5 bytes".into(),
-                ));
-            }
             let body = &framed[5..];
             let (branch, consumed) = read_avro_long(body)?;
             if branch != record_index {
@@ -554,18 +585,44 @@ impl ConfluentAvroDecoder {
             .map_err(|e| DataFusionError::Internal(format!("arrow-avro decode failed: {e}")))
     }
 
-    /// Flush accumulated rows into a `RecordBatch`, coerced to the target Arrow schema.
-    pub fn flush(&mut self) -> Result<Option<RecordBatch>> {
+    /// Flush the live arrow `Decoder` (if any) into a target-coerced batch. Does not touch the
+    /// `pending` generations or the active-id/decoder bookkeeping.
+    fn flush_inner(&mut self) -> Result<Option<RecordBatch>> {
+        if self.decoder.is_none() {
+            return Ok(None);
+        }
         let target = self.target_schema.clone().ok_or_else(|| {
             DataFusionError::Internal("ConfluentAvroDecoder: no schema set".into())
         })?;
         let batch = self
-            .ensure_decoder()?
+            .decoder
+            .as_mut()
+            .unwrap()
             .flush()
             .map_err(|e| DataFusionError::Internal(format!("arrow-avro flush failed: {e}")))?;
         match batch {
             Some(b) => Ok(Some(coerce_batch_to_target(&b, &target)?)),
             None => Ok(None),
+        }
+    }
+
+    /// Flush all accumulated rows into a single `RecordBatch` coerced to the target Arrow schema,
+    /// concatenating across writer-schema generations. Resets the decoder so the next batch starts
+    /// fresh (registered schemas in the store are retained).
+    pub fn flush(&mut self) -> Result<Option<RecordBatch>> {
+        let target = self.target_schema.clone().ok_or_else(|| {
+            DataFusionError::Internal("ConfluentAvroDecoder: no schema set".into())
+        })?;
+        if let Some(b) = self.flush_inner()? {
+            self.pending.push(b);
+        }
+        self.decoder = None;
+        self.active_writer_id = None;
+        let batches = std::mem::take(&mut self.pending);
+        match batches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(batches.into_iter().next().unwrap())),
+            _ => Ok(Some(concat_batches(&target, &batches).map_err(arrow_err)?)),
         }
     }
 }
@@ -758,5 +815,57 @@ mod tests {
             .downcast_ref::<PrimitiveArray<Decimal128Type>>()
             .unwrap();
         assert_eq!(amt_col.value(0), 1234_i128);
+    }
+
+    // Backward-compatible schema evolution (mirrors e2e test_schema_evolution_new_field_with_default):
+    // rows written with v1 {id,data} and v2 {id,data,version=default 1}, both resolved to the v2
+    // reader, decoded by ONE ConfluentAvroDecoder into one batch.
+    const EVOLVE_V1: &str = r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"long"},{"name":"data","type":"string"}]}"#;
+    const EVOLVE_V2: &str = r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"long"},{"name":"data","type":"string"},{"name":"version","type":"int","default":1}]}"#;
+
+    fn confluent_frame(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x00];
+        f.extend_from_slice(&id.to_be_bytes());
+        f.extend_from_slice(body);
+        f
+    }
+
+    #[test]
+    fn mixed_writer_schemas_resolve_to_reader_in_one_batch() {
+        let v1 = AvroWriterSchema::parse_str(EVOLVE_V1).unwrap();
+        let v2 = AvroWriterSchema::parse_str(EVOLVE_V2).unwrap();
+        let reader = AvroWriterSchema::parse_str(EVOLVE_V2).unwrap();
+        let (v1_id, v2_id): (u32, u32) = (1, 2);
+
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&reader)
+            .unwrap();
+        decoder.register_writer_schema(v2_id, EVOLVE_V2).unwrap();
+        decoder.register_writer_schema(v1_id, EVOLVE_V1).unwrap();
+
+        // 3 rows with v1 (no `version`), then 3 rows with v2 (version=2).
+        for i in 1..=3i64 {
+            let mut rec = Record::new(&v1).unwrap();
+            rec.put("id", Value::Long(i));
+            rec.put("data", Value::String(format!("v1_{i}")));
+            let body = to_avro_datum(&v1, rec).unwrap();
+            decoder.decode(&confluent_frame(v1_id, &body)).unwrap();
+        }
+        for i in 4..=6i64 {
+            let mut rec = Record::new(&v2).unwrap();
+            rec.put("id", Value::Long(i));
+            rec.put("data", Value::String(format!("v2_{i}")));
+            rec.put("version", Value::Int(2));
+            let body = to_avro_datum(&v2, rec).unwrap();
+            decoder.decode(&confluent_frame(v2_id, &body)).unwrap();
+        }
+
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert_eq!(batch.num_rows(), 6, "all 6 rows present");
+        assert_eq!(batch.num_columns(), 3, "id, data, version");
+        // every column must be the same length (regression: heterogeneous-writer desync)
+        for c in batch.columns() {
+            assert_eq!(c.len(), 6, "column length mismatch across writer schemas");
+        }
     }
 }
