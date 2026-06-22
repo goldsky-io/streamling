@@ -41,13 +41,13 @@ use datafusion::physical_plan::{
     filter::FilterExec,
     project_schema,
 };
+use streamling_core::formats::FromArrowConverter;
+use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
 use streamling_core::formats::avro::{
     FromArrowToAvroConverter, convert_avro_schema_to_arrow, post_process_avro_schema_for_writing,
     to_avro,
 };
-use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
 use streamling_core::formats::json::FromArrowToJsonConverter;
-use streamling_core::formats::FromArrowConverter;
 use streamling_core::operators::filter::StreamingFilterExec;
 use streamling_core::session::SessionManager;
 use streamling_core::topology::SchemaIdOverride;
@@ -964,7 +964,9 @@ impl ExecutionPlan for KafkaSourceExec {
             .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?;
         decoder
             .register_writer_schema(self.reader_schema_id, &reader_schema_json)
-            .map_err(|e| streamling_err!("failed to register reader schema in arrow-avro store: {e}"))?;
+            .map_err(|e| {
+                streamling_err!("failed to register reader schema in arrow-avro store: {e}")
+            })?;
         let payload_schema = self.payload_schema.clone();
         let payload_projection = self.payload_projection.clone();
 
@@ -1349,12 +1351,12 @@ impl ExecutionPlan for KafkaSourceExec {
 
                 // Drain any rows still buffered in the current Decoder generation, then assemble
                 // the full (unprojected) payload batch from all partials collected this batch.
-                if rows_in_current_decoder > 0 {
-                    if let Some(b) = decoder.flush().streamling_with_context(|| format!(
-                        "arrow-avro flush failed (topic: {topic})"
-                    ))? {
-                        pending_payload_batches.push(b);
-                    }
+                if rows_in_current_decoder > 0
+                    && let Some(b) = decoder.flush().streamling_with_context(|| {
+                        format!("arrow-avro flush failed (topic: {topic})")
+                    })?
+                {
+                    pending_payload_batches.push(b);
                 }
                 let payload_batch_full = match pending_payload_batches.len() {
                     0 => RecordBatch::new_empty(payload_schema.clone()),

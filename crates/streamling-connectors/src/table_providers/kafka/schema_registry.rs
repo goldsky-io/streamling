@@ -140,7 +140,6 @@ where
     .await
 }
 
-
 /// Returns true when the writer schema is registered after the reader schema for the same subject.
 ///
 /// Compares the writer's and reader's *subject-local versions* (not the global schema IDs), which

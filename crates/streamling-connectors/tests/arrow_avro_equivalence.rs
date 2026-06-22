@@ -41,7 +41,8 @@ fn load_payload(filename: &str) -> Vec<u8> {
 fn trim_to_datum_boundary(framed: &[u8], writer_schema: &AvroSchema) -> Vec<u8> {
     let body = &framed[5..];
     let mut cursor = std::io::Cursor::new(body);
-    apache_avro::from_avro_datum(writer_schema, &mut cursor, None).expect("decode to find boundary");
+    apache_avro::from_avro_datum(writer_schema, &mut cursor, None)
+        .expect("decode to find boundary");
     let consumed = cursor.position() as usize;
     framed[..5 + consumed].to_vec()
 }
@@ -98,7 +99,10 @@ fn arrow_avro_decodes_real_traces_to_target_schema() {
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .expect("u256 column is FixedSizeBinary(32)");
-        assert!(!value_col.is_null(0), "`value` should be non-null in this row");
+        assert!(
+            !value_col.is_null(0),
+            "`value` should be non-null in this row"
+        );
         assert_eq!(value_col.value(0).len(), 32, "u256 is 32 bytes");
 
         // Nested high-precision decimals inside the array-of-records become Decimal128(100,0)
@@ -117,6 +121,9 @@ fn arrow_avro_decodes_real_traces_to_target_schema() {
             "nested transfer `value` should be Decimal128(100,0)"
         );
 
-        println!("  OK: {} cols, schema + u256 + nested types verified", batch.num_columns());
+        println!(
+            "  OK: {} cols, schema + u256 + nested types verified",
+            batch.num_columns()
+        );
     }
 }

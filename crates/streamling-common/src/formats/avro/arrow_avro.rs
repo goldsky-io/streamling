@@ -119,13 +119,20 @@ pub fn coerce_batch_to_target(batch: &RecordBatch, target: &SchemaRef) -> Result
     let src_schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
     for tf in target.fields() {
-        let src = src_schema.index_of(tf.name()).map(|i| batch.column(i)).map_err(|_| {
-            DataFusionError::Internal(format!(
-                "arrow-avro batch is missing target field '{}' (have: {:?})",
-                tf.name(),
-                src_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-            ))
-        })?;
+        let src = src_schema
+            .index_of(tf.name())
+            .map(|i| batch.column(i))
+            .map_err(|_| {
+                DataFusionError::Internal(format!(
+                    "arrow-avro batch is missing target field '{}' (have: {:?})",
+                    tf.name(),
+                    src_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name())
+                        .collect::<Vec<_>>()
+                ))
+            })?;
         columns.push(coerce_array(src, tf)?);
     }
     RecordBatch::try_new(target.clone(), columns).map_err(arrow_err)
@@ -159,7 +166,11 @@ fn coerce_list(src: &ArrayRef, target_child: &FieldRef) -> Result<ArrayRef> {
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .expect("List downcast");
-            (la.offsets().clone(), la.values().clone(), la.nulls().cloned())
+            (
+                la.offsets().clone(),
+                la.values().clone(),
+                la.nulls().cloned(),
+            )
         }
         DataType::LargeList(_) => {
             let la = src
@@ -187,15 +198,12 @@ fn coerce_list(src: &ArrayRef, target_child: &FieldRef) -> Result<ArrayRef> {
 }
 
 fn coerce_struct(src: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef> {
-    let sa = src
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "arrow-avro coerce_struct: expected Struct, got {:?}",
-                src.data_type()
-            ))
-        })?;
+    let sa = src.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "arrow-avro coerce_struct: expected Struct, got {:?}",
+            src.data_type()
+        ))
+    })?;
     let mut children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
     for tf in target_fields {
         let col = sa.column_by_name(tf.name()).ok_or_else(|| {
@@ -206,8 +214,8 @@ fn coerce_struct(src: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef> {
         })?;
         children.push(coerce_array(col, tf)?);
     }
-    let struct_arr =
-        StructArray::try_new(target_fields.clone(), children, sa.nulls().cloned()).map_err(arrow_err)?;
+    let struct_arr = StructArray::try_new(target_fields.clone(), children, sa.nulls().cloned())
+        .map_err(arrow_err)?;
     Ok(Arc::new(struct_arr))
 }
 
@@ -330,7 +338,8 @@ fn be_bytes_to_i256(bytes: &[u8]) -> i256 {
 pub fn u256_be_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
     if !bytes.is_empty() && (bytes[0] & 0x80) != 0 {
         return Err(DataFusionError::Internal(
-            "Failed to convert negative decimal to U256 - negative values not supported".to_string(),
+            "Failed to convert negative decimal to U256 - negative values not supported"
+                .to_string(),
         ));
     }
     let mut bytes = bytes.to_vec();
@@ -547,10 +556,9 @@ impl ConfluentAvroDecoder {
 
     /// Flush accumulated rows into a `RecordBatch`, coerced to the target Arrow schema.
     pub fn flush(&mut self) -> Result<Option<RecordBatch>> {
-        let target = self
-            .target_schema
-            .clone()
-            .ok_or_else(|| DataFusionError::Internal("ConfluentAvroDecoder: no schema set".into()))?;
+        let target = self.target_schema.clone().ok_or_else(|| {
+            DataFusionError::Internal("ConfluentAvroDecoder: no schema set".into())
+        })?;
         let batch = self
             .ensure_decoder()?
             .flush()
@@ -606,7 +614,9 @@ mod tests {
 
         let rewritten_json = rewrite_writer_schema(DECIMAL_SCHEMA).unwrap();
         let mut store = SchemaStore::new();
-        let fp = store.register(ArrowAvroSchema::new(rewritten_json)).unwrap();
+        let fp = store
+            .register(ArrowAvroSchema::new(rewritten_json))
+            .unwrap();
         let rabin = match fp {
             Fingerprint::Rabin(r) => r,
             other => panic!("unexpected fingerprint: {other:?}"),
@@ -626,7 +636,10 @@ mod tests {
         let batch = coerce_batch_to_target(&batch, &target).unwrap();
 
         let field = batch.schema().field(0).clone();
-        assert!(U256Type::is_u256_field(&field), "field not tagged u256: {field:?}");
+        assert!(
+            U256Type::is_u256_field(&field),
+            "field not tagged u256: {field:?}"
+        );
         let col = batch
             .column(0)
             .as_any()
@@ -666,7 +679,11 @@ mod tests {
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .expect("FixedSizeBinary(32)");
-        assert_eq!(col.value(0), &payload, "u256 round-trips through Confluent decode");
+        assert_eq!(
+            col.value(0),
+            &payload,
+            "u256 round-trips through Confluent decode"
+        );
     }
 
     #[test]
@@ -680,7 +697,10 @@ mod tests {
         rec.put("top", Value::Decimal(Decimal::from(top.to_vec())));
         // xfers = [ {who: "alice", amt: 1234} ]
         let inner = Value::Record(vec![
-            ("who".to_string(), Value::Union(1, Box::new(Value::String("alice".into())))),
+            (
+                "who".to_string(),
+                Value::Union(1, Box::new(Value::String("alice".into()))),
+            ),
             (
                 "amt".to_string(),
                 Value::Union(1, Box::new(Value::Decimal(Decimal::from(vec![0x04, 0xD2])))), // 1234
@@ -697,7 +717,9 @@ mod tests {
 
         let schema_id: u32 = 7;
         let mut decoder = ConfluentAvroDecoder::new();
-        decoder.register_writer_schema(schema_id, NESTED_SCHEMA).unwrap();
+        decoder
+            .register_writer_schema(schema_id, NESTED_SCHEMA)
+            .unwrap();
         let mut framed = vec![0x00];
         framed.extend_from_slice(&schema_id.to_be_bytes());
         framed.extend_from_slice(&body);
@@ -724,7 +746,11 @@ mod tests {
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
-        let st = list.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let st = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let amt_col = st
             .column_by_name("amt")
             .unwrap()
