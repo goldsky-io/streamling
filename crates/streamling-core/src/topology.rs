@@ -223,16 +223,56 @@ pub struct PluginSource {
     pub telemetry: Option<Telemetry>,
 }
 
-/// Bounded source that reads files from `path` in the given `format` via
-/// DataFusion's `ListingTable`. `path` may be a local path or a remote object
-/// store URL (`s3://`, `gs://`); remote credentials come from the environment.
+/// Source that reads files from `path` in the given `format`. `path` may be a
+/// local path or a remote object store URL (`s3://`, `gs://`); remote
+/// credentials come from the environment. The `mode` selects between a
+/// continuous poll-for-new-files read (the default) and a bounded one-shot read.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct FileSource {
     pub path: String,
     pub format: FileSourceFormat,
+    #[serde(default)]
+    pub mode: FileSourceMode,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
+}
+
+/// Default discovery interval for a `Continuous` file source when none is given.
+pub const DEFAULT_FILE_POLL_INTERVAL: &str = "10s";
+
+fn default_file_poll_interval() -> String {
+    DEFAULT_FILE_POLL_INTERVAL.to_string()
+}
+
+/// How the file source reads `path`.
+///
+/// - `Continuous` (the default) keeps polling `path` every `poll_interval`,
+///   ingesting files whose `last_modified` exceeds a persisted watermark; it
+///   never self-terminates and so is not allowed under `job_mode`. When the mode
+///   is omitted entirely (or given without `poll_interval`), `poll_interval`
+///   defaults to [`DEFAULT_FILE_POLL_INTERVAL`].
+/// - `Bounded` lists the matching files once via DataFusion's `ListingTable`,
+///   reads them to completion, and lets the job terminate.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum FileSourceMode {
+    Bounded,
+    Continuous {
+        /// Discovery interval as a humantime string (e.g. `5s`, `500ms`),
+        /// parsed when the source is built. Defaults to
+        /// [`DEFAULT_FILE_POLL_INTERVAL`].
+        #[serde(default = "default_file_poll_interval")]
+        poll_interval: String,
+    },
+}
+
+impl Default for FileSourceMode {
+    fn default() -> Self {
+        FileSourceMode::Continuous {
+            poll_interval: default_file_poll_interval(),
+        }
+    }
 }
 
 /// Named `FileSourceFormat` to avoid colliding with DataFusion's `FileFormat`
@@ -1764,7 +1804,86 @@ sinks: {}
                 assert_eq!(file.path, "s3://my-bucket/events/");
                 assert_eq!(file.format, FileSourceFormat::Parquet);
                 assert_eq!(file.primary_key.as_deref(), Some("id"));
+                // Continuous is the default when `mode` is omitted.
+                assert_eq!(
+                    file.mode,
+                    FileSourceMode::Continuous {
+                        poll_interval: DEFAULT_FILE_POLL_INTERVAL.to_string()
+                    }
+                );
             }
+            other => panic!("expected file source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_file_source_continuous_poll_interval_defaults() {
+        // `mode: continuous` without `poll_interval` falls back to the default.
+        let yaml = r#"
+sources:
+  events:
+    type: file
+    path: /tmp/events
+    format: parquet
+    mode:
+      type: continuous
+transforms: {}
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.sources.get("events").unwrap() {
+            Source::file(file) => assert_eq!(
+                file.mode,
+                FileSourceMode::Continuous {
+                    poll_interval: DEFAULT_FILE_POLL_INTERVAL.to_string()
+                }
+            ),
+            other => panic!("expected file source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_file_source_parses_bounded_mode() {
+        let yaml = r#"
+sources:
+  events:
+    type: file
+    path: /tmp/events
+    format: parquet
+    mode:
+      type: bounded
+transforms: {}
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.sources.get("events").unwrap() {
+            Source::file(file) => assert_eq!(file.mode, FileSourceMode::Bounded),
+            other => panic!("expected file source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_file_source_parses_continuous_mode() {
+        let yaml = r#"
+sources:
+  events:
+    type: file
+    path: /tmp/events
+    format: parquet
+    mode:
+      type: continuous
+      poll_interval: 5s
+transforms: {}
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.sources.get("events").unwrap() {
+            Source::file(file) => assert_eq!(
+                file.mode,
+                FileSourceMode::Continuous {
+                    poll_interval: "5s".to_string()
+                }
+            ),
             other => panic!("expected file source, got {:?}", other),
         }
     }
