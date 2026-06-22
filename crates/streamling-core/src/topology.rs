@@ -239,7 +239,7 @@ pub struct FileSource {
 }
 
 /// Default discovery interval for a `Continuous` file source when none is given.
-pub const DEFAULT_FILE_POLL_INTERVAL: &str = "10s";
+pub const DEFAULT_FILE_POLL_INTERVAL: &str = "5s";
 
 fn default_file_poll_interval() -> String {
     DEFAULT_FILE_POLL_INTERVAL.to_string()

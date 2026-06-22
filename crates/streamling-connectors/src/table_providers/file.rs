@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{Column, DataFusionError, ScalarValue};
 use datafusion::datasource::file_format::FileFormat;
@@ -33,6 +33,7 @@ use datafusion::datasource::file_format::avro::AvroFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::helpers::parse_partitions_for_path;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl, PartitionedFile,
 };
@@ -166,8 +167,9 @@ fn register_object_store_for_url(
 /// non-nullable Utf8 column to match what downstream consumers expect.
 ///
 /// Supported path schemes: local paths, `s3://`, and `gs://`. Hive-style
-/// partition columns in the path (e.g. `…/dt=2024-01-01/`) are inferred and added
-/// to the schema.
+/// partition columns in the path (e.g. `…/dt=2024-01-01/`) are surfaced in the
+/// schema, and nested subfolders are read recursively (the session sets
+/// `listing_table_ignore_subdirectory = false`).
 pub async fn build_bounded_file_source_provider(
     reference_name: &str,
     path: &str,
@@ -178,16 +180,19 @@ pub async fn build_bounded_file_source_provider(
     register_object_store_for_url(&table_url, path, session_manager)?;
 
     let file_format = file_format_for(format);
+    let file_extension = file_format.get_ext();
 
     let state = session_manager.session_state();
-    let listing_options = ListingOptions::new(file_format);
+    // Detect Hive partition columns ourselves (only `key=value` directories) rather
+    // than via `infer_partitions_from_path`, which treats every parent directory as
+    // a partition level and so errors on plain nested subfolders.
+    let object_store = state.runtime_env().object_store(table_url.object_store())?;
+    let partition_cols =
+        infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
+    let listing_options =
+        ListingOptions::new(file_format).with_table_partition_cols(partition_cols);
     let config = ListingTableConfig::new(table_url)
         .with_listing_options(listing_options)
-        // Surface Hive-style partition columns (e.g. `dt=2024-01-01/`) in the
-        // schema, matching DataFusion's dynamic-file behavior. A no-op for flat
-        // directories.
-        .infer_partitions_from_path(&state)
-        .await?
         .infer_schema(&state)
         .await?;
     let listing_table = Arc::new(ListingTable::try_new(config)?);
@@ -266,6 +271,105 @@ fn should_process(
     location_extension == Some(file_extension) && last_modified_ms > watermark_ms
 }
 
+/// Number of discovered files sampled to detect the Hive partition layout.
+const PARTITION_SAMPLE_SIZE: usize = 10;
+
+/// Detects Hive partition column names from a sample of file paths: the leading
+/// run of `key=value` parent directory segments, required to be consistent across
+/// the sample. Plain (non `key=value`) directories yield no partition columns, so
+/// arbitrary nested subfolders are read without spurious partition columns.
+///
+/// This replaces DataFusion's `infer_partitions_from_path`, which treats every
+/// parent directory as a partition level and so rejects plain nested subfolders.
+fn detect_partition_columns(
+    table_url: &ListingTableUrl,
+    sample_paths: &[object_store::path::Path],
+) -> Vec<String> {
+    let per_file: Vec<Vec<String>> = sample_paths
+        .iter()
+        .filter_map(|path| {
+            let segments: Vec<&str> = table_url.strip_prefix(path)?.collect();
+            // Parent directories only (drop the filename), then the leading run of
+            // `key=value` segments.
+            let parents = segments
+                .split_last()
+                .map(|(_, parents)| parents)
+                .unwrap_or(&[]);
+            let keys = parents
+                .iter()
+                .take_while(|segment| segment.contains('='))
+                .map(|segment| segment.split('=').next().unwrap_or(segment).to_string())
+                .collect();
+            Some(keys)
+        })
+        .collect();
+
+    match per_file.split_first() {
+        Some((first, rest)) if rest.iter().all(|keys| keys == first) => first.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Lists a sample of files under the prefix and detects the Hive partition
+/// columns, typed as DataFusion types inferred partitions. Empty for flat /
+/// plain-subfolder layouts. Shared by the bounded and continuous builders.
+async fn infer_partition_columns(
+    table_url: &ListingTableUrl,
+    file_extension: &str,
+    object_store: &dyn object_store::ObjectStore,
+) -> Vec<(String, DataType)> {
+    let sample: Vec<object_store::path::Path> = object_store
+        .list(Some(table_url.prefix()))
+        .filter_map(|meta| {
+            let extension = file_extension.to_string();
+            async move {
+                meta.ok()
+                    .filter(|object| object.location.extension() == Some(extension.as_str()))
+                    .map(|object| object.location)
+            }
+        })
+        .take(PARTITION_SAMPLE_SIZE)
+        .collect()
+        .await;
+    detect_partition_columns(table_url, &sample)
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            )
+        })
+        .collect()
+}
+
+/// Parses Hive partition values for a file path against the configured partition
+/// columns (typed as DataFusion's `infer_partitions_from_path` produced them).
+/// `Ok(None)` means the file is not under the expected `key=value` layout and
+/// should be skipped; `Ok(Some(vec![]))` is returned for flat / plain-subfolder
+/// layouts that have no partition columns.
+fn partition_values_for(
+    table_url: &ListingTableUrl,
+    file_path: &object_store::path::Path,
+    partition_cols: &[(String, DataType)],
+) -> DataFusionResult<Option<Vec<ScalarValue>>> {
+    if partition_cols.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    match parse_partitions_for_path(
+        table_url,
+        file_path,
+        partition_cols.iter().map(|(name, _)| name.as_str()),
+    ) {
+        None => Ok(None),
+        Some(values) => values
+            .into_iter()
+            .zip(partition_cols)
+            .map(|(value, (_, datatype))| ScalarValue::try_from_string(value.to_string(), datatype))
+            .collect::<DataFusionResult<Vec<_>>>()
+            .map(Some),
+    }
+}
+
 /// Continuous (unbounded) file source. Polls `table_url` every `poll_interval`,
 /// ingesting files whose `last_modified` exceeds the persisted [`FileWatermark`],
 /// and emits their rows with a synthesized `_gs_op = 'i'` (unless the files
@@ -275,6 +379,11 @@ pub struct FileSourceTableProvider {
     table_url: ListingTableUrl,
     file_source: Arc<dyn FileSource>,
     file_extension: String,
+    /// Hive partition columns inferred from the path (empty for flat layouts);
+    /// used to parse per-file partition values during discovery.
+    partition_cols: Vec<(String, DataType)>,
+    /// Partition columns as fields for the runtime `FileScanConfig`.
+    partition_fields: Vec<Field>,
     /// Columns read from the files (includes `_gs_op` only if the files provide it).
     file_schema: SchemaRef,
     /// Published schema: `file_schema` plus a synthesized `_gs_op` when absent.
@@ -306,34 +415,13 @@ impl FileSourceTableProvider {
         register_object_store_for_url(&table_url, path, session_manager)?;
 
         let file_format = file_format_for(format);
+        let file_extension = file_format.get_ext();
+
         let state = session_manager.session_state();
 
-        // Continuous mode does not surface Hive partition columns (the poll loop
-        // builds flat file groups); bail rather than silently dropping them.
-        // `infer_partitions_from_path` only inspects the directory structure.
-        let partition_probe = ListingTableConfig::new(table_url.clone())
-            .with_listing_options(ListingOptions::new(file_format.clone()))
-            .infer_partitions_from_path(&state)
-            .await?;
-        let partition_cols = partition_probe
-            .options
-            .map(|options| options.table_partition_cols)
-            .unwrap_or_default();
-        if !partition_cols.is_empty() {
-            let names: Vec<&str> = partition_cols
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect();
-            streamling_user_bail!(
-                "file source '{}': continuous mode does not support Hive partition \
-                 columns (found {:?} under path '{}'). Use bounded mode or a \
-                 non-partitioned path.",
-                reference_name,
-                names,
-                path
-            );
-        }
-
+        // Infer the data (file) schema from file contents. This is safe for any
+        // nesting; it does not validate a partition structure (unlike DataFusion's
+        // `infer_partitions_from_path`, which rejects plain nested subfolders).
         let config = ListingTableConfig::new(table_url.clone())
             .with_listing_options(ListingOptions::new(file_format.clone()))
             .infer_schema(&state)
@@ -350,9 +438,23 @@ impl FileSourceTableProvider {
             );
         }
 
-        // Append a synthesized `_gs_op` unless the files already carry a valid one
-        // (mirrors the bounded source's ViewTable projection vs. passthrough).
-        let (full_schema, append_op) = match file_schema.field_with_name(COLUMN_NAME_OP) {
+        // Detect Hive partition columns from a sample of discovered paths: only
+        // `key=value` directory segments count, so plain nested subfolders yield no
+        // partition columns.
+        let object_store = state.runtime_env().object_store(table_url.object_store())?;
+        let partition_cols =
+            infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
+        let partition_fields: Vec<Field> = partition_cols
+            .iter()
+            .map(|(name, datatype)| Field::new(name, datatype.clone(), false))
+            .collect();
+
+        // Output schema: data columns, then partition columns, then a synthesized
+        // `_gs_op` unless the data already carries a valid one (mirrors the bounded
+        // source's ViewTable projection vs. passthrough).
+        let mut output_fields: Vec<FieldRef> = file_schema.fields().iter().cloned().collect();
+        output_fields.extend(partition_fields.iter().map(|field| Arc::new(field.clone())));
+        let append_op = match file_schema.field_with_name(COLUMN_NAME_OP) {
             Ok(op_field) => {
                 if op_field.data_type() != &DataType::Utf8 || op_field.is_nullable() {
                     streamling_user_bail!(
@@ -364,16 +466,15 @@ impl FileSourceTableProvider {
                         op_field.is_nullable()
                     );
                 }
-                (file_schema.clone(), false)
+                false
             }
             Err(_) => {
-                let mut fields = file_schema.fields().to_vec();
-                fields.push(Arc::new(Field::new(COLUMN_NAME_OP, DataType::Utf8, false)));
-                (Arc::new(Schema::new(fields)), true)
+                output_fields.push(Arc::new(Field::new(COLUMN_NAME_OP, DataType::Utf8, false)));
+                true
             }
         };
+        let full_schema: SchemaRef = Arc::new(Schema::new(output_fields));
 
-        let file_extension = file_format.get_ext();
         let file_source = file_source_for(format, &file_format);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -382,6 +483,8 @@ impl FileSourceTableProvider {
             table_url,
             file_source,
             file_extension,
+            partition_cols,
+            partition_fields,
             file_schema,
             full_schema,
             append_op,
@@ -433,6 +536,8 @@ impl TableProvider for FileSourceTableProvider {
             self.table_url.clone(),
             self.file_source.clone(),
             self.file_extension.clone(),
+            self.partition_cols.clone(),
+            self.partition_fields.clone(),
             self.file_schema.clone(),
             self.full_schema.clone(),
             self.append_op,
@@ -451,6 +556,8 @@ struct FileSourceExec {
     table_url: ListingTableUrl,
     file_source: Arc<dyn FileSource>,
     file_extension: String,
+    partition_cols: Vec<(String, DataType)>,
+    partition_fields: Vec<Field>,
     file_schema: SchemaRef,
     full_schema: SchemaRef,
     output_schema: SchemaRef,
@@ -471,6 +578,8 @@ impl FileSourceExec {
         table_url: ListingTableUrl,
         file_source: Arc<dyn FileSource>,
         file_extension: String,
+        partition_cols: Vec<(String, DataType)>,
+        partition_fields: Vec<Field>,
         file_schema: SchemaRef,
         full_schema: SchemaRef,
         append_op: bool,
@@ -495,6 +604,8 @@ impl FileSourceExec {
             table_url,
             file_source,
             file_extension,
+            partition_cols,
+            partition_fields,
             file_schema,
             full_schema,
             output_schema,
@@ -561,6 +672,8 @@ impl ExecutionPlan for FileSourceExec {
         let table_url = self.table_url.clone();
         let file_source = self.file_source.clone();
         let file_extension = self.file_extension.clone();
+        let partition_cols = self.partition_cols.clone();
+        let partition_fields = self.partition_fields.clone();
         let file_schema = self.file_schema.clone();
         let full_schema = self.full_schema.clone();
         let output_schema = self.output_schema.clone();
@@ -625,20 +738,38 @@ impl ExecutionPlan for FileSourceExec {
                 while let Some(meta) = listing.next().await {
                     let meta = meta?;
                     let last_modified_ms = meta.last_modified.timestamp_millis();
-                    if should_process(
+                    if !should_process(
                         meta.location.extension(),
                         last_modified_ms,
                         &file_extension,
                         watermark.last_modified_ms,
                     ) {
-                        max_seen = max_seen.max(last_modified_ms);
-                        new_files.push(PartitionedFile::from(meta));
-                    } else {
                         debug!(
                             "Skipping file {}, last modified at {}",
                             meta.location, meta.last_modified
                         );
+                        continue;
                     }
+                    // Parse Hive partition values from the path (empty for flat /
+                    // plain-subfolder layouts). Files outside the partition layout
+                    // are skipped.
+                    let partition_values =
+                        match partition_values_for(&table_url, &meta.location, &partition_cols)? {
+                            Some(values) => values,
+                            None => {
+                                debug!("Skipping file outside partition layout: {}", meta.location);
+                                continue;
+                            }
+                        };
+                    max_seen = max_seen.max(last_modified_ms);
+                    new_files.push(PartitionedFile {
+                        object_meta: meta,
+                        partition_values,
+                        range: None,
+                        statistics: None,
+                        extensions: None,
+                        metadata_size_hint: None,
+                    });
                 }
 
                 if !new_files.is_empty() {
@@ -647,6 +778,7 @@ impl ExecutionPlan for FileSourceExec {
                         file_schema.clone(),
                         file_source.clone(),
                     )
+                    .with_table_partition_cols(partition_fields.clone())
                     .with_file_group(FileGroup::new(new_files))
                     .build();
 
@@ -890,6 +1022,73 @@ mod tests {
         assert!(should_process(Some("parquet"), 10, "parquet", 5));
         assert!(!should_process(Some("parquet"), 5, "parquet", 5));
         assert!(!should_process(Some("parquet"), 4, "parquet", 5));
+    }
+
+    #[test]
+    fn detect_partition_columns_handles_hive_and_plain() {
+        let url = ListingTableUrl::parse("file:///t/").unwrap();
+
+        let hive = vec![
+            object_store::path::Path::from("t/dt=2024-01-01/a.parquet"),
+            object_store::path::Path::from("t/dt=2024-01-02/b.parquet"),
+        ];
+        assert_eq!(
+            detect_partition_columns(&url, &hive),
+            vec!["dt".to_string()]
+        );
+
+        let multi = vec![
+            object_store::path::Path::from("t/dt=2024-01-01/region=us/a.parquet"),
+            object_store::path::Path::from("t/dt=2024-01-02/region=eu/b.parquet"),
+        ];
+        assert_eq!(
+            detect_partition_columns(&url, &multi),
+            vec!["dt".to_string(), "region".to_string()]
+        );
+
+        // Plain nested subfolders (no `key=value`) → no partition columns, even at
+        // mixed depths.
+        let plain = vec![
+            object_store::path::Path::from("t/a/x.parquet"),
+            object_store::path::Path::from("t/b/c/y.parquet"),
+        ];
+        assert!(detect_partition_columns(&url, &plain).is_empty());
+
+        // Flat layout → no partition columns.
+        let flat = vec![object_store::path::Path::from("t/x.parquet")];
+        assert!(detect_partition_columns(&url, &flat).is_empty());
+    }
+
+    #[test]
+    fn partition_values_for_parses_hive_layout() {
+        let table_url = ListingTableUrl::parse("file:///tablepath/").unwrap();
+        let cols = vec![
+            ("dt".to_string(), DataType::Utf8),
+            ("region".to_string(), DataType::Utf8),
+        ];
+
+        // A file under a `dt=…/region=…/` layout yields its partition values.
+        let path = object_store::path::Path::from("tablepath/dt=2024-01-01/region=us/f.parquet");
+        let values = partition_values_for(&table_url, &path, &cols)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            values,
+            vec![ScalarValue::from("2024-01-01"), ScalarValue::from("us")]
+        );
+
+        // No partition columns → empty values (flat / plain-subfolder layout).
+        assert_eq!(
+            partition_values_for(&table_url, &path, &[]).unwrap(),
+            Some(vec![])
+        );
+
+        // A file not under the expected partition layout is skipped.
+        let flat = object_store::path::Path::from("tablepath/f.parquet");
+        assert_eq!(
+            partition_values_for(&table_url, &flat, &cols).unwrap(),
+            None
+        );
     }
 
     /// The continuous source must emit an empty `RecordBatch` on every poll — even
