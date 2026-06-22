@@ -603,26 +603,21 @@ impl ExecutionPlan for FileSourceExec {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
             loop {
-                // Drain checkpoint-coordinator messages. Each is recorded for
-                // commit-on-finalize (snapshot watermark on Marker, persist on
-                // Finalizer) and buffered to ride downstream on this poll's first
-                // emitted batch (a data batch, or the idle heartbeat), so the
-                // barrier keeps flowing even while the source is idle. The
-                // watermark snapshotted here is the pre-this-poll value, so a
-                // restart re-reads at most this poll's files. Mirrors the Kafka
-                // source.
-                let mut source_complete = false;
-                while let Ok(message) = checkpoint_receiver.try_recv() {
-                    source_complete |= handle_checkpoint_message(
-                        &message,
-                        watermark,
-                        &mut pending_watermarks,
-                        &state_backend,
-                        &state_key,
-                    )
-                    .await?;
-                    checkpoint_buffer.push(message);
-                }
+                // Drain coordinator messages that arrived during the sleep. Each
+                // is recorded for commit-on-finalize (snapshot watermark on
+                // Marker, persist on Finalizer) and buffered to ride downstream on
+                // the next emitted batch (a data batch, or the idle heartbeat).
+                // The watermark snapshotted here is the pre-this-poll value, so a
+                // restart re-reads at most this poll's files. Mirrors Kafka.
+                let mut source_complete = drain_checkpoints(
+                    &checkpoint_receiver,
+                    watermark,
+                    &mut pending_watermarks,
+                    &state_backend,
+                    &state_key,
+                    &mut checkpoint_buffer,
+                )
+                .await?;
 
                 let mut new_files: Vec<PartitionedFile> = Vec::new();
                 let mut max_seen = watermark.last_modified_ms;
@@ -657,28 +652,38 @@ impl ExecutionPlan for FileSourceExec {
 
                     let mut stream =
                         DataSourceExec::from_data_source(config).execute(0, context.clone())?;
-                    let mut checkpoints_attached = false;
                     while let Some(batch) = stream.next().await {
-                        let mut batch = build_output_batch(
-                            batch?,
-                            append_op,
-                            &full_schema,
-                            projection.as_ref(),
-                        )?;
-                        // Attach the drained checkpoint messages to this poll's
-                        // first emitted batch.
-                        if !checkpoints_attached {
-                            batch = enrich_with_checkpoints(batch, &checkpoint_buffer);
-                            checkpoint_buffer.clear();
-                            checkpoints_attached = true;
-                        }
+                        // Drain again before every batch so markers arriving mid-read
+                        // ride the next batch (within one batch interval) instead of
+                        // waiting for the whole file group, which can take a while.
+                        source_complete |= drain_checkpoints(
+                            &checkpoint_receiver,
+                            watermark,
+                            &mut pending_watermarks,
+                            &state_backend,
+                            &state_key,
+                            &mut checkpoint_buffer,
+                        )
+                        .await?;
+
+                        let batch = enrich_with_checkpoints(
+                            build_output_batch(
+                                batch?,
+                                append_op,
+                                &full_schema,
+                                projection.as_ref(),
+                            )?,
+                            &checkpoint_buffer,
+                        );
+                        checkpoint_buffer.clear();
+
                         let rows = batch.num_rows() as u64;
                         if tx.send(Ok(batch)).await.is_err() {
                             return Ok(());
                         }
                         total_emitted += rows;
-                        if let Some(limit) = num_records_before_stop
-                            && total_emitted >= limit
+                        if source_complete
+                            || num_records_before_stop.is_some_and(|limit| total_emitted >= limit)
                         {
                             return Ok(());
                         }
@@ -822,6 +827,34 @@ async fn handle_checkpoint_message(
         CheckpointMessage::Ack { .. } => {}
     }
     Ok(false)
+}
+
+/// Drains all currently-available coordinator messages, recording each (snapshot
+/// on `Marker`, persist on `Finalizer`) and buffering it for downstream
+/// enrichment. Returns whether a `SourceComplete` was seen. Called both between
+/// polls and before every emitted batch, so markers propagate within one batch
+/// interval even while a large file group reads for a while.
+async fn drain_checkpoints(
+    receiver: &crossbeam::channel::Receiver<CheckpointMessage>,
+    watermark: FileWatermark,
+    pending_watermarks: &mut BTreeMap<CheckpointEpoch, FileWatermark>,
+    state_backend: &Arc<dyn StateOperatorBackend<FileWatermark>>,
+    state_key: &StateKey,
+    buffer: &mut Vec<CheckpointMessage>,
+) -> DataFusionResult<bool> {
+    let mut source_complete = false;
+    while let Ok(message) = receiver.try_recv() {
+        source_complete |= handle_checkpoint_message(
+            &message,
+            watermark,
+            pending_watermarks,
+            state_backend,
+            state_key,
+        )
+        .await?;
+        buffer.push(message);
+    }
+    Ok(source_complete)
 }
 
 fn to_df_err<E>(e: E) -> DataFusionError
