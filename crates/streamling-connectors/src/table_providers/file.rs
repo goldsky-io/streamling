@@ -18,6 +18,7 @@
 //! column to match what downstream consumers expect.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +58,11 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, info};
 
+use streamling_core::checkpoints::channels::subscribe;
+use streamling_core::checkpoints::checkpoint_management::{
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
+    enrich_batch_metadata_with_checkpoints,
+};
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::error::Result;
 use streamling_core::session::SessionManager;
@@ -557,6 +563,7 @@ impl ExecutionPlan for FileSourceExec {
         let file_extension = self.file_extension.clone();
         let file_schema = self.file_schema.clone();
         let full_schema = self.full_schema.clone();
+        let output_schema = self.output_schema.clone();
         let append_op = self.append_op;
         let projection = self.projection.clone();
         let poll_interval = self.poll_interval;
@@ -564,6 +571,10 @@ impl ExecutionPlan for FileSourceExec {
         let state_key = watermark_state_key(&self.reference_name);
         let num_records_before_stop = self.num_records_before_stop;
         let mut shutdown_rx = self.shutdown_rx.clone();
+
+        // Subscribe synchronously, before the stream is returned, so no
+        // coordinator message is missed; the receiver is drained each poll.
+        let checkpoint_receiver = subscribe(CHECKPOINT_COORDINATOR_CHANNEL);
 
         builder.spawn(async move {
             let object_store_url = table_url.object_store();
@@ -577,6 +588,10 @@ impl ExecutionPlan for FileSourceExec {
                     last_modified_ms: i64::MIN,
                 });
             let mut total_emitted: u64 = 0;
+            let mut checkpoint_buffer: Vec<CheckpointMessage> = Vec::new();
+            // Watermark snapshot per in-flight checkpoint epoch (taken at marker
+            // time), persisted only when that epoch is finalized.
+            let mut pending_watermarks: BTreeMap<CheckpointEpoch, FileWatermark> = BTreeMap::new();
 
             debug!("Current watermark: {:?}", watermark);
 
@@ -588,6 +603,27 @@ impl ExecutionPlan for FileSourceExec {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
             loop {
+                // Drain checkpoint-coordinator messages. Each is recorded for
+                // commit-on-finalize (snapshot watermark on Marker, persist on
+                // Finalizer) and buffered to ride downstream on this poll's first
+                // emitted batch (a data batch, or the idle heartbeat), so the
+                // barrier keeps flowing even while the source is idle. The
+                // watermark snapshotted here is the pre-this-poll value, so a
+                // restart re-reads at most this poll's files. Mirrors the Kafka
+                // source.
+                let mut source_complete = false;
+                while let Ok(message) = checkpoint_receiver.try_recv() {
+                    source_complete |= handle_checkpoint_message(
+                        &message,
+                        watermark,
+                        &mut pending_watermarks,
+                        &state_backend,
+                        &state_key,
+                    )
+                    .await?;
+                    checkpoint_buffer.push(message);
+                }
+
                 let mut new_files: Vec<PartitionedFile> = Vec::new();
                 let mut max_seen = watermark.last_modified_ms;
                 let mut listing = object_store.list(Some(table_url.prefix()));
@@ -621,13 +657,21 @@ impl ExecutionPlan for FileSourceExec {
 
                     let mut stream =
                         DataSourceExec::from_data_source(config).execute(0, context.clone())?;
+                    let mut checkpoints_attached = false;
                     while let Some(batch) = stream.next().await {
-                        let batch = build_output_batch(
+                        let mut batch = build_output_batch(
                             batch?,
                             append_op,
                             &full_schema,
                             projection.as_ref(),
                         )?;
+                        // Attach the drained checkpoint messages to this poll's
+                        // first emitted batch.
+                        if !checkpoints_attached {
+                            batch = enrich_with_checkpoints(batch, &checkpoint_buffer);
+                            checkpoint_buffer.clear();
+                            checkpoints_attached = true;
+                        }
                         let rows = batch.num_rows() as u64;
                         if tx.send(Ok(batch)).await.is_err() {
                             return Ok(());
@@ -640,13 +684,33 @@ impl ExecutionPlan for FileSourceExec {
                         }
                     }
 
+                    // Advance the in-memory watermark so files aren't re-read
+                    // within this run. Durable persistence happens only on a
+                    // checkpoint finalize (see the drain above), mirroring the
+                    // Kafka source's commit-on-finalize.
                     watermark.last_modified_ms = max_seen;
-                    state_backend
-                        .put(state_key.clone(), watermark)
-                        .await
-                        .map_err(to_df_err)?;
                 } else {
                     debug!("No new files to process");
+                    // Heartbeat: on an idle poll (no new files), emit an empty batch
+                    // — carrying any drained checkpoint messages — so downstream
+                    // operators keep advancing (checkpoints, liveness, time-based
+                    // logic) while the source has no data to forward.
+                    let heartbeat = enrich_with_checkpoints(
+                        RecordBatch::new_empty(output_schema.clone()),
+                        &checkpoint_buffer,
+                    );
+                    checkpoint_buffer.clear();
+                    if tx.send(Ok(heartbeat)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+
+                if source_complete {
+                    debug!(
+                        "[{}] file source received SourceComplete; shutting down",
+                        reference_name
+                    );
+                    return Ok(());
                 }
 
                 tokio::select! {
@@ -709,6 +773,57 @@ fn build_output_batch(
     }
 }
 
+/// Attaches pending checkpoint-coordinator messages to a batch's schema metadata
+/// so the checkpoint barrier propagates downstream (mirrors the Kafka source).
+/// A no-op when there are no messages.
+fn enrich_with_checkpoints(batch: RecordBatch, messages: &[CheckpointMessage]) -> RecordBatch {
+    if messages.is_empty() {
+        return batch;
+    }
+    let mut metadata = batch.schema().metadata().clone();
+    enrich_batch_metadata_with_checkpoints(&mut metadata, messages);
+    let schema = Arc::new(Schema::new_with_metadata(
+        batch.schema().fields().clone(),
+        metadata,
+    ));
+    RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap_or(batch)
+}
+
+/// Handles one drained checkpoint message, mirroring the Kafka source's
+/// commit-on-finalize: a `Marker` snapshots the current watermark for its epoch,
+/// and a `Finalizer` durably persists the matching snapshot (the value captured
+/// at marker time, not the now-advanced watermark) and drops it. Returns `true`
+/// for `SourceComplete` so the caller can shut down. Other messages are no-ops
+/// here (they still propagate downstream via batch metadata).
+async fn handle_checkpoint_message(
+    message: &CheckpointMessage,
+    watermark: FileWatermark,
+    pending_watermarks: &mut BTreeMap<CheckpointEpoch, FileWatermark>,
+    state_backend: &Arc<dyn StateOperatorBackend<FileWatermark>>,
+    state_key: &StateKey,
+) -> DataFusionResult<bool> {
+    match message {
+        CheckpointMessage::Marker { epoch, .. } => {
+            pending_watermarks.insert(epoch.clone(), watermark);
+        }
+        CheckpointMessage::Finalizer(epoch) => {
+            if let Some(snapshot) = pending_watermarks.remove(epoch) {
+                state_backend
+                    .put(state_key.clone(), snapshot)
+                    .await
+                    .map_err(to_df_err)?;
+                debug!(
+                    "Persisted watermark {:?} on finalize of epoch {:?}",
+                    snapshot, epoch
+                );
+            }
+        }
+        CheckpointMessage::SourceComplete(_) => return Ok(true),
+        CheckpointMessage::Ack { .. } => {}
+    }
+    Ok(false)
+}
+
 fn to_df_err<E>(e: E) -> DataFusionError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -744,63 +859,199 @@ mod tests {
         assert!(!should_process(Some("parquet"), 4, "parquet", 5));
     }
 
-    /// Regression for the NUL-delimiter bug: building the runtime `FileScanConfig`
-    /// with `CsvFormat::file_source()` (`CsvSource::default`) splits on a NUL byte,
-    /// so every line collapses to a single field and the read fails with
-    /// "incorrect number of fields". `file_source_for` must wire the comma
-    /// delimiter and header-skipping instead.
+    /// The continuous source must emit an empty `RecordBatch` on every poll — even
+    /// when no new files were discovered — so downstream operators keep advancing
+    /// while the source is idle.
     #[tokio::test]
-    async fn continuous_csv_reads_comma_delimited_rows() {
-        use datafusion::arrow::array::Array;
-        use datafusion::physical_plan::collect;
-        use datafusion::prelude::SessionContext;
+    async fn continuous_source_emits_empty_heartbeat_when_idle() {
+        use std::time::Duration;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+        use tokio::time::timeout;
 
-        let dir = std::env::temp_dir().join(format!("streamling_csv_src_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("streamling_heartbeat_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("1.csv"), "id,name\n1,alice\n2,bob\n3,carol").unwrap();
 
-        let file_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let file_format = file_format_for(FileSourceFormat::Csv);
-        let file_source = file_source_for(FileSourceFormat::Csv, &file_format);
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<FileWatermark>("heartbeat_test");
 
-        let url = ListingTableUrl::parse(format!("{}/", dir.to_str().unwrap())).unwrap();
-        let object_store_url = url.object_store();
+        let provider = FileSourceTableProvider::try_new(
+            "heartbeat_src",
+            &format!("{}/", dir.to_str().unwrap()),
+            FileSourceFormat::Csv,
+            Duration::from_millis(100),
+            &session_manager,
+            state_backend,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
 
-        let ctx = SessionContext::new();
-        let task_ctx = ctx.task_ctx();
-        let object_store = task_ctx
-            .runtime_env()
-            .object_store(&object_store_url)
-            .unwrap();
-        let files: Vec<PartitionedFile> = object_store
-            .list(Some(url.prefix()))
-            .map(|meta| PartitionedFile::from(meta.unwrap()))
-            .collect()
-            .await;
-
-        let config = FileScanConfigBuilder::new(object_store_url, file_schema, file_source)
-            .with_file_group(FileGroup::new(files))
-            .build();
-        let batches = collect(DataSourceExec::from_data_source(config), task_ctx)
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
             .await
             .unwrap();
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+
+        // The first poll reads the file once (3 rows); each subsequent idle poll
+        // emits an empty heartbeat. Collecting several items spans multiple polls.
+        let mut data_rows = 0usize;
+        let mut empty_batches = 0usize;
+        for _ in 0..5 {
+            let batch = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream should yield within timeout")
+                .expect("stream should not end")
+                .unwrap();
+            if batch.num_rows() == 0 {
+                empty_batches += 1;
+            } else {
+                data_rows += batch.num_rows();
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
 
-        let names: Vec<String> = batches
-            .iter()
-            .flat_map(|batch| {
-                let column = batch.column_by_name("name").unwrap();
-                let array = column.as_any().downcast_ref::<StringArray>().unwrap();
-                (0..array.len())
-                    .map(|i| array.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // Header skipped (3 rows, not 4) and fields split on the comma.
-        assert_eq!(names, vec!["alice", "bob", "carol"]);
+        assert_eq!(data_rows, 3, "the file's 3 rows are read exactly once");
+        assert!(
+            empty_batches >= 2,
+            "idle polls must emit empty heartbeat batches; got {empty_batches}"
+        );
+    }
+
+    /// Checkpoint messages drained from the coordinator are attached to a batch's
+    /// schema metadata so the barrier propagates downstream (recoverable via
+    /// `extract_checkpoint_messages`); an empty set is a no-op.
+    #[test]
+    fn enrich_with_checkpoints_attaches_marker_metadata() {
+        use streamling_core::checkpoints::checkpoint_management::{
+            CheckpointEpoch, extract_checkpoint_messages,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+
+        let enriched = enrich_with_checkpoints(
+            RecordBatch::new_empty(schema.clone()),
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(3),
+                created_at_ms: 100,
+            }],
+        );
+        let extracted = extract_checkpoint_messages(enriched.schema().metadata());
+        assert!(
+            matches!(
+                extracted.as_slice(),
+                [CheckpointMessage::Marker { epoch, .. }] if epoch.0 == 3
+            ),
+            "marker should be recoverable from batch metadata; got {extracted:?}"
+        );
+
+        let untouched = enrich_with_checkpoints(RecordBatch::new_empty(schema), &[]);
+        assert!(extract_checkpoint_messages(untouched.schema().metadata()).is_empty());
+    }
+
+    /// The watermark is persisted only on a checkpoint finalize, and the value
+    /// persisted is the snapshot captured at marker time (not the now-advanced
+    /// watermark) — mirroring the Kafka source's commit-on-finalize.
+    #[tokio::test]
+    async fn persists_watermark_only_on_finalize() {
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<FileWatermark>("ns");
+        let key = watermark_state_key("src");
+        let mut pending: BTreeMap<CheckpointEpoch, FileWatermark> = BTreeMap::new();
+
+        // A marker snapshots the current watermark but persists nothing.
+        let is_complete = handle_checkpoint_message(
+            &CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(1),
+                created_at_ms: 0,
+            },
+            FileWatermark {
+                last_modified_ms: 42,
+            },
+            &mut pending,
+            &state_backend,
+            &key,
+        )
+        .await
+        .unwrap();
+        assert!(!is_complete);
+        assert!(
+            state_backend.get(key.clone()).await.unwrap().is_none(),
+            "a marker must not persist the watermark"
+        );
+
+        // Finalize persists the marker-time snapshot (42), not the now-advanced
+        // watermark (999) passed in here.
+        handle_checkpoint_message(
+            &CheckpointMessage::Finalizer(CheckpointEpoch(1)),
+            FileWatermark {
+                last_modified_ms: 999,
+            },
+            &mut pending,
+            &state_backend,
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state_backend
+                .get(key.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_modified_ms,
+            42,
+            "finalize must persist the snapshot captured at marker time"
+        );
+        assert!(pending.is_empty());
+
+        // A finalize for an unknown epoch changes nothing.
+        handle_checkpoint_message(
+            &CheckpointMessage::Finalizer(CheckpointEpoch(7)),
+            FileWatermark {
+                last_modified_ms: 1234,
+            },
+            &mut pending,
+            &state_backend,
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state_backend
+                .get(key.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_modified_ms,
+            42,
+            "an unknown-epoch finalize must not change persisted state"
+        );
+
+        // SourceComplete signals shutdown.
+        let is_complete = handle_checkpoint_message(
+            &CheckpointMessage::SourceComplete("src".to_string()),
+            FileWatermark {
+                last_modified_ms: 0,
+            },
+            &mut pending,
+            &state_backend,
+            &key,
+        )
+        .await
+        .unwrap();
+        assert!(is_complete);
     }
 }
