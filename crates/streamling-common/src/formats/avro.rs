@@ -2,11 +2,11 @@ pub mod arrow_avro;
 mod schema;
 mod writer;
 
+use crate::formats::FromArrowConverter;
 pub use crate::formats::avro::schema::convert_avro_schema_to_arrow;
 pub use crate::formats::avro::schema::post_process_avro_schema_for_reading;
 pub use crate::formats::avro::schema::post_process_avro_schema_for_writing;
 pub use crate::formats::avro::writer::{serialize, to_avro};
-use crate::formats::FromArrowConverter;
 use apache_avro::types::Value;
 use arrow_schema::SchemaRef;
 use datafusion::arrow::array::RecordBatch;
@@ -613,5 +613,4 @@ mod tests {
             panic!("Expected Record value");
         }
     }
-
 }
