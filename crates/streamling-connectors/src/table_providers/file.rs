@@ -18,7 +18,7 @@
 //! column to match what downstream consumers expect.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
@@ -248,12 +248,19 @@ pub async fn build_bounded_file_source_provider(
     Ok(Arc::new(ViewTable::new(plan, None)))
 }
 
-/// Persisted discovery position for the continuous file source: the maximum
-/// object `last_modified` (epoch milliseconds) already ingested. Files with a
-/// greater `last_modified` are (re)processed on the next poll.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+/// Persisted discovery position for the continuous file source.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct FileWatermark {
+    /// Maximum object `last_modified` (epoch milliseconds) already ingested.
     pub last_modified_ms: i64,
+    /// Paths of files already ingested whose `last_modified` equals
+    /// `last_modified_ms`. New files that share that boundary timestamp (common
+    /// with second-granularity object-store mtimes) are still picked up, while the
+    /// ones already done are not reprocessed. Bounded by the number of files
+    /// sharing the latest timestamp; it resets whenever a newer file advances the
+    /// watermark.
+    #[serde(default)]
+    pub boundary_paths: Vec<String>,
 }
 
 fn watermark_state_key(reference_name: &str) -> StateKey {
@@ -261,14 +268,39 @@ fn watermark_state_key(reference_name: &str) -> StateKey {
 }
 
 /// Whether a listed object should be ingested: it must carry the format's
-/// extension and be newer than the watermark.
+/// extension and either be newer than the watermark, or share the watermark's
+/// timestamp without having been ingested already. The boundary case keeps new
+/// files that land at the exact watermark second (common with second-granularity
+/// object-store mtimes) from being missed.
 fn should_process(
     location_extension: Option<&str>,
-    last_modified_ms: i64,
     file_extension: &str,
+    last_modified_ms: i64,
     watermark_ms: i64,
+    already_ingested_at_boundary: bool,
 ) -> bool {
-    location_extension == Some(file_extension) && last_modified_ms > watermark_ms
+    if location_extension != Some(file_extension) {
+        return false;
+    }
+    last_modified_ms > watermark_ms
+        || (last_modified_ms == watermark_ms && !already_ingested_at_boundary)
+}
+
+/// Advances the watermark after a poll's files are ingested. `new_boundary` are
+/// the paths ingested at `max_seen`. When `max_seen` matches the current second (a
+/// boundary), the boundary set is unioned so future files at that timestamp are
+/// still picked up; when it advances, the watermark and boundary set reset.
+fn advance_watermark(watermark: &mut FileWatermark, max_seen: i64, new_boundary: Vec<String>) {
+    if max_seen == watermark.last_modified_ms {
+        let mut combined: HashSet<String> = std::mem::take(&mut watermark.boundary_paths)
+            .into_iter()
+            .collect();
+        combined.extend(new_boundary);
+        watermark.boundary_paths = combined.into_iter().collect();
+    } else {
+        watermark.last_modified_ms = max_seen;
+        watermark.boundary_paths = new_boundary;
+    }
 }
 
 /// Number of discovered files sampled to detect the Hive partition layout.
@@ -699,6 +731,7 @@ impl ExecutionPlan for FileSourceExec {
                 .map_err(to_df_err)?
                 .unwrap_or(FileWatermark {
                     last_modified_ms: i64::MIN,
+                    boundary_paths: Vec::new(),
                 });
             let mut total_emitted: u64 = 0;
             let mut checkpoint_buffer: Vec<CheckpointMessage> = Vec::new();
@@ -724,7 +757,7 @@ impl ExecutionPlan for FileSourceExec {
                 // restart re-reads at most this poll's files. Mirrors Kafka.
                 let mut source_complete = drain_checkpoints(
                     &checkpoint_receiver,
-                    watermark,
+                    &watermark,
                     &mut pending_watermarks,
                     &state_backend,
                     &state_key,
@@ -732,17 +765,25 @@ impl ExecutionPlan for FileSourceExec {
                 )
                 .await?;
 
+                // Files already ingested at the current watermark second, so new
+                // files sharing that timestamp are still picked up without
+                // reprocessing the done ones.
+                let boundary: HashSet<String> = watermark.boundary_paths.iter().cloned().collect();
                 let mut new_files: Vec<PartitionedFile> = Vec::new();
                 let mut max_seen = watermark.last_modified_ms;
                 let mut listing = object_store.list(Some(table_url.prefix()));
                 while let Some(meta) = listing.next().await {
                     let meta = meta?;
                     let last_modified_ms = meta.last_modified.timestamp_millis();
+                    let already_ingested_at_boundary = last_modified_ms
+                        == watermark.last_modified_ms
+                        && boundary.contains(meta.location.as_ref());
                     if !should_process(
                         meta.location.extension(),
-                        last_modified_ms,
                         &file_extension,
+                        last_modified_ms,
                         watermark.last_modified_ms,
+                        already_ingested_at_boundary,
                     ) {
                         debug!(
                             "Skipping file {}, last modified at {}",
@@ -773,6 +814,16 @@ impl ExecutionPlan for FileSourceExec {
                 }
 
                 if !new_files.is_empty() {
+                    // The new boundary set: paths ingested this poll at the newest
+                    // timestamp. Computed before `new_files` is moved below.
+                    let new_boundary: Vec<String> = new_files
+                        .iter()
+                        .filter(|file| {
+                            file.object_meta.last_modified.timestamp_millis() == max_seen
+                        })
+                        .map(|file| file.object_meta.location.as_ref().to_string())
+                        .collect();
+
                     let config = FileScanConfigBuilder::new(
                         object_store_url.clone(),
                         file_schema.clone(),
@@ -790,7 +841,7 @@ impl ExecutionPlan for FileSourceExec {
                         // waiting for the whole file group, which can take a while.
                         source_complete |= drain_checkpoints(
                             &checkpoint_receiver,
-                            watermark,
+                            &watermark,
                             &mut pending_watermarks,
                             &state_backend,
                             &state_key,
@@ -821,11 +872,11 @@ impl ExecutionPlan for FileSourceExec {
                         }
                     }
 
-                    // Advance the in-memory watermark so files aren't re-read
-                    // within this run. Durable persistence happens only on a
-                    // checkpoint finalize (see the drain above), mirroring the
-                    // Kafka source's commit-on-finalize.
-                    watermark.last_modified_ms = max_seen;
+                    // Advance the in-memory watermark so files aren't re-read within
+                    // this run. Durable persistence happens only on a checkpoint
+                    // finalize (see the drain above), mirroring the Kafka source's
+                    // commit-on-finalize.
+                    advance_watermark(&mut watermark, max_seen, new_boundary);
                 } else {
                     debug!("No new files to process");
                     // Heartbeat: on an idle poll (no new files), emit an empty batch
@@ -934,25 +985,25 @@ fn enrich_with_checkpoints(batch: RecordBatch, messages: &[CheckpointMessage]) -
 /// here (they still propagate downstream via batch metadata).
 async fn handle_checkpoint_message(
     message: &CheckpointMessage,
-    watermark: FileWatermark,
+    watermark: &FileWatermark,
     pending_watermarks: &mut BTreeMap<CheckpointEpoch, FileWatermark>,
     state_backend: &Arc<dyn StateOperatorBackend<FileWatermark>>,
     state_key: &StateKey,
 ) -> DataFusionResult<bool> {
     match message {
         CheckpointMessage::Marker { epoch, .. } => {
-            pending_watermarks.insert(epoch.clone(), watermark);
+            pending_watermarks.insert(epoch.clone(), watermark.clone());
         }
         CheckpointMessage::Finalizer(epoch) => {
             if let Some(snapshot) = pending_watermarks.remove(epoch) {
+                debug!(
+                    "Persisting watermark {:?} on finalize of epoch {:?}",
+                    snapshot, epoch
+                );
                 state_backend
                     .put(state_key.clone(), snapshot)
                     .await
                     .map_err(to_df_err)?;
-                debug!(
-                    "Persisted watermark {:?} on finalize of epoch {:?}",
-                    snapshot, epoch
-                );
             }
         }
         CheckpointMessage::SourceComplete(_) => return Ok(true),
@@ -968,7 +1019,7 @@ async fn handle_checkpoint_message(
 /// interval even while a large file group reads for a while.
 async fn drain_checkpoints(
     receiver: &crossbeam::channel::Receiver<CheckpointMessage>,
-    watermark: FileWatermark,
+    watermark: &FileWatermark,
     pending_watermarks: &mut BTreeMap<CheckpointEpoch, FileWatermark>,
     state_backend: &Arc<dyn StateOperatorBackend<FileWatermark>>,
     state_key: &StateKey,
@@ -1004,24 +1055,52 @@ mod tests {
     fn file_watermark_serde_round_trip() {
         let watermark = FileWatermark {
             last_modified_ms: 1_700_000_000_123,
+            boundary_paths: vec!["a/f1.csv".to_string(), "a/f2.csv".to_string()],
         };
         let json = serde_json::to_string(&watermark).unwrap();
         let restored: FileWatermark = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.last_modified_ms, watermark.last_modified_ms);
+        assert_eq!(restored.boundary_paths, watermark.boundary_paths);
     }
 
     #[test]
     fn should_process_requires_matching_extension() {
-        assert!(should_process(Some("parquet"), 10, "parquet", 5));
-        assert!(!should_process(Some("csv"), 10, "parquet", 5));
-        assert!(!should_process(None, 10, "parquet", 5));
+        assert!(should_process(Some("parquet"), "parquet", 10, 5, false));
+        assert!(!should_process(Some("csv"), "parquet", 10, 5, false));
+        assert!(!should_process(None, "parquet", 10, 5, false));
     }
 
     #[test]
-    fn should_process_requires_newer_than_watermark() {
-        assert!(should_process(Some("parquet"), 10, "parquet", 5));
-        assert!(!should_process(Some("parquet"), 5, "parquet", 5));
-        assert!(!should_process(Some("parquet"), 4, "parquet", 5));
+    fn should_process_handles_watermark_boundary() {
+        // Strictly newer than the watermark.
+        assert!(should_process(Some("parquet"), "parquet", 10, 5, false));
+        // Below the watermark — skipped.
+        assert!(!should_process(Some("parquet"), "parquet", 4, 5, false));
+        // At the watermark, not yet ingested — picked up (the boundary catch).
+        assert!(should_process(Some("parquet"), "parquet", 5, 5, false));
+        // At the watermark, already ingested — skipped.
+        assert!(!should_process(Some("parquet"), "parquet", 5, 5, true));
+    }
+
+    #[test]
+    fn advance_watermark_unions_at_boundary_and_resets_on_advance() {
+        let mut watermark = FileWatermark {
+            last_modified_ms: 100,
+            boundary_paths: vec!["a.csv".to_string()],
+        };
+
+        // Same second: the boundary set accumulates (so a third same-second file
+        // could still be ingested next poll), watermark unchanged.
+        advance_watermark(&mut watermark, 100, vec!["b.csv".to_string()]);
+        assert_eq!(watermark.last_modified_ms, 100);
+        let mut got = watermark.boundary_paths.clone();
+        got.sort();
+        assert_eq!(got, vec!["a.csv".to_string(), "b.csv".to_string()]);
+
+        // Newer second: watermark advances and the boundary set resets.
+        advance_watermark(&mut watermark, 200, vec!["c.csv".to_string()]);
+        assert_eq!(watermark.last_modified_ms, 200);
+        assert_eq!(watermark.boundary_paths, vec!["c.csv".to_string()]);
     }
 
     #[test]
@@ -1209,8 +1288,9 @@ mod tests {
                 epoch: CheckpointEpoch(1),
                 created_at_ms: 0,
             },
-            FileWatermark {
+            &FileWatermark {
                 last_modified_ms: 42,
+                boundary_paths: vec!["a/x.csv".to_string()],
             },
             &mut pending,
             &state_backend,
@@ -1228,8 +1308,9 @@ mod tests {
         // watermark (999) passed in here.
         handle_checkpoint_message(
             &CheckpointMessage::Finalizer(CheckpointEpoch(1)),
-            FileWatermark {
+            &FileWatermark {
                 last_modified_ms: 999,
+                boundary_paths: Vec::new(),
             },
             &mut pending,
             &state_backend,
@@ -1237,23 +1318,24 @@ mod tests {
         )
         .await
         .unwrap();
+        let persisted = state_backend.get(key.clone()).await.unwrap().unwrap();
         assert_eq!(
-            state_backend
-                .get(key.clone())
-                .await
-                .unwrap()
-                .unwrap()
-                .last_modified_ms,
-            42,
+            persisted.last_modified_ms, 42,
             "finalize must persist the snapshot captured at marker time"
+        );
+        assert_eq!(
+            persisted.boundary_paths,
+            vec!["a/x.csv".to_string()],
+            "finalize must persist the boundary set from the marker-time snapshot"
         );
         assert!(pending.is_empty());
 
         // A finalize for an unknown epoch changes nothing.
         handle_checkpoint_message(
             &CheckpointMessage::Finalizer(CheckpointEpoch(7)),
-            FileWatermark {
+            &FileWatermark {
                 last_modified_ms: 1234,
+                boundary_paths: Vec::new(),
             },
             &mut pending,
             &state_backend,
@@ -1275,8 +1357,9 @@ mod tests {
         // SourceComplete signals shutdown.
         let is_complete = handle_checkpoint_message(
             &CheckpointMessage::SourceComplete("src".to_string()),
-            FileWatermark {
+            &FileWatermark {
                 last_modified_ms: 0,
+                boundary_paths: Vec::new(),
             },
             &mut pending,
             &state_backend,
