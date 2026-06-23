@@ -115,13 +115,26 @@ This is the simplest path to a running pipeline. Most production flows add plugi
 # 1. Install the runtime (macOS/Linux)
 curl -fsSL https://www.streamling.dev/install.sh | bash
 
-# 2. Write a pipeline
+# 2. Create some data to read
+mkdir -p data
+cat > data/transactions.csv <<'EOF'
+id,amount
+1,500
+2,1500
+3,2500
+4,750
+EOF
+
+# 3. Write a pipeline
 cat > pipeline.yaml <<'EOF'
 sources:
   raw_transactions:
-    type: kafka
-    topic: raw.event.transaction
+    type: file
+    path: ./data/
+    format: csv
     primary_key: id
+    mode:
+      type: bounded
 transforms:
   large_transactions:
     type: sql
@@ -136,15 +149,13 @@ sinks:
     from: large_transactions
 EOF
 
-# 3. Run it
-export STREAMLING__KAFKA_SOURCE__BROKERS=localhost:9092
-export STREAMLING__KAFKA_SOURCE__SCHEMA_REGISTRY_URL=http://localhost:8081
-export STREAMLING__PIPELINE_DEFINITION_LOCATION=pipeline.yaml
-export RUST_LOG=info
-streamling
+# 4. Run it
+streamling pipeline.yaml
 ```
 
-Records flow from source through transforms to sinks. Checkpoints fire periodically; when a sink acks, the source commits its position. Swap the print sink for [Postgres](#postgres-sink) or [webhook](#webhook-http-sink) in production.
+The bounded file source reads `data/transactions.csv` once, the SQL transform keeps the rows with `amount > 1000`, and the print sink writes them to stdout before the pipeline terminates on its own. Change `type: bounded` to `type: continuous` to keep polling the folder for new files.
+
+You can also swap the print sink for [Postgres](#postgres-sink) or [webhook](#webhook-http-sink), or switch the source to [Kafka](#kafka-source) for a live stream, in production.
 
 To **build from source** or run against local Kafka/Postgres/ClickHouse, see [Development setup](#development-setup).
 
