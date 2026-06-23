@@ -15,7 +15,7 @@ Streamling is a columnar streaming runtime easily extendable with your own opera
 
 You can write plugins for what's specific to your domain: polling a partner API, enriching from Postgres, pushing to your warehouse. Reuse them across pipelines by id. A plugin runs at native speed, and the runtime gives it the same guarantees the built-in connectors get: backpressure, checkpoint-coordinated at-least-once delivery, schema validation, and upsert (`_gs_op`) propagation.
 
-Built-in connectors for Kafka, Postgres, ClickHouse, and webhooks cover the common movement patterns, so you only write code for the parts that are yours.
+Built-in connectors for Kafka, Postgres, ClickHouse, files, and webhooks cover the common movement patterns, so you only write code for the parts that are yours.
 
 Built with Rust, Apache Arrow, and Apache DataFusion. Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
 
@@ -39,7 +39,7 @@ The division of labor: you own the logic, the runtime owns correctness.
 - **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source that emits data over time
 - **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in a single topology, all exchanging Arrow `RecordBatch`es
 - **Get at-least-once delivery** with checkpoint-coordinated commit ordering: sources don't advance until sinks have durably flushed
-- **Use built-in connectors as conveniences**: Kafka, Postgres, ClickHouse, and webhooks for common data movement, no plugin required
+- **Use built-in connectors as conveniences**: Kafka, Postgres, ClickHouse, files, and webhooks for common data movement, no plugin required
 - **Run bounded batch jobs** and handle upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
 
 Use Streamling when you need a streaming engine to process continuously arriving data in order through a defined pipeline, not a distributed shuffle or windowed aggregation engine.
@@ -451,6 +451,58 @@ sources:
 | `STREAMLING__CLICKHOUSE_SOURCE__PASSWORD` | _(empty)_ | Password |
 | `STREAMLING__CLICKHOUSE_SOURCE__DATABASE` | `default` | Database name |
 | `STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE` | `10000000` | Rows fetched per pagination chunk |
+
+#### File Source
+
+Reads files from a local path or object store (`s3://`, `gs://`) into the pipeline. Formats: `csv`, `json` (newline-delimited / NDJSON — aliases `ndjson`, `jsonl`), `parquet`, `avro`. The schema is inferred at startup. Because file reads are append-only, a constant `_gs_op = 'i'` column is synthesized when the data doesn't already carry one.
+
+**Layouts** — all of the following work in both modes below:
+
+- flat directories,
+- plain nested subfolders (read recursively),
+- Hive-style partition directories (`…/dt=2024-01-01/`), whose `key=value` columns (e.g. `dt`) are inferred and added to the schema.
+
+The `mode` field selects between two modes (default **continuous**):
+
+**Bounded** — lists the matching files once at startup, reads them to EOF, and the pipeline terminates on its own (so it works with `STREAMLING__JOB_MODE=true`).
+
+```yaml
+sources:
+  events:
+    type: file
+    path: s3://my-bucket/events/
+    format: parquet
+    primary_key: id
+    mode:
+      type: bounded
+```
+
+**Continuous** (default) — keeps polling `path` every `poll_interval`, ingesting newly-arrived files; never self-terminates.
+
+```yaml
+sources:
+  events:
+    type: file
+    path: /data/events/
+    format: csv
+    primary_key: id
+    mode:
+      type: continuous
+      poll_interval: 10s   # optional; defaults to 5s
+```
+
+**Discovery semantics & caveats (continuous mode).** Discovery is **polling-based** and tracked with a **scalar `last_modified` watermark** plus a small set of paths already ingested at that exact timestamp. Understand these limits before relying on it:
+
+- Each poll lists the path and ingests every file whose object `last_modified` is **greater than** the watermark, plus any file **sharing the watermark's exact timestamp** that hasn't been ingested yet — so new files landing in the same second the watermark sits on are not lost (common with second-granularity object-store mtimes). The watermark then advances to the newest `last_modified` seen, and its boundary set resets when a newer timestamp appears.
+- **Files with an older timestamp can be missed.** Any file that becomes visible with a `last_modified` **strictly below** the current watermark is skipped permanently — there is no per-file bookkeeping below the boundary.
+- **Updated files are reprocessed.** A rewritten file is re-ingested if its new `last_modified` reaches or exceeds the watermark. Reprocessed rows are emitted as inserts (`_gs_op = 'i'`) at the moment.
+- **Deletions are not detected** — removing a file has no effect on already-ingested data.
+- **At-least-once across restarts.** The watermark (and its boundary set) is persisted to the state backend only on a checkpoint **finalize** (mirroring the Kafka source). On restart the source reloads the last finalized watermark and re-reads any files from polls that had not finalized, so downstream may see duplicates (deduplicated by `primary_key` + an upsert sink).
+- Idle polls emit empty heartbeat batches so checkpoint markers keep propagating even when no new files arrive.
+
+For guaranteed no-miss discovery, ensure new data always lands as immutable, newly-named files whose `last_modified` never goes backwards (atomic writes), or use **bounded** mode for one-shot reads.
+
+**Credentials** for `s3://` / `gs://` come from the standard environment (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, etc.) — there are no `STREAMLING__` overrides for the file source, and only `s3`/`s3a`/`gs` remote schemes are supported.
 
 ### Transforms
 
