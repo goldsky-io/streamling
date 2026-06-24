@@ -6653,10 +6653,12 @@ name = "streamling"
 version = "0.2.0"
 dependencies = [
  "arrow-schema",
+ "cc",
  "clap",
  "datafusion",
  "futures",
  "humantime",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -37,4 +37,8 @@ serde.workspace = true
 # Test dependencies
 serde.workspace = true
 serde_json.workspace = true
+libc = "0.2"
 
+[build-dependencies]
+# Compiles the vendored mimalloc static override (see build.rs).
+cc = "1"
