@@ -71,7 +71,7 @@ Use Streamling when you need a streaming engine to process continuously arriving
 - **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes aren't supported today, but can be done through custom plugins
 - **A library to embed**: it's a standalone runtime you deploy and configure, not a crate you wire into your codebase
 
-Streamling runs as a **single-node engine**. It can scale horizontally via Kafka consumer groups and multiple independent instances. \Each instance checkpoints and progresses on its own.
+Streamling runs as a **single-node engine**. It can scale horizontally via Kafka consumer groups and multiple independent instances. Each instance checkpoints and progresses on its own.
 
 ## Quick start
 
