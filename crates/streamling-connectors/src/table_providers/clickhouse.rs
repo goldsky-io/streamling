@@ -279,7 +279,7 @@ struct SinkParams {
 
 impl ClickHouseTableProvider {
     const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
-    const DEFAULT_PAGE_SIZE: usize = 10_000_000;
+    const DEFAULT_PAGE_SIZE: usize = 2_000_000;
     const MIN_SORT_KEY_RANGE: i64 = 100;
     const SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
 
