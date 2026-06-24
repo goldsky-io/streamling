@@ -132,7 +132,7 @@ jobs:
           claude_args: |
             --model ${{ steps.config.outputs.model }}
             --max-turns ${{ steps.config.outputs.max_turns }}
-            --allowedTools Bash(gh pr diff:*),Bash(gh pr comment:*),Read(*),codebase-memory:*
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr comment:*),Read(*),codebase-memory:*"
             --mcp-config '{"mcpServers": {"codebase-memory": {"command": "npx", "args": ["-y", "codebase-memory-mcp"]}}}'
           prompt: |
             You are an expert Rust code reviewer for the Streamling project — a data
