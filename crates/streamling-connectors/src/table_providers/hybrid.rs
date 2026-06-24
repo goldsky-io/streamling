@@ -782,8 +782,16 @@ impl HybridTableProvider {
         );
 
         if state.current_phase == self.config.bounded_sources.len()
+            && !self.config.job_mode
             && let Some(offset_provider) = &self.config.offset_provider
         {
+            // Only fetch/seed offsets when actually transitioning to the
+            // unbounded phase. In job_mode the unbounded phase never runs, so
+            // this ClickHouse max-offset query + Kafka seed is wasted work and a
+            // stall/hang vector under load (it blocks advance_to_next_phase,
+            // which the hybrid execute loop must return from before it can break
+            // and end the source stream). Skip it; the bounded source's own
+            // cursor is already persisted via its checkpoint Finalizer.
             let offsets = offset_provider.get_offsets().await?;
             state.unbounded_offsets = Some(offsets.clone());
 
@@ -2875,6 +2883,64 @@ mod tests {
         assert_eq!(
             state.current_phase, 0,
             "should fall back to phase 0 when offset provider returns empty map"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn job_mode_advancing_past_bounded_skips_offset_provider() {
+        // Regression: in job_mode, advancing to the unbounded transition must
+        // NOT call offset_provider.get_offsets(). That ClickHouse max-offset
+        // query + Kafka seed is for an unbounded phase job_mode never runs, and
+        // blocking on it stalls advance_to_next_phase — which the hybrid execute
+        // loop must return from before it can break and end the source stream
+        // (the production job-mode termination hang).
+        let state_config = StateBackendConfig {
+            backend_type: streamling_config::StateBackendType::InMemory,
+            postgres: None,
+            sqlite: None,
+        };
+        let factory = streamling_state::StateBackendFactories::new(state_config)
+            .expect("Failed to create state backend factory");
+        let backend: Arc<dyn StateOperatorBackend<HybridSourceState>> =
+            factory.create::<HybridSourceState>("job_mode_skip_offsets_test");
+
+        let config = HybridSourceConfig {
+            bounded_sources: vec![
+                Arc::new(MockTableProvider::new("bounded1".to_string())) as Arc<dyn TableProvider>
+            ],
+            unbounded_source: Arc::new(MockTableProvider::new("unbounded".to_string()))
+                as Arc<dyn TableProvider>,
+            // Returns Err if ever called. job_mode must skip it, so advance
+            // succeeds; without the skip, advance would propagate the error.
+            offset_provider: Some(Arc::new(FailingOffsetProvider)),
+            job_mode: true,
+        };
+
+        let provider = HybridTableProvider::new(
+            "test_job_mode_skip_offsets".to_string(),
+            config,
+            create_test_schema(),
+            backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        provider.load_state().await.unwrap();
+        // Advance past the single bounded phase (0 -> 1 == bounded_sources.len()),
+        // the unbounded transition. In job_mode it must skip the offset provider.
+        let result = provider.advance_to_next_phase().await;
+        assert!(
+            result.is_ok(),
+            "job_mode advance should skip the offset provider, got: {:?}",
+            result
+        );
+        let state = provider.state.read().await;
+        assert_eq!(
+            state.current_phase, 1,
+            "phase bookkeeping still advances; only the offset work is skipped"
+        );
+        assert!(
+            state.unbounded_offsets.is_none(),
+            "offsets must not be fetched in job_mode"
         );
     }
 
