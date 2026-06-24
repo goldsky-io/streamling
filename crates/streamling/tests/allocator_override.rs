@@ -1,4 +1,4 @@
-//! Regression guard for the vendored mimalloc static override.
+//! Regression guard for the mimalloc static override.
 //!
 //! `crates/streamling/build.rs` links mimalloc's single-translation-unit override
 //! directly into every binary this crate produces (the `streamling` binary, and,

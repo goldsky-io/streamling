@@ -1,15 +1,21 @@
-use std::path::PathBuf;
-
-// Path B (production-safe) mimalloc integration.
+// Path B (production-safe) mimalloc integration, without vendoring C into this repo.
 //
-// We statically link mimalloc v3's single-translation-unit override
-// (`src/static.c`, compiled with `-DMI_MALLOC_OVERRIDE`) directly into the
-// executable so the binary *defines* `malloc`/`free`/`calloc`/`realloc`/
-// `posix_memalign` as strong, exported symbols. With `--export-dynamic`
-// (`-Wl,-E`) those land in the dynamic symbol table, so every `dlopen`'d
-// plugin `cdylib` resolves its `malloc`/`free` to the *same* mimalloc heap as
-// the host. One process-wide heap => cross-boundary alloc/free (the
-// `abi_stable` `RVec`/`RString` ownership transfer) is safe.
+// We depend on `libmimalloc-sys` solely to fetch the upstream mimalloc v3
+// sources; it exposes its include directory to us via `DEP_MIMALLOC_INCLUDE_DIR`
+// (it has `links = "mimalloc"` and emits `cargo:INCLUDE_DIR`). From there we
+// locate `src/static.c` — the single-translation-unit amalgamation — compile it
+// ourselves with `-DMI_MALLOC_OVERRIDE`, and link the resulting object *directly*
+// (not via a static archive). Linking the bare object guarantees unconditional
+// inclusion across every target (binary and integration tests alike): a static
+// archive would be lazily dropped because the binary references `malloc` as a
+// dynamic symbol (resolved against libc at runtime), leaving no undefined
+// `malloc` for the archive to satisfy.
+//
+// The binary thus *defines* `malloc`/`free`/`calloc`/`realloc`/`posix_memalign`
+// as strong symbols; `--export-dynamic` (`-Wl,-E`) puts them in the dynamic
+// symbol table, so every `dlopen`'d plugin `cdylib` resolves its `malloc`/`free`
+// to the *same* mimalloc heap as the host. One process-wide heap => the
+// `abi_stable` `RVec`/`RString` cross-boundary alloc/free is safe.
 //
 // This deliberately does NOT use `#[global_allocator]`: that would give the
 // host a *private* mimalloc heap while plugins keep libc `malloc`, so the host
@@ -19,26 +25,34 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let opt_out = std::env::var_os("STREAMLING_NO_MIMALLOC").is_some();
 
-    // The static-override mechanism is glibc/Linux specific. On other targets
-    // (and on explicit opt-out) we fall back to the platform default allocator,
-    // which is the safe status quo (host and plugins both use libc `malloc`).
+    // The override is glibc/Linux specific (a symbol-interposition mechanism).
+    // On other targets, and on explicit opt-out, fall back to the platform
+    // default allocator — the safe status quo where host and plugins both use
+    // libc `malloc`.
     if target_os != "linux" || opt_out {
         return;
     }
 
-    let manifest_dir = PathBuf::from(
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
-    );
-    let vendor = manifest_dir.join("vendor/mimalloc");
-    let static_c = vendor.join("src/static.c");
-    let include = vendor.join("include");
+    // libmimalloc-sys exposes the mimalloc v3 include dir via `links = "mimalloc"`.
+    let include_dir = std::env::var("DEP_MIMALLOC_INCLUDE_DIR").unwrap_or_else(|_| {
+        panic!(
+            "DEP_MIMALLOC_INCLUDE_DIR is not set; is `libmimalloc-sys` a dependency of this \
+             crate? It must build before this build script so it can propagate its include dir."
+        )
+    });
+    // static.c is the sibling `src` directory next to the exposed `include` dir.
+    let static_c = std::path::Path::new(&include_dir)
+        .parent() // .../c_src/mimalloc/v3
+        .expect("include dir has a parent")
+        .join("src")
+        .join("static.c");
 
     // `compile_intermediates` returns the bare object(s) without bundling them
     // into an archive or emitting link directives. We link the object directly
     // so it is included unconditionally (not subject to lazy `.a` resolution).
     let objects = cc::Build::new()
         .file(&static_c)
-        .include(&include)
+        .include(&include_dir)
         .pic(true)
         // Emit the standard `malloc`/`free`/... override symbols.
         .define("MI_MALLOC_OVERRIDE", None)
@@ -63,8 +77,6 @@ fn main() {
     // Put the override symbols in the dynamic symbol table so plugins bind to them.
     println!("cargo:rustc-link-arg=-Wl,-E");
 
-    println!("cargo:rerun-if-changed={}", static_c.display());
-    println!("cargo:rerun-if-changed={}", include.display());
     println!("cargo:rerun-if-env-changed=STREAMLING_NO_MIMALLOC");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
 }
