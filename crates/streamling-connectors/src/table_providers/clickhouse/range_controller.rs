@@ -13,14 +13,25 @@ use std::time::Duration;
 /// `on_overflow` and `on_timeout` shrink `width` WITHOUT advancing, so the same
 /// range is re-read. Emitted ranges therefore tile the key space with no gaps.
 ///
-/// Two signals drive width:
+/// Three signals drive width:
 /// - **rows** — the tripwire. A page is read with `LIMIT page_size + 1`; `page_size + 1`
 ///   rows means the range overflowed (`on_overflow`), else it was fully consumed.
 /// - **elapsed** — the time guard. A page slower than `soft_time_budget` shrinks the
 ///   width even if the row count looked fine, catching the scan-bound case.
+/// - **bytes** — the array guard. A page over `max_page_bytes` (`on_byte_overflow`)
+///   would build a single Arrow column past the ~2 GiB `i32` offset limit, so it is
+///   re-read smaller. `on_complete` also clamps growth by observed byte density, or a
+///   byte-dense region would let the row multiplier snap width straight back into a
+///   byte overflow and thrash forever.
 #[derive(Debug, Clone)]
 pub struct RangeController {
     page_size: u64,
+    /// Upper bound on a page's total byte size. Guards Arrow's `i32` per-array
+    /// limit (~2 GiB): the widest column is at most the page total, so a page
+    /// kept under this never builds a column that overflows `concat_batches` or
+    /// the IPC reader. Drives `on_byte_overflow` and the byte clamp in
+    /// `on_complete`.
+    max_page_bytes: u64,
     width: i128,
     max_width: i128,
     soft_time_budget: Duration,
@@ -42,6 +53,7 @@ impl RangeController {
 
     pub fn new(
         page_size: u64,
+        max_page_bytes: u64,
         range_start: i128,
         max_key: i128,
         initial_width: i128,
@@ -50,6 +62,7 @@ impl RangeController {
     ) -> Self {
         Self {
             page_size,
+            max_page_bytes,
             width: initial_width.clamp(Self::MIN_WIDTH, max_width),
             max_width,
             soft_time_budget,
@@ -84,10 +97,14 @@ impl RangeController {
         self.width <= Self::MIN_WIDTH
     }
 
-    /// A page was fully consumed (rows <= page_size). Advances the cursor past the
-    /// completed range, then sizes the next range: grow toward `page_size` rows, or
-    /// shrink if the page was slow.
-    pub fn on_complete(&mut self, rows: usize, elapsed: Duration) {
+    /// A page was fully consumed (rows <= page_size, bytes <= max_page_bytes).
+    /// Advances the cursor past the completed range, then sizes the next range:
+    /// grow toward `page_size` rows, shrink if the page was slow, and — crucially
+    /// — never grow past the byte density just observed. That byte clamp is what
+    /// stops a byte-dense region from thrashing: without it the row multiplier
+    /// (rows are few when bytes are large) would snap width straight back over
+    /// `max_page_bytes`, re-trigger overflow, and re-read forever.
+    pub fn on_complete(&mut self, rows: usize, elapsed: Duration, bytes: u64) {
         // Advance past the range just read, using the width that produced it. This
         // is the ONLY method that advances the cursor — overflow and timeout re-read.
         self.range_start += self.width;
@@ -107,11 +124,22 @@ impl RangeController {
             candidate = candidate.min(self.width as f64 * time_mult);
         }
 
+        // Byte guard: cap growth so the next page stays under `max_page_bytes`,
+        // using the byte density just observed (bytes per unit width). `self.width`
+        // here is still the completing page's width, so bytes/width is the density
+        // of the region just scanned. A byte-light page leaves headroom to grow;
+        // a byte-heavy page pins width near its current value.
+        if bytes > 0 && self.width > 0 {
+            let bytes_per_width = bytes as f64 / self.width as f64;
+            let byte_ceiling = self.max_page_bytes as f64 / bytes_per_width;
+            candidate = candidate.min(byte_ceiling);
+        }
+
         self.width = (candidate as i128).clamp(Self::MIN_WIDTH, self.max_width);
     }
 
-    /// A page overflowed the tripwire (rows == page_size + 1). Shrinks width so the
-    /// SAME range is re-read. Does NOT advance the cursor. With a probed exact
+    /// A page overflowed the row tripwire (rows == page_size + 1). Shrinks width so
+    /// the SAME range is re-read. Does NOT advance the cursor. With a probed exact
     /// `count`, resizes in one step; otherwise halves.
     pub fn on_overflow(&mut self, probed_count: Option<u64>) {
         let candidate = match probed_count {
@@ -119,6 +147,20 @@ impl RangeController {
                 (self.width as f64 * (self.page_size as f64 / count as f64)) as i128
             }
             _ => self.width / 2,
+        };
+        self.width = candidate.clamp(Self::MIN_WIDTH, self.max_width);
+    }
+
+    /// A page overflowed the byte guard (bytes > max_page_bytes) while fitting by
+    /// rows. Sizes the next width from the observed byte density so the re-read
+    /// lands just under `max_page_bytes` in one step — halving could take several
+    /// discarded reads to converge, and `on_complete`'s byte clamp then keeps it
+    /// there. Does NOT advance the cursor, so the same range is re-read.
+    pub fn on_byte_overflow(&mut self, observed_bytes: u64) {
+        let candidate = if observed_bytes > 0 {
+            (self.width as f64 * (self.max_page_bytes as f64 / observed_bytes as f64)) as i128
+        } else {
+            self.width / 2
         };
         self.width = candidate.clamp(Self::MIN_WIDTH, self.max_width);
     }
@@ -138,6 +180,7 @@ mod tests {
     fn controller() -> RangeController {
         RangeController::new(
             1000,
+            u64::MAX,
             0,
             1_000_000_000,
             1000,
@@ -151,7 +194,7 @@ mod tests {
     #[test]
     fn page_at_target_keeps_width_stable() {
         let mut c = controller();
-        c.on_complete(1000, Duration::from_secs(1));
+        c.on_complete(1000, Duration::from_secs(1), 0);
         assert_eq!(
             c.width(),
             1000,
@@ -162,14 +205,14 @@ mod tests {
     #[test]
     fn sparse_page_grows_width_capped_at_ceiling() {
         let mut c = controller();
-        c.on_complete(100, Duration::from_secs(1));
+        c.on_complete(100, Duration::from_secs(1), 0);
         assert_eq!(c.width(), 4000, "growth is capped at 4x per step");
     }
 
     #[test]
     fn empty_fast_page_grows_at_ceiling() {
         let mut c = controller();
-        c.on_complete(0, Duration::from_secs(1));
+        c.on_complete(0, Duration::from_secs(1), 0);
         assert_eq!(c.width(), 4000, "an empty fast page grows at the ceiling");
     }
 
@@ -178,7 +221,7 @@ mod tests {
         let mut c = controller();
         // Empty but 60s against a 30s budget: scan-bound. Time guard overrides the
         // grow-on-empty and shrinks instead (width * 30/60 = 500).
-        c.on_complete(0, Duration::from_secs(60));
+        c.on_complete(0, Duration::from_secs(60), 0);
         assert_eq!(
             c.width(),
             500,
@@ -189,7 +232,7 @@ mod tests {
     #[test]
     fn slow_page_shrinks_even_with_row_headroom() {
         let mut c = controller();
-        c.on_complete(500, Duration::from_secs(60));
+        c.on_complete(500, Duration::from_secs(60), 0);
         assert_eq!(c.width(), 500, "the time guard wins over row-based growth");
     }
 
@@ -211,8 +254,15 @@ mod tests {
     fn shrink_floors_at_one_to_guarantee_progress() {
         // Width must never reach 0, or an empty range would stall the scan. Even an
         // aggressive shrink (probed count far above page_size) floors at 1.
-        let mut c =
-            RangeController::new(1000, 0, 1_000_000, 100, 1_000_000, Duration::from_secs(30));
+        let mut c = RangeController::new(
+            1000,
+            u64::MAX,
+            0,
+            1_000_000,
+            100,
+            1_000_000,
+            Duration::from_secs(30),
+        );
         c.on_overflow(Some(1_000_000));
         assert_eq!(
             c.width(),
@@ -226,13 +276,14 @@ mod tests {
     fn growth_is_clamped_to_max_width() {
         let mut c = RangeController::new(
             1000,
+            u64::MAX,
             0,
             1_000_000_000,
             500_000,
             1_000_000,
             Duration::from_secs(30),
         );
-        c.on_complete(0, Duration::from_secs(1));
+        c.on_complete(0, Duration::from_secs(1), 0);
         assert_eq!(c.width(), 1_000_000, "growth never exceeds max_width");
     }
 
@@ -240,10 +291,17 @@ mod tests {
 
     #[test]
     fn complete_advances_cursor_by_the_width_just_used() {
-        let mut c =
-            RangeController::new(1000, 100, 1_000_000_000, 50, 4096, Duration::from_secs(30));
+        let mut c = RangeController::new(
+            1000,
+            u64::MAX,
+            100,
+            1_000_000_000,
+            50,
+            4096,
+            Duration::from_secs(30),
+        );
         assert_eq!(c.current_range(), (100, 150));
-        c.on_complete(50, Duration::from_secs(1));
+        c.on_complete(50, Duration::from_secs(1), 0);
         assert_eq!(
             c.range_start(),
             150,
@@ -253,7 +311,15 @@ mod tests {
 
     #[test]
     fn overflow_does_not_advance_cursor() {
-        let mut c = RangeController::new(20, 100, 1_000_000_000, 80, 4096, Duration::from_secs(30));
+        let mut c = RangeController::new(
+            20,
+            u64::MAX,
+            100,
+            1_000_000_000,
+            80,
+            4096,
+            Duration::from_secs(30),
+        );
         c.on_overflow(None);
         assert_eq!(
             c.range_start(),
@@ -265,7 +331,15 @@ mod tests {
 
     #[test]
     fn timeout_does_not_advance_cursor_and_shrinks() {
-        let mut c = RangeController::new(20, 100, 1_000_000_000, 80, 4096, Duration::from_secs(30));
+        let mut c = RangeController::new(
+            20,
+            u64::MAX,
+            100,
+            1_000_000_000,
+            80,
+            4096,
+            Duration::from_secs(30),
+        );
         c.on_timeout();
         assert_eq!(c.range_start(), 100, "timeout must NOT advance the cursor");
         assert!(c.width() < 80, "timeout shrinks the width");
@@ -273,14 +347,15 @@ mod tests {
 
     #[test]
     fn is_done_only_after_cursor_passes_max_key() {
-        let mut c = RangeController::new(1000, 0, 100, 100, 4096, Duration::from_secs(30));
+        let mut c =
+            RangeController::new(1000, u64::MAX, 0, 100, 100, 4096, Duration::from_secs(30));
         assert!(!c.is_done());
-        c.on_complete(100, Duration::from_secs(1)); // advance 0 -> 100
+        c.on_complete(100, Duration::from_secs(1), 0); // advance 0 -> 100
         assert!(
             !c.is_done(),
             "range_start == max_key is not done (max_key row still in range)"
         );
-        c.on_complete(100, Duration::from_secs(1)); // advance past max_key
+        c.on_complete(100, Duration::from_secs(1), 0); // advance past max_key
         assert!(c.is_done(), "range_start past max_key is done");
     }
 
@@ -303,7 +378,15 @@ mod tests {
     fn no_data_loss_through_dense_burst_with_overflow_and_rescale() {
         let max_key = 1000i128;
         let page_size = 20u64;
-        let mut c = RangeController::new(page_size, 0, max_key, 20, 4096, Duration::from_secs(30));
+        let mut c = RangeController::new(
+            page_size,
+            u64::MAX,
+            0,
+            max_key,
+            20,
+            4096,
+            Duration::from_secs(30),
+        );
 
         let mut emitted: Vec<(i128, i128)> = Vec::new();
         let mut saw_overflow = false;
@@ -328,7 +411,7 @@ mod tests {
                 c.on_overflow(None);
             } else {
                 emitted.push((start, end));
-                c.on_complete(rows, Duration::from_millis(1));
+                c.on_complete(rows, Duration::from_millis(1), 0);
                 if start >= 400 {
                     max_width_after_burst = max_width_after_burst.max(c.width());
                 }
@@ -373,7 +456,15 @@ mod tests {
     fn no_data_loss_with_injected_timeouts() {
         let max_key = 500i128;
         let page_size = 20u64;
-        let mut c = RangeController::new(page_size, 0, max_key, 30, 4096, Duration::from_secs(30));
+        let mut c = RangeController::new(
+            page_size,
+            u64::MAX,
+            0,
+            max_key,
+            30,
+            4096,
+            Duration::from_secs(30),
+        );
 
         let mut emitted: Vec<(i128, i128)> = Vec::new();
         let mut step = 0;
@@ -403,7 +494,7 @@ mod tests {
                 c.on_overflow(None);
             } else {
                 emitted.push((start, end));
-                c.on_complete(rows, Duration::from_millis(1));
+                c.on_complete(rows, Duration::from_millis(1), 0);
             }
         }
 
@@ -423,5 +514,179 @@ mod tests {
         let total = rows_in_range(0, max_key + 1);
         let got: usize = emitted.iter().map(|(s, e)| rows_in_range(*s, *e)).sum();
         assert_eq!(got, total, "no rows lost despite timeouts");
+    }
+
+    // ---- byte tripwire (Arrow ~2 GiB per-array guard) ----
+
+    /// A controller configured with a tiny byte limit, used to exercise the byte
+    /// signals in isolation (page_size is set huge so rows never trip).
+    fn byte_controller() -> RangeController {
+        RangeController::new(
+            100_000,
+            1_000,
+            0,
+            1_000_000_000,
+            1000,
+            100_000,
+            Duration::from_secs(30),
+        )
+    }
+
+    #[test]
+    fn byte_overflow_sizes_from_observed_density_in_one_step() {
+        let mut c = byte_controller();
+        // width 1000, observed 2500 bytes vs a 1000 limit -> next width 400,
+        // landing just under the limit in a single re-read (not a halve chain).
+        c.on_byte_overflow(2500);
+        assert_eq!(
+            c.width(),
+            400,
+            "byte overflow resizes by max/observed ratio"
+        );
+        assert_eq!(
+            c.range_start(),
+            0,
+            "byte overflow must NOT advance the cursor (re-read the same range)"
+        );
+    }
+
+    #[test]
+    fn byte_overflow_floors_at_one() {
+        let mut c = byte_controller();
+        // Observed bytes dwarf the limit: resize floors at MIN_WIDTH so the
+        // cursor still advances one key at a time.
+        c.on_byte_overflow(u64::MAX);
+        assert_eq!(c.width(), 1);
+        assert!(c.at_min_width());
+    }
+
+    #[test]
+    fn on_complete_byte_clamp_prevents_thrash() {
+        // Regression: a byte-dense but row-sparse region. Without the byte clamp
+        // in on_complete, the row multiplier (page_size/rows, capped at 4x) would
+        // snap width straight back past the byte limit every cycle, thrashing
+        // between overflow and re-read forever. With the clamp, width stays put.
+        let mut c = byte_controller();
+        // width 1000: rows 100 (row-sparse), bytes 2000 (byte-dense -> overflow).
+        c.on_byte_overflow(2000);
+        assert_eq!(c.width(), 500, "shrunk to the byte-safe width");
+        // Re-read at 500: bytes ~1000 (at the limit, not over), rows ~50 -> complete.
+        c.on_complete(50, Duration::from_millis(1), 1000);
+        assert_eq!(
+            c.width(),
+            500,
+            "on_complete must NOT grow width back into a byte overflow"
+        );
+    }
+
+    #[test]
+    fn on_complete_grows_when_byte_headroom_allows() {
+        // A byte-light page leaves headroom: growth is capped by the byte ceiling
+        // (which is well above the row target), so the row multiplier wins and
+        // width grows — the byte guard must not over-restrict sparse data.
+        let mut c = byte_controller();
+        c.on_complete(10, Duration::from_millis(1), 10);
+        // row_mult = 100_000/10 capped at 4 -> 1000*4 = 4000; byte_ceiling =
+        // 1000/(10/1000) = 100_000; min = 4000, clamped to max_width 100_000.
+        assert_eq!(c.width(), 4000, "byte-light page grows normally");
+    }
+
+    /// A full scan through a byte-dense burst. Models bytes-per-key (1 outside
+    /// [300,400), 100 inside) against a 1000-byte limit with rows never
+    /// overflowing. The controller must shrink inside the burst, recover after
+    /// it, and tile the whole key space with no gaps or duplicates — proving the
+    /// byte tripwire never loses data and converges instead of thrashing.
+    fn bytes_in_range(start: i128, end: i128) -> u64 {
+        (start..end)
+            .map(|k| {
+                if (300..400).contains(&k) {
+                    100u64
+                } else {
+                    1u64
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn no_data_loss_through_byte_dense_burst() {
+        let max_key = 1000i128;
+        let page_size = 100_000u64;
+        let max_page_bytes = 1000u64;
+        let mut c = RangeController::new(
+            page_size,
+            max_page_bytes,
+            0,
+            max_key,
+            500,
+            100_000,
+            Duration::from_secs(30),
+        );
+
+        let mut emitted: Vec<(i128, i128)> = Vec::new();
+        let mut saw_byte_overflow = false;
+        let mut min_width_in_burst = i128::MAX;
+        let mut max_width_after_burst = 0i128;
+        let mut guard = 0;
+
+        while !c.is_done() {
+            guard += 1;
+            assert!(guard < 1_000_000, "controller failed to terminate");
+            let (start, end_raw) = c.current_range();
+            let end = end_raw.min(max_key + 1);
+            let rows = (end - start) as usize; // 1 row/key
+            let bytes = bytes_in_range(start, end);
+
+            if bytes > max_page_bytes {
+                assert!(
+                    !c.at_min_width(),
+                    "coverable byte density must never stick at min width"
+                );
+                saw_byte_overflow = true;
+                if (300..400).contains(&start) || start >= 290 {
+                    min_width_in_burst = min_width_in_burst.min(c.width());
+                }
+                c.on_byte_overflow(bytes);
+            } else {
+                emitted.push((start, end));
+                c.on_complete(rows, Duration::from_millis(1), bytes);
+                if start >= 400 {
+                    max_width_after_burst = max_width_after_burst.max(c.width());
+                }
+            }
+        }
+
+        // No gaps, no overlaps: emitted ranges tile [0, max_key + 1) contiguously.
+        assert_eq!(emitted.first().unwrap().0, 0, "scan must start at key 0");
+        for w in emitted.windows(2) {
+            assert_eq!(
+                w[0].1, w[1].0,
+                "gap or overlap between {:?} and {:?}",
+                w[0], w[1]
+            );
+        }
+        assert!(
+            emitted.last().unwrap().1 > max_key,
+            "scan must cover past max_key"
+        );
+
+        // Every key emitted exactly once.
+        let total_keys = (max_key + 1) as usize;
+        let got: usize = emitted.iter().map(|(s, e)| (*e - *s) as usize).sum();
+        assert_eq!(
+            got, total_keys,
+            "all keys emitted exactly once (no loss, no dup)"
+        );
+
+        assert!(
+            saw_byte_overflow,
+            "byte-dense burst should trigger byte overflow"
+        );
+        assert!(
+            max_width_after_burst > min_width_in_burst,
+            "width should recover after the burst (down {} -> up {})",
+            min_width_in_burst,
+            max_width_after_burst
+        );
     }
 }

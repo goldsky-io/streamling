@@ -115,6 +115,18 @@ fn is_timeout_error(error: &DataFusionError) -> bool {
     let error_msg = error.to_string().to_lowercase();
     error_msg.contains("timeout") || error_msg.contains("timed out")
 }
+/// Maximum total byte size of a fully-buffered source page.
+///
+/// Arrow's variable-length arrays (`Utf8`/`Binary`) index their data buffer with
+/// `i32` offsets, so a single column cannot hold more than ~2 GiB; building one
+/// — via the IPC reader or `concat_batches` (version dedup) — panics with
+/// "byte array offset overflow" past that point. Pagination bounded pages by row
+/// count (`page_size`) only, so a dense string column blew the limit on a page
+/// that looked fine by rows (observed on `matic_raw_logs` in production). The
+/// widest column is at most the page total, so keeping the page well under
+/// `i32::MAX` guarantees no column can overflow. Half the limit leaves a 2x
+/// margin against offsets/null-bitmap overhead and measurement slack.
+const MAX_PAGE_BYTES: u64 = (i32::MAX as u64) / 2;
 
 /// Drop the column at `drop_idx` and re-tag the batch with `target_schema`.
 /// Strips a dedup-only version column (force-included because the configured
@@ -1366,6 +1378,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
 
             let mut controller = RangeController::new(
                 page_size as u64,
+                MAX_PAGE_BYTES,
                 range_start,
                 max_key,
                 initial_width,
@@ -1443,11 +1456,16 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // holds parsed batches, bounded by page_size + 1 rows.
                         let mut batches: Vec<RecordBatch> = Vec::new();
                         let mut total_rows_in_page: usize = 0;
+                        // Summed so the byte tripwire can shrink a page that is
+                        // fine by rows but too large for a single Arrow column
+                        // (see MAX_PAGE_BYTES). The widest column <= this total.
+                        let mut total_page_bytes: u64 = 0;
                         let mut stream_failed = false;
                         while let Some(item_result) = stream.next().await {
                             match item_result {
                                 Ok(batch) => {
                                     total_rows_in_page += batch.num_rows();
+                                    total_page_bytes += batch.get_array_memory_size() as u64;
                                     batches.push(batch);
                                 }
                                 Err(e) => {
@@ -1466,24 +1484,46 @@ impl ExecutionPlan for ClickHouseSourceExec {
 
                         trace!("ClickHouseSourceExec: page {} read {} rows (page_size {})", page_count, total_rows_in_page, page_size);
 
-                        // Overflow: the range holds more than page_size rows. Shrink and
-                        // re-read the SAME range. Nothing was emitted, so no duplicates
-                        // and no advance.
-                        if total_rows_in_page > page_size {
+                        // Overflow: the range holds more than `page_size` rows, OR the
+                        // page is too large in bytes for a single Arrow column. Dedup
+                        // coalesces the whole page via `concat_batches`, and a Utf8/
+                        // Binary column panics ("byte array offset overflow") past ~2 GiB
+                        // of i32 offsets — a page that looks fine by rows can still blow
+                        // that limit on a dense string column. Either way: shrink the
+                        // width and re-read the SAME range. Nothing was emitted, so no
+                        // duplicates and no advance.
+                        let row_overflow = total_rows_in_page > page_size;
+                        let byte_overflow = total_page_bytes > MAX_PAGE_BYTES;
+                        if row_overflow || byte_overflow {
                             if controller.at_min_width() {
-                                // A min-width range still overflows: a single key holds more
-                                // than page_size matching rows and cannot be split further.
-                                // Surface it rather than silently skip data.
+                                // A min-width range still overflows: a single sort key
+                                // holds more data than one page can carry and cannot be
+                                // split further. Surface it rather than silently skip
+                                // data — a key exceeding MAX_PAGE_BYTES alone would
+                                // overflow Arrow's per-array limit.
                                 let _ = tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
-                                    "ClickHouse source: range [{}, {}) at min width still exceeds page_size {} ({} rows); increase page_size",
-                                    range_start, upper_bound, page_size, total_rows_in_page
+                                    "ClickHouse source: range [{}, {}) at min width still exceeds page limits \
+                                     (page_size={}, {} rows; max_page_bytes={}, {} bytes)",
+                                    range_start, upper_bound, page_size, total_rows_in_page,
+                                    MAX_PAGE_BYTES, total_page_bytes
                                 )))).await;
                                 break;
                             }
-                            controller.on_overflow(None);
+                            // Size the next width from whichever limit was hit. A byte
+                            // overflow sizes from the observed byte density so the re-read
+                            // lands just under MAX_PAGE_BYTES in one step; on_complete's
+                            // byte clamp then keeps it there (no thrash). A row overflow
+                            // halves. When both trip, byte is the stricter constraint.
+                            if byte_overflow {
+                                controller.on_byte_overflow(total_page_bytes);
+                            } else {
+                                controller.on_overflow(None);
+                            }
                             info!(
-                                "[{}] range [{}, {}) overflowed page_size {} ({} rows); width -> {}",
-                                reference_name, range_start, upper_bound, page_size, total_rows_in_page, controller.width()
+                                "[{}] range [{}, {}) overflowed page limits \
+                                 (page_size={}, {} rows; max_page_bytes={}, {} bytes); width -> {}",
+                                reference_name, range_start, upper_bound, page_size, total_rows_in_page,
+                                MAX_PAGE_BYTES, total_page_bytes, controller.width()
                             );
                             page_count -= 1;
                             continue;
@@ -1586,7 +1626,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // ends the scan once the cursor passes max_key. On restart we re-read
                         // from the persisted cursor.
                         let page_elapsed = page_start.elapsed();
-                        controller.on_complete(total_rows_in_page, page_elapsed);
+                        controller.on_complete(total_rows_in_page, page_elapsed, total_page_bytes);
                         if let Ok(mut split_guard) = split.lock() {
                             split_guard.update_args(vec![i128_to_scalar_like(controller.range_start(), &template)]);
                         }
@@ -2853,7 +2893,6 @@ mod tests {
         assert!(parse_replacing_merge_tree_dedup("MergeTree()").is_none());
         assert!(parse_replacing_merge_tree_dedup("CollapsingMergeTree(sign)").is_none());
     }
-
     #[test]
     fn parse_engine_with_comma_in_path() {
         // A zk path with a comma inside the quoted literal must not be split.
