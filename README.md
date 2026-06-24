@@ -11,101 +11,67 @@
 
 ```
 
-Streamling is a columnar streaming runtime easily extendable with your own operators. Everything in a pipeline is the same thing underneath: a DataFusion operator passing Apache Arrow `RecordBatch`es. A Kafka source, a SQL filter, sandboxed TypeScript, an HTTP enrichment, and a plugin you wrote yourself all run on one data plane, so they compose freely and inherit the same guarantees.
+Streamling is a columnar streaming runtime for real-time and historical processing, with a highly efficient plugin system. 
 
-You can write plugins for what's specific to your domain: polling a partner API, enriching from Postgres, pushing to your warehouse. Reuse them across pipelines by id. A plugin runs at native speed, and the runtime gives it the same guarantees the built-in connectors get: backpressure, checkpoint-coordinated at-least-once delivery, schema validation, and upsert (`_gs_op`) propagation.
+The runtime provides:
 
-Built-in connectors for Kafka, Postgres, ClickHouse, files, and webhooks cover the common movement patterns, so you only write code for the parts that are yours.
+- Performance in high-throughput (millions of rows per second) real-time filtering and enrichment scenarios like trading or gaming
+- Decoupled runtime vs logic. User code can be developed and deployed on a separate lifecycle, making drift easy to manage
+- At-least-once consistency through a checkpointing system 
+- Fast startup and operational ease. Checkpoint state can be kept any postgres database 
 
-Built with Rust, Apache Arrow, and Apache DataFusion. Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
+Streamling powers [Goldsky Turbo](https://goldsky.com/products/turbo-pipelines), and runs vital production workloads that provide real-time data to banks, hedge funds, prediction markets, and more. 
 
-## Plugins vs. the runtime
+Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
 
-The division of labor: you own the logic, the runtime owns correctness.
+## Why Streamling
 
-| You implement in plugins                  | The runtime enforces                                            |
-| ----------------------------------------- | --------------------------------------------------------------- |
-| Custom sources, transforms, sinks         | Checkpoint protocol across the full topology                    |
-| Arbitrary connection and processing logic | At-least-once delivery (sources commit only after sink flush)   |
-| Domain-specific schemas and options       | Schema and `primary_key` validation before startup              |
-| External API calls, decoding, enrichment  | Backpressure, graceful shutdown, retriable error classification |
-| State via the plugin state backend        | Upsert semantics (`_gs_op`) through to sinks                    |
+Streamling enables teams to build and deploy custom sources, transforms, sinks, and UDFs through plugins without sacrificing performance or correctness. It's also meant to be highly efficient. 
 
-## When to use Streamling
+Many other streaming frameworks can be extended like libaries (include, extend, compile) for higher performance or through external services and API endpoints. The intent behind Streamling is that to extend, you would write plugins and dynamically link them in instead of compiling, reducing the operational complexity. 
+
+Plugins are created as separate rust crates that are compiled and linked in at runtime. Users reuse them through a declarative YAML format for the precise solution. They have minimal overhead and have similiar efficiency to embedding code into the codebase despite the FFI boundary in real-world scenarios.
+
+A pipeline has three sections: `sources`, `transforms`, and `sinks`. Every node exchanges Arrow RecordBatches. Built-in connectors cover Kafka, Postgres, ClickHouse, webhooks, and WASM scripts; anything else can be a [plugin](#plugin-system).
+
+```yaml
+sources:
+  raw.transactions:
+    type: kafka
+    topic: raw.event.transaction
+transforms:
+  large_transactions:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT *
+      FROM raw.transactions
+      WHERE amount > 1000
+sinks:
+  pg.large_transactions:
+    from: large_transactions
+    type: postgres
+    schema: public
+    table: large_transactions
+    primary_key: id
+```
 
 **Streamling is a good fit when you need to:**
 
-- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline by id. The runtime enforces checkpointing, schema validation, and delivery guarantees around your code
+- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline. The runtime enforces checkpointing, schema validation, and delivery guarantees around your code
 - **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source that emits data over time
 - **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in a single topology, all exchanging Arrow `RecordBatch`es
-- **Get at-least-once delivery** with checkpoint-coordinated commit ordering: sources don't advance until sinks have durably flushed
-- **Use built-in connectors as conveniences**: Kafka, Postgres, ClickHouse, files, and webhooks for common data movement, no plugin required
-- **Run bounded batch jobs** and handle upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
+- **Move data with minimal overhead**: Kafka, Postgres, ClickHouse, files, and webhooks. 
+- **Run bounded batch jobs** With the same logic as real-time and handle upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
 
 Use Streamling when you need a streaming engine to process continuously arriving data in order through a defined pipeline, not a distributed shuffle or windowed aggregation engine.
 
 **Streamling is probably not the right fit when you need:**
 
-- **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes aren't supported today
+- **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes aren't supported today, but can be done through custom plugins
 - **A library to embed**: it's a standalone runtime you deploy and configure, not a crate you wire into your codebase
 
-Streamling runs as a **single-node engine**. It can scale horizontally via Kafka consumer groups and multiple independent instances; each instance checkpoints and progresses on its own.
-
-## How it works
-
-You define a **pipeline in YAML** with three sections: `sources` (where data comes from), `transforms` (optional processing), and `sinks` (where results go). The runtime loads the pipeline, wires operators together, and runs until stopped, or until a bounded source finishes.
-
-Data moves between operators as **Arrow RecordBatches**. **Checkpoints** coordinate flush and commit across the whole topology so sources only advance after sinks have durably written their data. See [Checkpointing](#checkpointing) for the full protocol.
-
-**Streaming** pipelines use unbounded sources like Kafka that run indefinitely. **Batch** pipelines use bounded sources that read a finite dataset and terminate, for example a [ClickHouse source](#clickhouse-source) or a [hybrid source](#hybrid-source) with `STREAMLING__JOB_MODE=true` to stop after the bounded phase completes.
-
-### Building data flows
-
-Streamling is more than point-to-point data movement. The runtime orchestrates complex, ongoing data processes:
-
-- **Continuous inputs**: event streams, database changelogs, polled APIs, or any plugin source that emits ordered data over time
-- **Processing stages**: decode, enrich, filter, and transform via plugins, SQL, WASM, and HTTP handlers chained in a single topology
-- **Live lookup state**: [dynamic tables](#dynamic-tables) back SQL transforms with externally updatable lookup data, without restarting the pipeline
-- **Runtime contract**: checkpoint markers propagate through every operator (including plugins); sources don't commit until sinks ack; schemas and `primary_key` are validated at startup
-
-Built-in Postgres is the convenience in the example below; the processing logic lives in the plugin source, SQL filter, HTTP handler, and WASM stages:
-
-```yaml
-sources:
-  api_orders:
-    type: acme_api.orders_source # plugin: polls partner API
-    options:
-      poll_interval_ms: "5000"
-transforms:
-  recent_orders:
-    type: sql
-    primary_key: id
-    sql: SELECT * FROM api_orders WHERE created_at > now() - interval '1 hour'
-  enriched:
-    type: handler
-    from: recent_orders
-    url: http://localhost:8087/enrich
-    primary_key: id
-  scored:
-    type: script
-    from: enriched
-    language: typescript
-    script: |
-      function process(input) {
-        input.risk_score = input.amount > 1000 ? 'high' : 'low';
-        return input;
-      }
-    primary_key: id
-sinks:
-  pg_orders:
-    type: postgres
-    from: scored
-    schema: app
-    table: orders
-    primary_key: id
-```
-
-Your plugins own the I/O and business logic; the runtime owns execution, backpressure, checkpointing, and recovery.
+Streamling runs as a **single-node engine**. It can scale horizontally via Kafka consumer groups and multiple independent instances. \Each instance checkpoints and progresses on its own.
 
 ## Quick start
 
@@ -161,21 +127,15 @@ To **build from source** or run against local Kafka/Postgres/ClickHouse, see [De
 
 ## Common patterns
 
-Built-in connectors are shortcuts for common data movement. Custom data flows mix [plugins](#plugin-system), SQL, WASM, and HTTP handlers; the runtime orchestrates them with the same delivery guarantees.
+Mix the built-in connectors with [plugins](#plugin-system), SQL, WASM, and HTTP handlers; the runtime orchestrates them with the same delivery guarantees.
 
-### Data flows
 
 | Flow                                 | Stages                                                                                                       | What the runtime provides                                                                                   |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | Plugin → SQL → handler → WASM → sink | plugin source + sql + [HTTP handler](#http-handler-transform) + [WASM](#webassembly-script-transform) + sink | Ordered processing and at-least-once delivery through all stages. See [hero example](#building-data-flows). |
 | Plugin → plugin → sink               | custom source + custom transform + custom sink                                                               | Same guarantees on fully custom I/O (e.g. poll an API, apply domain logic, push to a partner system)        |
 | Kafka → plugin transform → sink      | built-in source + plugin transform + built-in sink                                                           | Built-in source convenience + custom compute (decoding, external lookups, multi-record logic)               |
-| Multi-source via hybrid              | bounded backfill + live stream                                                                               | Phase-ordered processing with checkpoint continuity. See [Hybrid Source](#hybrid-source).                   |
-
-### Connector shortcuts
-
-| Shortcut                      | Shape                             | When to use                                                                                                                                                   |
-| ----------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Multi-source via hybrid              | bounded backfill in a datalake + live stream through kafka                                                   | Phase-ordered processing with checkpoint continuity. See [Hybrid Source](#hybrid-source).                   |
 | Kafka → SQL → Postgres        | source + sql + postgres sink      | Simple movement and filter with no custom logic. See [Kafka Source](#kafka-source), [SQL Transform](#sql-transform), [Postgres Sink](#postgres-sink).         |
 | ClickHouse → Postgres (batch) | clickhouse source + postgres sink | One-time or job-mode backfill. See [ClickHouse Source](#clickhouse-source).                                                                                   |
 | Kafka → WASM → webhook        | source + script + webhook sink    | Lightweight scripted transform, push to an API. See [WebAssembly Script Transform](#webassembly-script-transform), [Webhook (HTTP) Sink](#webhook-http-sink). |
@@ -191,13 +151,12 @@ Plugin ids appear as the `type` in pipeline YAML (`namespace.operator_name`). Th
 sources:
   orders:
     type: basic_plugin.random_source # e.g. acme_api.orders_source in production
-    options:
-      max_rows: "10000"
-      record_batch_size: "1000"
+    max_rows: 10000
+    record_batch_size: 1000
 transforms:
   filtered:
     type: sql
-    primary_key: alphanumeric_field
+    primary_key: id
     sql: SELECT * FROM orders WHERE num_field > 100
 sinks:
   pg_orders:
@@ -205,7 +164,7 @@ sinks:
     from: filtered
     schema: public
     table: orders
-    primary_key: alphanumeric_field
+    primary_key: id
 ```
 
 **Custom transform**: enrich or reshape records between built-in operators:
@@ -220,8 +179,6 @@ transforms:
   enriched:
     type: basic_plugin.filter_transform # e.g. enrichment.normalize_events in production
     from: raw_events
-    options:
-      _gs_op: i # keep inserts only
 sinks:
   pg_events:
     type: postgres
@@ -248,35 +205,7 @@ sinks:
       mode: batch
 ```
 
-A single pipeline can mix all three (plugin source, built-in SQL transform, plugin sink) as long as schemas and `primary_key` line up between stages. Write plugins for the parts that are unique to your domain; let the runtime enforce the parts that must be correct in production (checkpointing, offset commit ordering, upsert propagation, backpressure). See [Plugin Pipeline Configuration](#plugin-pipeline-configuration) for loading plugins and the full options reference.
-
 **Community plugins are available in the [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository**.
-
-## Overview
-
-A pipeline has three sections: `sources`, `transforms` (optional), and `sinks`. Every node exchanges Arrow RecordBatches. Built-in connectors cover Kafka, Postgres, ClickHouse, webhooks, and WASM scripts; anything else can be a [plugin](#plugin-system).
-
-```yaml
-sources:
-  raw.transactions:
-    type: kafka
-    topic: raw.event.transaction
-transforms:
-  large_transactions:
-    type: sql
-    primary_key: id
-    sql: |
-      SELECT *
-      FROM raw.transactions
-      WHERE amount > 1000
-sinks:
-  pg.large_transactions:
-    from: large_transactions
-    type: postgres
-    schema: public
-    table: large_transactions
-    primary_key: id
-```
 
 ## Development setup
 
