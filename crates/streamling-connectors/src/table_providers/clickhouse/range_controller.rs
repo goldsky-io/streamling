@@ -44,6 +44,17 @@ impl RangeController {
     /// near-empty page can't explode the range in one step.
     const GROW_CEILING: f64 = 4.0;
 
+    /// Fraction of `max_page_bytes` that byte sizing targets. A re-read covers a
+    /// different (shrunk) sub-range whose byte density differs from the page that
+    /// overflowed, so sizing to land at *exactly* the limit asymptotes — each read
+    /// lands a hair over and shrinks by one (observed on `matic_raw_logs`: 6
+    /// discarded ~1 GiB reads to converge). Targeting 90% leaves headroom for that
+    /// density variance so the re-read lands under the limit in one step; even when
+    /// variance exceeds it, convergence is geometric (each step shrinks >10%), not
+    /// a unit creep. `on_complete`'s byte clamp uses the same target so a completed
+    /// page can't creep back up to the limit and re-overflow.
+    const BYTE_TARGET_RATIO: f64 = 0.9;
+
     /// Smallest range width: one key. A range must cover at least one key, or it
     /// reads nothing, "completes", advances by zero, and the scan stalls forever.
     /// This floor is what guarantees forward progress. It is deliberately 1 (not
@@ -128,10 +139,13 @@ impl RangeController {
         // using the byte density just observed (bytes per unit width). `self.width`
         // here is still the completing page's width, so bytes/width is the density
         // of the region just scanned. A byte-light page leaves headroom to grow;
-        // a byte-heavy page pins width near its current value.
+        // a byte-heavy page pins width near its current value. Target
+        // BYTE_TARGET_RATIO of the limit so a page completing right at the cap
+        // can't let the next one creep over and re-overflow.
         if bytes > 0 && self.width > 0 {
             let bytes_per_width = bytes as f64 / self.width as f64;
-            let byte_ceiling = self.max_page_bytes as f64 / bytes_per_width;
+            let byte_ceiling =
+                (self.max_page_bytes as f64 * Self::BYTE_TARGET_RATIO) / bytes_per_width;
             candidate = candidate.min(byte_ceiling);
         }
 
@@ -152,13 +166,16 @@ impl RangeController {
     }
 
     /// A page overflowed the byte guard (bytes > max_page_bytes) while fitting by
-    /// rows. Sizes the next width from the observed byte density so the re-read
-    /// lands just under `max_page_bytes` in one step — halving could take several
-    /// discarded reads to converge, and `on_complete`'s byte clamp then keeps it
-    /// there. Does NOT advance the cursor, so the same range is re-read.
+    /// rows. Sizes the next width from the observed byte density, targeting
+    /// `BYTE_TARGET_RATIO` of `max_page_bytes` (not the limit itself) so the re-read
+    /// — which covers a different, shrunk sub-range with different density — lands
+    /// under the limit in one step rather than asymptoting a unit at a time.
+    /// `on_complete`'s byte clamp then keeps it there. Does NOT advance the cursor,
+    /// so the same range is re-read.
     pub fn on_byte_overflow(&mut self, observed_bytes: u64) {
+        let target = self.max_page_bytes as f64 * Self::BYTE_TARGET_RATIO;
         let candidate = if observed_bytes > 0 {
-            (self.width as f64 * (self.max_page_bytes as f64 / observed_bytes as f64)) as i128
+            (self.width as f64 * (target / observed_bytes as f64)) as i128
         } else {
             self.width / 2
         };
@@ -535,13 +552,13 @@ mod tests {
     #[test]
     fn byte_overflow_sizes_from_observed_density_in_one_step() {
         let mut c = byte_controller();
-        // width 1000, observed 2500 bytes vs a 1000 limit -> next width 400,
-        // landing just under the limit in a single re-read (not a halve chain).
+        // width 1000, observed 2500 bytes vs a 1000 limit, target 90% -> next
+        // width 360, landing under the limit with headroom in a single re-read.
         c.on_byte_overflow(2500);
         assert_eq!(
             c.width(),
-            400,
-            "byte overflow resizes by max/observed ratio"
+            360,
+            "byte overflow resizes by (0.9*max)/observed ratio"
         );
         assert_eq!(
             c.range_start(),
@@ -568,14 +585,18 @@ mod tests {
         // between overflow and re-read forever. With the clamp, width stays put.
         let mut c = byte_controller();
         // width 1000: rows 100 (row-sparse), bytes 2000 (byte-dense -> overflow).
+        // Target 90% of the 1000 limit -> shrinks to 450 (not 500).
         c.on_byte_overflow(2000);
-        assert_eq!(c.width(), 500, "shrunk to the byte-safe width");
-        // Re-read at 500: bytes ~1000 (at the limit, not over), rows ~50 -> complete.
+        assert_eq!(c.width(), 450, "shrunk to 90% of the byte-safe width");
+        // Re-read at 450: bytes ~1000 (at the limit, not over), rows ~50 -> complete.
+        // The byte clamp caps growth at 90% of the limit, so width does NOT snap
+        // back toward the row multiplier's 1800 target.
         c.on_complete(50, Duration::from_millis(1), 1000);
-        assert_eq!(
-            c.width(),
-            500,
-            "on_complete must NOT grow width back into a byte overflow"
+        assert!(
+            c.width() <= 450,
+            "on_complete must NOT grow width back into a byte overflow \
+             (clamped to {}, would be ~1800 without it)",
+            c.width()
         );
     }
 
