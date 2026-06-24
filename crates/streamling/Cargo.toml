@@ -33,17 +33,19 @@ serde_yaml.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 
-# mimalloc v3 source (no vendored C in this repo). We depend on libmimalloc-sys
-# purely to fetch the upstream mimalloc v3 sources; build.rs compiles
-# `static.c` with `-DMI_MALLOC_OVERRIDE` and links the bare object directly so
-# the binary defines malloc/free/etc. with `--export-dynamic` exposing them for
-# dlopen'd plugins to resolve (one shared heap).
+# Upstream mimalloc v3 sources. We use `default-features = false` because we
+# don't want libmimalloc-sys's own link step; build.rs locates `static.c` via
+# `DEP_MIMALLOC_INCLUDE_DIR` (propagated through libmimalloc-sys's
+# `links = "mimalloc"`), compiles it with `-DMI_MALLOC_OVERRIDE`, and links the
+# bare object + `--export-dynamic` so the binary exports malloc/free/etc. for
+# dlopen'd plugins to resolve (one shared heap). See build.rs for details.
 libmimalloc-sys = { version = "0.1.49", default-features = false }
 
 [dev-dependencies]
 # Test dependencies
 serde.workspace = true
 serde_json.workspace = true
+# dlsym allocator-identity check in tests/allocator_override.rs.
 libc = "0.2"
 
 [build-dependencies]

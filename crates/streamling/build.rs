@@ -1,4 +1,5 @@
-// Path B (production-safe) mimalloc integration, without vendoring C into this repo.
+// Bake a process-wide mimalloc override into this binary so that host and
+// dlopen'd plugin cdylibs share one allocator heap.
 //
 // We depend on `libmimalloc-sys` solely to fetch the upstream mimalloc v3
 // sources; it exposes its include directory to us via `DEP_MIMALLOC_INCLUDE_DIR`
