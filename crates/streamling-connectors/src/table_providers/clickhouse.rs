@@ -338,20 +338,22 @@ impl ClickHouseTableProvider {
         // Infer the ReplacingMergeTree version column from engine_full so the
         // scan can deduplicate by max version (keyed on the table's ORDER BY),
         // not by row position.
-        let (inferred_version_column, inferred_is_deleted_column): (Option<String>, Option<String>) =
-            match client.fetch_engine_full(&database_name, table_name) {
-                Ok(engine_full) => match parse_replacing_merge_tree_dedup(&engine_full) {
-                    Some(d) => (d.version_column, d.is_deleted_column),
-                    None => (None, None),
-                },
-                Err(e) => {
-                    warn!(
-                        "[{}] could not fetch engine_full for dedup inference ({}); version-aware dedup disabled",
-                        reference_name, e
-                    );
-                    (None, None)
-                }
-            };
+        let (inferred_version_column, inferred_is_deleted_column): (
+            Option<String>,
+            Option<String>,
+        ) = match client.fetch_engine_full(&database_name, table_name) {
+            Ok(engine_full) => match parse_replacing_merge_tree_dedup(&engine_full) {
+                Some(d) => (d.version_column, d.is_deleted_column),
+                None => (None, None),
+            },
+            Err(e) => {
+                warn!(
+                    "[{}] could not fetch engine_full for dedup inference ({}); version-aware dedup disabled",
+                    reference_name, e
+                );
+                (None, None)
+            }
+        };
 
         // The version column is force-included in the scan for dedup even when
         // the configured columns omit it — a hybrid source projects ClickHouse
@@ -374,7 +376,11 @@ impl ClickHouseTableProvider {
         // version column that doesn't actually exist, the fetch errors and we
         // fall back to the configured columns with dedup disabled.
         let (scan_schema, scan_columns, dedup_version_column, project_out_version_index) =
-            match client.fetch_schema(table_name, Some(scan_columns.clone()), inferred_is_deleted_column.clone()) {
+            match client.fetch_schema(
+                table_name,
+                Some(scan_columns.clone()),
+                inferred_is_deleted_column.clone(),
+            ) {
                 Ok(s) => {
                     let dvc = inferred_version_column
                         .clone()
@@ -395,7 +401,11 @@ impl ClickHouseTableProvider {
                     );
                     let fallback = user_columns.clone();
                     let s = client
-                        .fetch_schema(table_name, Some(fallback.clone()), inferred_is_deleted_column.clone())
+                        .fetch_schema(
+                            table_name,
+                            Some(fallback.clone()),
+                            inferred_is_deleted_column.clone(),
+                        )
                         .streamling_with_context(|| {
                             format!(
                                 "failed to fetch schema from ClickHouse for table '{}'",

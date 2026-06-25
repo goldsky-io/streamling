@@ -1363,13 +1363,16 @@ impl ClickHouseSchemaAdapter {
         table_name: &str,
         target_schema: &SchemaRef,
     ) -> Result<Vec<String>, DataFusionError> {
-        let table_schema = self.client.fetch_schema(table_name, None, None).map_err(|e| {
-            streamling_err!(
-                "failed to fetch schema from ClickHouse for table '{}': {}",
-                table_name,
-                e
-            )
-        })?;
+        let table_schema = self
+            .client
+            .fetch_schema(table_name, None, None)
+            .map_err(|e| {
+                streamling_err!(
+                    "failed to fetch schema from ClickHouse for table '{}': {}",
+                    table_name,
+                    e
+                )
+            })?;
         let table_fields: HashMap<&str, Arc<Field>> = table_schema
             .fields()
             .iter()

@@ -23,7 +23,6 @@ pub struct ClickHouseQueryBuilder {
 }
 
 impl ClickHouseQueryBuilder {
-
     // Helper function to format ScalarValue for SQL with proper quoting
     fn format_scalar_for_sql(value: &ScalarValue) -> String {
         match value {
