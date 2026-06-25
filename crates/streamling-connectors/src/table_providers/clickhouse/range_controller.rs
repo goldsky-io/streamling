@@ -55,6 +55,15 @@ impl RangeController {
     /// page can't creep back up to the limit and re-overflow.
     const BYTE_TARGET_RATIO: f64 = 0.9;
 
+    /// Fraction of `page_size` that a probed one-step resize targets for rows.
+    /// Symmetric with `BYTE_TARGET_RATIO`: sizing a shrunk range to land at
+    /// *exactly* `page_size` rows leaves no margin, so a range whose true count
+    /// sits just over the tripwire re-reads at almost the same width, hits
+    /// `page_size + 1` again, and creeps down a row at a time. Targeting 90%
+    /// guarantees each overflow shrinks the width meaningfully, at the cost of
+    /// ~10% per-page headroom in a steady dense region.
+    const ROW_TARGET_RATIO: f64 = 0.9;
+
     /// Smallest range width: one key. A range must cover at least one key, or it
     /// reads nothing, "completes", advances by zero, and the scan stalls forever.
     /// This floor is what guarantees forward progress. It is deliberately 1 (not
@@ -180,6 +189,56 @@ impl RangeController {
             self.width / 2
         };
         self.width = candidate.clamp(Self::MIN_WIDTH, self.max_width);
+    }
+
+    /// A page overflowed the row tripwire and/or the byte guard, and the caller
+    /// probed the exact `count` for the range just read. Size the next width to
+    /// satisfy BOTH limits in one step using the *true* density (`count /
+    /// width`) — not the LIMIT-capped row sample that biases `on_byte_overflow`.
+    ///
+    /// `observed_bytes` is the byte size of the rows actually materialised (≤
+    /// `page_size + 1`). Divided by the smaller of `count` and `page_size + 1`
+    /// it gives bytes-per-row; multiplied by the true row density it predicts
+    /// the byte density of the *whole* range, so the byte limit is respected
+    /// even though only a prefix of the rows was read.
+    ///
+    /// This is what makes a dense region converge in one re-read instead of
+    /// shrinking geometrically over many discarded pages: a wide range whose
+    /// first `page_size + 1` rows overflow still has its full `count` probed,
+    /// so the next width lands under both limits immediately. A probe failure
+    /// (`None`) falls back to the byte/row shrink so a transient count-query
+    /// error cannot stall the scan. Does NOT advance the cursor — the same
+    /// range is re-read.
+    pub fn on_overflow_probed(&mut self, count: Option<u64>, observed_bytes: u64) {
+        let Some(count) = count.filter(|&c| c > 0) else {
+            if observed_bytes > self.max_page_bytes {
+                self.on_byte_overflow(observed_bytes);
+            } else {
+                self.on_overflow(None);
+            }
+            return;
+        };
+        let count = count as f64;
+        // Bytes-per-row from the sampled rows we actually materialised. The
+        // sample is at most page_size + 1 rows even when the range holds more.
+        let sampled_rows = count.min(self.page_size as f64 + 1.0);
+        let bytes_per_row = if observed_bytes > 0 {
+            observed_bytes as f64 / sampled_rows
+        } else {
+            0.0
+        };
+        // Row-safe width: scale so the next range holds ~ROW_TARGET_RATIO * page_size.
+        let row_safe = self.width as f64 * (Self::ROW_TARGET_RATIO * self.page_size as f64 / count);
+        // Byte-safe width: scale so the next range holds ~BYTE_TARGET_RATIO * max.
+        // bytes_per_width = (count / width) * bytes_per_row = true row density × size.
+        let byte_safe = if bytes_per_row > 0.0 && self.width > 0 {
+            let bytes_per_width = (count / self.width as f64) * bytes_per_row;
+            (Self::BYTE_TARGET_RATIO * self.max_page_bytes as f64) / bytes_per_width
+        } else {
+            row_safe
+        };
+        let candidate = row_safe.min(byte_safe);
+        self.width = (candidate as i128).clamp(Self::MIN_WIDTH, self.max_width);
     }
 
     /// A page timed out. Shrinks width and re-reads the SAME range. Does NOT advance
@@ -610,6 +669,130 @@ mod tests {
         // row_mult = 100_000/10 capped at 4 -> 1000*4 = 4000; byte_ceiling =
         // 1000/(10/1000) = 100_000; min = 4000, clamped to max_width 100_000.
         assert_eq!(c.width(), 4000, "byte-light page grows normally");
+    }
+
+    // ---- probed one-step overflow sizing (true density) ----
+
+    #[test]
+    fn probed_overflow_converges_dense_range_in_one_step() {
+        // The production pathology: a wide range whose first page_size+1 rows
+        // overflow on bytes. The LIMIT-capped sample under-estimates density, so
+        // the old byte sizer shrank geometrically over many re-reads. With a
+        // probed count the true density sizes the next width under the byte limit
+        // at once. byte_controller: page_size 100_000, max 1000 bytes, width 1000.
+        //   count 50_000 (true); observed 4000 bytes for all 50_000 rows.
+        //   bytes_per_row = 4000/50_000 = 0.08
+        //   bytes_per_width = (50_000/1000)*0.08 = 4.0
+        //   byte_safe = 0.9*1000/4 = 225; row_safe = 1000*0.9*100_000/50_000 = 1800
+        //   -> 225 (byte binds), one step.
+        let mut c = byte_controller();
+        c.on_overflow_probed(Some(50_000), 4000);
+        assert_eq!(c.width(), 225, "one-step resize to the byte-safe width");
+        assert_eq!(
+            c.range_start(),
+            0,
+            "probed overflow must NOT advance the cursor (re-read the same range)"
+        );
+    }
+
+    #[test]
+    fn probed_overflow_byte_only_matches_byte_sizer() {
+        // count <= page_size (rows fit, bytes trip): reduces to on_byte_overflow.
+        let mut a = byte_controller();
+        let mut b = byte_controller();
+        a.on_overflow_probed(Some(100), 2500);
+        b.on_byte_overflow(2500);
+        assert_eq!(a.width(), b.width());
+        assert_eq!(a.width(), 360);
+    }
+
+    #[test]
+    fn probed_overflow_row_only_targets_ninety_percent() {
+        // No byte concern (observed 0): row constraint binds, sized to 90% of the
+        // row-safe width (10% margin vs on_overflow's exact page_size target).
+        let mut c = controller(); // page_size 1000, width 1000
+        c.on_overflow_probed(Some(4000), 0);
+        assert_eq!(c.width(), 225, "0.9 * (1000*1000/4000) = 225");
+    }
+
+    #[test]
+    fn probed_overflow_none_falls_back_to_byte_or_halve() {
+        // A failed/absent probe must not change behavior vs the un-probed path.
+        let mut over = byte_controller(); // max_page_bytes 1000
+        over.on_overflow_probed(None, 2500); // bytes over limit -> byte sizer
+        assert_eq!(over.width(), 360);
+
+        let mut under = controller(); // max_page_bytes u64::MAX, width 1000
+        under.on_overflow_probed(None, 0); // bytes under limit -> halve
+        assert_eq!(under.width(), 500);
+    }
+
+    #[test]
+    fn probed_overflow_floors_at_one() {
+        // A single key holding vast bytes/rows: even the true density can't fit,
+        // so width floors at MIN_WIDTH and the caller surfaces it.
+        let mut c = byte_controller();
+        c.on_overflow_probed(Some(u64::MAX), u64::MAX);
+        assert_eq!(c.width(), 1);
+        assert!(c.at_min_width());
+    }
+
+    /// No-data-loss check for the probed path: drive a full scan through the dense
+    /// burst, sizing overflows from the true count (as the driver now does). The
+    /// emitted ranges must still tile the key space with no gaps or duplicates.
+    #[test]
+    fn no_data_loss_with_probed_overflow_sizing() {
+        let max_key = 1000i128;
+        let page_size = 20u64;
+        let mut c = RangeController::new(
+            page_size,
+            u64::MAX,
+            0,
+            max_key,
+            20,
+            4096,
+            Duration::from_secs(30),
+        );
+
+        let mut emitted: Vec<(i128, i128)> = Vec::new();
+        let mut guard = 0;
+        while !c.is_done() {
+            guard += 1;
+            assert!(guard < 1_000_000, "controller failed to terminate");
+            let (start, end_raw) = c.current_range();
+            let end = end_raw.min(max_key + 1);
+            let rows = rows_in_range(start, end);
+            if rows as u64 > page_size {
+                assert!(
+                    !c.at_min_width(),
+                    "coverable density must never stick at min width"
+                );
+                // The driver probes the true count here.
+                c.on_overflow_probed(Some(rows as u64), 0);
+            } else {
+                emitted.push((start, end));
+                c.on_complete(rows, Duration::from_millis(1), 0);
+            }
+        }
+
+        assert_eq!(emitted.first().unwrap().0, 0, "scan must start at key 0");
+        for w in emitted.windows(2) {
+            assert_eq!(
+                w[0].1, w[1].0,
+                "gap or overlap between {:?} and {:?}",
+                w[0], w[1]
+            );
+        }
+        assert!(
+            emitted.last().unwrap().1 > max_key,
+            "scan must cover past max_key"
+        );
+        let total = rows_in_range(0, max_key + 1);
+        let got: usize = emitted.iter().map(|(s, e)| rows_in_range(*s, *e)).sum();
+        assert_eq!(
+            got, total,
+            "all rows emitted exactly once (no loss, no dup)"
+        );
     }
 
     /// A full scan through a byte-dense burst. Models bytes-per-key (1 outside

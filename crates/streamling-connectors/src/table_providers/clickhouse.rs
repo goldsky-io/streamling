@@ -1358,6 +1358,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     &table_name_for_exec,
                     where_clause_for_exec.as_deref(),
                     Some(range_start),
+                    None,
                     &first_sorting_key_name,
                 )
                 .await
@@ -1509,16 +1510,36 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 )))).await;
                                 break;
                             }
-                            // Size the next width from whichever limit was hit. A byte
-                            // overflow sizes from the observed byte density so the re-read
-                            // lands just under MAX_PAGE_BYTES in one step; on_complete's
-                            // byte clamp then keeps it there (no thrash). A row overflow
-                            // halves. When both trip, byte is the stricter constraint.
-                            if byte_overflow {
-                                controller.on_byte_overflow(total_page_bytes);
-                            } else {
-                                controller.on_overflow(None);
-                            }
+                            // Probe the exact row count for this range so the next
+                            // width is sized from the TRUE density (count / width) in
+                            // one step. Without it the byte sizer divides the
+                            // LIMIT-capped sample by the full range width, under-
+                            // estimates density, and a dense range shrinks
+                            // geometrically over many discarded multi-GiB re-reads
+                            // before converging. The probe is a primary-key count
+                            // (cheap); a failure is non-fatal — the controller falls
+                            // back to byte/row halving.
+                            let probed_count = match client
+                                .fetch_count(
+                                    &table_name_for_exec,
+                                    where_clause_for_exec.as_deref(),
+                                    Some(range_start),
+                                    Some(upper_bound),
+                                    &first_sorting_key_name,
+                                )
+                                .await
+                            {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    warn!(
+                                        "[{}] count probe on overflow [{}, {}) failed ({}); \
+                                         falling back to halve",
+                                        reference_name, range_start, upper_bound, e
+                                    );
+                                    None
+                                }
+                            };
+                            controller.on_overflow_probed(probed_count, total_page_bytes);
                             info!(
                                 "[{}] range [{}, {}) overflowed page limits \
                                  (page_size={}, {} rows; max_page_bytes={}, {} bytes); width -> {}",
@@ -2111,15 +2132,19 @@ impl ClickHouseClient {
         Ok(max_val)
     }
 
-    /// Count rows matching the source filter at or above `lower_bound` on the
-    /// first sorting key. Used as an up-front density probe to size the first
-    /// pagination range. Carries no ORDER BY, so a matching projection serves it
-    /// cheaply; a slow probe is itself a signal that the filter is scan-bound.
+    /// Count rows matching the source filter in the half-open sort-key range
+    /// `[lower_bound, upper_bound)` on the first sorting key. Used two ways: as
+    /// an up-front density probe to size the first pagination range (no upper
+    /// bound — the whole remaining tail), and on overflow to size the next range
+    /// from the *true* density in one step (both bounds — the overflowing
+    /// range). Carries no ORDER BY, so a matching projection serves it cheaply;
+    /// a slow probe is itself a signal that the filter is scan-bound.
     pub async fn fetch_count(
         &self,
         table_name: &str,
         where_clause: Option<&str>,
         lower_bound: Option<i128>,
+        upper_bound: Option<i128>,
         first_key: &str,
     ) -> streamling_core::error::Result<u64> {
         let mut conditions: Vec<String> = Vec::new();
@@ -2128,6 +2153,9 @@ impl ClickHouseClient {
         }
         if let Some(lb) = lower_bound {
             conditions.push(format!("{} >= {}", first_key, lb));
+        }
+        if let Some(ub) = upper_bound {
+            conditions.push(format!("{} < {}", first_key, ub));
         }
         let where_sql = if conditions.is_empty() {
             String::new()
