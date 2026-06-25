@@ -24,6 +24,24 @@ Streamling powers [Goldsky Turbo](https://goldsky.com/products/turbo-pipelines),
 
 Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
 
+## Contents
+
+- [Why Streamling](#why-streamling)
+- [Quick start](#quick-start)
+- [Common patterns](#common-patterns)
+- [Development setup](#development-setup)
+- [Reference](#reference)
+- [Topology](#topology)
+- [Dynamic Tables](#dynamic-tables)
+- [Side Outputs](#side-outputs)
+- [Checkpointing](#checkpointing)
+- [State Backends](#state-backends)
+- [Error Handling](#error-handling)
+- [Upsert Semantics](#upsert-semantics)
+- [Plugin System](#plugin-system)
+- [Profiling](#profiling)
+- [Telemetry and Metrics](#telemetry-and-metrics)
+
 ## Why Streamling
 
 Streamling enables teams to build and deploy custom sources, transforms, sinks, and UDFs through plugins without sacrificing performance or correctness. It's also meant to be highly efficient. 
@@ -1800,6 +1818,39 @@ To build a plugin (using the high-level API):
 5. Build with `cargo build`
 
 The resulting shared library (`.so`, `.dylib`, `.dll`) can be loaded by Streamling via the `STREAMLING__PLUGIN__PATH` configuration.
+
+### AI Authoring Skills
+
+Streamling ships a pack of AI agent skills (in [`skills/`](skills/)) that teach a coding agent how to build plugins correctly — the registration macros, constructor contracts, checkpoint/exactly-once lifecycle, error types, and option/secret patterns, all grounded in this repo's plugin API. Install them once and an agent can scaffold a new source/sink/transform/preprocessor/UDF without re-deriving the FFI contract.
+
+| Skill | Covers |
+|---|---|
+| `streamling-plugin-basics` | crate setup, registration macros, constructor contracts, lifecycle, async runtime, errors, options/secrets, metrics, state — **start here** |
+| `streamling-source-plugin` | `SourcePlugin`, `_gs_op`, `generate_batch`, resumable pagination, backpressure |
+| `streamling-sink-plugin` | `SinkPlugin`, lazy client init, batched writes with retry + partial-failure handling, checkpoint acks |
+| `streamling-transform-plugin` | `TransformPlugin`, `process_batch`, arrow-compute filtering |
+| `streamling-udf-plugin` | DataFusion scalar UDFs — `ScalarUDFImpl`, `invoke_with_args`, calling custom functions from SQL |
+| `streamling-advanced-plugins` | preprocessors, side outputs, multi-kind crates, low-level FFI |
+
+#### Installing the skills
+
+Each skill is `<name>/SKILL.md`. Symlink the ones you want into your coding agent's personal skills directory (they then stay in sync with the repo):
+
+| Agent | Skills directory |
+|---|---|
+| Claude Code | `~/.claude/skills/` |
+| Codex, GitHub Copilot CLI, Gemini CLI | `~/.agents/skills/` (cross-runtime alias) |
+
+```bash
+cd /path/to/streamling
+for d in skills/streamling-*; do
+  for dir in ~/.claude/skills ~/.agents/skills; do
+    mkdir -p "$dir" && ln -sf "$(pwd)/$d" "$dir/$(basename "$d")"
+  done
+done
+```
+
+Skills are discovered at agent **startup** — restart your session after installing. See [`skills/README.md`](skills/README.md) for the full per-agent path table (incl. `~/.codex`, `~/.copilot`, `~/.gemini`, Antigravity), a copy/freeze option, and verification steps.
 
 ### Checkpointing Support
 
