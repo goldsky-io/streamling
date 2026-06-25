@@ -87,18 +87,36 @@ fn require_decimal_arb(field: &Field, op_name: &str) -> Result<(u32, u32)> {
     })
 }
 
+fn is_decimal_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
 /// Replicate the built-in `sum` numeric coercion for the non-decimal_arb path.
 /// DF54's `sum` encodes coercion in its `Coercible` signature rather than
 /// `coerce_types`, so delegating to `builtin.coerce_types` errors with
 /// "does not implement coerce_types"; mirror the Postgres-style rules here.
+/// Kept in parity with `datafusion-functions-aggregate` 54's `Sum` signature:
+/// Null and Duration pass through, decimals are preserved, dictionary/REE wrap
+/// integer/float values that coerce (decimal-valued dictionaries stay wrapped).
 fn builtin_sum_coerce(arg_types: &[DataType]) -> Result<Vec<DataType>> {
     fn coerced(dt: &DataType) -> Result<DataType> {
         match dt {
+            // Typeless NULL flows through unchanged (DF54 short-circuits it).
+            DataType::Null => Ok(dt.clone()),
+            // Decimal-valued dictionaries/REE stay wrapped (DF54 doesn't decode
+            // the Decimal class); integer/float wrappers coerce their value.
+            DataType::Dictionary(_, v) if is_decimal_type(v) => Ok(dt.clone()),
             DataType::Dictionary(_, v) => coerced(v),
-            DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _) => Ok(dt.clone()),
+            DataType::RunEndEncoded(_, v) if is_decimal_type(v.data_type()) => Ok(dt.clone()),
+            DataType::RunEndEncoded(_, v) => coerced(v.data_type()),
+            DataType::Duration(_) => Ok(dt.clone()),
+            d if is_decimal_type(d) => Ok(dt.clone()),
             d if d.is_signed_integer() => Ok(DataType::Int64),
             d if d.is_unsigned_integer() => Ok(DataType::UInt64),
             d if d.is_floating() => Ok(DataType::Float64),
@@ -117,16 +135,18 @@ fn builtin_sum_coerce(arg_types: &[DataType]) -> Result<Vec<DataType>> {
 
 /// Replicate the built-in `avg` numeric coercion for the non-decimal_arb path
 /// (same DF54 caveat as [`builtin_sum_coerce`]): integers/floats → Float64,
-/// decimals and durations pass through unchanged.
+/// decimals and durations pass through unchanged, Null flows through, and
+/// dictionary/REE wrappers behave as in `Average`'s DF54 signature.
 fn builtin_avg_coerce(arg_types: &[DataType]) -> Result<Vec<DataType>> {
     fn coerced(dt: &DataType) -> Result<DataType> {
         match dt {
+            DataType::Null => Ok(dt.clone()),
+            DataType::Dictionary(_, v) if is_decimal_type(v) => Ok(dt.clone()),
             DataType::Dictionary(_, v) => coerced(v),
-            DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Duration(_) => Ok(dt.clone()),
+            DataType::RunEndEncoded(_, v) if is_decimal_type(v.data_type()) => Ok(dt.clone()),
+            DataType::RunEndEncoded(_, v) => coerced(v.data_type()),
+            DataType::Duration(_) => Ok(dt.clone()),
+            d if is_decimal_type(d) => Ok(dt.clone()),
             d if d.is_integer() || d.is_floating() => Ok(DataType::Float64),
             other => Err(datafusion::error::DataFusionError::from(
                 streamling_user_err!("avg is not supported for input type {other:?}"),
@@ -811,6 +831,65 @@ mod tests {
     use crate::types::decimal_arb::DecimalArbArrayBuilder;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    #[test]
+    fn builtin_sum_coerce_matches_df54_numeric_rules() {
+        let cases = [
+            (DataType::Int8, DataType::Int64),
+            (DataType::Int64, DataType::Int64),
+            (DataType::UInt16, DataType::UInt64),
+            (DataType::Float32, DataType::Float64),
+            (DataType::Decimal128(20, 4), DataType::Decimal128(20, 4)),
+            (DataType::Decimal256(60, 8), DataType::Decimal256(60, 8)),
+            // Regression (H3): these were rejected before parity fix.
+            (DataType::Null, DataType::Null),
+            (
+                DataType::Duration(arrow_schema::TimeUnit::Second),
+                DataType::Duration(arrow_schema::TimeUnit::Second),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                builtin_sum_coerce(std::slice::from_ref(&input)).unwrap(),
+                vec![expected],
+                "sum coercion for {input:?}"
+            );
+        }
+        // Dictionary/REE of integer coerce their value; of decimal stay wrapped.
+        let dict_i32 = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
+        assert_eq!(
+            builtin_sum_coerce(&[dict_i32]).unwrap(),
+            vec![DataType::Int64]
+        );
+        let dict_dec = DataType::Dictionary(
+            Box::new(DataType::Int8),
+            Box::new(DataType::Decimal128(10, 2)),
+        );
+        assert_eq!(
+            builtin_sum_coerce(std::slice::from_ref(&dict_dec)).unwrap(),
+            vec![dict_dec]
+        );
+    }
+
+    #[test]
+    fn builtin_avg_coerce_matches_df54_numeric_rules() {
+        assert_eq!(
+            builtin_avg_coerce(&[DataType::Int32]).unwrap(),
+            vec![DataType::Float64]
+        );
+        assert_eq!(
+            builtin_avg_coerce(&[DataType::Float32]).unwrap(),
+            vec![DataType::Float64]
+        );
+        assert_eq!(
+            builtin_avg_coerce(&[DataType::Decimal128(20, 4)]).unwrap(),
+            vec![DataType::Decimal128(20, 4)]
+        );
+        assert_eq!(
+            builtin_avg_coerce(&[DataType::Null]).unwrap(),
+            vec![DataType::Null]
+        );
+    }
 
     fn build_input(scale: u32, precision: u32, values: &[Option<&str>]) -> Arc<dyn Array> {
         let mut b =

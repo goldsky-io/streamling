@@ -439,7 +439,7 @@ impl HybridTableProvider {
                     let compatible = Self::is_compatible_data_type(
                         bounded_field.data_type(),
                         unbounded_field.data_type(),
-                    ) || Self::is_clickhouse_native_wide_int(
+                    ) || Self::clickhouse_reads_as_decimal_arb(
                         bounded_field.data_type(),
                         unbounded_field,
                     );
@@ -464,20 +464,31 @@ impl HybridTableProvider {
         Ok(unbounded_schema)
     }
 
-    /// A bounded ClickHouse column fetched as native `UInt256`/`Int256` arrives
-    /// as Arrow `FixedSizeBinary(32)`, while the unbounded (target) schema
-    /// declares the same column as `decimal_arb` (`LargeBinary`) with a
-    /// `native_int_kind` hint. These are the same logical wide integer:
-    /// `normalize_batch_from_clickhouse` reinterprets the 32 little-endian bytes
-    /// into decimal_arb canonical form at read time, so they're compatible.
-    fn is_clickhouse_native_wide_int(
+    /// A bounded ClickHouse column whose unbounded (target) field is
+    /// `decimal_arb` is fetched in one of two encodings, both reinterpreted into
+    /// decimal_arb by `normalize_batch_from_clickhouse`:
+    /// - native `UInt256`/`Int256` → Arrow `FixedSizeBinary(32)` (only when the
+    ///   target carries a `native_int_kind` hint), or
+    /// - canonical decimal text → `Utf8`/`LargeUtf8` (the wide / `coerce_to:
+    ///   string` path that has no native ClickHouse numeric type).
+    ///
+    /// Either is compatible with the `decimal_arb` `LargeBinary` target.
+    fn clickhouse_reads_as_decimal_arb(
         bounded_type: &arrow_schema::DataType,
         unbounded_field: &Field,
     ) -> bool {
+        use arrow_schema::DataType;
         use streamling_core::types::decimal_arb::DecimalArbType;
-        matches!(bounded_type, arrow_schema::DataType::FixedSizeBinary(32))
-            && DecimalArbType::is_decimal_arb_field(unbounded_field)
-            && DecimalArbType::native_int_kind_from_field(unbounded_field).is_some()
+        if !DecimalArbType::is_decimal_arb_field(unbounded_field) {
+            return false;
+        }
+        match bounded_type {
+            DataType::FixedSizeBinary(32) => {
+                DecimalArbType::native_int_kind_from_field(unbounded_field).is_some()
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => true,
+            _ => false,
+        }
     }
 
     fn is_compatible_data_type(

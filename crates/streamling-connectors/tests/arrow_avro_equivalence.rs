@@ -109,8 +109,9 @@ fn arrow_avro_decodes_real_traces_to_target_schema() {
         DecimalArbValue::from_canonical_bytes_at_scale(value_col.value(0), scale)
             .expect("`value` decodes as decimal_arb");
 
-        // Nested high-precision decimals inside the array-of-records become Decimal128(100,0)
-        // (matching streamling's top-level-only u256 fixup — nested decimals fall through).
+        // Nested high-precision decimals inside the array-of-records route to
+        // streamling.decimal_arb (precision 100 > 76), lossless — they no longer
+        // fall through to the truncating Decimal128(100,0) path.
         let xfers_idx = target.index_of("after_evm_transfers").unwrap();
         let DataType::List(elem) = schema.field(xfers_idx).data_type() else {
             panic!("after_evm_transfers is not a List");
@@ -119,14 +120,14 @@ fn arrow_avro_decodes_real_traces_to_target_schema() {
             panic!("after_evm_transfers element is not a Struct");
         };
         let nested_value = fields.iter().find(|f| f.name() == "value").unwrap();
-        assert_eq!(
-            nested_value.data_type(),
-            &DataType::Decimal128(100, 0),
-            "nested transfer `value` should be Decimal128(100,0)"
+        assert!(
+            DecimalArbType::is_decimal_arb_field(nested_value),
+            "nested transfer `value` should be decimal_arb, got {:?}",
+            nested_value.data_type()
         );
 
         println!(
-            "  OK: {} cols, schema + u256 + nested types verified",
+            "  OK: {} cols, schema + decimal_arb + nested types verified",
             batch.num_columns()
         );
     }

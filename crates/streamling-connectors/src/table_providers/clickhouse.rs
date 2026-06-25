@@ -2776,20 +2776,39 @@ impl ClickHouseClient {
 
         for (column, original_field) in batch.columns().iter().zip(original_schema.fields().iter())
         {
-            let wide_int_target = target_by_name
-                .get(original_field.name().as_str())
-                .copied()
-                .filter(|tf| {
-                    matches!(original_field.data_type(), DataType::FixedSizeBinary(32))
-                        && DecimalArbType::is_decimal_arb_field(tf)
-                        && DecimalArbType::native_int_kind_from_field(tf).is_some()
-                });
+            // A decimal_arb target column is fetched from ClickHouse either as
+            // native UInt256/Int256 (FixedSizeBinary(32), for native_int_kind
+            // hints) or as canonical decimal text (Utf8, the wide/`coerce_to:
+            // string` path). Reinterpret each into decimal_arb; everything else
+            // passes through unchanged.
+            let mut converted: Option<(ArrayRef, &FieldRef)> = None;
+            if let Some(tf) = target_by_name.get(original_field.name().as_str()).copied()
+                && DecimalArbType::is_decimal_arb_field(tf)
+            {
+                match original_field.data_type() {
+                    DataType::FixedSizeBinary(32)
+                        if DecimalArbType::native_int_kind_from_field(tf).is_some() =>
+                    {
+                        converted = Some((
+                            clickhouse_native_to_decimal_arb(column.as_ref(), tf)
+                                .map_err(DataFusionError::from)?,
+                            tf,
+                        ));
+                    }
+                    DataType::Utf8 | DataType::LargeUtf8 => {
+                        converted = Some((
+                            clickhouse_string_to_decimal_arb(column.as_ref(), tf)
+                                .map_err(DataFusionError::from)?,
+                            tf,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
 
-            match wide_int_target {
-                Some(tf) => {
-                    let converted = clickhouse_native_to_decimal_arb(column.as_ref(), tf)
-                        .map_err(DataFusionError::from)?;
-                    new_columns.push(converted);
+            match converted {
+                Some((col, tf)) => {
+                    new_columns.push(col);
                     new_fields.push((*tf).clone());
                     changed = true;
                 }
@@ -5655,6 +5674,67 @@ fn canonical_to_clickhouse_le(
     Ok(be_buf)
 }
 
+/// Read-side conversion for `decimal_arb` columns ClickHouse stores as canonical
+/// decimal text (`Utf8`) — the wide / `coerce_to: string` path that has no native
+/// ClickHouse numeric type. Parses each cell with `DecimalArbValue::from_str` and
+/// re-encodes at the target field's declared scale. Inverse of the sink's
+/// `CanonicalString` emission.
+pub fn clickhouse_string_to_decimal_arb(
+    column: &dyn arrow::array::Array,
+    field: &arrow_schema::FieldRef,
+) -> std::result::Result<arrow::array::ArrayRef, StreamlingError> {
+    use arrow::array::{Array, LargeBinaryBuilder, LargeStringArray, StringArray};
+    use std::str::FromStr;
+    use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
+
+    let (_precision, scale) =
+        DecimalArbType::precision_scale_from_field(field).ok_or_else(|| {
+            streamling_err!(
+                "field '{}' is not a decimal_arb field (missing extension metadata)",
+                field.name(),
+            )
+        })?;
+
+    let parse = |text: &str| -> std::result::Result<Vec<u8>, StreamlingError> {
+        DecimalArbValue::from_str(text)
+            .map(|v| v.to_canonical_bytes_at_scale(scale))
+            .map_err(|e| {
+                streamling_err!(
+                    "column '{}': cannot parse decimal_arb from ClickHouse text '{}': {}",
+                    field.name(),
+                    text,
+                    e
+                )
+            })
+    };
+
+    let mut builder = LargeBinaryBuilder::with_capacity(column.len(), 0);
+    if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(parse(arr.value(i))?);
+            }
+        }
+    } else if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(parse(arr.value(i))?);
+            }
+        }
+    } else {
+        return Err(streamling_err!(
+            "expected Utf8/LargeUtf8 for decimal_arb string column '{}', got {:?}",
+            field.name(),
+            column.data_type(),
+        ));
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
 /// Read-side inverse of [`decimal_arb_to_clickhouse_native`]: reinterpret a
 /// ClickHouse `UInt256` / `Int256` column (decoded as little-endian
 /// `FixedSizeBinary(32)`) as a `decimal_arb` `LargeBinary` column at the target
@@ -6105,6 +6185,43 @@ mod feature_002_byte_conversion_tests {
             "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
         ] {
             assert_native_round_trip(NativeIntKind::I256, v);
+        }
+    }
+
+    #[test]
+    fn read_string_decimal_arb_round_trips() {
+        use arrow::array::StringArray;
+        use std::str::FromStr;
+        use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
+
+        // Wide / coerce_to:string columns land in ClickHouse as canonical text.
+        // A wide-fractional decimal_arb(90, 18) with no native_int_kind hint.
+        let field = Arc::new(DecimalArbType::field("v", 90, 18, true).unwrap());
+        let texts = [
+            Some("123.456789000000000000"),
+            None,
+            Some("-0.000000000000000001"),
+            Some("0"),
+            // 80-digit integer part — far beyond u256/native range.
+            Some("12345678901234567890123456789012345678901234567890.000000000000000000"),
+        ];
+        let arr = StringArray::from(texts.to_vec());
+
+        let out = clickhouse_string_to_decimal_arb(&arr, &field).unwrap();
+        let lb = out.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        for (i, t) in texts.iter().enumerate() {
+            match t {
+                None => assert!(lb.is_null(i), "row {i} should be null"),
+                Some(text) => {
+                    let got =
+                        DecimalArbValue::from_canonical_bytes_at_scale(lb.value(i), 18).unwrap();
+                    assert_eq!(
+                        got,
+                        DecimalArbValue::from_str(text).unwrap(),
+                        "string decimal_arb round-trip for {text}"
+                    );
+                }
+            }
         }
     }
 

@@ -364,10 +364,14 @@ fn binary_or_passthrough_decimal128(src: &ArrayRef, p: u8, s: i8) -> Result<Arra
         // `fixed(n)` — same big-endian two's-complement payload as the `bytes` case.
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             let rows = as_binary_iter(src)?;
-            let arr: PrimitiveArray<Decimal128Type> = rows
-                .iter()
-                .map(|b| b.as_ref().map(|bytes| be_bytes_to_i128(bytes)))
-                .collect();
+            let mut vals: Vec<Option<i128>> = Vec::with_capacity(rows.len());
+            for b in &rows {
+                vals.push(match b {
+                    Some(bytes) => Some(be_bytes_to_i128(bytes)?),
+                    None => None,
+                });
+            }
+            let arr: PrimitiveArray<Decimal128Type> = vals.into_iter().collect();
             Ok(Arc::new(arr.with_data_type(dt)))
         }
         DataType::Decimal128(_, _) => {
@@ -411,10 +415,14 @@ fn binary_or_passthrough_decimal256(src: &ArrayRef, p: u8, s: i8) -> Result<Arra
         // `fixed(n)` — same big-endian two's-complement payload as the `bytes` case.
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             let rows = as_binary_iter(src)?;
-            let arr: PrimitiveArray<Decimal256Type> = rows
-                .iter()
-                .map(|b| b.as_ref().map(|bytes| be_bytes_to_i256(bytes)))
-                .collect();
+            let mut vals: Vec<Option<i256>> = Vec::with_capacity(rows.len());
+            for b in &rows {
+                vals.push(match b {
+                    Some(bytes) => Some(be_bytes_to_i256(bytes)?),
+                    None => None,
+                });
+            }
+            let arr: PrimitiveArray<Decimal256Type> = vals.into_iter().collect();
             Ok(Arc::new(arr.with_data_type(dt)))
         }
         DataType::Decimal256(_, _) => {
@@ -430,26 +438,52 @@ fn binary_or_passthrough_decimal256(src: &ArrayRef, p: u8, s: i8) -> Result<Arra
     }
 }
 
-/// Big-endian two's-complement avro decimal bytes → sign-extended `i128`. Mirrors the vendored
-/// `arrow_array_reader::resolve_decimal`. For inputs longer than 16 bytes the low 16 bytes are
-/// kept (the vendored reader only ever saw ≤16-byte nested values).
-fn be_bytes_to_i128(bytes: &[u8]) -> i128 {
+/// Returns an error if `bytes` (big-endian two's-complement) needs more than
+/// `width` bytes to represent — i.e. the bytes above the low `width` aren't pure
+/// sign-extension, so truncating to `width` would silently corrupt the value.
+fn check_fits_width(bytes: &[u8], width: usize, target: &str) -> Result<()> {
+    if bytes.len() <= width {
+        return Ok(());
+    }
+    let negative = !bytes.is_empty() && (bytes[0] & 0x80) != 0;
+    let fill = if negative { 0xFFu8 } else { 0x00 };
+    let (high, low) = bytes.split_at(bytes.len() - width);
+    // Pure sign-extension above the low `width` bytes, AND the sign bit of the
+    // retained high byte must already carry the sign.
+    let sign_carried = !low.is_empty() && ((low[0] & 0x80 != 0) == negative);
+    if !high.iter().all(|&b| b == fill) || !sign_carried {
+        return Err(DataFusionError::Internal(format!(
+            "avro decimal value does not fit {target} (needs > {} bits): {} bytes",
+            width * 8,
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Big-endian two's-complement avro decimal bytes → sign-extended `i128`. Errors
+/// (rather than silently truncating) when the value needs more than 128 bits —
+/// callers route >38-digit decimals to Decimal256/decimal_arb instead.
+fn be_bytes_to_i128(bytes: &[u8]) -> Result<i128> {
+    check_fits_width(bytes, 16, "Decimal128")?;
     let negative = !bytes.is_empty() && (bytes[0] & 0x80) != 0;
     let fill = if negative { 0xFFu8 } else { 0x00 };
     let mut ext = [fill; 16];
     let n = bytes.len().min(16);
     ext[16 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
-    i128::from_be_bytes(ext)
+    Ok(i128::from_be_bytes(ext))
 }
 
-/// Big-endian two's-complement avro decimal bytes → sign-extended `i256`.
-fn be_bytes_to_i256(bytes: &[u8]) -> i256 {
+/// Big-endian two's-complement avro decimal bytes → sign-extended `i256`. Errors
+/// (rather than silently truncating) when the value needs more than 256 bits.
+fn be_bytes_to_i256(bytes: &[u8]) -> Result<i256> {
+    check_fits_width(bytes, 32, "Decimal256")?;
     let negative = !bytes.is_empty() && (bytes[0] & 0x80) != 0;
     let fill = if negative { 0xFFu8 } else { 0x00 };
     let mut ext = [fill; 32];
     let n = bytes.len().min(32);
     ext[32 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
-    i256::from_be_bytes(ext)
+    Ok(i256::from_be_bytes(ext))
 }
 
 // ---------------------------------------------------------------------------
@@ -954,15 +988,25 @@ mod tests {
     }
 
     #[test]
-    fn nested_decimal_decodes_to_list_struct_decimal128() {
-        // top-level u256 value + an array with one transfer carrying a small nested decimal.
+    fn nested_wide_decimal_decodes_to_list_struct_decimal_arb() {
+        // top-level wide value + an array with one transfer whose nested `amt`
+        // (avro decimal precision 100) exceeds 2^128. The nested decimal must
+        // route to streamling.decimal_arb and round-trip losslessly — the old
+        // path mapped it to Decimal128(100,0) and truncated to the low 128 bits.
         let mut top = [0u8; 32];
         top[31] = 0x07;
+
+        // 2^130 = 1361129467683753853853498429727072845824 — needs 131 bits, so
+        // its low-128-bit truncation is 0. A regression here would read it as 0.
+        let amt_decimal = "1361129467683753853853498429727072845824";
+        let amt_bigint = BigInt::parse_bytes(amt_decimal.as_bytes(), 10).unwrap();
+        let amt_be = amt_bigint.to_signed_bytes_be();
+        assert!(amt_be.len() > 16, "test value must exceed 128 bits");
 
         let schema = AvroWriterSchema::parse_str(NESTED_SCHEMA).unwrap();
         let mut rec = Record::new(&schema).unwrap();
         rec.put("top", Value::Decimal(Decimal::from(top.to_vec())));
-        // xfers = [ {who: "alice", amt: 1234} ]
+        // xfers = [ {who: "alice", amt: 2^130} ]
         let inner = Value::Record(vec![
             (
                 "who".to_string(),
@@ -970,7 +1014,7 @@ mod tests {
             ),
             (
                 "amt".to_string(),
-                Value::Union(1, Box::new(Value::Decimal(Decimal::from(vec![0x04, 0xD2])))), // 1234
+                Value::Union(1, Box::new(Value::Decimal(Decimal::from(amt_be)))),
             ),
         ]);
         rec.put(
@@ -1003,13 +1047,9 @@ mod tests {
             .downcast_ref::<LargeBinaryArray>()
             .expect("decimal_arb storage is LargeBinary");
         let top_val = DecimalArbValue::from_canonical_bytes_at_scale(top_col.value(0), 0).unwrap();
-        assert_eq!(
-            top_val.to_canonical_string(),
-            "7",
-            "top-level u256 value == 7"
-        );
+        assert_eq!(top_val.to_canonical_string(), "7", "top-level value == 7");
 
-        // xfers is List<Struct{who: Utf8, amt: Decimal128(100,0)}>
+        // xfers is List<Struct{who: Utf8, amt: streamling.decimal_arb}>
         let xfers = batch.schema().field(1).clone();
         let DataType::List(elem) = xfers.data_type() else {
             panic!("xfers not a List: {:?}", xfers.data_type());
@@ -1018,9 +1058,13 @@ mod tests {
             panic!("element not a Struct: {:?}", elem.data_type());
         };
         let amt = fields.iter().find(|f| f.name() == "amt").unwrap();
-        assert_eq!(amt.data_type(), &DataType::Decimal128(100, 0));
+        assert!(
+            DecimalArbType::is_decimal_arb_field(amt),
+            "nested wide decimal must be decimal_arb, got {:?}",
+            amt.data_type()
+        );
 
-        // verify the nested decimal value round-trips as 1234.
+        // verify the nested decimal value round-trips as 2^130 (no truncation).
         let list = batch
             .column(1)
             .as_any()
@@ -1035,9 +1079,14 @@ mod tests {
             .column_by_name("amt")
             .unwrap()
             .as_any()
-            .downcast_ref::<PrimitiveArray<Decimal128Type>>()
-            .unwrap();
-        assert_eq!(amt_col.value(0), 1234_i128);
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("nested decimal_arb storage is LargeBinary");
+        let amt_val = DecimalArbValue::from_canonical_bytes_at_scale(amt_col.value(0), 0).unwrap();
+        assert_eq!(
+            amt_val.to_canonical_string(),
+            amt_decimal,
+            "nested wide decimal round-trips losslessly (no 128-bit truncation)"
+        );
     }
 
     // Backward-compatible schema evolution (mirrors e2e test_schema_evolution_new_field_with_default):

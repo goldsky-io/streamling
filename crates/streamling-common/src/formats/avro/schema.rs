@@ -403,11 +403,38 @@ fn schema_to_field_with_props(
         AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
     };
 
+    // Route decimals by precision, mirroring the top-level
+    // `convert_avro_schema_to_arrow` fixup, so NESTED decimals (inside
+    // List/Struct/Map) aren't left as the malformed `Decimal128(p, s)` the
+    // match above produces for every precision — which is invalid for p > 38
+    // and silently truncates to 128 bits on decode. p <= 38 -> Decimal128;
+    // 38 < p <= 76 -> Decimal256; p > 76 -> streamling.decimal_arb. Top-level
+    // fields are re-processed (with the ClickHouse `native_int_kind` hint) by
+    // `convert_avro_schema_to_arrow` afterward, so this only changes nested
+    // decimals in practice. `find_decimal_schema` sees through nullable unions.
+    let mut props = props.unwrap_or_default();
+    let mut field_type = field_type;
+    if let Some(decimal) = find_decimal_schema(schema) {
+        let (precision, scale) = (decimal.precision, decimal.scale);
+        if precision > 76 {
+            // decimal_arb is the only lossless representation for >76-digit
+            // values. On an unsupported (precision, scale) (e.g. negative
+            // scale) leave the field as-is rather than failing the whole schema.
+            if let Ok(meta) = DecimalArbType::metadata(precision as u32, scale as u32) {
+                field_type = DecimalArbType::new();
+                props.extend(meta);
+            }
+        } else if precision > 38 {
+            field_type = DataType::Decimal256(precision as u8, scale as i8);
+        }
+        // precision <= 38 is already Decimal128(p, s) from the match above.
+    }
+
     let data_type = field_type.clone();
     let name = name.unwrap_or_else(|| default_field_name(&data_type));
 
     let mut field = Field::new(name, field_type, nullable);
-    field.set_metadata(props.unwrap_or_default());
+    field.set_metadata(props);
     Ok(field)
 }
 

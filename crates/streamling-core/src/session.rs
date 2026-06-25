@@ -462,6 +462,110 @@ mod tests {
     use arrow::array::{Float64Array, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
 
+    /// Build a `t(id, amt decimal_arb(100,0), alt decimal_arb(100,0), flag)`
+    /// MemTable: amt = [111, 222], alt = [999, 888], flag = [1, 0].
+    fn register_decimal_arb_case_table(sm: &SessionManager) {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+        use arrow::array::StringArray;
+        use datafusion::datasource::MemTable;
+        use std::str::FromStr;
+
+        let col = |vals: [&str; 2], name: &str| {
+            let mut b = DecimalArbArrayBuilder::with_capacity(2, name, 100, 0).unwrap();
+            for v in vals {
+                b.append_value(&DecimalArbValue::from_str(v).unwrap())
+                    .unwrap();
+            }
+            b.finish().into_inner().0
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            DecimalArbType::field("amt", 100, 0, true).unwrap(),
+            DecimalArbType::field("alt", 100, 0, true).unwrap(),
+            Field::new("flag", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(col(["111", "222"], "amt")),
+                Arc::new(col(["999", "888"], "alt")),
+                Arc::new(Int64Array::from(vec![1, 0])),
+            ],
+        )
+        .unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        sm.register_table("t", Arc::new(table)).unwrap();
+    }
+
+    /// `CASE` over `decimal_arb` branches plans, executes, and selects the right
+    /// values through the full session — the decimal_arb `ExprPlanner` only
+    /// rewrites binary ops, so this confirms CASE rides DataFusion's native
+    /// coercion of the underlying `LargeBinary` without erroring. (Mirrors the
+    /// "does not kill the stream" u256 CASE test retired in feature 002.)
+    #[tokio::test]
+    async fn case_over_decimal_arb_plans_and_selects_correct_values() {
+        use crate::types::decimal_arb::DecimalArbValue;
+        use arrow::array::{Array, LargeBinaryArray};
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_case_table(&sm);
+
+        let sql = "SELECT id, CASE WHEN flag = 1 THEN amt ELSE alt END AS chosen FROM t";
+        let plan = sm
+            .create_logical_plan(sql.to_string())
+            .await
+            .expect("CASE over decimal_arb should plan");
+        let batches = sm
+            .new_df(plan)
+            .collect()
+            .await
+            .expect("CASE over decimal_arb should execute");
+
+        // row 0: flag=1 -> amt=111 ; row 1: flag=0 -> alt=888
+        let col = batches[0]
+            .column_by_name("chosen")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("decimal_arb storage is LargeBinary");
+        let v0 = DecimalArbValue::from_canonical_bytes_at_scale(col.value(0), 0).unwrap();
+        let v1 = DecimalArbValue::from_canonical_bytes_at_scale(col.value(1), 0).unwrap();
+        assert_eq!(v0.to_canonical_string(), "111");
+        assert_eq!(v1.to_canonical_string(), "888");
+    }
+
+    /// KNOWN GAP (tripwire): DataFusion's `CASE` does not propagate the
+    /// `decimal_arb` extension metadata to its output field, so `chosen` comes
+    /// back as a bare `LargeBinary`. A downstream Postgres/ClickHouse sink keyed
+    /// on the extension metadata would then treat the column as raw BYTEA/binary
+    /// instead of `NUMERIC(p, s)`. Fixing this needs a metadata-propagation rule
+    /// (the decimal_arb `ExprPlanner` only covers binary ops, not CASE). Ignored
+    /// until that lands; remove `#[ignore]` once metadata survives CASE.
+    #[tokio::test]
+    #[ignore = "known gap: CASE over decimal_arb drops the extension metadata (needs a metadata-propagation rule)"]
+    async fn case_over_decimal_arb_should_preserve_metadata() {
+        use crate::types::decimal_arb::DecimalArbType;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_case_table(&sm);
+
+        let sql = "SELECT id, CASE WHEN flag = 1 THEN amt ELSE alt END AS chosen FROM t";
+        let plan = sm.create_logical_plan(sql.to_string()).await.unwrap();
+        let batches = sm.new_df(plan).collect().await.unwrap();
+
+        let field = batches[0]
+            .schema()
+            .field_with_name("chosen")
+            .unwrap()
+            .clone();
+        assert!(
+            DecimalArbType::is_decimal_arb_field(&field),
+            "CASE output lost decimal_arb metadata: {field:?}"
+        );
+    }
+
     #[test]
     fn test_extract_schema_and_table_names() {
         assert_eq!(
