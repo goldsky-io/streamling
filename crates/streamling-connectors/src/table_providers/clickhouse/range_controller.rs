@@ -164,7 +164,7 @@ impl RangeController {
     /// A page overflowed the row tripwire (rows == page_size + 1). Shrinks width so
     /// the SAME range is re-read. Does NOT advance the cursor. With a probed exact
     /// `count`, resizes in one step; otherwise halves.
-    pub fn on_overflow(&mut self, probed_count: Option<u64>) {
+    fn on_overflow(&mut self, probed_count: Option<u64>) {
         let candidate = match probed_count {
             Some(count) if count > 0 => {
                 (self.width as f64 * (self.page_size as f64 / count as f64)) as i128
@@ -181,7 +181,7 @@ impl RangeController {
     /// under the limit in one step rather than asymptoting a unit at a time.
     /// `on_complete`'s byte clamp then keeps it there. Does NOT advance the cursor,
     /// so the same range is re-read.
-    pub fn on_byte_overflow(&mut self, observed_bytes: u64) {
+    fn on_byte_overflow(&mut self, observed_bytes: u64) {
         let target = self.max_page_bytes as f64 * Self::BYTE_TARGET_RATIO;
         let candidate = if observed_bytes > 0 {
             (self.width as f64 * (target / observed_bytes as f64)) as i128

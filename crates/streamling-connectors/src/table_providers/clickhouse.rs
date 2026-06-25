@@ -1400,7 +1400,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let attach_checkpoints = {
                 let buffer_arc = checkpoint_buffer_for_data.clone();
                 move |batch: RecordBatch| -> RecordBatch {
-                    let mut buffer = buffer_arc.lock().unwrap();
+                    let mut buffer = buffer_arc.lock().expect("checkpoint buffer mutex poisoned");
                     if buffer.is_empty() {
                         return batch;
                     }

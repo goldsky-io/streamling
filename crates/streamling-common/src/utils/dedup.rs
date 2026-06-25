@@ -342,6 +342,7 @@ pub fn deduplicate_record_batches_by_version(
 
     deduplicate_record_batch_by_version(&concatenated, primary_key, version_column, tombstone)
 }
+
 /// Feed an array value at `index` into `hasher`. Used to bucket rows by their
 /// primary-key hash; equality is verified separately via `make_comparator` so
 /// `u64` hash collisions do not drop rows (STRM-5990).
