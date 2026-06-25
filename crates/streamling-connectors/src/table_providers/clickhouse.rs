@@ -1708,46 +1708,6 @@ impl ExecutionPlan for ClickHouseSourceExec {
             }
             debug!("Checkpointing task completed for {}", reference_name);
 
-            // Flush any checkpoint messages the task buffered after the last data
-            // batch was emitted (attach_checkpoints only drains onto an outgoing
-            // batch; a Marker that arrives during the final pages — or after the
-            // scan loop exits — has no batch to ride). Without this flush that
-            // Marker is dropped when `tx` drops, so the sink never sees the epoch,
-            // never acks, and the coordinator stalls on "missing sinks" — the
-            // production job-mode termination hang. Emit a synthetic empty batch
-            // carrying the buffered markers so they reach the sink (and the
-            // hybrid safety-net) before the stream ends.
-            {
-                // Build the flush batch inside the lock, then send outside it —
-                // holding a std MutexGuard across `.await` makes the spawn future !Send.
-                let enriched = {
-                    let mut buffer = checkpoint_buffer_for_data.lock().unwrap();
-                    if buffer.is_empty() {
-                        None
-                    } else {
-                        debug!(
-                            "Flushing {} buffered checkpoint message(s) on source completion",
-                            buffer.len()
-                        );
-                        let batch = RecordBatch::new_empty(empty_batch_schema.clone());
-                        let mut metadata = batch.schema().metadata().clone();
-                        enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
-                        let enriched = enrich_batch_with_metadata(batch, metadata)
-                            .expect("Failed to enrich final flush batch with checkpoint metadata");
-                        buffer.clear();
-                        Some(enriched)
-                    }
-                };
-                if let Some(enriched) = enriched
-                    && tx.send(Ok(enriched)).await.is_err()
-                {
-                    warn!(
-                        "ClickHouseSourceExec: receiver dropped before final checkpoint flush for {}",
-                        reference_name
-                    );
-                }
-            }
-
             // Unsubscribe from checkpoint channel before dropping the receiver
             // to avoid SendError when the coordinator tries to send to this channel
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
