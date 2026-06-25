@@ -128,6 +128,42 @@ fn is_timeout_error(error: &DataFusionError) -> bool {
 /// margin against offsets/null-bitmap overhead and measurement slack.
 const MAX_PAGE_BYTES: u64 = (i32::MAX as u64) / 2;
 
+/// Drain `buffer` and, if non-empty, build a synthetic empty batch carrying the
+/// checkpoint messages as schema metadata so they reach the sink before the
+/// source stream ends.
+///
+/// `attach_checkpoints` (the inline closure in `execute`) only drains the buffer
+/// onto an outgoing *data* batch. When the scan loop exits, a Marker buffered
+/// after the last data batch has no batch to ride — without this flush it is
+/// dropped when `tx` drops, the sink never ACKs that epoch, and the coordinator
+/// stalls on "missing sinks". On main's keyset pagination the last page was
+/// always an exhausted page that emitted an empty batch (draining the buffer);
+/// the new range pagination's last page has data and skips that drain, so this
+/// explicit flush restores parity.
+///
+/// Extracted as a free function so the drain logic is unit-testable without a
+/// ClickHouse connection or a multi-minute scan. Returns `None` when the buffer
+/// is empty (nothing to flush).
+fn build_checkpoint_flush_batch(
+    buffer: &mut Vec<CheckpointMessage>,
+    schema: SchemaRef,
+) -> Option<RecordBatch> {
+    if buffer.is_empty() {
+        return None;
+    }
+    debug!(
+        "Flushing {} buffered checkpoint message(s) on source completion",
+        buffer.len()
+    );
+    let batch = RecordBatch::new_empty(schema);
+    let mut metadata = batch.schema().metadata().clone();
+    enrich_batch_metadata_with_checkpoints(&mut metadata, buffer);
+    let enriched = enrich_batch_with_metadata(batch, metadata)
+        .expect("Failed to enrich final flush batch with checkpoint metadata");
+    buffer.clear();
+    Some(enriched)
+}
+
 /// Drop the column at `drop_idx` and re-tag the batch with `target_schema`.
 /// Strips a dedup-only version column (force-included because the configured
 /// columns omit it) before emission, so the external schema is unchanged.
@@ -1708,6 +1744,27 @@ impl ExecutionPlan for ClickHouseSourceExec {
             }
             debug!("Checkpointing task completed for {}", reference_name);
 
+            // Flush any checkpoint messages buffered after the last data batch.
+            // attach_checkpoints only drains onto an outgoing data batch; a Marker
+            // that arrived during the final pages (or after the scan loop exited)
+            // has no batch to ride. Without this flush it is dropped when `tx`
+            // drops, the sink never ACKs the epoch, and the coordinator stalls on
+            // "missing sinks" — the production job-mode termination hang.
+            {
+                let flush_batch = build_checkpoint_flush_batch(
+                    &mut checkpoint_buffer_for_data.lock().expect("checkpoint buffer mutex poisoned"),
+                    empty_batch_schema.clone(),
+                );
+                if let Some(batch) = flush_batch
+                    && tx.send(Ok(batch)).await.is_err()
+                {
+                    warn!(
+                        "ClickHouseSourceExec: receiver dropped before final checkpoint flush for {}",
+                        reference_name
+                    );
+                }
+            }
+
             // Unsubscribe from checkpoint channel before dropping the receiver
             // to avoid SendError when the coordinator tries to send to this channel
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
@@ -2869,6 +2926,7 @@ impl ClickHouseClient {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
 
     #[test]
     fn split_range_start_reads_first_sorting_key() {
@@ -4625,6 +4683,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn checkpoint_flush_drains_buffered_markers_into_synthetic_batch() {
+        // Regression: after the scan loop exits, a Marker buffered in
+        // checkpoint_buffer has no data batch to ride. build_checkpoint_flush_batch
+        // must drain it into a synthetic empty batch carrying the markers as
+        // schema metadata so the sink ACKs the epoch before the stream ends.
+        // Without it the coordinator stalls on "missing sinks" (the production
+        // job-mode termination hang).
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+
+        // Empty buffer -> nothing to flush.
+        let mut empty: Vec<CheckpointMessage> = vec![];
+        assert!(build_checkpoint_flush_batch(&mut empty, schema.clone()).is_none());
+        assert!(empty.is_empty(), "empty buffer stays empty");
+
+        // Buffered Marker -> synthetic empty batch carrying it, buffer drained.
+        let mut buffer = vec![CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(42),
+            created_at_ms: 1234,
+        }];
+        let batch = build_checkpoint_flush_batch(&mut buffer, schema.clone())
+            .expect("non-empty buffer must produce a flush batch");
+        assert_eq!(batch.num_rows(), 0, "flush batch is synthetic/empty");
+        assert!(buffer.is_empty(), "buffer drained after flush");
+
+        // The Marker must be recoverable from the batch's schema metadata — that
+        // is how the sink extracts and ACKs it.
+        let extracted = extract_checkpoint_messages(batch.schema().metadata());
+        assert!(
+            !extracted.is_empty(),
+            "flush batch must carry the checkpoint marker in metadata"
+        );
+        assert!(
+            extracted.iter().any(|m| matches!(
+                m,
+                CheckpointMessage::Marker { epoch, .. } if epoch.0 == 42
+            )),
+            "flushed batch must carry epoch 42 marker"
+        );
     }
 }
 
