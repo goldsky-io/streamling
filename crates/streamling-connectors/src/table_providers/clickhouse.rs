@@ -353,7 +353,7 @@ struct SinkParams {
 
 impl ClickHouseTableProvider {
     const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
-    const DEFAULT_PAGE_SIZE: usize = 2_000_000;
+    const DEFAULT_PAGE_SIZE: usize = 10_000_000;
     const MIN_SORT_KEY_RANGE: i64 = 100;
     const SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
 
@@ -1416,7 +1416,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             // Resume from the persisted cursor. Only the first sorting key matters;
             // see ClickHouseSourceSplit::range_start for checkpoint compatibility.
             let range_start = {
-                let guard = split.lock().unwrap();
+                let guard = split.lock().expect("split mutex poisoned");
                 guard.range_start().unwrap_or(0)
             };
             let template = i128_to_scalar_like(0, &max_val);
