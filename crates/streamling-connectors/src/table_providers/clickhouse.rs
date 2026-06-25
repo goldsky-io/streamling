@@ -209,7 +209,7 @@ pub(crate) fn parse_replacing_merge_tree_dedup(
     if !engine_name.to_ascii_lowercase().contains("replacing") {
         return None;
     }
-    let close = engine_full.rfind(')')?;
+    let close = matching_close_paren(engine_full, open)?;
     if close <= open {
         return None;
     }
@@ -267,6 +267,44 @@ fn tokenize_engine_args(args: &str) -> Vec<String> {
         tokens.push(current.trim().to_string());
     }
     tokens
+}
+
+/// Index of the `)` that closes the `(` at `open`, respecting single-quoted
+/// string literals (with `''` escapes) and nested parens. A real `engine_full`
+/// is `ReplacingMergeTree(...) ORDER BY (...)` — the trailing ORDER BY /
+/// SETTINGS clauses carry their own parens, so a naive `rfind(')')` grabs the
+/// wrong close and lets the ORDER BY text leak into the parsed column names.
+fn matching_close_paren(engine_full: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut chars = engine_full.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if i < open {
+            continue;
+        }
+        if in_quote {
+            if c == '\'' {
+                if matches!(chars.peek(), Some(&(_, '\''))) {
+                    chars.next(); // escaped quote
+                } else {
+                    in_quote = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_quote = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -3001,6 +3039,20 @@ mod tests {
         .expect("quoted commas must be ignored");
         assert_eq!(d.version_column.as_deref(), Some("v"));
         assert_eq!(d.is_deleted_column.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn parse_engine_with_trailing_order_by_clause() {
+        // A real `system.tables.engine_full` value appends the ORDER BY (and
+        // possibly SETTINGS) clause, which carries its own parens. The parser
+        // must close on the engine's matching paren, not the last one — or the
+        // ORDER BY text leaks into the parsed column names.
+        let d = parse_replacing_merge_tree_dedup(
+            "ReplacingMergeTree(insert_timestamp, is_deleted) ORDER BY (block_number, id)",
+        )
+        .expect("replacing variant with ORDER BY should parse");
+        assert_eq!(d.version_column.as_deref(), Some("insert_timestamp"));
+        assert_eq!(d.is_deleted_column.as_deref(), Some("is_deleted"));
     }
 
     #[test]
