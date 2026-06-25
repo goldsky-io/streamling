@@ -571,6 +571,309 @@ sinks:
 }
 
 // ============================================================================
+// Scenario 3b: Job mode checkpoint epoch finalization (no "missing sinks")
+// ============================================================================
+
+/// Regression: in job mode the bounded ClickHouse source must flush buffered
+/// checkpoint Markers before its stream ends. Otherwise the sink never ACKs the
+/// in-flight epoch and the coordinator stalls on "missing sinks" — and, under
+/// load, the process hangs because the source's final `tx.send(...).await` (the
+/// synthetic marker flush) backpressures against a sink that never finishes.
+///
+/// The existing 3-row test finishes before the checkpoint interval fires, so it
+/// never exercises a Marker arriving mid-scan. This test uses enough rows + a
+/// 1s checkpoint interval to force a Marker during the scan, then asserts:
+///   1. The process exits 0 (no hang).
+///   2. No "missing sinks" / "still waiting for finalization" warnings (markers
+///      flowed and epochs finalized).
+///   3. All bounded records reached the sink.
+#[tokio::test]
+async fn test_job_mode_checkpoint_epoch_finalizes() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE job_mode_checkpoint_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    // Enough rows that the scan spans the 1s checkpoint interval. With
+    // batch_size 1 and a print sink, 200 rows is well over a second of work
+    // and guarantees at least one Marker fires mid-scan.
+    let mut values = String::from("INSERT INTO job_mode_checkpoint_test VALUES ");
+    for i in 1..=200u32 {
+        if i > 1 {
+            values.push(',');
+        }
+        values.push_str(&format!("({}, 'row_{}', 'data_{}', {}, 0)", i, i, i, i));
+    }
+    clickhouse
+        .execute(&values)
+        .await
+        .expect("Failed to insert ClickHouse data");
+    // Register the Kafka schema + produce records so the hybrid source's
+    // unbounded phase can initialize (schema registry fetch). Job mode never
+    // consumes them, but the Kafka consumer is still set up at source creation.
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    ctx.kafka
+        .produce_avro_records(&[TestRecord {
+            block: 999,
+            id: "kafka_unused".to_string(),
+            data: "unused".to_string(),
+            timestamp: 9999,
+        }])
+        .await
+        .expect("Failed to produce Kafka records");
+
+    // Offset table (hybrid source probes it on transition; skipped in job mode
+    // but the config must still parse).
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_job_mode_cp (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: job_mode_checkpoint_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_job_mode_cp
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: job_mode_checkpoint_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__JOB_MODE", "true")
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(180)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    // 1. Process must exit successfully (no hang → no timeout).
+    assert!(
+        output.status.success(),
+        "Job mode pipeline should terminate successfully; stderr:\n{}",
+        output.stderr
+    );
+
+    // 2. No marker-loss symptoms: the coordinator must not stall on a missing
+    //    ACK. "missing sinks" or "still waiting for finalization" means a Marker
+    //    never reached the sink — the regression.
+    assert!(
+        !output.stderr.contains("missing sinks"),
+        "Checkpoint marker was lost: coordinator reports missing sinks.\nstderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("still waiting for finalization"),
+        "Checkpoint epoch never finalized: marker lost before sink ACK.\nstderr:\n{}",
+        output.stderr
+    );
+
+    // 3. All bounded records reached the sink.
+    let total_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.job_mode_checkpoint_results")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(
+        total_count, 200,
+        "Should have all 200 bounded records in the sink, got {}",
+        total_count
+    );
+}
+
+/// Regression: a larger bounded scan that requires multiple pages must still
+/// terminate cleanly in job mode. The page_size + 1 tripwire + dedup coalescing
+/// can interact with the checkpoint Marker delivery on the final page; this
+/// catches a hang or marker loss on a multi-page bounded scan.
+#[tokio::test]
+async fn test_job_mode_multi_page_scan_terminates() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE job_mode_multi_page_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    // 3000 rows with a tiny sort_key_range forces multiple pages (each page is
+    // bounded by the range width), exercising the pagination→completion→flush
+    // path repeatedly. batch_size 1 keeps the sink slow so a Marker fires.
+    let mut values = String::from("INSERT INTO job_mode_multi_page_test VALUES ");
+    for i in 1..=3000u32 {
+        if i > 1 {
+            values.push(',');
+        }
+        values.push_str(&format!("({}, 'row_{}', 'data_{}', {}, 0)", i, i, i, i));
+    }
+    clickhouse
+        .execute(&values)
+        .await
+        .expect("Failed to insert ClickHouse data");
+    // Register Kafka schema + produce a record so the hybrid unbounded phase
+    // initializes (job mode never consumes it).
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    ctx.kafka
+        .produce_avro_records(&[TestRecord {
+            block: 999,
+            id: "kafka_unused".to_string(),
+            data: "unused".to_string(),
+            timestamp: 9999,
+        }])
+        .await
+        .expect("Failed to produce Kafka records");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_multi_page (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: job_mode_multi_page_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_multi_page
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: job_mode_multi_page_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__JOB_MODE", "true")
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(180)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    assert!(
+        output.status.success(),
+        "Multi-page job mode pipeline should terminate successfully; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("missing sinks"),
+        "Marker lost on multi-page scan: missing sinks.\nstderr:\n{}",
+        output.stderr
+    );
+
+    let total_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.job_mode_multi_page_results")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(
+        total_count, 3000,
+        "Should have all 3000 bounded records, got {}",
+        total_count
+    );
+}
+
+// ============================================================================
 // Scenario 4: Hybrid resume from high savepoint/checkpoint
 // ============================================================================
 
