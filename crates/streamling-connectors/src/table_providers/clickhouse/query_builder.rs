@@ -15,10 +15,14 @@ pub struct ClickHouseQueryBuilder {
     pagination_config: Option<ClickHousePaginationConfig>,
     current_keyset: Option<Vec<ScalarValue>>, // `>=` lower bound on the sorting key
     sort_key_range_upper_bound: Option<ScalarValue>, // Upper bound (exclusive) on first sorting key for sort key range pagination
+    /// Name of the ReplacingMergeTree `is_deleted` flag column, parsed from
+    /// `engine_full`. When `Some`, `_gs_op` is derived from it (so a custom-named
+    /// flag works); when `None` there is no engine-level deletion concept and
+    /// every row is classified 'i'. See `gs_op_field`.
+    is_deleted_column: Option<String>,
 }
 
 impl ClickHouseQueryBuilder {
-    const VIRTUAL_GS_OP_FIELD: &str = "CASE WHEN is_deleted=0 THEN 'i' ELSE 'd' END AS _gs_op";
 
     // Helper function to format ScalarValue for SQL with proper quoting
     fn format_scalar_for_sql(value: &ScalarValue) -> String {
@@ -81,6 +85,7 @@ impl ClickHouseQueryBuilder {
             pagination_config: config,
             current_keyset: None,
             sort_key_range_upper_bound: None,
+            is_deleted_column: None,
         }
     }
 
@@ -93,6 +98,25 @@ impl ClickHouseQueryBuilder {
     pub fn set_sort_key_range_upper_bound(&mut self, value: Option<ScalarValue>) -> &mut Self {
         self.sort_key_range_upper_bound = value;
         self
+    }
+
+    /// Set the ReplacingMergeTree `is_deleted` flag column name (parsed from
+    /// `engine_full`). Drives the virtual `_gs_op` field; see `gs_op_field`.
+    pub fn set_is_deleted_column(&mut self, col: Option<String>) -> &mut Self {
+        self.is_deleted_column = col;
+        self
+    }
+
+    /// The virtual `_gs_op` column: 'i' for a live row, 'd' for a tombstone.
+    /// For a ReplacingMergeTree with an `is_deleted` flag, derive it from that
+    /// flag using the column name parsed from `engine_full` (not a hardcode, so a
+    /// custom-named flag column works). With no `is_deleted` column there is no
+    /// engine-level deletion concept, so every row is classified 'i'.
+    fn gs_op_field(&self) -> String {
+        match &self.is_deleted_column {
+            Some(col) => format!("CASE WHEN {}=0 THEN 'i' ELSE 'd' END AS _gs_op", col),
+            None => "'i' AS _gs_op".to_string(),
+        }
     }
 
     // Rebuild the query with current pagination state
@@ -158,7 +182,7 @@ impl ClickHouseQueryBuilder {
         let final_select = format!(
             "SELECT {},\n{}",
             select_columns.join(",\n"),
-            Self::VIRTUAL_GS_OP_FIELD
+            self.gs_op_field()
         );
 
         // Combine CTE and final SELECT
@@ -402,7 +426,9 @@ mod tests {
     }
 
     #[test]
-    fn test_query_includes_gs_op() {
+    fn test_query_includes_gs_op_default_is_constant_insert() {
+        // No is_deleted column: no engine-level deletion concept, so _gs_op is a
+        // constant 'i' (always present so the output schema contract holds).
         let mut builder = ClickHouseQueryBuilder::of(
             "test_table".to_string(),
             vec!["id".to_string()],
@@ -410,10 +436,23 @@ mod tests {
             None,
         );
         let query = builder.get_query();
-
-        // Should include _gs_op virtual field
         assert!(query.contains("_gs_op"));
-        assert!(query.contains("CASE WHEN is_deleted=0 THEN 'i' ELSE 'd' END AS _gs_op"));
+        assert!(query.contains("'i' AS _gs_op"));
+    }
+
+    #[test]
+    fn test_query_gs_op_from_is_deleted_flag() {
+        // A ReplacingMergeTree is_deleted flag (custom name) drives _gs_op, so a
+        // non-standard flag column works instead of a hardcode.
+        let mut builder = ClickHouseQueryBuilder::of(
+            "test_table".to_string(),
+            vec!["id".to_string()],
+            None,
+            None,
+        );
+        builder.set_is_deleted_column(Some("deleted_flag".to_string()));
+        let query = builder.get_query();
+        assert!(query.contains("CASE WHEN deleted_flag=0 THEN 'i' ELSE 'd' END AS _gs_op"));
     }
 
     #[test]
@@ -424,6 +463,7 @@ mod tests {
             None,
             None,
         );
+        builder.set_is_deleted_column(Some("is_deleted".to_string()));
         let query = builder.get_query();
 
         // Should include id and name columns
