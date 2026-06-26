@@ -49,8 +49,8 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 | `BETWEEN` / `IN` (column/self operands) | ✅ desugars to intercepted `>=`/`<=`/`=` | ✅ `edge_sql_runnable` | works without literals (numeric order, incl. negatives) |
 | `BETWEEN` / `IN` (integer literal bound) | ❌ **F1** | tripwire `edge_sql_runnable` | literal coercion gap |
 | `IS [NOT] NULL` | ✅ | ✅ `edge_sql_runnable` | |
-| `GROUP BY` | ⚠️ likely works (canonical-byte equality) | ❌ untested | |
-| `DISTINCT` | ⚠️ likely works | ❌ untested | |
+| `GROUP BY` | ✅ groups by canonical bytes | ✅ unit (`session::tests::group_by_decimal_arb_groups_numerically_equal_values`) | verified: `5`/`5.0`/`05` collapse, `±0` same group |
+| `DISTINCT` | ✅ dedupes by canonical bytes | ✅ unit (`session::tests::distinct_decimal_arb_dedupes_numerically_equal_values`) | numerically-equal values dedupe |
 | `JOIN` on decimal_arb | n/a | n/a | streamling streaming transforms don't run JOINs |
 | Window functions | n/a | n/a | not runnable in streaming transforms |
 | `round/ceil/floor/trunc/sqrt/power/ln/log/exp/sign/...` | ❌ **no decimal_arb impl** | ❌ | see §3 |
@@ -91,9 +91,10 @@ overflow), **F7** (nested decimal_arb → Avro encode fails). **F6** (nested dec
 JSON hex) is **fixed** (recursive metadata rewrite in `json.rs`).
 
 **Coverage still thin** (lower priority): aggregates (SUM/MIN/MAX/AVG) are unit-only;
-ClickHouse-source string→decimal_arb path is unit-only; GROUP BY / DISTINCT
-unverified. (Postgres source / MySQL sink / SQS sink / JSON-source-decimal / file
-source do **not** exist or do not yield decimal_arb — not gaps.)
+ClickHouse-source string→decimal_arb path is unit-only. (GROUP BY / DISTINCT are now
+verified correct — numerically-equal values group/dedupe via canonical bytes.
+Postgres source / MySQL sink / SQS sink / JSON-source-decimal / file source do **not**
+exist or do not yield decimal_arb — not gaps.)
 
 ## Out of scope here: the `streamling-goldsky-plugins` repo
 
