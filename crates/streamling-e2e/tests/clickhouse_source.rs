@@ -375,6 +375,129 @@ sinks:
     );
 }
 
+/// Count-first pagination: a sort-key span whose *average* density fits a page
+/// but contains a DENSE cluster (several rows per key) must be sized from the
+/// exact per-range count BEFORE the data read, not from the span average. The
+/// up-front probe sizes the initial width from whole-span density and would
+/// otherwise walk a wide range straight into the cluster, materialising more
+/// than `page_size` rows before the reactive overflow could shrink it. With
+/// count-first sizing each range is probed and shrunk to fit first; this test
+/// verifies the orchestration (probe, shrink, re-probe, converge) delivers
+/// every row through a real dense cluster without loss or stall.
+#[tokio::test]
+async fn test_clickhouse_source_count_first_shrinks_dense_cluster() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE count_first_cluster_test (
+                block_number UInt64,
+                id UInt64,
+                data String,
+                is_deleted UInt8
+            ) ENGINE = MergeTree() ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create table");
+
+    // Sparse [0,40): one row per key. Dense cluster [40,50): five rows per key
+    // (fanout 5, kept under page_size so no single key hits the unsplittable
+    // floor). Sparse [50,90): one row per key. Total = 40 + 50 + 40 = 130.
+    let mut values: Vec<String> = Vec::new();
+    for i in 0..40u64 {
+        values.push(format!("({}, {}, 'sparse_{}', 0)", i, i, i));
+    }
+    for blk in 40..50u64 {
+        for j in 0..5u64 {
+            let id = blk * 10 + j;
+            values.push(format!("({}, {}, 'dense_{}', 0)", blk, id, id));
+        }
+    }
+    for i in 50..90u64 {
+        values.push(format!("({}, {}, 'sparse_{}', 0)", i, i, i));
+    }
+    let total_records = values.len() as i64;
+
+    for chunk in values.chunks(200) {
+        let insert_query = format!(
+            "INSERT INTO count_first_cluster_test (block_number, id, data, is_deleted) VALUES {}",
+            chunk.join(", ")
+        );
+        clickhouse
+            .execute(&insert_query)
+            .await
+            .expect("Failed to insert data");
+    }
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: count_first_cluster_test
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: count_first_cluster_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    // page_size 30 < the cluster's 50 rows across [40,50), so any multi-key range
+    // overlapping the cluster overflows by rows and must be shrunk from its exact
+    // count before reading.
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "50")
+                .record_limit(total_records as u64)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.count_first_cluster_results")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(
+        count, total_records,
+        "every row, including the dense cluster, must be delivered after count-first sizing"
+    );
+
+    // The cluster [40,50) carries 50 rows across 10 keys; confirming all 50
+    // arrived proves the count-first loop shrank each overlapping range to fit
+    // rather than skipping the overflow.
+    let cluster_rows = ctx
+        .postgres
+        .count(
+            "SELECT COUNT(*) FROM public.count_first_cluster_results \
+             WHERE block_number >= 40 AND block_number < 50",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster_rows, 50,
+        "dense cluster [40,50) must deliver all 50 rows (5 per key x 10 keys)"
+    );
+}
+
 // ============================================================================
 // Scenario 4: Checkpoint flow across sparse sort key ranges
 // ============================================================================

@@ -241,6 +241,30 @@ impl RangeController {
         self.width = (candidate as i128).clamp(Self::MIN_WIDTH, self.max_width);
     }
 
+    /// Count-first sizing: shrink the current range's width so it holds ≤ ~`page_size`
+    /// rows, given an exact `count` for the range the cursor currently covers. Called
+    /// BEFORE the data read so a clustered high-fanout region is shrunk to fit without
+    /// first materialising an oversized page — the up-front span-average density that
+    /// sized `initial_width` misses dense clusters, which is the OOM path.
+    ///
+    /// Row-based only (no bytes are known before the read); the reactive byte
+    /// tripwire remains the backstop for variable-width columns. Does NOT advance the
+    /// cursor — the caller re-probes the shrunk range until it fits or
+    /// [`at_min_width`] is reached. Returns `true` when `count` already fits
+    /// (`count <= page_size`), `false` after shrinking (caller should re-probe).
+    pub fn shrink_to_fit_count(&mut self, count: u64) -> bool {
+        if count <= self.page_size {
+            return true;
+        }
+        // Mirror on_overflow_probed's row sizing: target ROW_TARGET_RATIO of
+        // page_size so a range whose density sits right at the boundary doesn't
+        // re-overflow on the immediately following read.
+        let candidate =
+            self.width as f64 * (Self::ROW_TARGET_RATIO * self.page_size as f64 / count as f64);
+        self.width = (candidate as i128).clamp(Self::MIN_WIDTH, self.max_width);
+        false
+    }
+
     /// A page timed out. Shrinks width and re-reads the SAME range. Does NOT advance
     /// the cursor, so no rows are skipped.
     pub fn on_timeout(&mut self) {
@@ -346,6 +370,52 @@ mod tests {
             "shrink floors at 1 so the cursor always advances"
         );
         assert!(c.at_min_width(), "width 1 is the minimum");
+    }
+
+    #[test]
+    fn shrink_to_fit_count_is_noop_when_already_fits() {
+        let mut c = controller(); // page_size 1000, width 1000
+        assert!(c.shrink_to_fit_count(800), "a range that fits reports true");
+        assert_eq!(c.width(), 1000, "a fitting range is not shrunk");
+    }
+
+    #[test]
+    fn shrink_to_fit_count_sizes_from_exact_density() {
+        // width 1000 holds 4000 rows (4x page_size). Targeting 0.9*page_size rows
+        // lands at width 1000 * (900 / 4000) = 225.
+        let mut c = controller();
+        assert!(
+            !c.shrink_to_fit_count(4000),
+            "a shrunk range reports false so the caller re-probes"
+        );
+        assert_eq!(c.width(), 225);
+    }
+
+    #[test]
+    fn shrink_to_fit_count_floors_at_min_width() {
+        // A single key dwarfing page_size can't shrink below MIN_WIDTH (1).
+        let mut c = RangeController::new(
+            1000,
+            u64::MAX,
+            0,
+            1_000_000,
+            100,
+            1_000_000,
+            Duration::from_secs(30),
+        );
+        assert!(!c.shrink_to_fit_count(u64::MAX));
+        assert_eq!(c.width(), 1);
+        assert!(c.at_min_width());
+    }
+
+    #[test]
+    fn shrink_to_fit_count_does_not_advance_cursor() {
+        let mut c = controller(); // cursor 0
+        c.shrink_to_fit_count(4000);
+        assert_eq!(c.range_start(), 0, "sizing never advances the cursor");
+        let (start, upper) = c.current_range();
+        assert_eq!(start, 0);
+        assert_eq!(upper, 225, "upper bound reflects the shrunk width");
     }
 
     #[test]

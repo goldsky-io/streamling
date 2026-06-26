@@ -1501,6 +1501,47 @@ impl ExecutionPlan for ClickHouseSourceExec {
 
             while !controller.is_done() {
                 page_count += 1;
+                // Count-first sizing: probe the exact row count for the range the
+                // cursor covers and shrink the width to fit BEFORE the data read.
+                // The up-front span-average density that sized `initial_width`
+                // misses clustered high-fanout regions — a dense cluster inside a
+                // sparse span would otherwise be read at the span-average width and
+                // materialise `page_size + 1` rows (the OOM) before the reactive
+                // overflow could shrink it. Each iteration shrinks from the exact
+                // count; the cursor never moves during sizing (only `on_complete`
+                // advances it), so range_start is fixed and only the upper bound
+                // shrinks. A probe failure is non-fatal — fall through and let the
+                // reactive overflow below handle it.
+                loop {
+                    let (probe_lo, probe_hi) = controller.current_range();
+                    if controller.at_min_width() {
+                        break;
+                    }
+                    match client
+                        .fetch_count(
+                            &table_name_for_exec,
+                            where_clause_for_exec.as_deref(),
+                            Some(probe_lo),
+                            Some(probe_hi),
+                            &first_sorting_key_name,
+                        )
+                        .await
+                    {
+                        Ok(count) if count > page_size as u64 => {
+                            controller.shrink_to_fit_count(count);
+                            continue;
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            warn!(
+                                "[{}] count-first probe on range [{}, {}) failed ({}); \
+                                 reading at current width and letting the reactive overflow handle it",
+                                reference_name, probe_lo, probe_hi, e
+                            );
+                            break;
+                        }
+                    }
+                }
                 let (range_start, upper_bound) = controller.current_range();
                 query_builder
                     .set_sort_key_range_upper_bound(Some(i128_to_scalar_like(upper_bound, &template)));
