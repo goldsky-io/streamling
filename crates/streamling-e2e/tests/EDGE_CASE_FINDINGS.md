@@ -105,16 +105,20 @@ decimal_arb serializes as its decimal value across print, webhook, and any JSON/
 output. (Decode of nested decimal_arb from a JSON *source* is a separate, still-unhandled path —
 the recursive rewrite is currently output-only.)
 
-### F7 — Nested decimal_arb fails the Kafka Avro sink
-**Test:** `edge_complex_decimal::nested_struct_decimal_arb_kafka_avro_sink_fails_f7` (pinned).
-**Symptom:** the avro schema builder (`to_avro`) emits **nested** decimal_arb fields as
-plain `Bytes` (only top-level fields get the `decimal` logicalType), so the writer's
-`Value::Decimal` fails to encode — `apache_avro`: *"Unsupported value-schema combination:
-Decimal vs Bytes"* — and the sink errors. Top-level decimal_arb → avro is correct.
-(F6 + F7 together: **nested/complex decimal_arb is unsupported at every sink except,
-at the byte level, ClickHouse/Postgres which have no nested column type anyway**;
-only the Avro/JSON *top-level* path works. The Avro *decode* of nested decimals →
-decimal_arb is correct, per C1 — it's the re-serialization that's missing.)
+### F7 — Nested decimal at the Kafka Avro sink — **FIXED**
+**Test:** `edge_complex_decimal::nested_struct_decimal_arb_kafka_avro_sink_round_trip`
+(full round-trip: nested decimal_arb → avro sink → re-read → print JSON shows the value),
+plus unit `formats::avro::writer::tests::nested_struct_decimal_keeps_logical_type_in_schema`.
+**Was:** `apache_avro`: *"Unsupported value-schema combination: Decimal vs Bytes"* — the
+avro schema builder emitted **nested** decimals as plain `Bytes`, so the writer's
+`Value::Decimal` failed to encode.
+**Root cause:** `arrow_to_avro`'s `Struct` branch built the nested record schema via
+`Schema::canonical_form()`, and Avro's Parsing Canonical Form **strips `logicalType`** —
+demoting every nested decimal (decimal_arb *and* standard Decimal128/256) to `bytes`.
+**Fix:** the struct path now assembles the nested record JSON directly
+(`record_schema_json`), preserving nested logicalType. Nested decimals now encode at the
+Avro sink. (Combined with the F6 fix, nested/complex decimal_arb is now supported at both
+the JSON and Avro output boundaries; ClickHouse/Postgres still have no nested column type.)
 
 ## Status of the suite
 

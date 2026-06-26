@@ -45,18 +45,27 @@ impl SerializeTarget for Vec<Value> {
     }
 }
 
-/// Computes an avro schema from an arrow schema
-pub fn to_avro(name: &str, fields: &Fields) -> Schema {
-    let fields: Vec<_> = fields.iter().map(|f| field_to_avro(name, f)).collect();
-
-    let schema = json!({
+/// Build the Avro record-schema JSON for a struct's `fields`, preserving nested
+/// `logicalType` attributes (decimal, date, timestamp, …).
+///
+/// This must be assembled as JSON directly: Avro's Parsing Canonical Form
+/// (`Schema::canonical_form`) *strips* `logicalType`, so round-tripping a nested
+/// struct schema through it silently demotes nested decimals to plain `bytes`
+/// (the F7 cause — the value encoder then emits `Decimal` against a `Bytes`
+/// schema and fails).
+fn record_schema_json(name: &str, fields: &Fields) -> serde_json::value::Value {
+    let avro_fields: Vec<_> = fields.iter().map(|f| field_to_avro(name, f)).collect();
+    json!({
         "type": "record",
         "name": name,
-        "fields": fields,
-    });
+        "fields": avro_fields,
+    })
+}
 
+/// Computes an avro schema from an arrow schema
+pub fn to_avro(name: &str, fields: &Fields) -> Schema {
     // TODO: make it a Result
-    Schema::parse_str(&schema.to_string()).unwrap()
+    Schema::parse_str(&record_schema_json(name, fields).to_string()).unwrap()
 }
 
 fn field_to_avro(name: &str, field: &Field) -> serde_json::value::Value {
@@ -135,8 +144,10 @@ fn arrow_to_avro(name: &str, dt: &DataType) -> serde_json::value::Value {
             });
         }
         DataType::Struct(fields) => {
-            let schema = to_avro(name, fields).canonical_form();
-            return serde_json::from_str(&schema).unwrap();
+            // Build the nested record JSON directly — NOT via canonical_form,
+            // which strips nested logicalType (decimal/date/timestamp) and breaks
+            // nested decimal encoding (F7).
+            return record_schema_json(name, fields);
         }
         DataType::Union(_, _) => unimplemented!("unions are not supported"),
         DataType::Dictionary(_, _) => unimplemented!("dictionaries are not supported"),
@@ -574,6 +585,35 @@ mod tests {
         Int64Builder, ListBuilder, StringBuilder, StructBuilder,
     };
     use std::sync::Arc;
+
+    /// A decimal nested inside a struct must keep its `decimal` logicalType in the
+    /// generated Avro schema. Regression guard for F7: the struct path used
+    /// `Schema::canonical_form()`, which strips logicalType and demoted nested
+    /// decimals to plain `bytes` (the value encoder then emitted `Decimal` against
+    /// a `Bytes` schema and failed). Covers both decimal_arb and standard Decimal128.
+    #[test]
+    fn nested_struct_decimal_keeps_logical_type_in_schema() {
+        use crate::types::decimal_arb::DecimalArbType;
+
+        let inner = vec![
+            DecimalArbType::field("amt", 20, 0, false).unwrap(),
+            Field::new("d128", DataType::Decimal128(10, 2), false),
+        ];
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("inner", DataType::Struct(inner.into()), false),
+        ]);
+
+        let avro = to_avro("R", &arrow_schema.fields);
+        let json = serde_json::to_string(&avro).unwrap();
+
+        // Both nested decimals must surface their decimal logicalType, not bytes.
+        let decimal_count = json.matches("\"logicalType\":\"decimal\"").count();
+        assert_eq!(
+            decimal_count, 2,
+            "both nested decimals must keep decimal logicalType; schema was: {json}"
+        );
+    }
 
     #[test]
     fn test_writing() {
