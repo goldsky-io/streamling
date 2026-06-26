@@ -5,8 +5,11 @@ use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalA
 use arrow_json::reader::Decoder;
 use arrow_json::writer::JsonFormat;
 use arrow_json::{ReaderBuilder, WriterBuilder};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::array::{Array, ArrayRef, LargeBinaryArray, StringArray};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, LargeBinaryArray, LargeListArray, ListArray, MapArray,
+    StringArray, StructArray,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
@@ -29,68 +32,30 @@ impl FromArrowToJsonConverter {
     }
 
     fn to_json(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
-        // If the schema contains U256 or decimal_arb extension fields, convert
-        // those columns to Utf8 (decimal strings) so the standard arrow-json
-        // writer can serialize them as JSON strings.
+        // If the schema carries any decimal_arb extension field — at the top
+        // level OR nested inside a Struct / List / Map — rewrite those leaves to
+        // Utf8 (canonical decimal text) so the standard arrow-json writer emits
+        // the value, not the raw canonical bytes as hex. (Top-level-only handling
+        // was the cause of F6: nested decimal_arb serialized as hex.)
         let needs_transform = batch
             .schema()
             .fields()
             .iter()
-            .any(|f| DecimalArbType::is_decimal_arb_field(f));
+            .any(|f| field_contains_decimal_arb(f));
 
-        let transformed_batch =
-            if needs_transform {
-                let mut new_fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
-                let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-
-                for (idx, field) in batch.schema().fields().iter().enumerate() {
-                    if DecimalArbType::is_decimal_arb_field(field) {
-                        // Convert decimal_arb LargeBinary -> Utf8 with canonical decimal text.
-                        let (_, scale) = DecimalArbType::precision_scale_from_field(field)
-                            .ok_or_else(|| {
-                                DataFusionError::from(streamling_err!(
-                                    "decimal_arb field '{}' missing precision/scale metadata",
-                                    field.name(),
-                                ))
-                            })?;
-                        let col = batch.column(idx);
-                        let lba =
-                        col.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| {
-                            DataFusionError::from(streamling_err!(
-                                "expected LargeBinaryArray for decimal_arb field '{}', got {:?}",
-                                field.name(),
-                                col.data_type(),
-                            ))
-                        })?;
-                        let mut string_values: Vec<Option<String>> = Vec::with_capacity(lba.len());
-                        for row_idx in 0..lba.len() {
-                            if lba.is_null(row_idx) {
-                                string_values.push(None);
-                            } else {
-                                let value = DecimalArbValue::from_canonical_bytes_at_scale(
-                                    lba.value(row_idx),
-                                    scale,
-                                )?;
-                                string_values.push(Some(value.to_canonical_string()));
-                            }
-                        }
-                        new_columns.push(Arc::new(StringArray::from(string_values)) as ArrayRef);
-                        new_fields.push(Field::new(
-                            field.name(),
-                            DataType::Utf8,
-                            field.is_nullable(),
-                        ));
-                    } else {
-                        new_columns.push(batch.column(idx).clone());
-                        new_fields.push(field.as_ref().clone());
-                    }
-                }
-
-                let new_schema = Arc::new(Schema::new(new_fields));
-                RecordBatch::try_new(new_schema, new_columns)?
-            } else {
-                batch.clone()
-            };
+        let transformed_batch = if needs_transform {
+            let mut new_fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
+            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+            for (idx, field) in batch.schema().fields().iter().enumerate() {
+                let (nf, na) = decimalize_for_json(field, batch.column(idx))?;
+                new_fields.push(nf);
+                new_columns.push(na);
+            }
+            let new_schema = Arc::new(Schema::new(new_fields));
+            RecordBatch::try_new(new_schema, new_columns)?
+        } else {
+            batch.clone()
+        };
 
         let buf = Vec::new();
         let mut writer = WriterBuilder::new()
@@ -107,6 +72,179 @@ impl FromArrowToJsonConverter {
 impl Default for FromArrowToJsonConverter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns `true` if `field` is `decimal_arb`, or contains a `decimal_arb`
+/// leaf nested anywhere inside a Struct / List / LargeList / FixedSizeList /
+/// Map. Used to decide whether a batch needs the decimal_arb → Utf8 rewrite
+/// before JSON serialization.
+fn field_contains_decimal_arb(field: &Field) -> bool {
+    if DecimalArbType::is_decimal_arb_field(field) {
+        return true;
+    }
+    match field.data_type() {
+        DataType::Struct(children) => children.iter().any(|f| field_contains_decimal_arb(f)),
+        DataType::List(c)
+        | DataType::LargeList(c)
+        | DataType::FixedSizeList(c, _)
+        | DataType::Map(c, _) => field_contains_decimal_arb(c),
+        _ => false,
+    }
+}
+
+/// Rebuild `orig` with a new `DataType`, preserving its name, nullability, and
+/// metadata.
+fn field_with_type(orig: &Field, data_type: DataType) -> Field {
+    Field::new(orig.name(), data_type, orig.is_nullable()).with_metadata(orig.metadata().clone())
+}
+
+/// Convert a `decimal_arb` `LargeBinaryArray` to a `StringArray` of canonical
+/// decimal text (nulls preserved), reading the scale from the field metadata.
+fn decimal_arb_to_strings(field: &Field, array: &ArrayRef) -> Result<StringArray> {
+    let (_, scale) = DecimalArbType::precision_scale_from_field(field).ok_or_else(|| {
+        DataFusionError::from(streamling_err!(
+            "decimal_arb field '{}' missing precision/scale metadata",
+            field.name(),
+        ))
+    })?;
+    let lba = array
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            DataFusionError::from(streamling_err!(
+                "expected LargeBinaryArray for decimal_arb field '{}', got {:?}",
+                field.name(),
+                array.data_type(),
+            ))
+        })?;
+    let mut values: Vec<Option<String>> = Vec::with_capacity(lba.len());
+    for row_idx in 0..lba.len() {
+        if lba.is_null(row_idx) {
+            values.push(None);
+        } else {
+            let value = DecimalArbValue::from_canonical_bytes_at_scale(lba.value(row_idx), scale)?;
+            values.push(Some(value.to_canonical_string()));
+        }
+    }
+    Ok(StringArray::from(values))
+}
+
+/// Recursively rewrite `(field, array)` so every `decimal_arb` leaf — top-level
+/// or nested inside Struct / List / LargeList / FixedSizeList / Map — becomes a
+/// Utf8 canonical-decimal string for JSON output. Non-decimal_arb leaves and
+/// containers without any decimal_arb descendant are returned unchanged.
+fn decimalize_for_json(field: &Field, array: &ArrayRef) -> Result<(Field, ArrayRef)> {
+    if DecimalArbType::is_decimal_arb_field(field) {
+        let strings = decimal_arb_to_strings(field, array)?;
+        return Ok((
+            Field::new(field.name(), DataType::Utf8, field.is_nullable()),
+            Arc::new(strings) as ArrayRef,
+        ));
+    }
+
+    // Containers with no decimal_arb descendant pass through untouched.
+    if !field_contains_decimal_arb(field) {
+        return Ok((field.clone(), array.clone()));
+    }
+
+    let downcast_err = |what: &str| {
+        DataFusionError::from(streamling_err!(
+            "expected {} for field '{}', got {:?}",
+            what,
+            field.name(),
+            array.data_type(),
+        ))
+    };
+
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let sa = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| downcast_err("StructArray"))?;
+            let mut new_fields: Vec<Arc<Field>> = Vec::with_capacity(children.len());
+            let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(children.len());
+            for (child, col) in children.iter().zip(sa.columns()) {
+                let (nf, na) = decimalize_for_json(child, col)?;
+                new_fields.push(Arc::new(nf));
+                new_cols.push(na);
+            }
+            let fields: Fields = new_fields.into();
+            let new_arr = StructArray::new(fields.clone(), new_cols, sa.nulls().cloned());
+            Ok((
+                field_with_type(field, DataType::Struct(fields)),
+                Arc::new(new_arr) as ArrayRef,
+            ))
+        }
+        DataType::List(child) => {
+            let la = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| downcast_err("ListArray"))?;
+            let (nf, nv) = decimalize_for_json(child, la.values())?;
+            let nf = Arc::new(nf);
+            let new_arr = ListArray::new(nf.clone(), la.offsets().clone(), nv, la.nulls().cloned());
+            Ok((
+                field_with_type(field, DataType::List(nf)),
+                Arc::new(new_arr) as ArrayRef,
+            ))
+        }
+        DataType::LargeList(child) => {
+            let la = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| downcast_err("LargeListArray"))?;
+            let (nf, nv) = decimalize_for_json(child, la.values())?;
+            let nf = Arc::new(nf);
+            let new_arr =
+                LargeListArray::new(nf.clone(), la.offsets().clone(), nv, la.nulls().cloned());
+            Ok((
+                field_with_type(field, DataType::LargeList(nf)),
+                Arc::new(new_arr) as ArrayRef,
+            ))
+        }
+        DataType::FixedSizeList(child, n) => {
+            let fa = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| downcast_err("FixedSizeListArray"))?;
+            let (nf, nv) = decimalize_for_json(child, fa.values())?;
+            let nf = Arc::new(nf);
+            let new_arr = FixedSizeListArray::new(nf.clone(), *n, nv, fa.nulls().cloned());
+            Ok((
+                field_with_type(field, DataType::FixedSizeList(nf, *n)),
+                Arc::new(new_arr) as ArrayRef,
+            ))
+        }
+        DataType::Map(entry_field, sorted) => {
+            let ma = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| downcast_err("MapArray"))?;
+            let entries: ArrayRef = Arc::new(ma.entries().clone());
+            let (nef, nea) = decimalize_for_json(entry_field, &entries)?;
+            let nef = Arc::new(nef);
+            let new_entries = nea
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| downcast_err("StructArray (map entries)"))?
+                .clone();
+            let new_arr = MapArray::new(
+                nef.clone(),
+                ma.offsets().clone(),
+                new_entries,
+                ma.nulls().cloned(),
+                *sorted,
+            );
+            Ok((
+                field_with_type(field, DataType::Map(nef, *sorted)),
+                Arc::new(new_arr) as ArrayRef,
+            ))
+        }
+        // Unreachable: field_contains_decimal_arb was true but the type is not
+        // a known container — return unchanged rather than erroring.
+        _ => Ok((field.clone(), array.clone())),
     }
 }
 
@@ -573,6 +711,94 @@ mod tests {
         );
         let row1 = String::from_utf8(serialized[1].clone()).unwrap();
         assert!(row1.contains(r#""amount":null"#));
+    }
+
+    // ------- nested decimal_arb JSON serialization (F6) -------
+
+    /// A `decimal_arb` nested inside a struct must serialize as its decimal
+    /// value, not the raw canonical bytes as hex (F6 regression guard).
+    #[test]
+    fn nested_struct_decimal_arb_serializes_value_not_hex() {
+        let big = "123456789012345678901234567890"; // 30 digits, > 2^64
+        let amt_field = DecimalArbType::field("amt", 100, 0, false).unwrap();
+        let mut b = DecimalArbArrayBuilder::with_capacity(1, "amt", 100, 0).unwrap();
+        b.append_str(big).unwrap();
+        let (amt_raw, _, _) = b.finish().into_inner();
+
+        let inner_fields = Fields::from(vec![Arc::new(amt_field)]);
+        let inner = StructArray::new(
+            inner_fields.clone(),
+            vec![Arc::new(amt_raw) as ArrayRef],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("inner", DataType::Struct(inner_fields), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(inner) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap();
+        let json = String::from_utf8(rows[0].clone()).unwrap();
+        assert_eq!(json, format!(r#"{{"id":1,"inner":{{"amt":"{big}"}}}}"#));
+    }
+
+    /// An array of records each carrying a `decimal_arb` (the blockchain
+    /// "transfers"/"traces" shape) must serialize each element's value, not hex.
+    #[test]
+    fn array_of_struct_decimal_arb_serializes_values_not_hex() {
+        use datafusion::arrow::buffer::OffsetBuffer;
+
+        let amt_field = DecimalArbType::field("amt", 100, 0, false).unwrap();
+        let mut b = DecimalArbArrayBuilder::with_capacity(2, "amt", 100, 0).unwrap();
+        b.append_str("123456789012345678901234567890").unwrap();
+        b.append_str("7").unwrap();
+        let (amt_raw, _, _) = b.finish().into_inner();
+
+        let item_fields = Fields::from(vec![Arc::new(amt_field)]);
+        let items_struct = StructArray::new(
+            item_fields.clone(),
+            vec![Arc::new(amt_raw) as ArrayRef],
+            None,
+        );
+        let item_field = Arc::new(Field::new("item", DataType::Struct(item_fields), false));
+        // Single row whose list holds both structs.
+        let offsets = OffsetBuffer::new(vec![0, 2].into());
+        let list = ListArray::new(
+            item_field.clone(),
+            offsets,
+            Arc::new(items_struct) as ArrayRef,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("items", DataType::List(item_field), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(list) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap();
+        let json = String::from_utf8(rows[0].clone()).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":1,"items":[{"amt":"123456789012345678901234567890"},{"amt":"7"}]}"#
+        );
     }
 
     #[test]
