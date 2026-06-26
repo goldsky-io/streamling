@@ -113,6 +113,19 @@ fn decode_value(
     )?))
 }
 
+/// Result length for a binary op given two (possibly broadcast) operand
+/// lengths. A length-1 operand is a scalar that broadcasts to the *other*
+/// operand's length. Critically this yields 0 for an empty batch even when the
+/// other operand is a broadcast scalar — `max(0, 1)` would wrongly give 1 and
+/// then read `value(0)` out of an empty column (the F1 empty-batch panic).
+fn broadcast_len(left: usize, right: usize) -> usize {
+    match (left, right) {
+        (1, n) => n,
+        (n, 1) => n,
+        (a, b) => a.max(b),
+    }
+}
+
 /// Build the output `Field` for a unary or binary `decimal_arb` op.
 fn build_output_field(name: &str, precision: u32, scale: u32) -> Result<FieldRef> {
     let field = DecimalArbType::field(name, precision, scale, true)?;
@@ -145,7 +158,7 @@ where
     let left = downcast_decimal_arb_array(&args.args[0], op_name, "left")?;
     let right = downcast_decimal_arb_array(&args.args[1], op_name, "right")?;
 
-    let len = left.len().max(right.len());
+    let len = broadcast_len(left.len(), right.len());
     let column = args.return_field.name();
     let mut builder = DecimalArbArrayBuilder::with_capacity(len, column, p_out, s_out)?;
     for i in 0..len {
@@ -445,7 +458,7 @@ where
 
     let left = downcast_decimal_arb_array(&args.args[0], op_name, "left")?;
     let right = downcast_decimal_arb_array(&args.args[1], op_name, "right")?;
-    let len = left.len().max(right.len());
+    let len = broadcast_len(left.len(), right.len());
 
     let mut builder = BooleanBuilder::with_capacity(len);
     for i in 0..len {
@@ -1575,6 +1588,67 @@ mod tests {
                 nullable,
                 "decimal_arb_to_decimal128 must mirror input nullability"
             );
+        }
+    }
+
+    #[test]
+    fn broadcast_len_handles_empty_and_scalar() {
+        // The empty-batch + broadcast-scalar case that caused the F1 panic:
+        // an empty column (0) against a length-1 scalar must yield 0, NOT 1.
+        assert_eq!(broadcast_len(0, 1), 0);
+        assert_eq!(broadcast_len(1, 0), 0);
+        // Normal broadcast: a length-1 scalar broadcasts to the array length.
+        assert_eq!(broadcast_len(3, 1), 3);
+        assert_eq!(broadcast_len(1, 3), 3);
+        // Equal-length arrays and scalar-scalar.
+        assert_eq!(broadcast_len(5, 5), 5);
+        assert_eq!(broadcast_len(1, 1), 1);
+        assert_eq!(broadcast_len(0, 0), 0);
+    }
+
+    #[test]
+    fn binary_op_on_empty_column_with_scalar_operand_is_empty_not_panic() {
+        // Regression for F1: `amount <op> <literal>` on an empty batch. The
+        // literal coerces to a length-1 decimal_arb scalar; the column is empty.
+        // Must produce an empty result, not panic reading column.value(0).
+        let empty = build_array(30, 4, &[]);
+        let scalar = build_array(20, 0, &[Some("10")]);
+        let (out, _, _) = invoke_binary_op(
+            &DecimalArbAddFunc::new(),
+            (empty, 30, 4, "a"),
+            (scalar, 20, 0, "lit"),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 0, "empty column + scalar literal must be empty");
+
+        // And the comparison path (the `WHERE amount > 0` shape).
+        let empty = build_array(30, 4, &[]);
+        let scalar = build_array(20, 0, &[Some("0")]);
+        let gt = DecimalArbGtFunc::new();
+        let lhs_field = Arc::new(DecimalArbType::field("a", 30, 4, true).unwrap());
+        let rhs_field = Arc::new(DecimalArbType::field("lit", 20, 0, true).unwrap());
+        let arg_fields = vec![lhs_field, rhs_field];
+        let return_field = gt
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &arg_fields,
+                scalar_arguments: &[None, None],
+            })
+            .unwrap();
+        let out = gt
+            .invoke_with_args(ScalarFunctionArgs {
+                args: vec![
+                    ColumnarValue::Array(Arc::new(empty)),
+                    ColumnarValue::Array(Arc::new(scalar)),
+                ],
+                arg_fields,
+                number_rows: 0,
+                return_field,
+                config_options: Arc::new(::datafusion::config::ConfigOptions::default()),
+            })
+            .unwrap();
+        match out {
+            ColumnarValue::Array(a) => assert_eq!(a.len(), 0, "empty > scalar must be empty"),
+            _ => panic!("expected array"),
         }
     }
 

@@ -34,18 +34,35 @@ error attribution unreliable.)
 
 ## Confirmed findings (real issues these tests surfaced)
 
-### F1 — `decimal_arb` mixed with an integer literal fails type coercion
-**Tests:** `edge_decimal_sql::sql_add_integer_literal_coercion`, `sql_mod_literal`, `sql_filter_positive_only`.
-**Symptom:** `amount + 1`, `amount % 10`, and `WHERE amount > 0` fail at planning:
-`Error during planning: Cannot infer common argument type for comparison operation LargeBinary > Int64`.
-**Root cause:** the `decimal_arb` `ExprPlanner` (`decimal_arb_coercion.rs`) rewrites
-binary ops only when **both** operands are `decimal_arb`. A `decimal_arb` operand
-against a plain integer/float literal is left to DataFusion, which cannot coerce
-`LargeBinary` vs `Int64`. Any arithmetic/comparison/filter mixing a `decimal_arb`
-column with a numeric literal therefore fails.
-**Suggested fix:** extend the `ExprPlanner` to coerce a numeric literal (or other
-numeric operand) to `decimal_arb` when the other side is `decimal_arb` (insert a
-`to_decimal_arb_from_*` cast), for arithmetic **and** comparison operators.
+### F1 — `decimal_arb` mixed with an integer literal failed type coercion — **FIXED**
+**Tests:** `edge_decimal_sql::{sql_add_integer_literal_coercion, sql_mod_literal, sql_filter_positive_only}`,
+`edge_sql_runnable::between_int_literals` (now assert correct results), plus unit tests
+`functions::decimal_arb_coercion::tests::{decimal_arb_plus_integer_literal_dispatches, decimal_arb_filter_with_integer_literal_works, mixed_decimal_arb_plus_int64_column_dispatches, decimal_arb_plus_float_still_rejected}`.
+**Was:** `amount + 1`, `amount % 10`, `WHERE amount > 0`, `BETWEEN 0 AND 100` failed at
+planning: `Cannot infer common argument type … LargeBinary > Int64`. The `ExprPlanner`
+rewrote binary ops only when **both** operands were `decimal_arb`; a `decimal_arb` vs an
+integer was left to DataFusion, which can't coerce `LargeBinary` vs `Int64`.
+**Fix:** the `ExprPlanner` (`decimal_arb_coercion.rs`) now coerces an integer operand
+(column or literal) to `decimal_arb` at scale 0 via `to_decimal_arb_from_int` (precision
+20, covering any 64-bit int) for both arithmetic and comparison operators. Floats remain
+rejected (lossy — explicit cast required); a bare `1.5` literal is `Decimal128` in
+DataFusion and coerces fine, but a genuine `Float64` still errors. Fixing this also
+surfaced and fixed a **latent empty-batch panic**: the binary/comparison ops computed
+result length as `max(left.len(), right.len())`, so an empty column (0 rows) against a
+broadcast scalar (len 1) gave length 1 and read `column.value(0)` out of bounds —
+replaced with proper broadcast semantics (`broadcast_len`).
+
+### F1b — `BETWEEN` / `IN` with literal bounds over `decimal_arb` — still open
+**Test:** `edge_sql_runnable::between_int_literals_f1b` (pinned tripwire).
+**Symptom:** `amount BETWEEN 0 AND 100` (and `amount IN (…)` with literals) fails to plan
+/ lands nothing. **Distinct from F1**: `BETWEEN` is an `Expr::Between` and `IN` an
+`Expr::InList` — not `BinaryExpr` — so the decimal_arb `ExprPlanner::plan_binary_op` hook
+never intercepts them, and DataFusion's native coercion can't reconcile `LargeBinary` vs
+the `Int64` bounds. (`x BETWEEN x AND x` over decimal_arb works only because it needs no
+coercion — byte comparison of equal operands.)
+**Suggested fix:** an `AnalyzerRule` that rewrites a decimal_arb `Between`/`InList` into the
+decimal_arb comparison UDFs (`>=`/`<=`/`=` chains), or expands them to binary ops before
+the ExprPlanner runs.
 
 ### F2 — `CASE` over `decimal_arb` drops the extension metadata → sink fails/hangs
 **Tests:** `edge_decimal_sql::sql_case_passthrough_metadata_tripwire`, `sql_nested_case`.

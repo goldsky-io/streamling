@@ -299,9 +299,23 @@ async fn sql_mod_literal() {
     let schema = decimal_schema(90, 0);
     produce(&ctx, &schema, &[(1, "100"), (2, "103"), (3, "-7")]).await;
 
+    // F1 FIXED: `amount % 10` coerces the integer literal to decimal_arb.
     let yaml = sql_pipeline(&ctx.kafka_topic, "amount % 10");
-    // KNOWN GAP (F1): decimal_arb % <int literal> can't coerce (LargeBinary vs Int64).
-    assert_known_gap_no_rows(&ctx, &yaml, "F1: decimal_arb % integer literal").await;
+    let status = ctx
+        .run_pipeline_with_opts(&yaml, base_opts().record_limit(3))
+        .await
+        .expect("pipeline run");
+    assert!(status.success(), "amount % 10 should succeed (F1 fixed)");
+
+    let rows: Vec<IdText> = ctx
+        .postgres
+        .query("SELECT id, t::text AS t FROM public.results ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].t, "0"); // 100 % 10
+    assert_eq!(rows[1].t, "3"); // 103 % 10
+    assert_eq!(rows[2].t, "-7"); // -7 % 10 (sign follows dividend)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,9 +481,22 @@ sinks:
 "#,
         topic = ctx.kafka_topic,
     );
-    // KNOWN GAP (F1): `WHERE amount > 0` can't coerce decimal_arb vs the integer
-    // literal 0 (LargeBinary > Int64), so planning fails. Tripwire.
-    assert_known_gap_no_rows(&ctx, &yaml, "F1: decimal_arb > integer literal in WHERE").await;
+    // F1 FIXED: `WHERE amount > 0` coerces the integer literal to decimal_arb and
+    // filters correctly — only the two positive rows land. The filter drops 2 of
+    // 4 rows, so `record_limit` (counts emitted rows) is never reached on the
+    // unbounded Kafka source; bound with a short timeout and assert table state.
+    let opts = base_opts()
+        .record_limit(4)
+        .timeout(std::time::Duration::from_secs(20));
+    let _ = ctx.run_pipeline_raw(&yaml, opts).await;
+
+    let rows: Vec<IdText> = ctx
+        .postgres
+        .query("SELECT id, t::text AS t FROM public.results ORDER BY id")
+        .await
+        .unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1, 4], "only positive amounts (5.0 and tiny) pass");
 }
 
 // ---------------------------------------------------------------------------
@@ -616,9 +643,22 @@ async fn sql_add_integer_literal_coercion() {
     )
     .await;
 
-    // Adding a bare integer literal to a wide decimal exercises the
-    // decimal_arb + int coercion path; a coercion gap surfaces here.
+    // F1 FIXED: the ExprPlanner now coerces the integer literal to decimal_arb
+    // (scale 0) and dispatches to decimal_arb_add.
     let yaml = sql_pipeline(&ctx.kafka_topic, "amount + 1");
-    // KNOWN GAP (F1): decimal_arb + <int literal> can't coerce (LargeBinary vs Int64).
-    assert_known_gap_no_rows(&ctx, &yaml, "F1: decimal_arb + integer literal").await;
+    let status = ctx
+        .run_pipeline_with_opts(&yaml, base_opts().record_limit(3))
+        .await
+        .expect("pipeline run");
+    assert!(status.success(), "amount + 1 should succeed (F1 fixed)");
+
+    let rows: Vec<IdText> = ctx
+        .postgres
+        .query("SELECT id, t::text AS t FROM public.results ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].t, "2.000000000000000000");
+    assert_eq!(rows[1].t, "0.000000000000000000");
+    assert_eq!(rows[2].t, "2.234567890123456789");
 }

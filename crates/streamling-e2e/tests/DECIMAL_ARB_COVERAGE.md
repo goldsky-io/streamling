@@ -37,8 +37,8 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 | --- | --- | --- | --- |
 | `+ - * /  %` (both operands decimal_arb) | ✅ ExprPlanner→`decimal_arb_*` | ✅ `decimal_arb_arithmetic`, `edge_decimal_sql` | |
 | decimal_arb × `Decimal128/256` column | ✅ planner inserts `to_decimal_arb_from_decimal*` cast | ⚠️ partial | only Decimal columns; |
-| decimal_arb × **integer/float literal** | ❌ **F1** | tripwire | planner's `coerce_operand` maps only Decimal128/256, not Int64/literals |
-| `= != < <= > >=` (both decimal_arb) | ✅ | ✅ | literal RHS → same F1 gap |
+| decimal_arb × **integer literal/column** | ✅ **F1 fixed** (planner coerces int→decimal_arb scale 0) | ✅ `edge_decimal_sql`, `edge_sql_runnable` | floats still rejected (lossy) |
+| `= != < <= > >=` (both decimal_arb) | ✅ | ✅ | integer-literal RHS now works (F1 fixed) |
 | unary `-` (neg) | ✅ | ⚠️ | |
 | `abs` | ✅ `decimal_arb_abs` (named) | ⚠️ | DF builtin `abs()` does NOT route here |
 | `CASE` / plain `COALESCE` | ⚠️ plans but **drops metadata (F2)** → sink fails | tripwire | use `coalesce_meta` to preserve metadata |
@@ -47,7 +47,7 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 | `ORDER BY` | ✅ sort optimizer → `decimal_arb_to_sort_key` | ✅ `wide_int_sort` | |
 | `SUM / MIN / MAX / AVG / COUNT` | ✅ UDAF overrides | ⚠️ **unit-only** | streaming transforms reject bare aggregates; `postgres_aggregate` sink path untested for decimal_arb |
 | `BETWEEN` / `IN` (column/self operands) | ✅ desugars to intercepted `>=`/`<=`/`=` | ✅ `edge_sql_runnable` | works without literals (numeric order, incl. negatives) |
-| `BETWEEN` / `IN` (integer literal bound) | ❌ **F1** | tripwire `edge_sql_runnable` | literal coercion gap |
+| `BETWEEN` / `IN` (integer literal bound) | ❌ **F1b** (Between/InList bypass `plan_binary_op`) | tripwire `edge_sql_runnable::between_int_literals_f1b` | needs an analyzer rule; distinct from F1 |
 | `IS [NOT] NULL` | ✅ | ✅ `edge_sql_runnable` | |
 | `GROUP BY` | ✅ groups by canonical bytes | ✅ unit (`session::tests::group_by_decimal_arb_groups_numerically_equal_values`) | verified: `5`/`5.0`/`05` collapse, `±0` same group |
 | `DISTINCT` | ✅ dedupes by canonical bytes | ✅ unit (`session::tests::distinct_decimal_arb_dedupes_numerically_equal_values`) | numerically-equal values dedupe |
@@ -84,13 +84,16 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 
 ## Remaining gaps
 
-**Real code findings to fix** (pinned as tripwire tests): **F1** (decimal_arb + integer
-literal coercion), **F2** (CASE/COALESCE metadata loss; `coalesce_meta` is the
-workaround), **F4** (sink retries non-retriable errors → hang; filed as STRM-6322),
-**F5** (multiply overflow), **F7** (nested decimal_arb → Avro encode fails). **Fixed:**
+**Real code findings to fix** (pinned as tripwire tests): **F1b** (`BETWEEN`/`IN` with
+literal bounds — `Between`/`InList` bypass the binary-op ExprPlanner; needs an analyzer
+rule), **F2** (CASE/COALESCE metadata loss; `coalesce_meta` is the workaround), **F4**
+(sink retries non-retriable errors → hang; filed as STRM-6322), **F5** (multiply
+overflow). **Fixed:** **F1** (decimal_arb + integer literal/column *binary-op* coercion —
+ExprPlanner now inserts `to_decimal_arb_from_int`);
 **F3** (standard Decimal128/256 → Postgres bound the unscaled integer with the point
 misplaced — now `unscaled_to_numeric_string`); **F6** (nested decimal_arb → JSON hex —
-recursive metadata rewrite in `json.rs`).
+recursive metadata rewrite in `json.rs`); **F7** (nested decimal at Avro sink — preserve
+logicalType via `record_schema_json`).
 
 **Coverage still thin** (lower priority): aggregates (SUM/MIN/MAX/AVG) are unit-only;
 ClickHouse-source string→decimal_arb path is unit-only. (GROUP BY / DISTINCT are now
