@@ -85,10 +85,11 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 
 **Real code findings to fix** (pinned as tripwire tests): **F1** (decimal_arb + integer
 literal coercion), **F2** (CASE/COALESCE metadata loss; `coalesce_meta` is the
-workaround), **F3** (some decimal shapes overflow a wide-enough Postgres NUMERIC),
-**F4** (sink retries non-retriable errors → hang; filed as STRM-6322), **F5** (multiply
-overflow), **F7** (nested decimal_arb → Avro encode fails). **F6** (nested decimal_arb →
-JSON hex) is **fixed** (recursive metadata rewrite in `json.rs`).
+workaround), **F4** (sink retries non-retriable errors → hang; filed as STRM-6322),
+**F5** (multiply overflow), **F7** (nested decimal_arb → Avro encode fails). **Fixed:**
+**F3** (standard Decimal128/256 → Postgres bound the unscaled integer with the point
+misplaced — now `unscaled_to_numeric_string`); **F6** (nested decimal_arb → JSON hex —
+recursive metadata rewrite in `json.rs`).
 
 **Coverage still thin** (lower priority): aggregates (SUM/MIN/MAX/AVG) are unit-only;
 ClickHouse-source string→decimal_arb path is unit-only. (GROUP BY / DISTINCT are now
