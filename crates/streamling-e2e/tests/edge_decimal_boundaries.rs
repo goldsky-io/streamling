@@ -96,70 +96,6 @@ sinks:
         .expect("query")
 }
 
-/// KNOWN-GAP tripwire (F3 — see EDGE_CASE_FINDINGS.md). Some decimal shapes
-/// (all-fractional scale==precision, large-negative, high-scale) currently
-/// `numeric field overflow` on the Postgres INSERT *even into an over-sized
-/// NUMERIC* — streamling materializes an out-of-range value, and the sink
-/// retries the non-retriable error to the timeout (F4). This documents the
-/// current broken behavior: no row lands. When F3 is fixed a row WILL land and
-/// the `count == 0` assertion fails — that's the signal to convert this back to
-/// `ingest_to_pg` + a value assertion.
-async fn assert_overflows_no_rows(
-    ctx: &TestContext,
-    precision: u32,
-    scale: u32,
-    pg_type: &str,
-    cases: &[(i64, &str)],
-) {
-    ctx.postgres
-        .execute(&format!(
-            "CREATE TABLE amounts (id BIGINT PRIMARY KEY, amount {pg_type} NOT NULL)"
-        ))
-        .await
-        .expect("create table");
-    let schema = decimal_schema(precision, scale);
-    for (id, unscaled) in cases {
-        ctx.kafka
-            .produce_decimal_record(&schema, *id, "amount", unscaled)
-            .await
-            .expect("produce decimal record");
-    }
-    let pipeline = format!(
-        r#"
-sources:
-  amt_in:
-    type: kafka
-    topic: {topic}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  amt_out:
-    type: postgres
-    from: amt_in
-    table: amounts
-    schema: public
-    primary_key: id
-    on_conflict: update
-"#,
-        topic = ctx.kafka_topic,
-    );
-    let opts = base_opts()
-        .record_limit(cases.len() as u64)
-        .timeout(std::time::Duration::from_secs(15));
-    let _ = ctx.run_pipeline_raw(&pipeline, opts).await;
-    let count = ctx
-        .postgres
-        .count("SELECT COUNT(*) FROM public.amounts")
-        .await
-        .unwrap_or(0);
-    assert_eq!(
-        count, 0,
-        "F3 tripwire: this decimal shape currently overflows NUMERIC and no row \
-         should land; a landed row means F3 may be fixed — update this test"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Decimal128 territory (precision <= 38)
 // ---------------------------------------------------------------------------
@@ -190,19 +126,20 @@ async fn dec128_scale_equals_precision() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
     // decimal(10,10): all fractional. unscaled 1234567890 -> 0.1234567890.
-    // KNOWN GAP (F3): currently overflows NUMERIC(40,10) on insert (wrong value
-    // materialized) even though 0.1234567890 trivially fits.
-    assert_overflows_no_rows(&ctx, 10, 10, "NUMERIC(40,10)", &[(1, "1234567890")]).await;
+    // F3 FIXED: the unscaled integer now binds with the point placed `scale`
+    // from the right, so 0.1234567890 lands correctly in NUMERIC(40,10).
+    let rows = ingest_to_pg(&ctx, 10, 10, "NUMERIC(40,10)", &[(1, "1234567890")]).await;
+    assert_eq!(rows[0].t, "0.1234567890");
 }
 
 #[tokio::test]
 async fn dec128_negative_near_min() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
-    // Large negative Decimal128(38,2). KNOWN GAP (F3): overflows NUMERIC(40,2)
-    // on insert even though the value fits comfortably.
+    // Large negative Decimal128(38,2). F3 FIXED: 36 integer digits + ".99".
     let neg = format!("-{}", "9".repeat(38));
-    assert_overflows_no_rows(&ctx, 38, 2, "NUMERIC(40,2)", &[(1, neg.as_str())]).await;
+    let rows = ingest_to_pg(&ctx, 38, 2, "NUMERIC(40,2)", &[(1, neg.as_str())]).await;
+    assert_eq!(rows[0].t, format!("-{}.99", "9".repeat(36)));
 }
 
 // ---------------------------------------------------------------------------
@@ -245,10 +182,14 @@ async fn dec256_seventeen_byte_value() {
 async fn dec256_negative_high_scale() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
-    // Negative high-scale Decimal256(60,30). KNOWN GAP (F3): overflows
-    // NUMERIC(80,30) on insert even though the value fits.
+    // Negative high-scale Decimal256(60,30). F3 FIXED: 30 integer + 30 fractional
+    // digits, fits NUMERIC(80,30) (the old code produced 60 integer digits).
     let neg = format!("-{}", "1".repeat(60));
-    assert_overflows_no_rows(&ctx, 60, 30, "NUMERIC(80,30)", &[(1, neg.as_str())]).await;
+    let rows = ingest_to_pg(&ctx, 60, 30, "NUMERIC(80,30)", &[(1, neg.as_str())]).await;
+    assert_eq!(
+        rows[0].t,
+        format!("-{}.{}", "1".repeat(30), "1".repeat(30))
+    );
 }
 
 // ---------------------------------------------------------------------------
