@@ -57,20 +57,23 @@ TODO and the `#[ignore]`d unit tripwire
 **Suggested fix:** a metadata-propagation rule so expression outputs (CASE,
 COALESCE, …) whose inputs are `decimal_arb` retain the extension metadata.
 
-### F3 — Some decimal shapes overflow Postgres NUMERIC even into an over-sized column
-**Tests:** `edge_decimal_boundaries::dec128_scale_equals_precision` (decimal(10,10),
-value `0.1234567890` → `NUMERIC(40,10)`), `dec128_negative_near_min`
-(decimal(38,2), large negative → `NUMERIC(40,2)`), `dec256_negative_high_scale`
-(decimal(60,30), negative → `NUMERIC(80,30)`).
-**Symptom:** `error returned from database: numeric field overflow` on INSERT —
-even though the target NUMERIC is comfortably wide enough for the *correct* value
-(`0.1234567890` cannot need >30 integer digits). Reproduces serially (`-j1`), so
-not a parallelism artifact. Indicates streamling materializes an out-of-range
-value for these shapes — a likely scale/sign handling bug in the decimal →
-Postgres bind path for all-fractional (scale == precision), large-negative, and
-high-scale decimals.
-**Status:** root cause not yet pinned; needs investigation in the Postgres sink
-decimal path.
+### F3 — Standard Decimal128/256 → Postgres bound with the decimal point misplaced — **FIXED**
+**Tests:** `edge_decimal_boundaries::{dec128_scale_equals_precision, dec128_negative_near_min, dec256_negative_high_scale}` (now assert the correct value lands), plus unit test
+`value_binding::tests::test_unscaled_to_numeric_string`.
+**Was:** `error returned from database: numeric field overflow` on INSERT for
+all-fractional (scale == precision), large-negative, and high-scale shapes — even
+into an over-sized NUMERIC.
+**Root cause:** `value_binding::format_decimal_string` received the **unscaled
+integer** (`Decimal128/256::value()` → e.g. `12345` for `123.45` at scale 2) but
+**appended `scale` trailing zeros** instead of placing the decimal point `scale`
+digits from the right. This inflated every non-zero-scale value by 10^scale —
+silently wrong even when it fit, and overflowing the column once the inflated
+integer part exceeded `precision − scale` digits. (decimal_arb dodged this: it is
+converted to a canonical decimal string upstream and binds via the Utf8 path.)
+**Fix:** renamed to `unscaled_to_numeric_string`, which interprets the input as an
+unscaled integer and places the point correctly (sign-aware, sub-1 magnitudes
+padded as `0.00…d`). Affects any pipeline sinking a raw `Decimal128/256` (scale > 0)
+to Postgres NUMERIC.
 
 ### F4 — Postgres sink retries non-retriable errors indefinitely → silent hang
 **Symptom:** a non-retriable DB error (`numeric field overflow`, `column "x" does
