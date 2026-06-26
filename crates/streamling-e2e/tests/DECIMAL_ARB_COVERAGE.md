@@ -15,7 +15,7 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 | --- | --- | --- | --- |
 | Kafka source — Avro decode | ✅ `avro/schema.rs`, `arrow_avro.rs` | ✅ (C1 fix; nested decimal→decimal_arb) | ✅ unit + `arrow_avro_equivalence` + most decimal e2e use this source |
 | Kafka source — JSON decode | ✅ `json.rs` (top-level) | ❌ no nested recursion | ❌ no JSON-source decimal_arb test |
-| Kafka **sink** — Avro encode | ✅ top-level | ❌ **F7** (nested → `Bytes` schema, encode fails) | ✅ top-level round-trip (`edge_boundary_sinks`); nested pinned (`edge_complex_decimal`, F7) |
+| Kafka **sink** — Avro encode | ✅ top-level | ✅ **F7 fixed** (nested keeps `decimal` logicalType) | ✅ top-level (`edge_boundary_sinks`) + nested round-trip (`edge_complex_decimal`) |
 | File source | ✅ via avro/json formats | inherits format | ❌ no decimal_arb file-source test |
 | Postgres **sink** | ✅ → `NUMERIC(p,s)` (`pg.rs`, `value_binding`, `type_mapping`) | ❌ (no nested struct/jsonb path) | ✅ `decimal_arb_postgres`, `edge_*` |
 | Postgres **source** | ✅ `pg.rs` auto-promotes `NUMERIC(78,0)`→decimal_arb | ❌ | ❌ untested |
@@ -74,9 +74,10 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 - **Webhook** and **Print** (JSON) decimal_arb (top-level): tested ✅.
 - **Nested/complex decimal_arb** at the JSON output boundary (print/webhook/external
   handler) is now **supported** — **F6 fixed** via a recursive metadata-driven rewrite in
-  `json.rs`. Still unsupported: the **Avro sink** (**F7**, nested fields emit as `Bytes`),
-  and ClickHouse/Postgres (no nested column type). Nested *decode* avro→decimal_arb is
-  correct (C1); nested decode from a JSON *source* remains unhandled (output-only fix).
+  `json.rs`. The **Avro sink** is also fixed — **F7 fixed** (nested decimals keep their
+  `decimal` logicalType). Still unsupported: ClickHouse/Postgres (no nested column type).
+  Nested *decode* avro→decimal_arb is correct (C1); nested decode from a JSON *source*
+  remains unhandled (the JSON fix is output-only).
 - **Runnable SQL** over decimal_arb — `BETWEEN`, `IN`, `IS [NOT] NULL` (column/self
   operands): tested ✅; literal-bounded forms pin **F1**. (`JOIN`/window/bare
   aggregates aren't runnable in streaming transforms — out of scope by design.)
