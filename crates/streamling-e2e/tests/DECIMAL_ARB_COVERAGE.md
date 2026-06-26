@@ -22,9 +22,9 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 | ClickHouse **sink** | ✅ native `UInt256`/`Int256`, `CanonicalString`, `Decimal` | ❌ nested (Array/Tuple of decimal_arb) not handled | ✅ `decimal_arb_clickhouse`, `edge_decimal_clickhouse` |
 | ClickHouse **source** | ✅ native FSB(32)→decimal_arb + String→decimal_arb (H2) | ❌ nested | ⚠️ native ✅ (`hybrid_source`); **string path unit-only** |
 | Hybrid source | ✅ schema adapter + `normalize_batch_from_clickhouse` | ❌ nested | ✅ `hybrid_source` |
-| print sink | ✅ top-level (JSON) | ❌ **F6** (nested → hex bytes) | ✅ top-level (`edge_boundary_sinks`); nested pinned (F6) |
-| Webhook / HTTP sink | ✅ top-level (JSON) | ❌ **F6** | ✅ top-level (`edge_boundary_sinks`) |
-| External handler | ⚠️ JSON-based (same path as print/webhook) | ❌ **F6** | ⚠️ same JSON path as webhook (not separately run) |
+| print sink | ✅ top-level (JSON) | ✅ **F6 fixed** (recursive metadata rewrite) | ✅ top-level (`edge_boundary_sinks`); nested (`edge_complex_decimal`) |
+| Webhook / HTTP sink | ✅ top-level (JSON) | ✅ **F6 fixed** | ✅ top-level (`edge_boundary_sinks`) |
+| External handler | ⚠️ JSON-based (same path as print/webhook) | ✅ **F6 fixed** (same JSON path) | ⚠️ same JSON path as webhook (not separately run) |
 | MySQL sink | ❌ **no decimal_arb code at all** | ❌ | ❌ untested |
 | SQS sink | ⚠️ JSON-based (top-level via json.rs) | ❌ | ❌ untested |
 | memory / blackhole | n/a (discards) | n/a | n/a |
@@ -72,10 +72,11 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 
 - Kafka **Avro sink** decimal_arb round-trip (top-level): tested ✅ (`edge_boundary_sinks`).
 - **Webhook** and **Print** (JSON) decimal_arb (top-level): tested ✅.
-- **Nested/complex decimal_arb** behavior is now *known and pinned*: it is **not**
-  supported at any sink — JSON renders hex (**F6**), Avro fails to encode (**F7**);
-  ClickHouse/Postgres have no nested column type. Only top-level decimal_arb works.
-  (Nested *decode* avro→decimal_arb is correct, per C1.)
+- **Nested/complex decimal_arb** at the JSON output boundary (print/webhook/external
+  handler) is now **supported** — **F6 fixed** via a recursive metadata-driven rewrite in
+  `json.rs`. Still unsupported: the **Avro sink** (**F7**, nested fields emit as `Bytes`),
+  and ClickHouse/Postgres (no nested column type). Nested *decode* avro→decimal_arb is
+  correct (C1); nested decode from a JSON *source* remains unhandled (output-only fix).
 - **Runnable SQL** over decimal_arb — `BETWEEN`, `IN`, `IS [NOT] NULL` (column/self
   operands): tested ✅; literal-bounded forms pin **F1**. (`JOIN`/window/bare
   aggregates aren't runnable in streaming transforms — out of scope by design.)
@@ -85,8 +86,9 @@ Legend: ✅ supported/tested · ⚠️ partial / unit-only / untested · ❌ abs
 **Real code findings to fix** (pinned as tripwire tests): **F1** (decimal_arb + integer
 literal coercion), **F2** (CASE/COALESCE metadata loss; `coalesce_meta` is the
 workaround), **F3** (some decimal shapes overflow a wide-enough Postgres NUMERIC),
-**F4** (sink retries non-retriable errors → hang), **F5** (multiply overflow), **F6**
-(nested decimal_arb → JSON hex), **F7** (nested decimal_arb → Avro encode fails).
+**F4** (sink retries non-retriable errors → hang; filed as STRM-6322), **F5** (multiply
+overflow), **F7** (nested decimal_arb → Avro encode fails). **F6** (nested decimal_arb →
+JSON hex) is **fixed** (recursive metadata rewrite in `json.rs`).
 
 **Coverage still thin** (lower priority): aggregates (SUM/MIN/MAX/AVG) are unit-only;
 ClickHouse-source string→decimal_arb path is unit-only; GROUP BY / DISTINCT

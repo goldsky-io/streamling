@@ -94,17 +94,16 @@ sinks:
         .unwrap();
 
     let blob = format!("{:?}", captured.column_values("inner"));
-    // KNOWN GAP (F6): the JSON serializer special-cases only TOP-LEVEL decimal_arb
-    // columns. A decimal_arb NESTED in a struct/array is emitted as its raw
-    // canonical bytes in hex, NOT its decimal value. Pinned here; when F6 is fixed
-    // the value will appear and this tripwire fails — flip it to assert the value.
+    // F6 FIXED: the JSON serializer now rewrites decimal_arb leaves recursively
+    // (by field metadata), so a decimal_arb NESTED in a struct renders as its
+    // decimal value, not the raw canonical bytes in hex.
     assert!(
-        blob.contains("00018ee90ff6c373e0ee4e3f0ad2"),
-        "expected nested decimal_arb to render as canonical-byte hex (F6); got: {blob}"
+        blob.contains(BIG),
+        "nested decimal_arb must render its decimal value (F6 fixed); got: {blob}"
     );
     assert!(
-        !blob.contains(BIG),
-        "F6 may be fixed: nested decimal_arb now renders its value — update this test"
+        !blob.contains("00018ee90ff6c373e0ee4e3f0ad2"),
+        "nested decimal_arb must NOT render as canonical-byte hex (F6 regressed); got: {blob}"
     );
 }
 
@@ -152,15 +151,15 @@ sinks:
         .unwrap();
 
     let blob = format!("{:?}", captured.column_values("items"));
-    // KNOWN GAP (F6): same as the nested-struct case — array<record<decimal_arb>>
-    // renders the canonical bytes as hex, not the values.
+    // F6 FIXED: array<record<decimal_arb>> now renders each element's decimal
+    // value (recursive metadata-driven rewrite), not the canonical bytes as hex.
     assert!(
-        blob.contains("00018ee90ff6c373e0ee4e3f0ad2") && blob.contains("0007"),
-        "expected array<decimal_arb> to render as canonical-byte hex (F6); got: {blob}"
+        blob.contains(BIG) && blob.contains('7'),
+        "array<decimal_arb> must render element values (F6 fixed); got: {blob}"
     );
     assert!(
-        !blob.contains(BIG),
-        "F6 may be fixed: nested decimal_arb now renders its value — update this test"
+        !blob.contains("00018ee90ff6c373e0ee4e3f0ad2"),
+        "array<decimal_arb> must NOT render as canonical-byte hex (F6 regressed); got: {blob}"
     );
 }
 

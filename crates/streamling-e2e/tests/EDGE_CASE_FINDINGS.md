@@ -90,13 +90,17 @@ precision approaches the `decimal_arb` ceiling. Likely *correct* (the result
 exceeds the precision cap), but it surfaces as an opaque sink error and (via F4)
 can hang. Worth confirming the intended UX (clear overflow error vs widening).
 
-### F6 — Nested decimal_arb is not serialized at the JSON boundary
-**Tests:** `edge_complex_decimal::{nested_struct_decimal_arb_to_print_json, array_of_decimal_arb_to_print_json}` (pinned tripwires).
-**Symptom:** a `decimal_arb` nested inside a struct or array is emitted by the JSON
+### F6 — Nested decimal_arb at the JSON boundary — **FIXED**
+**Tests:** `edge_complex_decimal::{nested_struct_decimal_arb_to_print_json, array_of_decimal_arb_to_print_json}` (now assert the value), plus unit tests
+`formats::json::tests::{nested_struct_decimal_arb_serializes_value_not_hex, array_of_struct_decimal_arb_serializes_values_not_hex}`.
+**Was:** a `decimal_arb` nested inside a struct or array was emitted by the JSON
 converter as its **raw canonical bytes in hex** (e.g. `{"amt":"00018ee9…"}`), not its
-decimal value. `json.rs` special-cases only **top-level** decimal_arb columns; nested
-ones fall through to the generic Arrow→JSON path. Affects print, webhook, and any
-JSON/external-handler serialization. Top-level decimal_arb → JSON is correct.
+decimal value, because `json.rs` special-cased only **top-level** decimal_arb columns.
+**Fix:** `json.rs` now rewrites decimal_arb leaves **recursively by field metadata**
+(`decimalize_for_json` walks Struct / List / LargeList / FixedSizeList / Map), so nested
+decimal_arb serializes as its decimal value across print, webhook, and any JSON/external-handler
+output. (Decode of nested decimal_arb from a JSON *source* is a separate, still-unhandled path —
+the recursive rewrite is currently output-only.)
 
 ### F7 — Nested decimal_arb fails the Kafka Avro sink
 **Test:** `edge_complex_decimal::nested_struct_decimal_arb_kafka_avro_sink_fails_f7` (pinned).
