@@ -566,6 +566,140 @@ mod tests {
         );
     }
 
+    /// Register a single-column `t(amt decimal_arb(100,0))` MemTable from a list
+    /// of textual decimal values (each canonicalized via `DecimalArbValue`).
+    fn register_decimal_arb_values(sm: &SessionManager, table: &str, values: &[&str]) {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+        use datafusion::datasource::MemTable;
+        use std::str::FromStr;
+
+        let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "amt", 100, 0).unwrap();
+        for v in values {
+            b.append_value(&DecimalArbValue::from_str(v).unwrap()).unwrap();
+        }
+        let amt = b.finish().into_inner().0;
+        let schema = Arc::new(Schema::new(vec![
+            DecimalArbType::field("amt", 100, 0, true).unwrap(),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(amt)]).unwrap();
+        let table_provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        sm.register_table(table, Arc::new(table_provider)).unwrap();
+    }
+
+    /// `GROUP BY` over `decimal_arb` groups by the canonical bytes. This verifies
+    /// the equality assumption end-to-end: numerically-equal values written in
+    /// different textual forms (`5` / `5.0` / `05`) collapse into ONE group, and
+    /// `+0` / `-0` are the same group — i.e. grouping is numerically correct, not
+    /// a silent byte-representation split.
+    #[tokio::test]
+    async fn group_by_decimal_arb_groups_numerically_equal_values() {
+        use crate::types::decimal_arb::DecimalArbValue;
+        use arrow::array::{Array, LargeBinaryArray};
+        use std::collections::HashMap;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_values(&sm, "t", &["5", "5.0", "05", "-3", "-3", "0", "-0"]);
+
+        let sql = "SELECT amt, COUNT(*) AS n FROM t GROUP BY amt";
+        let plan = sm
+            .create_logical_plan(sql.to_string())
+            .await
+            .expect("GROUP BY decimal_arb should plan");
+        let batches = sm
+            .new_df(plan)
+            .collect()
+            .await
+            .expect("GROUP BY decimal_arb should execute");
+
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for batch in &batches {
+            let amt = batch
+                .column_by_name("amt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            let n = batch
+                .column_by_name("n")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let key = DecimalArbValue::from_canonical_bytes_at_scale(amt.value(i), 0)
+                    .unwrap()
+                    .to_canonical_string();
+                *counts.entry(key).or_default() += n.value(i);
+            }
+        }
+
+        assert_eq!(
+            counts.len(),
+            3,
+            "exactly three distinct numeric groups expected: {counts:?}"
+        );
+        assert_eq!(
+            counts.get("5"),
+            Some(&3),
+            "5 / 5.0 / 05 must collapse to one group of 3: {counts:?}"
+        );
+        assert_eq!(counts.get("-3"), Some(&2), "{counts:?}");
+        assert_eq!(
+            counts.get("0"),
+            Some(&2),
+            "+0 and -0 must be the same group: {counts:?}"
+        );
+    }
+
+    /// `SELECT DISTINCT` over `decimal_arb` dedupes by numeric value, not textual
+    /// form — the same byte-equality guarantee as GROUP BY.
+    #[tokio::test]
+    async fn distinct_decimal_arb_dedupes_numerically_equal_values() {
+        use crate::types::decimal_arb::DecimalArbValue;
+        use arrow::array::{Array, LargeBinaryArray};
+        use std::collections::BTreeSet;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_values(&sm, "t", &["5", "5.0", "-3", "-3", "0", "-0", "7"]);
+
+        let sql = "SELECT DISTINCT amt FROM t";
+        let plan = sm
+            .create_logical_plan(sql.to_string())
+            .await
+            .expect("DISTINCT decimal_arb should plan");
+        let batches = sm
+            .new_df(plan)
+            .collect()
+            .await
+            .expect("DISTINCT decimal_arb should execute");
+
+        let mut distinct: BTreeSet<String> = BTreeSet::new();
+        for batch in &batches {
+            let amt = batch
+                .column_by_name("amt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                distinct.insert(
+                    DecimalArbValue::from_canonical_bytes_at_scale(amt.value(i), 0)
+                        .unwrap()
+                        .to_canonical_string(),
+                );
+            }
+        }
+
+        let expected: BTreeSet<String> = ["5", "-3", "0", "7"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            distinct, expected,
+            "DISTINCT must dedupe numerically-equal decimal_arb values"
+        );
+    }
+
     #[test]
     fn test_extract_schema_and_table_names() {
         assert_eq!(
