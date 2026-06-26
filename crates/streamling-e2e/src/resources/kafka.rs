@@ -303,6 +303,41 @@ impl KafkaResource {
         Ok(())
     }
 
+    /// Produce a single Avro record of arbitrary shape (e.g. with nested records
+    /// or arrays carrying `decimal` logical-type fields) using the schema-registry
+    /// wire format `[magic(0)] [schema_id BE u32] [avro_datum]` plus a `dbz.op="c"`
+    /// header. The caller supplies the fully-built record `Value`.
+    pub async fn produce_avro_value(
+        &self,
+        schema_str: &str,
+        value: apache_avro::types::Value,
+    ) -> Result<()> {
+        use rdkafka::message::{Header, OwnedHeaders};
+
+        let schema_id = self.register_schema(schema_str).await?;
+        let schema = apache_avro::Schema::parse_str(schema_str)
+            .map_err(|e| E2eError::Kafka(format!("invalid schema: {}", e)))?;
+        let datum = apache_avro::to_avro_datum(&schema, value)
+            .map_err(|e| E2eError::Kafka(format!("avro encode failed: {}", e)))?;
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&schema_id.to_be_bytes());
+        payload.extend_from_slice(&datum);
+
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "dbz.op",
+            value: Some("c"),
+        });
+        let kafka_record = FutureRecord::to(&self.topic)
+            .payload(&payload)
+            .key("")
+            .headers(headers);
+        self.producer
+            .send(kafka_record, Timeout::After(Duration::from_secs(15)))
+            .await
+            .map_err(|(e, _)| E2eError::Kafka(e.to_string()))?;
+        Ok(())
+    }
+
     /// Produce raw bytes to the topic
     pub async fn produce_raw(&self, records: &[Vec<u8>]) -> Result<()> {
         for payload in records {
