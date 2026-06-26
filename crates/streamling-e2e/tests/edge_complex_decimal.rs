@@ -163,11 +163,14 @@ sinks:
     );
 }
 
-/// nested struct with decimal_arb -> Kafka **Avro sink**. KNOWN GAP (F7): the
-/// avro schema builder emits nested decimal_arb as plain `Bytes`, so the encode
-/// fails. This test pins that failure.
+/// nested struct with decimal_arb -> Kafka **Avro sink** -> re-read -> Print JSON.
+/// F7 FIXED: the avro schema builder now emits nested decimal_arb with the
+/// `decimal` logicalType (it no longer round-trips the struct schema through
+/// canonical_form, which stripped logicalType), so the sink encodes the nested
+/// value. The re-read + print also confirms the nested value survives end-to-end
+/// (decode C1 + render F6).
 #[tokio::test]
-async fn nested_struct_decimal_arb_kafka_avro_sink_fails_f7() {
+async fn nested_struct_decimal_arb_kafka_avro_sink_round_trip() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
 
@@ -185,6 +188,7 @@ async fn nested_struct_decimal_arb_kafka_avro_sink_fails_f7() {
 
     let out_topic = ctx.create_kafka_topic("nestout").await.unwrap();
 
+    // Pipeline 1: kafka(avro) source -> kafka(avro) sink. Must succeed now.
     let p1 = format!(
         r#"
 sources:
@@ -205,33 +209,44 @@ sinks:
         input = ctx.kafka_topic,
         output = out_topic.topic,
     );
-    // KNOWN GAP (F7): the Kafka Avro SINK does not handle NESTED decimal_arb. The
-    // `to_avro` schema builder emits nested decimal_arb fields as plain `Bytes`
-    // (only top-level fields get the `decimal` logicalType), so the writer's
-    // `Value::Decimal` fails to encode ("Unsupported value-schema combination:
-    // Decimal vs Bytes") and the sink errors. Pinned here; when nested-aware avro
-    // schema generation lands, restore the round-trip + value assertion.
-    let out = ctx
-        .run_pipeline_raw(
-            &p1,
-            base_opts()
-                .record_limit(1)
-                .timeout(std::time::Duration::from_secs(20)),
-        )
-        .await;
-    match out {
-        Ok(o) => {
-            assert!(
-                !o.status.success(),
-                "F7 may be fixed: nested decimal_arb now encodes to avro — restore the round-trip test"
-            );
-            assert!(
-                !o.stderr.contains("panicked"),
-                "avro sink must not panic on nested decimal_arb: {}",
-                o.stderr
-            );
-        }
-        // Timed out because the sink retried the non-retriable encode error (F4).
-        Err(_) => {}
-    }
+    let s1 = ctx
+        .run_pipeline_with_opts(&p1, base_opts().record_limit(1))
+        .await
+        .unwrap();
+    assert!(
+        s1.success(),
+        "nested decimal_arb must encode to the Avro sink (F7 fixed)"
+    );
+
+    // Pipeline 2: read the avro-sink output back -> Print (JSON). The nested
+    // decimal must render its value (decode C1 + JSON render F6), not hex.
+    let p2 = format!(
+        r#"
+sources:
+  src2:
+    type: kafka
+    topic: {output}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  out:
+    type: print
+    from: src2
+"#,
+        output = out_topic.topic,
+    );
+    let captured = ctx
+        .run_pipeline_with_capture(&p2, base_opts().record_limit(1))
+        .await
+        .unwrap();
+    let blob = format!("{:?}", captured.column_values("inner"));
+    assert!(
+        blob.contains(BIG),
+        "nested decimal_arb must survive the Avro sink round-trip with its value; got: {blob}"
+    );
+    assert!(
+        !blob.contains("00018ee90ff6c373e0ee4e3f0ad2"),
+        "round-tripped nested decimal_arb must not render as hex; got: {blob}"
+    );
 }
