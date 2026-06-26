@@ -28,6 +28,9 @@ error attribution unreliable.)
 | `edge_pk_upsert_delete.rs` | primary-key / debezium op (`c`/`u`/`d`) / `on_conflict` semantics |
 | `edge_values_general.rs` | value/throughput edges (large batches, unicode/empty PKs, int/float extremes, filters, SQL string ops) |
 | `edge_robustness_misc.rs` | multi-sink fan-out, filters, SQL coercion, arithmetic overflow / divide-by-zero |
+| `edge_boundary_sinks.rs` | decimal_arb across Kafka(Avro) sink (round-trip), Webhook (JSON), Print (JSON) — all top-level, all pass |
+| `edge_complex_decimal.rs` | NESTED decimal_arb (struct / array) at the JSON and Avro boundaries — pins F6/F7 |
+| `edge_sql_runnable.rs` | runnable scalar SQL over decimal_arb — BETWEEN, IN, IS [NOT] NULL (pass); literal-BETWEEN pins F1 |
 
 ## Confirmed findings (real issues these tests surfaced)
 
@@ -86,6 +89,25 @@ errors.
 precision approaches the `decimal_arb` ceiling. Likely *correct* (the result
 exceeds the precision cap), but it surfaces as an opaque sink error and (via F4)
 can hang. Worth confirming the intended UX (clear overflow error vs widening).
+
+### F6 — Nested decimal_arb is not serialized at the JSON boundary
+**Tests:** `edge_complex_decimal::{nested_struct_decimal_arb_to_print_json, array_of_decimal_arb_to_print_json}` (pinned tripwires).
+**Symptom:** a `decimal_arb` nested inside a struct or array is emitted by the JSON
+converter as its **raw canonical bytes in hex** (e.g. `{"amt":"00018ee9…"}`), not its
+decimal value. `json.rs` special-cases only **top-level** decimal_arb columns; nested
+ones fall through to the generic Arrow→JSON path. Affects print, webhook, and any
+JSON/external-handler serialization. Top-level decimal_arb → JSON is correct.
+
+### F7 — Nested decimal_arb fails the Kafka Avro sink
+**Test:** `edge_complex_decimal::nested_struct_decimal_arb_kafka_avro_sink_fails_f7` (pinned).
+**Symptom:** the avro schema builder (`to_avro`) emits **nested** decimal_arb fields as
+plain `Bytes` (only top-level fields get the `decimal` logicalType), so the writer's
+`Value::Decimal` fails to encode — `apache_avro`: *"Unsupported value-schema combination:
+Decimal vs Bytes"* — and the sink errors. Top-level decimal_arb → avro is correct.
+(F6 + F7 together: **nested/complex decimal_arb is unsupported at every sink except,
+at the byte level, ClickHouse/Postgres which have no nested column type anyway**;
+only the Avro/JSON *top-level* path works. The Avro *decode* of nested decimals →
+decimal_arb is correct, per C1 — it's the re-serialization that's missing.)
 
 ## Status of the suite
 
