@@ -16,6 +16,8 @@ use arrow::array::{
 };
 use arrow::datatypes::i256 as ArrowI256;
 use arrow::datatypes::{DataType, Field};
+use arrow_schema::extension::ExtensionType;
+use arrow_schema::ArrowError;
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 use num_traits::Zero;
@@ -73,26 +75,27 @@ impl DecimalArbType {
     /// Build the per-`Field` metadata map for a `decimal_arb` column with the
     /// given declared `precision` and `scale`. Validates the invariants from
     /// `data-model.md` (E1) before producing the map.
+    ///
+    /// Delegates to the Arrow [`ExtensionType`] machinery so the
+    /// `ARROW:extension:{name,metadata}` keys are produced canonically; the
+    /// returned map is the same byte layout the type has always emitted.
     pub fn metadata(precision: u32, scale: u32) -> Result<HashMap<String, String>> {
-        validate_precision_scale(precision, scale)?;
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            Self::EXTENSION_NAME_KEY.to_string(),
-            Self::EXTENSION_NAME.to_string(),
-        );
-        metadata.insert(
-            Self::EXTENSION_METADATA_KEY.to_string(),
-            format!(r#"{{"precision":{},"scale":{}}}"#, precision, scale),
-        );
-        Ok(metadata)
+        Ok(Self::field("decimal_arb", precision, scale, true)?
+            .metadata()
+            .clone())
     }
 
     /// Build a complete `Field` for a `decimal_arb` column.
+    ///
+    /// Construction goes through [`Field::try_with_extension_type`], which
+    /// validates the `LargeBinary` storage invariant
+    /// ([`DecimalArbExtension::supports_data_type`]) and stamps the standard
+    /// Arrow extension keys.
     pub fn field(name: &str, precision: u32, scale: u32, nullable: bool) -> Result<Field> {
-        Ok(
-            Field::new(name, Self::new(), nullable)
-                .with_metadata(Self::metadata(precision, scale)?),
-        )
+        let ext = DecimalArbExtension::new(precision, scale)?;
+        let mut field = Field::new(name, Self::new(), nullable);
+        field.try_with_extension_type(ext)?;
+        Ok(field)
     }
 
     /// Returns `true` if the metadata map advertises the extension name.
@@ -118,8 +121,10 @@ impl DecimalArbType {
         if !Self::is_decimal_arb_field(field) {
             return None;
         }
-        let raw = field.metadata().get(Self::EXTENSION_METADATA_KEY)?;
-        parse_precision_scale_json(raw).ok()
+        field
+            .try_extension_type::<DecimalArbExtension>()
+            .ok()
+            .map(|ext| (ext.params.precision, ext.params.scale))
     }
 
     /// Stamp the `native_int_kind` origin hint on a `decimal_arb` field.
@@ -166,6 +171,106 @@ impl DecimalArbType {
         }
         let raw = metadata.get(Self::NATIVE_INT_KIND_KEY)?;
         NativeIntKind::parse(raw)
+    }
+}
+
+/// Resolved `(precision, scale)` carried in a `decimal_arb` field's
+/// `ARROW:extension:metadata` payload, serialized as the JSON object
+/// `{"precision":<u32>,"scale":<u32>}` (see
+/// `specs/001-decimal-arbitrary-precision/contracts/arrow-extension-type.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DecimalArbParams {
+    pub precision: u32,
+    pub scale: u32,
+}
+
+/// First-class Arrow 58 [`ExtensionType`] instance for `decimal_arb`.
+///
+/// [`DecimalArbType`] is a unit "namespace" of static helpers; this is the
+/// concrete extension-type instance that owns the canonical (de)serialization
+/// of the `(precision, scale)` metadata and enforces the `LargeBinary`
+/// storage-type invariant. Field helpers route through the standard Arrow API
+/// ([`Field::try_with_extension_type`] /
+/// [`Field::try_extension_type`]), and new code may do the same:
+///
+/// ```ignore
+/// let p_s = field.try_extension_type::<DecimalArbExtension>()
+///     .map(|e| (e.precision(), e.scale()));
+/// ```
+///
+/// The optional `native_int_kind` origin hint is stored under a *separate*
+/// field-metadata key ([`DecimalArbType::NATIVE_INT_KIND_KEY`]), not inside
+/// this extension's metadata, so it survives independently and is managed by
+/// [`DecimalArbType::with_native_int_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecimalArbExtension {
+    params: DecimalArbParams,
+}
+
+impl DecimalArbExtension {
+    /// Construct a validated extension instance for the given precision/scale.
+    pub fn new(precision: u32, scale: u32) -> Result<Self> {
+        validate_precision_scale(precision, scale)?;
+        Ok(Self {
+            params: DecimalArbParams { precision, scale },
+        })
+    }
+
+    /// Declared precision.
+    pub fn precision(&self) -> u32 {
+        self.params.precision
+    }
+
+    /// Declared scale.
+    pub fn scale(&self) -> u32 {
+        self.params.scale
+    }
+}
+
+impl ExtensionType for DecimalArbExtension {
+    const NAME: &'static str = DecimalArbType::EXTENSION_NAME;
+    type Metadata = DecimalArbParams;
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.params
+    }
+
+    fn serialize_metadata(&self) -> Option<String> {
+        // Two u32s — infallible. Byte-for-byte the historical layout
+        // (`{"precision":N,"scale":M}`) so on-wire/at-rest fields are unchanged.
+        Some(format!(
+            r#"{{"precision":{},"scale":{}}}"#,
+            self.params.precision, self.params.scale
+        ))
+    }
+
+    fn deserialize_metadata(metadata: Option<&str>) -> std::result::Result<Self::Metadata, ArrowError> {
+        let raw = metadata.ok_or_else(|| {
+            ArrowError::InvalidArgumentError("decimal_arb extension metadata missing".to_string())
+        })?;
+        let (precision, scale) = parse_precision_scale_json(raw)
+            .map_err(|e| ArrowError::InvalidArgumentError(e.to_string()))?;
+        Ok(DecimalArbParams { precision, scale })
+    }
+
+    fn supports_data_type(&self, data_type: &DataType) -> std::result::Result<(), ArrowError> {
+        match data_type {
+            DataType::LargeBinary => Ok(()),
+            other => Err(ArrowError::InvalidArgumentError(format!(
+                "decimal_arb storage type must be LargeBinary, got {other:?}"
+            ))),
+        }
+    }
+
+    fn try_new(
+        data_type: &DataType,
+        metadata: Self::Metadata,
+    ) -> std::result::Result<Self, ArrowError> {
+        validate_precision_scale(metadata.precision, metadata.scale)
+            .map_err(|e| ArrowError::InvalidArgumentError(e.to_string()))?;
+        let ext = Self { params: metadata };
+        ext.supports_data_type(data_type)?;
+        Ok(ext)
     }
 }
 
@@ -1059,6 +1164,38 @@ mod tests {
         let f = Field::new("blob", DataType::LargeBinary, true);
         assert!(!DecimalArbType::is_decimal_arb_field(&f));
         assert_eq!(DecimalArbType::precision_scale_from_field(&f), None);
+    }
+
+    #[test]
+    fn field_round_trips_through_arrow_extension_api() {
+        // The field built by the helper is recognized by the standard Arrow
+        // extension-type API, and reading it back yields the same params.
+        let f = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        assert!(f.has_valid_extension_type::<DecimalArbExtension>());
+        let ext = f.try_extension_type::<DecimalArbExtension>().unwrap();
+        assert_eq!((ext.precision(), ext.scale()), (100, 18));
+        assert_eq!(f.extension_type_name(), Some(DecimalArbType::EXTENSION_NAME));
+    }
+
+    #[test]
+    fn extension_rejects_non_large_binary_storage() {
+        // supports_data_type / try_new enforce the LargeBinary invariant.
+        let ext = DecimalArbExtension::new(10, 2).unwrap();
+        assert!(ext.supports_data_type(&DataType::LargeBinary).is_ok());
+        assert!(ext.supports_data_type(&DataType::Binary).is_err());
+        let mut wrong = Field::new("x", DataType::Binary, true);
+        assert!(wrong.try_with_extension_type(ext).is_err());
+    }
+
+    #[test]
+    fn extension_metadata_serialization_is_byte_stable() {
+        // Pins the historical `{"precision":N,"scale":M}` layout so existing
+        // at-rest / on-wire fields keep deserializing.
+        let ext = DecimalArbExtension::new(100, 18).unwrap();
+        assert_eq!(
+            ext.serialize_metadata().as_deref(),
+            Some(r#"{"precision":100,"scale":18}"#)
+        );
     }
 
     #[test]
