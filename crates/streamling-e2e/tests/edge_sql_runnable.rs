@@ -4,8 +4,10 @@
 //!
 //! Input is a single `amount decimal(100,18)` column via the proven
 //! `produce_decimal_record`. Self-referential predicates (`amount BETWEEN amount
-//! AND amount`) exercise BETWEEN/IN desugaring over decimal_arb WITHOUT integer
-//! literals (which hit the F1 coercion gap). A literal-bounded BETWEEN pins F1.
+//! AND amount`) exercise BETWEEN/IN over decimal_arb (byte comparison, no
+//! coercion needed). A literal-bounded BETWEEN pins F1b — `Between`/`InList`
+//! bypass the binary-op ExprPlanner, so literal bounds aren't coerced (distinct
+//! from the now-fixed binary-op literal coercion, F1).
 
 use serde::Deserialize;
 use sqlx::FromRow;
@@ -155,15 +157,23 @@ async fn is_null_decimal_arb_none() {
     );
 }
 
-/// `amount BETWEEN 0 AND 100` — integer literals. KNOWN GAP (F1): decimal_arb vs
-/// integer literal can't coerce, so nothing passes. Pinned.
+/// `amount BETWEEN 0 AND 100` — integer literal bounds. KNOWN GAP (F1b): the
+/// binary-op literal coercion (`amount > 0`, `amount + 1`) is fixed, but `BETWEEN`
+/// is an `Expr::Between` node, not a `BinaryExpr`, so the decimal_arb `ExprPlanner`
+/// (`plan_binary_op`) never intercepts it — DataFusion's own coercion can't reconcile
+/// `LargeBinary` vs the `Int64` bounds and planning fails, so nothing lands. (`IN`
+/// with literals has the same `Expr::InList` shape.) Closing this needs an analyzer
+/// rule that rewrites decimal_arb `Between`/`InList` into the decimal_arb comparison
+/// UDFs. Pinned; when fixed, the in-range row lands and this tripwire fires.
 #[tokio::test]
-async fn between_int_literals_f1() {
+async fn between_int_literals_f1b() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
     let ids = ids_passing(&ctx, "amount BETWEEN 0 AND 100", &[(1, "1")]).await;
     assert!(
         ids.is_empty(),
-        "KNOWN GAP (F1): BETWEEN over decimal_arb with integer literals should pass nothing; got {ids:?} — F1 may be fixed, update this test"
+        "KNOWN GAP (F1b): BETWEEN over decimal_arb with integer literal bounds isn't \
+         coerced (Between bypasses plan_binary_op); expected no rows, got {ids:?} — \
+         if rows landed, F1b is fixed: flip to assert the in-range row"
     );
 }
