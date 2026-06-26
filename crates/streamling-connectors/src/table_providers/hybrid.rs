@@ -332,6 +332,7 @@ impl HybridTableProvider {
                         columns,
                         state_backend_factory.create(application_id.as_str()),
                         app_config.internal_buffer_size as usize,
+                        app_config.record_batch_size as usize,
                     )?);
                     debug!(
                         "Clickhouse schema for bounded source: {:?}",

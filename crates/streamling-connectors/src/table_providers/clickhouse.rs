@@ -324,6 +324,11 @@ struct SourceParams {
     initial_split_args: Vec<ScalarValue>,
     state_store: Arc<ClickHouseSourceStateStore>,
     datafusion_buffer_size: usize,
+    /// Target rows per emitted batch. A page (which dedup coalesces into one
+    /// batch) is split into chunks of this size at the emit point so downstream
+    /// operators see `record_batch_size`-bounded batches, matching the Kafka
+    /// source. Mirrors the global `AppConfig::record_batch_size`.
+    record_batch_size: usize,
     sort_key_range: i64,
     table_name: String,
     has_persisted_split: bool,
@@ -367,6 +372,7 @@ impl ClickHouseTableProvider {
         columns: Option<Vec<String>>,
         state_backend: Arc<dyn StateOperatorBackend<ClickHouseSourceSplit>>,
         datafusion_buffer_size: usize,
+        record_batch_size: usize,
     ) -> Result<Self, DataFusionError> {
         let database_name = config.connection.database.clone();
         let page_size = config.page_size.unwrap_or(Self::DEFAULT_PAGE_SIZE);
@@ -591,6 +597,7 @@ impl ClickHouseTableProvider {
             sorting_keys,
             initial_split_args,
             state_store,
+            record_batch_size,
             datafusion_buffer_size,
             sort_key_range,
             table_name: table_name.to_string(),
@@ -1310,6 +1317,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .page_size;
         let default_sort_key_range = source_params.sort_key_range;
         let table_name_for_exec = source_params.table_name.clone();
+        let record_batch_size = source_params.record_batch_size;
         let first_sorting_key_name = self
             .split
             .sorting_keys
@@ -1755,9 +1763,18 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                     }
                                 }
                                 for batch in emit_batches.into_iter() {
-                                    let batch = attach_checkpoints(batch);
-                                    if tx.send(Ok(batch)).await.is_err() {
-                                        receiver_dropped = true;
+                                    for chunk in chunk_record_batch(batch, record_batch_size) {
+                                        // attach_checkpoints drains the buffered messages onto
+                                        // the first chunk it sees (and no-ops once empty), so
+                                        // checkpoint messages still ride exactly one emitted
+                                        // batch — the first chunk of the page.
+                                        let chunk = attach_checkpoints(chunk);
+                                        if tx.send(Ok(chunk)).await.is_err() {
+                                            receiver_dropped = true;
+                                            break;
+                                        }
+                                    }
+                                    if receiver_dropped {
                                         break;
                                     }
                                 }
@@ -1866,6 +1883,29 @@ impl ExecutionPlan for ClickHouseSourceExec {
         info!("ClickHouseSourceExec built successfully");
         Ok(builder.build())
     }
+}
+
+/// Split `batch` into chunks of at most `max_rows` rows. Used at the ClickHouse
+/// source emit point so downstream operators receive `record_batch_size`-bounded
+/// batches regardless of how large a deduped page is — dedup coalesces a whole
+/// page into a single batch, which can dwarf the global `record_batch_size` that
+/// other operators (and the Kafka source) emit at.
+///
+/// `RecordBatch::slice` shares the schema (and all of its metadata) across
+/// chunks, so every chunk carries the page's schema metadata unchanged; any
+/// per-emission metadata (checkpoint messages) is attached by the caller to a
+/// single chunk after this split. A batch that is empty or already within the
+/// limit yields itself as the sole chunk. A `max_rows` of 0 is treated as "no
+/// chunking" so a misconfigured size cannot produce zero-row chunks.
+fn chunk_record_batch(batch: RecordBatch, max_rows: usize) -> Vec<RecordBatch> {
+    let n = batch.num_rows();
+    if max_rows == 0 || n <= max_rows {
+        return vec![batch];
+    }
+    (0..n)
+        .step_by(max_rows)
+        .map(|offset| batch.slice(offset, (n - offset).min(max_rows)))
+        .collect()
 }
 
 impl ClickHouseSourceExec {
@@ -3094,6 +3134,135 @@ mod tests {
         .expect("replacing variant with ORDER BY should parse");
         assert_eq!(d.version_column.as_deref(), Some("insert_timestamp"));
         assert_eq!(d.is_deleted_column.as_deref(), Some("is_deleted"));
+    }
+
+    // ---- emit-time batch chunking (chunk_record_batch) ----
+
+    fn make_int64_batch_with_meta(n: i64, meta: Option<(&str, &str)>) -> RecordBatch {
+        let fields = vec![Field::new("block_number", DataType::Int64, false)];
+        let schema = match meta {
+            Some((k, v)) => Schema::new_with_metadata(
+                fields,
+                std::iter::once((k.to_string(), v.to_string())).collect(),
+            ),
+            None => Schema::new(fields),
+        };
+        let values: Vec<i64> = (0..n).collect();
+        RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(values))
+                as arrow::array::ArrayRef],
+        )
+        .expect("valid batch")
+    }
+
+    fn make_int64_batch(n: i64) -> RecordBatch {
+        make_int64_batch_with_meta(n, None)
+    }
+
+    #[test]
+    fn chunk_record_batch_splits_evenly() {
+        let chunks = chunk_record_batch(make_int64_batch(10), 5);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].num_rows(), 5);
+        assert_eq!(chunks[1].num_rows(), 5);
+    }
+
+    #[test]
+    fn chunk_record_batch_splits_with_remainder() {
+        let chunks = chunk_record_batch(make_int64_batch(7), 3);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].num_rows(), 3);
+        assert_eq!(chunks[1].num_rows(), 3);
+        assert_eq!(chunks[2].num_rows(), 1);
+    }
+
+    #[test]
+    fn chunk_record_batch_preserves_row_order_with_no_loss_or_duplication() {
+        let chunks = chunk_record_batch(make_int64_batch(8), 3);
+        let collected: Vec<i64> = chunks
+            .iter()
+            .flat_map(|c| {
+                c.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("int64 column")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(collected, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn chunk_record_batch_under_limit_returns_single_chunk() {
+        let chunks = chunk_record_batch(make_int64_batch(3), 5);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 3);
+    }
+
+    #[test]
+    fn chunk_record_batch_empty_batch_returns_single_chunk() {
+        let chunks = chunk_record_batch(make_int64_batch(0), 5);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn chunk_record_batch_max_rows_zero_is_a_noop() {
+        // A misconfigured size of 0 must not produce zero-row chunks or loop.
+        let chunks = chunk_record_batch(make_int64_batch(10), 0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 10);
+    }
+
+    #[test]
+    fn chunk_record_batch_preserves_schema_metadata_on_every_chunk() {
+        let batch = make_int64_batch_with_meta(7, Some(("schema_version", "42")));
+        let chunks = chunk_record_batch(batch, 3);
+        assert_eq!(chunks.len(), 3);
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(
+                c.schema().metadata().get("schema_version"),
+                Some(&"42".to_string()),
+                "chunk {} lost the schema metadata",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_record_batch_checkpoint_rides_first_chunk_only() {
+        // Mirrors the emit loop: a page is chunked, then per-emission metadata
+        // (checkpoint messages) is attached to the FIRST chunk only, because
+        // attach_checkpoints drains its buffer on first use and no-ops after.
+        // Chunks are independent RecordBatches, so merging metadata into the
+        // first cannot leak to the rest — this locks that invariant so a future
+        // refactor can't silently duplicate or drop checkpoint messages.
+        let chunks = chunk_record_batch(make_int64_batch(7), 3);
+        assert_eq!(chunks.len(), 3);
+        let first = {
+            let merged: std::collections::HashMap<String, String> =
+                std::iter::once(("checkpoint_epoch".to_string(), "99".to_string())).collect();
+            let schema = Schema::new_with_metadata(
+                vec![Field::new("block_number", DataType::Int64, false)],
+                merged,
+            );
+            RecordBatch::try_new(std::sync::Arc::new(schema), chunks[0].columns().to_vec())
+                .expect("rebuild first chunk with checkpoint metadata")
+        };
+        assert_eq!(
+            first.schema().metadata().get("checkpoint_epoch"),
+            Some(&"99".to_string()),
+            "first chunk carries the checkpoint"
+        );
+        for c in chunks.iter().skip(1) {
+            assert!(
+                c.schema().metadata().get("checkpoint_epoch").is_none(),
+                "a later chunk leaked the checkpoint — chunks must be independent"
+            );
+        }
     }
 
     #[test]
@@ -4379,6 +4548,7 @@ mod tests {
                 initial_split_args: initial_split_args.clone(),
                 state_store,
                 datafusion_buffer_size: 16,
+                record_batch_size: 1000,
                 sort_key_range: 1_000_000,
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
