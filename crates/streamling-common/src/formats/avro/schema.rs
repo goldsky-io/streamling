@@ -230,7 +230,19 @@ fn schema_to_field_with_props(
 ) -> AvroResult<Field> {
     let mut nullable = nullable;
     let field_type: DataType = match schema {
-        AvroSchema::Ref { .. } => todo!("Add support for AvroSchema::Ref"),
+        // Named-type references (shared/recursive type definitions) require the
+        // enclosing schema's named-type registry to resolve, which this leaf-wise
+        // converter doesn't carry. Fail gracefully instead of panicking.
+        // `Inconclusive` would read best here but is gated behind an apache-avro
+        // feature we don't enable (default-features = false); `ParsePrimitive` is
+        // the closest always-available variant, and the message carries the detail.
+        AvroSchema::Ref { name } => {
+            return Err(apache_avro::Error::ParsePrimitive(format!(
+                "unsupported avro schema reference '{}': named-type / recursive \
+                 references must be resolved before arrow conversion",
+                name.fullname(None)
+            )));
+        }
         AvroSchema::Null => DataType::Null,
         AvroSchema::Boolean => DataType::Boolean,
         AvroSchema::Int => DataType::Int32,
@@ -309,9 +321,12 @@ fn schema_to_field_with_props(
         AvroSchema::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
         AvroSchema::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
         AvroSchema::TimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        AvroSchema::LocalTimestampMillis => todo!(),
-        AvroSchema::LocalTimestampMicros => todo!(),
-        AvroSchema::LocalTimestampNanos => todo!(),
+        // Local (timezone-naive) timestamps map to the same tz-less Arrow
+        // timestamp as their non-local counterparts above (`Timestamp(unit,
+        // None)`); common in Kafka/Flink Avro for events without a timezone.
+        AvroSchema::LocalTimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+        AvroSchema::LocalTimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
+        AvroSchema::LocalTimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
         AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
     };
 
