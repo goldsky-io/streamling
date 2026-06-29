@@ -157,23 +157,28 @@ async fn is_null_decimal_arb_none() {
     );
 }
 
-/// `amount BETWEEN 0 AND 100` — integer literal bounds. KNOWN GAP (F1b): the
-/// binary-op literal coercion (`amount > 0`, `amount + 1`) is fixed, but `BETWEEN`
-/// is an `Expr::Between` node, not a `BinaryExpr`, so the decimal_arb `ExprPlanner`
-/// (`plan_binary_op`) never intercepts it — DataFusion's own coercion can't reconcile
-/// `LargeBinary` vs the `Int64` bounds and planning fails, so nothing lands. (`IN`
-/// with literals has the same `Expr::InList` shape.) Closing this needs an analyzer
-/// rule that rewrites decimal_arb `Between`/`InList` into the decimal_arb comparison
-/// UDFs. Pinned; when fixed, the in-range row lands and this tripwire fires.
+/// `amount BETWEEN 0 AND 100` — integer literal bounds. F1b FIXED: a
+/// `FunctionRewrite` (`DecimalArbPredicateRewrite`) desugars decimal_arb
+/// `Between`/`InList` into the decimal_arb comparison UDFs *before* TypeCoercion,
+/// coercing the integer bounds. amount is decimal(100,18): 5.0 is in range,
+/// -3.0 is below 0, 200 is above 100.
 #[tokio::test]
-async fn between_int_literals_f1b() {
+async fn between_int_literals() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
-    let ids = ids_passing(&ctx, "amount BETWEEN 0 AND 100", &[(1, "1")]).await;
-    assert!(
-        ids.is_empty(),
-        "KNOWN GAP (F1b): BETWEEN over decimal_arb with integer literal bounds isn't \
-         coerced (Between bypasses plan_binary_op); expected no rows, got {ids:?} — \
-         if rows landed, F1b is fixed: flip to assert the in-range row"
+    let ids = ids_passing(
+        &ctx,
+        "amount BETWEEN 0 AND 100",
+        &[
+            (1, "5000000000000000000"),   // 5.0  -> in range
+            (2, "-3000000000000000000"),  // -3.0 -> below 0
+            (3, "200000000000000000000"), // 200  -> above 100
+        ],
+    )
+    .await;
+    assert_eq!(
+        ids,
+        vec![1],
+        "only the in-range value passes BETWEEN 0 AND 100 (F1b fixed); got {ids:?}"
     );
 }

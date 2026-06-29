@@ -19,6 +19,7 @@ use streamling_common::functions::decimal_arb_aggregates::{
     DecimalArbAvgUdaf, DecimalArbExtremeUdaf, DecimalArbSumUdaf,
 };
 use streamling_common::functions::decimal_arb_coercion::DecimalArbExprPlanner;
+use streamling_common::functions::decimal_arb_predicate_optimizer::DecimalArbExprRewrite;
 use streamling_common::functions::decimal_arb_sort_optimizer::DecimalArbSortRewriteRule;
 use streamling_flink_compat::{register_json_functions, register_string_aliases};
 
@@ -173,6 +174,12 @@ impl SessionManager {
         ctx.register_udaf(DecimalArbExtremeUdaf::max_udaf());
         ctx.register_udaf(DecimalArbAvgUdaf::into_udaf());
         ctx.register_expr_planner(Arc::new(DecimalArbExprPlanner::new()))?;
+        // Rewrite `BETWEEN` / `IN` over decimal_arb into the decimal_arb
+        // comparison UDFs (F1b). Registered as a FunctionRewrite so it runs in
+        // the analyzer *before* TypeCoercion — which would otherwise fail to
+        // reconcile LargeBinary against the Int64 bounds before any optimizer
+        // rule could rewrite the Between/InList node.
+        ctx.register_function_rewrite(Arc::new(DecimalArbExprRewrite::new()))?;
 
         crate::plugin::udf::register_plugin_udfs(&ctx);
 
@@ -536,15 +543,12 @@ mod tests {
         assert_eq!(v1.to_canonical_string(), "888");
     }
 
-    /// KNOWN GAP (tripwire): DataFusion's `CASE` does not propagate the
-    /// `decimal_arb` extension metadata to its output field, so `chosen` comes
-    /// back as a bare `LargeBinary`. A downstream Postgres/ClickHouse sink keyed
-    /// on the extension metadata would then treat the column as raw BYTEA/binary
-    /// instead of `NUMERIC(p, s)`. Fixing this needs a metadata-propagation rule
-    /// (the decimal_arb `ExprPlanner` only covers binary ops, not CASE). Ignored
-    /// until that lands; remove `#[ignore]` once metadata survives CASE.
+    /// F2 FIXED: `CASE` over `decimal_arb` used to come back as a bare
+    /// `LargeBinary` (extension metadata dropped), so a Postgres/ClickHouse sink
+    /// treated it as raw BYTEA instead of `NUMERIC(p, s)`. The
+    /// `DecimalArbExprRewrite` FunctionRewrite now re-stamps the metadata, so the
+    /// `chosen` output is a proper decimal_arb field again.
     #[tokio::test]
-    #[ignore = "known gap: CASE over decimal_arb drops the extension metadata (needs a metadata-propagation rule)"]
     async fn case_over_decimal_arb_should_preserve_metadata() {
         use crate::types::decimal_arb::DecimalArbType;
 
