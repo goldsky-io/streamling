@@ -36,6 +36,7 @@ use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaSt
 use arrow_schema::{DataType, Field, FieldRef, Fields, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use serde_json::Value as Json;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::convert_avro_schema_to_arrow;
@@ -416,6 +417,16 @@ pub struct ConfluentAvroDecoder {
     /// concatenated by `flush`.
     pending: Vec<RecordBatch>,
     decoder: Option<Decoder>,
+    /// The reader record's Avro full name (set by `with_reader_schema`), used to detect a writer
+    /// whose top-level record name differs from the reader's.
+    reader_full_name: Option<String>,
+    /// Full names of registered writer records that differ from the reader's. These are injected as
+    /// aliases on the reader schema before building the arrow-avro decoder: arrow-avro performs
+    /// spec-strict record-name resolution and rejects a writer/reader name mismatch, whereas the
+    /// vendored reader matched fields positionally and ignored the record name. Producers that
+    /// rename the top-level record (e.g. a transform / schema-compat output named differently from
+    /// the topic's writer schema) are common, so we preserve the old lenient behavior via aliases.
+    writer_aliases: BTreeSet<String>,
 }
 
 /// Strip high-precision decimals, then if the root is a union, unwrap it to its record branch.
@@ -441,6 +452,21 @@ fn prepare_arrow_avro_schema(json: &str) -> Result<(String, Option<i64>)> {
     let record_json =
         serde_json::to_string(&root).map_err(|e| DataFusionError::External(Box::new(e)))?;
     Ok((record_json, None))
+}
+
+/// The Avro full name (`namespace.name`, or bare `name`) of a record-root schema JSON. Returns
+/// `None` if the JSON isn't an object with a string `name`. A `name` that already contains a dot is
+/// itself a full name (the namespace attribute is ignored), matching arrow-avro's `make_full_name`.
+fn record_full_name(record_json: &str) -> Option<String> {
+    let v: Json = serde_json::from_str(record_json).ok()?;
+    let name = v.get("name")?.as_str()?;
+    if name.contains('.') {
+        return Some(name.to_string());
+    }
+    match v.get("namespace").and_then(Json::as_str) {
+        Some(ns) if !ns.is_empty() => Some(format!("{ns}.{name}")),
+        _ => Some(name.to_string()),
+    }
 }
 
 /// Decode a zigzag avro `long` from the front of `buf`; returns `(value, bytes_consumed)`.
@@ -482,6 +508,8 @@ impl ConfluentAvroDecoder {
             active_writer_id: None,
             pending: Vec::new(),
             decoder: None,
+            reader_full_name: None,
+            writer_aliases: BTreeSet::new(),
         }
     }
 
@@ -492,6 +520,7 @@ impl ConfluentAvroDecoder {
         let reader_json =
             serde_json::to_string(reader).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let (record_json, _) = prepare_arrow_avro_schema(&reader_json)?;
+        self.reader_full_name = record_full_name(&record_json);
         self.reader_schema_json = Some(record_json);
         self.target_schema = Some(convert_avro_schema_to_arrow(reader.clone()));
         self.decoder = None;
@@ -506,6 +535,15 @@ impl ConfluentAvroDecoder {
             let parsed = ApacheAvroSchema::parse_str(writer_json)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             self.target_schema = Some(convert_avro_schema_to_arrow(parsed));
+        }
+        // If this writer's top-level record name differs from the reader's, remember it so the
+        // reader schema can claim it as an alias when the decoder is (re)built — otherwise
+        // arrow-avro's spec-strict name resolution rejects the mismatch (see `writer_aliases`).
+        if let (Some(reader_name), Some(writer_name)) =
+            (&self.reader_full_name, record_full_name(&record_json))
+            && &writer_name != reader_name
+        {
+            self.writer_aliases.insert(writer_name);
         }
         // The wire framing (union-wrapped or not) is consistent per subject; record it so
         // `decode` can strip the union-branch prefix from each body.
@@ -529,15 +567,54 @@ impl ConfluentAvroDecoder {
         self.target_schema.as_ref()
     }
 
+    /// The reader schema JSON with any differing writer record names merged into its top-level
+    /// `aliases`, so arrow-avro's record-name resolution accepts those writers. Returns the reader
+    /// JSON unchanged when there are no such writers (the common same-name case).
+    fn reader_json_with_aliases(&self) -> Result<Option<String>> {
+        let Some(base) = &self.reader_schema_json else {
+            return Ok(None);
+        };
+        if self.writer_aliases.is_empty() {
+            return Ok(Some(base.clone()));
+        }
+        let mut v: Json =
+            serde_json::from_str(base).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let Some(obj) = v.as_object_mut() else {
+            return Ok(Some(base.clone()));
+        };
+        let mut aliases: Vec<Json> = obj
+            .get("aliases")
+            .and_then(Json::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let existing: BTreeSet<String> = aliases
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::to_string)
+            .collect();
+        for name in &self.writer_aliases {
+            if !existing.contains(name) {
+                aliases.push(Json::String(name.clone()));
+            }
+        }
+        obj.insert("aliases".to_string(), Json::Array(aliases));
+        Ok(Some(
+            serde_json::to_string(&v).map_err(|e| DataFusionError::External(Box::new(e)))?,
+        ))
+    }
+
     fn ensure_decoder(&mut self) -> Result<&mut Decoder> {
         if self.decoder.is_none() {
             let mut builder = ReaderBuilder::new().with_writer_schema_store(self.store.clone());
-            if let Some(js) = &self.reader_schema_json {
-                builder = builder.with_reader_schema(AvroSchema::new(js.clone()));
+            if let Some(js) = self.reader_json_with_aliases()? {
+                builder = builder.with_reader_schema(AvroSchema::new(js));
             }
             self.decoder = Some(builder.build_decoder().map_err(arrow_err)?);
         }
-        Ok(self.decoder.as_mut().unwrap())
+        Ok(self
+            .decoder
+            .as_mut()
+            .expect("decoder is Some: built just above when it was None"))
     }
 
     /// Decode one Confluent-framed message: `0x00` + 4-byte big-endian schema id + avro body.
@@ -597,7 +674,7 @@ impl ConfluentAvroDecoder {
         let batch = self
             .decoder
             .as_mut()
-            .unwrap()
+            .expect("decoder is Some: guarded by the is_none() early return above")
             .flush()
             .map_err(|e| DataFusionError::Internal(format!("arrow-avro flush failed: {e}")))?;
         match batch {
@@ -621,7 +698,12 @@ impl ConfluentAvroDecoder {
         let batches = std::mem::take(&mut self.pending);
         match batches.len() {
             0 => Ok(None),
-            1 => Ok(Some(batches.into_iter().next().unwrap())),
+            1 => Ok(Some(
+                batches
+                    .into_iter()
+                    .next()
+                    .expect("batches.len() == 1 in this match arm"),
+            )),
             _ => Ok(Some(concat_batches(&target, &batches).map_err(arrow_err)?)),
         }
     }
@@ -867,5 +949,52 @@ mod tests {
         for c in batch.columns() {
             assert_eq!(c.len(), 6, "column length mismatch across writer schemas");
         }
+    }
+
+    // Regression: a producer whose top-level record name differs from the reader's. The vendored
+    // reader matched fields positionally and ignored the record name; arrow-avro does spec-strict
+    // name resolution and would otherwise fail with "Record name mismatch writer=..., reader=...".
+    // We inject the writer name as a reader alias so resolution succeeds (and field-level schema
+    // evolution still applies). Mirrors the production `arbitrum-one.raw.traces` failure.
+    #[test]
+    fn writer_record_name_differs_from_reader_decodes_via_alias() {
+        // Same fields, different record names — a pure rename plus one added reader field (default).
+        const WRITER: &str = r#"{"type":"record","name":"trace_arbitrums_after_evm_transfers","fields":[{"name":"id","type":"long"},{"name":"data","type":"string"}]}"#;
+        const READER: &str = r#"{"type":"record","name":"ArbitrumTransfer","fields":[{"name":"id","type":"long"},{"name":"data","type":"string"},{"name":"version","type":"int","default":7}]}"#;
+        let writer = AvroWriterSchema::parse_str(WRITER).unwrap();
+        let reader = AvroWriterSchema::parse_str(READER).unwrap();
+        let (writer_id, reader_id): (u32, u32) = (10, 20);
+
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&reader)
+            .unwrap();
+        // Pre-register the reader's own schema (the same-id fast path), then the differently-named
+        // writer fetched on first sight — exactly what the Kafka source does.
+        decoder.register_writer_schema(reader_id, READER).unwrap();
+        decoder.register_writer_schema(writer_id, WRITER).unwrap();
+
+        for i in 1..=3i64 {
+            let mut rec = Record::new(&writer).unwrap();
+            rec.put("id", Value::Long(i));
+            rec.put("data", Value::String(format!("row_{i}")));
+            let body = to_avro_datum(&writer, rec).unwrap();
+            decoder
+                .decode(&confluent_frame(writer_id, &body))
+                .expect("decode must not fail on a writer/reader record-name mismatch");
+        }
+
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 3, "id, data, version(default)");
+        let versions = batch
+            .column(batch.schema().index_of("version").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("version is int32");
+        // The reader-only field is filled from its default for every writer row.
+        assert!(
+            (0..3).all(|i| versions.value(i) == 7),
+            "added reader field resolved to its default"
+        );
     }
 }
