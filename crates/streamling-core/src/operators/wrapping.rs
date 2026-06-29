@@ -183,6 +183,59 @@ fn emit_event_time_metrics(
     }
 }
 
+/// Accumulates the time a wrapped node spends backpressured.
+///
+/// A node is backpressured while it is suspended at `yield` after producing a
+/// batch, waiting for its downstream consumer to poll for the next one. That
+/// suspension span (yield -> resume) is time the node *could* have spent
+/// producing but was held back by everything downstream of it — the canonical
+/// definition of backpressure.
+///
+/// Usage in a stream loop: call [`on_yield`](Self::on_yield) immediately before
+/// yielding a batch, and [`on_resume`](Self::on_resume) at the top of the next
+/// iteration (the resume point). [`take_whole_millis`](Self::take_whole_millis)
+/// drains the accrued time as whole milliseconds for emission, retaining any
+/// sub-millisecond remainder so it is not lost across batches.
+///
+/// Kept as a small, side-effect-free helper so the accumulation math is unit
+/// testable with hand-fed `Instant`s, independent of the async stream.
+#[derive(Debug, Default)]
+struct BackpressureAccumulator {
+    last_yield: Option<Instant>,
+    total: Duration,
+}
+
+impl BackpressureAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the instant a batch was yielded downstream. The span until the
+    /// next [`on_resume`](Self::on_resume) counts as backpressure.
+    fn on_yield(&mut self, now: Instant) {
+        self.last_yield = Some(now);
+    }
+
+    /// Called when the stream resumes (is polled again) after a prior yield.
+    /// Adds the suspension span to the running total. A no-op before the first
+    /// yield, so the first loop iteration contributes nothing.
+    fn on_resume(&mut self, now: Instant) {
+        if let Some(last) = self.last_yield.take() {
+            self.total += now.saturating_duration_since(last);
+        }
+    }
+
+    /// Drain the accrued backpressure as whole milliseconds, retaining the
+    /// sub-millisecond remainder. Returns 0 until at least 1ms has accrued.
+    fn take_whole_millis(&mut self) -> u64 {
+        let whole = self.total.as_millis() as u64;
+        if whole > 0 {
+            self.total -= Duration::from_millis(whole);
+        }
+        whole
+    }
+}
+
 /// WrappingSourceTableProvider wraps any source TableProvider and automatically adds additional
 /// capabilities like telemetry and dynamic tables to its ExecutionPlan without requiring changes
 /// to the underlying implementation
@@ -548,7 +601,26 @@ impl ExecutionPlan for WrappingExec {
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
+            // Tracks time this node spends suspended after yielding a batch
+            // while waiting for the downstream consumer to poll again — i.e.
+            // backpressure exerted on this node by everything downstream.
+            let mut backpressure = BackpressureAccumulator::new();
             loop {
+                // Resume point: the span since the previous `yield` is the
+                // downstream-induced suspension. The first iteration has no
+                // prior yield and contributes nothing. Time subsequently spent
+                // in `data.next().await` (waiting on upstream) is excluded
+                // because it happens after this measurement.
+                backpressure.on_resume(Instant::now());
+                let backpressured_ms = backpressure.take_whole_millis();
+                if backpressured_ms > 0 {
+                    metrics_recorder.record_count(
+                        "node_backpressured_time",
+                        backpressured_ms,
+                        &metric_metadata_id,
+                    );
+                }
+
                 let batch_start = Instant::now();
                 let batch_result = data.next().await;
                 let batch_elapsed = batch_start.elapsed();
@@ -613,6 +685,10 @@ impl ExecutionPlan for WrappingExec {
 
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
+                        // Mark the yield instant; the next `on_resume` at the
+                        // top of the loop measures how long the downstream took
+                        // to request the following batch.
+                        backpressure.on_yield(Instant::now());
                         yield Ok(batch);
                     }
                     Err(e) => {
@@ -1435,5 +1511,95 @@ mod tests {
         // `true` and the warn-log path is skipped.
         emit_event_time_metrics(&inst, &batch, "test_source", recorder.as_ref());
         assert!(inst.read_error_logged.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn backpressure_accumulator_first_resume_is_zero() {
+        // Before any yield there is no prior suspension to attribute, so the
+        // first `on_resume` (top of the very first loop iteration) contributes
+        // nothing — guarding against an off-by-one that would charge the first
+        // batch with bogus backpressure.
+        let mut acc = BackpressureAccumulator::new();
+        let now = Instant::now();
+        acc.on_resume(now);
+        assert_eq!(acc.take_whole_millis(), 0);
+    }
+
+    #[test]
+    fn backpressure_accumulator_accumulates_yield_to_resume_gap() {
+        let mut acc = BackpressureAccumulator::new();
+        let t0 = Instant::now();
+        // Yield at t0, resume 5ms later → 5ms of backpressure.
+        acc.on_yield(t0);
+        acc.on_resume(t0 + Duration::from_millis(5));
+        // Yield again, resume 7ms later → +7ms.
+        acc.on_yield(t0 + Duration::from_millis(5));
+        acc.on_resume(t0 + Duration::from_millis(12));
+        assert_eq!(acc.take_whole_millis(), 12);
+    }
+
+    #[test]
+    fn backpressure_accumulator_retains_sub_millisecond_remainder() {
+        let mut acc = BackpressureAccumulator::new();
+        let t0 = Instant::now();
+        // 1.5ms gap: only 1 whole ms drains, 0.5ms is retained.
+        acc.on_yield(t0);
+        acc.on_resume(t0 + Duration::from_micros(1_500));
+        assert_eq!(acc.take_whole_millis(), 1);
+        assert_eq!(acc.take_whole_millis(), 0);
+        // Another 0.5ms gap pushes the retained remainder over 1ms.
+        acc.on_yield(t0);
+        acc.on_resume(t0 + Duration::from_micros(500));
+        assert_eq!(acc.take_whole_millis(), 1);
+    }
+
+    /// Drives a `WrappingExec` output stream with a deliberately slow consumer
+    /// (a sleep between polls) so the yield->resume span exceeds a millisecond
+    /// and the backpressure accounting path runs. Guards that the instrumented
+    /// loop preserves the data path — every row is delivered — and never panics
+    /// or hangs with the accounting in place.
+    ///
+    /// Uses an *unregistered* node id so the test does not mutate the global
+    /// metrics recorder (which would race with the recorder's own tests). The
+    /// emission record_count call still executes; it returns early at the
+    /// metadata lookup. That emission dispatches to the *counter* registry
+    /// (rather than panicking on a histogram lookup) is covered by
+    /// `backpressure_counters_are_registered`.
+    #[tokio::test]
+    async fn wrapping_exec_streams_all_rows_under_slow_consumer() {
+        let schema = test_schema();
+        // Three batches in a single partition → multiple yield/resume cycles.
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let source_exec = mem_table.scan(&state, None, &[], None).await.unwrap();
+
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            "bp_unregistered_node".to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch must be Ok");
+            total_rows += batch.num_rows();
+            // Slow consumer: force >1ms of backpressure before the next poll.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        assert_eq!(
+            total_rows,
+            test_batch().num_rows() * 3,
+            "all rows must flow through the instrumented loop"
+        );
     }
 }

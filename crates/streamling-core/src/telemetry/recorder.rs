@@ -800,6 +800,38 @@ pub fn initialize_metrics_recorder(
                 .with_boundaries(duration_boundaries_ms.clone())
                 .build(),
         );
+
+        // Backpressure metrics — monotonic counters in milliseconds.
+        // `node_backpressured_time` accumulates, per wrapped node, the time the
+        // node spends suspended after yielding a batch while it waits for the
+        // downstream consumer to poll again (i.e. downstream is the bottleneck).
+        // `backpressure_blocked_send` accumulates, per multi-sink fan-out edge,
+        // the time a broadcast producer spends blocked on a full consumer
+        // channel; the `downstream_id` tag names the slow sink so a single
+        // struggling sink in a multi-sink topology can be pinpointed.
+        // The OTel Prometheus exporter appends the unit and `_total` suffixes,
+        // yielding `streamling_node_backpressured_time_milliseconds_total` and
+        // `streamling_backpressure_blocked_send_milliseconds_total`.
+        count_registry.insert(
+            String::from("node_backpressured_time"),
+            meter
+                .u64_counter(add_service_prefix("node_backpressured_time"))
+                .with_description(
+                    "Time a node spends backpressured (suspended at yield waiting for downstream to poll), milliseconds",
+                )
+                .with_unit("ms")
+                .build(),
+        );
+        count_registry.insert(
+            String::from("backpressure_blocked_send"),
+            meter
+                .u64_counter(add_service_prefix("backpressure_blocked_send"))
+                .with_description(
+                    "Time a fan-out producer spends blocked on a full downstream consumer channel, attributed via the downstream_id tag, milliseconds",
+                )
+                .with_unit("ms")
+                .build(),
+        );
         let mut metric_metadata_tags_registry = HashMap::new();
         // caching tags for each metric metadata so that we don't have to compute them everytime metric is recorded
         for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
@@ -1048,6 +1080,12 @@ impl ControlPlaneMetricsRecorder {
     pub fn record_count(&self, name: &str, value: u64) {
         self.inner
             .record_count_w_tags(name, value, vec![], &self.component_id);
+    }
+
+    /// Record a counter metric with extra tags (e.g. `downstream_id`).
+    pub fn record_count_w_tags(&self, name: &str, value: u64, tags: Vec<(&str, &str)>) {
+        self.inner
+            .record_count_w_tags(name, value, tags, &self.component_id);
     }
 
     /// Record a gauge metric.
@@ -1460,6 +1498,27 @@ mod tests {
             let tags = additional_tags("app::blocks");
             assert_eq!(tags.get("chain"), Some(&"polygon".to_string()));
             assert_eq!(tags.get("tier"), Some(&"gold".to_string()));
+        }
+
+        /// The backpressure counters must be pre-registered by
+        /// `initialize_metrics_recorder`. Emission paths look counters up by
+        /// name and panic if missing (see `record_metric_data`), so this guards
+        /// against a refactor silently dropping the registration.
+        #[test]
+        fn backpressure_counters_are_registered() {
+            let _guard = TEST_LOCK.lock().unwrap();
+            reset_instance();
+            seed_metadata("app::blocks");
+            let recorder = get_metrics_recorder();
+            let counters = recorder.count_registry.lock().unwrap();
+            assert!(
+                counters.contains_key("node_backpressured_time"),
+                "node_backpressured_time counter must be pre-registered"
+            );
+            assert!(
+                counters.contains_key("backpressure_blocked_send"),
+                "backpressure_blocked_send counter must be pre-registered"
+            );
         }
     }
 

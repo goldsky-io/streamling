@@ -103,6 +103,33 @@ impl PrometheusResource {
         )
     }
 
+    /// Build a query for the per-node backpressured-time counter (total ms a
+    /// node spent suspended waiting for its downstream to poll).
+    pub fn node_backpressured_time_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_metric_query(
+            "streamling_node_backpressured_time_milliseconds_total",
+            node_id,
+            instance_id,
+        )
+    }
+
+    /// Build a query for the multi-sink blocked-send counter filtered by the
+    /// downstream sink it is attributed to (total ms the broadcast producer was
+    /// blocked on that sink's full channel).
+    pub fn backpressure_blocked_send_query(
+        downstream_id: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        let mut labels = format!("downstream_id=\"{}\"", downstream_id);
+        if let Some(instance) = instance_id {
+            labels.push_str(&format!(",instance=\"{}\"", instance));
+        }
+        format!(
+            "streamling_backpressure_blocked_send_milliseconds_total{{{}}}",
+            labels
+        )
+    }
+
     /// Build a query for a checkpoint coordinator metric (counter total).
     /// Coordinator metrics use `id="checkpoint_coordinator"`.
     pub fn checkpoint_coordinator_query(metric_name: &str, instance_id: Option<&str>) -> String {

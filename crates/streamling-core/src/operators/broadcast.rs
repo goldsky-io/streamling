@@ -425,8 +425,10 @@ impl ExecutionPlan for MultiSinkExec {
             let has_transforms = self.sink_has_transforms[i];
             let sink_name = self.sink_names.get(i).cloned().unwrap_or_default();
             let rebatch_config = self.sink_rebatch_configs[i].clone();
+            // Attribute this consumer's blocked-send time to the sink it feeds
+            // so a single slow sink can be pinpointed in a multi-sink topology.
             let broadcast_consumer: SendableRecordBatchStream =
-                Box::pin(broadcast_stream.add_consumer());
+                Box::pin(broadcast_stream.add_consumer(sink_name.clone()));
             let task_context = context.clone();
             let broadcast_schema = self.schema();
 
@@ -503,7 +505,9 @@ impl ExecutionPlan for MultiSinkExec {
             });
         }
 
-        let output_consumer = broadcast_stream.add_consumer();
+        // The passthrough output is not a sink; opt out of blocked-send
+        // attribution with an empty downstream id.
+        let output_consumer = broadcast_stream.add_consumer(String::new());
 
         // Start broadcasting after all consumers (sinks + output) are registered
         broadcast_stream.start(data);

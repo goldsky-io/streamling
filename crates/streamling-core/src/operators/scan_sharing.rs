@@ -230,7 +230,10 @@ impl ExecutionPlan for BroadcastingExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let broadcast = self.handle.get_or_start_broadcast_stream();
-        let consumer = broadcast.add_consumer();
+        // Scan-sharing fan-out is out of scope for blocked-send attribution
+        // (the consuming branch's identity is not available here), so opt out
+        // with an empty downstream id.
+        let consumer = broadcast.add_consumer(String::new());
         self.handle.register_consumer();
         self.handle.start_if_needed(partition, context)?;
         Ok(Box::pin(consumer))
