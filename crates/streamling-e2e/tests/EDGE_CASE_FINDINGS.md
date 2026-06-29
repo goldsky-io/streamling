@@ -52,27 +52,31 @@ result length as `max(left.len(), right.len())`, so an empty column (0 rows) aga
 broadcast scalar (len 1) gave length 1 and read `column.value(0)` out of bounds —
 replaced with proper broadcast semantics (`broadcast_len`).
 
-### F1b — `BETWEEN` / `IN` with literal bounds over `decimal_arb` — still open
-**Test:** `edge_sql_runnable::between_int_literals_f1b` (pinned tripwire).
-**Symptom:** `amount BETWEEN 0 AND 100` (and `amount IN (…)` with literals) fails to plan
-/ lands nothing. **Distinct from F1**: `BETWEEN` is an `Expr::Between` and `IN` an
-`Expr::InList` — not `BinaryExpr` — so the decimal_arb `ExprPlanner::plan_binary_op` hook
-never intercepts them, and DataFusion's native coercion can't reconcile `LargeBinary` vs
-the `Int64` bounds. (`x BETWEEN x AND x` over decimal_arb works only because it needs no
-coercion — byte comparison of equal operands.)
-**Suggested fix:** an `AnalyzerRule` that rewrites a decimal_arb `Between`/`InList` into the
-decimal_arb comparison UDFs (`>=`/`<=`/`=` chains), or expands them to binary ops before
-the ExprPlanner runs.
+### F1b — `BETWEEN` / `IN` with literal bounds over `decimal_arb` — **FIXED**
+**Tests:** `edge_sql_runnable::between_int_literals` (asserts correct filtering), plus unit
+tests `decimal_arb_predicate_optimizer::tests::{between_integer_literals_filters_correctly, not_between_integer_literals_filters_correctly, in_integer_literals_filters_correctly, not_in_integer_literals_filters_correctly}`.
+**Was:** `amount BETWEEN 0 AND 100` / `amount IN (…)` with literals failed to plan.
+**Distinct from F1**: `BETWEEN` is an `Expr::Between` and `IN` an `Expr::InList` — not
+`BinaryExpr` — so `ExprPlanner::plan_binary_op` never intercepts them, and `TypeCoercion`
+(an analyzer pass) can't reconcile `LargeBinary` vs the `Int64` bounds.
+**Fix:** the `DecimalArbExprRewrite` `FunctionRewrite` (runs before `TypeCoercion`)
+desugars decimal_arb `Between`/`InList` into the decimal_arb comparison UDFs, coercing the
+bounds/elements the same way the binary-op planner coerces (F1). See that module for the
+full rewrite table.
 
-### F2 — `CASE` over `decimal_arb` drops the extension metadata → sink fails/hangs
-**Tests:** `edge_decimal_sql::sql_case_passthrough_metadata_tripwire`, `sql_nested_case`.
-**Symptom:** the `CASE` output field is bare `LargeBinary` (no decimal_arb
-metadata), so the Postgres NUMERIC insert fails and the sink retries to the
-timeout (see F4). End-to-end confirmation of the gap already tracked in PR #37's
-TODO and the `#[ignore]`d unit tripwire
-`session::tests::case_over_decimal_arb_should_preserve_metadata`.
-**Suggested fix:** a metadata-propagation rule so expression outputs (CASE,
-COALESCE, …) whose inputs are `decimal_arb` retain the extension metadata.
+### F2 — `CASE`/`COALESCE` over `decimal_arb` dropped the extension metadata — **FIXED**
+**Tests:** `edge_decimal_sql::{sql_case_passthrough_metadata_tripwire, sql_nested_case}`
+(now assert the value round-trips), `session::tests::case_over_decimal_arb_should_preserve_metadata`
+(un-`#[ignore]`d), plus unit tests
+`decimal_arb_predicate_optimizer::tests::{case_over_decimal_arb_preserves_metadata, coalesce_over_decimal_arb_preserves_metadata, case_over_non_decimal_arb_is_untouched}`.
+**Was:** the `CASE`/`COALESCE` output field came back as bare `LargeBinary` (no
+decimal_arb metadata), so the Postgres NUMERIC insert failed (then retried to
+timeout via F4) and JSON sinks rendered hex.
+**Fix:** the `DecimalArbExprRewrite` `FunctionRewrite` wraps a `CASE`/`COALESCE`
+whose branches are decimal_arb in `decimal_arb_with_meta(expr, p, s)`, restoring
+the `(precision, scale)` metadata. Fires only when all non-null branches share a
+scale (the canonical bytes carry no scale of their own, so a single stamp would
+misread a different-scaled branch); mixed-scale branches are left untouched.
 
 ### F3 — Standard Decimal128/256 → Postgres bound with the decimal point misplaced — **FIXED**
 **Tests:** `edge_decimal_boundaries::{dec128_scale_equals_precision, dec128_negative_near_min, dec256_negative_high_scale}` (now assert the correct value lands), plus unit test

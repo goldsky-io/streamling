@@ -1193,6 +1193,84 @@ impl ScalarUDFImpl for ToDecimalArbFromIntFunc {
     }
 }
 
+// ---------- Metadata stamping: with_meta (CASE/COALESCE output) ----------
+
+/// `decimal_arb_with_meta(value, precision_lit, scale_lit)` — passes the
+/// `LargeBinary` value through UNCHANGED but stamps the result field with
+/// decimal_arb `(precision, scale)` metadata.
+///
+/// DataFusion derives a `CASE`/`COALESCE` output field as bare `LargeBinary`,
+/// dropping the decimal_arb extension metadata (F2); a downstream sink then
+/// treats the column as raw BYTEA instead of `NUMERIC(p, s)` (Postgres) or
+/// renders hex (JSON). The metadata-propagation rewrite wraps such an
+/// expression in this UDF to restore the metadata. The value bytes are already
+/// canonical decimal_arb at `scale` (the rewrite only fires when all decimal_arb
+/// branches share the same scale), so no re-encoding is needed.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbWithMetaFunc {
+    signature: Signature,
+}
+
+impl Default for DecimalArbWithMetaFunc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecimalArbWithMetaFunc {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![
+                    DataType::LargeBinary,
+                    DataType::Int64,
+                    DataType::Int64,
+                ])],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for DecimalArbWithMetaFunc {
+    fn name(&self) -> &str {
+        "decimal_arb_with_meta"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let precision = ToDecimalArbFromStringFunc::read_return_field_literal(
+            &args,
+            1,
+            "decimal_arb_with_meta",
+        )?;
+        let scale = ToDecimalArbFromStringFunc::read_return_field_literal(
+            &args,
+            2,
+            "decimal_arb_with_meta",
+        )?;
+        // Preserve the input's nullability (CASE/COALESCE may be nullable).
+        let nullable = args.arg_fields[0].is_nullable();
+        Ok(Arc::new(DecimalArbType::field(
+            self.name(),
+            precision,
+            scale,
+            nullable,
+        )?))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // Passthrough — the value is already decimal_arb canonical bytes.
+        match &args.args[0] {
+            ColumnarValue::Array(arr) => Ok(ColumnarValue::Array(arr.clone())),
+            ColumnarValue::Scalar(scalar) => Ok(ColumnarValue::Array(scalar.to_array()?)),
+        }
+    }
+}
+
 // ---------- Narrowing: decimal_arb_to_decimal128 / 256 ----------
 
 fn read_target_precision_scale(args: &ScalarFunctionArgs, op_name: &str) -> Result<(u8, i8)> {
