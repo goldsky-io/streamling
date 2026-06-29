@@ -206,10 +206,6 @@ struct BackpressureAccumulator {
 }
 
 impl BackpressureAccumulator {
-    fn new() -> Self {
-        Self::default()
-    }
-
     /// Record the instant a batch was yielded downstream. The span until the
     /// next [`on_resume`](Self::on_resume) counts as backpressure.
     fn on_yield(&mut self, now: Instant) {
@@ -604,7 +600,7 @@ impl ExecutionPlan for WrappingExec {
             // Tracks time this node spends suspended after yielding a batch
             // while waiting for the downstream consumer to poll again — i.e.
             // backpressure exerted on this node by everything downstream.
-            let mut backpressure = BackpressureAccumulator::new();
+            let mut backpressure = BackpressureAccumulator::default();
             loop {
                 // Resume point: the span since the previous `yield` is the
                 // downstream-induced suspension. The first iteration has no
@@ -1519,7 +1515,7 @@ mod tests {
         // first `on_resume` (top of the very first loop iteration) contributes
         // nothing — guarding against an off-by-one that would charge the first
         // batch with bogus backpressure.
-        let mut acc = BackpressureAccumulator::new();
+        let mut acc = BackpressureAccumulator::default();
         let now = Instant::now();
         acc.on_resume(now);
         assert_eq!(acc.take_whole_millis(), 0);
@@ -1527,7 +1523,7 @@ mod tests {
 
     #[test]
     fn backpressure_accumulator_accumulates_yield_to_resume_gap() {
-        let mut acc = BackpressureAccumulator::new();
+        let mut acc = BackpressureAccumulator::default();
         let t0 = Instant::now();
         // Yield at t0, resume 5ms later → 5ms of backpressure.
         acc.on_yield(t0);
@@ -1540,7 +1536,7 @@ mod tests {
 
     #[test]
     fn backpressure_accumulator_retains_sub_millisecond_remainder() {
-        let mut acc = BackpressureAccumulator::new();
+        let mut acc = BackpressureAccumulator::default();
         let t0 = Instant::now();
         // 1.5ms gap: only 1 whole ms drains, 0.5ms is retained.
         acc.on_yield(t0);

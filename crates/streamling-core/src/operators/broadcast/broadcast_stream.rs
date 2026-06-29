@@ -8,6 +8,7 @@ use datafusion::{
 use futures::StreamExt;
 use futures::future;
 use futures::stream::Stream;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{
@@ -45,6 +46,32 @@ struct BroadcastState {
 struct BroadcastSender {
     downstream_id: String,
     tx: Sender<DFResult<RecordBatch>>,
+}
+
+/// Accumulates blocked-send time for a single downstream sink and yields whole
+/// milliseconds, carrying the sub-millisecond remainder forward. Without this,
+/// each per-batch block is truncated to whole milliseconds independently, so a
+/// stream of many sub-millisecond blocks would be repeatedly rounded down to
+/// zero and the attributed time would be consistently undercounted at high
+/// throughput. Mirrors `BackpressureAccumulator::take_whole_millis` in
+/// `wrapping.rs`, kept as a small side-effect-free helper so the math is unit
+/// testable independent of the async broadcast task.
+#[derive(Debug, Default)]
+struct BlockedSendAccumulator {
+    remainder: Duration,
+}
+
+impl BlockedSendAccumulator {
+    /// Add a batch's blocked duration and return the whole milliseconds now
+    /// ready to emit, retaining any sub-millisecond remainder for the next add.
+    fn add(&mut self, blocked: Duration) -> u64 {
+        self.remainder += blocked;
+        let whole = self.remainder.as_millis() as u64;
+        if whole > 0 {
+            self.remainder -= Duration::from_millis(whole);
+        }
+        whole
+    }
 }
 
 impl BroadcastStream {
@@ -108,6 +135,9 @@ impl BroadcastStream {
         // (the passthrough output and scan-sharing fan-out) are not attributed.
         let metrics_recorder =
             crate::telemetry::recorder::get_control_plane_metrics_recorder(BROADCAST_COMPONENT_ID);
+        // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
+        // into whole milliseconds instead of each truncating to zero.
+        let mut blocked_accumulators: HashMap<String, BlockedSendAccumulator> = HashMap::new();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 break;
@@ -136,8 +166,16 @@ impl BroadcastStream {
                     for (downstream_id, result) in results {
                         match result {
                             Ok(blocked) => {
-                                let blocked_ms = blocked.as_millis() as u64;
-                                if blocked_ms > 0 && !downstream_id.is_empty() {
+                                // Consumers without a downstream id (passthrough
+                                // output, scan-sharing fan-out) are not attributed.
+                                if downstream_id.is_empty() {
+                                    continue;
+                                }
+                                let blocked_ms = blocked_accumulators
+                                    .entry(downstream_id.clone())
+                                    .or_default()
+                                    .add(blocked);
+                                if blocked_ms > 0 {
                                     metrics_recorder.record_count_w_tags(
                                         "backpressure_blocked_send",
                                         blocked_ms,
@@ -451,6 +489,34 @@ mod tests {
             slow_blocked > fast_blocked,
             "slow consumer ({slow_blocked:?}) must accrue more blocked time than fast ({fast_blocked:?})"
         );
+    }
+
+    /// Sub-millisecond blocks must not be silently dropped: each one rounds to
+    /// zero on its own, but the accumulator carries the remainder forward so the
+    /// running total still surfaces whole milliseconds (and the leftover is kept
+    /// for the next add). Guards against the high-throughput undercount that a
+    /// per-batch `as_millis()` truncation would cause.
+    #[test]
+    fn blocked_send_accumulator_carries_sub_millisecond_remainder() {
+        let mut acc = BlockedSendAccumulator::default();
+        // Each 0.4ms block truncates to 0ms in isolation.
+        assert_eq!(acc.add(Duration::from_micros(400)), 0);
+        assert_eq!(acc.add(Duration::from_micros(400)), 0);
+        // The third crosses 1ms, so a whole millisecond is now emitted.
+        assert_eq!(acc.add(Duration::from_micros(400)), 1);
+        // The 0.2ms remainder is retained, not discarded: adding 0.9ms reaches
+        // 1.1ms and yields another whole millisecond.
+        assert_eq!(acc.add(Duration::from_micros(900)), 1);
+    }
+
+    /// A single block of several whole milliseconds is emitted in full, with the
+    /// fractional tail retained.
+    #[test]
+    fn blocked_send_accumulator_emits_whole_millis_and_keeps_fraction() {
+        let mut acc = BlockedSendAccumulator::default();
+        assert_eq!(acc.add(Duration::from_micros(3_700)), 3);
+        // 0.7ms remainder carried; +0.4ms = 1.1ms -> 1 whole ms emitted.
+        assert_eq!(acc.add(Duration::from_micros(400)), 1);
     }
 
     /// A closed consumer channel surfaces as `Err`, which `run_broadcast` logs
