@@ -344,17 +344,26 @@ async fn sql_case_passthrough_metadata_tripwire() {
     )
     .await;
 
-    // Both branches yield the same value; the VALUE must round-trip. If the
-    // CASE projection loses the decimal_arb metadata (scale/precision), the
-    // sink will write a wrong-scaled number — this assert is the tripwire.
+    // F2 FIXED: the DecimalArbExprRewrite re-stamps the decimal_arb metadata the
+    // CASE projection drops, so the value round-trips into NUMERIC at the right scale.
     let yaml = sql_pipeline(
         &ctx.kafka_topic,
         "CASE WHEN id = 1 THEN amount ELSE amount END",
     );
-    // KNOWN GAP (F2): CASE over decimal_arb drops the extension metadata, so the
-    // NUMERIC insert fails and the sink retries to timeout (F4). Tripwire until a
-    // metadata-propagation rule lands (see EDGE_CASE_FINDINGS.md / PR #37 TODO).
-    assert_known_gap_no_rows(&ctx, &yaml, "F2: CASE over decimal_arb drops metadata").await;
+    let status = ctx
+        .run_pipeline_with_opts(&yaml, base_opts().record_limit(2))
+        .await
+        .expect("pipeline run");
+    assert!(status.success(), "CASE over decimal_arb should succeed (F2 fixed)");
+
+    let rows: Vec<IdText> = ctx
+        .postgres
+        .query("SELECT id, t::text AS t FROM public.results ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].t, "1.234567890123456789");
+    assert_eq!(rows[1].t, "-99.000000000000000000");
 }
 
 // ---------------------------------------------------------------------------
@@ -387,8 +396,22 @@ async fn sql_nested_case() {
         &ctx.kafka_topic,
         "CASE WHEN id = 1 THEN amount ELSE (CASE WHEN id = 2 THEN amount ELSE amount END) END",
     );
-    // KNOWN GAP (F2): nested CASE over decimal_arb likewise drops the metadata.
-    assert_known_gap_no_rows(&ctx, &yaml, "F2: nested CASE over decimal_arb").await;
+    // F2 FIXED: nested CASE over decimal_arb re-stamps metadata at each level.
+    let status = ctx
+        .run_pipeline_with_opts(&yaml, base_opts().record_limit(3))
+        .await
+        .expect("pipeline run");
+    assert!(status.success(), "nested CASE over decimal_arb should succeed (F2 fixed)");
+
+    let rows: Vec<IdText> = ctx
+        .postgres
+        .query("SELECT id, t::text AS t FROM public.results ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].t, "1.000000000000000000");
+    assert_eq!(rows[1].t, "2.000000000000000000");
+    assert_eq!(rows[2].t, "3.000000000000000000");
 }
 
 // ---------------------------------------------------------------------------

@@ -48,6 +48,7 @@ pub mod current_time;
 pub mod decimal_arb_aggregates;
 pub mod decimal_arb_coercion;
 pub mod decimal_arb_ops;
+pub mod decimal_arb_predicate_optimizer;
 pub mod decimal_arb_sort_optimizer;
 pub mod from_base58;
 pub mod generate_series;
