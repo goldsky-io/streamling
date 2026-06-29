@@ -17,7 +17,6 @@
 //! `_gs_op` pass through unwrapped, but the column must be a non-nullable Utf8
 //! column to match what downstream consumers expect.
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
@@ -37,10 +36,9 @@ use datafusion::datasource::listing::helpers::parse_partitions_for_path;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl, PartitionedFile,
 };
-use datafusion::datasource::physical_plan::{
-    CsvSource, FileGroup, FileScanConfigBuilder, FileSource,
-};
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, FileSource};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType, ViewTable, provider_as_source};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
@@ -84,23 +82,16 @@ fn file_format_for(format: FileSourceFormat) -> Arc<dyn FileFormat> {
 
 /// The DataFusion [`FileSource`] (per-format reader) the continuous source feeds
 /// to its runtime `FileScanConfig`.
+///
+/// df54: `FileSource` now carries the `TableSchema` (file schema + partition
+/// columns), and `FileFormat::file_source` builds a per-format reader already
+/// configured from the format's own options (e.g. `CsvFormat`'s
+/// has_header/delimiter/quote), so no per-format special-casing is needed.
 fn file_source_for(
-    format: FileSourceFormat,
     file_format: &Arc<dyn FileFormat>,
+    table_schema: TableSchema,
 ) -> Arc<dyn FileSource> {
-    match format {
-        // CsvSource::default() has incorrect defaults, passing proper ones from CsvFormat::default()
-        FileSourceFormat::Csv => {
-            const DEFAULT_HAS_HEADER: bool = true;
-            let default_options = CsvFormat::default().options().clone();
-            Arc::new(CsvSource::new(
-                default_options.has_header.unwrap_or(DEFAULT_HAS_HEADER),
-                default_options.delimiter,
-                default_options.quote,
-            ))
-        }
-        _ => file_format.file_source(),
-    }
+    file_format.file_source(table_schema)
 }
 
 /// Registers the object store for a remote path scheme on the session. Local
@@ -436,11 +427,9 @@ pub struct FileSourceTableProvider {
     /// Hive partition columns inferred from the path (empty for flat layouts);
     /// used to parse per-file partition values during discovery.
     partition_cols: Vec<(String, DataType)>,
-    /// Partition columns as fields for the runtime `FileScanConfig`.
-    partition_fields: Vec<Field>,
-    /// Columns read from the files (includes `_gs_op` only if the files provide it).
-    file_schema: SchemaRef,
-    /// Published schema: `file_schema` plus a synthesized `_gs_op` when absent.
+    /// Published schema: file columns plus a synthesized `_gs_op` when absent.
+    /// (The file schema + partition fields are baked into `file_source`'s
+    /// `TableSchema` at construction, so they aren't stored separately.)
     full_schema: SchemaRef,
     /// Whether `_gs_op` must be synthesized (false when the files already have it).
     append_op: bool,
@@ -476,10 +465,30 @@ impl FileSourceTableProvider {
         // Infer the data (file) schema from file contents. This is safe for any
         // nesting; it does not validate a partition structure (unlike DataFusion's
         // `infer_partitions_from_path`, which rejects plain nested subfolders).
+        //
+        // DataFusion 54 errors out of `infer_schema` when the path matches no files
+        // ("No files found at ... Cannot infer schema from an empty location") rather
+        // than returning an empty schema (df49). Translate that into the same clear
+        // fail-fast message the bounded path uses (the `is_empty()` check below is the
+        // df49-era fallback).
         let config = ListingTableConfig::new(table_url.clone())
-            .with_listing_options(ListingOptions::new(file_format.clone()))
-            .infer_schema(&state)
-            .await?;
+            .with_listing_options(ListingOptions::new(file_format.clone()));
+        let config = match config.infer_schema(&state).await {
+            Ok(config) => config,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("No files found") || msg.contains("empty location") {
+                    streamling_user_bail!(
+                        "file source '{}': no files matching format {:?} found at path '{}'. \
+                         Check the path and that the files use the format's extension.",
+                        reference_name,
+                        format,
+                        path
+                    );
+                }
+                return Err(e.into());
+            }
+        };
         let file_schema = ListingTable::try_new(config)?.schema();
 
         if file_schema.fields().is_empty() {
@@ -529,7 +538,15 @@ impl FileSourceTableProvider {
         };
         let full_schema: SchemaRef = Arc::new(Schema::new(output_fields));
 
-        let file_source = file_source_for(format, &file_format);
+        // df54: the FileSource carries the full TableSchema (file columns +
+        // partition columns), which is how the runtime FileScanConfig learns the
+        // partition layout (the builder no longer takes partition cols directly).
+        let table_partition_cols: Vec<FieldRef> = partition_fields
+            .iter()
+            .map(|f| Arc::new(f.clone()))
+            .collect();
+        let table_schema = TableSchema::new(file_schema.clone(), table_partition_cols);
+        let file_source = file_source_for(&file_format, table_schema);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Arc::new(Self {
@@ -538,8 +555,6 @@ impl FileSourceTableProvider {
             file_source,
             file_extension,
             partition_cols,
-            partition_fields,
-            file_schema,
             full_schema,
             append_op,
             poll_interval,
@@ -566,10 +581,6 @@ impl Debug for FileSourceTableProvider {
 
 #[async_trait]
 impl TableProvider for FileSourceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -591,8 +602,6 @@ impl TableProvider for FileSourceTableProvider {
             self.file_source.clone(),
             self.file_extension.clone(),
             self.partition_cols.clone(),
-            self.partition_fields.clone(),
-            self.file_schema.clone(),
             self.full_schema.clone(),
             self.append_op,
             projection.cloned(),
@@ -611,8 +620,6 @@ struct FileSourceExec {
     file_source: Arc<dyn FileSource>,
     file_extension: String,
     partition_cols: Vec<(String, DataType)>,
-    partition_fields: Vec<Field>,
-    file_schema: SchemaRef,
     full_schema: SchemaRef,
     output_schema: SchemaRef,
     append_op: bool,
@@ -622,7 +629,7 @@ struct FileSourceExec {
     num_records_before_stop: Option<u64>,
     internal_buffer_size: u32,
     shutdown_rx: watch::Receiver<bool>,
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
 }
 
 impl FileSourceExec {
@@ -633,8 +640,6 @@ impl FileSourceExec {
         file_source: Arc<dyn FileSource>,
         file_extension: String,
         partition_cols: Vec<(String, DataType)>,
-        partition_fields: Vec<Field>,
-        file_schema: SchemaRef,
         full_schema: SchemaRef,
         append_op: bool,
         projection: Option<Vec<usize>>,
@@ -645,22 +650,20 @@ impl FileSourceExec {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let output_schema = project_schema(&full_schema, projection.as_ref()).unwrap();
-        let cached_properties = PlanProperties::new(
+        let cached_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
             },
-        );
+        ));
         Self {
             reference_name,
             table_url,
             file_source,
             file_extension,
             partition_cols,
-            partition_fields,
-            file_schema,
             full_schema,
             output_schema,
             append_op,
@@ -692,11 +695,7 @@ impl ExecutionPlan for FileSourceExec {
         "FileSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -727,8 +726,8 @@ impl ExecutionPlan for FileSourceExec {
         let file_source = self.file_source.clone();
         let file_extension = self.file_extension.clone();
         let partition_cols = self.partition_cols.clone();
-        let partition_fields = self.partition_fields.clone();
-        let file_schema = self.file_schema.clone();
+        // partition columns + file schema are now baked into `file_source`'s
+        // TableSchema (df54), so the execute loop no longer needs them directly.
         let full_schema = self.full_schema.clone();
         let output_schema = self.output_schema.clone();
         let append_op = self.append_op;
@@ -830,8 +829,10 @@ impl ExecutionPlan for FileSourceExec {
                         partition_values,
                         range: None,
                         statistics: None,
-                        extensions: None,
+                        ordering: None,
+                        extensions: Default::default(),
                         metadata_size_hint: None,
+                        table_reference: None,
                     });
                 }
 
@@ -846,14 +847,14 @@ impl ExecutionPlan for FileSourceExec {
                         .map(|file| file.object_meta.location.as_ref().to_string())
                         .collect();
 
-                    let config = FileScanConfigBuilder::new(
-                        object_store_url.clone(),
-                        file_schema.clone(),
-                        file_source.clone(),
-                    )
-                    .with_table_partition_cols(partition_fields.clone())
-                    .with_file_group(FileGroup::new(new_files))
-                    .build();
+                    // df54: partition columns are carried by the FileSource's
+                    // TableSchema (set at construction), so the builder takes just
+                    // (object_store_url, file_source) and no longer accepts the
+                    // file schema or partition cols directly.
+                    let config =
+                        FileScanConfigBuilder::new(object_store_url.clone(), file_source.clone())
+                            .with_file_group(FileGroup::new(new_files))
+                            .build();
 
                     let mut stream =
                         DataSourceExec::from_data_source(config).execute(0, context.clone())?;
