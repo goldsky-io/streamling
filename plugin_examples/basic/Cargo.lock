@@ -4284,6 +4284,7 @@ dependencies = [
  "anyhow",
  "apache-avro",
  "arrow",
+ "arrow-avro",
  "arrow-buffer",
  "arrow-json",
  "arrow-schema",
