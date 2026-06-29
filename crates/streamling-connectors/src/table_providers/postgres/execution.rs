@@ -1,8 +1,9 @@
 use datafusion::arrow::array::Array;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 use streamling_config::PostgresSinkConfig;
 use streamling_core::error::ResultExt;
+use streamling_core::retry::retry_forever_with_backoff_async_on_error;
 use streamling_core::utils::pg::PostgresConnection;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
@@ -47,18 +48,20 @@ pub async fn execute_batch_insert(
         ctx.schema_name, ctx.table_name, ctx.sink_name
     );
 
-    let mut attempt: u32 = 0;
-    let mut backoff_ms: u64 = 100;
+    // Generation observed by the in-flight attempt. The operation records the pool
+    // generation it used; the on_error hook reads it to decide whether this task
+    // owns the pool swap — deduplicating reconnection across concurrent writers.
+    let observed_gen = AtomicU64::new(0);
+    let observed_gen = &observed_gen;
 
-    loop {
-        attempt = attempt.saturating_add(1);
+    retry_forever_with_backoff_async_on_error(
+        || async {
+            let (current_pool, my_gen) = {
+                let g = pool.lock().await;
+                (g.0.clone(), g.1)
+            };
+            observed_gen.store(my_gen, Ordering::Relaxed);
 
-        let (current_pool, my_gen) = {
-            let g = pool.lock().await;
-            (g.0.clone(), g.1)
-        };
-
-        let result = {
             let mut q = sqlx::query(query);
             let bind_result: streamling_core::error::Result<_> = (|| {
                 for row_idx in 0..num_rows {
@@ -74,46 +77,33 @@ pub async fn execute_batch_insert(
                 }
                 Ok(q)
             })();
-
-            match bind_result {
-                Ok(q) => q.execute(&current_pool).await,
+            let q = match bind_result {
+                Ok(q) => q,
                 Err(e) => {
                     error!("[{}] bind error: {:?}", operation_name, e);
-                    Err(sqlx::Error::Protocol(format!("{:?}", e)))
+                    return Err(sqlx::Error::Protocol(format!("{:?}", e)));
+                }
+            };
+            q.execute(&current_pool).await.map(|_| ())
+        },
+        |err: sqlx::Error| {
+            let operation_name = operation_name.clone();
+            async move {
+                if is_read_only_error(&err) {
+                    handle_read_only_error(
+                        pool,
+                        config,
+                        parallelism,
+                        observed_gen.load(Ordering::Relaxed),
+                        &operation_name,
+                    )
+                    .await;
                 }
             }
-        };
-
-        match result {
-            Ok(_) => {
-                if attempt > 1 {
-                    warn!("{} recovered after {} attempts", operation_name, attempt);
-                }
-                return;
-            }
-            Err(e) if is_read_only_error(&e) => {
-                handle_read_only_error(pool, config, parallelism, my_gen, &operation_name).await;
-            }
-            Err(e) => {
-                if attempt > 5 {
-                    error!(
-                        "{} failed (attempt {}):\n{:?}\nRetrying...",
-                        operation_name, attempt, e
-                    );
-                } else {
-                    warn!(
-                        "{} failed (attempt {}):\n{:?}\nRetrying...",
-                        operation_name, attempt, e
-                    );
-                }
-            }
-        }
-
-        let jitter = (attempt as u64 % 100) * 7;
-        let sleep_ms = (backoff_ms + jitter).min(30_000);
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-        backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
-    }
+        },
+        &operation_name,
+    )
+    .await;
 }
 
 /// Execute a batch delete query with retry logic.
@@ -133,18 +123,17 @@ pub async fn execute_batch_delete(
         ctx.schema_name, ctx.table_name, ctx.sink_name
     );
 
-    let mut attempt: u32 = 0;
-    let mut backoff_ms: u64 = 100;
+    let observed_gen = AtomicU64::new(0);
+    let observed_gen = &observed_gen;
 
-    loop {
-        attempt = attempt.saturating_add(1);
+    retry_forever_with_backoff_async_on_error(
+        || async {
+            let (current_pool, my_gen) = {
+                let g = pool.lock().await;
+                (g.0.clone(), g.1)
+            };
+            observed_gen.store(my_gen, Ordering::Relaxed);
 
-        let (current_pool, my_gen) = {
-            let g = pool.lock().await;
-            (g.0.clone(), g.1)
-        };
-
-        let result = {
             let mut q = sqlx::query(query);
             let bind_result: streamling_core::error::Result<_> = (|| {
                 for row_idx in 0..num_rows {
@@ -157,46 +146,33 @@ pub async fn execute_batch_delete(
                 }
                 Ok(q)
             })();
-
-            match bind_result {
-                Ok(q) => q.execute(&current_pool).await,
+            let q = match bind_result {
+                Ok(q) => q,
                 Err(e) => {
                     error!("[{}] bind error: {:?}", operation_name, e);
-                    Err(sqlx::Error::Protocol(format!("{:?}", e)))
+                    return Err(sqlx::Error::Protocol(format!("{:?}", e)));
+                }
+            };
+            q.execute(&current_pool).await.map(|_| ())
+        },
+        |err: sqlx::Error| {
+            let operation_name = operation_name.clone();
+            async move {
+                if is_read_only_error(&err) {
+                    handle_read_only_error(
+                        pool,
+                        config,
+                        parallelism,
+                        observed_gen.load(Ordering::Relaxed),
+                        &operation_name,
+                    )
+                    .await;
                 }
             }
-        };
-
-        match result {
-            Ok(_) => {
-                if attempt > 1 {
-                    warn!("{} recovered after {} attempts", operation_name, attempt);
-                }
-                return;
-            }
-            Err(e) if is_read_only_error(&e) => {
-                handle_read_only_error(pool, config, parallelism, my_gen, &operation_name).await;
-            }
-            Err(e) => {
-                if attempt > 5 {
-                    error!(
-                        "{} failed (attempt {}):\n{:?}\nRetrying...",
-                        operation_name, attempt, e
-                    );
-                } else {
-                    warn!(
-                        "{} failed (attempt {}):\n{:?}\nRetrying...",
-                        operation_name, attempt, e
-                    );
-                }
-            }
-        }
-
-        let jitter = (attempt as u64 % 100) * 7;
-        let sleep_ms = (backoff_ms + jitter).min(30_000);
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-        backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
-    }
+        },
+        &operation_name,
+    )
+    .await;
 }
 
 /// Handle a READ_ONLY error by performing a deduplicated pool swap.

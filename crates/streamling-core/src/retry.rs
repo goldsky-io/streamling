@@ -108,6 +108,58 @@ where
     }
 }
 
+/// Retry `operation` indefinitely with exponential backoff, handing each failure
+/// to `on_error` before the retry sleep so the caller can run remediation — for
+/// example, swapping a stale connection pool after a failover error.
+///
+/// Generic over the error type `E` so callers that must inspect a specific error
+/// code (such as a Postgres SQLSTATE) can do so without downcasting through
+/// `StreamlingError`. The error is logged once, then moved into `on_error`.
+pub async fn retry_forever_with_backoff_async_on_error<Op, Fut, E, OnErr, OnErrFut>(
+    mut operation: Op,
+    mut on_error: OnErr,
+    operation_name: &str,
+) where
+    Op: FnMut() -> Fut,
+    Fut: core::future::Future<Output = core::result::Result<(), E>>,
+    E: std::fmt::Debug,
+    OnErr: FnMut(E) -> OnErrFut,
+    OnErrFut: core::future::Future<Output = ()>,
+{
+    let mut attempt: u32 = 0;
+    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        match operation().await {
+            Ok(()) => {
+                if attempt > 1 {
+                    warn!("{} recovered after {} attempts", operation_name, attempt);
+                }
+                break;
+            }
+            Err(err) => {
+                if attempt > 5 {
+                    error!(
+                        "{} failed (attempt {}):\n{:?}\nRetrying...",
+                        operation_name, attempt, err
+                    );
+                } else {
+                    warn!(
+                        "{} failed (attempt {}):\n{:?}\nRetrying...",
+                        operation_name, attempt, err
+                    );
+                }
+                on_error(err).await;
+            }
+        }
+
+        let jitter = (attempt as u64 % 100) * 7; // small deterministic jitter
+        let sleep_ms = std::cmp::min(MAX_BACKOFF_MS, backoff_ms + jitter);
+        sleep(Duration::from_millis(sleep_ms)).await;
+        backoff_ms = std::cmp::min(backoff_ms.saturating_mul(2), MAX_BACKOFF_MS);
+    }
+}
 /// Retry the operation only if errors are marked as retriable.
 ///
 /// - If the operation succeeds, returns `Ok(value)`
@@ -217,6 +269,46 @@ mod tests {
         retry_forever_with_backoff_async(operation, "test_operation").await;
 
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_on_error_hook_runs_before_each_retry() {
+        // The on_error hook must fire once per failure (before the next attempt),
+        // receive the error by value, and the operation must keep retrying to success.
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let remediation_count = Arc::new(AtomicU32::new(0));
+
+        let attempt_clone = attempt_count.clone();
+        let remediation_clone = remediation_count.clone();
+
+        retry_forever_with_backoff_async_on_error(
+            || {
+                let c = attempt_clone.clone();
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 3 {
+                        Err(format!("fail {n}"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |err| {
+                let r = remediation_clone.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        err.starts_with("fail"),
+                        "hook should see the failing error, got: {err}"
+                    );
+                }
+            },
+            "test_operation",
+        )
+        .await;
+
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+        assert_eq!(remediation_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
