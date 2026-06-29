@@ -2,7 +2,7 @@ use datafusion::arrow::array::Array;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use streamling_config::PostgresSinkConfig;
-use streamling_core::error::ResultExt;
+use streamling_core::error::{ResultExt, StreamlingError};
 use streamling_core::retry::retry_forever_with_backoff_async_on_error;
 use streamling_core::utils::pg::PostgresConnection;
 use tokio::sync::Mutex;
@@ -22,9 +22,16 @@ pub struct SinkContext {
     pub table_name: String,
 }
 
-fn is_read_only_error(err: &sqlx::Error) -> bool {
-    if let sqlx::Error::Database(db_err) = err {
-        return db_err.code().as_deref() == Some("25006");
+fn is_read_only_error(err: &StreamlingError) -> bool {
+    // The underlying sqlx::Error is wrapped inside the StreamlingError cause
+    // chain (execute/bind errors are context-wrapped before reaching here), so
+    // walk the chain to find the database error and its SQLSTATE.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(sqlx::Error::Database(db_err)) = e.downcast_ref::<sqlx::Error>() {
+            return db_err.code().as_deref() == Some("25006");
+        }
+        current = e.source();
     }
     false
 }
@@ -81,12 +88,15 @@ pub async fn execute_batch_insert(
                 Ok(q) => q,
                 Err(e) => {
                     error!("[{}] bind error: {:?}", operation_name, e);
-                    return Err(sqlx::Error::Protocol(format!("{:?}", e)));
+                    return Err(e);
                 }
             };
-            q.execute(&current_pool).await.map(|_| ())
+            q.execute(&current_pool)
+                .await
+                .streamling_context("failed to execute INSERT query")?;
+            Ok(())
         },
-        |err: sqlx::Error| {
+        |err: StreamlingError| {
             let operation_name = operation_name.clone();
             async move {
                 if is_read_only_error(&err) {
@@ -150,12 +160,15 @@ pub async fn execute_batch_delete(
                 Ok(q) => q,
                 Err(e) => {
                     error!("[{}] bind error: {:?}", operation_name, e);
-                    return Err(sqlx::Error::Protocol(format!("{:?}", e)));
+                    return Err(e);
                 }
             };
-            q.execute(&current_pool).await.map(|_| ())
+            q.execute(&current_pool)
+                .await
+                .streamling_context("failed to execute DELETE query")?;
+            Ok(())
         },
-        |err: sqlx::Error| {
+        |err: StreamlingError| {
             let operation_name = operation_name.clone();
             async move {
                 if is_read_only_error(&err) {
@@ -218,36 +231,44 @@ async fn handle_read_only_error(
 mod tests {
     use super::*;
 
+    fn wrap_sqlx(err: sqlx::Error) -> StreamlingError {
+        // Mirror production: execute errors reach the retry loop wrapped in a
+        // StreamlingError cause chain via streamling_context.
+        Err::<(), sqlx::Error>(err)
+            .streamling_context("failed to execute INSERT query")
+            .unwrap_err()
+    }
+
     #[test]
     fn test_is_read_only_error_with_25006() {
-        let err = sqlx::Error::Database(Box::new(TestDbError {
+        let err = wrap_sqlx(sqlx::Error::Database(Box::new(TestDbError {
             code: Some("25006".into()),
             message: "cannot execute INSERT in a read-only transaction".into(),
-        }));
+        })));
         assert!(is_read_only_error(&err));
     }
 
     #[test]
     fn test_is_read_only_error_with_other_code() {
-        let err = sqlx::Error::Database(Box::new(TestDbError {
+        let err = wrap_sqlx(sqlx::Error::Database(Box::new(TestDbError {
             code: Some("23505".into()),
             message: "duplicate key value violates unique constraint".into(),
-        }));
+        })));
         assert!(!is_read_only_error(&err));
     }
 
     #[test]
     fn test_is_read_only_error_with_non_db_error() {
-        let err = sqlx::Error::PoolTimedOut;
+        let err = wrap_sqlx(sqlx::Error::PoolTimedOut);
         assert!(!is_read_only_error(&err));
     }
 
     #[test]
     fn test_is_read_only_error_with_no_code() {
-        let err = sqlx::Error::Database(Box::new(TestDbError {
+        let err = wrap_sqlx(sqlx::Error::Database(Box::new(TestDbError {
             code: None,
             message: "some error".into(),
-        }));
+        })));
         assert!(!is_read_only_error(&err));
     }
 

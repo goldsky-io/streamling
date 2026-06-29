@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Result, StreamlingError};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, warn};
@@ -112,18 +112,18 @@ where
 /// to `on_error` before the retry sleep so the caller can run remediation — for
 /// example, swapping a stale connection pool after a failover error.
 ///
-/// Generic over the error type `E` so callers that must inspect a specific error
-/// code (such as a Postgres SQLSTATE) can do so without downcasting through
-/// `StreamlingError`. The error is logged once, then moved into `on_error`.
-pub async fn retry_forever_with_backoff_async_on_error<Op, Fut, E, OnErr, OnErrFut>(
+/// Unlike [`retry_forever_with_backoff_async`], the operation returns a
+/// [`StreamlingError`], so each failure is logged with `error.internal` /
+/// `error.retriable` structured fields, and `on_error` receives the error by
+/// value (letting it introspect the cause chain, e.g. for a Postgres SQLSTATE).
+pub async fn retry_forever_with_backoff_async_on_error<Op, Fut, OnErr, OnErrFut>(
     mut operation: Op,
     mut on_error: OnErr,
     operation_name: &str,
 ) where
     Op: FnMut() -> Fut,
-    Fut: core::future::Future<Output = core::result::Result<(), E>>,
-    E: std::fmt::Debug,
-    OnErr: FnMut(E) -> OnErrFut,
+    Fut: core::future::Future<Output = Result<()>>,
+    OnErr: FnMut(StreamlingError) -> OnErrFut,
     OnErrFut: core::future::Future<Output = ()>,
 {
     let mut attempt: u32 = 0;
@@ -141,13 +141,21 @@ pub async fn retry_forever_with_backoff_async_on_error<Op, Fut, E, OnErr, OnErrF
             Err(err) => {
                 if attempt > 5 {
                     error!(
+                        error.internal = err.is_internal(),
+                        error.retriable = err.is_retriable(),
                         "{} failed (attempt {}):\n{:?}\nRetrying...",
-                        operation_name, attempt, err
+                        operation_name,
+                        attempt,
+                        err
                     );
                 } else {
                     warn!(
+                        error.internal = err.is_internal(),
+                        error.retriable = err.is_retriable(),
                         "{} failed (attempt {}):\n{:?}\nRetrying...",
-                        operation_name, attempt, err
+                        operation_name,
+                        attempt,
+                        err
                     );
                 }
                 on_error(err).await;
@@ -287,18 +295,18 @@ mod tests {
                 async move {
                     let n = c.fetch_add(1, Ordering::SeqCst) + 1;
                     if n < 3 {
-                        Err(format!("fail {n}"))
+                        Err(streamling_err!("fail {n}"))
                     } else {
                         Ok(())
                     }
                 }
             },
-            |err| {
+            |err: StreamlingError| {
                 let r = remediation_clone.clone();
                 async move {
                     r.fetch_add(1, Ordering::SeqCst);
                     assert!(
-                        err.starts_with("fail"),
+                        err.to_string().contains("fail"),
                         "hook should see the failing error, got: {err}"
                     );
                 }
