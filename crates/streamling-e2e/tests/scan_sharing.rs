@@ -102,9 +102,13 @@ sources:
 
 transforms:
   fast_branch:
+    type: sql
     sql: "SELECT id, value, timestamp FROM scanshare_source"
+    primary_key: id
   slow_branch:
+    type: sql
     sql: "SELECT id, value, timestamp FROM scanshare_source"
+    primary_key: id
 
 sinks:
   pg_fast:
