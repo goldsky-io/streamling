@@ -161,7 +161,7 @@ Backpressure is exported as a single counter, `streamling_backpressure_milliseco
 The core invariant is **exactly one emitter per edge**:
 
 - A single-downstream node's `WrappingExec` emits its one edge (`id=self, downstream_id=the_consumer`), measured as yield→resume suspension.
-- A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel.
+- A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel. `each_consumer` is the **immediate** downstream: for a multi-sink fan-out that is each terminal sink; for a scan-sharing fan-out that is each consuming transform reading the shared source (falling back to the sink only when a sink reads the shared source directly, with no transform in between).
 
 Because the two layers never coexist for the same node, `sum`/`max by (id)` and `... by (downstream_id)` are safe — no double counting. "Is this node backpressured?" is `sum by (id) (...)`. The only untagged series is a rare fallback where a linear node's downstream name can't be resolved (still one series for that node).
 

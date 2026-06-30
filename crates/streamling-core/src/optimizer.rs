@@ -237,8 +237,22 @@ fn attribute_downstream(
         return stamped.with_new_children(new_children);
     }
 
-    // BroadcastingExec: scan-sharing leaf. Stamp the consumer it feeds.
+    // BroadcastingExec: scan-sharing leaf. Stamp the immediate consumer it feeds.
+    //
+    // A scan-shared source is consumed once per downstream branch. Each branch's
+    // sub-plan (`WrappingExec(<transform>) -> ... -> BroadcastingExec`) is
+    // optimized before it is embedded into the consuming sink's plan, so this
+    // leaf is already stamped with the immediate consumer (the transform) by the
+    // time the sink-plan pass reaches it. The sink-plan pass must NOT overwrite
+    // that with the terminal sink's name: the transform's `WrappingExec` is not
+    // inlined into the sink plan, so `named_downstream` here is the sink, but the
+    // documented attribution is the immediate consumer. Preserve the existing
+    // stamp; only fall back to `named_downstream` when none was set — e.g. a sink
+    // that reads the shared source directly, with no transform in between.
     if let Some(broadcasting) = node.as_any().downcast_ref::<BroadcastingExec>() {
+        if broadcasting.downstream_id().is_some() {
+            return Ok(Arc::clone(&node));
+        }
         return match &named_downstream {
             Some(downstream) => Ok(Arc::new(
                 broadcasting.with_downstream_id(downstream.clone()),
@@ -491,6 +505,65 @@ mod attribution_tests {
             .downcast_ref::<BroadcastingExec>()
             .expect("expected a BroadcastingExec");
         assert_eq!(broadcasting_exec.downstream_id(), Some("sql_a"));
+    }
+
+    fn broadcasting_leaf(downstream_id: Option<&str>) -> Arc<dyn ExecutionPlan> {
+        let handle = Arc::new(SharedSourceHandle::new(
+            schema(),
+            leaf(),
+            1,
+            1,
+            Some("app::kafka_source".to_string()),
+        ));
+        let exec = BroadcastingExec::new(handle);
+        match downstream_id {
+            Some(id) => Arc::new(exec.with_downstream_id(id.to_string())),
+            None => Arc::new(exec),
+        }
+    }
+
+    /// A `BroadcastingExec` already stamped with its immediate consumer (the
+    /// transform — stamped when that transform's own sub-plan was optimized)
+    /// must NOT be overwritten with the terminal sink's name when the sink plan
+    /// is later optimized. In real plans the trivial transform is not inlined as
+    /// a `WrappingExec` into the sink plan, so the only named ancestor the rule
+    /// sees is the sink; preserving the existing stamp keeps the documented
+    /// "attribute to the immediate consumer" semantics.
+    #[test]
+    fn broadcasting_preexisting_downstream_id_is_not_overwritten() {
+        // DataSinkExec(webhook_slow) <- mid <- BroadcastingExec("slow_branch")
+        // (no transform WrappingExec between the sink and the leaf).
+        let plan = sink(
+            mid(broadcasting_leaf(Some("slow_branch"))),
+            "app::webhook_slow",
+        );
+        let optimized = run(plan);
+
+        let mid_out = child(&optimized, 0);
+        let broadcasting_out = child(&mid_out, 0);
+        let broadcasting_exec = broadcasting_out
+            .as_any()
+            .downcast_ref::<BroadcastingExec>()
+            .expect("expected a BroadcastingExec");
+        assert_eq!(broadcasting_exec.downstream_id(), Some("slow_branch"));
+    }
+
+    /// An unstamped `BroadcastingExec` that feeds a sink directly (a sink reading
+    /// the shared source with no transform in between) is attributed to the sink
+    /// — the documented fallback when there is no immediate consumer transform.
+    #[test]
+    fn broadcasting_direct_sink_gets_sink_downstream_id() {
+        // DataSinkExec(pg_sink) <- mid <- BroadcastingExec (unstamped)
+        let plan = sink(mid(broadcasting_leaf(None)), "app::pg_sink");
+        let optimized = run(plan);
+
+        let mid_out = child(&optimized, 0);
+        let broadcasting_out = child(&mid_out, 0);
+        let broadcasting_exec = broadcasting_out
+            .as_any()
+            .downcast_ref::<BroadcastingExec>()
+            .expect("expected a BroadcastingExec");
+        assert_eq!(broadcasting_exec.downstream_id(), Some("pg_sink"));
     }
 
     /// A `WrappingExec` suppressed at construction (a scan-sharing producer) is
