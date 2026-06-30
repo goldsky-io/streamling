@@ -386,16 +386,12 @@ impl KafkaSourceConverter<'_> {
                 converter.buffer(resolved_value);
             }
             KafkaSourceConverter::Json(converter) => {
-                let payload = message.payload().unwrap_or_default();
-                let json = String::from_utf8(payload.to_vec()).map_err(|e| {
-                    streamling_user_err!(
-                        "Kafka JSON payload is not valid UTF-8\n  topic: {}\n  partition: {}\n  offset: {}\n  error: {}",
-                        message.topic(),
-                        message.partition(),
-                        message.offset(),
-                        e
-                    )
-                })?;
+                let json = json_payload_to_string(
+                    message.payload().unwrap_or_default(),
+                    message.topic(),
+                    message.partition(),
+                    message.offset(),
+                )?;
                 converter.buffer(json);
             }
         }
@@ -408,6 +404,36 @@ impl KafkaSourceConverter<'_> {
             KafkaSourceConverter::Json(converter) => converter.convert_to_batch(),
         }
     }
+}
+
+/// Decode a Kafka JSON payload into a UTF-8 string, failing with message coordinates for
+/// empty payloads (tombstones) and invalid UTF-8.
+fn json_payload_to_string(
+    payload: &[u8],
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<String> {
+    if payload.is_empty() {
+        return Err(streamling_err!(
+            "JSON source received an empty payload (tombstone?)\n  topic: {}\n  partition: {}\n  offset: {}",
+            topic,
+            partition,
+            offset
+        )
+        .into());
+    }
+
+    String::from_utf8(payload.to_vec()).map_err(|e| {
+        streamling_user_err!(
+            "Kafka JSON payload is not valid UTF-8\n  topic: {}\n  partition: {}\n  offset: {}\n  error: {}",
+            topic,
+            partition,
+            offset,
+            e
+        )
+        .into()
+    })
 }
 
 struct KafkaCommon {}
@@ -2828,6 +2854,27 @@ impl TableProvider for KafkaSinkTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_payload_to_string_rejects_empty_payload() {
+        let err = json_payload_to_string(b"", "orders", 3, 42).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty payload"), "{msg}");
+        assert!(msg.contains("orders"), "should carry the topic: {msg}");
+        assert!(msg.contains("42"), "should carry the offset: {msg}");
+    }
+
+    #[test]
+    fn json_payload_to_string_rejects_invalid_utf8() {
+        let err = json_payload_to_string(&[0xff, 0xfe], "orders", 0, 0).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn json_payload_to_string_passes_valid_payload() {
+        let json = json_payload_to_string(br#"{"id":1}"#, "orders", 0, 0).unwrap();
+        assert_eq!(json, r#"{"id":1}"#);
+    }
 
     fn test_kafka_config() -> KafkaConfig {
         KafkaConfig {
