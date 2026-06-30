@@ -265,6 +265,46 @@ impl PrimaryKeyRegistry {
 
         Ok(pk_metadata_opt)
     }
+
+    /// Resolve the primary key for a sink that cannot operate without one and require
+    /// the resolved key to be non-empty.
+    ///
+    /// Kafka is the motivating case (STRM-6281): without a usable key a Kafka sink either
+    /// silently drops to round-robin partitioning with no log compaction, or — when an
+    /// upstream node supplies an empty key string, as the abstract-dataset preprocessor
+    /// does (`primary_key: ""`) for datasets that have no primary key in the CMS —
+    /// crashloops at runtime with `primary key column '' not found in batch`. Validating
+    /// here, *after* the source's Avro-schema discovery and after primary-key propagation,
+    /// turns that runtime crashloop into an up-front, user-facing validation error while
+    /// still accepting a key supplied by the sink config, an upstream node, or the
+    /// source's Avro schema.
+    pub fn require_primary_key_for_sink(
+        &self,
+        sink_kind: &str,
+        primary_key: &Option<String>,
+        source_name: String,
+        reference_name: String,
+        schema: &SchemaRef,
+    ) -> Result<PrimaryKeyMetadata> {
+        let pk_metadata_opt = self.track_primary_key_for_transform_or_sink(
+            primary_key,
+            source_name,
+            reference_name.clone(),
+            schema,
+        )?;
+
+        match pk_metadata_opt {
+            Some(pk) if !pk.columns.is_empty() => Ok(pk),
+            _ => streamling_user_bail!(
+                "{} sink '{}' requires a primary key, but none could be resolved. \
+                 Set 'primary_key' on the sink or its upstream source/transform, \
+                 define it in the source's Avro schema, or — for abstract datasets — \
+                 set the primary key in the CMS.",
+                sink_kind,
+                reference_name
+            ),
+        }
+    }
 }
 
 impl Default for PrimaryKeyRegistry {
@@ -1781,7 +1821,14 @@ impl Streamling {
                     let (source_plan, source_schema) =
                         Self::find_plan_and_schema(&pipeline_plans, from.as_str())?;
 
-                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
+                    // STRM-6281: a Kafka sink without a usable primary key crashloops at
+                    // runtime (`primary key column '' not found in batch`) or silently
+                    // drops to round-robin partitioning with no compaction. Require a
+                    // non-empty resolved key here — after Avro-schema discovery and
+                    // primary-key propagation — so a key from the sink config, an upstream
+                    // node, or the source's Avro schema all satisfy it.
+                    let pk_metadata = pk_registry.require_primary_key_for_sink(
+                        "kafka",
                         primary_key_opt,
                         from.clone(),
                         reference_name.clone(),
@@ -1797,7 +1844,7 @@ impl Streamling {
                         data_format.parse()?,
                         app_config.num_records_before_stop,
                         from.clone(),
-                        pk_metadata_opt.map(|pk| pk.to_str()),
+                        Some(pk_metadata.to_str()),
                         batch_size,
                         batch_flush_interval_ms,
                         kafka_sink.message_max_bytes,
@@ -2899,5 +2946,141 @@ sinks: {}
             meta.additional_tags.get("topic"),
             Some(&"v2.evm.blocks".to_string())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // STRM-6281: Kafka sinks require a resolvable, non-empty primary key
+    // ------------------------------------------------------------------
+
+    fn pk_test_schema() -> SchemaRef {
+        use arrow_schema::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]))
+    }
+
+    /// Reproduces STRM-6281: the abstract-dataset preprocessor emits `primary_key: ""`
+    /// for datasets with no primary key in the CMS. That empty string used to reach the
+    /// Kafka sink as `Some("")` and crashloop at runtime with
+    /// `primary key column '' not found in batch`. It must now fail validation up front.
+    #[test]
+    fn test_require_primary_key_for_sink_rejects_empty_string() {
+        let registry = PrimaryKeyRegistry::new(false);
+        let err = registry
+            .require_primary_key_for_sink(
+                "kafka",
+                &Some(String::new()),
+                "upstream".to_string(),
+                "my_kafka_sink".to_string(),
+                &pk_test_schema(),
+            )
+            .expect_err("empty-string primary key must be rejected for a Kafka sink");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kafka sink 'my_kafka_sink'") && msg.contains("requires a primary key"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// A whitespace-only / comma-only key string also resolves to zero columns and must be
+    /// rejected (it would otherwise reach the sink as a key with no usable columns).
+    #[test]
+    fn test_require_primary_key_for_sink_rejects_blank_columns() {
+        let registry = PrimaryKeyRegistry::new(false);
+        let err = registry
+            .require_primary_key_for_sink(
+                "kafka",
+                &Some("  ,  ".to_string()),
+                "upstream".to_string(),
+                "my_kafka_sink".to_string(),
+                &pk_test_schema(),
+            )
+            .expect_err("blank primary key must be rejected for a Kafka sink");
+        assert!(err.to_string().contains("requires a primary key"));
+    }
+
+    /// No primary key on the sink and nothing registered upstream to propagate from.
+    #[test]
+    fn test_require_primary_key_for_sink_rejects_missing_with_no_upstream() {
+        let registry = PrimaryKeyRegistry::new(false);
+        let err = registry
+            .require_primary_key_for_sink(
+                "kafka",
+                &None,
+                "upstream".to_string(),
+                "my_kafka_sink".to_string(),
+                &pk_test_schema(),
+            )
+            .expect_err("missing primary key must be rejected for a Kafka sink");
+        assert!(err.to_string().contains("requires a primary key"));
+    }
+
+    /// An empty key string that propagates down from an upstream node (e.g. a transform
+    /// generated for an abstract dataset with no CMS primary key) must also be rejected.
+    #[test]
+    fn test_require_primary_key_for_sink_rejects_propagated_empty() {
+        let registry = PrimaryKeyRegistry::new(false);
+        registry.register(
+            "abstract_transform".to_string(),
+            PrimaryKeyMetadata::new(
+                Vec::new(),
+                PrimaryKeySource::TopologyDefined,
+                "abstract_transform".to_string(),
+            ),
+        );
+        let err = registry
+            .require_primary_key_for_sink(
+                "kafka",
+                &None,
+                "abstract_transform".to_string(),
+                "my_kafka_sink".to_string(),
+                &pk_test_schema(),
+            )
+            .expect_err("propagated empty primary key must be rejected for a Kafka sink");
+        assert!(err.to_string().contains("requires a primary key"));
+    }
+
+    /// An explicit primary key on the sink config is accepted.
+    #[test]
+    fn test_require_primary_key_for_sink_accepts_explicit() {
+        let registry = PrimaryKeyRegistry::new(false);
+        let pk = registry
+            .require_primary_key_for_sink(
+                "kafka",
+                &Some("id".to_string()),
+                "upstream".to_string(),
+                "my_kafka_sink".to_string(),
+                &pk_test_schema(),
+            )
+            .expect("explicit primary key should be accepted");
+        assert_eq!(pk.columns, vec!["id".to_string()]);
+    }
+
+    /// Addresses the runtime-discovery concern: a key the source discovered from its Avro
+    /// schema (`SchemaInferred`) and registered must propagate to a Kafka sink that omits
+    /// `primary_key`, satisfying the requirement without an explicit config entry.
+    #[test]
+    fn test_require_primary_key_for_sink_accepts_propagated_from_source() {
+        let registry = PrimaryKeyRegistry::new(false);
+        registry.register(
+            "kafka_source".to_string(),
+            PrimaryKeyMetadata::new(
+                vec!["id".to_string()],
+                PrimaryKeySource::SchemaInferred,
+                "kafka_source".to_string(),
+            ),
+        );
+        let pk = registry
+            .require_primary_key_for_sink(
+                "kafka",
+                &None,
+                "kafka_source".to_string(),
+                "my_kafka_sink".to_string(),
+                &pk_test_schema(),
+            )
+            .expect("propagated primary key should be accepted");
+        assert_eq!(pk.columns, vec!["id".to_string()]);
+        assert_eq!(pk.source, PrimaryKeySource::Propagated);
     }
 }
