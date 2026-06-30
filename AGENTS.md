@@ -154,6 +154,19 @@ Label constraints (enforced at config load):
 
 **Hybrid sources:** `telemetry.labels` on a hybrid source automatically propagate to both the bounded and unbounded phase-child metric series — declare them once on the parent.
 
+### Backpressure metric
+
+Backpressure is exported as a single counter, `streamling_backpressure_milliseconds_total`, modeled as a property of an **edge** (`producer → consumer`). Every series carries `id=<producer>` and, when the downstream is a single named node, `downstream_id=<consumer>` — so a linear chain is a sequence of single edges and a fan-out is several edges, with no "single node vs multi node" distinction for the user.
+
+The core invariant is **exactly one emitter per edge**:
+
+- A single-downstream node's `WrappingExec` emits its one edge (`id=self, downstream_id=the_consumer`), measured as yield→resume suspension.
+- A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel.
+
+Because the two layers never coexist for the same node, `sum`/`max by (id)` and `... by (downstream_id)` are safe — no double counting. "Is this node backpressured?" is `sum by (id) (...)`. The only untagged series is a rare fallback where a linear node's downstream name can't be resolved (still one series for that node).
+
+Attribution is stamped by the `DownstreamAttributionRule` physical-optimizer pass (`optimizer.rs`); scan-sharing producers are suppressed at construction (they are unreachable by the pass).
+
 ## Key Architecture Concepts
 
 - **Arrow RecordBatches** flow between operators as the internal data format.

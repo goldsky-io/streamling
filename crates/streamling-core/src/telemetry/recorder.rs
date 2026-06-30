@@ -801,33 +801,26 @@ pub fn initialize_metrics_recorder(
                 .build(),
         );
 
-        // Backpressure metrics — monotonic counters in milliseconds.
-        // `node_backpressured_time` accumulates, per wrapped node, the time the
-        // node spends suspended after yielding a batch while it waits for the
-        // downstream consumer to poll again (i.e. downstream is the bottleneck).
-        // `backpressure_blocked_send` accumulates, per multi-sink fan-out edge,
-        // the time a broadcast producer spends blocked on a full consumer
-        // channel; the `downstream_id` tag names the slow sink so a single
-        // struggling sink in a multi-sink topology can be pinpointed.
+        // Backpressure metric — one monotonic counter in milliseconds modeling
+        // backpressure as a property of an edge (producer -> consumer). Every
+        // series carries `id` (the producer node) and, when the downstream is a
+        // single named node, `downstream_id` (the consumer). There is exactly
+        // one emitter per edge:
+        //  - a single-downstream node's `WrappingExec` emits its one edge,
+        //    measured as yield->resume suspension; and
+        //  - a fan-out producer's `WrappingExec` is suppressed while the
+        //    `BroadcastStream` emits one edge per consumer, measured as the time
+        //    blocked on that consumer's full channel.
+        // Because the two layers never coexist for the same node, `sum`/`max by
+        // (id)` and `... by (downstream_id)` are safe with no double counting.
         // The OTel Prometheus exporter appends the unit and `_total` suffixes,
-        // yielding `streamling_node_backpressured_time_milliseconds_total` and
-        // `streamling_backpressure_blocked_send_milliseconds_total`.
+        // yielding `streamling_backpressure_milliseconds_total`.
         count_registry.insert(
-            String::from("node_backpressured_time"),
+            String::from("backpressure"),
             meter
-                .u64_counter(add_service_prefix("node_backpressured_time"))
+                .u64_counter(add_service_prefix("backpressure"))
                 .with_description(
-                    "Time a node spends backpressured (suspended at yield waiting for downstream to poll), milliseconds",
-                )
-                .with_unit("ms")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("backpressure_blocked_send"),
-            meter
-                .u64_counter(add_service_prefix("backpressure_blocked_send"))
-                .with_description(
-                    "Time a fan-out producer spends blocked on a full downstream consumer channel, attributed via the downstream_id tag, milliseconds",
+                    "Time a producer node is held back by a downstream consumer (suspension for a single downstream, or blocked-send on a full fan-out channel), attributed via the downstream_id tag, milliseconds",
                 )
                 .with_unit("ms")
                 .build(),
@@ -1500,7 +1493,7 @@ mod tests {
             assert_eq!(tags.get("tier"), Some(&"gold".to_string()));
         }
 
-        /// The backpressure counters must be pre-registered by
+        /// The backpressure counter must be pre-registered by
         /// `initialize_metrics_recorder`. Emission paths look counters up by
         /// name and panic if missing (see `record_metric_data`), so this guards
         /// against a refactor silently dropping the registration.
@@ -1512,12 +1505,8 @@ mod tests {
             let recorder = get_metrics_recorder();
             let counters = recorder.count_registry.lock().unwrap();
             assert!(
-                counters.contains_key("node_backpressured_time"),
-                "node_backpressured_time counter must be pre-registered"
-            );
-            assert!(
-                counters.contains_key("backpressure_blocked_send"),
-                "backpressure_blocked_send counter must be pre-registered"
+                counters.contains_key("backpressure"),
+                "backpressure counter must be pre-registered"
             );
         }
     }

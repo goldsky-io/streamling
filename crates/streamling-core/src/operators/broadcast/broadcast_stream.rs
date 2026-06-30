@@ -19,9 +19,11 @@ use std::{
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use tracing::{info, warn};
 
-/// Component id under which multi-sink fan-out backpressure attribution is
-/// emitted. The blocked-send counter carries this as its `id` tag and the slow
-/// sink's reference name as the `downstream_id` tag.
+/// Fallback component id for fan-out backpressure attribution when the producing
+/// node's `metric_metadata_id` is unknown. The unified `backpressure` counter
+/// carries this as its `id` tag and the slow consumer's reference name as the
+/// `downstream_id` tag. When the producer id IS known, emission goes through the
+/// data-plane recorder instead so `id` is the real producer node.
 const BROADCAST_COMPONENT_ID: &str = "multi_sink_broadcast";
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,13 @@ pub struct BroadcastStream {
     inner: Arc<BroadcastState>,
     stopped: Arc<AtomicBool>,
     channel_capacity: usize,
+    /// `metric_metadata_id` (the `metric_key` form `"{app}::{name}"`) of the
+    /// producer node feeding this broadcast. When set, per-consumer blocked-send
+    /// time is emitted as the unified `backpressure` metric via the data-plane
+    /// recorder, so it carries `id=<producer>` plus the producer's full tag set
+    /// and `downstream_id=<consumer>`. When `None`, emission falls back to the
+    /// control-plane `BROADCAST_COMPONENT_ID`.
+    upstream_metadata_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -85,7 +94,15 @@ impl BroadcastStream {
             }),
             stopped: Arc::new(AtomicBool::new(false)),
             channel_capacity,
+            upstream_metadata_id: None,
         }
+    }
+
+    /// Set the producing node's `metric_metadata_id` so per-consumer blocked-send
+    /// time is attributed to that node (data-plane). See `upstream_metadata_id`.
+    pub fn with_upstream_metadata_id(mut self, upstream_metadata_id: Option<String>) -> Self {
+        self.upstream_metadata_id = upstream_metadata_id;
+        self
     }
 
     /// Start the background broadcasting task.
@@ -130,11 +147,17 @@ impl BroadcastStream {
 
     /// The task that reads from the single source stream and broadcasts to all active consumers.
     async fn run_broadcast(&self, mut source_stream: SendableRecordBatchStream) {
-        // Resolved once; used to attribute per-sink blocked-send time in the
-        // multi-sink fan-out case. Consumers with an empty `downstream_id`
-        // (the passthrough output and scan-sharing fan-out) are not attributed.
-        let metrics_recorder =
+        // Per-consumer blocked-send time is emitted as the unified `backpressure`
+        // edge-metric. When the producing node's `metric_metadata_id` is known we
+        // use the data-plane recorder so the series carries `id=<producer>` plus
+        // the producer's full tag set and `downstream_id=<consumer>`. Otherwise we
+        // fall back to the control-plane `BROADCAST_COMPONENT_ID`. Consumers with
+        // an empty `downstream_id` (the passthrough output, or a fan-out edge the
+        // attribution rule could not reach) are not attributed.
+        let data_plane_recorder = crate::telemetry::recorder::get_metrics_recorder();
+        let control_plane_recorder =
             crate::telemetry::recorder::get_control_plane_metrics_recorder(BROADCAST_COMPONENT_ID);
+        let upstream_metadata_id = self.upstream_metadata_id.clone();
         // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
         // into whole milliseconds instead of each truncating to zero.
         let mut blocked_accumulators: HashMap<String, BlockedSendAccumulator> = HashMap::new();
@@ -176,11 +199,25 @@ impl BroadcastStream {
                                     .or_default()
                                     .add(blocked);
                                 if blocked_ms > 0 {
-                                    metrics_recorder.record_count_w_tags(
-                                        "backpressure_blocked_send",
-                                        blocked_ms,
-                                        vec![("downstream_id", downstream_id.as_str())],
-                                    );
+                                    match &upstream_metadata_id {
+                                        Some(metadata_id) => {
+                                            // Data-plane: id=<producer> + full tags + downstream_id.
+                                            data_plane_recorder.record_count_w_tags(
+                                                "backpressure",
+                                                blocked_ms,
+                                                vec![("downstream_id", downstream_id.as_str())],
+                                                metadata_id,
+                                            );
+                                        }
+                                        None => {
+                                            // Fallback: control-plane id=multi_sink_broadcast.
+                                            control_plane_recorder.record_count_w_tags(
+                                                "backpressure",
+                                                blocked_ms,
+                                                vec![("downstream_id", downstream_id.as_str())],
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(()) => {
@@ -429,6 +466,24 @@ mod tests {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap()
+    }
+
+    /// `upstream_metadata_id` selects the emission path in `run_broadcast`: when
+    /// set, blocked-send time is attributed to the producer via the data-plane
+    /// recorder; when unset, it falls back to the control-plane component id.
+    #[test]
+    fn with_upstream_metadata_id_sets_producer_attribution() {
+        let schema = one_row_batch().schema();
+        let broadcast = BroadcastStream::new(schema, 4);
+        assert!(
+            broadcast.upstream_metadata_id.is_none(),
+            "default opts into the control-plane fallback"
+        );
+        let broadcast = broadcast.with_upstream_metadata_id(Some("app::producer".to_string()));
+        assert_eq!(
+            broadcast.upstream_metadata_id.as_deref(),
+            Some("app::producer")
+        );
     }
 
     /// A consumer that drains promptly imposes ~no backpressure: the retry

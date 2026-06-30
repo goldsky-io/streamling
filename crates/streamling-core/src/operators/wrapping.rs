@@ -280,19 +280,41 @@ impl WrappingSourceTableProvider {
     /// accurate lag calculations even when a source-level filter is configured. Same
     /// rationale applies to event-time instrumentation: the `WrappingExec` sits below
     /// the source filter so freshness metrics see the pre-filter row stream.
+    ///
+    /// `suppress_backpressure` marks the produced `WrappingExec` as a
+    /// [`BackpressureRole::FanOutProducer`] — set this for a scan-shared source,
+    /// whose per-edge backpressure is emitted by the `BroadcastStream` (the
+    /// `WrappingExec` is stashed in `SharedSourceHandle` before the optimizer
+    /// runs, so it is unreachable by the attribution rule and must be suppressed
+    /// here at construction).
     fn wrap_with_side_outputs_before_filter(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        suppress_backpressure: bool,
     ) -> Arc<dyn ExecutionPlan> {
+        let build = |inner: Arc<dyn ExecutionPlan>,
+                     side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+                     instrumentation: Option<EventTimeInstrumentation>| {
+            let exec = WrappingExec::new(
+                inner,
+                reference_name.to_string(),
+                side_outputs,
+                Vec::new(),
+                instrumentation,
+            );
+            if suppress_backpressure {
+                exec.suppress_backpressure()
+            } else {
+                exec
+            }
+        };
         if let Some(filter_exec) = inner_exec.as_any().downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(build(
                 source_exec,
-                reference_name.to_string(),
                 side_outputs.clone(),
-                Vec::new(),
                 event_time_instrumentation.clone(),
             ));
             match Arc::new(filter_exec.clone()).with_new_children(vec![wrapped_source]) {
@@ -303,23 +325,11 @@ impl WrappingSourceTableProvider {
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(WrappingExec::new(
-                        inner_exec,
-                        reference_name.to_string(),
-                        side_outputs,
-                        Vec::new(),
-                        event_time_instrumentation,
-                    ))
+                    Arc::new(build(inner_exec, side_outputs, event_time_instrumentation))
                 }
             }
         } else {
-            Arc::new(WrappingExec::new(
-                inner_exec,
-                reference_name.to_string(),
-                side_outputs,
-                Vec::new(),
-                event_time_instrumentation,
-            ))
+            Arc::new(build(inner_exec, side_outputs, event_time_instrumentation))
         }
     }
 }
@@ -385,11 +395,16 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // Scan-shared source: this WrappingExec becomes the SharedSourceHandle's
+            // base_exec (stashed before the optimizer runs, so unreachable by the
+            // attribution rule). Suppress its own emission — the BroadcastStream
+            // emits one per-edge `backpressure` series per consumer instead.
             let wrapped_exec = Self::wrap_with_side_outputs_before_filter(
                 inner_exec,
                 &reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                true,
             );
 
             // Get internal_buffer_size from Session config
@@ -411,6 +426,7 @@ impl TableProvider for WrappingSourceTableProvider {
                         wrapped_exec,
                         internal_buffer_size,
                         expected_count,
+                        Some(reference_name.clone()),
                     ));
                     sources.insert(reference_name.clone(), handle.clone());
                     handle
@@ -428,11 +444,14 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // No scan sharing: single linear downstream — the optimizer rule
+            // stamps the Edge(downstream_id); do not suppress here.
             Ok(Self::wrap_with_side_outputs_before_filter(
                 inner_exec,
                 &self.reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                false,
             ))
         }
     }
@@ -451,9 +470,31 @@ impl TableProvider for WrappingSourceTableProvider {
     }
 }
 
+/// How this node's backpressure (yield->resume suspension) is attributed when
+/// emitted as the unified `backpressure` edge-metric. Stamped by the
+/// `DownstreamAttributionRule` physical-optimizer pass (and, for scan-sharing
+/// producers, at construction). Default is [`BackpressureRole::Unattributed`],
+/// which preserves the pre-attribution untagged emission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BackpressureRole {
+    /// The node has a single named downstream consumer. Emit
+    /// `backpressure{downstream_id=<plain name>}`. The stored string is the
+    /// *plain* node name (already stripped of the `metric_key` prefix) so it
+    /// joins against the downstream's own `id` tag.
+    Edge(String),
+    /// The downstream identity could not be resolved (rare). Emit
+    /// `backpressure` untagged — still one series for this node.
+    #[default]
+    Unattributed,
+    /// The node feeds a `BroadcastStream` fan-out (multi-sink or scan sharing).
+    /// Do not emit here: the broadcast emits one per-edge series per consumer,
+    /// so emitting the node's aggregate too would double count.
+    FanOutProducer,
+}
+
 /// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
 /// attributes and dynamic tables
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WrappingExec {
     inner: Arc<dyn ExecutionPlan>,
     reference_name: String,
@@ -465,6 +506,9 @@ pub struct WrappingExec {
     /// reconstruction so per-source watermark state survives DataFusion
     /// optimizer rewrites.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
+    /// Downstream-attribution role for the unified `backpressure` metric.
+    /// Defaults to `Unattributed`; the optimizer rule stamps `Edge`/`FanOutProducer`.
+    backpressure_role: BackpressureRole,
 }
 
 impl WrappingExec {
@@ -508,7 +552,36 @@ impl WrappingExec {
             forced_non_null_columns,
             adjusted_schema,
             event_time_instrumentation,
+            backpressure_role: BackpressureRole::Unattributed,
         }
+    }
+
+    /// The node's `reference_name` (the metric_key form `"{app}::{name}"`). Used
+    /// by the `DownstreamAttributionRule` to compute the named downstream for
+    /// children; strip with `get_reference_name_from_metric_key` before using as
+    /// a tag value.
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
+    }
+
+    /// This node's backpressure attribution role.
+    pub fn backpressure_role(&self) -> &BackpressureRole {
+        &self.backpressure_role
+    }
+
+    /// Stamp this node as having a single named downstream consumer. `downstream_id`
+    /// must be the *plain* node name (not the metric_key form) so it joins against
+    /// the downstream's `id` tag.
+    pub fn with_downstream_id(mut self, downstream_id: String) -> Self {
+        self.backpressure_role = BackpressureRole::Edge(downstream_id);
+        self
+    }
+
+    /// Stamp this node as a fan-out producer whose per-edge backpressure is
+    /// emitted by the `BroadcastStream`; suppresses this node's own emission.
+    pub fn suppress_backpressure(mut self) -> Self {
+        self.backpressure_role = BackpressureRole::FanOutProducer;
+        self
     }
 }
 
@@ -558,13 +631,17 @@ impl ExecutionPlan for WrappingExec {
         // SAME watermark state Arc — without this, DataFusion optimizer
         // rewrites would silently start a fresh watermark for every
         // reconstruction.
-        Ok(Arc::new(WrappingExec::new(
+        let mut rebuilt = WrappingExec::new(
             new_inner,
             self.reference_name.clone(),
             self.side_outputs.clone(),
             self.forced_non_null_columns.clone(),
             self.event_time_instrumentation.clone(),
-        )))
+        );
+        // Preserve the downstream-attribution role across reconstructions so an
+        // optimizer rewrite after the attribution pass cannot drop the stamp.
+        rebuilt.backpressure_role = self.backpressure_role.clone();
+        Ok(Arc::new(rebuilt))
     }
 
     fn execute(
@@ -593,6 +670,7 @@ impl ExecutionPlan for WrappingExec {
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
+        let backpressure_role = self.backpressure_role.clone();
 
         let schema = self.schema();
 
@@ -610,11 +688,29 @@ impl ExecutionPlan for WrappingExec {
                 backpressure.on_resume(Instant::now());
                 let backpressured_ms = backpressure.take_whole_millis();
                 if backpressured_ms > 0 {
-                    metrics_recorder.record_count(
-                        "node_backpressured_time",
-                        backpressured_ms,
-                        &metric_metadata_id,
-                    );
+                    // Unified `backpressure` edge-metric, one emitter per edge:
+                    //  - Edge(id): single named downstream -> tag downstream_id.
+                    //  - Unattributed: downstream unresolved -> untagged.
+                    //  - FanOutProducer: suppressed; the BroadcastStream emits
+                    //    one per-edge series per consumer instead (no double count).
+                    match &backpressure_role {
+                        BackpressureRole::Edge(downstream_id) => {
+                            metrics_recorder.record_count_w_tags(
+                                "backpressure",
+                                backpressured_ms,
+                                vec![("downstream_id", downstream_id.as_str())],
+                                &metric_metadata_id,
+                            );
+                        }
+                        BackpressureRole::Unattributed => {
+                            metrics_recorder.record_count(
+                                "backpressure",
+                                backpressured_ms,
+                                &metric_metadata_id,
+                            );
+                        }
+                        BackpressureRole::FanOutProducer => {}
+                    }
                 }
 
                 let batch_start = Instant::now();
@@ -750,6 +846,14 @@ impl WrappingDataSink {
             primary_key,
             event_time_instrumentation: EventTimeInstrumentation::from_telemetry(telemetry),
         }
+    }
+
+    /// The sink's `reference_name` (the metric_key form `"{app}::{name}"`). The
+    /// `DownstreamAttributionRule` recovers this from a root `DataSinkExec` to
+    /// name the topmost transform's downstream; strip with
+    /// `get_reference_name_from_metric_key` before using as a tag value.
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
     }
 }
 
@@ -1029,13 +1133,24 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                     }
                 }
 
-                let exec = Arc::new(WrappingExec::new(
-                    input_physical,
-                    reference_name.clone(),
-                    side_outputs,
-                    wrapping_node.forced_non_null_columns.clone(),
-                    EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
-                ));
+                let exec = {
+                    let wrapping_exec = WrappingExec::new(
+                        input_physical,
+                        reference_name.clone(),
+                        side_outputs,
+                        wrapping_node.forced_non_null_columns.clone(),
+                        EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
+                    );
+                    // A scan-shared transform becomes a SharedSourceHandle base_exec
+                    // (stashed before the optimizer runs, unreachable by the rule), so
+                    // suppress its own emission here — the BroadcastStream emits one
+                    // per-edge `backpressure` series per consumer instead.
+                    if wrapping_node.enable_scan_sharing {
+                        Arc::new(wrapping_exec.suppress_backpressure())
+                    } else {
+                        Arc::new(wrapping_exec)
+                    }
+                };
 
                 // Check if we should store this in the scan sharing registry for future reuse
                 if wrapping_node.enable_scan_sharing {
@@ -1063,6 +1178,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             exec.clone(),
                             internal_buffer_size,
                             expected_count,
+                            Some(reference_name.clone()),
                         ));
                         registry.insert(reference_name.clone(), handle.clone());
 
@@ -1156,6 +1272,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            false,
         );
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
@@ -1201,6 +1318,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            false,
         );
 
         // Without a filter, the top-level plan should be WrappingExec directly
@@ -1236,6 +1354,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            false,
         );
 
         let task_ctx = Arc::new(TaskContext::default());
@@ -1433,6 +1552,7 @@ mod tests {
             "test_source",
             Vec::new(),
             Some(inst),
+            false,
         );
 
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.
@@ -1596,6 +1716,44 @@ mod tests {
             total_rows,
             test_batch().num_rows() * 3,
             "all rows must flow through the instrumented loop"
+        );
+    }
+
+    /// The `BackpressureRole` builders set the expected role and
+    /// `with_new_children` carries it across reconstruction (so an optimizer
+    /// rewrite after the attribution pass cannot drop the stamp).
+    #[test]
+    fn backpressure_role_builders_and_with_new_children_preserve_role() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(test_schema()));
+
+        let base = WrappingExec::new(leaf, "app::node".to_string(), vec![], vec![], None);
+        assert_eq!(base.backpressure_role(), &BackpressureRole::Unattributed);
+
+        let edge = base.clone().with_downstream_id("consumer".to_string());
+        assert_eq!(
+            edge.backpressure_role(),
+            &BackpressureRole::Edge("consumer".to_string())
+        );
+
+        let suppressed = base.suppress_backpressure();
+        assert_eq!(
+            suppressed.backpressure_role(),
+            &BackpressureRole::FanOutProducer
+        );
+
+        // with_new_children must carry the role across reconstruction.
+        let edge_arc: Arc<dyn ExecutionPlan> = Arc::new(edge);
+        let children: Vec<Arc<dyn ExecutionPlan>> =
+            edge_arc.children().into_iter().cloned().collect();
+        let rebuilt = edge_arc.with_new_children(children).unwrap();
+        let rebuilt_we = rebuilt
+            .as_any()
+            .downcast_ref::<WrappingExec>()
+            .expect("rebuilt node must still be a WrappingExec");
+        assert_eq!(
+            rebuilt_we.backpressure_role(),
+            &BackpressureRole::Edge("consumer".to_string())
         );
     }
 }

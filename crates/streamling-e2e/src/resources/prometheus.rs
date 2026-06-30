@@ -103,25 +103,26 @@ impl PrometheusResource {
         )
     }
 
-    /// Build a query for the per-node backpressured-time counter (total ms a
-    /// node spent suspended waiting for its downstream to poll).
-    pub fn node_backpressured_time_query(node_id: &str, instance_id: Option<&str>) -> String {
+    /// Build a query for the unified backpressure counter filtered by producer
+    /// `id`. A producer emits one series per outgoing edge (one `downstream_id`
+    /// each), so wrap this in `sum(...)` to get the node's total backpressure.
+    pub fn backpressure_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
         Self::build_metric_query(
-            "streamling_node_backpressured_time_milliseconds_total",
+            "streamling_backpressure_milliseconds_total",
             node_id,
             instance_id,
         )
     }
 
-    /// Build a query for the multi-sink blocked-send counter filtered by the
-    /// downstream sink it is attributed to (total ms the broadcast producer was
-    /// blocked on that sink's full channel).
-    pub fn backpressure_blocked_send_query(
+    /// Build a query for the unified backpressure counter filtered by the
+    /// downstream node it is attributed to (total ms a producer was held back by
+    /// that specific consumer, whether via suspension or a full fan-out channel).
+    pub fn backpressure_by_downstream_query(
         downstream_id: &str,
         instance_id: Option<&str>,
     ) -> String {
         Self::build_metric_query_by_label(
-            "streamling_backpressure_blocked_send_milliseconds_total",
+            "streamling_backpressure_milliseconds_total",
             "downstream_id",
             downstream_id,
             instance_id,

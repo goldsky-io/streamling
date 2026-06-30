@@ -133,11 +133,23 @@ pub struct MultiSinkEntry {
 pub struct MultiSinkLogicalNode {
     pub input: LogicalPlan,
     pub sinks: Vec<MultiSinkEntry>,
+    /// `metric_metadata_id` (the `metric_key` form) of the producer node feeding
+    /// this fan-out, threaded into the `BroadcastStream` so per-sink blocked-send
+    /// time is attributed to the producer via the unified `backpressure` metric.
+    pub upstream_metadata_id: Option<String>,
 }
 
 impl MultiSinkLogicalNode {
-    pub fn new(input: LogicalPlan, sinks: Vec<MultiSinkEntry>) -> Self {
-        Self { input, sinks }
+    pub fn new(
+        input: LogicalPlan,
+        sinks: Vec<MultiSinkEntry>,
+        upstream_metadata_id: Option<String>,
+    ) -> Self {
+        Self {
+            input,
+            sinks,
+            upstream_metadata_id,
+        }
     }
 }
 
@@ -187,6 +199,7 @@ impl UserDefinedLogicalNodeCore for MultiSinkLogicalNode {
         Ok(Self {
             input: inputs.swap_remove(0),
             sinks,
+            upstream_metadata_id: self.upstream_metadata_id.clone(),
         })
     }
 
@@ -254,6 +267,7 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
                     sink_names,
                     sink_rebatch_configs,
                     internal_buffer_size,
+                    multi_sink_node.upstream_metadata_id.clone(),
                 ));
                 Some(exec)
             } else {
@@ -263,7 +277,7 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
     }
 }
 
-struct MultiSinkExec {
+pub(crate) struct MultiSinkExec {
     input: Arc<dyn ExecutionPlan>,
     sinks: Vec<Arc<dyn ExecutionPlan>>,
     /// Pre-computed at plan time via `Arc::ptr_eq` — before the physical
@@ -276,16 +290,21 @@ struct MultiSinkExec {
     sink_rebatch_configs: Vec<RebatchConfig>,
     cache: PlanProperties,
     internal_buffer_size: usize,
+    /// `metric_metadata_id` of the producer feeding this fan-out, passed to the
+    /// `BroadcastStream` so blocked-send time is attributed to the producer.
+    upstream_metadata_id: Option<String>,
 }
 
 impl MultiSinkExec {
-    fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         sinks: Vec<Arc<dyn ExecutionPlan>>,
         sink_has_transforms: Vec<bool>,
         sink_names: Vec<String>,
         sink_rebatch_configs: Vec<RebatchConfig>,
         internal_buffer_size: usize,
+        upstream_metadata_id: Option<String>,
     ) -> Self {
         let cache = Self::compute_properties(input.schema());
         Self {
@@ -296,6 +315,7 @@ impl MultiSinkExec {
             sink_rebatch_configs,
             cache,
             internal_buffer_size,
+            upstream_metadata_id,
         }
     }
 
@@ -392,6 +412,7 @@ impl ExecutionPlan for MultiSinkExec {
             self.sink_names.clone(),
             self.sink_rebatch_configs.clone(),
             self.internal_buffer_size,
+            self.upstream_metadata_id.clone(),
         )))
     }
 
@@ -412,10 +433,10 @@ impl ExecutionPlan for MultiSinkExec {
             Arc::clone(&context),
         )?;
 
-        let broadcast_stream = Arc::new(BroadcastStream::new(
-            self.schema(),
-            self.internal_buffer_size,
-        ));
+        let broadcast_stream = Arc::new(
+            BroadcastStream::new(self.schema(), self.internal_buffer_size)
+                .with_upstream_metadata_id(self.upstream_metadata_id.clone()),
+        );
 
         let total_sinks = self.sinks.len();
         let completed_sinks = Arc::new(Mutex::new(0));

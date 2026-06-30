@@ -267,9 +267,10 @@ sinks:
 // ============================================================================
 
 /// A deliberately slow webhook sink alongside a fast Postgres sink must:
-///   1. backpressure the shared upstream (source `node_backpressured_time` > 0), and
+///   1. backpressure the shared upstream (source backpressure > 0, summed over
+///      its per-edge series), and
 ///   2. attribute the broadcast's blocked-send time to the slow sink via the
-///      `downstream_id` label (`backpressure_blocked_send{downstream_id="webhook_sink"}`).
+///      `downstream_id` label (`backpressure{downstream_id="webhook_sink"}`).
 ///
 /// This is the end-to-end proof of the "which sink is struggling" signal.
 #[tokio::test]
@@ -400,7 +401,7 @@ sinks:
     // add to the total and cannot mask this run's backpressure.
     let blocked_webhook_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_blocked_send_query("webhook_sink", None)
+        PrometheusResource::backpressure_by_downstream_query("webhook_sink", None)
     );
     let blocked_webhook = prometheus
         .wait_for_metric_at_least(&blocked_webhook_query, 50, 30, 500)
@@ -411,9 +412,13 @@ sinks:
         "expected substantial blocked-send time attributed to webhook_sink, got {blocked_webhook}ms"
     );
 
+    // The source feeds a multi-sink fan-out, so its WrappingExec is suppressed
+    // and it no longer emits its own node series — its backpressure surfaces only
+    // as per-edge series (one per downstream sink). Sum across `id="kafka_source"`
+    // to recover the node-level total.
     let source_backpressure_query = format!(
         "sum({})",
-        PrometheusResource::node_backpressured_time_query("kafka_source", None)
+        PrometheusResource::backpressure_by_id_query("kafka_source", None)
     );
     let source_backpressure = prometheus
         .wait_for_metric_at_least(&source_backpressure_query, 1, 30, 500)

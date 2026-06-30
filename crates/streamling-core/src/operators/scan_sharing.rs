@@ -69,6 +69,10 @@ pub struct SharedSourceHandle {
     channel_capacity: usize,
     expected_consumers: AtomicUsize,
     registered_consumers: Arc<AtomicUsize>,
+    /// `metric_metadata_id` (the `metric_key` form) of the shared producer node,
+    /// threaded into the `BroadcastStream` so per-consumer blocked-send time is
+    /// attributed to the producer via the data-plane recorder.
+    upstream_metadata_id: Option<String>,
 }
 
 impl Debug for SharedSourceHandle {
@@ -91,6 +95,7 @@ impl SharedSourceHandle {
         base_exec: Arc<dyn ExecutionPlan>,
         channel_capacity: usize,
         expected_consumers: usize,
+        upstream_metadata_id: Option<String>,
     ) -> Self {
         Self {
             schema,
@@ -100,6 +105,7 @@ impl SharedSourceHandle {
             channel_capacity,
             expected_consumers: AtomicUsize::new(expected_consumers),
             registered_consumers: Arc::new(AtomicUsize::new(0)),
+            upstream_metadata_id,
         }
     }
 
@@ -119,10 +125,10 @@ impl SharedSourceHandle {
             return broadcast.clone();
         }
 
-        let broadcast = Arc::new(BroadcastStream::new(
-            self.schema.clone(),
-            self.channel_capacity,
-        ));
+        let broadcast = Arc::new(
+            BroadcastStream::new(self.schema.clone(), self.channel_capacity)
+                .with_upstream_metadata_id(self.upstream_metadata_id.clone()),
+        );
         *broadcast_opt = Some(broadcast.clone());
         broadcast
     }
@@ -162,16 +168,40 @@ impl SharedSourceHandle {
 }
 
 /// Execution plan that broadcasts data from a source to multiple consumers
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BroadcastingExec {
     handle: Arc<SharedSourceHandle>,
     cache: PlanProperties,
+    /// Plain name of the consumer this broadcast leaf feeds, stamped by the
+    /// `DownstreamAttributionRule`. Passed to `add_consumer` so the producer's
+    /// per-consumer blocked-send time carries `downstream_id`. `None` opts out
+    /// (e.g. a scan-shared edge under a multi-sink, which the rule cannot reach).
+    downstream_id: Option<String>,
 }
 
 impl BroadcastingExec {
     pub fn new(handle: Arc<SharedSourceHandle>) -> Self {
         let cache = Self::compute_properties(handle.schema());
-        Self { handle, cache }
+        Self {
+            handle,
+            cache,
+            downstream_id: None,
+        }
+    }
+
+    /// Stamp the plain name of the consumer this leaf feeds (set by the
+    /// attribution rule). Used to attribute the producer's blocked-send time.
+    pub fn with_downstream_id(&self, downstream_id: String) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            cache: self.cache.clone(),
+            downstream_id: Some(downstream_id),
+        }
+    }
+
+    /// This leaf's stamped downstream consumer name, if any.
+    pub fn downstream_id(&self) -> Option<&str> {
+        self.downstream_id.as_deref()
     }
 
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
@@ -230,10 +260,11 @@ impl ExecutionPlan for BroadcastingExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let broadcast = self.handle.get_or_start_broadcast_stream();
-        // Scan-sharing fan-out is out of scope for blocked-send attribution
-        // (the consuming branch's identity is not available here), so opt out
-        // with an empty downstream id.
-        let consumer = broadcast.add_consumer(String::new());
+        // Attribute this consumer's blocked-send time to the downstream the
+        // attribution rule stamped onto this leaf. `None` (e.g. a scan-shared
+        // edge under a multi-sink, unreachable by the rule) opts out via an
+        // empty id, preserving the prior behavior.
+        let consumer = broadcast.add_consumer(self.downstream_id.clone().unwrap_or_default());
         self.handle.register_consumer();
         self.handle.start_if_needed(partition, context)?;
         Ok(Box::pin(consumer))
