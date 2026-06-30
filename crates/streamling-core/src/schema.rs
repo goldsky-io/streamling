@@ -1,12 +1,12 @@
 //! Shared helpers for building Arrow schemas from user-provided topology config.
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::{DataFusionError, Result};
 use heck::ToUpperCamelCase;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::error::Result;
 use crate::streamling_user_err;
 
 /// Default precision and scale for `decimal` types declared without parameters.
@@ -41,14 +41,14 @@ fn parse_data_type(type_str: &str) -> Result<DataType> {
         type_str.to_upper_camel_case()
     };
     DataType::from_str(&normalized).map_err(|_| {
-        DataFusionError::from(streamling_user_err!(
+        streamling_user_err!(
             "unsupported data type '{}' in schema; supported types: \
              int8, int16, int32, int64, uint8, uint16, uint32, uint64, \
              float16, float32, float64, string/utf8, binary, boolean, \
              date32, date64, timestamp, time32, time64, duration, interval, \
              decimal128(precision, scale), decimal256(precision, scale), null",
             type_str
-        ))
+        )
     })
 }
 
@@ -99,8 +99,7 @@ fn parse_decimal_type(type_str: &str) -> Result<Option<DataType>> {
                 return Err(streamling_user_err!(
                     "invalid decimal type '{}': expected at most precision and scale",
                     type_str
-                )
-                .into());
+                ));
             }
             (precision, scale)
         }
