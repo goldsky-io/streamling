@@ -160,6 +160,12 @@ pub struct KafkaSource {
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
+    /// Message payload format: "avro" (default) or "json". Avro decodes via the Schema
+    /// Registry; JSON decodes each payload as a UTF-8 JSON object using `schema`.
+    pub data_format: Option<String>,
+    /// Input schema for JSON payloads: column name -> Arrow type string (e.g. `id: int64`,
+    /// `name: string`). Required when `data_format` is "json"; rejected for Avro.
+    pub schema: Option<BTreeMap<String, String>>,
     /// When true (default), the consumer compares writer/reader schema versions per subject
     /// and fails fast if the writer schema is newer than the reader's, so the pod restarts
     /// and refetches the latest schema. Set to false to skip the check

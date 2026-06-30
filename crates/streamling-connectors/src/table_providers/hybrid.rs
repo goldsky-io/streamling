@@ -236,7 +236,7 @@ impl HybridTableProvider {
         telemetry: Option<&Telemetry>,
     ) -> DataFusionResult<Self> {
         use crate::table_providers::clickhouse::ClickHouseTableProvider;
-        use crate::table_providers::kafka::KafkaSourceTableProvider;
+        use crate::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
         use datafusion::common::ScalarValue;
 
         let mut bounded_table_providers = Vec::new();
@@ -270,6 +270,10 @@ impl HybridTableProvider {
                             unbounded_source
                                 .skip_schema_resolution_for_reader_schema_ids
                                 .unwrap_or_default(),
+                            // Hybrid sources are Avro-only; JSON is supported on the
+                            // standalone Kafka source.
+                            KafkaFormat::Avro,
+                            None,
                         )
                         .streamling_with_context(|| {
                             format!(

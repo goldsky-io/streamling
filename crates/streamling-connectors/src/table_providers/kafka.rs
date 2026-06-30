@@ -43,9 +43,10 @@ use streamling_core::formats::avro::{
     AvroToArrowConverter, FromArrowToAvroConverter, convert_avro_schema_to_arrow,
     post_process_avro_schema_for_writing, to_avro,
 };
-use streamling_core::formats::json::FromArrowToJsonConverter;
+use streamling_core::formats::json::{FromArrowToJsonConverter, JsonToArrowConverter};
 use streamling_core::formats::{FromArrowConverter, ToArrowConverter};
 use streamling_core::operators::filter::StreamingFilterExec;
+use streamling_core::schema::arrow_schema_from_type_map;
 use streamling_core::session::SessionManager;
 use streamling_core::topology::SchemaIdOverride;
 use streamling_state::StateKey;
@@ -61,7 +62,7 @@ use futures::StreamExt;
 use once_cell::sync::OnceCell;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::{BorrowedHeaders, Header, Headers, OwnedHeaders, ToBytes};
+use rdkafka::message::{BorrowedHeaders, BorrowedMessage, Header, Headers, OwnedHeaders, ToBytes};
 use rdkafka::producer::{BaseRecord, Producer, ThreadedProducer};
 use rdkafka::util::Timeout;
 use rdkafka::{
@@ -281,6 +282,134 @@ impl FromStr for KafkaFormat {
     }
 }
 
+/// Format-specific state needed to decode Kafka source payloads, resolved at source
+/// construction. Grouping it behind an enum keeps the Avro-only state (schema registry
+/// client, resolution settings) off the JSON path, where it is meaningless.
+#[derive(Clone)]
+pub(crate) enum KafkaSourceDecoding {
+    Avro(Box<AvroSourceDecoding>),
+    Json,
+}
+
+#[derive(Clone)]
+pub(crate) struct AvroSourceDecoding {
+    avro_schema: AvroSchema,
+    reader_schema_id: u32,
+    versions_client: Arc<SubjectVersionsClient>,
+    validate_writer_schema_ordering: bool,
+    schema_id_overrides: HashMap<u32, u32>,
+    skip_schema_resolution: bool,
+}
+
+/// Per-stream payload decoder, built from [`KafkaSourceDecoding`] when the consumer task
+/// starts. Mirrors the sink-side `KafkaSinkConverter`: each variant owns exactly the state
+/// its format needs. The Avro state is boxed to keep the variant sizes balanced.
+enum KafkaSourceConverter<'a> {
+    Avro(Box<AvroStreamConverter<'a>>),
+    Json(Box<JsonToArrowConverter>),
+}
+
+struct AvroStreamConverter<'a> {
+    converter: AvroToArrowConverter,
+    decoder: AvroDecoder<'a>,
+    versions_client: Arc<SubjectVersionsClient>,
+    subject: String,
+    reader_schema_id: u32,
+    reader_avro_schema: AvroSchema,
+    skip_schema_resolution: bool,
+    validate_writer_schema_ordering: bool,
+    schema_id_overrides: HashMap<u32, u32>,
+}
+
+impl KafkaSourceConverter<'_> {
+    /// Decode a single Kafka message payload and buffer it for the next batch.
+    async fn decode_and_buffer(&mut self, message: &BorrowedMessage<'_>) -> Result<()> {
+        match self {
+            KafkaSourceConverter::Avro(avro) => {
+                let AvroStreamConverter {
+                    converter,
+                    decoder,
+                    versions_client,
+                    subject,
+                    reader_schema_id,
+                    reader_avro_schema,
+                    skip_schema_resolution,
+                    validate_writer_schema_ordering,
+                    schema_id_overrides,
+                } = avro.as_mut();
+                let payload = message.payload();
+                let patched = patch_schema_id_with_overrides(payload, schema_id_overrides);
+                let decoded = decoder
+                    .decode_with_schema(patched.as_deref().or(payload))
+                    .await
+                    .streamling_with_context(|| {
+                        format!(
+                            "Avro decoding failed\n  topic: {}\n  partition: {}\n  offset: {}\n  patched: {}",
+                            message.topic(),
+                            message.partition(),
+                            message.offset(),
+                            patched.is_some()
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        streamling_err!(
+                            "Avro decoder returned None (empty payload?)\n  topic: {}\n  partition: {}\n  offset: {}",
+                            message.topic(),
+                            message.partition(),
+                            message.offset()
+                        )
+                    })?;
+
+                let resolved_value = if *skip_schema_resolution {
+                    decoded.value
+                } else {
+                    match resolve_schema(
+                        decoded.value,
+                        subject.as_str(),
+                        versions_client.as_ref(),
+                        decoded.schema.id,
+                        *reader_schema_id,
+                        reader_avro_schema,
+                        *validate_writer_schema_ordering,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(e) => {
+                            // fail fast to terminate and fetch latest schema
+                            // TODO: look into graceful shutdown
+                            error!(topic = %message.topic(), "Schema resolution failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                };
+                converter.buffer(resolved_value);
+            }
+            KafkaSourceConverter::Json(converter) => {
+                let payload = message.payload().unwrap_or_default();
+                let json = String::from_utf8(payload.to_vec()).map_err(|e| {
+                    streamling_user_err!(
+                        "Kafka JSON payload is not valid UTF-8\n  topic: {}\n  partition: {}\n  offset: {}\n  error: {}",
+                        message.topic(),
+                        message.partition(),
+                        message.offset(),
+                        e
+                    )
+                })?;
+                converter.buffer(json);
+            }
+        }
+        Ok(())
+    }
+
+    fn convert_to_batch(&mut self) -> Result<RecordBatch> {
+        match self {
+            KafkaSourceConverter::Avro(avro) => avro.converter.convert_to_batch(),
+            KafkaSourceConverter::Json(converter) => converter.convert_to_batch(),
+        }
+    }
+}
+
 struct KafkaCommon {}
 
 impl KafkaCommon {
@@ -369,8 +498,7 @@ struct KafkaSourceExec {
     payload_schema: SchemaRef,
     full_schema_projected: SchemaRef,
     payload_projection: Option<Vec<usize>>,
-    avro_schema: AvroSchema,
-    reader_schema_id: u32,
+    decoding: KafkaSourceDecoding,
     should_enrich_op_column: bool,
     kafka_config: KafkaConfig,
     topic: String,
@@ -384,10 +512,6 @@ struct KafkaSourceExec {
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     shutdown_rx: watch::Receiver<bool>,
     num_records_before_stop: Option<u64>,
-    versions_client: Arc<SubjectVersionsClient>,
-    validate_writer_schema_ordering: bool,
-    schema_id_overrides: HashMap<u32, u32>,
-    skip_schema_resolution: bool,
 }
 
 impl Debug for KafkaSourceExec {
@@ -428,8 +552,7 @@ impl KafkaSourceExec {
         topic: String,
         start_at: Option<String>,
         filter: Option<String>,
-        avro_schema: AvroSchema,
-        reader_schema_id: u32,
+        decoding: KafkaSourceDecoding,
         should_enrich_op_column: bool,
         record_batch_interval_ms: u64,
         record_batch_size: u32,
@@ -439,10 +562,6 @@ impl KafkaSourceExec {
         shutdown_rx: watch::Receiver<bool>,
         num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
-        versions_client: Arc<SubjectVersionsClient>,
-        validate_writer_schema_ordering: bool,
-        schema_id_overrides: HashMap<u32, u32>,
-        skip_schema_resolution: bool,
     ) -> Self {
         let full_schema_projected = project_schema(&full_schema, projections).unwrap();
         let cached_properties = Self::compute_properties(full_schema_projected.clone());
@@ -450,7 +569,7 @@ impl KafkaSourceExec {
         let payload_projection = projections.cloned().map(|vec| {
             // Filter to only include indices valid for the payload schema.
             // Metadata columns (partition, offset, timestamp) are handled separately
-            // after Avro conversion, so they should not be included in the Avro projection.
+            // after payload conversion, so they should not be included in the payload projection.
             let max_valid_index = payload_schema.fields.len();
             vec.into_iter().filter(|&i| i < max_valid_index).collect()
         });
@@ -462,8 +581,7 @@ impl KafkaSourceExec {
             payload_schema,
             full_schema_projected,
             payload_projection,
-            avro_schema,
-            reader_schema_id,
+            decoding,
             should_enrich_op_column,
             kafka_config: config,
             topic,
@@ -477,10 +595,6 @@ impl KafkaSourceExec {
             state_backend,
             shutdown_rx,
             num_records_before_stop,
-            versions_client,
-            validate_writer_schema_ordering,
-            schema_id_overrides,
-            skip_schema_resolution,
         }
     }
 
@@ -964,12 +1078,30 @@ impl ExecutionPlan for KafkaSourceExec {
         // local cache for the state backend
         let mut committed_offsets: Option<KafkaTopicPartitionList> = None;
 
-        let mut converter = Self::create_converter(
-            self.payload_schema.clone(),
-            self.avro_schema.clone(),
-            self.payload_projection.clone(),
-        );
-        let decoder = Self::create_decoder(self.kafka_config.clone());
+        let mut converter = match &self.decoding {
+            KafkaSourceDecoding::Avro(avro) => {
+                KafkaSourceConverter::Avro(Box::new(AvroStreamConverter {
+                    converter: Self::create_converter(
+                        self.payload_schema.clone(),
+                        avro.avro_schema.clone(),
+                        self.payload_projection.clone(),
+                    ),
+                    decoder: Self::create_decoder(self.kafka_config.clone()),
+                    versions_client: avro.versions_client.clone(),
+                    // Subject convention: TopicNameStrategy with is_key=false yields "{topic}-value".
+                    // See SubjectNameStrategy::get_subject in schema_registry_converter.
+                    subject: format!("{}-value", self.topic),
+                    reader_schema_id: avro.reader_schema_id,
+                    reader_avro_schema: avro.avro_schema.clone(),
+                    skip_schema_resolution: avro.skip_schema_resolution,
+                    validate_writer_schema_ordering: avro.validate_writer_schema_ordering,
+                    schema_id_overrides: avro.schema_id_overrides.clone(),
+                }))
+            }
+            KafkaSourceDecoding::Json => KafkaSourceConverter::Json(Box::new(
+                JsonToArrowConverter::new(self.payload_schema.clone(), true, None),
+            )),
+        };
 
         let full_schema = self.full_schema_projected.clone();
 
@@ -998,16 +1130,7 @@ impl ExecutionPlan for KafkaSourceExec {
             &self.reference_name,
             true,
         );
-        let reader_avro_schema = self.avro_schema.clone();
-        let reader_schema_id = self.reader_schema_id;
         let topic = self.topic.clone();
-        // Subject convention: TopicNameStrategy with is_key=false yields "{topic}-value".
-        // See SubjectNameStrategy::get_subject in schema_registry_converter.
-        let subject = format!("{}-value", topic);
-        let versions_client = self.versions_client.clone();
-        let validate_writer_schema_ordering = self.validate_writer_schema_ordering;
-        let schema_id_overrides = self.schema_id_overrides.clone();
-        let skip_schema_resolution = self.skip_schema_resolution;
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
             let (max_lag_tx, max_lag_rx) = watch::channel(None);
@@ -1224,51 +1347,7 @@ impl ExecutionPlan for KafkaSourceExec {
                                         meta.extract_metadata(&message);
                                     }
 
-                                    let payload = message.payload();
-
-                                    let patched = patch_schema_id_with_overrides(
-                                        payload,
-                                        &schema_id_overrides,
-                                    );
-                                    let decoded = decoder
-                                        .decode_with_schema(patched.as_deref().or(payload))
-                                        .await
-                                        .streamling_with_context(|| format!(
-                                            "Avro decoding failed\n  topic: {}\n  partition: {}\n  offset: {}\n  patched: {}",
-                                            message.topic(),
-                                            message.partition(),
-                                            message.offset(),
-                                            patched.is_some()
-                                        ))?
-                                        .ok_or_else(|| streamling_err!(
-                                            "Avro decoder returned None (empty payload?)\n  topic: {}\n  partition: {}\n  offset: {}",
-                                            message.topic(),
-                                            message.partition(),
-                                            message.offset()
-                                        ))?;
-
-                                    let resolved_value = if skip_schema_resolution {
-                                        decoded.value
-                                    } else {
-                                        match resolve_schema(
-                                            decoded.value,
-                                            &subject,
-                                            &versions_client,
-                                            decoded.schema.id,
-                                            reader_schema_id,
-                                            &reader_avro_schema,
-                                            validate_writer_schema_ordering,
-                                        ).await {
-                                            Ok(value) => value,
-                                            Err(e) => {
-                                                // fail fast to crash k8s pod and fetch latest schema
-                                                // TODO: look into graceful shutdown
-                                                tracing::error!(topic = %topic, "Schema resolution failed: {e}");
-                                                std::process::exit(1);
-                                            }
-                                        }
-                                    };
-                                    converter.buffer(resolved_value);
+                                    converter.decode_and_buffer(&message).await?;
                                     watchdog.on_record();
                                     batch_row_count += 1;
                                     metrics_recorder.record_count("input_rows", 1, metric_metadata_id.as_str());
@@ -1494,8 +1573,7 @@ pub struct KafkaSourceTableProvider {
     filter: Option<String>,
     full_schema: SchemaRef,
     payload_schema: SchemaRef,
-    avro_schema: AvroSchema,
-    reader_schema_id: u32,
+    decoding: KafkaSourceDecoding,
     should_enrich_op_column: bool,
     record_batch_interval_ms: u64,
     record_batch_size: u32,
@@ -1507,10 +1585,6 @@ pub struct KafkaSourceTableProvider {
     shutdown_rx: watch::Receiver<bool>,
     num_records_before_stop: Option<u64>,
     extracted_primary_key: Option<String>,
-    versions_client: Arc<SubjectVersionsClient>,
-    validate_writer_schema_ordering: bool,
-    schema_id_overrides: HashMap<u32, u32>,
-    skip_schema_resolution: bool,
 }
 
 impl Debug for KafkaSourceTableProvider {
@@ -1523,7 +1597,6 @@ impl Debug for KafkaSourceTableProvider {
             .field("filter", &self.filter)
             .field("full_schema", &self.full_schema)
             .field("payload_schema", &self.payload_schema)
-            .field("avro_schema", &self.avro_schema)
             .field("should_enrich_op_column", &self.should_enrich_op_column)
             .field("record_batch_interval_ms", &self.record_batch_interval_ms)
             .field("record_batch_size", &self.record_batch_size)
@@ -1570,26 +1643,65 @@ impl KafkaSourceTableProvider {
         schema_id_overrides: Vec<SchemaIdOverride>,
         skip_schema_resolution_unconditional: bool,
         skip_schema_resolution_for_reader_schema_ids: Vec<u32>,
+        format: KafkaFormat,
+        json_schema: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
-        let (avro_schema, reader_schema_id) = KafkaCommon::fetch_avro_schema(&config, &topic)?;
-        let payload_schema = convert_avro_schema_to_arrow(avro_schema.clone());
+        let (payload_schema, decoding, extracted_primary_key) = match format {
+            KafkaFormat::Avro => {
+                if json_schema.is_some() {
+                    return Err(streamling_user_err!(
+                        "`schema` is only supported with data_format: json"
+                    )
+                    .into());
+                }
 
-        let schema_id_overrides = build_schema_id_overrides_map(&topic, schema_id_overrides)?;
-        let skip_schema_resolution = skip_schema_resolution_unconditional
-            || skip_schema_resolution_for_reader_schema_ids.contains(&reader_schema_id);
+                let (avro_schema, reader_schema_id) =
+                    KafkaCommon::fetch_avro_schema(&config, &topic)?;
+                let payload_schema = convert_avro_schema_to_arrow(avro_schema.clone());
 
-        let extracted_primary_key = Self::extract_primary_key(avro_schema.clone())
-            .map_err(|e| {
-                warn!("Could not extract primary key from Avro schema: {}", e);
-                e
-            })
-            .ok();
+                let schema_id_overrides =
+                    build_schema_id_overrides_map(&topic, schema_id_overrides)?;
+                let skip_schema_resolution = skip_schema_resolution_unconditional
+                    || skip_schema_resolution_for_reader_schema_ids.contains(&reader_schema_id);
 
-        if let Some(ref pk) = extracted_primary_key {
-            debug!("Extracted primary key from Avro schema: {}", pk);
-        } else {
-            debug!("No primary key found in Avro schema");
-        }
+                let extracted_primary_key = Self::extract_primary_key(avro_schema.clone())
+                    .map_err(|e| {
+                        warn!("Could not extract primary key from Avro schema: {}", e);
+                        e
+                    })
+                    .ok();
+                if let Some(ref pk) = extracted_primary_key {
+                    debug!("Extracted primary key from Avro schema: {}", pk);
+                } else {
+                    debug!("No primary key found in Avro schema");
+                }
+
+                let versions_client = Arc::new(SubjectVersionsClient::new(
+                    config.get_schema_registry_settings().ok_or_else(|| {
+                        streamling_user_err!("schema_registry_url is required for Avro format")
+                    })?,
+                ));
+
+                let decoding = KafkaSourceDecoding::Avro(Box::new(AvroSourceDecoding {
+                    avro_schema,
+                    reader_schema_id,
+                    versions_client,
+                    validate_writer_schema_ordering,
+                    schema_id_overrides,
+                    skip_schema_resolution,
+                }));
+
+                (payload_schema, decoding, extracted_primary_key)
+            }
+            KafkaFormat::Json => {
+                let schema_map = json_schema.ok_or_else(|| {
+                    streamling_user_err!("`schema` is required when data_format is json")
+                })?;
+                let payload_schema = arrow_schema_from_type_map(&schema_map)?;
+                // JSON payloads carry no embedded primary key; it comes from the source config.
+                (payload_schema, KafkaSourceDecoding::Json, None)
+            }
+        };
 
         let mut should_enrich_op_column = false;
         let mut enriched_schema_fields = payload_schema.fields.to_vec();
@@ -1620,12 +1732,6 @@ impl KafkaSourceTableProvider {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let versions_client = Arc::new(SubjectVersionsClient::new(
-            config.get_schema_registry_settings().ok_or_else(|| {
-                streamling_user_err!("schema_registry_url is required for Avro format")
-            })?,
-        ));
-
         Ok(KafkaSourceTableProvider {
             reference_name,
             metric_metadata_id,
@@ -1635,8 +1741,7 @@ impl KafkaSourceTableProvider {
             filter,
             full_schema,
             payload_schema,
-            avro_schema,
-            reader_schema_id,
+            decoding,
             should_enrich_op_column,
             record_batch_interval_ms,
             record_batch_size,
@@ -1648,14 +1753,10 @@ impl KafkaSourceTableProvider {
             shutdown_rx,
             num_records_before_stop,
             extracted_primary_key,
-            versions_client,
-            validate_writer_schema_ordering,
-            schema_id_overrides,
-            skip_schema_resolution,
         })
     }
 
-    /// Get the payload schema (Avro data columns only, without _gs_op or __kafka_* metadata)
+    /// Get the payload schema (data columns only, without _gs_op or __kafka_* metadata)
     pub fn payload_schema(&self) -> SchemaRef {
         self.payload_schema.clone()
     }
@@ -1743,8 +1844,7 @@ impl KafkaSourceTableProvider {
         topic: String,
         start_at: Option<String>,
         filter: Option<String>,
-        avro_schema: AvroSchema,
-        reader_schema_id: u32,
+        decoding: KafkaSourceDecoding,
         should_enrich_op_column: bool,
         record_batch_interval_ms: u64,
         record_batch_size: u32,
@@ -1761,8 +1861,7 @@ impl KafkaSourceTableProvider {
             topic,
             start_at,
             filter.clone(),
-            avro_schema,
-            reader_schema_id,
+            decoding,
             should_enrich_op_column,
             record_batch_interval_ms,
             record_batch_size,
@@ -1772,10 +1871,6 @@ impl KafkaSourceTableProvider {
             self.shutdown_rx.clone(),
             self.num_records_before_stop,
             self.metric_metadata_id.clone(),
-            self.versions_client.clone(),
-            self.validate_writer_schema_ordering,
-            self.schema_id_overrides.clone(),
-            self.skip_schema_resolution,
         ));
 
         if let Some(filter_expr) = &filter {
@@ -1932,8 +2027,7 @@ impl TableProvider for KafkaSourceTableProvider {
             self.topic.clone(),
             self.start_at.clone(),
             self.filter.clone(),
-            self.avro_schema.clone(),
-            self.reader_schema_id,
+            self.decoding.clone(),
             self.should_enrich_op_column,
             self.record_batch_interval_ms,
             self.record_batch_size,

@@ -15,7 +15,7 @@ use streamling_connectors::table_providers::file::{
 };
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
-use streamling_connectors::table_providers::kafka::KafkaSourceTableProvider;
+use streamling_connectors::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
 use streamling_connectors::table_providers::memory::MemoryTableProvider;
 use streamling_connectors::table_providers::postgres::PostgresSinkTableProvider;
 use streamling_connectors::table_providers::postgres::query_builder::validate_update_where;
@@ -553,6 +553,8 @@ impl Streamling {
                             .unwrap_or(app_config.record_batch_interval_ms);
                     let record_batch_size =
                         kafka.batch_size.unwrap_or(app_config.record_batch_size);
+                    let data_format: KafkaFormat =
+                        kafka.data_format.as_deref().unwrap_or("avro").parse()?;
                     let kafka_source_provider = Arc::new(
                         KafkaSourceTableProvider::new(
                             reference_name.clone(),
@@ -575,6 +577,8 @@ impl Streamling {
                                 .skip_schema_resolution_for_reader_schema_ids
                                 .clone()
                                 .unwrap_or_default(),
+                            data_format,
+                            kafka.schema.clone(),
                         )
                         .streamling_with_context(|| {
                             format!("{}: failed to create Kafka source", ctx.format())
