@@ -9,7 +9,10 @@
 //! These tests prove the unified backpressure edge-metric works on the
 //! scan-sharing path: a slow consumer's blocked-send time is attributed to it
 //! via the `downstream_id` label on `streamling_backpressure_milliseconds_total`,
-//! while a fast consumer sharing the same source is not charged.
+//! while a fast consumer sharing the same source is not charged. As in the
+//! multi-sink fan-out, the producer's per-consumer edges are attributed to the
+//! terminal sink (`downstream_id="webhook_slow"` / `"pg_fast"`), not the
+//! intermediate transform.
 
 use serde::Serialize;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
@@ -33,11 +36,18 @@ const TEST_SCHEMA: &str = r#"{
 
 /// One shared Kafka source feeds two transforms (so scan sharing turns on): a
 /// fast branch (Postgres) and a deliberately slow branch (a webhook that blocks
-/// 100ms per request). The slow branch must:
-///   1. accrue backpressure attributed to it on the shared producer's fan-out
-///      edge (`backpressure{id=<source>, downstream_id="slow_branch"}`), and
-///   2. show materially more backpressure than the fast branch sharing the same
-///      source — the per-consumer isolation guarantee of the BroadcastStream.
+/// 100ms per request). The scan-sharing `BroadcastStream` must:
+///   1. accrue backpressure on the shared producer's fan-out edge to the slow
+///      sink (`backpressure{id="scanshare_source", downstream_id="webhook_slow"}`),
+///      and
+///   2. charge that edge materially more than the fast sink's edge
+///      (`downstream_id="pg_fast"`) — the per-consumer isolation guarantee of the
+///      BroadcastStream.
+///
+/// `STREAMLING__INTERNAL_BUFFER_SIZE=1` shrinks every internal channel (including
+/// the broadcast's per-consumer channels) to one batch so the slow webhook gates
+/// the shared producer promptly instead of the two-stage transform→sink pipeline
+/// absorbing the whole run before backpressure can register.
 #[tokio::test]
 async fn test_scan_sharing_backpressure_attribution() {
     init_tracing();
@@ -138,7 +148,8 @@ sinks:
             PipelineOpts::new()
                 .record_limit(records_to_produce as u64)
                 .timeout(std::time::Duration::from_secs(120))
-                .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1"),
         )
         .await
         .expect("Streamling execution failed");
@@ -169,12 +180,13 @@ sinks:
     // Give metrics time to flush to Prometheus.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    // The shared producer's fan-out edge to the slow branch must accrue blocked
-    // send time, attributed via `downstream_id="slow_branch"` (this is the
-    // scan-sharing BroadcastStream attribution under test).
+    // The shared producer's fan-out edge to the slow sink must accrue blocked
+    // send time, attributed via `downstream_id="webhook_slow"` (this is the
+    // scan-sharing BroadcastStream attribution under test). As with multi-sink,
+    // the edge is named for the terminal sink, not the intermediate transform.
     let slow_edge_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("slow_branch", None)
+        PrometheusResource::backpressure_by_downstream_query("webhook_slow", None)
     );
     let slow_edge = prometheus
         .wait_for_metric_at_least(&slow_edge_query, 50, 30, 500)
@@ -182,15 +194,15 @@ sinks:
         .expect("slow scan-sharing consumer must accrue attributed blocked-send time");
     assert!(
         slow_edge >= 50,
-        "expected substantial backpressure attributed to slow_branch, got {slow_edge}ms"
+        "expected substantial backpressure attributed to webhook_slow, got {slow_edge}ms"
     );
 
-    // The fast branch shares the same source but must be charged far less — the
+    // The fast sink shares the same source but must be charged far less — the
     // BroadcastStream isolates per-consumer blocked time, so a single slow
     // consumer cannot smear backpressure onto its fast sibling.
     let fast_edge_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("fast_branch", None)
+        PrometheusResource::backpressure_by_downstream_query("pg_fast", None)
     );
     let fast_edge = prometheus
         .query_count(&fast_edge_query)
@@ -199,6 +211,6 @@ sinks:
         .unwrap_or(0);
     assert!(
         fast_edge < slow_edge,
-        "fast_branch ({fast_edge}ms) should be charged less backpressure than slow_branch ({slow_edge}ms)"
+        "pg_fast ({fast_edge}ms) should be charged less backpressure than webhook_slow ({slow_edge}ms)"
     );
 }
