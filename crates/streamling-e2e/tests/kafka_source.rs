@@ -1,0 +1,141 @@
+//! Kafka source e2e tests.
+//!
+//! Verifies the Kafka source can decode JSON-encoded message payloads using a
+//! config-supplied input `schema` (no Schema Registry). Each message payload is a
+//! single UTF-8 JSON object produced via `produce_json_records`.
+
+use serde::Serialize;
+use streamling_e2e::{init_tracing, PipelineOpts, TestContext};
+
+/// Test record serialized as a plain JSON object into the Kafka payload.
+#[derive(Debug, Clone, Serialize)]
+struct JsonRecord {
+    id: i64,
+    name: String,
+    amount: f64,
+    active: bool,
+}
+
+/// Basic happy path: produce JSON messages, decode them via `data_format: json`
+/// plus an explicit schema, and verify the decoded rows on a print sink.
+#[tokio::test]
+async fn kafka_json_source_decodes_payloads() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    // JSON source needs no Schema Registry — produce raw JSON objects (no dbz.op header).
+    let records: Vec<JsonRecord> = vec![
+        JsonRecord {
+            id: 1,
+            name: "alpha".to_string(),
+            amount: 10.5,
+            active: true,
+        },
+        JsonRecord {
+            id: 2,
+            name: "beta".to_string(),
+            amount: 20.0,
+            active: false,
+        },
+        JsonRecord {
+            id: 3,
+            name: "gamma".to_string(),
+            amount: 30.25,
+            active: true,
+        },
+    ];
+
+    ctx.kafka
+        .produce_json_records(&records)
+        .await
+        .expect("Failed to produce JSON records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+    data_format: json
+    schema:
+      id: int64
+      name: string
+      amount: float64
+      active: boolean
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: kafka_source
+    sample_every: 1
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records.len() as u64)
+                // One row per batch so the print sink emits every decoded row.
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    assert_eq!(output.len(), 3, "expected 3 decoded JSON rows");
+
+    // Every declared column plus the synthesized _gs_op should be present.
+    for column in ["id", "name", "amount", "active", "_gs_op"] {
+        assert!(
+            output.has_column(column),
+            "missing column '{}'; got {:?}",
+            column,
+            output.column_names()
+        );
+    }
+
+    // No dbz.op header was set, so each row defaults to an insert.
+    for row in output.rows() {
+        assert_eq!(row.row_kind, "Insert", "JSON rows must default to inserts");
+    }
+    for op in output.column_values("_gs_op") {
+        assert_eq!(op.as_str(), Some("i"), "synthesized _gs_op must be 'i'");
+    }
+
+    // Values round-trip from the JSON payloads (order is preserved on a single partition,
+    // but assert by id to stay robust).
+    let mut ids: Vec<i64> = output
+        .column_values("id")
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    let row_two = output
+        .rows()
+        .iter()
+        .find(|r| r.data.get("id").and_then(|v| v.as_i64()) == Some(2))
+        .expect("row with id=2");
+    assert_eq!(
+        row_two.data.get("name").and_then(|v| v.as_str()),
+        Some("beta")
+    );
+    assert_eq!(
+        row_two.data.get("amount").and_then(|v| v.as_f64()),
+        Some(20.0)
+    );
+    assert_eq!(
+        row_two.data.get("active").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
