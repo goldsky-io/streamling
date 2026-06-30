@@ -29,7 +29,7 @@ use streamling_core::operators::external_handlers::{ExternalHandlerConfig, Exter
 use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
 use streamling_core::topology::PipelineTopology;
-use streamling_core::{streamling_err, streamling_user_bail, streamling_user_err};
+use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 // Re-export for convenience
@@ -275,9 +275,14 @@ impl PrimaryKeyRegistry {
     /// does (`primary_key: ""`) for datasets that have no primary key in the CMS —
     /// crashloops at runtime with `primary key column '' not found in batch`. Validating
     /// here, *after* the source's Avro-schema discovery and after primary-key propagation,
-    /// turns that runtime crashloop into an up-front, user-facing validation error while
-    /// still accepting a key supplied by the sink config, an upstream node, or the
-    /// source's Avro schema.
+    /// turns that runtime crashloop into an up-front failure while still accepting a key
+    /// supplied by the sink config, an upstream node, or the source's Avro schema.
+    ///
+    /// The failure is raised as an **internal (platform) error**, not a user error: every
+    /// dataset is expected to declare a primary key (in its schema or the CMS), so a
+    /// missing one is a platform/dataset invariant violation rather than a customer
+    /// misconfiguration. This makes `--validate` report `success: false` and tags the
+    /// log as `error.internal = true` so it routes to the platform team.
     pub fn require_primary_key_for_sink(
         &self,
         sink_kind: &str,
@@ -295,11 +300,12 @@ impl PrimaryKeyRegistry {
 
         match pk_metadata_opt {
             Some(pk) if !pk.columns.is_empty() => Ok(pk),
-            _ => streamling_user_bail!(
+            _ => streamling_bail!(
                 "{} sink '{}' requires a primary key, but none could be resolved. \
-                 Set 'primary_key' on the sink or its upstream source/transform, \
-                 define it in the source's Avro schema, or — for abstract datasets — \
-                 set the primary key in the CMS.",
+                 Every dataset is expected to declare a primary key (in the sink config, \
+                 an upstream node, the source's Avro schema, or — for abstract datasets — \
+                 the CMS), so this indicates a platform/dataset configuration issue rather \
+                 than a user error.",
                 sink_kind,
                 reference_name
             ),
@@ -2980,6 +2986,13 @@ sinks: {}
         assert!(
             msg.contains("kafka sink 'my_kafka_sink'") && msg.contains("requires a primary key"),
             "unexpected error message: {msg}"
+        );
+        // Attributed as a platform error: every dataset is expected to have a primary
+        // key, so a missing one is a platform/dataset invariant violation, not a user
+        // misconfiguration. `internal == true` is this codebase's "platform error".
+        assert!(
+            err.is_internal(),
+            "missing Kafka sink primary key must be a platform (internal) error"
         );
     }
 

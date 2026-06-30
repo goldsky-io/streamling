@@ -584,6 +584,13 @@ sinks:
         "Pipeline with an unresolvable Kafka sink primary key should be invalid, got: {:?}",
         validation
     );
+    // Attributed as a platform error (internal), since every dataset is expected to
+    // declare a primary key — so `--validate` reports success: false.
+    assert!(
+        !validation.success,
+        "A missing Kafka sink primary key is a platform (internal) error, so success should be false, got: {:?}",
+        validation
+    );
 
     let all_errors = validation.errors.join("\n");
     assert!(
