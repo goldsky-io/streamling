@@ -421,6 +421,29 @@ mod tests {
         assert_from_json_to_arrow_conversion(batch);
     }
 
+    /// A schema covering only a subset of the JSON object's fields decodes just those
+    /// columns and ignores the rest. The Kafka JSON source relies on this to apply column
+    /// projection by decoding against a projected payload schema.
+    #[test]
+    fn test_json_to_arrow_converter_subset_schema_ignores_extra_fields() {
+        let subset_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        let mut converter = JsonToArrowConverter::new(subset_schema, true, None);
+        converter.buffer(r#"{"a":1,"b":"foo"}"#.to_string());
+        converter.buffer(r#"{"a":2,"b":"bar"}"#.to_string());
+
+        let batch = converter.convert_to_batch().unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 2);
+        let a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a, &Int32Array::from(vec![1, 2]));
+    }
+
     #[test]
     fn test_json_to_arrow_converter_batch_with_envelope() {
         let schema = create_test_schema();

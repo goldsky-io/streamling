@@ -1098,9 +1098,18 @@ impl ExecutionPlan for KafkaSourceExec {
                     schema_id_overrides: avro.schema_id_overrides.clone(),
                 }))
             }
-            KafkaSourceDecoding::Json => KafkaSourceConverter::Json(Box::new(
-                JsonToArrowConverter::new(self.payload_schema.clone(), true, None),
-            )),
+            KafkaSourceDecoding::Json => {
+                // Apply the same column projection Avro does, so the decoded batch lines up
+                // with `full_schema_projected`. The schema-driven JSON decoder reads fields
+                // by name and ignores any payload keys not in the (projected) schema.
+                let projected_payload_schema =
+                    project_schema(&self.payload_schema, self.payload_projection.as_ref())?;
+                KafkaSourceConverter::Json(Box::new(JsonToArrowConverter::new(
+                    projected_payload_schema,
+                    true,
+                    None,
+                )))
+            }
         };
 
         let full_schema = self.full_schema_projected.clone();

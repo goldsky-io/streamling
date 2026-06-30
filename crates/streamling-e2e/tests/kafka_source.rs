@@ -139,3 +139,115 @@ sinks:
         Some(false)
     );
 }
+
+/// Test for column projection. When a downstream query prunes payload columns,
+/// the JSON source must decode only the projected columns so the batch stays aligned with
+/// the projected schema. Before the JSON path applied the column projection, this pipeline
+/// failed with a `RecordBatch` column-count mismatch.
+#[tokio::test]
+async fn kafka_json_source_respects_column_projection() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let records: Vec<JsonRecord> = vec![
+        JsonRecord {
+            id: 1,
+            name: "alpha".to_string(),
+            amount: 10.5,
+            active: true,
+        },
+        JsonRecord {
+            id: 2,
+            name: "beta".to_string(),
+            amount: 20.0,
+            active: false,
+        },
+        JsonRecord {
+            id: 3,
+            name: "gamma".to_string(),
+            amount: 30.25,
+            active: true,
+        },
+    ];
+
+    ctx.kafka
+        .produce_json_records(&records)
+        .await
+        .expect("Failed to produce JSON records");
+
+    // The SQL transform selects a subset, pruning `amount` and `active` from the source scan.
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+    data_format: json
+    schema:
+      id: int64
+      name: string
+      amount: float64
+      active: boolean
+
+transforms:
+  pick_columns:
+    type: sql
+    sql: "SELECT id, name FROM kafka_source"
+    primary_key: id
+
+sinks:
+  print_sink:
+    type: print
+    from: pick_columns
+    sample_every: 1
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records.len() as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    assert_eq!(output.len(), 3, "expected 3 projected rows");
+
+    // The selected columns (plus the propagated _gs_op) survive...
+    for column in ["id", "name", "_gs_op"] {
+        assert!(
+            output.has_column(column),
+            "missing column '{}'; got {:?}",
+            column,
+            output.column_names()
+        );
+    }
+    // ...and the pruned payload columns are gone.
+    assert!(
+        !output.has_column("amount"),
+        "amount should be projected out; got {:?}",
+        output.column_names()
+    );
+    assert!(
+        !output.has_column("active"),
+        "active should be projected out; got {:?}",
+        output.column_names()
+    );
+
+    let mut ids: Vec<i64> = output
+        .column_values("id")
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
