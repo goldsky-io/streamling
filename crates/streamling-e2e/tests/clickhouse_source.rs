@@ -898,3 +898,97 @@ sinks:
         cols
     );
 }
+
+/// Regression: when a live row and a delete share the SAME `insert_timestamp`
+/// (a tied version), the source-side version dedup must let the delete win so
+/// the key is dropped — the row's final state is deleted. The scan has no
+/// ORDER BY, so the previous tiebreak (later position wins) was
+/// order-dependent: a live row scanned after the delete survived and the
+/// deletion was silently lost, leaving a stale live row in the sink.
+#[tokio::test]
+async fn test_clickhouse_source_tied_version_delete_drops_key() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE tied_version_dedup_test (
+                block_number UInt64,
+                id String,
+                payload String,
+                insert_timestamp DateTime,
+                is_deleted UInt8
+            ) ENGINE = ReplacingMergeTree(insert_timestamp, is_deleted)
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    // Two keys; for each, a live row and a delete at the SAME version, in
+    // opposite orders so the regression is caught regardless of scan order.
+    //   (1, 'a') — live first, then delete.
+    //   (2, 'b') — delete first, then live.
+    // Both must drop the key: the delete supersedes the live row on a tie.
+    //
+    // `optimize_on_insert = 0` stops ClickHouse from collapsing the tied live
+    // + delete rows at INSERT time — its default dedups them per the engine
+    // before the source scan ever sees both, which hides exactly this bug.
+    // One part, no insert-time collapse, no background-merge race: the scan
+    // reads all four raw rows and the source-side dedup resolves the tie.
+    clickhouse
+        .execute(
+            "INSERT INTO tied_version_dedup_test SETTINGS optimize_on_insert = 0 VALUES
+                (1, 'a', 'a_alive', toDateTime(1000), 0),
+                (1, 'a', 'a_alive', toDateTime(1000), 1),
+                (2, 'b', 'b_alive', toDateTime(1000), 1),
+                (2, 'b', 'b_alive', toDateTime(1000), 0)",
+        )
+        .await
+        .expect("Failed to insert source data");
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: tied_version_dedup_test
+    columns: "block_number,id,payload"
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: tied_version_dedup_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .record_limit(4)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    // Both keys are deleted at their (tied) max version -> FINAL drops them.
+    let total = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.tied_version_dedup_results")
+        .await
+        .expect("count query failed");
+    assert_eq!(
+        total, 0,
+        "tied live+delete rows must both be dropped (delete wins the tie)"
+    );
+}

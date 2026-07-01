@@ -265,12 +265,23 @@ pub fn deduplicate_record_batch_by_version(
         let bucket = buckets.entry(hash).or_default();
         let mut updated = false;
         for entry in bucket.iter_mut() {
-            let (existing, _) = *entry;
+            let (existing, existing_is_tomb) = *entry;
             if pk_eq(existing, row_index) {
-                // Replace when the new row's version >= the current winner's.
-                // `>=` (existing is NOT greater) makes ties resolve to the later
-                // position, matching ReplacingMergeTree merges.
-                if !version_cmp(existing, row_index).is_gt() {
+                // Keep the higher version. On a tie, prefer the tombstone: a
+                // delete at the same version supersedes the live row, so the
+                // key is dropped — ReplacingMergeTree FINAL with an `is_deleted`
+                // flag. The scan has no ORDER BY, so without this the winner is
+                // order-dependent and a live row scanned after the delete
+                // survives, silently losing the deletion. When neither side is a
+                // tombstone (e.g. no tombstone rule), ties keep the later row,
+                // matching merge order.
+                let should_replace = match version_cmp(existing, row_index) {
+                    o if o.is_lt() => true,  // new row has the higher version
+                    o if o.is_gt() => false, // current winner has the higher version
+                    // tie: tombstone wins; if both/neither, later position wins
+                    _ => !existing_is_tomb || row_is_tomb,
+                };
+                if should_replace {
                     *entry = (row_index, row_is_tomb);
                 }
                 updated = true;
@@ -1535,6 +1546,63 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(op_col.value(0), "i");
+    }
+
+    #[test]
+    fn test_dedup_by_version_tie_prefers_tombstone() {
+        // id=1: a live row and a delete at the SAME version. A delete at the
+        // same version supersedes the live row (the row's final state is
+        // deleted), so the whole key must be dropped regardless of row order —
+        // ReplacingMergeTree FINAL with an `is_deleted` flag.
+        //
+        // Regression: the previous tiebreak kept the later-position row, so a
+        // live row scanned AFTER the delete survived and the deletion was
+        // silently lost. The scan has no ORDER BY, so this is order-dependent
+        // and intermittently drops deletes.
+        let tombstone = TombstoneRule {
+            column: "_gs_op".to_string(),
+            value: "d".to_string(),
+        };
+
+        // Order 1: delete first, then live.
+        let batch_del_first = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(100), Some(100)],
+            vec![Some("d"), Some("i")],
+        );
+        let result_del_first = deduplicate_record_batch_by_version(
+            &batch_del_first,
+            "id",
+            "insert_timestamp",
+            Some(&tombstone),
+        )
+        .unwrap();
+        assert_eq!(
+            result_del_first.num_rows(),
+            0,
+            "tied delete must drop the key (delete-first order)"
+        );
+
+        // Order 2: live first, then delete.
+        let batch_live_first = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(100), Some(100)],
+            vec![Some("i"), Some("d")],
+        );
+        let result_live_first = deduplicate_record_batch_by_version(
+            &batch_live_first,
+            "id",
+            "insert_timestamp",
+            Some(&tombstone),
+        )
+        .unwrap();
+        assert_eq!(
+            result_live_first.num_rows(),
+            0,
+            "tied delete must drop the key (live-first order)"
+        );
     }
 
     #[test]
