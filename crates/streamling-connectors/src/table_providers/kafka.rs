@@ -2,7 +2,7 @@ mod config_optimizer;
 mod metadata;
 mod schema_registry;
 
-use streamling_config::KafkaConfig;
+use streamling_config::{KafkaCompression, KafkaConfig};
 use streamling_core::checkpoints::channels::{send, subscribe};
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
@@ -1966,6 +1966,8 @@ pub struct KafkaSink {
     message_max_bytes: Option<u32>,
     /// Number of parallel producers (each with independent connections/queues)
     parallelism: usize,
+    /// Producer compression codec (maps to librdkafka's compression.type)
+    compression: KafkaCompression,
 }
 
 impl KafkaSink {
@@ -1983,6 +1985,7 @@ impl KafkaSink {
         batch_flush_interval_ms: Option<u64>,
         message_max_bytes: Option<u32>,
         parallelism: Option<usize>,
+        compression: KafkaCompression,
     ) -> Self {
         let subject_name_strategy = SubjectNameStrategy::TopicNameStrategy(topic.to_owned(), false);
         let topic_partitions = topic_partitions.unwrap_or(DEFAULT_NUM_PARTITIONS);
@@ -2004,6 +2007,7 @@ impl KafkaSink {
             batch_flush_interval_ms,
             message_max_bytes,
             parallelism: parallelism.unwrap_or(1).max(1),
+            compression,
         }
     }
 
@@ -2034,48 +2038,62 @@ impl KafkaSink {
         }
     }
 
+    /// Assemble the librdkafka producer configuration.
+    fn build_producer_config(
+        config: &KafkaConfig,
+        batch_size: Option<u32>,
+        batch_flush_interval_ms: Option<u64>,
+        message_max_bytes: Option<u32>,
+        compression: KafkaCompression,
+    ) -> ClientConfig {
+        let mut builder = KafkaCommon::build_client(config);
+
+        builder
+            .set("message.timeout.ms", "600000")
+            .set("acks", "all");
+
+        let kafka_config_optimizer = KafkaConfigOptimizer::new(config);
+        for (key, value) in kafka_config_optimizer.optimized_producer_config() {
+            builder.set(key, value);
+        }
+
+        if let Some(batch_num_messages) = batch_size {
+            builder.set("batch.num.messages", batch_num_messages.to_string());
+        }
+        if let Some(linger_ms) = batch_flush_interval_ms {
+            builder.set("linger.ms", linger_ms.to_string());
+        }
+        if let Some(max_bytes) = message_max_bytes {
+            builder.set("message.max.bytes", max_bytes.to_string());
+        }
+        // Applied last so the per-sink setting wins over the optimizer default.
+        builder.set("compression.type", compression.as_str());
+
+        builder
+    }
+
     fn create_producers(&self) -> streamling_core::error::Result<Vec<KafkaThreadedProducer>> {
         info!(
-            "Creating {} Kafka producer(s) for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?})",
+            "Creating {} Kafka producer(s) for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={})",
             self.parallelism,
             self.topic,
             self.batch_size,
             self.batch_flush_interval_ms,
             self.message_max_bytes,
+            self.compression.as_str(),
         );
 
         (0..self.parallelism)
             .map(|_| {
-                let mut builder = KafkaCommon::build_client(&self.config);
-
-                builder
-                    .set("message.timeout.ms", "600000")
-                    .set("acks", "all");
-
-                let kafka_config_optimizer = KafkaConfigOptimizer::new(&self.config);
-                kafka_config_optimizer
-                    .optimized_producer_config()
-                    .iter()
-                    .for_each(|(key, value)| {
-                        builder.set(key, value);
-                    });
-
-                if let Some(batch_num_messages) = self.batch_size {
-                    builder.set(
-                        "batch.num.messages",
-                        batch_num_messages.to_string().as_str(),
-                    );
-                }
-                if let Some(linger_ms) = self.batch_flush_interval_ms {
-                    builder.set("linger.ms", linger_ms.to_string().as_str());
-                }
-                if let Some(max_bytes) = self.message_max_bytes {
-                    builder.set("message.max.bytes", max_bytes.to_string().as_str());
-                }
-
-                builder
-                    .create_with_context(KafkaProducerContext::new())
-                    .streamling_context("failed to create Kafka producer")
+                Self::build_producer_config(
+                    &self.config,
+                    self.batch_size,
+                    self.batch_flush_interval_ms,
+                    self.message_max_bytes,
+                    self.compression,
+                )
+                .create_with_context(KafkaProducerContext::new())
+                .streamling_context("failed to create Kafka producer")
             })
             .collect()
     }
@@ -2603,6 +2621,8 @@ pub struct KafkaSinkTableProvider {
     /// Maximum Kafka protocol request message size in bytes (maps to message.max.bytes)
     message_max_bytes: Option<u32>,
     parallelism: Option<usize>,
+    /// Producer compression codec (maps to librdkafka's compression.type)
+    compression: KafkaCompression,
     telemetry: Option<Telemetry>,
 }
 
@@ -2622,6 +2642,7 @@ impl KafkaSinkTableProvider {
         batch_flush_interval_ms: Option<u64>,
         message_max_bytes: Option<u32>,
         parallelism: Option<usize>,
+        compression: KafkaCompression,
         telemetry: Option<Telemetry>,
     ) -> Self {
         Self {
@@ -2638,6 +2659,7 @@ impl KafkaSinkTableProvider {
             batch_flush_interval_ms,
             message_max_bytes,
             parallelism,
+            compression,
             telemetry,
         }
     }
@@ -2687,6 +2709,7 @@ impl TableProvider for KafkaSinkTableProvider {
             self.batch_flush_interval_ms,
             self.message_max_bytes,
             self.parallelism,
+            self.compression,
         ));
         let metric_metadata_id = self.metric_metadata_id.clone();
         let wrapper_data_sink = Arc::new(WrappingDataSink::new(
@@ -2702,6 +2725,75 @@ impl TableProvider for KafkaSinkTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_kafka_config() -> KafkaConfig {
+        KafkaConfig {
+            brokers: "localhost:9092".to_string(),
+            security_protocol: "plaintext".to_string(),
+            sasl_mechanism: None,
+            sasl_username: None,
+            sasl_password: None,
+            schema_registry_url: None,
+            schema_registry_username: None,
+            schema_registry_password: None,
+            consumer_group_id: None,
+            client_id: None,
+            lag_report_interval_ms: None,
+        }
+    }
+
+    #[test]
+    fn build_producer_config_sets_requested_compression() {
+        for compression in [
+            KafkaCompression::None,
+            KafkaCompression::Gzip,
+            KafkaCompression::Lz4,
+        ] {
+            let cfg = KafkaSink::build_producer_config(
+                &test_kafka_config(),
+                None,
+                None,
+                None,
+                compression,
+            );
+            assert_eq!(
+                cfg.get("compression.type"),
+                Some(compression.as_str()),
+                "compression {compression:?} should reach the producer config"
+            );
+        }
+    }
+
+    #[test]
+    fn build_producer_config_compression_overrides_optimizer_default() {
+        // The optimizer seeds compression.type=lz4; an explicit gzip is applied
+        // afterwards and must win.
+        let cfg = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            None,
+            KafkaCompression::Gzip,
+        );
+        assert_eq!(cfg.get("compression.type"), Some("gzip"));
+    }
+
+    #[test]
+    fn build_producer_config_threads_optional_tunables() {
+        let cfg = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            Some(5000),
+            Some(250),
+            Some(20_000_000),
+            KafkaCompression::Lz4,
+        );
+        assert_eq!(cfg.get("batch.num.messages"), Some("5000"));
+        assert_eq!(cfg.get("linger.ms"), Some("250"));
+        assert_eq!(cfg.get("message.max.bytes"), Some("20000000"));
+        // Invariants that must always hold for the sink producer.
+        assert_eq!(cfg.get("acks"), Some("all"));
+        assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
+    }
 
     #[test]
     fn build_schema_id_overrides_map_empty_returns_empty_map() {

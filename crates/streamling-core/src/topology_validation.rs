@@ -8,7 +8,7 @@
 
 use crate::sql_parse::extract_table_references_from_sql;
 use crate::streamling_user_err;
-use crate::topology::{PipelineTopology, Source};
+use crate::topology::{FileSourceMode, PipelineTopology, Source};
 use std::collections::HashMap;
 
 fn strip_sql_quotes(name: &str) -> &str {
@@ -130,12 +130,30 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
     }
 }
 
+/// Whether a source self-terminates and so can run under `job_mode`. Hybrid
+/// sources terminate after all bounded phases complete; file sources terminate
+/// only in `Bounded` mode (a `Continuous` file source is unbounded and never
+/// completes); plugin sources are trusted to self-terminate via their
+/// `is_running()` implementation (e.g. a bounded backfill plugin that returns
+/// `false` once its range is exhausted). The host cannot statically tell a
+/// bounded plugin from an unbounded one, so plugin authors are responsible for
+/// ensuring their source terminates under `job_mode`.
+fn source_supports_job_mode(source: &Source) -> bool {
+    match source {
+        Source::hybrid(_) => true,
+        Source::file(file) => matches!(file.mode, FileSourceMode::Bounded),
+        Source::plugin(_) => true,
+        _ => false,
+    }
+}
+
 /// Validates that job_mode is only enabled when every source supports it.
 ///
 /// Job mode requires bounded sources that terminate on their own: hybrid sources
-/// (they terminate after all bounded phases complete) and file sources (they read
-/// their files once and complete). If any source is neither, we fail early with a
-/// clear message listing the unsupported sources.
+/// (they terminate after all bounded phases complete), file sources in bounded
+/// mode (they read their files once and complete), and plugin sources (trusted
+/// to self-terminate via `is_running()`). If any source is neither, we fail
+/// early with a clear message listing the unsupported sources.
 pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::error::Result<()> {
     if !job_mode {
         return Ok(());
@@ -144,7 +162,7 @@ pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::
     let mut unsupported: Vec<&String> = topology
         .sources
         .iter()
-        .filter(|(_, s)| !matches!(s, Source::hybrid(_) | Source::file(_)))
+        .filter(|(_, s)| !source_supports_job_mode(s))
         .map(|(name, _)| name)
         .collect();
 
@@ -152,8 +170,8 @@ pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::
         unsupported.sort();
         return Err(streamling_user_err!(
             "job_mode is enabled but the following source(s) do not support it: {}. \
-             Job mode is only supported for pipelines where every source is a hybrid or \
-             file (bounded) source.",
+             Job mode is only supported for pipelines where every source is a hybrid source, \
+             a bounded file source, or a self-terminating plugin source.",
             unsupported
                 .iter()
                 .map(|s| format!("'{s}'"))
@@ -688,6 +706,8 @@ sources:
     path: /tmp/events
     format: parquet
     primary_key: id
+    mode:
+      type: bounded
 transforms: {}
 sinks:
   out:
@@ -697,8 +717,35 @@ sinks:
         let topology = PipelineTopology::load_from_string(config).unwrap();
         assert!(
             validate_job_mode(true, &topology).is_ok(),
-            "job_mode with a file source should succeed"
+            "job_mode with a bounded file source should succeed"
         );
+    }
+
+    #[test]
+    fn job_mode_with_continuous_file_source_rejected() {
+        let config = r#"
+sources:
+  src:
+    type: file
+    path: /tmp/events
+    format: parquet
+    mode:
+      type: continuous
+      poll_interval: 5s
+transforms: {}
+sinks:
+  out:
+    type: print
+    from: src
+"#;
+        let topology = PipelineTopology::load_from_string(config).unwrap();
+        let result = validate_job_mode(true, &topology);
+        assert!(
+            result.is_err(),
+            "job_mode with a continuous file source should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("'src'"), "error should name the source: {err}");
     }
 
     #[test]
@@ -709,6 +756,8 @@ sources:
     type: file
     path: /tmp/events
     format: json
+    mode:
+      type: bounded
   hybrid_src:
     type: hybrid
     bounded_sources:
@@ -769,6 +818,28 @@ sinks:
         assert!(
             validate_job_mode(true, &topology).is_ok(),
             "job_mode with all hybrid sources should succeed"
+        );
+    }
+    #[test]
+    fn job_mode_with_plugin_source_ok() {
+        // Plugin sources are trusted to self-terminate via their `is_running()`
+        // implementation, so they are allowed under job_mode regardless of type.
+        let config = r#"
+sources:
+  plugin_source:
+    type: some_plugin
+    some_option: value
+    primary_key: id
+transforms: {}
+sinks:
+  out:
+    type: print
+    from: plugin_source
+"#;
+        let topology = PipelineTopology::load_from_string(config).unwrap();
+        assert!(
+            validate_job_mode(true, &topology).is_ok(),
+            "job_mode with a plugin source should succeed"
         );
     }
 }

@@ -1,13 +1,15 @@
 //! File source e2e tests.
 //!
-//! Streamling reads files from a temp directory, a print sink captures output to assert.
-//! Verifies schema inference, the synthesized `_gs_op = 'i'` column, Hive-partition
-//! inference, and fail-fast on bad paths.
+//! Streamling reads files from a temp directory; a print sink captures output to
+//! assert. Covers the matrix of mode (bounded, continuous) × layout (flat, nested
+//! subfolders, Hive partitions), plus the synthesized `_gs_op = 'i'` column,
+//! continuous mid-run file pickup, and fail-fast on bad paths.
 //!
 //! The file source uses neither Kafka nor Postgres, but `TestContext` still
 //! provisions them, so these tests require the e2e Docker stack like the rest.
 
 use std::fs;
+use std::time::Duration;
 
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext};
 
@@ -38,6 +40,8 @@ sources:
     path: {path}/
     format: csv
     primary_key: id
+    mode:
+      type: bounded
 
 transforms: {{}}
 
@@ -78,6 +82,88 @@ sinks:
     }
 }
 
+/// Continuous file source: ingests the files present at startup, then picks up a
+/// new file dropped in after the pipeline is already running. The watermark stops
+/// the initial files from being re-read, so the run only reaches the record limit
+/// once the new file is discovered on a later poll.
+#[tokio::test]
+async fn file_source_continuous_picks_up_new_files() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let data_dir = ctx.temp_dir.path().join("continuous_data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    // Three rows are present at startup; two more arrive while the source polls.
+    fs::write(
+        data_dir.join("initial.csv"),
+        "id,name\n1,alice\n2,bob\n3,carol\n",
+    )
+    .expect("write initial csv");
+
+    let pipeline = format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    mode:
+      type: continuous
+      poll_interval: 1s
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: file_src
+    sample_every: 1
+"#,
+        path = data_dir.display()
+    );
+
+    // The continuous source never self-terminates, so bound the run by record
+    // count. The limit (5) exceeds the 3 startup rows, so the run can only finish
+    // after the 2-row file that is dropped in mid-run is discovered.
+    let new_file = data_dir.join("new.csv");
+    let writer = async {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        fs::write(&new_file, "id,name\n4,dave\n5,erin\n").expect("write new csv");
+    };
+
+    let (result, ()) = tokio::join!(
+        ctx.run_pipeline_with_capture(&pipeline, PipelineOpts::new().record_limit(5)),
+        writer,
+    );
+    let output = result.expect("Pipeline should complete successfully");
+
+    // Reaching the limit of 5 is itself proof the mid-run file was ingested: the
+    // 3 startup rows are read once (the watermark blocks re-reads), so the run
+    // cannot finish without the 2 rows from `new.csv`.
+    assert_eq!(
+        output.len(),
+        5,
+        "expected 3 startup rows plus 2 from the file added mid-run"
+    );
+
+    for row in output.rows() {
+        assert_eq!(
+            row.row_kind, "Insert",
+            "append-only file rows must be inserts"
+        );
+    }
+
+    let ops = output.column_values("_gs_op");
+    assert_eq!(ops.len(), 5, "every row should carry a synthesized _gs_op");
+    for op in ops {
+        assert_eq!(op.as_str(), Some("i"), "synthesized _gs_op must be 'i'");
+    }
+}
+
 /// Hive-style partition columns encoded in the path are inferred into the schema.
 #[tokio::test]
 async fn file_source_infers_hive_partition_columns() {
@@ -103,6 +189,8 @@ sources:
     path: {path}/
     format: csv
     primary_key: id
+    mode:
+      type: bounded
 
 transforms: {{}}
 
@@ -126,6 +214,178 @@ sinks:
         "Hive partition column 'dt' should be inferred from the path; got {:?}",
         output.column_names()
     );
+}
+
+/// Continuous mode infers Hive partition columns and traverses the partition
+/// subdirectories.
+#[tokio::test]
+async fn file_source_continuous_infers_hive_partition_columns() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let root = ctx.temp_dir.path().join("continuous_hive");
+    fs::create_dir_all(root.join("dt=2024-01-01")).expect("create partition 1");
+    fs::create_dir_all(root.join("dt=2024-01-02")).expect("create partition 2");
+    fs::write(
+        root.join("dt=2024-01-01/a.csv"),
+        "id,name\n1,alice\n2,bob\n",
+    )
+    .expect("write partition 1");
+    fs::write(root.join("dt=2024-01-02/b.csv"), "id,name\n3,carol\n").expect("write partition 2");
+
+    let pipeline = format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    mode:
+      type: continuous
+      poll_interval: 1s
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: file_src
+    sample_every: 1
+"#,
+        path = root.display()
+    );
+
+    // Cold start reads all 3 rows on the first poll; the limit ends the run.
+    let output = ctx
+        .run_pipeline_with_capture(&pipeline, PipelineOpts::new().record_limit(3))
+        .await
+        .expect("Pipeline should complete successfully");
+
+    assert_eq!(output.len(), 3, "expected 3 rows across both partitions");
+    assert!(
+        output.has_column("dt"),
+        "Hive partition column 'dt' should be inferred from the path; got {:?}",
+        output.column_names()
+    );
+}
+
+/// Bounded mode reads plain nested subfolders (no `key=value`) recursively, with
+/// no partition column from the directory names.
+#[tokio::test]
+async fn file_source_bounded_reads_nested_subfolders() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let root = ctx.temp_dir.path().join("bounded_nested");
+    fs::create_dir_all(root.join("a/b")).expect("create nested dirs");
+    fs::write(root.join("a/b/x.csv"), "id,name\n1,alice\n").expect("write nested csv");
+    fs::write(root.join("a/y.csv"), "id,name\n2,bob\n").expect("write nested csv");
+
+    let pipeline = format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    mode:
+      type: bounded
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: file_src
+    sample_every: 1
+"#,
+        path = root.display()
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(&pipeline, PipelineOpts::new())
+        .await
+        .expect("Pipeline should complete successfully");
+
+    assert_eq!(
+        output.len(),
+        2,
+        "both nested files must be read recursively"
+    );
+    assert!(
+        output.has_column("id"),
+        "inferred id column; got {:?}",
+        output.column_names()
+    );
+    assert!(output.has_column("name"), "inferred name column");
+    assert!(
+        !output.has_column("a"),
+        "plain directory names must not become partition columns; got {:?}",
+        output.column_names()
+    );
+}
+
+/// Continuous mode reads plain nested subfolders recursively.
+#[tokio::test]
+async fn file_source_continuous_reads_nested_subfolders() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let root = ctx.temp_dir.path().join("continuous_nested");
+    fs::create_dir_all(root.join("a/b")).expect("create nested dirs");
+    fs::write(root.join("a/b/x.csv"), "id,name\n1,alice\n").expect("write nested csv");
+    fs::write(root.join("a/y.csv"), "id,name\n2,bob\n").expect("write nested csv");
+
+    let pipeline = format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    mode:
+      type: continuous
+      poll_interval: 1s
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: file_src
+    sample_every: 1
+"#,
+        path = root.display()
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(&pipeline, PipelineOpts::new().record_limit(2))
+        .await
+        .expect("Pipeline should complete successfully");
+
+    assert_eq!(
+        output.len(),
+        2,
+        "both nested files must be read recursively"
+    );
+    assert!(
+        output.has_column("id"),
+        "inferred id column; got {:?}",
+        output.column_names()
+    );
+    assert!(output.has_column("name"), "inferred name column");
 }
 
 /// A path matching no files fails fast instead of producing a silent empty source.

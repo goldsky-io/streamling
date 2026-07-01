@@ -4082,6 +4082,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5292,7 +5301,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5329,9 +5338,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6650,13 +6659,16 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streamling"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-schema",
+ "cc",
  "clap",
  "datafusion",
  "futures",
  "humantime",
+ "libc",
+ "libmimalloc-sys",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -6672,7 +6684,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6701,7 +6713,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6719,7 +6731,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-connectors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -6755,7 +6767,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "abi_stable",
  "anyhow",
@@ -6811,7 +6823,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "apache-avro",
  "aws-config",
@@ -6839,7 +6851,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-flink-compat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.21.7",
  "datafusion",
@@ -6876,7 +6888,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin-derive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6885,7 +6897,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-state"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "parking_lot 0.12.5",
