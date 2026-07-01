@@ -656,6 +656,7 @@ impl Streamling {
                         columns,
                         state_backend_factory.create(app_config.state_backend_namespace()),
                         app_config.internal_buffer_size.as_usize(),
+                        app_config.record_batch_size as usize,
                     )?);
                     let extracted_pk = clickhouse_source_provider.get_extracted_primary_key();
 
