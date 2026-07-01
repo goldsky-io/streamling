@@ -99,6 +99,13 @@ impl SessionManager {
             // This is used when we convert to arrow ipc for export as well as any other output conversion
             // directly using datafusion.
             .set_bool("datafusion.optimizer.expand_views_at_output", true)
+            // Recurse into subdirectories when listing files. DataFusion defaults this
+            // to `true` (ignore subdirs), which makes the file source skip nested
+            // folders; Used by the file source
+            .set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            )
             .with_option_extension(StreamlingConfig::new(internal_buffer_size as usize));
 
         let runtime = Arc::new(RuntimeEnv::default());

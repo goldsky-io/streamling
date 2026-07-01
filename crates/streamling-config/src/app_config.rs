@@ -295,6 +295,50 @@ impl KafkaConfig {
     }
 }
 
+/// Compression codec applied by the Kafka sink's producer (librdkafka
+/// `compression.type`). Defaults to `lz4`, which is the historical built-in
+/// behavior. Parsing is case-insensitive so env-var overrides arriving as
+/// strings work.
+///
+/// Only the codecs that librdkafka always links are exposed: `none`, `gzip`,
+/// and `lz4`. `gzip` (or `none`) is needed for brokers that don't accept lz4.
+/// `snappy`/`zstd` are intentionally omitted for now — `zstd` in particular
+/// requires libzstd to be linked at build time — and can be added once that is
+/// verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KafkaCompression {
+    None,
+    Gzip,
+    #[default]
+    Lz4,
+}
+
+impl KafkaCompression {
+    /// The librdkafka `compression.type` value for this codec.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KafkaCompression::None => "none",
+            KafkaCompression::Gzip => "gzip",
+            KafkaCompression::Lz4 => "lz4",
+        }
+    }
+}
+
+impl<'de> SerdeDeserialize<'de> for KafkaCompression {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.trim().to_lowercase().as_str() {
+            "none" => Ok(KafkaCompression::None),
+            "gzip" => Ok(KafkaCompression::Gzip),
+            "lz4" => Ok(KafkaCompression::Lz4),
+            other => Err(DeError::custom(format!(
+                "unknown Kafka compression `{}`; expected `none`, `gzip`, or `lz4`",
+                other
+            ))),
+        }
+    }
+}
+
 /// Wire-format compression to apply to outbound HTTP request bodies sent to
 /// ClickHouse. Accepted values: `"none"` (default) or `"gzip"`. Parsing is
 /// case-insensitive so env-var overrides arriving as strings work. The
@@ -382,7 +426,8 @@ pub struct ClickHouseSourceConfig {
     /// Limits scan width to prevent timeouts on large tables. Automatically halved on timeout.
     /// Only applies when the first sorting key is a numeric type.
     /// Default: 1,000,000
-    pub block_range: Option<i64>,
+    #[serde(alias = "block_range")]
+    pub sort_key_range: Option<i64>,
 }
 
 pub type ClickHouseSinkConfig = ClickHouseConfig;
@@ -967,6 +1012,52 @@ password: ""
                 "unexpected error for {bad}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn kafka_compression_parses_known_codecs() {
+        // Covers all three codecs plus case/whitespace normalization, since
+        // env-var overrides arrive as strings.
+        for (s, expected) in [
+            ("none", KafkaCompression::None),
+            ("gzip", KafkaCompression::Gzip),
+            ("lz4", KafkaCompression::Lz4),
+            ("NONE", KafkaCompression::None),
+            (" Gzip ", KafkaCompression::Gzip),
+            ("LZ4", KafkaCompression::Lz4),
+        ] {
+            let value: KafkaCompression =
+                serde_yaml::from_str(&format!(r#""{}""#, s)).expect("should parse");
+            assert_eq!(value, expected, "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn kafka_compression_defaults_to_lz4() {
+        // Preserves the historical hardcoded producer default.
+        assert_eq!(KafkaCompression::default(), KafkaCompression::Lz4);
+    }
+
+    #[test]
+    fn kafka_compression_rejects_unknown_codec() {
+        // snappy/zstd are intentionally not exposed yet, so they must be rejected
+        // rather than silently misconfiguring the producer.
+        for bad in ["snappy", "zstd", "brotli"] {
+            let err = serde_yaml::from_str::<KafkaCompression>(&format!(r#""{}""#, bad))
+                .expect_err("should reject");
+            assert!(
+                err.to_string()
+                    .contains("expected `none`, `gzip`, or `lz4`"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_compression_as_str_matches_librdkafka_values() {
+        assert_eq!(KafkaCompression::None.as_str(), "none");
+        assert_eq!(KafkaCompression::Gzip.as_str(), "gzip");
+        assert_eq!(KafkaCompression::Lz4.as_str(), "lz4");
     }
 
     #[test]

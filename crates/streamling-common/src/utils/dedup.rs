@@ -1,12 +1,14 @@
 use crate::error::{Result, ResultExt};
 use crate::{streamling_err, streamling_user_err};
-use arrow::array::{ArrayRef, Int64Array, make_comparator};
+use arrow::array::{ArrayRef, Int64Array, LargeStringArray, StringArray, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
+use arrow_schema::DataType;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::sync::Arc;
 
 pub fn deduplicate_record_batch(batch: &RecordBatch, primary_key: &str) -> Result<RecordBatch> {
     if primary_key.is_empty() {
@@ -146,6 +148,210 @@ pub fn deduplicate_record_batches(
 
     // Apply deduplication to the concatenated batch
     deduplicate_record_batch(&concatenated, primary_key)
+}
+
+/// Tombstone detection for version-aware deduplication. A row is a tombstone
+/// when the Utf8/LargeUtf8 `column` equals `value`; if such a row is the
+/// max-version winner for its key, the key is dropped entirely, mirroring
+/// ReplacingMergeTree `FINAL` semantics.
+#[derive(Debug, Clone)]
+pub struct TombstoneRule {
+    pub column: String,
+    pub value: String,
+}
+
+/// Deduplicate a RecordBatch by `primary_key`, keeping the row with the maximum
+/// `version_column` value per key.
+///
+/// Unlike [`deduplicate_record_batch`] (which keeps the last row by position),
+/// this picks the winner by version, so it is correct for streams whose rows do
+/// not arrive in version order — e.g. a ClickHouse source scan that deliberately
+/// omits `ORDER BY`. Ties on `version_column` break by position (later wins),
+/// matching ReplacingMergeTree merge behaviour.
+///
+/// When `tombstone` is set, keys whose winning row is a tombstone are dropped
+/// entirely (ReplacingMergeTree `FINAL` semantics).
+pub fn deduplicate_record_batch_by_version(
+    batch: &RecordBatch,
+    primary_key: &str,
+    version_column: &str,
+    tombstone: Option<&TombstoneRule>,
+) -> Result<RecordBatch> {
+    if primary_key.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let primary_keys = crate::utils::parse_primary_key_columns(primary_key);
+
+    let pk_indices: Vec<usize> = primary_keys
+        .iter()
+        .map(|name| {
+            batch.schema().index_of(name).map_err(|_| {
+                streamling_user_err!("Primary key column '{}' not found in schema", name)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if pk_indices.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let version_idx = batch.schema().index_of(version_column).map_err(|_| {
+        streamling_user_err!("Version column '{}' not found in schema", version_column)
+    })?;
+
+    let key_columns: Vec<ArrayRef> = pk_indices
+        .iter()
+        .map(|i| batch.column(*i).clone())
+        .collect();
+    let version_array = batch.column(version_idx).clone();
+
+    let pk_comparators: Vec<_> = key_columns
+        .iter()
+        .map(|col| make_comparator(col.as_ref(), col.as_ref(), SortOptions::default()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .streamling_context("failed to build primary key comparator for dedup")?;
+    let pk_eq = |i: usize, j: usize| -> bool { pk_comparators.iter().all(|cmp| cmp(i, j).is_eq()) };
+
+    let version_cmp = make_comparator(
+        version_array.as_ref(),
+        version_array.as_ref(),
+        SortOptions::default(),
+    )
+    .streamling_context("failed to build version comparator for dedup")?;
+
+    // Tombstone: row matches when `tombstone_column[row] == value`. Build a
+    // single-element literal array of the column's own type so the comparison
+    // is type-safe without a per-row ScalarValue allocation.
+    let tombstone_cmp = match tombstone {
+        Some(rule) => match batch.schema().index_of(&rule.column) {
+            Ok(idx) => {
+                let col = batch.column(idx);
+                let value_arr: ArrayRef = match col.data_type() {
+                    DataType::Utf8 => Arc::new(StringArray::from(vec![Some(rule.value.as_str())])),
+                    DataType::LargeUtf8 => {
+                        Arc::new(LargeStringArray::from(vec![Some(rule.value.as_str())]))
+                    }
+                    other => {
+                        return Err(streamling_user_err!(
+                            "Tombstone column '{}' must be Utf8 or LargeUtf8, got {:?}",
+                            rule.column,
+                            other
+                        ));
+                    }
+                };
+                let cmp = make_comparator(col.as_ref(), value_arr.as_ref(), SortOptions::default())
+                    .streamling_context("failed to build tombstone comparator for dedup")?;
+                Some(cmp)
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let is_tombstone = |row: usize| tombstone_cmp.as_ref().is_some_and(|c| c(row, 0).is_eq());
+
+    // Bucket winning row index (and whether it is a tombstone) per primary-key
+    // hash. Collisions are resolved by real PK equality, same as
+    // `deduplicate_record_batch` (STRM-5990).
+    let mut buckets: HashMap<u64, Vec<(usize, bool)>> = HashMap::with_capacity(batch.num_rows());
+
+    for row_index in 0..batch.num_rows() {
+        let mut hasher = DefaultHasher::new();
+        for col in &key_columns {
+            hash_array_value(&mut hasher, col, row_index);
+        }
+        let hash = hasher.finish();
+        let row_is_tomb = is_tombstone(row_index);
+
+        let bucket = buckets.entry(hash).or_default();
+        let mut updated = false;
+        for entry in bucket.iter_mut() {
+            let (existing, existing_is_tomb) = *entry;
+            if pk_eq(existing, row_index) {
+                // Keep the higher version. On a tie, prefer the tombstone: a
+                // delete at the same version supersedes the live row, so the
+                // key is dropped — ReplacingMergeTree FINAL with an `is_deleted`
+                // flag. The scan has no ORDER BY, so without this the winner is
+                // order-dependent and a live row scanned after the delete
+                // survives, silently losing the deletion. When neither side is a
+                // tombstone (e.g. no tombstone rule), ties keep the later row,
+                // matching merge order.
+                let should_replace = match version_cmp(existing, row_index) {
+                    o if o.is_lt() => true,  // new row has the higher version
+                    o if o.is_gt() => false, // current winner has the higher version
+                    // tie: tombstone wins; if both/neither, later position wins
+                    _ => !existing_is_tomb || row_is_tomb,
+                };
+                if should_replace {
+                    *entry = (row_index, row_is_tomb);
+                }
+                updated = true;
+                break;
+            }
+        }
+        if !updated {
+            bucket.push((row_index, row_is_tomb));
+        }
+    }
+
+    // Survivors in original ascending order; drop tombstoned keys entirely.
+    let mut unique_indices: Vec<i64> = buckets
+        .into_values()
+        .flatten()
+        .filter(|(_, is_tomb)| !is_tomb)
+        .map(|(row, _)| row as i64)
+        .collect();
+    unique_indices.sort_unstable();
+    let indices_array = Int64Array::from(unique_indices);
+
+    let unique_columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|col| {
+            crate::utils::arrow::safe_take(col, &indices_array)
+                .streamling_context("failed to take unique rows from column")
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let new_schema = crate::utils::arrow::build_schema_from_columns(
+        &batch.schema(),
+        &unique_columns,
+        batch.schema().metadata().clone(),
+    );
+
+    let unique_batch = RecordBatch::try_new(new_schema, unique_columns)
+        .streamling_context("failed to create deduplicated batch")?;
+
+    Ok(unique_batch)
+}
+
+/// Deduplicate across multiple RecordBatches by version, keeping the max-version
+/// row per primary key. Concatenates the batches first, so duplicates that
+/// straddle batch boundaries (common when a page is split into multiple IPC
+/// blocks) are collapsed correctly.
+pub fn deduplicate_record_batches_by_version(
+    batches: &[RecordBatch],
+    primary_key: &str,
+    version_column: &str,
+    tombstone: Option<&TombstoneRule>,
+) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Err(streamling_err!("Cannot deduplicate empty batch list"));
+    }
+
+    if batches.len() == 1 {
+        return deduplicate_record_batch_by_version(
+            &batches[0],
+            primary_key,
+            version_column,
+            tombstone,
+        );
+    }
+
+    let schema = batches[0].schema();
+    let concatenated = concat_batches(&schema, batches.iter())
+        .streamling_context("failed to concatenate batches for dedup")?;
+
+    deduplicate_record_batch_by_version(&concatenated, primary_key, version_column, tombstone)
 }
 
 /// Feed an array value at `index` into `hasher`. Used to bucket rows by their
@@ -1221,5 +1427,234 @@ mod tests {
         // id=a appears twice; latest occurrence (value=3) wins.
         assert_eq!(row_for("a"), 3);
         assert_eq!(row_for("b"), 2);
+    }
+    fn create_versioned_batch(
+        id_values: Vec<Option<&str>>,
+        value_values: Vec<Option<i64>>,
+        version_values: Vec<Option<i64>>,
+        op_values: Vec<Option<&str>>,
+    ) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+            Field::new("insert_timestamp", DataType::Int64, true),
+            Field::new("_gs_op", DataType::Utf8, true),
+        ]);
+        let id_array: ArrayRef = Arc::new(StringArray::from(id_values));
+        let value_array: ArrayRef = Arc::new(Int64Array::from(value_values));
+        let version_array: ArrayRef = Arc::new(Int64Array::from(version_values));
+        let op_array: ArrayRef = Arc::new(StringArray::from(op_values));
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![id_array, value_array, version_array, op_array],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_dedup_by_version_keeps_max_version_not_position() {
+        // id=1 appears twice; the EARLIER row has the HIGHER version.
+        // Position-based dedup would wrongly keep row 1; version-aware keeps row 0.
+        let batch = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(100), Some(50)],
+            vec![Some("i"), Some("i")],
+        );
+        let result =
+            deduplicate_record_batch_by_version(&batch, "id", "insert_timestamp", None).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let value_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            value_col.value(0),
+            10,
+            "max-version row (value=10) must win"
+        );
+    }
+
+    #[test]
+    fn test_dedup_by_version_tie_keeps_later_position() {
+        // Equal versions: later position wins (ReplacingMergeTree merge order).
+        let batch = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(100), Some(100)],
+            vec![Some("i"), Some("i")],
+        );
+        let result =
+            deduplicate_record_batch_by_version(&batch, "id", "insert_timestamp", None).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let value_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.value(0), 20);
+    }
+
+    #[test]
+    fn test_dedup_by_version_tombstone_drops_key_when_winner() {
+        // id=1: live insert (version 100) then a delete (version 200). The
+        // delete is the max-version winner -> the whole key is dropped (FINAL).
+        let batch = create_versioned_batch(
+            vec![Some("1"), Some("1"), Some("2")],
+            vec![Some(10), Some(20), Some(30)],
+            vec![Some(100), Some(200), Some(50)],
+            vec![Some("i"), Some("d"), Some("i")],
+        );
+        let tombstone = TombstoneRule {
+            column: "_gs_op".to_string(),
+            value: "d".to_string(),
+        };
+        let result =
+            deduplicate_record_batch_by_version(&batch, "id", "insert_timestamp", Some(&tombstone))
+                .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let id_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "2", "tombstoned id=1 must be dropped");
+    }
+
+    #[test]
+    fn test_dedup_by_version_tombstone_kept_when_not_winner() {
+        // id=1: delete (version 50) then live insert (version 200). The delete
+        // is NOT the winner -> key survives with the live row.
+        let batch = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(50), Some(200)],
+            vec![Some("d"), Some("i")],
+        );
+        let tombstone = TombstoneRule {
+            column: "_gs_op".to_string(),
+            value: "d".to_string(),
+        };
+        let result =
+            deduplicate_record_batch_by_version(&batch, "id", "insert_timestamp", Some(&tombstone))
+                .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let op_col = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(op_col.value(0), "i");
+    }
+
+    #[test]
+    fn test_dedup_by_version_tie_prefers_tombstone() {
+        // id=1: a live row and a delete at the SAME version. A delete at the
+        // same version supersedes the live row (the row's final state is
+        // deleted), so the whole key must be dropped regardless of row order —
+        // ReplacingMergeTree FINAL with an `is_deleted` flag.
+        //
+        // Regression: the previous tiebreak kept the later-position row, so a
+        // live row scanned AFTER the delete survived and the deletion was
+        // silently lost. The scan has no ORDER BY, so this is order-dependent
+        // and intermittently drops deletes.
+        let tombstone = TombstoneRule {
+            column: "_gs_op".to_string(),
+            value: "d".to_string(),
+        };
+
+        // Order 1: delete first, then live.
+        let batch_del_first = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(100), Some(100)],
+            vec![Some("d"), Some("i")],
+        );
+        let result_del_first = deduplicate_record_batch_by_version(
+            &batch_del_first,
+            "id",
+            "insert_timestamp",
+            Some(&tombstone),
+        )
+        .unwrap();
+        assert_eq!(
+            result_del_first.num_rows(),
+            0,
+            "tied delete must drop the key (delete-first order)"
+        );
+
+        // Order 2: live first, then delete.
+        let batch_live_first = create_versioned_batch(
+            vec![Some("1"), Some("1")],
+            vec![Some(10), Some(20)],
+            vec![Some(100), Some(100)],
+            vec![Some("i"), Some("d")],
+        );
+        let result_live_first = deduplicate_record_batch_by_version(
+            &batch_live_first,
+            "id",
+            "insert_timestamp",
+            Some(&tombstone),
+        )
+        .unwrap();
+        assert_eq!(
+            result_live_first.num_rows(),
+            0,
+            "tied delete must drop the key (live-first order)"
+        );
+    }
+
+    #[test]
+    fn test_dedup_by_version_missing_version_column_errors() {
+        let batch = create_versioned_batch(
+            vec![Some("1")],
+            vec![Some(10)],
+            vec![Some(100)],
+            vec![Some("i")],
+        );
+        let result = deduplicate_record_batch_by_version(&batch, "id", "nope", None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Version column 'nope' not found")
+        );
+    }
+
+    #[test]
+    fn test_dedup_by_version_across_batches() {
+        // Same key split across two batches; the higher version lives in batch 1.
+        let batch1 = create_versioned_batch(
+            vec![Some("1")],
+            vec![Some(10)],
+            vec![Some(300)],
+            vec![Some("i")],
+        );
+        let batch2 = create_versioned_batch(
+            vec![Some("1")],
+            vec![Some(20)],
+            vec![Some(100)],
+            vec![Some("i")],
+        );
+        let result = deduplicate_record_batches_by_version(
+            &[batch1, batch2],
+            "id",
+            "insert_timestamp",
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let value_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            value_col.value(0),
+            10,
+            "max-version (batch1, value=10) must win"
+        );
     }
 }

@@ -383,7 +383,7 @@ jobs:
             streamling-common
             streamling-flink-compat
             streamling-plugin-derive
-            streamling-state          
+            streamling-state
             streamling-plugin
             streamling-core
             streamling-connectors
@@ -392,6 +392,16 @@ jobs:
           )
           for crate in "${crates[@]}"; do
             echo "::group::cargo publish -p $crate"
-            cargo publish -p "$crate" --locked
+            if output="$(cargo publish -p "$crate" --locked 2>&1)"; then
+              echo "$output"
+            else
+              echo "$output"
+              if grep -q "already exists on crates.io index" <<<"$output"; then
+                echo "::notice::$crate version already published; skipping."
+              else
+                echo "::error::cargo publish failed for $crate."
+                exit 1
+              fi
+            fi
             echo "::endgroup::"
           done

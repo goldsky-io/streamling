@@ -10,7 +10,9 @@ use std::time::Duration;
 use streamling_config::AppConfig;
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
 use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
-use streamling_connectors::table_providers::file::build_file_source_provider;
+use streamling_connectors::table_providers::file::{
+    FileSourceTableProvider, build_bounded_file_source_provider,
+};
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
 use streamling_connectors::table_providers::kafka::KafkaSourceTableProvider;
@@ -654,6 +656,7 @@ impl Streamling {
                         columns,
                         state_backend_factory.create(app_config.state_backend_namespace()),
                         app_config.internal_buffer_size.as_usize(),
+                        app_config.record_batch_size as usize,
                     )?);
                     let extracted_pk = clickhouse_source_provider.get_extracted_primary_key();
 
@@ -774,16 +777,43 @@ impl Streamling {
                         .get(reference_name)
                         .expect("node context must exist");
 
-                    let provider = build_file_source_provider(
-                        reference_name,
-                        &file.path,
-                        file.format,
-                        &session_manager,
-                    )
-                    .await
-                    .map_err(|e| {
-                        e.context(format!("{}: failed to create file source", ctx.format()))
-                    })?;
+                    let provider: Arc<dyn TableProvider> = match &file.mode {
+                        topology::FileSourceMode::Bounded => build_bounded_file_source_provider(
+                            reference_name,
+                            &file.path,
+                            file.format,
+                            &session_manager,
+                        )
+                        .await
+                        .map_err(|e| {
+                            e.context(format!("{}: failed to create file source", ctx.format()))
+                        })?,
+                        topology::FileSourceMode::Continuous { poll_interval } => {
+                            let interval =
+                                humantime::parse_duration(poll_interval).map_err(|e| {
+                                    streamling_user_err!(
+                                        "{}: invalid poll_interval '{}': {}",
+                                        ctx.format(),
+                                        poll_interval,
+                                        e
+                                    )
+                                })?;
+                            FileSourceTableProvider::try_new(
+                                reference_name,
+                                &file.path,
+                                file.format,
+                                interval,
+                                &session_manager,
+                                state_backend_factory.create(app_config.state_backend_namespace()),
+                                app_config.num_records_before_stop,
+                                app_config.internal_buffer_size,
+                            )
+                            .await
+                            .map_err(|e| {
+                                e.context(format!("{}: failed to create file source", ctx.format()))
+                            })?
+                        }
+                    };
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         provider,
@@ -1773,6 +1803,7 @@ impl Streamling {
                         batch_flush_interval_ms,
                         kafka_sink.message_max_bytes,
                         kafka_sink.parallelism,
+                        kafka_sink.compression,
                         sink_telemetry.clone(),
                     ));
                     session_manager
