@@ -407,7 +407,12 @@ impl KafkaSourceConverter<'_> {
 }
 
 /// Decode a Kafka JSON payload into a UTF-8 string, failing with message coordinates for
-/// empty payloads (tombstones) and invalid UTF-8.
+/// empty payloads and invalid UTF-8.
+///
+/// The Kafka source does not support tombstone records (null/empty payloads, e.g. CDC
+/// deletes-as-tombstones) in any format — the Avro decoder rejects them too. An empty payload
+/// is a hard error that terminates the source; represent deletes with a non-empty payload plus
+/// a `dbz.op=d` header instead.
 fn json_payload_to_string(
     payload: &[u8],
     topic: &str,
@@ -415,8 +420,8 @@ fn json_payload_to_string(
     offset: i64,
 ) -> Result<String> {
     if payload.is_empty() {
-        return Err(streamling_err!(
-            "JSON source received an empty payload (tombstone?)\n  topic: {}\n  partition: {}\n  offset: {}",
+        return Err(streamling_user_err!(
+            "JSON source received an empty payload; tombstone records are not supported\n  topic: {}\n  partition: {}\n  offset: {}",
             topic,
             partition,
             offset

@@ -328,6 +328,8 @@ serialization. It's implemented as a custom DataFusion Table Provider (`TablePro
     - The size of the batches is controlled by the `record_batch_size` and `record_batch_interval_ms` parameters.
   - Adds operation type column (`_gs_op`) to track INSERT/UPDATE/DELETE operations (see `Upsert Semantics` section
     below). The operation type is determined by the `dbz.op` header value.
+  - Tombstone records (null/empty payloads, e.g. CDC deletes-as-tombstones) are **not supported** in any format
+    and fail the source. Represent deletes with a non-empty payload plus a `dbz.op=d` header instead.
 
 Kafka Source uses
 high-level [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html) which handles

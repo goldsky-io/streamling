@@ -162,6 +162,10 @@ pub struct KafkaSource {
     pub batch_flush_interval: Option<String>,
     /// Message payload format: "avro" (default) or "json". Avro decodes via the Schema
     /// Registry; JSON decodes each payload as a UTF-8 JSON object using `schema`.
+    ///
+    /// The Kafka source does not support tombstone records (null/empty payloads, e.g. CDC
+    /// deletes-as-tombstones) in any format — they fail the source. Represent deletes with a
+    /// non-empty payload plus a `dbz.op=d` header instead.
     pub data_format: Option<String>,
     /// Input schema for JSON payloads: column name -> Arrow type string (e.g. `id: int64`,
     /// `name: string`). Required when `data_format` is "json"; rejected for Avro.
