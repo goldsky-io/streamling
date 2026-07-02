@@ -41,13 +41,11 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use extism::{Manifest, Plugin, Pool, Wasm};
 use futures::StreamExt;
-use heck::ToUpperCamelCase;
 use std::any::Any;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{self, debug, error, info};
 
@@ -197,39 +195,19 @@ impl WasmRunnerNode {
     pub fn create_arrow_schema_from_map(
         schema_map: &BTreeMap<String, String>,
     ) -> Result<SchemaRef> {
-        let fields: Result<Vec<Field>> = schema_map
-            .iter()
-            .map(|(name, type_str)| {
-                let type_str = if type_str.eq_ignore_ascii_case("string") {
-                    "Utf8".to_string()
-                } else {
-                    type_str.to_upper_camel_case()
-                };
-                let data_type = match DataType::from_str(&type_str) {
-                    Ok(dt) => Ok(dt),
-                    Err(_) => Err(DataFusionError::from(crate::streamling_user_err!(
-                        "unsupported data type '{}' in WASM schema; supported types: \
-                         int8, int16, int32, int64, uint8, uint16, uint32, uint64, \
-                         float16, float32, float64, string/utf8, binary, boolean, \
-                         date32, date64, timestamp, time32, time64, duration, interval, null",
-                        type_str
-                    ))),
-                }?;
-                Ok(Field::new(name, data_type, true))
-            })
-            .collect();
-
-        let mut fields = fields?;
+        let schema = crate::schema::arrow_schema_from_type_map(schema_map)?;
 
         // Always ensure _gs_op is present as a string type (non-nullable)
-        if !schema_map.contains_key(crate::data::COLUMN_NAME_OP) {
-            fields.push(Field::new(
-                crate::data::COLUMN_NAME_OP,
-                DataType::Utf8,
-                false, // non-nullable
-            ));
+        if schema_map.contains_key(crate::data::COLUMN_NAME_OP) {
+            return Ok(schema);
         }
 
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            crate::data::COLUMN_NAME_OP,
+            DataType::Utf8,
+            false, // non-nullable
+        )));
         Ok(Arc::new(Schema::new(fields)))
     }
 }
