@@ -127,16 +127,16 @@ A node's dominant state says whether it *is* the constraint (busy), a victim of 
 
 ## Implementation checklist
 
-- [ ] `recorder.rs` (~L818): rename the `backpressure` counter registration to `node_wait` (unit `ms`, two-state description).
-- [ ] `wrapping.rs` (~L688): emit `node_wait` with `("state","blocked")` (+ `downstream_id`, `""` when unattributed) in the three `BackpressureRole` arms.
-- [ ] `wrapping.rs` (~L716): add a starvation accumulator; record `batch_elapsed` as `node_wait{state="starved", downstream_id=""}` **and keep** recording it as `elapsed_compute` (dual-emit for backward compat — see §4).
-- [ ] `broadcast_stream.rs` (~L204): emit `node_wait` with `("state","blocked")` in the data-plane branch (the control-plane fallback / `BROADCAST_COMPONENT_ID` was removed — the producer id is always threaded through).
-- [ ] Generalize `BackpressureAccumulator` + `BlockedSendAccumulator` into one shared `MillisAccumulator` used by all three emission sites.
-- [ ] (Optional) rename `BackpressureRole` → `EdgeRole`; the optimizer pass logic is unchanged.
-- [ ] `crates/streamling-e2e/src/resources/prometheus.rs`: replace `backpressure_by_id_query` / `backpressure_by_downstream_query` with `node_wait` queries filtered by `state` (blocked-by-id, blocked-by-downstream, starved-by-id).
-- [ ] `crates/streamling-e2e/tests/multi_sink.rs`, `scan_sharing.rs`: update assertions to the new metric/tags.
-- [ ] `AGENTS.md`: replace the "Backpressure metric" section with a "Node-wait / utilization" section describing the `state` label, the two idle states, the (unchanged) single-emitter invariant, and the triad with `elapsed_compute` for busy.
-- [ ] Run `just fix && just lint`; run the multi-sink and scan-sharing e2e tests.
+- [x] `recorder.rs`: rename the `backpressure` counter registration to `node_wait` (unit `ms`, two-state description).
+- [x] `wrapping.rs`: emit `node_wait` with `("state","blocked")` (+ `downstream_id`, `""` when unattributed) in the three `BackpressureRole` arms.
+- [x] `wrapping.rs`: add a starvation accumulator; record `batch_elapsed` as `node_wait{state="starved", downstream_id=""}` **and keep** recording it as `elapsed_compute` (dual-emit for backward compat — see §4).
+- [x] `broadcast_stream.rs`: emit `node_wait` with `("state","blocked")` in the data-plane branch (the control-plane fallback / `BROADCAST_COMPONENT_ID` was removed — the producer id is always threaded through).
+- [x] Generalize `BackpressureAccumulator` + `BlockedSendAccumulator` into one shared `MillisAccumulator` used by all three emission sites.
+- [ ] (Optional, not done) rename `BackpressureRole` → `EdgeRole`; the optimizer pass logic is unchanged.
+- [x] `crates/streamling-e2e/src/resources/prometheus.rs`: replace `backpressure_by_id_query` / `backpressure_by_downstream_query` with `node_wait` queries filtered by `state` (blocked-by-id, blocked-by-downstream, starved-by-id).
+- [x] `crates/streamling-e2e/tests/multi_sink.rs`, `scan_sharing.rs`: update assertions to the new metric/tags.
+- [x] `AGENTS.md`: replace the "Backpressure metric" section with a "Node-wait / utilization" section describing the `state` label, the two idle states, the (unchanged) single-emitter invariant, and the triad with `elapsed_compute` for busy.
+- [x] Run `just fix && just lint`; run the multi-sink and scan-sharing e2e tests.
 
 ## Testing plan
 

@@ -26,6 +26,9 @@ impl MillisAccumulator {
     /// Drain the accrued time as whole milliseconds, retaining the
     /// sub-millisecond remainder. Returns 0 until at least 1ms has accrued.
     pub fn take_whole_millis(&mut self) -> u64 {
+        // `as_millis()` is u128; the `as u64` truncation is safe in practice —
+        // overflowing u64 milliseconds requires ~584 million years of accrued
+        // time, and the remainder is drained on every emission.
         let whole = self.total.as_millis() as u64;
         if whole > 0 {
             self.total -= Duration::from_millis(whole);

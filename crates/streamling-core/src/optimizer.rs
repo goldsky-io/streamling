@@ -170,18 +170,13 @@ impl PhysicalOptimizerRule for StreamingUnnestRewritePhysicalOptimizerRule {
 /// Scan-shared producer `WrappingExec`s are stashed in `SharedSourceHandle`
 /// before this rule runs (unreachable here), so they are suppressed at
 /// construction instead.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DownstreamAttributionRule {}
 
 impl DownstreamAttributionRule {
+    /// Create a new `DownstreamAttributionRule`.
     pub fn new() -> Self {
         Self {}
-    }
-}
-
-impl Default for DownstreamAttributionRule {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -189,7 +184,7 @@ impl Default for DownstreamAttributionRule {
 /// whether the next `WrappingExec` should be suppressed (multi-sink producer).
 fn attribute_downstream(
     node: Arc<dyn ExecutionPlan>,
-    named_downstream: Option<String>,
+    named_downstream: Option<&str>,
     suppress_next_wrapping: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // MultiSinkExec boundary: the single `input` is the fan-out producer. Suppress
@@ -215,23 +210,27 @@ fn attribute_downstream(
             // Preserve construction-time suppression (scan sharing) and honor the
             // multi-sink boundary suppression.
             BackpressureRole::FanOutProducer
-        } else if let Some(downstream) = &named_downstream {
-            BackpressureRole::Edge(downstream.clone())
+        } else if let Some(downstream) = named_downstream {
+            BackpressureRole::Edge(downstream.to_string())
         } else {
             BackpressureRole::Unattributed
         };
-        let child_downstream = Some(get_reference_name_from_metric_key(
-            wrapping.reference_name(),
-        ));
+        // Owned here so its `&str` can be lent to every child recursion below
+        // without re-allocating the name per child.
+        let child_downstream = get_reference_name_from_metric_key(wrapping.reference_name());
         let new_children = wrapping
             .children()
             .into_iter()
-            .map(|child| attribute_downstream(Arc::clone(child), child_downstream.clone(), false))
+            .map(|child| {
+                attribute_downstream(Arc::clone(child), Some(child_downstream.as_str()), false)
+            })
             .collect::<Result<Vec<_>>>()?;
+        // Clone the node once, then move it through the role builders.
+        let stamped = wrapping.clone();
         let stamped = match role {
-            BackpressureRole::Edge(downstream) => wrapping.clone().with_downstream_id(downstream),
-            BackpressureRole::FanOutProducer => wrapping.clone().suppress_backpressure(),
-            BackpressureRole::Unattributed => wrapping.clone(),
+            BackpressureRole::Edge(downstream) => stamped.with_downstream_id(downstream),
+            BackpressureRole::FanOutProducer => stamped.suppress_backpressure(),
+            BackpressureRole::Unattributed => stamped,
         };
         let stamped: Arc<dyn ExecutionPlan> = Arc::new(stamped);
         return stamped.with_new_children(new_children);
@@ -253,9 +252,9 @@ fn attribute_downstream(
         if broadcasting.downstream_id().is_some() {
             return Ok(Arc::clone(&node));
         }
-        return match &named_downstream {
+        return match named_downstream {
             Some(downstream) => Ok(Arc::new(
-                broadcasting.with_downstream_id(downstream.clone()),
+                broadcasting.with_downstream_id(downstream.to_string()),
             )),
             None => Ok(Arc::clone(&node)),
         };
@@ -264,19 +263,19 @@ fn attribute_downstream(
     // DataSinkExec (root of a sink plan): the sink is the named downstream for
     // the topmost transform. Recover its plain name from the WrappingDataSink.
     if let Some(dse) = node.as_any().downcast_ref::<DataSinkExec>() {
-        let sink_downstream = dse
+        let sink_downstream: Option<String> = dse
             .sink()
             .as_any()
             .downcast_ref::<WrappingDataSink>()
             .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
-            .or(named_downstream);
+            .or_else(|| named_downstream.map(str::to_string));
         let new_children = node
             .children()
             .into_iter()
             .map(|child| {
                 attribute_downstream(
                     Arc::clone(child),
-                    sink_downstream.clone(),
+                    sink_downstream.as_deref(),
                     suppress_next_wrapping,
                 )
             })
@@ -293,11 +292,7 @@ fn attribute_downstream(
         .children()
         .into_iter()
         .map(|child| {
-            attribute_downstream(
-                Arc::clone(child),
-                named_downstream.clone(),
-                suppress_next_wrapping,
-            )
+            attribute_downstream(Arc::clone(child), named_downstream, suppress_next_wrapping)
         })
         .collect::<Result<Vec<_>>>()?;
     node.with_new_children(new_children)
