@@ -674,10 +674,11 @@ impl ExecutionPlan for WrappingExec {
 
                 let batch_start = Instant::now();
                 let batch_result = data.next().await;
+                let batch_elapsed = batch_start.elapsed();
                 // `starved`: time this node waited on upstream for its input.
                 // Node-local (not an edge property), so downstream_id is always
                 // "" to keep the label key set identical to the blocked series.
-                starved.add(batch_start.elapsed());
+                starved.add(batch_elapsed);
                 let starved_ms = starved.take_whole_millis();
                 if starved_ms > 0 {
                     metrics_recorder.record_count_w_tags(
@@ -695,6 +696,15 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
+                        // Also fold input-wait into `elapsed_compute` for backward
+                        // compatibility (deprecated): `node_wait{state="starved"}`
+                        // above is the clean successor. Keeping this emission means
+                        // existing `elapsed_compute` dashboards/alerts are unchanged;
+                        // pure compute is derivable as
+                        // `elapsed_compute - node_wait{state="starved"}`. Remove in a
+                        // future release once consumers migrate to the `starved` state.
+                        metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),

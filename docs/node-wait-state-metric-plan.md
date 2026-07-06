@@ -63,14 +63,12 @@ The measurement is unchanged; only the metric name and the added `state` tag cha
 
 ### 3. `starved` emission (new; replaces the `input_wait` histogram idea)
 
-In `wrapping.rs` (~L716–728), `batch_elapsed` (time in `data.next().await`) is today folded into `elapsed_compute`. Stop that; record it as `state="starved"` on the counter instead, using a **remainder-carry accumulator** so sub-millisecond waits are lossless and directly comparable to `blocked`:
+In `wrapping.rs` (~L716–728), `batch_elapsed` (time in `data.next().await`) is folded into `elapsed_compute`. **Additively** record it as `state="starved"` on the counter as well (dual-emit — see §4 for why we keep the `elapsed_compute` fold), using a **remainder-carry accumulator** so sub-millisecond waits are lossless and directly comparable to `blocked`:
 
 ```rust
-// before
-metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
-// after
-starvation.add(batch_elapsed);
-let starved_ms = starvation.take_whole_millis();
+let batch_elapsed = batch_start.elapsed();
+starved.add(batch_elapsed);
+let starved_ms = starved.take_whole_millis();
 if starved_ms > 0 {
     metrics_recorder.record_count_w_tags(
         "node_wait",
@@ -79,18 +77,22 @@ if starved_ms > 0 {
         &metric_metadata_id,
     );
 }
+// ... and, in the Ok branch, KEEP the existing fold for backward compatibility:
+metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
 ```
 
 `BackpressureAccumulator` and `BlockedSendAccumulator` are both "remainder-carry ms accumulators." Rather than add a third copy, generalize them into one shared `MillisAccumulator` (add duration, drain whole millis, retain the remainder) and use it for all three sites (blocked yield→resume, blocked-send, starved). This is a small, mechanical refactor that removes duplication.
 
 > Note the counter choice for `starved` (vs. the histogram in the old plan): keeping all idle states as counters with the same accumulator makes the triad summable losslessly and keeps one code path. The only thing we lose vs. a histogram is per-batch wait *distribution*, which the triad doesn't need.
 
-### 4. `elapsed_compute` semantics change (unchanged from the old plan)
+### 4. `elapsed_compute` compatibility — dual-emit (chosen)
 
-Because `batch_elapsed` moves out of `elapsed_compute` into `state="starved"`, `elapsed_compute` for sources and non-DataFusion nodes drops to ~the 1 ms seed — it finally means *compute only*. Sinks and SQL transforms are unaffected (their `elapsed_compute` is connector-/DataFusion-recorded, not `batch_elapsed`).
+`elapsed_compute` is a pre-existing, deployed metric (likely consumed by the companion Grafana dashboard). Moving `batch_elapsed` off it would silently change source/transform `elapsed_compute` — for a `WrappingExec`-wrapped source it would drop to the ~1 ms per-batch seed, breaking any dashboard using it as a latency proxy. To keep this **non-breaking** we chose the additive path:
 
-- **(A) Clean cut (recommended):** move `batch_elapsed` entirely to `state="starved"` now and document the semantics change in `AGENTS.md`.
-- **(C) Fallback:** if any live dashboard depends on the old source `elapsed_compute` meaning "fetch time," keep folding `batch_elapsed` into `elapsed_compute` for a deprecation window while also emitting `starved`. Non-breaking but leaves `elapsed_compute` conflated in the interim.
+- **(C) Dual-emit (chosen):** keep folding `batch_elapsed` into `elapsed_compute` **and** emit `node_wait{state="starved"}`. `elapsed_compute` keeps its exact historical value (no dashboard breaks); `starved` is purely additive. Pure compute is recoverable as `elapsed_compute - node_wait{state="starved"}` (clamp ≥ 0): `≈ seed` for a source, `≈ DataFusion compute` for a SQL transform. Documented in `AGENTS.md` with a deprecation note.
+- **(A) Clean cut (deferred):** a future release drops the `elapsed_compute` input-wait fold so it means *compute only*. Do this once consumers have migrated to `node_wait{state="starved"}`.
+
+Cost of (C): the input-wait span lives in two series, so don't naively sum `elapsed_compute + node_wait{state="starved"}`. Sinks are unaffected either way (their `elapsed_compute` is connector-recorded service time, not `batch_elapsed`).
 
 ## Label consistency: always emit `downstream_id`
 
@@ -103,10 +105,10 @@ To keep queries frictionless, **always emit `downstream_id`**, using `""` for `s
 | State | Series | Meaning |
 | ----------- | ---------------------------------------------------- | -------------------------------------------------------------------- |
 | **starved** | `node_wait{state="starved"}` | waiting on upstream (slow source / backpressure arriving from below) |
-| **busy** | `elapsed_compute` | this node is the CPU/service bottleneck |
+| **busy** | `elapsed_compute - node_wait{state="starved"}` | this node is the CPU/service bottleneck |
 | **blocked** | `node_wait{state="blocked", downstream_id=...}` | held back by a specific downstream consumer |
 
-A node's dominant state says whether it *is* the constraint (busy), a victim of something upstream (starved), or a victim of something downstream (blocked) — and `downstream_id` names the culprit for the blocked case. Two of the three states now live in one metric; `busy` is a one-metric join away.
+A node's dominant state says whether it *is* the constraint (busy), a victim of something upstream (starved), or a victim of something downstream (blocked) — and `downstream_id` names the culprit for the blocked case. Two of the three states live in one metric; `busy` is `elapsed_compute` minus the `starved` fold (see §4) until the deprecated fold is removed, after which `elapsed_compute` alone is busy.
 
 ## What is explicitly out of scope
 
@@ -127,8 +129,8 @@ A node's dominant state says whether it *is* the constraint (busy), a victim of 
 
 - [ ] `recorder.rs` (~L818): rename the `backpressure` counter registration to `node_wait` (unit `ms`, two-state description).
 - [ ] `wrapping.rs` (~L688): emit `node_wait` with `("state","blocked")` (+ `downstream_id`, `""` when unattributed) in the three `BackpressureRole` arms.
-- [ ] `wrapping.rs` (~L716): add a starvation accumulator; record `batch_elapsed` as `node_wait{state="starved", downstream_id=""}` and stop recording it as `elapsed_compute`.
-- [ ] `broadcast_stream.rs` (~L204): emit `node_wait` with `("state","blocked")` in the data-plane and control-plane branches.
+- [ ] `wrapping.rs` (~L716): add a starvation accumulator; record `batch_elapsed` as `node_wait{state="starved", downstream_id=""}` **and keep** recording it as `elapsed_compute` (dual-emit for backward compat — see §4).
+- [ ] `broadcast_stream.rs` (~L204): emit `node_wait` with `("state","blocked")` in the data-plane branch (the control-plane fallback / `BROADCAST_COMPONENT_ID` was removed — the producer id is always threaded through).
 - [ ] Generalize `BackpressureAccumulator` + `BlockedSendAccumulator` into one shared `MillisAccumulator` used by all three emission sites.
 - [ ] (Optional) rename `BackpressureRole` → `EdgeRole`; the optimizer pass logic is unchanged.
 - [ ] `crates/streamling-e2e/src/resources/prometheus.rs`: replace `backpressure_by_id_query` / `backpressure_by_downstream_query` with `node_wait` queries filtered by `state` (blocked-by-id, blocked-by-downstream, starved-by-id).
@@ -139,7 +141,7 @@ A node's dominant state says whether it *is* the constraint (busy), a victim of 
 ## Testing plan
 
 - **Unit (recorder):** `node_wait` counter is pre-registered — adapt `backpressure_counters_are_registered`.
-- **Unit (wrapping):** with a registered node id and a slow downstream, assert `node_wait{state="blocked"}` accrues (adapt the existing backpressure wrapping test); with a slow upstream, assert `node_wait{state="starved"}` accrues while a non-SQL node's `elapsed_compute` stays ~seed. (Mind the global-recorder `TEST_LOCK` and metadata-seeding pattern.)
+- **Unit (wrapping):** with a registered node id and a slow downstream, assert `node_wait{state="blocked"}` accrues (adapt the existing backpressure wrapping test); with a slow upstream, assert `node_wait{state="starved"}` accrues. (`elapsed_compute` still receives the input-wait fold under dual-emit, so don't assert it drops.) (Mind the global-recorder `TEST_LOCK` and metadata-seeding pattern.)
 - **Unit (accumulator):** keep the sub-millisecond remainder-carry tests, retargeted at the shared `MillisAccumulator`.
 - **E2E:** the multi-sink and scan-sharing tests already assert per-consumer attribution — update them to `node_wait{state="blocked", downstream_id=...}` and add a `state="starved"` sanity assertion for a source.
 
@@ -148,4 +150,4 @@ A node's dominant state says whether it *is* the constraint (busy), a victim of 
 1. **Metric name.** `node_wait` (recommended) vs. `node_idle` vs. `node_stall`. All read fine with a `state` label; `node_time` is avoided because busy is intentionally excluded, so "time" would overstate coverage.
 2. **`downstream_id` on all series** (recommended, for label uniformity) vs. omitting it for `starved`.
 3. Whether to rename `BackpressureRole` → `EdgeRole` now or leave it (cosmetic).
-4. Clean-cut (A) vs. additive-deprecate (C) for the `elapsed_compute` semantics change.
+4. ~~Clean-cut (A) vs. additive-deprecate (C) for the `elapsed_compute` semantics change.~~ **Resolved: (C) dual-emit** — non-breaking; drop the fold in a later release.

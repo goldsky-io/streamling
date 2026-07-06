@@ -156,13 +156,15 @@ Label constraints (enforced at config load):
 
 ### Node-wait metric (starved / blocked)
 
-A node's idle time — time spent *not* doing useful work — is exported as a single counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the two idle states of the utilization triad. The third state, **busy**, is `streamling_elapsed_compute_milliseconds` (unchanged); together the three localize a bottleneck at a glance:
+A node's idle time — time spent *not* doing useful work — is exported as a single counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the two idle states of the utilization triad. The third state, **busy**, is derived from the existing `streamling_elapsed_compute_milliseconds`; together the three localize a bottleneck at a glance:
 
 | State | Series | Meaning |
 |-------|--------|---------|
 | **starved** | `node_wait{state="starved"}` | waiting on upstream for input (slow source, or backpressure arriving from below) |
-| **busy** | `elapsed_compute` | this node is the CPU/service bottleneck |
+| **busy** | `elapsed_compute - node_wait{state="starved"}` | this node is the CPU/service bottleneck |
 | **blocked** | `node_wait{state="blocked", downstream_id=...}` | held back by a specific downstream consumer |
+
+> **`elapsed_compute` compatibility.** For backward compatibility, a `WrappingExec` node's input-wait (`data.next().await`) is *still folded into* `elapsed_compute` in addition to being emitted as `node_wait{state="starved"}`. So `elapsed_compute` retains its historical (input-wait + compute) meaning — existing dashboards/alerts are unchanged — and pure compute is `elapsed_compute - node_wait{state="starved"}`. The double-fold is deprecated; a future release will drop the `elapsed_compute` input-wait contribution so it means compute only. (Sink `elapsed_compute` is connector-recorded service time and is unaffected either way.)
 
 Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved` and for unresolved `blocked`), so the two states share an identical label key set and cross-state math needs no per-series label surgery.
 

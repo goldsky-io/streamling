@@ -21,24 +21,18 @@ use tracing::{info, warn};
 
 use crate::telemetry::MillisAccumulator;
 
-/// Fallback component id for fan-out backpressure attribution when the producing
-/// node's `metric_metadata_id` is unknown. The `node_wait{state="blocked"}`
-/// counter carries this as its `id` tag and the slow consumer's reference name
-/// as the `downstream_id` tag. When the producer id IS known, emission goes
-/// through the data-plane recorder instead so `id` is the real producer node.
-const BROADCAST_COMPONENT_ID: &str = "multi_sink_broadcast";
-
 #[derive(Clone, Debug)]
 pub struct BroadcastStream {
     inner: Arc<BroadcastState>,
     stopped: Arc<AtomicBool>,
     channel_capacity: usize,
     /// `metric_metadata_id` (the `metric_key` form `"{app}::{name}"`) of the
-    /// producer node feeding this broadcast. When set, per-consumer blocked-send
-    /// time is emitted as `node_wait{state="blocked"}` via the data-plane
-    /// recorder, so it carries `id=<producer>` plus the producer's full tag set
-    /// and `downstream_id=<consumer>`. When `None`, emission falls back to the
-    /// control-plane `BROADCAST_COMPONENT_ID`.
+    /// producer node feeding this broadcast. Per-consumer blocked-send time is
+    /// emitted as `node_wait{state="blocked"}` via the data-plane recorder, so it
+    /// carries `id=<producer>` plus the producer's full tag set and
+    /// `downstream_id=<consumer>`. Every production `BroadcastStream` threads the
+    /// producing node's id through its constructor; when `None` (only reachable in
+    /// tests) blocked-send time is simply not attributed.
     upstream_metadata_id: Option<String>,
 }
 
@@ -123,16 +117,14 @@ impl BroadcastStream {
 
     /// The task that reads from the single source stream and broadcasts to all active consumers.
     async fn run_broadcast(&self, mut source_stream: SendableRecordBatchStream) {
-        // Per-consumer blocked-send time is emitted as `node_wait{state="blocked"}`.
-        // When the producing node's `metric_metadata_id` is known we use the
-        // data-plane recorder so the series carries `id=<producer>` plus the
-        // producer's full tag set and `downstream_id=<consumer>`. Otherwise we
-        // fall back to the control-plane `BROADCAST_COMPONENT_ID`. Consumers with
-        // an empty `downstream_id` (the passthrough output, or a fan-out edge the
+        // Per-consumer blocked-send time is emitted as `node_wait{state="blocked"}`
+        // via the data-plane recorder so the series carries `id=<producer>` plus
+        // the producer's full tag set and `downstream_id=<consumer>`. Every
+        // production BroadcastStream is constructed with the producer id threaded
+        // through, so `upstream_metadata_id` is always set; consumers with an empty
+        // `downstream_id` (the passthrough output, or a fan-out edge the
         // attribution rule could not reach) are not attributed.
         let data_plane_recorder = crate::telemetry::recorder::get_metrics_recorder();
-        let control_plane_recorder =
-            crate::telemetry::recorder::get_control_plane_metrics_recorder(BROADCAST_COMPONENT_ID);
         let upstream_metadata_id = self.upstream_metadata_id.clone();
         // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
         // into whole milliseconds instead of each truncating to zero.
@@ -165,8 +157,13 @@ impl BroadcastStream {
                     for (downstream_id, result) in results {
                         match result {
                             Ok(blocked) => {
-                                // Consumers without a downstream id (passthrough
-                                // output, scan-sharing fan-out) are not attributed.
+                                // Not attributed: a consumer without a downstream id
+                                // (passthrough output, scan-sharing fan-out), or a
+                                // broadcast with no producer id (tests only —
+                                // production always threads it through).
+                                let Some(metadata_id) = upstream_metadata_id.as_deref() else {
+                                    continue;
+                                };
                                 if downstream_id.is_empty() {
                                     continue;
                                 }
@@ -176,31 +173,16 @@ impl BroadcastStream {
                                 acc.add(blocked);
                                 let blocked_ms = acc.take_whole_millis();
                                 if blocked_ms > 0 {
-                                    match &upstream_metadata_id {
-                                        Some(metadata_id) => {
-                                            // Data-plane: id=<producer> + full tags + downstream_id.
-                                            data_plane_recorder.record_count_w_tags(
-                                                "node_wait",
-                                                blocked_ms,
-                                                vec![
-                                                    ("state", "blocked"),
-                                                    ("downstream_id", downstream_id.as_str()),
-                                                ],
-                                                metadata_id,
-                                            );
-                                        }
-                                        None => {
-                                            // Fallback: control-plane id=multi_sink_broadcast.
-                                            control_plane_recorder.record_count_w_tags(
-                                                "node_wait",
-                                                blocked_ms,
-                                                vec![
-                                                    ("state", "blocked"),
-                                                    ("downstream_id", downstream_id.as_str()),
-                                                ],
-                                            );
-                                        }
-                                    }
+                                    // Data-plane: id=<producer> + full tags + downstream_id.
+                                    data_plane_recorder.record_count_w_tags(
+                                        "node_wait",
+                                        blocked_ms,
+                                        vec![
+                                            ("state", "blocked"),
+                                            ("downstream_id", downstream_id.as_str()),
+                                        ],
+                                        metadata_id,
+                                    );
                                 }
                             }
                             Err(()) => {
@@ -451,16 +433,16 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap()
     }
 
-    /// `upstream_metadata_id` selects the emission path in `run_broadcast`: when
-    /// set, blocked-send time is attributed to the producer via the data-plane
-    /// recorder; when unset, it falls back to the control-plane component id.
+    /// `upstream_metadata_id` drives attribution in `run_broadcast`: when set,
+    /// blocked-send time is attributed to the producer via the data-plane
+    /// recorder; when unset (tests only) blocked-send is not attributed.
     #[test]
     fn with_upstream_metadata_id_sets_producer_attribution() {
         let schema = one_row_batch().schema();
         let broadcast = BroadcastStream::new(schema, 4);
         assert!(
             broadcast.upstream_metadata_id.is_none(),
-            "default opts into the control-plane fallback"
+            "default leaves blocked-send unattributed"
         );
         let broadcast = broadcast.with_upstream_metadata_id(Some("app::producer".to_string()));
         assert_eq!(
