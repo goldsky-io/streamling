@@ -41,7 +41,6 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use extism::{Manifest, Plugin, Pool, Wasm};
 use futures::StreamExt;
-use heck::ToUpperCamelCase;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BTreeMap;
 use std::fmt;
