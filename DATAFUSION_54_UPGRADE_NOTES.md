@@ -305,37 +305,42 @@ these: `Record name mismatch writer=trace_arbitrums_after_evm_transfers, reader=
 Fixed on #27 (commit 487b9c14) by injecting the writer's record name into the reader schema's top-level
 `aliases`; code-reviewer-pro verdict **pass with two follow-ups** (items 2–3 below).
 
-Must-do before #27 lands:
+Status — all resolved (fixed, verified-equivalent, or tracked). Details:
 
-1. **`skip_schema_resolution` is silently neutered in #27** *(highest priority — behavioral change)*.
-   Vendored: when set (globally via `skip_schema_resolution_unconditional`, or per id via
-   `skip_schema_resolution_for_reader_schema_ids`) the raw writer `Value` is used with **no resolution at
-   all** — no name check, no reordering, no default-filling (`kafka.rs:1245`, main). #27: the decoder
-   *unconditionally* calls `with_reader_schema(...)`, so arrow-avro **always resolves**; the flag now only
-   gates the writer-ahead ordering fail-fast (`kafka.rs:1275`, #27). Decide: honor the flag by decoding
-   against the writer schema (skip `with_reader_schema`), or document that resolution is always-on now.
-   Not currently set in `streamling-cloud` configs (grep came up empty), so no known pipeline depends on
-   it today — but it's a real semantic regression for anyone who does.
+1. **`skip_schema_resolution`** — ✅ **FIXED** (`eb549131`). Vendored: when set (globally via
+   `skip_schema_resolution_unconditional`, or per id via `skip_schema_resolution_for_reader_schema_ids`) the
+   raw writer `Value` is used with **no resolution** — no name check, reordering, or default-filling
+   (`kafka.rs:1245`, main). #27 originally *unconditionally* called `with_reader_schema(...)` so arrow-avro
+   always resolved, silently neutering the flag. Now honored: `ConfluentAvroDecoder::with_schema_resolution(
+   false)` builds the decoder with only the writer-schema store (decode against the writer, no resolution),
+   and `coerce_batch_to_target` null-fills an absent *nullable* target field (mirroring the vendored reader)
+   rather than erroring. Test: `skip_schema_resolution_decodes_against_writer_and_skips_defaults`.
 
-2. **Namespace-aware alias injection** (review follow-up). The record-name fix injects the writer's *bare*
-   name; `arrow_avro.rs::record_full_name` can't see the reader's namespace. If a reader schema ever has a
-   namespace while the writer stays bare, arrow-avro re-qualifies the injected alias with the reader ns and
-   the match fails again with the identical error. Thread the reader namespace through and inject the
-   dotted (already-qualified) form. Doesn't affect today's namespace-less schemas.
+2. **Namespace-aware alias injection** — 📋 **DEFERRED → STRM-6359**. The record-name fix injects the
+   writer's bare name; arrow-avro re-qualifies a bare alias with the *reader's* namespace, so a
+   bare-writer/namespaced-reader pair fails again. The alias mechanism can't express a bare full-name under a
+   namespaced record; the robust fix is to rename the reader record to the writer's identity. Doesn't affect
+   today's namespace-less schemas.
 
-3. **Nested-name resolution limitation** (review follow-up). The fix only aligns the **top-level** record
-   name; `resolve_records`/`resolve_enums`/`resolve_fixed` also `ensure_names_match` on every nested named
-   type. Trace schemas have nested transfer records, so a nested rename would reproduce the error one level
-   down. Add a doc comment at the alias-injection site + a tracking issue so the next `Record name
-   mismatch` isn't misdiagnosed.
+3. **Nested-name resolution limitation** — ✅ **DOCUMENTED** (inline on `writer_aliases`) + 📋 **STRM-6359**.
+   The fix aligns only the top-level record name; `resolve_records`/`resolve_enums`/`resolve_fixed` also
+   name-check nested named types, so a nested rename would reproduce the error one level down. STRM-6359's
+   rename-based fix covers this recursively.
 
-4. **Numeric-overflow equivalence.** Vendored `Resolver::resolve` uses `NumCast::from(...)`, which returns
-   `None` on out-of-range → the cell becomes **NULL silently** (e.g. a `u64` > `i64::MAX` into `Int64`).
-   Verify arrow-avro + `coerce_batch_to_target` reproduces silent-null rather than erroring or wrapping.
+4. **Numeric-overflow equivalence** — ✅ **VERIFIED equivalent, no change** (`b12442fd`). The vendored
+   `Resolver::resolve` `NumCast::from(...)` overflow→silent-NULL fallback was **unreachable**: the avro→arrow
+   mapping is width-preserving (int→Int32, long→Int64, …) and Avro only permits *widening* promotion, so a
+   narrowing overflow never occurred. arrow-avro decodes each primitive to its natural width identically.
+   Test: `numeric_boundaries_decode_exactly` (i32::MIN / i64::MAX / f32::MIN / f64::MAX round-trip exactly).
 
-5. **Decimal heuristics equivalence.** Confirm the vendored behaviors are matched under `coerce_batch_to_target`:
-   silent scale-clamp (`scale > MAX_SCHEMA_PRECISION`) in `post_process_avro_schema_for_reading`, and the
-   `precision > 76 && scale == 0 ⇒ U256` blockchain heuristic in `convert_avro_schema_to_arrow`.
+5. **Decimal heuristics equivalence** — ✅ **VERIFIED equivalent, no change** (`b12442fd`). u256/i256/decimal
+   byte reinterpretation (`u256_be_bytes`/`i256_be_bytes`/`be_bytes_to_i128`/`be_bytes_to_i256`) was extracted
+   from the vendored `resolve_u256`/`resolve_i256`/`resolve_decimal(_256)` and is byte-identical for in-range
+   inputs (same negative-reject, sign-aware padding-strip, error-on-oversize for u256/i256; the i128/i256
+   helpers only differ by keeping low bytes instead of *panicking* on impossible oversized input). Scale-clamp
+   (`scale > MAX_SCHEMA_PRECISION`) and the `precision > 76 && scale == 0 ⇒ U256` routing live in shared
+   `convert_avro_schema_to_arrow`/`post_process_avro_schema_for_reading` code, so target schemas are identical
+   by construction. Test: `decimal_byte_reinterpretation_is_twos_complement`.
 
 Other vendored leniencies/panics (status quo on main; catalogued for completeness): same-id resolution
 shortcut (`resolve_schema`, writer_id==reader_id ⇒ no resolution); optional `validate_writer_schema_ordering`;
