@@ -1,8 +1,10 @@
+pub mod accumulator;
 pub mod event_time_reader;
 pub mod provider;
 pub mod recorder;
 pub mod types;
 
+pub use accumulator::MillisAccumulator;
 pub use event_time_reader::{EventTimeReadError, EventTimeReader};
 pub use provider::{get_delta_meter, init_telemetry_provider, shutdown_test_meter_providers};
 pub use types::{

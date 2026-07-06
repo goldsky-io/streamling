@@ -154,18 +154,28 @@ Label constraints (enforced at config load):
 
 **Hybrid sources:** `telemetry.labels` on a hybrid source automatically propagate to both the bounded and unbounded phase-child metric series — declare them once on the parent.
 
-### Backpressure metric
+### Node-wait metric (starved / blocked)
 
-Backpressure is exported as a single counter, `streamling_backpressure_milliseconds_total`, modeled as a property of an **edge** (`producer → consumer`). Every series carries `id=<producer>` and, when the downstream is a single named node, `downstream_id=<consumer>` — so a linear chain is a sequence of single edges and a fan-out is several edges, with no "single node vs multi node" distinction for the user.
+A node's idle time — time spent *not* doing useful work — is exported as a single counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the two idle states of the utilization triad. The third state, **busy**, is `streamling_elapsed_compute_milliseconds` (unchanged); together the three localize a bottleneck at a glance:
 
-The core invariant is **exactly one emitter per edge**:
+| State | Series | Meaning |
+|-------|--------|---------|
+| **starved** | `node_wait{state="starved"}` | waiting on upstream for input (slow source, or backpressure arriving from below) |
+| **busy** | `elapsed_compute` | this node is the CPU/service bottleneck |
+| **blocked** | `node_wait{state="blocked", downstream_id=...}` | held back by a specific downstream consumer |
+
+Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved` and for unresolved `blocked`), so the two states share an identical label key set and cross-state math needs no per-series label surgery.
+
+**`blocked`** is modeled as a property of an **edge** (`producer → consumer`): the `downstream_id` names the consumer, so a linear chain is a sequence of single edges and a fan-out is several edges. The core invariant is **exactly one blocked emitter per edge**:
 
 - A single-downstream node's `WrappingExec` emits its one edge (`id=self, downstream_id=the_consumer`), measured as yield→resume suspension.
-- A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel. `each_consumer` is the **immediate** downstream: for a multi-sink fan-out that is each terminal sink; for a scan-sharing fan-out that is each consuming transform reading the shared source (falling back to the sink only when a sink reads the shared source directly, with no transform in between).
+- A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` blocked emission **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel. `each_consumer` is the **immediate** downstream: for a multi-sink fan-out that is each terminal sink; for a scan-sharing fan-out that is each consuming transform reading the shared source (falling back to the sink only when a sink reads the shared source directly, with no transform in between).
 
-Because the two layers never coexist for the same node, `sum`/`max by (id)` and `... by (downstream_id)` are safe — no double counting. "Is this node backpressured?" is `sum by (id) (...)`. The only untagged series is a rare fallback where a linear node's downstream name can't be resolved (still one series for that node).
+Because the two blocked layers never coexist for the same node, `sum`/`max by (id)` and `... by (downstream_id)` are safe — no double counting. "Is this node backpressured?" is `sum by (id) (node_wait{state="blocked"})`. The only `downstream_id=""` blocked series is a rare fallback where a linear node's downstream name can't be resolved (still one series for that node).
 
-Attribution is stamped by the `DownstreamAttributionRule` physical-optimizer pass (`optimizer.rs`); scan-sharing producers are suppressed at construction (they are unreachable by the pass).
+**`starved`** is node-local (not an edge property): it is the `WrappingExec`'s time in `data.next().await`, always emitted with `downstream_id=""` regardless of the node's blocked-attribution role. For a source it is upstream I/O wait; for a channel-decoupled SQL transform it is input starvation.
+
+Blocked attribution is stamped by the `DownstreamAttributionRule` physical-optimizer pass (`optimizer.rs`); scan-sharing producers are suppressed at construction (they are unreachable by the pass). Both states share the remainder-carrying `MillisAccumulator` (`telemetry/accumulator.rs`) so sub-millisecond spans are not truncated to zero at high throughput.
 
 ## Key Architecture Concepts
 

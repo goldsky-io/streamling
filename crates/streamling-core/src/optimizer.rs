@@ -147,7 +147,7 @@ impl PhysicalOptimizerRule for StreamingUnnestRewritePhysicalOptimizerRule {
 }
 
 /// Stamps each node with the identity of the downstream consumer it feeds, so
-/// the unified `backpressure` metric can be attributed per edge
+/// the `node_wait{state="blocked"}` metric can be attributed per edge
 /// (`id=<producer>, downstream_id=<consumer>`).
 ///
 /// It is a manual top-down recursion (not `transform_up`/`transform_down`)
@@ -263,11 +263,11 @@ fn attribute_downstream(
 
     // DataSinkExec (root of a sink plan): the sink is the named downstream for
     // the topmost transform. Recover its plain name from the WrappingDataSink.
-    if node.as_any().is::<DataSinkExec>() {
-        let sink_downstream = node
+    if let Some(dse) = node.as_any().downcast_ref::<DataSinkExec>() {
+        let sink_downstream = dse
+            .sink()
             .as_any()
-            .downcast_ref::<DataSinkExec>()
-            .and_then(|dse| dse.sink().as_any().downcast_ref::<WrappingDataSink>())
+            .downcast_ref::<WrappingDataSink>()
             .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
             .or(named_downstream);
         let new_children = node

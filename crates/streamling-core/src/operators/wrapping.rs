@@ -7,6 +7,7 @@ use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, Share
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
+use crate::telemetry::MillisAccumulator;
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::types::RowCountMeasurementType;
 use crate::topology::Telemetry;
@@ -180,55 +181,6 @@ fn emit_event_time_metrics(
             Vec::new(),
             metric_metadata_id,
         );
-    }
-}
-
-/// Accumulates the time a wrapped node spends backpressured.
-///
-/// A node is backpressured while it is suspended at `yield` after producing a
-/// batch, waiting for its downstream consumer to poll for the next one. That
-/// suspension span (yield -> resume) is time the node *could* have spent
-/// producing but was held back by everything downstream of it — the canonical
-/// definition of backpressure.
-///
-/// Usage in a stream loop: call [`on_yield`](Self::on_yield) immediately before
-/// yielding a batch, and [`on_resume`](Self::on_resume) at the top of the next
-/// iteration (the resume point). [`take_whole_millis`](Self::take_whole_millis)
-/// drains the accrued time as whole milliseconds for emission, retaining any
-/// sub-millisecond remainder so it is not lost across batches.
-///
-/// Kept as a small, side-effect-free helper so the accumulation math is unit
-/// testable with hand-fed `Instant`s, independent of the async stream.
-#[derive(Debug, Default)]
-struct BackpressureAccumulator {
-    last_yield: Option<Instant>,
-    total: Duration,
-}
-
-impl BackpressureAccumulator {
-    /// Record the instant a batch was yielded downstream. The span until the
-    /// next [`on_resume`](Self::on_resume) counts as backpressure.
-    fn on_yield(&mut self, now: Instant) {
-        self.last_yield = Some(now);
-    }
-
-    /// Called when the stream resumes (is polled again) after a prior yield.
-    /// Adds the suspension span to the running total. A no-op before the first
-    /// yield, so the first loop iteration contributes nothing.
-    fn on_resume(&mut self, now: Instant) {
-        if let Some(last) = self.last_yield.take() {
-            self.total += now.saturating_duration_since(last);
-        }
-    }
-
-    /// Drain the accrued backpressure as whole milliseconds, retaining the
-    /// sub-millisecond remainder. Returns 0 until at least 1ms has accrued.
-    fn take_whole_millis(&mut self) -> u64 {
-        let whole = self.total.as_millis() as u64;
-        if whole > 0 {
-            self.total -= Duration::from_millis(whole);
-        }
-        whole
     }
 }
 
@@ -470,25 +422,28 @@ impl TableProvider for WrappingSourceTableProvider {
     }
 }
 
-/// How this node's backpressure (yield->resume suspension) is attributed when
-/// emitted as the unified `backpressure` edge-metric. Stamped by the
+/// How this node's `blocked` state (yield->resume suspension) is attributed when
+/// emitted as `node_wait{state="blocked"}`. Stamped by the
 /// `DownstreamAttributionRule` physical-optimizer pass (and, for scan-sharing
 /// producers, at construction). Default is [`BackpressureRole::Unattributed`],
-/// which preserves the pre-attribution untagged emission.
+/// which preserves the pre-attribution empty-`downstream_id` emission. Only the
+/// `blocked` state consults this role; `starved` is node-local and always emits
+/// regardless of role.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BackpressureRole {
     /// The node has a single named downstream consumer. Emit
-    /// `backpressure{downstream_id=<plain name>}`. The stored string is the
-    /// *plain* node name (already stripped of the `metric_key` prefix) so it
-    /// joins against the downstream's own `id` tag.
+    /// `node_wait{state="blocked", downstream_id=<plain name>}`. The stored
+    /// string is the *plain* node name (already stripped of the `metric_key`
+    /// prefix) so it joins against the downstream's own `id` tag.
     Edge(String),
     /// The downstream identity could not be resolved (rare). Emit
-    /// `backpressure` untagged — still one series for this node.
+    /// `node_wait{state="blocked", downstream_id=""}` — still one series for
+    /// this node, with a label key set identical to the attributed case.
     #[default]
     Unattributed,
     /// The node feeds a `BroadcastStream` fan-out (multi-sink or scan sharing).
-    /// Do not emit here: the broadcast emits one per-edge series per consumer,
-    /// so emitting the node's aggregate too would double count.
+    /// Do not emit `blocked` here: the broadcast emits one per-edge series per
+    /// consumer, so emitting the node's aggregate too would double count.
     FanOutProducer,
 }
 
@@ -675,47 +630,63 @@ impl ExecutionPlan for WrappingExec {
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
-            // Tracks time this node spends suspended after yielding a batch
-            // while waiting for the downstream consumer to poll again — i.e.
-            // backpressure exerted on this node by everything downstream.
-            let mut backpressure = BackpressureAccumulator::default();
+            // The two idle states of the node-wait metric:
+            //  - `blocked`: time suspended at `yield` after producing a batch,
+            //    waiting for the downstream consumer to poll again (backpressure
+            //    exerted by everything downstream); and
+            //  - `starved`: time in `data.next().await` waiting on upstream for
+            //    the next input.
+            // Both use the shared remainder-carrying accumulator so sub-ms spans
+            // are not truncated to zero at high throughput.
+            let mut blocked = MillisAccumulator::default();
+            let mut starved = MillisAccumulator::default();
+            let mut last_yield: Option<Instant> = None;
             loop {
                 // Resume point: the span since the previous `yield` is the
-                // downstream-induced suspension. The first iteration has no
-                // prior yield and contributes nothing. Time subsequently spent
-                // in `data.next().await` (waiting on upstream) is excluded
-                // because it happens after this measurement.
-                backpressure.on_resume(Instant::now());
-                let backpressured_ms = backpressure.take_whole_millis();
-                if backpressured_ms > 0 {
-                    // Unified `backpressure` edge-metric, one emitter per edge:
-                    //  - Edge(id): single named downstream -> tag downstream_id.
-                    //  - Unattributed: downstream unresolved -> untagged.
+                // downstream-induced suspension (blocked). The first iteration
+                // has no prior yield and contributes nothing. Time subsequently
+                // spent in `data.next().await` (waiting on upstream) is measured
+                // separately below as `starved`.
+                if let Some(yielded_at) = last_yield.take() {
+                    blocked.add(yielded_at.elapsed());
+                }
+                let blocked_ms = blocked.take_whole_millis();
+                if blocked_ms > 0 {
+                    // `node_wait{state="blocked"}`, one emitter per edge:
+                    //  - Edge(id): single named downstream -> downstream_id=name.
+                    //  - Unattributed: downstream unresolved -> downstream_id="".
                     //  - FanOutProducer: suppressed; the BroadcastStream emits
                     //    one per-edge series per consumer instead (no double count).
-                    match &backpressure_role {
-                        BackpressureRole::Edge(downstream_id) => {
-                            metrics_recorder.record_count_w_tags(
-                                "backpressure",
-                                backpressured_ms,
-                                vec![("downstream_id", downstream_id.as_str())],
-                                &metric_metadata_id,
-                            );
-                        }
-                        BackpressureRole::Unattributed => {
-                            metrics_recorder.record_count(
-                                "backpressure",
-                                backpressured_ms,
-                                &metric_metadata_id,
-                            );
-                        }
-                        BackpressureRole::FanOutProducer => {}
+                    let downstream_id = match &backpressure_role {
+                        BackpressureRole::Edge(downstream_id) => Some(downstream_id.as_str()),
+                        BackpressureRole::Unattributed => Some(""),
+                        BackpressureRole::FanOutProducer => None,
+                    };
+                    if let Some(downstream_id) = downstream_id {
+                        metrics_recorder.record_count_w_tags(
+                            "node_wait",
+                            blocked_ms,
+                            vec![("state", "blocked"), ("downstream_id", downstream_id)],
+                            &metric_metadata_id,
+                        );
                     }
                 }
 
                 let batch_start = Instant::now();
                 let batch_result = data.next().await;
-                let batch_elapsed = batch_start.elapsed();
+                // `starved`: time this node waited on upstream for its input.
+                // Node-local (not an edge property), so downstream_id is always
+                // "" to keep the label key set identical to the blocked series.
+                starved.add(batch_start.elapsed());
+                let starved_ms = starved.take_whole_millis();
+                if starved_ms > 0 {
+                    metrics_recorder.record_count_w_tags(
+                        "node_wait",
+                        starved_ms,
+                        vec![("state", "starved"), ("downstream_id", "")],
+                        &metric_metadata_id,
+                    );
+                }
 
                 let batch_result = match batch_result {
                     Some(r) => r,
@@ -724,9 +695,6 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        // Record per-batch compute time
-                        metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
-
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
@@ -777,10 +745,10 @@ impl ExecutionPlan for WrappingExec {
 
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
-                        // Mark the yield instant; the next `on_resume` at the
-                        // top of the loop measures how long the downstream took
-                        // to request the following batch.
-                        backpressure.on_yield(Instant::now());
+                        // Mark the yield instant; the resume point at the top of
+                        // the loop measures how long the downstream took to
+                        // request the following batch (the blocked span).
+                        last_yield = Some(Instant::now());
                         yield Ok(batch);
                     }
                     Err(e) => {
@@ -1629,58 +1597,18 @@ mod tests {
         assert!(inst.read_error_logged.load(Ordering::Relaxed));
     }
 
-    #[test]
-    fn backpressure_accumulator_first_resume_is_zero() {
-        // Before any yield there is no prior suspension to attribute, so the
-        // first `on_resume` (top of the very first loop iteration) contributes
-        // nothing — guarding against an off-by-one that would charge the first
-        // batch with bogus backpressure.
-        let mut acc = BackpressureAccumulator::default();
-        let now = Instant::now();
-        acc.on_resume(now);
-        assert_eq!(acc.take_whole_millis(), 0);
-    }
-
-    #[test]
-    fn backpressure_accumulator_accumulates_yield_to_resume_gap() {
-        let mut acc = BackpressureAccumulator::default();
-        let t0 = Instant::now();
-        // Yield at t0, resume 5ms later → 5ms of backpressure.
-        acc.on_yield(t0);
-        acc.on_resume(t0 + Duration::from_millis(5));
-        // Yield again, resume 7ms later → +7ms.
-        acc.on_yield(t0 + Duration::from_millis(5));
-        acc.on_resume(t0 + Duration::from_millis(12));
-        assert_eq!(acc.take_whole_millis(), 12);
-    }
-
-    #[test]
-    fn backpressure_accumulator_retains_sub_millisecond_remainder() {
-        let mut acc = BackpressureAccumulator::default();
-        let t0 = Instant::now();
-        // 1.5ms gap: only 1 whole ms drains, 0.5ms is retained.
-        acc.on_yield(t0);
-        acc.on_resume(t0 + Duration::from_micros(1_500));
-        assert_eq!(acc.take_whole_millis(), 1);
-        assert_eq!(acc.take_whole_millis(), 0);
-        // Another 0.5ms gap pushes the retained remainder over 1ms.
-        acc.on_yield(t0);
-        acc.on_resume(t0 + Duration::from_micros(500));
-        assert_eq!(acc.take_whole_millis(), 1);
-    }
-
     /// Drives a `WrappingExec` output stream with a deliberately slow consumer
     /// (a sleep between polls) so the yield->resume span exceeds a millisecond
-    /// and the backpressure accounting path runs. Guards that the instrumented
-    /// loop preserves the data path — every row is delivered — and never panics
-    /// or hangs with the accounting in place.
+    /// and the `node_wait{state="blocked"}` accounting path runs. Guards that the
+    /// instrumented loop preserves the data path — every row is delivered — and
+    /// never panics or hangs with the accounting in place.
     ///
     /// Uses an *unregistered* node id so the test does not mutate the global
     /// metrics recorder (which would race with the recorder's own tests). The
     /// emission record_count call still executes; it returns early at the
     /// metadata lookup. That emission dispatches to the *counter* registry
     /// (rather than panicking on a histogram lookup) is covered by
-    /// `backpressure_counters_are_registered`.
+    /// `node_wait_counter_is_registered`.
     #[tokio::test]
     async fn wrapping_exec_streams_all_rows_under_slow_consumer() {
         let schema = test_schema();

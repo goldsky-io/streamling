@@ -270,7 +270,8 @@ sinks:
 ///   1. backpressure the shared upstream (source backpressure > 0, summed over
 ///      its per-edge series), and
 ///   2. attribute the broadcast's blocked-send time to the slow sink via the
-///      `downstream_id` label (`backpressure{downstream_id="webhook_sink"}`).
+///      `downstream_id` label
+///      (`node_wait{state="blocked", downstream_id="webhook_sink"}`).
 ///
 /// This is the end-to-end proof of the "which sink is struggling" signal.
 #[tokio::test]

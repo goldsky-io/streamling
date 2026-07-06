@@ -6,10 +6,11 @@
 //! different code path from multi-sink fan-out (a single multi-sink group counts
 //! as one consumer).
 //!
-//! These tests prove the unified backpressure edge-metric works on the
+//! These tests prove the node-wait `blocked` edge-metric works on the
 //! scan-sharing path: a slow consumer's blocked-send time is attributed to it
-//! via the `downstream_id` label on `streamling_backpressure_milliseconds_total`,
-//! while a fast consumer sharing the same source is not charged. The shared
+//! via the `downstream_id` label on
+//! `streamling_node_wait_milliseconds_total{state="blocked"}`, while a fast
+//! consumer sharing the same source is not charged. The shared
 //! producer's per-consumer edges are attributed to the *immediate* consumer —
 //! the transform that reads the shared source (`downstream_id="slow_branch"` /
 //! `"fast_branch"`) — not the terminal sink behind it.
@@ -37,10 +38,10 @@ const TEST_SCHEMA: &str = r#"{
 /// One shared Kafka source feeds two transforms (so scan sharing turns on): a
 /// fast branch (Postgres) and a deliberately slow branch (a webhook that blocks
 /// 100ms per request). The scan-sharing `BroadcastStream` must:
-///   1. accrue backpressure on the shared producer's fan-out edge to the slow
-///      branch (`backpressure{id="scanshare_source", downstream_id="slow_branch"}`),
-///      attributed to the immediate consumer transform (not the webhook sink
-///      behind it), and
+///   1. accrue blocked time on the shared producer's fan-out edge to the slow
+///      branch (`node_wait{state="blocked", id="scanshare_source",
+///      downstream_id="slow_branch"}`), attributed to the immediate consumer
+///      transform (not the webhook sink behind it), and
 ///   2. charge that edge materially more than the fast branch's edge
 ///      (`downstream_id="fast_branch"`) — the per-consumer isolation guarantee of
 ///      the BroadcastStream.

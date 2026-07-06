@@ -103,30 +103,42 @@ impl PrometheusResource {
         )
     }
 
-    /// Build a query for the unified backpressure counter filtered by producer
-    /// `id`. A producer emits one series per outgoing edge (one `downstream_id`
-    /// each), so wrap this in `sum(...)` to get the node's total backpressure.
+    /// Build a query for the node-wait counter's `blocked` state filtered by
+    /// producer `id`. A producer emits one blocked series per outgoing edge (one
+    /// `downstream_id` each), so wrap this in `sum(...)` to get the node's total
+    /// blocked time (i.e. backpressure from downstream).
     pub fn backpressure_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
-        Self::build_metric_query(
-            "streamling_backpressure_milliseconds_total",
-            node_id,
-            instance_id,
-        )
+        Self::build_node_wait_query("blocked", "id", node_id, instance_id)
     }
 
-    /// Build a query for the unified backpressure counter filtered by the
+    /// Build a query for the node-wait counter's `blocked` state filtered by the
     /// downstream node it is attributed to (total ms a producer was held back by
     /// that specific consumer, whether via suspension or a full fan-out channel).
     pub fn backpressure_by_downstream_query(
         downstream_id: &str,
         instance_id: Option<&str>,
     ) -> String {
-        Self::build_metric_query_by_label(
-            "streamling_backpressure_milliseconds_total",
-            "downstream_id",
-            downstream_id,
-            instance_id,
-        )
+        Self::build_node_wait_query("blocked", "downstream_id", downstream_id, instance_id)
+    }
+
+    /// Build a query for the node-wait counter's `starved` state (time a node
+    /// waited on upstream for input) filtered by node `id`.
+    pub fn starved_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_node_wait_query("starved", "id", node_id, instance_id)
+    }
+
+    /// Build `streamling_node_wait_milliseconds_total{state="<state>",<label>="<value>"[,instance="..."]}`.
+    fn build_node_wait_query(
+        state: &str,
+        label_key: &str,
+        label_value: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        let mut labels = format!("state=\"{state}\",{label_key}=\"{label_value}\"");
+        if let Some(instance) = instance_id {
+            labels.push_str(&format!(",instance=\"{instance}\""));
+        }
+        format!("streamling_node_wait_milliseconds_total{{{labels}}}")
     }
 
     /// Build a query for a checkpoint coordinator metric (counter total).

@@ -19,11 +19,13 @@ use std::{
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use tracing::{info, warn};
 
+use crate::telemetry::MillisAccumulator;
+
 /// Fallback component id for fan-out backpressure attribution when the producing
-/// node's `metric_metadata_id` is unknown. The unified `backpressure` counter
-/// carries this as its `id` tag and the slow consumer's reference name as the
-/// `downstream_id` tag. When the producer id IS known, emission goes through the
-/// data-plane recorder instead so `id` is the real producer node.
+/// node's `metric_metadata_id` is unknown. The `node_wait{state="blocked"}`
+/// counter carries this as its `id` tag and the slow consumer's reference name
+/// as the `downstream_id` tag. When the producer id IS known, emission goes
+/// through the data-plane recorder instead so `id` is the real producer node.
 const BROADCAST_COMPONENT_ID: &str = "multi_sink_broadcast";
 
 #[derive(Clone, Debug)]
@@ -33,7 +35,7 @@ pub struct BroadcastStream {
     channel_capacity: usize,
     /// `metric_metadata_id` (the `metric_key` form `"{app}::{name}"`) of the
     /// producer node feeding this broadcast. When set, per-consumer blocked-send
-    /// time is emitted as the unified `backpressure` metric via the data-plane
+    /// time is emitted as `node_wait{state="blocked"}` via the data-plane
     /// recorder, so it carries `id=<producer>` plus the producer's full tag set
     /// and `downstream_id=<consumer>`. When `None`, emission falls back to the
     /// control-plane `BROADCAST_COMPONENT_ID`.
@@ -55,32 +57,6 @@ struct BroadcastState {
 struct BroadcastSender {
     downstream_id: String,
     tx: Sender<DFResult<RecordBatch>>,
-}
-
-/// Accumulates blocked-send time for a single downstream sink and yields whole
-/// milliseconds, carrying the sub-millisecond remainder forward. Without this,
-/// each per-batch block is truncated to whole milliseconds independently, so a
-/// stream of many sub-millisecond blocks would be repeatedly rounded down to
-/// zero and the attributed time would be consistently undercounted at high
-/// throughput. Mirrors `BackpressureAccumulator::take_whole_millis` in
-/// `wrapping.rs`, kept as a small side-effect-free helper so the math is unit
-/// testable independent of the async broadcast task.
-#[derive(Debug, Default)]
-struct BlockedSendAccumulator {
-    remainder: Duration,
-}
-
-impl BlockedSendAccumulator {
-    /// Add a batch's blocked duration and return the whole milliseconds now
-    /// ready to emit, retaining any sub-millisecond remainder for the next add.
-    fn add(&mut self, blocked: Duration) -> u64 {
-        self.remainder += blocked;
-        let whole = self.remainder.as_millis() as u64;
-        if whole > 0 {
-            self.remainder -= Duration::from_millis(whole);
-        }
-        whole
-    }
 }
 
 impl BroadcastStream {
@@ -147,10 +123,10 @@ impl BroadcastStream {
 
     /// The task that reads from the single source stream and broadcasts to all active consumers.
     async fn run_broadcast(&self, mut source_stream: SendableRecordBatchStream) {
-        // Per-consumer blocked-send time is emitted as the unified `backpressure`
-        // edge-metric. When the producing node's `metric_metadata_id` is known we
-        // use the data-plane recorder so the series carries `id=<producer>` plus
-        // the producer's full tag set and `downstream_id=<consumer>`. Otherwise we
+        // Per-consumer blocked-send time is emitted as `node_wait{state="blocked"}`.
+        // When the producing node's `metric_metadata_id` is known we use the
+        // data-plane recorder so the series carries `id=<producer>` plus the
+        // producer's full tag set and `downstream_id=<consumer>`. Otherwise we
         // fall back to the control-plane `BROADCAST_COMPONENT_ID`. Consumers with
         // an empty `downstream_id` (the passthrough output, or a fan-out edge the
         // attribution rule could not reach) are not attributed.
@@ -160,7 +136,7 @@ impl BroadcastStream {
         let upstream_metadata_id = self.upstream_metadata_id.clone();
         // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
         // into whole milliseconds instead of each truncating to zero.
-        let mut blocked_accumulators: HashMap<String, BlockedSendAccumulator> = HashMap::new();
+        let mut blocked_accumulators: HashMap<String, MillisAccumulator> = HashMap::new();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 break;
@@ -194,27 +170,34 @@ impl BroadcastStream {
                                 if downstream_id.is_empty() {
                                     continue;
                                 }
-                                let blocked_ms = blocked_accumulators
+                                let acc = blocked_accumulators
                                     .entry(downstream_id.clone())
-                                    .or_default()
-                                    .add(blocked);
+                                    .or_default();
+                                acc.add(blocked);
+                                let blocked_ms = acc.take_whole_millis();
                                 if blocked_ms > 0 {
                                     match &upstream_metadata_id {
                                         Some(metadata_id) => {
                                             // Data-plane: id=<producer> + full tags + downstream_id.
                                             data_plane_recorder.record_count_w_tags(
-                                                "backpressure",
+                                                "node_wait",
                                                 blocked_ms,
-                                                vec![("downstream_id", downstream_id.as_str())],
+                                                vec![
+                                                    ("state", "blocked"),
+                                                    ("downstream_id", downstream_id.as_str()),
+                                                ],
                                                 metadata_id,
                                             );
                                         }
                                         None => {
                                             // Fallback: control-plane id=multi_sink_broadcast.
                                             control_plane_recorder.record_count_w_tags(
-                                                "backpressure",
+                                                "node_wait",
                                                 blocked_ms,
-                                                vec![("downstream_id", downstream_id.as_str())],
+                                                vec![
+                                                    ("state", "blocked"),
+                                                    ("downstream_id", downstream_id.as_str()),
+                                                ],
                                             );
                                         }
                                     }
@@ -544,34 +527,6 @@ mod tests {
             slow_blocked > fast_blocked,
             "slow consumer ({slow_blocked:?}) must accrue more blocked time than fast ({fast_blocked:?})"
         );
-    }
-
-    /// Sub-millisecond blocks must not be silently dropped: each one rounds to
-    /// zero on its own, but the accumulator carries the remainder forward so the
-    /// running total still surfaces whole milliseconds (and the leftover is kept
-    /// for the next add). Guards against the high-throughput undercount that a
-    /// per-batch `as_millis()` truncation would cause.
-    #[test]
-    fn blocked_send_accumulator_carries_sub_millisecond_remainder() {
-        let mut acc = BlockedSendAccumulator::default();
-        // Each 0.4ms block truncates to 0ms in isolation.
-        assert_eq!(acc.add(Duration::from_micros(400)), 0);
-        assert_eq!(acc.add(Duration::from_micros(400)), 0);
-        // The third crosses 1ms, so a whole millisecond is now emitted.
-        assert_eq!(acc.add(Duration::from_micros(400)), 1);
-        // The 0.2ms remainder is retained, not discarded: adding 0.9ms reaches
-        // 1.1ms and yields another whole millisecond.
-        assert_eq!(acc.add(Duration::from_micros(900)), 1);
-    }
-
-    /// A single block of several whole milliseconds is emitted in full, with the
-    /// fractional tail retained.
-    #[test]
-    fn blocked_send_accumulator_emits_whole_millis_and_keeps_fraction() {
-        let mut acc = BlockedSendAccumulator::default();
-        assert_eq!(acc.add(Duration::from_micros(3_700)), 3);
-        // 0.7ms remainder carried; +0.4ms = 1.1ms -> 1 whole ms emitted.
-        assert_eq!(acc.add(Duration::from_micros(400)), 1);
     }
 
     /// A closed consumer channel surfaces as `Err`, which `run_broadcast` logs

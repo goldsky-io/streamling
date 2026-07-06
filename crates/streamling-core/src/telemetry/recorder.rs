@@ -801,26 +801,33 @@ pub fn initialize_metrics_recorder(
                 .build(),
         );
 
-        // Backpressure metric — one monotonic counter in milliseconds modeling
-        // backpressure as a property of an edge (producer -> consumer). Every
-        // series carries `id` (the producer node) and, when the downstream is a
-        // single named node, `downstream_id` (the consumer). There is exactly
-        // one emitter per edge:
-        //  - a single-downstream node's `WrappingExec` emits its one edge,
-        //    measured as yield->resume suspension; and
-        //  - a fan-out producer's `WrappingExec` is suppressed while the
-        //    `BroadcastStream` emits one edge per consumer, measured as the time
-        //    blocked on that consumer's full channel.
-        // Because the two layers never coexist for the same node, `sum`/`max by
-        // (id)` and `... by (downstream_id)` are safe with no double counting.
-        // The OTel Prometheus exporter appends the unit and `_total` suffixes,
-        // yielding `streamling_backpressure_milliseconds_total`.
+        // Node-wait metric — one monotonic counter in milliseconds modeling the
+        // time a node is idle rather than doing useful work, split by the `state`
+        // tag into the two idle states of the starved/busy/blocked triad (the
+        // `busy` complement is `elapsed_compute`):
+        //  - `state="blocked"` — held back by a downstream consumer. Modeled as a
+        //    property of an edge (producer -> consumer): every blocked series
+        //    also carries `downstream_id` (the consumer, or "" when unresolved).
+        //    Exactly one emitter per edge: a single-downstream node's
+        //    `WrappingExec` emits its one edge, measured as yield->resume
+        //    suspension; a fan-out producer's `WrappingExec` is suppressed while
+        //    the `BroadcastStream` emits one edge per consumer, measured as time
+        //    blocked on that consumer's full channel. Because the two layers
+        //    never coexist for the same node, `sum`/`max by (id)` and `... by
+        //    (downstream_id)` are safe with no double counting.
+        //  - `state="starved"` — waiting on upstream for input, measured as the
+        //    `WrappingExec`'s time in `data.next().await`. `downstream_id` is ""
+        //    (starvation is not an edge property).
+        // Every series carries both `state` and `downstream_id` so the two states
+        // share an identical label key set and cross-state math needs no
+        // per-series label surgery. The OTel Prometheus exporter appends the unit
+        // and `_total` suffixes, yielding `streamling_node_wait_milliseconds_total`.
         count_registry.insert(
-            String::from("backpressure"),
+            String::from("node_wait"),
             meter
-                .u64_counter(add_service_prefix("backpressure"))
+                .u64_counter(add_service_prefix("node_wait"))
                 .with_description(
-                    "Time a producer node is held back by a downstream consumer (suspension for a single downstream, or blocked-send on a full fan-out channel), attributed via the downstream_id tag, milliseconds",
+                    "Time a node is idle rather than doing useful work, split by the state tag: blocked (held back by a downstream consumer, attributed via downstream_id) or starved (waiting on upstream for input), milliseconds",
                 )
                 .with_unit("ms")
                 .build(),
@@ -1493,20 +1500,20 @@ mod tests {
             assert_eq!(tags.get("tier"), Some(&"gold".to_string()));
         }
 
-        /// The backpressure counter must be pre-registered by
+        /// The node_wait counter must be pre-registered by
         /// `initialize_metrics_recorder`. Emission paths look counters up by
         /// name and panic if missing (see `record_metric_data`), so this guards
         /// against a refactor silently dropping the registration.
         #[test]
-        fn backpressure_counters_are_registered() {
+        fn node_wait_counter_is_registered() {
             let _guard = TEST_LOCK.lock().unwrap();
             reset_instance();
             seed_metadata("app::blocks");
             let recorder = get_metrics_recorder();
             let counters = recorder.count_registry.lock().unwrap();
             assert!(
-                counters.contains_key("backpressure"),
-                "backpressure counter must be pre-registered"
+                counters.contains_key("node_wait"),
+                "node_wait counter must be pre-registered"
             );
         }
     }
