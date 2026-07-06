@@ -1097,4 +1097,97 @@ mod tests {
             .expect("id is int64");
         assert_eq!(id.value(0), 7, "writer field still decodes under skip");
     }
+
+    // Equivalence check (#4): the vendored `Resolver::resolve` coerced avro numerics with
+    // `NumCast::from`, which returns `None` (→ silent NULL) on overflow. That fallback was only
+    // reachable if the target arrow type were *narrower* than the avro value — but the avro→arrow
+    // mapping is width-preserving (int→Int32, long→Int64, float→Float32, double→Float64) and Avro
+    // only permits *widening* promotion, so it never triggered. arrow-avro decodes each primitive to
+    // its natural width identically. This asserts the reachable domain: boundary values round-trip
+    // exactly, with no overflow, panic, or width change.
+    #[test]
+    fn numeric_boundaries_decode_exactly() {
+        const SCHEMA: &str = r#"{"type":"record","name":"N","fields":[
+            {"name":"i","type":"int"},{"name":"l","type":"long"},
+            {"name":"f","type":"float"},{"name":"d","type":"double"}]}"#;
+        let schema = AvroWriterSchema::parse_str(SCHEMA).unwrap();
+        let id = 1u32;
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(id, SCHEMA).unwrap();
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put("i", Value::Int(i32::MIN));
+        rec.put("l", Value::Long(i64::MAX));
+        rec.put("f", Value::Float(f32::MIN));
+        rec.put("d", Value::Double(f64::MAX));
+        decoder
+            .decode(&confluent_frame(id, &to_avro_datum(&schema, rec).unwrap()))
+            .unwrap();
+        let b = decoder.flush().unwrap().expect("batch");
+        let col = |name: &str| b.column(b.schema().index_of(name).unwrap()).clone();
+        assert_eq!(
+            col("i")
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(0),
+            i32::MIN
+        );
+        assert_eq!(
+            col("l")
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            i64::MAX
+        );
+        assert_eq!(
+            col("f")
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap()
+                .value(0),
+            f32::MIN
+        );
+        assert_eq!(
+            col("d")
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .value(0),
+            f64::MAX
+        );
+    }
+
+    // Equivalence check (#5): the u256/i256/decimal byte reinterpretation must match the vendored
+    // `resolve_u256`/`resolve_i256`/`resolve_decimal(_256)` two's-complement handling exactly (the
+    // functions were extracted from them). Locks in the concrete byte→value contract.
+    #[test]
+    fn decimal_byte_reinterpretation_is_twos_complement() {
+        // i128 sign extension (Decimal128 nested path).
+        assert_eq!(be_bytes_to_i128(&[0x01]), 1);
+        assert_eq!(be_bytes_to_i128(&[0xFF]), -1);
+        assert_eq!(be_bytes_to_i128(&[0x80]), -128);
+        assert_eq!(be_bytes_to_i128(&[0x01, 0x00]), 256);
+        // i256 sign extension (Decimal256 path).
+        assert_eq!(be_bytes_to_i256(&[0x01]), i256::from_i128(1));
+        assert_eq!(be_bytes_to_i256(&[0xFF]), i256::from_i128(-1));
+        // u256: big-endian zero-extension; negatives rejected.
+        let one = u256_be_bytes(&[0x01]).unwrap();
+        assert_eq!(one[31], 1);
+        assert!(one[..31].iter().all(|&x| x == 0));
+        assert!(
+            u256_be_bytes(&[0x80]).is_err(),
+            "negative decimal rejected for u256"
+        );
+        // i256 bytes: sign-extended fill.
+        assert_eq!(i256_be_bytes(&[0xFF]).unwrap(), [0xFFu8; 32]);
+        assert_eq!(i256_be_bytes(&[0x01]).unwrap()[31], 1);
+        assert!(
+            i256_be_bytes(&[0x01]).unwrap()[..31]
+                .iter()
+                .all(|&x| x == 0)
+        );
+    }
 }
