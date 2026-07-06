@@ -1162,7 +1162,11 @@ impl ExecutionPlan for KafkaSourceExec {
                     .expect("reader avro schema serializes to JSON");
                 let mut decoder = ConfluentAvroDecoder::new()
                     .with_reader_schema(&avro.avro_schema)
-                    .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?;
+                    .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?
+                    // Honor `skip_schema_resolution`: when set, decode each message against its own
+                    // writer schema with no writer→reader resolution (matching the vendored path),
+                    // then coerce the batch to the target schema by field name.
+                    .with_schema_resolution(!avro.skip_schema_resolution);
                 decoder
                     .register_writer_schema(avro.reader_schema_id, &reader_schema_json)
                     .map_err(|e| {
