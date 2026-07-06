@@ -25,7 +25,7 @@ use crate::types::u256::U256Type;
 use apache_avro::Schema as ApacheAvroSchema;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, ListArray,
-    PrimitiveArray, StructArray,
+    PrimitiveArray, StructArray, new_null_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{cast, concat_batches};
@@ -120,21 +120,27 @@ pub fn coerce_batch_to_target(batch: &RecordBatch, target: &SchemaRef) -> Result
     let src_schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
     for tf in target.fields() {
-        let src = src_schema
-            .index_of(tf.name())
-            .map(|i| batch.column(i))
-            .map_err(|_| {
-                DataFusionError::Internal(format!(
-                    "arrow-avro batch is missing target field '{}' (have: {:?})",
+        match src_schema.index_of(tf.name()) {
+            Ok(i) => columns.push(coerce_array(batch.column(i), tf)?),
+            // Field absent from the decoded batch. With resolution enabled this cannot happen
+            // (arrow-avro produces every target field); it only arises under `skip_schema_resolution`,
+            // where we decode against the writer schema. Mirror the vendored reader: a nullable target
+            // field becomes an all-null column; a required one is a genuine error.
+            Err(_) if tf.is_nullable() => {
+                columns.push(new_null_array(tf.data_type(), batch.num_rows()));
+            }
+            Err(_) => {
+                return Err(DataFusionError::Internal(format!(
+                    "decoded avro batch is missing required target field '{}' (have: {:?})",
                     tf.name(),
                     src_schema
                         .fields()
                         .iter()
                         .map(|f| f.name())
                         .collect::<Vec<_>>()
-                ))
-            })?;
-        columns.push(coerce_array(src, tf)?);
+                )));
+            }
+        }
     }
     RecordBatch::try_new(target.clone(), columns).map_err(arrow_err)
 }
@@ -426,7 +432,21 @@ pub struct ConfluentAvroDecoder {
     /// vendored reader matched fields positionally and ignored the record name. Producers that
     /// rename the top-level record (e.g. a transform / schema-compat output named differently from
     /// the topic's writer schema) are common, so we preserve the old lenient behavior via aliases.
+    ///
+    /// LIMITATION: only the *top-level* record name is aliased. arrow-avro also name-checks every
+    /// *nested* named type (`resolve_records`/`resolve_enums`/`resolve_fixed`) using that type's own
+    /// aliases, so a differing NESTED record/enum/fixed name still errors. And the alias can't
+    /// express a bare (namespace-less) writer name under a namespaced reader — arrow-avro re-qualifies
+    /// a bare alias with the reader's namespace. Neither case occurs for today's namespace-less,
+    /// top-level-renamed schemas. Tracked in STRM-6359.
     writer_aliases: BTreeSet<String>,
+    /// Whether to drive arrow-avro's writer→reader schema *resolution* with the reader schema. When
+    /// `false` (the pipeline set `skip_schema_resolution`), the decoder is built with only the writer
+    /// schema store, so arrow-avro decodes each message against its own writer schema with no
+    /// resolution — no field reordering, default-filling, or name-matching. The decoded batch is
+    /// still coerced to `target_schema` (by field name) afterward. This mirrors the vendored path,
+    /// where `skip_schema_resolution` fed the raw writer value straight to the converter.
+    resolve_against_reader: bool,
 }
 
 /// Strip high-precision decimals, then if the root is a union, unwrap it to its record branch.
@@ -510,7 +530,17 @@ impl ConfluentAvroDecoder {
             decoder: None,
             reader_full_name: None,
             writer_aliases: BTreeSet::new(),
+            resolve_against_reader: true,
         }
+    }
+
+    /// Enable or disable arrow-avro writer→reader schema resolution (default: enabled). Pass `false`
+    /// to honor a pipeline's `skip_schema_resolution`: the decoder then decodes each message against
+    /// its writer schema with no resolution, and the batch is coerced to the target by field name.
+    pub fn with_schema_resolution(mut self, enabled: bool) -> Self {
+        self.resolve_against_reader = enabled;
+        self.decoder = None;
+        self
     }
 
     /// Set the reader schema (the topic's current schema): its rewritten form drives arrow-avro's
@@ -606,7 +636,12 @@ impl ConfluentAvroDecoder {
     fn ensure_decoder(&mut self) -> Result<&mut Decoder> {
         if self.decoder.is_none() {
             let mut builder = ReaderBuilder::new().with_writer_schema_store(self.store.clone());
-            if let Some(js) = self.reader_json_with_aliases()? {
+            // When resolution is disabled (`skip_schema_resolution`), don't set a reader schema:
+            // arrow-avro then decodes each message against its own writer schema with no resolution.
+            // The batch is still coerced to `target_schema` (by name) in `flush_inner`.
+            if self.resolve_against_reader
+                && let Some(js) = self.reader_json_with_aliases()?
+            {
                 builder = builder.with_reader_schema(AvroSchema::new(js));
             }
             self.decoder = Some(builder.build_decoder().map_err(arrow_err)?);
@@ -996,5 +1031,70 @@ mod tests {
             (0..3).all(|i| versions.value(i) == 7),
             "added reader field resolved to its default"
         );
+    }
+
+    // `with_schema_resolution(false)` (a pipeline's `skip_schema_resolution`) must decode each
+    // message against its own writer schema with NO writer→reader resolution — so a reader-only
+    // field is NOT default-filled (it comes through null after target coercion), unlike the default
+    // resolving path. Mirrors the vendored `skip_schema_resolution` behavior.
+    #[test]
+    fn skip_schema_resolution_decodes_against_writer_and_skips_defaults() {
+        // Reader has an extra nullable field with a NON-null default; the writer lacks it.
+        const READER: &str = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"},{"name":"extra","type":["int","null"],"default":42}]}"#;
+        const WRITER: &str =
+            r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let reader = AvroWriterSchema::parse_str(READER).unwrap();
+        let writer = AvroWriterSchema::parse_str(WRITER).unwrap();
+        let (reader_id, writer_id): (u32, u32) = (1, 2);
+
+        let encode = |id_val: i64| {
+            let mut rec = Record::new(&writer).unwrap();
+            rec.put("id", Value::Long(id_val));
+            confluent_frame(writer_id, &to_avro_datum(&writer, rec).unwrap())
+        };
+        let extra_of = |rb: &RecordBatch| -> Arc<arrow::array::Int32Array> {
+            Arc::new(
+                rb.column(rb.schema().index_of("extra").unwrap())
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .expect("extra is int32")
+                    .clone(),
+            )
+        };
+
+        // Resolution ON (default): the missing `extra` is filled from its reader default (42).
+        let mut resolving = ConfluentAvroDecoder::new()
+            .with_reader_schema(&reader)
+            .unwrap();
+        resolving.register_writer_schema(reader_id, READER).unwrap();
+        resolving.register_writer_schema(writer_id, WRITER).unwrap();
+        resolving.decode(&encode(1)).unwrap();
+        let resolved = resolving.flush().unwrap().expect("batch");
+        let re = extra_of(&resolved);
+        assert!(
+            !re.is_null(0) && re.value(0) == 42,
+            "resolution fills the reader default"
+        );
+
+        // Resolution OFF (skip): decode against the writer schema; `extra` is absent → null, not
+        // defaulted. `id` still decodes.
+        let mut skipping = ConfluentAvroDecoder::new()
+            .with_reader_schema(&reader)
+            .unwrap()
+            .with_schema_resolution(false);
+        skipping.register_writer_schema(reader_id, READER).unwrap();
+        skipping.register_writer_schema(writer_id, WRITER).unwrap();
+        skipping.decode(&encode(7)).unwrap();
+        let skipped = skipping.flush().unwrap().expect("batch");
+        assert!(
+            extra_of(&skipped).is_null(0),
+            "skip_schema_resolution must not fill reader defaults"
+        );
+        let id = skipped
+            .column(skipped.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("id is int64");
+        assert_eq!(id.value(0), 7, "writer field still decodes under skip");
     }
 }
