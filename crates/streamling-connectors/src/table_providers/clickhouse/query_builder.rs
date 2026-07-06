@@ -13,14 +13,16 @@ pub struct ClickHouseQueryBuilder {
     columns: Vec<String>,
     where_clause: Option<String>,
     pagination_config: Option<ClickHousePaginationConfig>,
-    current_keyset: Option<Vec<ScalarValue>>, // Current pagination state
-    is_start_at: bool, // True if this keyset is from start_at (use >=), false if pagination boundary (use >)
-    block_range_upper_bound: Option<ScalarValue>, // Upper bound (exclusive) on first sorting key for block range pagination
+    current_keyset: Option<Vec<ScalarValue>>, // `>=` lower bound on the sorting key
+    sort_key_range_upper_bound: Option<ScalarValue>, // Upper bound (exclusive) on first sorting key for sort key range pagination
+    /// Name of the ReplacingMergeTree `is_deleted` flag column, parsed from
+    /// `engine_full`. When `Some`, `_gs_op` is derived from it (so a custom-named
+    /// flag works); when `None` there is no engine-level deletion concept and
+    /// every row is classified 'i'. See `gs_op_field`.
+    is_deleted_column: Option<String>,
 }
 
 impl ClickHouseQueryBuilder {
-    const VIRTUAL_GS_OP_FIELD: &str = "CASE WHEN is_deleted=0 THEN 'i' ELSE 'd' END AS _gs_op";
-
     // Helper function to format ScalarValue for SQL with proper quoting
     fn format_scalar_for_sql(value: &ScalarValue) -> String {
         match value {
@@ -81,41 +83,44 @@ impl ClickHouseQueryBuilder {
             where_clause,
             pagination_config: config,
             current_keyset: None,
-            is_start_at: false,
-            block_range_upper_bound: None,
+            sort_key_range_upper_bound: None,
+            is_deleted_column: None,
         }
     }
 
     pub fn start_at_page(&mut self, args: Vec<ScalarValue>) -> &mut Self {
-        // Store the start_at keyset so it survives query rebuilding
+        // Store the keyset; it is applied as a `>=` lower bound on the sorting key.
         self.current_keyset = Some(args);
-        self.is_start_at = true;
         self
     }
 
-    // Convenient method to update pagination state and rebuild query
-    pub fn update_keyset(&mut self, keyset: Vec<ScalarValue>) -> &mut Self {
-        self.current_keyset = Some(keyset);
-        self.is_start_at = false; // This is a pagination boundary, not start_at
-        self.rebuild_query();
+    pub fn set_sort_key_range_upper_bound(&mut self, value: Option<ScalarValue>) -> &mut Self {
+        self.sort_key_range_upper_bound = value;
         self
     }
 
-    #[allow(dead_code)]
-    pub fn clear_keyset(&mut self) -> &mut Self {
-        self.current_keyset = None;
-        self.is_start_at = false;
+    /// Set the ReplacingMergeTree `is_deleted` flag column name (parsed from
+    /// `engine_full`). Drives the virtual `_gs_op` field; see `gs_op_field`.
+    pub fn set_is_deleted_column(&mut self, col: Option<String>) -> &mut Self {
+        self.is_deleted_column = col;
         self
     }
 
-    pub fn set_block_range_upper_bound(&mut self, value: Option<ScalarValue>) -> &mut Self {
-        self.block_range_upper_bound = value;
-        self
+    /// The virtual `_gs_op` column: 'i' for a live row, 'd' for a tombstone.
+    /// For a ReplacingMergeTree with an `is_deleted` flag, derive it from that
+    /// flag using the column name parsed from `engine_full` (not a hardcode, so a
+    /// custom-named flag column works). With no `is_deleted` column there is no
+    /// engine-level deletion concept, so every row is classified 'i'.
+    fn gs_op_field(&self) -> String {
+        match &self.is_deleted_column {
+            Some(col) => format!("CASE WHEN {}=0 THEN 'i' ELSE 'd' END AS _gs_op", col),
+            None => "'i' AS _gs_op".to_string(),
+        }
     }
 
     // Rebuild the query with current pagination state
     fn rebuild_query(&mut self) {
-        // Build the CTE with SELECT * FROM table WHERE ... ORDER BY ...
+        // Build the CTE with SELECT * FROM table WHERE ... (no ORDER BY; see below)
         let mut cte_query = format!("SELECT * FROM {}", self.table_name);
 
         // Add original where clause if it exists
@@ -128,9 +133,9 @@ impl ClickHouseQueryBuilder {
         let has_where = self.where_clause.is_some();
         let mut added_conditions = has_where;
 
-        // Add block range upper bound on the first sorting key
+        // Add sort key range upper bound on the first sorting key
         if let (Some(pagination_config), Some(upper_bound)) =
-            (&self.pagination_config, &self.block_range_upper_bound)
+            (&self.pagination_config, &self.sort_key_range_upper_bound)
             && let Some(first_key) = pagination_config.sorting_keys.first()
         {
             let bound_clause = format!(
@@ -147,7 +152,8 @@ impl ClickHouseQueryBuilder {
         if let (Some(pagination_config), Some(keyset)) =
             (&self.pagination_config, &self.current_keyset)
         {
-            let operator = if self.is_start_at { ">=" } else { ">" };
+            // The keyset is always a `>=` lower bound (set via start_at_page).
+            let operator = ">=";
             let conditions =
                 Self::build_keyset_conditions(&pagination_config.sorting_keys, keyset, operator);
             if !conditions.is_empty() {
@@ -156,13 +162,12 @@ impl ClickHouseQueryBuilder {
             }
         }
 
-        // Add ORDER BY clause to CTE
-        if let Some(pagination_config) = &self.pagination_config {
-            let sorting_keys_str = pagination_config.sorting_keys.join(",");
-            if !sorting_keys_str.trim().is_empty() {
-                cte_query = format!("{} ORDER BY {}", cte_query, sorting_keys_str);
-            }
-        }
+        // NB: deliberately NO `ORDER BY` here. Pagination is driven by disjoint
+        // half-open `block_number` ranges (the keyset/sort-key-range WHERE bounds
+        // above), so determinism comes from the predicate, not row order. An
+        // `ORDER BY` on the sorting key would force read-in-order on the main
+        // table and make ClickHouse skip a matching projection (read-in-order is
+        // not supported on projections), so it is intentionally omitted.
 
         // Build the final SELECT statement that selects columns from the CTE
         // Remove _gs_op if present since we create our own virtual column
@@ -176,7 +181,7 @@ impl ClickHouseQueryBuilder {
         let final_select = format!(
             "SELECT {},\n{}",
             select_columns.join(",\n"),
-            Self::VIRTUAL_GS_OP_FIELD
+            self.gs_op_field()
         );
 
         // Combine CTE and final SELECT
@@ -195,6 +200,11 @@ impl ClickHouseQueryBuilder {
     // Get pagination config (for accessing page_size)
     pub fn pagination_config(&self) -> Option<&ClickHousePaginationConfig> {
         self.pagination_config.as_ref()
+    }
+
+    // The user-supplied filter, used to build the matching count probe.
+    pub fn where_clause(&self) -> Option<&str> {
+        self.where_clause.as_deref()
     }
 }
 
@@ -252,7 +262,10 @@ mod tests {
         // Should have CTE structure
         assert!(query.contains("WITH t AS"));
         assert!(query.contains("SELECT * FROM test_table"));
-        assert!(query.contains("ORDER BY id,timestamp"));
+        assert!(
+            !query.contains("ORDER BY"),
+            "CTE must not emit ORDER BY: {query}"
+        );
         assert!(query.contains("SELECT id,\nname"));
         assert!(query.contains("_gs_op"));
         assert!(query.contains("FROM t"));
@@ -275,7 +288,10 @@ mod tests {
         assert!(query.contains("WITH t AS"));
         assert!(query.contains("SELECT * FROM test_table"));
         assert!(query.contains("WHERE (status = 'active')"));
-        assert!(query.contains("ORDER BY id"));
+        assert!(
+            !query.contains("ORDER BY"),
+            "CTE must not emit ORDER BY: {query}"
+        );
     }
 
     #[test]
@@ -295,26 +311,10 @@ mod tests {
 
         // Should use >= for start_at
         assert!(query.contains("id >= 100"));
-        assert!(query.contains("ORDER BY id"));
-    }
-
-    #[test]
-    fn test_query_with_pagination_keyset() {
-        let pagination_config = ClickHousePaginationConfig {
-            sorting_keys: vec!["id".to_string()],
-            page_size: 1000,
-        };
-        let mut builder = ClickHouseQueryBuilder::of(
-            "test_table".to_string(),
-            vec!["id".to_string(), "name".to_string()],
-            None,
-            Some(pagination_config),
+        assert!(
+            !query.contains("ORDER BY"),
+            "CTE must not emit ORDER BY: {query}"
         );
-        builder.update_keyset(vec![ScalarValue::Int64(Some(100))]);
-        let query = builder.get_query();
-
-        // Should use > for pagination boundary
-        assert!(query.contains("id > 100"));
     }
 
     #[test]
@@ -338,7 +338,10 @@ mod tests {
         // Should have proper tuple comparison unwinding
         assert!(query.contains("block_number >= 1000"));
         assert!(query.contains("block_number = 1000 AND id >= 50"));
-        assert!(query.contains("ORDER BY block_number,id"));
+        assert!(
+            !query.contains("ORDER BY"),
+            "CTE must not emit ORDER BY: {query}"
+        );
     }
 
     #[test]
@@ -422,7 +425,9 @@ mod tests {
     }
 
     #[test]
-    fn test_query_includes_gs_op() {
+    fn test_query_includes_gs_op_default_is_constant_insert() {
+        // No is_deleted column: no engine-level deletion concept, so _gs_op is a
+        // constant 'i' (always present so the output schema contract holds).
         let mut builder = ClickHouseQueryBuilder::of(
             "test_table".to_string(),
             vec!["id".to_string()],
@@ -430,10 +435,23 @@ mod tests {
             None,
         );
         let query = builder.get_query();
-
-        // Should include _gs_op virtual field
         assert!(query.contains("_gs_op"));
-        assert!(query.contains("CASE WHEN is_deleted=0 THEN 'i' ELSE 'd' END AS _gs_op"));
+        assert!(query.contains("'i' AS _gs_op"));
+    }
+
+    #[test]
+    fn test_query_gs_op_from_is_deleted_flag() {
+        // A ReplacingMergeTree is_deleted flag (custom name) drives _gs_op, so a
+        // non-standard flag column works instead of a hardcode.
+        let mut builder = ClickHouseQueryBuilder::of(
+            "test_table".to_string(),
+            vec!["id".to_string()],
+            None,
+            None,
+        );
+        builder.set_is_deleted_column(Some("deleted_flag".to_string()));
+        let query = builder.get_query();
+        assert!(query.contains("CASE WHEN deleted_flag=0 THEN 'i' ELSE 'd' END AS _gs_op"));
     }
 
     #[test]
@@ -444,6 +462,7 @@ mod tests {
             None,
             None,
         );
+        builder.set_is_deleted_column(Some("is_deleted".to_string()));
         let query = builder.get_query();
 
         // Should include id and name columns
@@ -502,70 +521,16 @@ mod tests {
         assert!(query.starts_with("WITH t AS"));
         assert!(query.contains("SELECT * FROM matic_raw_logs"));
         assert!(query.contains("WHERE (address = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e')"));
-        assert!(query.contains("ORDER BY id"));
+        assert!(
+            !query.contains("ORDER BY"),
+            "CTE must not emit ORDER BY: {query}"
+        );
         assert!(query.contains("SELECT id,\nblock_number,\nblock_hash"));
         assert!(query.contains("FROM t"));
     }
 
     #[test]
-    fn test_pagination_flow() {
-        let pagination_config = ClickHousePaginationConfig {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            page_size: 1000,
-        };
-        let mut builder = ClickHouseQueryBuilder::of(
-            "transactions".to_string(),
-            vec![
-                "block_number".to_string(),
-                "id".to_string(),
-                "hash".to_string(),
-            ],
-            Some("status = 'confirmed'".to_string()),
-            Some(pagination_config),
-        );
-
-        // First page: no keyset, should return all matching rows
-        let first_page_query = builder.get_query().to_string();
-        assert!(first_page_query.contains("SELECT * FROM transactions"));
-        assert!(first_page_query.contains("WHERE (status = 'confirmed')"));
-        assert!(first_page_query.contains("ORDER BY block_number,id"));
-        assert!(!first_page_query.contains("block_number >"));
-        assert!(!first_page_query.contains("block_number >="));
-
-        // Simulate reading first page and getting last row: block_number=1000, id=50
-        builder.update_keyset(vec![
-            ScalarValue::Int64(Some(1000)),
-            ScalarValue::Int64(Some(50)),
-        ]);
-        let second_page_query = builder.get_query().to_string();
-
-        // Second page: should use > (not >=) for pagination boundary
-        assert!(second_page_query.contains("WHERE (status = 'confirmed')"));
-        assert!(second_page_query.contains("AND"));
-        // Should have proper tuple comparison unwinding
-        assert!(second_page_query.contains("block_number > 1000"));
-        assert!(second_page_query.contains("block_number = 1000 AND id > 50"));
-        assert!(second_page_query.contains("ORDER BY block_number,id"));
-
-        // Simulate reading second page and getting last row: block_number=1000, id=150
-        builder.update_keyset(vec![
-            ScalarValue::Int64(Some(1000)),
-            ScalarValue::Int64(Some(150)),
-        ]);
-        let third_page_query = builder.get_query().to_string();
-
-        // Third page: should continue with > operator
-        assert!(third_page_query.contains("block_number > 1000"));
-        assert!(third_page_query.contains("block_number = 1000 AND id > 150"));
-
-        // Verify all queries have proper CTE structure
-        assert!(first_page_query.starts_with("WITH t AS"));
-        assert!(second_page_query.starts_with("WITH t AS"));
-        assert!(third_page_query.starts_with("WITH t AS"));
-    }
-
-    #[test]
-    fn test_block_range_upper_bound_only() {
+    fn test_sort_key_range_upper_bound_only() {
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: vec!["block_number".to_string(), "id".to_string()],
             page_size: 1000,
@@ -576,15 +541,18 @@ mod tests {
             None,
             Some(pagination_config),
         );
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(1_000_000))));
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(1_000_000))));
         let query = builder.get_query();
 
         assert!(query.contains("block_number < 1000000"));
-        assert!(query.contains("ORDER BY block_number,id"));
+        assert!(
+            !query.contains("ORDER BY"),
+            "CTE must not emit ORDER BY: {query}"
+        );
     }
 
     #[test]
-    fn test_block_range_with_where_clause() {
+    fn test_sort_key_range_with_where_clause() {
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: vec!["block_number".to_string()],
             page_size: 1000,
@@ -595,7 +563,7 @@ mod tests {
             Some("address = '0x1234'".to_string()),
             Some(pagination_config),
         );
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(2_000_000))));
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(2_000_000))));
         let query = builder.get_query();
 
         assert!(query.contains("WHERE (address = '0x1234')"));
@@ -603,32 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_range_with_keyset() {
-        let pagination_config = ClickHousePaginationConfig {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            page_size: 1000,
-        };
-        let mut builder = ClickHouseQueryBuilder::of(
-            "test_table".to_string(),
-            vec!["block_number".to_string(), "id".to_string()],
-            None,
-            Some(pagination_config),
-        );
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(1_000_000))));
-        builder.update_keyset(vec![
-            ScalarValue::Int64(Some(500_000)),
-            ScalarValue::Int64(Some(42)),
-        ]);
-        let query = builder.get_query();
-
-        // Both block range upper bound and keyset conditions should be present
-        assert!(query.contains("block_number < 1000000"));
-        assert!(query.contains("block_number > 500000"));
-        assert!(query.contains("block_number = 500000 AND id > 42"));
-    }
-
-    #[test]
-    fn test_block_range_with_where_and_keyset() {
+    fn test_sort_key_range_with_where_and_keyset() {
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: vec!["block_number".to_string(), "id".to_string()],
             page_size: 1000,
@@ -639,132 +582,18 @@ mod tests {
             Some("address = '0xdead'".to_string()),
             Some(pagination_config),
         );
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(3_000_000))));
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(3_000_000))));
         builder.start_at_page(vec![
             ScalarValue::Int64(Some(1_000_000)),
             ScalarValue::Int64(Some(0)),
         ]);
         let query = builder.get_query();
 
-        // All three conditions: filter, block range, and keyset
+        // All three conditions: filter, sort key range, and keyset
         assert!(query.contains("WHERE (address = '0xdead')"));
         assert!(query.contains("block_number < 3000000"));
         assert!(query.contains("block_number >= 1000000"));
         assert!(query.contains("block_number = 1000000 AND id >= 0"));
-    }
-
-    #[test]
-    fn test_clear_keyset() {
-        let pagination_config = ClickHousePaginationConfig {
-            sorting_keys: vec!["block_number".to_string()],
-            page_size: 1000,
-        };
-        let mut builder = ClickHouseQueryBuilder::of(
-            "test_table".to_string(),
-            vec!["block_number".to_string()],
-            None,
-            Some(pagination_config),
-        );
-
-        builder.update_keyset(vec![ScalarValue::Int64(Some(500))]);
-        let query_with_keyset = builder.get_query().to_string();
-        assert!(query_with_keyset.contains("block_number > 500"));
-
-        builder.clear_keyset();
-        let query_without_keyset = builder.get_query().to_string();
-        assert!(!query_without_keyset.contains("block_number >"));
-        assert!(!query_without_keyset.contains("block_number >="));
-    }
-
-    #[test]
-    fn test_block_range_pagination_flow() {
-        let pagination_config = ClickHousePaginationConfig {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            page_size: 1000,
-        };
-        let mut builder = ClickHouseQueryBuilder::of(
-            "traces".to_string(),
-            vec![
-                "block_number".to_string(),
-                "id".to_string(),
-                "data".to_string(),
-            ],
-            Some("error = '0x01'".to_string()),
-            Some(pagination_config),
-        );
-
-        // Range 1: [0, 1M) - first page, no keyset
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(1_000_000))));
-        let q1 = builder.get_query().to_string();
-        assert!(q1.contains("block_number < 1000000"));
-        assert!(!q1.contains("block_number >"));
-
-        // Within range 1: keyset pagination after first page
-        builder.update_keyset(vec![
-            ScalarValue::Int64(Some(500_000)),
-            ScalarValue::Int64(Some(99)),
-        ]);
-        let q2 = builder.get_query().to_string();
-        assert!(q2.contains("block_number < 1000000"));
-        assert!(q2.contains("block_number > 500000"));
-
-        // Advance to range 2: [1M, 2M) - start_at new range, new upper bound
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(2_000_000))));
-        builder.start_at_page(vec![ScalarValue::Int64(Some(1_000_000))]);
-        let q3 = builder.get_query().to_string();
-        assert!(q3.contains("block_number < 2000000"));
-        assert!(q3.contains("block_number >= 1000000"));
-        assert!(!q3.contains("block_number > 500000"));
-
-        // All queries maintain CTE structure
-        assert!(q1.starts_with("WITH t AS"));
-        assert!(q2.starts_with("WITH t AS"));
-        assert!(q3.starts_with("WITH t AS"));
-    }
-
-    #[test]
-    fn test_timeout_retry_resets_keyset() {
-        let pagination_config = ClickHousePaginationConfig {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            page_size: 1000,
-        };
-        let mut builder = ClickHouseQueryBuilder::of(
-            "traces".to_string(),
-            vec!["block_number".to_string(), "id".to_string()],
-            None,
-            Some(pagination_config),
-        );
-
-        // Scanning range [0, 1000) — keyset advanced to block_number=800
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(1000))));
-        builder.update_keyset(vec![
-            ScalarValue::Int64(Some(800)),
-            ScalarValue::Int64(Some(42)),
-        ]);
-        let q1 = builder.get_query().to_string();
-        assert!(q1.contains("block_number < 1000"));
-        assert!(q1.contains("block_number > 800"));
-
-        // Timeout! Shrink range to [0, 500) and reset keyset to range_start=0.
-        // Without the reset, the query would have block_number > 800 AND block_number < 500.
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(500))));
-        builder.start_at_page(vec![ScalarValue::Int64(Some(0))]);
-        let q2 = builder.get_query().to_string();
-        assert!(
-            q2.contains("block_number < 500"),
-            "upper bound should be 500, got: {}",
-            q2
-        );
-        assert!(
-            q2.contains("block_number >= 0"),
-            "should restart from range_start, got: {}",
-            q2
-        );
-        assert!(
-            !q2.contains("block_number > 800"),
-            "stale keyset must be cleared, got: {}",
-            q2
-        );
     }
 
     #[test]
@@ -781,9 +610,9 @@ mod tests {
             Some("address IN ('0x1234')".to_string()),
             Some(pagination_config),
         );
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(1_000_000))));
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(1_000_000))));
         // Simulate an empty keyset being set (e.g. checkpoint with no args)
-        builder.update_keyset(vec![]);
+        builder.start_at_page(vec![]);
         let query = builder.get_query();
 
         assert!(
@@ -794,13 +623,13 @@ mod tests {
             !query.contains("WHERE ()"),
             "query must not contain 'WHERE ()': {query}"
         );
-        // The filter and block range upper bound should still be present
+        // The filter and sort key range upper bound should still be present
         assert!(query.contains("WHERE (address IN ('0x1234'))"));
         assert!(query.contains("AND (block_number < 1000000)"));
     }
 
     #[test]
-    fn test_recovery_uses_enlarged_block_range() {
+    fn test_recovery_uses_enlarged_sort_key_range() {
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: vec!["block_number".to_string(), "id".to_string()],
             page_size: 1000,
@@ -812,20 +641,20 @@ mod tests {
             Some(pagination_config),
         );
 
-        // Simulate: block_range was halved to 500 after timeout, range [0, 500) exhausted.
-        // Advancing to next range: recover block_range to 1000 first, THEN set upper bound.
-        let mut block_range: i128 = 500;
-        let default_block_range: i128 = 1000;
+        // Simulate: sort_key_range was halved to 500 after timeout, range [0, 500) exhausted.
+        // Advancing to next range: recover sort_key_range to 1000 first, THEN set upper bound.
+        let mut sort_key_range: i128 = 500;
+        let default_sort_key_range: i128 = 1000;
         let next_start: i128 = 500;
 
         // Recovery happens before setting upper bound
-        if block_range < default_block_range {
-            block_range = (block_range * 2).min(default_block_range);
+        if sort_key_range < default_sort_key_range {
+            sort_key_range = (sort_key_range * 2).min(default_sort_key_range);
         }
-        assert_eq!(block_range, 1000);
+        assert_eq!(sort_key_range, 1000);
 
-        builder.set_block_range_upper_bound(Some(ScalarValue::Int64(Some(
-            (next_start + block_range) as i64,
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(
+            (next_start + sort_key_range) as i64,
         ))));
         builder.start_at_page(vec![ScalarValue::Int64(Some(next_start as i64))]);
         let query = builder.get_query().to_string();
@@ -833,7 +662,7 @@ mod tests {
         // The range should be [500, 1500), not [500, 1000) which would skip [1000, 1500)
         assert!(
             query.contains("block_number < 1500"),
-            "upper bound should use recovered block_range, got: {}",
+            "upper bound should use recovered sort_key_range, got: {}",
             query
         );
         assert!(query.contains("block_number >= 500"));

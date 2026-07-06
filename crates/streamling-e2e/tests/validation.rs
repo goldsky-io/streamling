@@ -495,6 +495,112 @@ sinks:
 }
 
 // ============================================================================
+// STRM-6281: Kafka sink requires a resolvable primary key
+// ============================================================================
+
+/// A Kafka sink whose upstream has no primary key — none in the sink config, none on
+/// the source, and none discoverable from the Avro schema — must fail validation up
+/// front instead of crashlooping at runtime with `primary key column '' not found in
+/// batch`. This mirrors the abstract-dataset-with-no-CMS-primary-key scenario, where
+/// the preprocessor emits `primary_key: ""` that used to flow through to the sink.
+#[tokio::test]
+async fn test_kafka_sink_without_primary_key_fails_validation() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    // TEST_SCHEMA has no `doc` with primaryKeys, so nothing is discovered from Avro.
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records: Vec<TestRecord> = (0..5)
+        .map(|i| TestRecord {
+            block: i,
+            id: format!("id_{}", i),
+            data: format!("data{}", i),
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let output_topic = ctx
+        .create_kafka_topic("output")
+        .await
+        .expect("Failed to create output topic");
+
+    // No primary_key on the source OR the sink, and no embedded Avro primary key:
+    // there is nothing to resolve or propagate to the Kafka sink.
+    let pipeline = format!(
+        r#"
+sources:
+  test_kafka_source:
+    type: kafka
+    topic: {input_topic}
+    starting_offsets: earliest
+
+transforms: {{}}
+
+sinks:
+  kafka_sink:
+    type: kafka
+    from: test_kafka_source
+    topic: {output_topic}
+    topic_partitions: 1
+    data_format: avro
+"#,
+        input_topic = ctx.kafka_topic,
+        output_topic = output_topic.topic,
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new().record_limit(5).arg("--validate"),
+        )
+        .await
+        .expect("Failed to run pipeline");
+
+    assert!(
+        !output.status.success(),
+        "Kafka sink without a resolvable primary key should exit non-zero under --validate"
+    );
+
+    let validation: ValidationOutput = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "Failed to parse validation JSON from stdout: {}\nstdout was:\n{}\nstderr was:\n{}",
+            e, output.stdout, output.stderr
+        )
+    });
+
+    assert!(
+        !validation.is_valid,
+        "Pipeline with an unresolvable Kafka sink primary key should be invalid, got: {:?}",
+        validation
+    );
+    // Attributed as a platform error (internal), since every dataset is expected to
+    // declare a primary key — so `--validate` reports success: false.
+    assert!(
+        !validation.success,
+        "A missing Kafka sink primary key is a platform (internal) error, so success should be false, got: {:?}",
+        validation
+    );
+
+    let all_errors = validation.errors.join("\n");
+    assert!(
+        all_errors.contains("kafka sink 'kafka_sink' requires a primary key"),
+        "Errors should mention the Kafka sink primary key requirement, got: {:?}",
+        validation.errors
+    );
+}
+
+// ============================================================================
 // STRM-5695: u256 comparison combined with boolean predicate via AND/OR
 // ============================================================================
 

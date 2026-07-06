@@ -24,7 +24,7 @@ async fn test_clickhouse_source_boundary() {
 
     let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
 
-    // Create source table — first sorting key must be numeric for block range pagination
+    // Create source table — first sorting key must be numeric for sort key range pagination
     clickhouse
         .execute(
             "CREATE TABLE boundary_test (
@@ -155,7 +155,7 @@ async fn test_clickhouse_source_keyset_pagination() {
 
     let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
 
-    // Create table with compound sorting key — first sorting key must be numeric for block range pagination
+    // Create table with compound sorting key — first sorting key must be numeric for sort key range pagination
     clickhouse
         .execute(
             "CREATE TABLE keyset_test (
@@ -258,14 +258,14 @@ sinks:
 }
 
 // ============================================================================
-// Scenario 3: Block range with inner keyset pagination
+// Scenario 3: Sort key range with inner keyset pagination
 // ============================================================================
 
-/// Test that when a single block range contains more rows than page_size,
-/// inner keyset pagination correctly pages through them before advancing
-/// to the next block range.
+/// Test that when a sort key range contains more rows than page_size, the source
+/// shrinks the range until each page fits and still delivers every row across
+/// all ranges.
 #[tokio::test]
-async fn test_clickhouse_source_block_range_exceeds_page_size() {
+async fn test_clickhouse_source_sort_key_range_exceeds_page_size() {
     init_tracing();
 
     let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
@@ -276,7 +276,7 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
 
     clickhouse
         .execute(
-            "CREATE TABLE block_range_paging_test (
+            "CREATE TABLE sort_key_range_paging_test (
                 block_number UInt64,
                 id UInt64,
                 data String,
@@ -287,8 +287,8 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
         .expect("Failed to create table");
 
     // Insert 500 rows: block_number 0..499, each with a unique id.
-    // With block_range=100, we get 5 block ranges: [0,100), [100,200), ...
-    // With page_size=30, each block range (100 rows) needs ~4 keyset pages.
+    // page_size=30 forces the adaptive controller to shrink ranges below the
+    // dense regions until each page fits; all 500 rows must still arrive.
     let total_records: u64 = 500;
     let mut values = Vec::new();
     for i in 0..total_records {
@@ -297,7 +297,7 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
 
     for chunk in values.chunks(200) {
         let insert_query = format!(
-            "INSERT INTO block_range_paging_test (block_number, id, data, is_deleted) VALUES {}",
+            "INSERT INTO sort_key_range_paging_test (block_number, id, data, is_deleted) VALUES {}",
             chunk.join(", ")
         );
         clickhouse
@@ -310,7 +310,7 @@ async fn test_clickhouse_source_block_range_exceeds_page_size() {
 sources:
   ch_source:
     type: clickhouse
-    table_name: block_range_paging_test
+    table_name: sort_key_range_paging_test
     primary_key: id
 
 transforms: {}
@@ -319,7 +319,7 @@ sinks:
   pg_sink:
     type: postgres
     from: ch_source
-    table: block_range_paging_results
+    table: sort_key_range_paging_results
     schema: public
     primary_key: id
     on_conflict: update
@@ -330,7 +330,7 @@ sinks:
             pipeline,
             PipelineOpts::new()
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
                 .record_limit(total_records)
                 .timeout(std::time::Duration::from_secs(60)),
         )
@@ -341,49 +341,174 @@ sinks:
 
     let count = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.block_range_paging_results")
+        .count("SELECT COUNT(*) FROM public.sort_key_range_paging_results")
         .await
         .expect("Failed to query count");
 
     assert_eq!(
         count, total_records as i64,
-        "Should have processed all {} records across multiple block ranges with inner keyset pagination",
+        "Should have processed all {} records across multiple sort key ranges with inner keyset pagination",
         total_records
     );
 
-    // Verify rows from different block ranges made it through
+    // Verify rows from different sort key ranges made it through
     let first_range = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.block_range_paging_results WHERE block_number < 100")
+        .count("SELECT COUNT(*) FROM public.sort_key_range_paging_results WHERE block_number < 100")
         .await
         .unwrap();
     assert_eq!(
         first_range, 100,
-        "First block range [0,100) should have 100 rows"
+        "First sort key range [0,100) should have 100 rows"
     );
 
     let last_range = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.block_range_paging_results WHERE block_number >= 400")
+        .count(
+            "SELECT COUNT(*) FROM public.sort_key_range_paging_results WHERE block_number >= 400",
+        )
         .await
         .unwrap();
     assert_eq!(
         last_range, 100,
-        "Last block range [400,500) should have 100 rows"
+        "Last sort key range [400,500) should have 100 rows"
+    );
+}
+
+/// Count-first pagination: a sort-key span whose *average* density fits a page
+/// but contains a DENSE cluster (several rows per key) must be sized from the
+/// exact per-range count BEFORE the data read, not from the span average. The
+/// up-front probe sizes the initial width from whole-span density and would
+/// otherwise walk a wide range straight into the cluster, materialising more
+/// than `page_size` rows before the reactive overflow could shrink it. With
+/// count-first sizing each range is probed and shrunk to fit first; this test
+/// verifies the orchestration (probe, shrink, re-probe, converge) delivers
+/// every row through a real dense cluster without loss or stall.
+#[tokio::test]
+async fn test_clickhouse_source_count_first_shrinks_dense_cluster() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE count_first_cluster_test (
+                block_number UInt64,
+                id UInt64,
+                data String,
+                is_deleted UInt8
+            ) ENGINE = MergeTree() ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create table");
+
+    // Sparse [0,40): one row per key. Dense cluster [40,50): five rows per key
+    // (fanout 5, kept under page_size so no single key hits the unsplittable
+    // floor). Sparse [50,90): one row per key. Total = 40 + 50 + 40 = 130.
+    let mut values: Vec<String> = Vec::new();
+    for i in 0..40u64 {
+        values.push(format!("({}, {}, 'sparse_{}', 0)", i, i, i));
+    }
+    for blk in 40..50u64 {
+        for j in 0..5u64 {
+            let id = blk * 10 + j;
+            values.push(format!("({}, {}, 'dense_{}', 0)", blk, id, id));
+        }
+    }
+    for i in 50..90u64 {
+        values.push(format!("({}, {}, 'sparse_{}', 0)", i, i, i));
+    }
+    let total_records = values.len() as i64;
+
+    for chunk in values.chunks(200) {
+        let insert_query = format!(
+            "INSERT INTO count_first_cluster_test (block_number, id, data, is_deleted) VALUES {}",
+            chunk.join(", ")
+        );
+        clickhouse
+            .execute(&insert_query)
+            .await
+            .expect("Failed to insert data");
+    }
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: count_first_cluster_test
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: count_first_cluster_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    // page_size 30 < the cluster's 50 rows across [40,50), so any multi-key range
+    // overlapping the cluster overflows by rows and must be shrunk from its exact
+    // count before reading.
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "50")
+                .record_limit(total_records as u64)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.count_first_cluster_results")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(
+        count, total_records,
+        "every row, including the dense cluster, must be delivered after count-first sizing"
+    );
+
+    // The cluster [40,50) carries 50 rows across 10 keys; confirming all 50
+    // arrived proves the count-first loop shrank each overlapping range to fit
+    // rather than skipping the overflow.
+    let cluster_rows = ctx
+        .postgres
+        .count(
+            "SELECT COUNT(*) FROM public.count_first_cluster_results \
+             WHERE block_number >= 40 AND block_number < 50",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster_rows, 50,
+        "dense cluster [40,50) must deliver all 50 rows (5 per key x 10 keys)"
     );
 }
 
 // ============================================================================
-// Scenario 4: Checkpoint flow across sparse block ranges
+// Scenario 4: Checkpoint flow across sparse sort key ranges
 // ============================================================================
 
-/// Test that checkpoints flow correctly when block range pagination scans
+/// Test that checkpoints flow correctly when sort key range pagination scans
 /// through a mix of populated and empty ranges. Verifies:
 /// 1. Pipeline 1 processes the first cluster and checkpoints its position
 /// 2. Pipeline 2 resumes from the checkpoint and processes the second cluster
 ///    without re-reading the first cluster
 ///
-/// Data layout with block_range=100:
+/// Data layout with sort_key_range=100:
 ///   [0,100)   → 50 rows (cluster 1)
 ///   [100,500) → empty (4 empty ranges)
 ///   [500,600) → 50 rows (cluster 2)
@@ -451,7 +576,7 @@ sinks:
 "#;
 
     // Run 1: process only the first 50 records (cluster 1).
-    // With block_range=100 and page_size=30 the source will also scan
+    // With sort_key_range=100 and page_size=30 the source will also scan
     // empty ranges [100,200)…[400,500) before reaching cluster 2,
     // but record_limit will stop it after 50 records.
     let status_1 = ctx
@@ -481,7 +606,7 @@ sinks:
                 .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
                 .env("STREAMLING__RECORD_BATCH_SIZE", "10")
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100"),
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100"),
         )
         .await
         .expect("Pipeline run 1 failed");
@@ -558,7 +683,7 @@ sinks:
                 .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
                 .env("STREAMLING__RECORD_BATCH_SIZE", "10")
                 .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__BLOCK_RANGE", "100"),
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100"),
         )
         .await
         .expect("Pipeline run 2 failed");
@@ -598,4 +723,272 @@ sinks:
             min_block_2[0].0
         );
     }
+}
+
+// ============================================================================
+// Scenario 5: Version-aware dedup activates when columns omit the version col
+// ============================================================================
+
+/// Regression: source-side ReplacingMergeTree dedup must activate even when
+/// the configured `columns` omit the inferred version column. This is the
+/// hybrid-source path — `ClickHouseSchemaAdapter::get_columns` projects
+/// ClickHouse to the unbounded source's (Kafka) target schema, which excludes
+/// ClickHouse housekeeping columns like `insert_timestamp` and `is_deleted`.
+///
+/// The fix force-includes the inferred version column in the internal scan
+/// and projects it back out before emission, so:
+///   1. dedup picks the max-`insert_timestamp` row per ORDER BY key,
+///   2. tombstone winners (`is_deleted=1`) drop the key entirely (FINAL),
+///   3. the external schema stays exactly the configured columns (no leaked
+///      `insert_timestamp` in the postgres sink table).
+#[tokio::test]
+async fn test_clickhouse_source_replacing_dedup_when_version_column_not_selected() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE replacing_dedup_test (
+                block_number UInt64,
+                id String,
+                payload String,
+                insert_timestamp DateTime,
+                is_deleted UInt8
+            ) ENGINE = ReplacingMergeTree(insert_timestamp, is_deleted)
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    // 5 distinct (block_number, id) keys, 9 raw rows. Each scenario probes a
+    // different dedup property; together they catch the activation regression
+    // regardless of ClickHouse part-read order.
+    //
+    //   (1, 'a')  — single version, sanity (must arrive once).
+    //   (2, 'b')  — newer insert_timestamp inserted second; dedup picks 'b_new'.
+    //   (3, 'c')  — newer insert_timestamp inserted FIRST; position-based dedup
+    //               would pick the wrong row, version-aware picks 'c_new'.
+    //   (4, 'd')  — tombstone has the max insert_timestamp → whole key dropped.
+    //   (5, 'e')  — tombstone is older than the live row → key kept as 'e_alive'.
+    clickhouse
+        .execute(
+            "INSERT INTO replacing_dedup_test VALUES
+                (1, 'a', 'a1',        toDateTime(1000), 0),
+                (2, 'b', 'b_old',     toDateTime(1000), 0),
+                (2, 'b', 'b_new',     toDateTime(2000), 0),
+                (3, 'c', 'c_new',     toDateTime(2000), 0),
+                (3, 'c', 'c_old',     toDateTime(1000), 0),
+                (4, 'd', 'd_alive',   toDateTime(1000), 0),
+                (4, 'd', 'd_deleted', toDateTime(2000), 1),
+                (5, 'e', 'e_alive',   toDateTime(2000), 0),
+                (5, 'e', 'e_deleted', toDateTime(1000), 1)",
+        )
+        .await
+        .expect("Failed to insert source data");
+
+    // The pipeline's `columns` deliberately OMIT `insert_timestamp` and
+    // `is_deleted` — replaying the hybrid-source projection that previously
+    // silently disabled dedup. (Comma-separated, no spaces: the topology
+    // parser splits on ',' without trimming.)
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: replacing_dedup_test
+    columns: "block_number,id,payload"
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: replacing_dedup_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            // Upper bound: 9 raw rows would be emitted without dedup. Bounded
+            // source completes naturally; the limit is a safety net.
+            PipelineOpts::new()
+                .record_limit(9)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    // (a) FINAL row count: 5 keys − 1 tombstoned key ('d') = 4.
+    let total = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.replacing_dedup_results")
+        .await
+        .expect("count query failed");
+    assert_eq!(
+        total, 4,
+        "ReplacingMergeTree FINAL semantics: 5 keys minus 1 tombstoned = 4"
+    );
+
+    // (b) Position-vs-version: 'c_new' has the higher `insert_timestamp` but
+    // was inserted FIRST, so a position-based or non-deduped reader would
+    // either pick 'c_old' or vary by scan order. Version-aware dedup picks
+    // 'c_new' deterministically.
+    let c_new = ctx
+        .postgres
+        .count(
+            "SELECT COUNT(*) FROM public.replacing_dedup_results \
+             WHERE id = 'c' AND payload = 'c_new'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        c_new, 1,
+        "max insert_timestamp must win for id='c' (got != 'c_new')"
+    );
+
+    // (c) Tombstone winner: key 'd' must be entirely absent.
+    let d = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.replacing_dedup_results WHERE id = 'd'")
+        .await
+        .unwrap();
+    assert_eq!(d, 0, "tombstoned key 'd' must be dropped (FINAL)");
+
+    // (d) Tombstone non-winner: 'e' survives as alive — an older delete must
+    // not displace a newer live row.
+    let e_alive = ctx
+        .postgres
+        .count(
+            "SELECT COUNT(*) FROM public.replacing_dedup_results \
+             WHERE id = 'e' AND payload = 'e_alive'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        e_alive, 1,
+        "older tombstone must not delete a newer live row for id='e'"
+    );
+
+    // (e) External schema contract: the force-included version column is
+    // projected out before emission, so the postgres table only carries the
+    // configured columns (plus any standard sink columns) — never
+    // `insert_timestamp` or `is_deleted`.
+    let cols = ctx
+        .postgres
+        .get_column_names("replacing_dedup_results")
+        .await
+        .unwrap();
+    assert!(
+        !cols.iter().any(|c| c == "insert_timestamp"),
+        "insert_timestamp must be projected out before emission (got columns: {:?})",
+        cols
+    );
+    assert!(
+        !cols.iter().any(|c| c == "is_deleted"),
+        "is_deleted must not leak into the external schema (got columns: {:?})",
+        cols
+    );
+}
+
+/// Regression: when a live row and a delete share the SAME `insert_timestamp`
+/// (a tied version), the source-side version dedup must let the delete win so
+/// the key is dropped — the row's final state is deleted. The scan has no
+/// ORDER BY, so the previous tiebreak (later position wins) was
+/// order-dependent: a live row scanned after the delete survived and the
+/// deletion was silently lost, leaving a stale live row in the sink.
+#[tokio::test]
+async fn test_clickhouse_source_tied_version_delete_drops_key() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE tied_version_dedup_test (
+                block_number UInt64,
+                id String,
+                payload String,
+                insert_timestamp DateTime,
+                is_deleted UInt8
+            ) ENGINE = ReplacingMergeTree(insert_timestamp, is_deleted)
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    // Two keys; for each, a live row and a delete at the SAME version, in
+    // opposite orders so the regression is caught regardless of scan order.
+    //   (1, 'a') — live first, then delete.
+    //   (2, 'b') — delete first, then live.
+    // Both must drop the key: the delete supersedes the live row on a tie.
+    //
+    // `optimize_on_insert = 0` stops ClickHouse from collapsing the tied live
+    // + delete rows at INSERT time — its default dedups them per the engine
+    // before the source scan ever sees both, which hides exactly this bug.
+    // One part, no insert-time collapse, no background-merge race: the scan
+    // reads all four raw rows and the source-side dedup resolves the tie.
+    clickhouse
+        .execute(
+            "INSERT INTO tied_version_dedup_test SETTINGS optimize_on_insert = 0 VALUES
+                (1, 'a', 'a_alive', toDateTime(1000), 0),
+                (1, 'a', 'a_alive', toDateTime(1000), 1),
+                (2, 'b', 'b_alive', toDateTime(1000), 1),
+                (2, 'b', 'b_alive', toDateTime(1000), 0)",
+        )
+        .await
+        .expect("Failed to insert source data");
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: tied_version_dedup_test
+    columns: "block_number,id,payload"
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: tied_version_dedup_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .record_limit(4)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    // Both keys are deleted at their (tied) max version -> FINAL drops them.
+    let total = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.tied_version_dedup_results")
+        .await
+        .expect("count query failed");
+    assert_eq!(
+        total, 0,
+        "tied live+delete rows must both be dropped (delete wins the tie)"
+    );
 }

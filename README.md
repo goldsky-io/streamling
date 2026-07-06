@@ -317,15 +317,19 @@ Sources return a `SendableRecordBatchStream` as a result.
 
 #### Kafka Source
 
-The Kafka source allows consuming data from Kafka topics using Avro serialization with Schema Registry integration. It's
-implemented as a custom DataFusion Table Provider (`TableProvider`) with the following key features:
+The Kafka source allows consuming data from Kafka topics using Avro (with Schema Registry integration) or JSON
+serialization. It's implemented as a custom DataFusion Table Provider (`TableProvider`) with the following key features:
 
-- **Schema Management**: Automatically fetches and converts Avro schemas from Schema Registry to Arrow schemas.
+- **Schema Management**:
+  - For Avro, automatically fetches and converts Avro schemas from Schema Registry to Arrow schemas.
+  - For JSON, uses the input schema declared in the source's `schema` field (Schema Registry is not used).
 - **Message Processing**:
-  - Converts Avro-encoded messages to Arrow `RecordBatch`es.
+  - Converts Avro- or JSON-encoded messages to Arrow `RecordBatch`es.
     - The size of the batches is controlled by the `record_batch_size` and `record_batch_interval_ms` parameters.
   - Adds operation type column (`_gs_op`) to track INSERT/UPDATE/DELETE operations (see `Upsert Semantics` section
     below). The operation type is determined by the `dbz.op` header value.
+  - Tombstone records (null/empty payloads, e.g. CDC deletes-as-tombstones) are **not supported** in any format
+    and fail the source. Represent deletes with a non-empty payload plus a `dbz.op=d` header instead.
 
 Kafka Source uses
 high-level [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html) which handles
@@ -348,6 +352,27 @@ sources:
     type: kafka
     topic: app.events
 ```
+
+**JSON format.** Set `data_format: json` (the default is `avro`) and declare the input schema as a `column → type` map.
+Each Kafka message payload is treated as a single UTF-8 JSON object (one row); Schema Registry is not used.
+
+```yaml
+sources:
+  raw_events:
+    type: kafka
+    topic: app.events
+    data_format: json
+    schema:
+      id: int64
+      name: string
+      amount: float64
+```
+
+Supported type names match Arrow's (`int8`..`int64`, `uint8`..`uint64`, `float32`/`float64`, `string`, `boolean`,
+`timestamp`, etc.). Decimals are written as `decimal128(precision, scale)` or `decimal256(precision, scale)`; the bare
+names `decimal128`/`decimal256` (alias `decimal`) default to `(38, 9)`. All declared columns are nullable. If the
+payload does not already contain `_gs_op`, it is added from the `dbz.op` header (defaulting to insert), exactly as for
+Avro.
 
 **Connection settings** — override the embedded defaults (local Kafka and Schema Registry) with these environment variables:
 

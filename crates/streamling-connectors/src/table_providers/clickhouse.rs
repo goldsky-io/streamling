@@ -17,6 +17,7 @@ use streamling_core::error::{ResultExt, StreamlingError};
 use streamling_core::functions::byte_reverse::ReverseBytes32Func;
 use streamling_core::streamling_err;
 use streamling_core::types::{i256::I256Type, u256::U256Type};
+use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
 use streamling_core::utils::parse_primary_key_columns;
 
 use crate::util::parallel::parallel_execute;
@@ -74,7 +75,9 @@ static CLICKHOUSE_ERROR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"Code: \d+\. \w+::\w*Exception:").unwrap());
 
 mod query_builder;
+mod range_controller;
 use query_builder::{ClickHousePaginationConfig, ClickHouseQueryBuilder};
+use range_controller::RangeController;
 
 fn scalar_to_i128(value: &ScalarValue) -> Option<i128> {
     match value {
@@ -102,7 +105,7 @@ fn i128_to_scalar_like(value: i128, template: &ScalarValue) -> ScalarValue {
         ScalarValue::UInt32(_) => ScalarValue::UInt32(Some(value as u32)),
         ScalarValue::UInt64(_) => ScalarValue::UInt64(Some(value as u64)),
         other => panic!(
-            "unsupported scalar type for block range arithmetic: {:?}",
+            "unsupported scalar type for sort key range arithmetic: {:?}",
             other
         ),
     }
@@ -111,6 +114,197 @@ fn i128_to_scalar_like(value: i128, template: &ScalarValue) -> ScalarValue {
 fn is_timeout_error(error: &DataFusionError) -> bool {
     let error_msg = error.to_string().to_lowercase();
     error_msg.contains("timeout") || error_msg.contains("timed out")
+}
+/// Maximum total byte size of a fully-buffered source page.
+///
+/// Arrow's variable-length arrays (`Utf8`/`Binary`) index their data buffer with
+/// `i32` offsets, so a single column cannot hold more than ~2 GiB; building one
+/// — via the IPC reader or `concat_batches` (version dedup) — panics with
+/// "byte array offset overflow" past that point. Pagination bounded pages by row
+/// count (`page_size`) only, so a dense string column blew the limit on a page
+/// that looked fine by rows (observed on `matic_raw_logs` in production). The
+/// widest column is at most the page total, so keeping the page well under
+/// `i32::MAX` guarantees no column can overflow. Half the limit leaves a 2x
+/// margin against offsets/null-bitmap overhead and measurement slack.
+const MAX_PAGE_BYTES: u64 = (i32::MAX as u64) / 2;
+
+/// Drain `buffer` and, if non-empty, build a synthetic empty batch carrying the
+/// checkpoint messages as schema metadata so they reach the sink before the
+/// source stream ends.
+///
+/// `attach_checkpoints` (the inline closure in `execute`) only drains the buffer
+/// onto an outgoing *data* batch. When the scan loop exits, a Marker buffered
+/// after the last data batch has no batch to ride — without this flush it is
+/// dropped when `tx` drops, the sink never ACKs that epoch, and the coordinator
+/// stalls on "missing sinks". On main's keyset pagination the last page was
+/// always an exhausted page that emitted an empty batch (draining the buffer);
+/// the new range pagination's last page has data and skips that drain, so this
+/// explicit flush restores parity.
+///
+/// Extracted as a free function so the drain logic is unit-testable without a
+/// ClickHouse connection or a multi-minute scan. Returns `None` when the buffer
+/// is empty (nothing to flush).
+fn build_checkpoint_flush_batch(
+    buffer: &mut Vec<CheckpointMessage>,
+    schema: SchemaRef,
+) -> Option<RecordBatch> {
+    if buffer.is_empty() {
+        return None;
+    }
+    debug!(
+        "Flushing {} buffered checkpoint message(s) on source completion",
+        buffer.len()
+    );
+    let batch = RecordBatch::new_empty(schema);
+    let mut metadata = batch.schema().metadata().clone();
+    enrich_batch_metadata_with_checkpoints(&mut metadata, buffer);
+    let enriched = enrich_batch_with_metadata(batch, metadata)
+        .expect("Failed to enrich final flush batch with checkpoint metadata");
+    buffer.clear();
+    Some(enriched)
+}
+
+/// Drop the column at `drop_idx` and re-tag the batch with `target_schema`.
+/// Strips a dedup-only version column (force-included because the configured
+/// columns omit it) before emission, so the external schema is unchanged.
+fn project_out_column(
+    batch: RecordBatch,
+    drop_idx: usize,
+    target_schema: SchemaRef,
+) -> Result<RecordBatch, DataFusionError> {
+    let kept: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != drop_idx)
+        .map(|(_, c)| Arc::clone(c))
+        .collect();
+    RecordBatch::try_new(target_schema, kept).map_err(Into::into)
+}
+/// Version / is_deleted columns inferred from a ReplacingMergeTree-family
+/// `engine_full` string. Either may be `None` (e.g. plain `ReplacingMergeTree()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplacingMergeTreeDedup {
+    pub version_column: Option<String>,
+    pub is_deleted_column: Option<String>,
+}
+
+/// Parse the version and is_deleted column names out of a `system.tables.engine_full`
+/// value for a ReplacingMergeTree-family engine.
+///
+/// Example: `SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', insert_timestamp, is_deleted)`
+/// The quoted path/replica literals are dropped; the remaining bare identifiers
+/// are, in order, the version column and the is_deleted column. This holds for
+/// every variant (`ReplacingMergeTree`, `ReplicatedReplacingMergeTree`,
+/// `SharedReplacingMergeTree`): the path/replica args are always quoted, while
+/// the version/is_deleted args are always bare column identifiers.
+///
+/// Returns `None` for non-ReplacingMergeTree engines (no version concept).
+pub(crate) fn parse_replacing_merge_tree_dedup(
+    engine_full: &str,
+) -> Option<ReplacingMergeTreeDedup> {
+    let engine_full = engine_full.trim();
+    let open = engine_full.find('(')?;
+    let engine_name = engine_full[..open].trim();
+    if !engine_name.to_ascii_lowercase().contains("replacing") {
+        return None;
+    }
+    let close = matching_close_paren(engine_full, open)?;
+    if close <= open {
+        return None;
+    }
+    let args = &engine_full[open + 1..close];
+
+    // Bare identifiers (version, is_deleted), in order: every token that isn't a
+    // quoted string literal.
+    let bare: Vec<String> = tokenize_engine_args(args)
+        .into_iter()
+        .filter(|tok| !tok.starts_with('\''))
+        .map(|tok| tok.trim().to_string())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+
+    let mut iter = bare.into_iter();
+    Some(ReplacingMergeTreeDedup {
+        version_column: iter.next(),
+        is_deleted_column: iter.next(),
+    })
+}
+
+/// Split engine args on top-level commas, preserving single-quoted string
+/// literals (with `''` escapes). Quoted tokens keep their quotes so callers can
+/// distinguish them from bare identifiers.
+fn tokenize_engine_args(args: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = args.chars().peekable();
+    let mut in_quote = false;
+    while let Some(c) = chars.next() {
+        if in_quote {
+            current.push(c);
+            if c == '\'' && matches!(chars.peek(), Some('\'')) {
+                // '' is an escaped quote; stay inside the literal.
+                chars.next();
+                current.push('\'');
+            } else if c == '\'' {
+                in_quote = false;
+            }
+        } else {
+            match c {
+                '\'' => {
+                    in_quote = true;
+                    current.push(c);
+                }
+                ',' => {
+                    tokens.push(current.trim().to_string());
+                    current = String::new();
+                }
+                _ => current.push(c),
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        tokens.push(current.trim().to_string());
+    }
+    tokens
+}
+
+/// Index of the `)` that closes the `(` at `open`, respecting single-quoted
+/// string literals (with `''` escapes) and nested parens. A real `engine_full`
+/// is `ReplacingMergeTree(...) ORDER BY (...)` — the trailing ORDER BY /
+/// SETTINGS clauses carry their own parens, so a naive `rfind(')')` grabs the
+/// wrong close and lets the ORDER BY text leak into the parsed column names.
+fn matching_close_paren(engine_full: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut chars = engine_full.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if i < open {
+            continue;
+        }
+        if in_quote {
+            if c == '\'' {
+                if matches!(chars.peek(), Some(&(_, '\''))) {
+                    chars.next(); // escaped quote
+                } else {
+                    in_quote = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_quote = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -130,9 +324,21 @@ struct SourceParams {
     initial_split_args: Vec<ScalarValue>,
     state_store: Arc<ClickHouseSourceStateStore>,
     datafusion_buffer_size: usize,
-    block_range: i64,
+    /// Target rows per emitted batch. A page (which dedup coalesces into one
+    /// batch) is split into chunks of this size at the emit point so downstream
+    /// operators see `record_batch_size`-bounded batches, matching the Kafka
+    /// source. Mirrors the global `AppConfig::record_batch_size`.
+    record_batch_size: usize,
+    sort_key_range: i64,
     table_name: String,
     has_persisted_split: bool,
+    /// Inferred ReplacingMergeTree version column. When `Some`, each fully-read
+    /// page is coalesced and deduplicated by max version before emission.
+    dedup_version_column: Option<String>,
+    /// Index of the dedup-only version column within the scan batch, when it
+    /// was force-included (not part of the configured columns). Such a column
+    /// is projected back out before emission so the external schema is unchanged.
+    project_out_version_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -151,9 +357,9 @@ struct SinkParams {
 }
 
 impl ClickHouseTableProvider {
-    const DEFAULT_BLOCK_RANGE: i64 = 1_000_000;
+    const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
     const DEFAULT_PAGE_SIZE: usize = 10_000_000;
-    const MIN_BLOCK_RANGE: i64 = 100;
+    const MIN_SORT_KEY_RANGE: i64 = 100;
     const SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
 
     pub fn new_source(
@@ -166,21 +372,93 @@ impl ClickHouseTableProvider {
         columns: Option<Vec<String>>,
         state_backend: Arc<dyn StateOperatorBackend<ClickHouseSourceSplit>>,
         datafusion_buffer_size: usize,
+        record_batch_size: usize,
     ) -> Result<Self, DataFusionError> {
         let database_name = config.connection.database.clone();
         let page_size = config.page_size.unwrap_or(Self::DEFAULT_PAGE_SIZE);
-        let block_range_config = config.block_range;
+        let sort_key_range_config = config.sort_key_range;
         let client = ClickHouseClient::new(config.connection.clone());
 
-        let columns_copy = columns.clone();
-        let schema = client
-            .fetch_schema(table_name, columns)
-            .streamling_with_context(|| {
-                format!(
-                    "failed to fetch schema from ClickHouse for table '{}'",
-                    table_name
-                )
-            })?;
+        // Infer the ReplacingMergeTree version column from engine_full so the
+        // scan can deduplicate by max version (keyed on the table's ORDER BY),
+        // not by row position.
+        let (inferred_version_column, inferred_is_deleted_column): (
+            Option<String>,
+            Option<String>,
+        ) = match client.fetch_engine_full(&database_name, table_name) {
+            Ok(engine_full) => match parse_replacing_merge_tree_dedup(&engine_full) {
+                Some(d) => (d.version_column, d.is_deleted_column),
+                None => (None, None),
+            },
+            Err(e) => {
+                warn!(
+                    "[{}] could not fetch engine_full for dedup inference ({}); version-aware dedup disabled",
+                    reference_name, e
+                );
+                (None, None)
+            }
+        };
+
+        // The version column is force-included in the scan for dedup even when
+        // the configured columns omit it — a hybrid source projects ClickHouse
+        // to the Kafka schema, which excludes insert_timestamp/is_deleted. It
+        // is projected back out before emission, so the external schema contract
+        // is unchanged. `*` already selects every column, so nothing is added.
+        let user_columns = columns.clone().unwrap_or_else(|| vec!["*".to_string()]);
+        let star_select = user_columns.iter().any(|c| c == "*");
+        let mut scan_columns = user_columns.clone();
+        let mut added_version = false;
+        if let Some(vc) = &inferred_version_column {
+            let already_selected = star_select || user_columns.iter().any(|c| c == vc);
+            if !already_selected {
+                scan_columns.push(vc.clone());
+                added_version = true;
+            }
+        }
+
+        // Fetch the schema the scan will produce. If we appended an inferred
+        // version column that doesn't actually exist, the fetch errors and we
+        // fall back to the configured columns with dedup disabled.
+        let (scan_schema, scan_columns, dedup_version_column, project_out_version_index) =
+            match client.fetch_schema(
+                table_name,
+                Some(scan_columns.clone()),
+                inferred_is_deleted_column.clone(),
+            ) {
+                Ok(s) => {
+                    let dvc = inferred_version_column
+                        .clone()
+                        .filter(|vc| s.field_with_name(vc).is_ok());
+                    let pvi = if added_version {
+                        dvc.as_ref().and_then(|vc| s.index_of(vc).ok())
+                    } else {
+                        None
+                    };
+                    (s, scan_columns, dvc, pvi)
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] inferred version column '{}' not selectable; dedup disabled ({})",
+                        reference_name,
+                        inferred_version_column.as_deref().unwrap_or("?"),
+                        e
+                    );
+                    let fallback = user_columns.clone();
+                    let s = client
+                        .fetch_schema(
+                            table_name,
+                            Some(fallback.clone()),
+                            inferred_is_deleted_column.clone(),
+                        )
+                        .streamling_with_context(|| {
+                            format!(
+                                "failed to fetch schema from ClickHouse for table '{}'",
+                                table_name
+                            )
+                        })?;
+                    (s, fallback, None, None)
+                }
+            };
         let sorting_keys = client
             .fetch_sorting_keys(&database_name, table_name)
             .streamling_with_context(|| {
@@ -203,11 +481,11 @@ impl ClickHouseTableProvider {
             page_size,
         };
 
-        // Require a wide numeric first sorting key for block range pagination.
+        // Require a wide numeric first sorting key for sort key range pagination.
         // Narrow types (Int8, UInt8, Int16, UInt16) would silently overflow in
-        // i128_to_scalar_like when computing block range boundaries.
+        // i128_to_scalar_like when computing sort key range boundaries.
         let first_key_name = sorting_keys.first().unwrap();
-        let first_key_type = schema
+        let first_key_type = scan_schema
             .field_with_name(first_key_name)
             .ok()
             .map(|f| f.data_type().clone());
@@ -222,28 +500,29 @@ impl ClickHouseTableProvider {
 
         if !is_wide_integer {
             return Err(streamling_err!(
-                "ClickHouse source requires a 32-bit or wider integer first sorting key for block range \
+                "ClickHouse source requires a 32-bit or wider integer first sorting key for sort key range \
                  pagination, but '{}' on table {}.{} has type {:?}",
                 first_key_name, database_name, table_name, first_key_type
             )
             .into());
         }
 
-        let block_range = block_range_config
-            .map(|br| br.max(Self::MIN_BLOCK_RANGE))
-            .unwrap_or(Self::DEFAULT_BLOCK_RANGE);
+        let sort_key_range = sort_key_range_config
+            .map(|br| br.max(Self::MIN_SORT_KEY_RANGE))
+            .unwrap_or(Self::DEFAULT_SORT_KEY_RANGE);
 
         info!(
-            "[{}] block range pagination configured (block_range={}, page_size={})",
-            reference_name, block_range, page_size
+            "[{}] sort key range pagination configured (sort_key_range={}, page_size={})",
+            reference_name, sort_key_range, page_size
         );
 
         let mut query_builder = ClickHouseQueryBuilder::of(
             table_name.to_string(),
-            columns_copy.unwrap_or(vec!["*".to_string()]),
+            scan_columns.clone(),
             filter.clone(),
             Some(pagination_config),
         );
+        query_builder.set_is_deleted_column(inferred_is_deleted_column.clone());
         let state_store = Arc::new(ClickHouseSourceStateStore {
             reference_name: reference_name.clone(),
             state_backend,
@@ -279,15 +558,52 @@ impl ClickHouseTableProvider {
             }
         };
 
+        // Provider schema exposed downstream: the scan schema with a
+        // dedup-only version column (force-included because the configured
+        // columns omit it) projected back out, so the external contract — e.g.
+        // a hybrid source's Kafka-matching schema — is unchanged.
+        let schema: SchemaRef = match project_out_version_index {
+            Some(idx) => {
+                let fields: Vec<arrow_schema::Field> = scan_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, f)| f.as_ref().clone())
+                    .collect();
+                Arc::new(arrow_schema::Schema::new_with_metadata(
+                    fields,
+                    scan_schema.metadata().clone(),
+                ))
+            }
+            None => scan_schema.clone(),
+        };
+
+        match &dedup_version_column {
+            Some(col) => info!(
+                "[{}] ReplacingMergeTree version-aware dedup enabled (version_column={}, force_included={})",
+                reference_name,
+                col,
+                project_out_version_index.is_some()
+            ),
+            None => debug!(
+                "[{}] no ReplacingMergeTree version column inferred; emitting raw rows",
+                reference_name
+            ),
+        }
+
         let source_params = SourceParams {
             query_builder: query_builder.clone(),
             sorting_keys,
             initial_split_args,
             state_store,
+            record_batch_size,
             datafusion_buffer_size,
-            block_range,
+            sort_key_range,
             table_name: table_name.to_string(),
             has_persisted_split,
+            dedup_version_column,
+            project_out_version_index,
         };
         Ok(ClickHouseTableProvider {
             reference_name: reference_name.clone(),
@@ -999,10 +1315,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .pagination_config()
             .expect("pagination config must be set")
             .page_size;
-        let sorting_keys = self.split.sorting_keys.clone();
-        let default_block_range = source_params.block_range;
+        let default_sort_key_range = source_params.sort_key_range;
         let table_name_for_exec = source_params.table_name.clone();
-        let first_sorting_key_name = sorting_keys
+        let record_batch_size = source_params.record_batch_size;
+        let first_sorting_key_name = self
+            .split
+            .sorting_keys
             .first()
             .cloned()
             .expect("sorting keys must not be empty");
@@ -1011,6 +1329,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
             args: self.split.args.clone(),
         }));
         let state_store = source_params.state_store.clone();
+        // Version-aware dedup (inferred from engine_full in new_source). The
+        // dedup key is the table's full ORDER BY, so all duplicate versions of a
+        // key share a `block_number` and land in the same page.
+        let dedup_version_column = source_params.dedup_version_column.clone();
+        let dedup_key = source_params.sorting_keys.join(",");
+        let project_out_version_index = source_params.project_out_version_index;
         let empty_batch_schema = schema.clone();
 
         // Shared checkpoint buffer for metadata propagation
@@ -1080,14 +1404,6 @@ impl ExecutionPlan for ClickHouseSourceExec {
 
             debug!("Starting ClickHouse execution with continuous pagination");
 
-            struct BlockRangeState {
-                block_range: i128,
-                default_block_range: i128,
-                max_key: i128,
-                range_start: i128,
-                template: ScalarValue,
-            }
-
             let max_val = client
                 .fetch_max_sorting_key(&table_name_for_exec, &first_sorting_key_name)
                 .await
@@ -1098,51 +1414,160 @@ impl ExecutionPlan for ClickHouseSourceExec {
                 .map_err(DataFusionError::from)?;
             // When the table is empty, SELECT max(first_key) returns NULL. In that case
             // scalar_to_i128 returns None; treat this as "no rows to scan" by defaulting to 0,
-            // so the pagination loop will immediately terminate (next_start > max_key).
+            // so the pagination loop terminates immediately (range_start > max_key).
             let max_key = scalar_to_i128(&max_val).unwrap_or(0);
 
-            let initial_keyset = {
-                let guard = split.lock().unwrap();
-                if !guard.args.is_empty() { Some(guard.args.clone()) } else { None }
+            // The persisted cursor (split.args) holds [range_start] — the start of the
+            // range to resume from. Ranges are disjoint half-open block_number windows,
+            // so restarting at range_start re-reads at most the in-progress range
+            // (at-least-once, covered by downstream dedup).
+            // Resume from the persisted cursor. Only the first sorting key matters;
+            // see ClickHouseSourceSplit::range_start for checkpoint compatibility.
+            let range_start = {
+                let guard = split.lock().expect("split mutex poisoned");
+                guard.range_start().unwrap_or(0)
             };
-            let range_start = initial_keyset.as_ref()
-                .and_then(|ks| ks.first().and_then(scalar_to_i128))
-                .unwrap_or(0);
             let template = i128_to_scalar_like(0, &max_val);
 
-            let default_block_range = default_block_range as i128;
-            let upper = i128_to_scalar_like(range_start + default_block_range, &template);
-            query_builder.set_block_range_upper_bound(Some(upper));
+            let default_sort_key_range = default_sort_key_range as i128;
+            // Let width grow well past the default for sparse filters: cap at the
+            // remaining span so an ultra-sparse table can be covered in few queries.
+            // The page_size + 1 tripwire still shrinks a too-dense range. The lower
+            // floor (one key) lives in RangeController; see RangeController::MIN_WIDTH.
+            let max_width = (max_key - range_start).max(default_sort_key_range);
 
-            info!(
-                "[{}] block range pagination enabled (block_range={}, max_key={}, start={})",
-                reference_name, default_block_range, max_key, range_start
-            );
-            let mut block_state = BlockRangeState {
-                block_range: default_block_range,
-                default_block_range,
-                max_key,
-                range_start,
-                template,
+            let source_query_timeout =
+                Duration::from_secs(ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS);
+            // Shrink proactively at half the hard timeout, before the query is killed.
+            let soft_time_budget = source_query_timeout / 2;
+
+            // Up-front count probe: size the first range to ~page_size rows from the
+            // observed density over the remaining span. A probe failure is non-fatal —
+            // fall back to the widest range and let the controller adapt.
+            let where_clause_for_exec = query_builder.where_clause().map(|s| s.to_string());
+            let scan_span = (max_key - range_start + 1).max(1);
+            let total_count = match client
+                .fetch_count(
+                    &table_name_for_exec,
+                    where_clause_for_exec.as_deref(),
+                    Some(range_start),
+                    None,
+                    &first_sorting_key_name,
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[{}] count probe failed ({}); using widest initial range", reference_name, e);
+                    0
+                }
+            };
+            let initial_width = if total_count == 0 {
+                max_width
+            } else {
+                // RangeController clamps this into [MIN_WIDTH, max_width].
+                let density = total_count as f64 / scan_span as f64;
+                (page_size as f64 / density) as i128
             };
 
-            let mut has_more_data = true;
+            let mut controller = RangeController::new(
+                page_size as u64,
+                MAX_PAGE_BYTES,
+                range_start,
+                max_key,
+                initial_width,
+                max_width,
+                soft_time_budget,
+            );
+            info!(
+                "[{}] adaptive range pagination (max_key={}, start={}, count={}, initial_width={}, page_size={})",
+                reference_name, max_key, range_start, total_count, controller.width(), page_size
+            );
+
             let mut page_count = 0;
             let mut query_retry_attempts: u32 = 0;
             let mut query_retry_backoff_ms: u64 = 100;
 
-            let source_query_timeout = Duration::from_secs(ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS);
-            let recovery_threshold = source_query_timeout / 4;
+            // Attach any buffered checkpoint messages to a batch about to be emitted.
+            // Clears the buffer after attaching, so messages ride exactly one batch.
+            let attach_checkpoints = {
+                let buffer_arc = checkpoint_buffer_for_data.clone();
+                move |batch: RecordBatch| -> RecordBatch {
+                    let mut buffer = buffer_arc.lock().expect("checkpoint buffer mutex poisoned");
+                    if buffer.is_empty() {
+                        return batch;
+                    }
+                    debug!("Attaching {} buffered checkpoint messages to batch", buffer.len());
+                    let mut metadata = batch.schema().metadata().clone();
+                    enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
+                    let enriched = enrich_batch_with_metadata(batch, metadata)
+                        .expect("Failed to enrich batch with checkpoint metadata");
+                    buffer.clear();
+                    enriched
+                }
+            };
 
-            while has_more_data {
+            while !controller.is_done() {
                 page_count += 1;
+                // Count-first sizing: probe the exact row count for the range the
+                // cursor covers and shrink the width to fit BEFORE the data read.
+                // The up-front span-average density that sized `initial_width`
+                // misses clustered high-fanout regions — a dense cluster inside a
+                // sparse span would otherwise be read at the span-average width and
+                // materialise `page_size + 1` rows (the OOM) before the reactive
+                // overflow could shrink it. Each iteration shrinks from the exact
+                // count; the cursor never moves during sizing (only `on_complete`
+                // advances it), so range_start is fixed and only the upper bound
+                // shrinks. A probe failure is non-fatal — fall through and let the
+                // reactive overflow below handle it.
+                loop {
+                    let (probe_lo, probe_hi) = controller.current_range();
+                    if controller.at_min_width() {
+                        break;
+                    }
+                    match client
+                        .fetch_count(
+                            &table_name_for_exec,
+                            where_clause_for_exec.as_deref(),
+                            Some(probe_lo),
+                            Some(probe_hi),
+                            &first_sorting_key_name,
+                        )
+                        .await
+                    {
+                        Ok(count) if count > page_size as u64 => {
+                            controller.shrink_to_fit_count(count);
+                            continue;
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            warn!(
+                                "[{}] count-first probe on range [{}, {}) failed ({}); \
+                                 reading at current width and letting the reactive overflow handle it",
+                                reference_name, probe_lo, probe_hi, e
+                            );
+                            break;
+                        }
+                    }
+                }
+                let (range_start, upper_bound) = controller.current_range();
+                query_builder
+                    .set_sort_key_range_upper_bound(Some(i128_to_scalar_like(upper_bound, &template)));
+                query_builder.start_at_page(vec![i128_to_scalar_like(range_start, &template)]);
                 let current_query = query_builder.get_query();
-                trace!("ClickHouseSourceExec: executing page {} with query: {}", page_count, current_query);
+                trace!(
+                    "ClickHouseSourceExec: page {} range [{}, {}) width {} query: {}",
+                    page_count, range_start, upper_bound, controller.width(), current_query
+                );
 
                 let page_start = std::time::Instant::now();
+                // LIMIT page_size + 1 is a tripwire, not a cursor: page_size + 1 rows
+                // means the range overflowed and must be re-read smaller. run() buffers
+                // the whole response before we emit, so an overflow is discarded with no
+                // duplicates.
                 let run_result = tokio::time::timeout(
                     source_query_timeout,
-                    Self::run(client.clone(), current_query, Some(page_size)),
+                    Self::run(client.clone(), current_query, Some(page_size + 1)),
                 ).await;
 
                 let run_result = match run_result {
@@ -1159,148 +1584,234 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     Ok(mut stream) => {
                         query_retry_attempts = 0;
                         query_retry_backoff_ms = 100;
-                        let mut batch_count = 0;
-                        let mut total_rows_in_page = 0;
-                        let mut last_batch_keyset: Option<Vec<ScalarValue>> = None;
 
+                        // Buffer the whole page before emitting so the overflow tripwire
+                        // can discard a too-dense range without sending duplicates. The
+                        // response is already fully in memory inside run(), so this only
+                        // holds parsed batches, bounded by page_size + 1 rows.
+                        let mut batches: Vec<RecordBatch> = Vec::new();
+                        let mut total_rows_in_page: usize = 0;
+                        // Summed so the byte tripwire can shrink a page that is
+                        // fine by rows but too large for a single Arrow column
+                        // (see MAX_PAGE_BYTES). The widest column <= this total.
+                        let mut total_page_bytes: u64 = 0;
+                        let mut stream_failed = false;
                         while let Some(item_result) = stream.next().await {
                             match item_result {
                                 Ok(batch) => {
-                                    batch_count += 1;
                                     total_rows_in_page += batch.num_rows();
-
-                                    let args = match Self::extract_keyset_from_batch(&batch, &sorting_keys) {
-                                        Ok(keyset_values) => keyset_values,
-                                        Err(e) => {
-                                            error!("Failed to extract keyset from batch: {}", e);
-                                            let df_error: DataFusionError = e.into();
-                                            if tx.send(Err(df_error)).await.is_err() {
-                                                warn!("ClickHouseSourceExec: receiver dropped");
-                                            }
-                                            has_more_data = false;
-                                            break;
-                                        }
-                                    };
-
-                                    last_batch_keyset = Some(args.clone());
-
-                                    let enriched_batch = {
-                                        let mut buffer = checkpoint_buffer_for_data.lock().unwrap();
-                                        if !buffer.is_empty() {
-                                            debug!("Attaching {} buffered checkpoint messages to batch", buffer.len());
-                                            let mut metadata = batch.schema().metadata().clone();
-                                            enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
-                                            let enriched = enrich_batch_with_metadata(batch, metadata)
-                                                .expect("Failed to enrich batch with checkpoint metadata");
-                                            buffer.clear();
-                                            enriched
-                                        } else {
-                                            batch
-                                        }
-                                    };
-
-                                    if tx.send(Ok(enriched_batch)).await.is_err() {
-                                        warn!("ClickHouseSourceExec: receiver dropped during batch {} of page {}", batch_count, page_count);
-                                        has_more_data = false;
-                                        break;
-                                    } else {
-                                        if let Ok(mut split_guard) = split.lock() {
-                                            split_guard.update_args(args.clone());
-                                        }
-                                        trace!("ClickHouseSourceExec: batch {} completed successfully", batch_count);
-                                    }
+                                    total_page_bytes += batch.get_array_memory_size() as u64;
+                                    batches.push(batch);
                                 }
                                 Err(e) => {
                                     error!("Error processing ClickHouse batch: {}", e);
                                     if tx.send(Err(DataFusionError::ArrowError(Box::new(e), None))).await.is_err() {
                                         warn!("ClickHouseSourceExec: receiver dropped while sending error");
                                     }
-                                    has_more_data = false;
+                                    stream_failed = true;
                                     break;
                                 }
                             }
                         }
+                        if stream_failed {
+                            break;
+                        }
 
-                        trace!("ClickHouseSourceExec: page {} summary - total_rows: {}, page_size: {}, batch_count: {}", page_count, total_rows_in_page, page_size, batch_count);
+                        trace!("ClickHouseSourceExec: page {} read {} rows (page_size {})", page_count, total_rows_in_page, page_size);
 
-                        // Emit an empty batch on empty scans so downstream operators
-                        // still receive a batch and buffered checkpoint messages can flow.
-                        if total_rows_in_page == 0 {
-                            let empty_batch = {
-                                let batch = RecordBatch::new_empty(empty_batch_schema.clone());
-                                let mut buffer = checkpoint_buffer_for_data.lock().unwrap();
-                                if !buffer.is_empty() {
-                                    debug!("Attaching {} buffered checkpoint messages to empty batch", buffer.len());
-                                    let mut metadata = batch.schema().metadata().clone();
-                                    enrich_batch_metadata_with_checkpoints(&mut metadata, &buffer);
-                                    let enriched = enrich_batch_with_metadata(batch, metadata)
-                                        .expect("Failed to enrich empty batch with checkpoint metadata");
-                                    buffer.clear();
-                                    enriched
-                                } else {
-                                    batch
+                        // Overflow: the range holds more than `page_size` rows, OR the
+                        // page is too large in bytes for a single Arrow column. Dedup
+                        // coalesces the whole page via `concat_batches`, and a Utf8/
+                        // Binary column panics ("byte array offset overflow") past ~2 GiB
+                        // of i32 offsets — a page that looks fine by rows can still blow
+                        // that limit on a dense string column. Either way: shrink the
+                        // width and re-read the SAME range. Nothing was emitted, so no
+                        // duplicates and no advance.
+                        let row_overflow = total_rows_in_page > page_size;
+                        let byte_overflow = total_page_bytes > MAX_PAGE_BYTES;
+                        if row_overflow || byte_overflow {
+                            if controller.at_min_width() {
+                                // A min-width range still overflows: a single sort key
+                                // holds more data than one page can carry and cannot be
+                                // split further. Surface it rather than silently skip
+                                // data — a key exceeding MAX_PAGE_BYTES alone would
+                                // overflow Arrow's per-array limit.
+                                let _ = tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
+                                    "ClickHouse source: range [{}, {}) at min width still exceeds page limits \
+                                     (page_size={}, {} rows; max_page_bytes={}, {} bytes)",
+                                    range_start, upper_bound, page_size, total_rows_in_page,
+                                    MAX_PAGE_BYTES, total_page_bytes
+                                )))).await;
+                                break;
+                            }
+                            // Probe the exact row count for this range so the next
+                            // width is sized from the TRUE density (count / width) in
+                            // one step. Without it the byte sizer divides the
+                            // LIMIT-capped sample by the full range width, under-
+                            // estimates density, and a dense range shrinks
+                            // geometrically over many discarded multi-GiB re-reads
+                            // before converging. The probe is a primary-key count
+                            // (cheap); a failure is non-fatal — the controller falls
+                            // back to byte/row halving.
+                            let probed_count = match client
+                                .fetch_count(
+                                    &table_name_for_exec,
+                                    where_clause_for_exec.as_deref(),
+                                    Some(range_start),
+                                    Some(upper_bound),
+                                    &first_sorting_key_name,
+                                )
+                                .await
+                            {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    warn!(
+                                        "[{}] count probe on overflow [{}, {}) failed ({}); \
+                                         falling back to halve",
+                                        reference_name, range_start, upper_bound, e
+                                    );
+                                    None
                                 }
                             };
-                            info!("[{}] empty scan on block range [{}, {})",
-                                reference_name, block_state.range_start, block_state.range_start + block_state.block_range);
-                            if tx.send(Ok(empty_batch)).await.is_err() {
-                                warn!("ClickHouseSourceExec: receiver dropped while sending empty batch");
-                                has_more_data = false;
-                                continue;
-                            }
+                            controller.on_overflow_probed(probed_count, total_page_bytes);
+                            info!(
+                                "[{}] range [{}, {}) overflowed page limits \
+                                 (page_size={}, {} rows; max_page_bytes={}, {} bytes); width -> {}",
+                                reference_name, range_start, upper_bound, page_size, total_rows_in_page,
+                                MAX_PAGE_BYTES, total_page_bytes, controller.width()
+                            );
+                            page_count -= 1;
+                            continue;
                         }
 
-                        let page_exhausted = total_rows_in_page < page_size;
-
-                        if page_exhausted {
-                            let next_start = block_state.range_start + block_state.block_range;
-                            if next_start > block_state.max_key {
-                                has_more_data = false;
-                                info!("[{}] scanned past max_key {} — done", reference_name, block_state.max_key);
-                            } else {
-                                block_state.range_start = next_start;
-
-                                let page_elapsed = page_start.elapsed();
-                                if block_state.block_range < block_state.default_block_range
-                                    && page_elapsed < recovery_threshold
-                                {
-                                    block_state.block_range = (block_state.block_range * 2).min(block_state.default_block_range);
-                                    info!("[{}] recovering block range to {} (page took {:?})", reference_name, block_state.block_range, page_elapsed);
-                                }
-
-                                let upper = i128_to_scalar_like(next_start + block_state.block_range, &block_state.template);
-                                query_builder.set_block_range_upper_bound(Some(upper));
-                                let start_val = i128_to_scalar_like(next_start, &block_state.template);
-                                query_builder.start_at_page(vec![start_val]);
-
-                                info!("[{}] advancing to next block range [{}, {})", reference_name, next_start, next_start + block_state.block_range);
+                        // Complete page. Emit all buffered batches, emitting one empty
+                        // batch for an empty scan so buffered checkpoint messages flow.
+                        let mut receiver_dropped = false;
+                        if total_rows_in_page == 0 {
+                            info!("[{}] empty scan on range [{}, {})", reference_name, range_start, upper_bound);
+                            let empty_batch = attach_checkpoints(RecordBatch::new_empty(empty_batch_schema.clone()));
+                            if tx.send(Ok(empty_batch)).await.is_err() {
+                                receiver_dropped = true;
                             }
                         } else {
-                            // More rows in this range — continue keyset pagination
-                            if let Some(keyset) = last_batch_keyset {
-                                query_builder.update_keyset(keyset);
+                            // When a version column was inferred, coalesce the
+                            // whole page and deduplicate by max version before
+                            // emitting: versions of one ORDER BY key can be split
+                            // across the page's IPC blocks, so per-batch dedup
+                            // would miss them. Keys whose winner is a tombstone
+                            // (_gs_op='d') are dropped (ReplacingMergeTree FINAL).
+                            let (mut emit_batches, deduped_to_empty): (Vec<RecordBatch>, bool) =
+                                match &dedup_version_column {
+                                    Some(version_col) => {
+                                        match deduplicate_record_batches_by_version(
+                                            &batches,
+                                            &dedup_key,
+                                            version_col,
+                                            Some(&TombstoneRule {
+                                                column: "_gs_op".to_string(),
+                                                value: "d".to_string(),
+                                            }),
+                                        ) {
+                                            Ok(deduped) if deduped.num_rows() == 0 => {
+                                                (Vec::new(), true)
+                                            }
+                                            Ok(deduped) => (vec![deduped], false),
+                                            Err(e) => {
+                                                let _ = tx
+                                                    .send(Err(DataFusionError::from(
+                                                        streamling_err!(
+                                                            "ClickHouse source dedup failed: {}",
+                                                            e
+                                                        ),
+                                                    )))
+                                                    .await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    None => (batches, false),
+                                };
+
+                            if deduped_to_empty {
+                                // Every key in this page was tombstoned. Emit one
+                                // empty provider_schema batch so any buffered
+                                // checkpoint messages still flow.
+                                let empty_batch = attach_checkpoints(RecordBatch::new_empty(
+                                    empty_batch_schema.clone(),
+                                ));
+                                if tx.send(Ok(empty_batch)).await.is_err() {
+                                    receiver_dropped = true;
+                                }
                             } else {
-                                has_more_data = false;
+                                // Strip the dedup-only version column (if it was
+                                // force-included) so the emitted batches match
+                                // the external schema. Projection is total — a
+                                // failure here is unrecoverable for the scan.
+                                if let Some(drop_idx) = project_out_version_index {
+                                    match emit_batches
+                                        .into_iter()
+                                        .map(|b| {
+                                            project_out_column(b, drop_idx, schema.clone())
+                                        })
+                                        .collect::<Result<Vec<_>>>()
+                                    {
+                                        Ok(p) => emit_batches = p,
+                                        Err(e) => {
+                                            let _ = tx.send(Err(e)).await;
+                                            break;
+                                        }
+                                    }
+                                }
+                                for batch in emit_batches.into_iter() {
+                                    for chunk in chunk_record_batch(batch, record_batch_size) {
+                                        // attach_checkpoints drains the buffered messages onto
+                                        // the first chunk it sees (and no-ops once empty), so
+                                        // checkpoint messages still ride exactly one emitted
+                                        // batch — the first chunk of the page.
+                                        let chunk = attach_checkpoints(chunk);
+                                        if tx.send(Ok(chunk)).await.is_err() {
+                                            receiver_dropped = true;
+                                            break;
+                                        }
+                                    }
+                                    if receiver_dropped {
+                                        break;
+                                    }
+                                }
                             }
                         }
+                        if receiver_dropped {
+                            warn!("ClickHouseSourceExec: receiver dropped during page {}", page_count);
+                            break;
+                        }
 
-                        trace!("ClickHouseSourceExec: done reading page {} (batches: {}, has_more: {})", page_count, batch_count, has_more_data);
+                        // Completed range: advance the cursor and persist it. on_complete
+                        // moves range_start past this range; the while condition (is_done)
+                        // ends the scan once the cursor passes max_key. On restart we re-read
+                        // from the persisted cursor.
+                        let page_elapsed = page_start.elapsed();
+                        controller.on_complete(total_rows_in_page, page_elapsed, total_page_bytes);
+                        if let Ok(mut split_guard) = split.lock() {
+                            split_guard.update_args(vec![i128_to_scalar_like(controller.range_start(), &template)]);
+                        }
+                        if controller.is_done() {
+                            info!("[{}] scanned past max_key {} — done", reference_name, max_key);
+                        } else {
+                            trace!(
+                                "[{}] advanced to [{}, {}) ({} rows in {:?})",
+                                reference_name, controller.range_start(), controller.current_range().1, total_rows_in_page, page_elapsed
+                            );
+                        }
                     }
                     Err(df_error) => {
                         if is_timeout_error(&df_error) {
-                            let old_br = block_state.block_range;
-                            block_state.block_range = (block_state.block_range / 2).max(ClickHouseTableProvider::MIN_BLOCK_RANGE as i128);
+                            let old_width = controller.width();
+                            // Too slow: shrink and re-read the same range (no advance).
+                            controller.on_timeout();
                             warn!(
-                                "[{}] timeout on page {}; reducing block range {} -> {}",
-                                reference_name, page_count, old_br, block_state.block_range
+                                "[{}] timeout on page {}; reducing width {} -> {}",
+                                reference_name, page_count, old_width, controller.width()
                             );
-                            let upper = i128_to_scalar_like(block_state.range_start + block_state.block_range, &block_state.template);
-                            query_builder.set_block_range_upper_bound(Some(upper));
-                            // Reset keyset to retry from the start of the current block range,
-                            // otherwise the stale keyset can contradict the new upper bound.
-                            let start_val = i128_to_scalar_like(block_state.range_start, &block_state.template);
-                            query_builder.start_at_page(vec![start_val]);
-
                             page_count -= 1;
                             tokio::time::sleep(Duration::from_millis(1_000)).await;
                             continue;
@@ -1340,6 +1851,27 @@ impl ExecutionPlan for ClickHouseSourceExec {
             }
             debug!("Checkpointing task completed for {}", reference_name);
 
+            // Flush any checkpoint messages buffered after the last data batch.
+            // attach_checkpoints only drains onto an outgoing data batch; a Marker
+            // that arrived during the final pages (or after the scan loop exited)
+            // has no batch to ride. Without this flush it is dropped when `tx`
+            // drops, the sink never ACKs the epoch, and the coordinator stalls on
+            // "missing sinks" — the production job-mode termination hang.
+            {
+                let flush_batch = build_checkpoint_flush_batch(
+                    &mut checkpoint_buffer_for_data.lock().expect("checkpoint buffer mutex poisoned"),
+                    empty_batch_schema.clone(),
+                );
+                if let Some(batch) = flush_batch
+                    && tx.send(Ok(batch)).await.is_err()
+                {
+                    warn!(
+                        "ClickHouseSourceExec: receiver dropped before final checkpoint flush for {}",
+                        reference_name
+                    );
+                }
+            }
+
             // Unsubscribe from checkpoint channel before dropping the receiver
             // to avoid SendError when the coordinator tries to send to this channel
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
@@ -1351,6 +1883,29 @@ impl ExecutionPlan for ClickHouseSourceExec {
         info!("ClickHouseSourceExec built successfully");
         Ok(builder.build())
     }
+}
+
+/// Split `batch` into chunks of at most `max_rows` rows. Used at the ClickHouse
+/// source emit point so downstream operators receive `record_batch_size`-bounded
+/// batches regardless of how large a deduped page is — dedup coalesces a whole
+/// page into a single batch, which can dwarf the global `record_batch_size` that
+/// other operators (and the Kafka source) emit at.
+///
+/// `RecordBatch::slice` shares the schema (and all of its metadata) across
+/// chunks, so every chunk carries the page's schema metadata unchanged; any
+/// per-emission metadata (checkpoint messages) is attached by the caller to a
+/// single chunk after this split. A batch that is empty or already within the
+/// limit yields itself as the sole chunk. A `max_rows` of 0 is treated as "no
+/// chunking" so a misconfigured size cannot produce zero-row chunks.
+fn chunk_record_batch(batch: RecordBatch, max_rows: usize) -> Vec<RecordBatch> {
+    let n = batch.num_rows();
+    if max_rows == 0 || n <= max_rows {
+        return vec![batch];
+    }
+    (0..n)
+        .step_by(max_rows)
+        .map(|offset| batch.slice(offset, (n - offset).min(max_rows)))
+        .collect()
 }
 
 impl ClickHouseSourceExec {
@@ -1624,6 +2179,7 @@ impl ClickHouseClient {
         &self,
         table_name: &str,
         columns: Option<Vec<String>>,
+        is_deleted_column: Option<String>,
     ) -> streamling_core::error::Result<SchemaRef> {
         let mut query_builder = ClickHouseQueryBuilder::of(
             table_name.to_string(),
@@ -1631,6 +2187,7 @@ impl ClickHouseClient {
             None,
             None,
         );
+        query_builder.set_is_deleted_column(is_deleted_column);
 
         let query = format!("{} LIMIT 1 FORMAT Arrow", query_builder.get_query());
         let response_bytes = block_on(async {
@@ -1677,6 +2234,32 @@ impl ClickHouseClient {
             .collect::<Vec<String>>();
         Ok(sorting_keys)
     }
+    /// Fetch the full engine declaration string (e.g.
+    /// `SharedReplacingMergeTree('...', '{replica}', insert_timestamp, is_deleted)`)
+    /// from `system.tables`. Used to infer the ReplacingMergeTree version and
+    /// is_deleted columns for source-side dedup.
+    pub fn fetch_engine_full(
+        &self,
+        database_name: &str,
+        table_name: &str,
+    ) -> streamling_core::error::Result<String> {
+        let query = format!(
+            "SELECT engine_full FROM system.tables WHERE database = '{}' AND name = '{}' FORMAT Arrow",
+            database_name, table_name
+        );
+        let response_bytes = block_on(async {
+            let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+            self.process_http_response(response_result, query.as_str(), "engine_full")
+                .await
+        })?;
+        let mut reader = self.create_arrow_reader(response_bytes, &query)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| streamling_err!("no rows returned for engine_full query"))??;
+        let scalar = ScalarValue::try_from_array(&batch.column(0), 0)
+            .streamling_context("failed to extract engine_full from query result")?;
+        Ok(scalar.to_string())
+    }
 
     pub async fn fetch_max_sorting_key(
         &self,
@@ -1696,6 +2279,54 @@ impl ClickHouseClient {
         let max_val = ScalarValue::try_from_array(&batch.column(0), 0)
             .streamling_context("failed to extract max sorting key value")?;
         Ok(max_val)
+    }
+
+    /// Count rows matching the source filter in the half-open sort-key range
+    /// `[lower_bound, upper_bound)` on the first sorting key. Used two ways: as
+    /// an up-front density probe to size the first pagination range (no upper
+    /// bound — the whole remaining tail), and on overflow to size the next range
+    /// from the *true* density in one step (both bounds — the overflowing
+    /// range). Carries no ORDER BY, so a matching projection serves it cheaply;
+    /// a slow probe is itself a signal that the filter is scan-bound.
+    pub async fn fetch_count(
+        &self,
+        table_name: &str,
+        where_clause: Option<&str>,
+        lower_bound: Option<i128>,
+        upper_bound: Option<i128>,
+        first_key: &str,
+    ) -> streamling_core::error::Result<u64> {
+        let mut conditions: Vec<String> = Vec::new();
+        if let Some(w) = where_clause {
+            conditions.push(format!("({})", w));
+        }
+        if let Some(lb) = lower_bound {
+            conditions.push(format!("{} >= {}", first_key, lb));
+        }
+        if let Some(ub) = upper_bound {
+            conditions.push(format!("{} < {}", first_key, ub));
+        }
+        let where_sql = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let query = format!(
+            "SELECT count() FROM {}{} FORMAT Arrow",
+            table_name, where_sql
+        );
+        let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+        let response_bytes = self
+            .process_http_response(response_result, query.as_str(), "count")
+            .await?;
+
+        let mut reader = self.create_arrow_reader(response_bytes, &query)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| streamling_err!("no rows returned for count query"))??;
+        let scalar = ScalarValue::try_from_array(&batch.column(0), 0)
+            .streamling_context("failed to extract count value")?;
+        Ok(scalar_to_i128(&scalar).unwrap_or(0).max(0) as u64)
     }
 
     /// Normalize schema for ClickHouse Arrow IPC: convert view types to standard types
@@ -2427,6 +3058,237 @@ impl ClickHouseClient {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
+
+    #[test]
+    fn split_range_start_reads_first_sorting_key() {
+        // New-format checkpoint stores [range_start].
+        let split = ClickHouseSourceSplit {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            args: vec![ScalarValue::Int64(Some(1000))],
+        };
+        assert_eq!(split.range_start(), Some(1000));
+    }
+
+    #[test]
+    fn parse_shared_replacing_mergetree_full() {
+        let d = parse_replacing_merge_tree_dedup(
+            "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', insert_timestamp, is_deleted)",
+        )
+        .expect("Replacing variant should parse");
+        assert_eq!(d.version_column.as_deref(), Some("insert_timestamp"));
+        assert_eq!(d.is_deleted_column.as_deref(), Some("is_deleted"));
+    }
+
+    #[test]
+    fn parse_replicated_replacing_mergetree() {
+        let d = parse_replacing_merge_tree_dedup(
+            "ReplicatedReplacingMergeTree('/clickhouse/path', 'replica1', version_col)",
+        )
+        .expect("Replicated variant should parse");
+        assert_eq!(d.version_column.as_deref(), Some("version_col"));
+        assert_eq!(d.is_deleted_column, None);
+    }
+
+    #[test]
+    fn parse_plain_replacing_mergetree() {
+        let d = parse_replacing_merge_tree_dedup("ReplacingMergeTree(insert_time)")
+            .expect("plain variant should parse");
+        assert_eq!(d.version_column.as_deref(), Some("insert_time"));
+        assert_eq!(d.is_deleted_column, None);
+    }
+
+    #[test]
+    fn parse_plain_replacing_mergetree_no_args() {
+        let d = parse_replacing_merge_tree_dedup("ReplacingMergeTree()")
+            .expect("no-arg variant should still parse");
+        assert_eq!(d.version_column, None);
+        assert_eq!(d.is_deleted_column, None);
+    }
+
+    #[test]
+    fn parse_non_replacing_engine_returns_none() {
+        assert!(parse_replacing_merge_tree_dedup("MergeTree()").is_none());
+        assert!(parse_replacing_merge_tree_dedup("CollapsingMergeTree(sign)").is_none());
+    }
+    #[test]
+    fn parse_engine_with_comma_in_path() {
+        // A zk path with a comma inside the quoted literal must not be split.
+        let d = parse_replacing_merge_tree_dedup(
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard},weird,name', '{replica}', v, d)",
+        )
+        .expect("quoted commas must be ignored");
+        assert_eq!(d.version_column.as_deref(), Some("v"));
+        assert_eq!(d.is_deleted_column.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn parse_engine_with_trailing_order_by_clause() {
+        // A real `system.tables.engine_full` value appends the ORDER BY (and
+        // possibly SETTINGS) clause, which carries its own parens. The parser
+        // must close on the engine's matching paren, not the last one — or the
+        // ORDER BY text leaks into the parsed column names.
+        let d = parse_replacing_merge_tree_dedup(
+            "ReplacingMergeTree(insert_timestamp, is_deleted) ORDER BY (block_number, id)",
+        )
+        .expect("replacing variant with ORDER BY should parse");
+        assert_eq!(d.version_column.as_deref(), Some("insert_timestamp"));
+        assert_eq!(d.is_deleted_column.as_deref(), Some("is_deleted"));
+    }
+
+    // ---- emit-time batch chunking (chunk_record_batch) ----
+
+    fn make_int64_batch_with_meta(n: i64, meta: Option<(&str, &str)>) -> RecordBatch {
+        let fields = vec![Field::new("block_number", DataType::Int64, false)];
+        let schema = match meta {
+            Some((k, v)) => Schema::new_with_metadata(
+                fields,
+                std::iter::once((k.to_string(), v.to_string())).collect(),
+            ),
+            None => Schema::new(fields),
+        };
+        let values: Vec<i64> = (0..n).collect();
+        RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(values))
+                as arrow::array::ArrayRef],
+        )
+        .expect("valid batch")
+    }
+
+    fn make_int64_batch(n: i64) -> RecordBatch {
+        make_int64_batch_with_meta(n, None)
+    }
+
+    #[test]
+    fn chunk_record_batch_splits_evenly() {
+        let chunks = chunk_record_batch(make_int64_batch(10), 5);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].num_rows(), 5);
+        assert_eq!(chunks[1].num_rows(), 5);
+    }
+
+    #[test]
+    fn chunk_record_batch_splits_with_remainder() {
+        let chunks = chunk_record_batch(make_int64_batch(7), 3);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].num_rows(), 3);
+        assert_eq!(chunks[1].num_rows(), 3);
+        assert_eq!(chunks[2].num_rows(), 1);
+    }
+
+    #[test]
+    fn chunk_record_batch_preserves_row_order_with_no_loss_or_duplication() {
+        let chunks = chunk_record_batch(make_int64_batch(8), 3);
+        let collected: Vec<i64> = chunks
+            .iter()
+            .flat_map(|c| {
+                c.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("int64 column")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(collected, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn chunk_record_batch_under_limit_returns_single_chunk() {
+        let chunks = chunk_record_batch(make_int64_batch(3), 5);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 3);
+    }
+
+    #[test]
+    fn chunk_record_batch_empty_batch_returns_single_chunk() {
+        let chunks = chunk_record_batch(make_int64_batch(0), 5);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn chunk_record_batch_max_rows_zero_is_a_noop() {
+        // A misconfigured size of 0 must not produce zero-row chunks or loop.
+        let chunks = chunk_record_batch(make_int64_batch(10), 0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 10);
+    }
+
+    #[test]
+    fn chunk_record_batch_preserves_schema_metadata_on_every_chunk() {
+        let batch = make_int64_batch_with_meta(7, Some(("schema_version", "42")));
+        let chunks = chunk_record_batch(batch, 3);
+        assert_eq!(chunks.len(), 3);
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(
+                c.schema().metadata().get("schema_version"),
+                Some(&"42".to_string()),
+                "chunk {} lost the schema metadata",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_record_batch_checkpoint_rides_first_chunk_only() {
+        // Mirrors the emit loop: a page is chunked, then per-emission metadata
+        // (checkpoint messages) is attached to the FIRST chunk only, because
+        // attach_checkpoints drains its buffer on first use and no-ops after.
+        // Chunks are independent RecordBatches, so merging metadata into the
+        // first cannot leak to the rest — this locks that invariant so a future
+        // refactor can't silently duplicate or drop checkpoint messages.
+        let chunks = chunk_record_batch(make_int64_batch(7), 3);
+        assert_eq!(chunks.len(), 3);
+        let first = {
+            let merged: std::collections::HashMap<String, String> =
+                std::iter::once(("checkpoint_epoch".to_string(), "99".to_string())).collect();
+            let schema = Schema::new_with_metadata(
+                vec![Field::new("block_number", DataType::Int64, false)],
+                merged,
+            );
+            RecordBatch::try_new(std::sync::Arc::new(schema), chunks[0].columns().to_vec())
+                .expect("rebuild first chunk with checkpoint metadata")
+        };
+        assert_eq!(
+            first.schema().metadata().get("checkpoint_epoch"),
+            Some(&"99".to_string()),
+            "first chunk carries the checkpoint"
+        );
+        for c in chunks.iter().skip(1) {
+            assert!(
+                c.schema().metadata().get("checkpoint_epoch").is_none(),
+                "a later chunk leaked the checkpoint — chunks must be independent"
+            );
+        }
+    }
+
+    #[test]
+    fn split_range_start_is_backwards_compatible_with_full_keyset() {
+        // Checkpoints written before sort-key-range pagination stored the full
+        // last-row keyset. The new code must resume at the first sorting key,
+        // re-reading from there rather than skipping rows.
+        let old_split = ClickHouseSourceSplit {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            args: vec![ScalarValue::Int64(Some(1000)), ScalarValue::Int64(Some(50))],
+        };
+        assert_eq!(
+            old_split.range_start(),
+            Some(1000),
+            "old full-keyset checkpoint must resume at the first sorting key"
+        );
+    }
+
+    #[test]
+    fn split_range_start_empty_is_none() {
+        let split = ClickHouseSourceSplit {
+            sorting_keys: vec![],
+            args: vec![],
+        };
+        assert_eq!(split.range_start(), None);
+    }
 
     #[test]
     fn test_schema_normalization() {
@@ -3686,9 +4548,12 @@ mod tests {
                 initial_split_args: initial_split_args.clone(),
                 state_store,
                 datafusion_buffer_size: 16,
-                block_range: 1_000_000,
+                record_batch_size: 1000,
+                sort_key_range: 1_000_000,
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
+                dedup_version_column: None,
+                project_out_version_index: None,
             }),
             sink_params: None,
             metric_metadata_id: "test_metric".to_string(),
@@ -4095,6 +4960,47 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn checkpoint_flush_drains_buffered_markers_into_synthetic_batch() {
+        // Regression: after the scan loop exits, a Marker buffered in
+        // checkpoint_buffer has no data batch to ride. build_checkpoint_flush_batch
+        // must drain it into a synthetic empty batch carrying the markers as
+        // schema metadata so the sink ACKs the epoch before the stream ends.
+        // Without it the coordinator stalls on "missing sinks" (the production
+        // job-mode termination hang).
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+
+        // Empty buffer -> nothing to flush.
+        let mut empty: Vec<CheckpointMessage> = vec![];
+        assert!(build_checkpoint_flush_batch(&mut empty, schema.clone()).is_none());
+        assert!(empty.is_empty(), "empty buffer stays empty");
+
+        // Buffered Marker -> synthetic empty batch carrying it, buffer drained.
+        let mut buffer = vec![CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(42),
+            created_at_ms: 1234,
+        }];
+        let batch = build_checkpoint_flush_batch(&mut buffer, schema.clone())
+            .expect("non-empty buffer must produce a flush batch");
+        assert_eq!(batch.num_rows(), 0, "flush batch is synthetic/empty");
+        assert!(buffer.is_empty(), "buffer drained after flush");
+
+        // The Marker must be recoverable from the batch's schema metadata — that
+        // is how the sink extracts and ACKs it.
+        let extracted = extract_checkpoint_messages(batch.schema().metadata());
+        assert!(
+            !extracted.is_empty(),
+            "flush batch must carry the checkpoint marker in metadata"
+        );
+        assert!(
+            extracted.iter().any(|m| matches!(
+                m,
+                CheckpointMessage::Marker { epoch, .. } if epoch.0 == 42
+            )),
+            "flushed batch must carry epoch 42 marker"
+        );
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -4108,6 +5014,20 @@ impl ClickHouseSourceSplit {
     pub fn update_args(&mut self, args: Vec<ScalarValue>) {
         self.args = args;
     }
+
+    /// The first sorting-key value to resume scanning from, or `None` if no cursor
+    /// has been persisted yet.
+    ///
+    /// Only `args[0]` is read. Checkpoints written before sort-key-range pagination
+    /// stored the full last-row keyset `[k0, k1, ...]`; current ones store just
+    /// `[range_start]`. `args[0]` is the first sorting key in both, so an older
+    /// checkpoint resumes at that key and re-reads from there (at-least-once,
+    /// covered by downstream dedup) rather than skipping rows. Keep the persisted
+    /// format (`Vec<ScalarValue>`) and the state-store VERSION stable so existing
+    /// checkpoints stay loadable.
+    pub fn range_start(&self) -> Option<i128> {
+        self.args.first().and_then(scalar_to_i128)
+    }
 }
 
 #[derive(Debug)]
@@ -4117,6 +5037,9 @@ struct ClickHouseSourceStateStore {
 }
 
 impl ClickHouseSourceStateStore {
+    // Bumping this discards existing checkpoints (sources restart from the
+    // beginning). The persisted format stayed compatible across the keyset ->
+    // sort-key-range change (see ClickHouseSourceSplit::range_start), so keep "v1".
     const VERSION: &str = "v1";
 
     pub async fn save_split(&self, split: ClickHouseSourceSplit) -> Result<(), StateBackendError> {
