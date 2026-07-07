@@ -22,9 +22,11 @@ impl MillisAccumulator {
     /// Drain the accrued time as whole milliseconds, retaining the
     /// sub-millisecond remainder. Returns 0 until at least 1ms has accrued.
     pub fn take_whole_millis(&mut self) -> u64 {
-        // `as u64` truncation of the u128 `as_millis()` is safe: overflowing u64
-        // ms takes ~584 million years, and the remainder is drained each call.
-        let whole = self.total.as_millis() as u64;
+        // `as_millis()` is u128; saturate to u64::MAX rather than let a `as u64`
+        // cast silently wrap. Overflow needs ~584 million years of accrued time,
+        // so this is unreachable in practice, but `try_from` makes the clamp
+        // deliberate and testable. The remainder is drained each call.
+        let whole = u64::try_from(self.total.as_millis()).unwrap_or(u64::MAX);
         if whole > 0 {
             self.total -= Duration::from_millis(whole);
         }
@@ -85,5 +87,14 @@ mod tests {
         // 0.7ms remainder carried; +0.4ms = 1.1ms -> 1 whole ms emitted.
         acc.add(Duration::from_micros(400));
         assert_eq!(acc.take_whole_millis(), 1);
+    }
+
+    #[test]
+    fn saturates_to_u64_max_instead_of_wrapping() {
+        let mut acc = MillisAccumulator::default();
+        // Duration::MAX holds more whole milliseconds than u64 can represent; a
+        // truncating `as u64` cast would wrap, so the drain must clamp instead.
+        acc.add(Duration::MAX);
+        assert_eq!(acc.take_whole_millis(), u64::MAX);
     }
 }
