@@ -441,6 +441,18 @@ pub enum BackpressureRole {
     FanOutProducer,
 }
 
+/// The span of an input poll to attribute to `starved`. A poll only counts as
+/// starvation when it actually yields input; a `None` result is end-of-stream,
+/// so its poll-to-EOF wait is pipeline shutdown/teardown (source teardown, a
+/// producer finishing) rather than time genuinely spent waiting for the next
+/// batch — attribute nothing for it.
+fn starved_span_for_poll<T>(poll_result: &Option<T>, waited: Duration) -> Duration {
+    match poll_result {
+        Some(_) => waited,
+        None => Duration::ZERO,
+    }
+}
+
 /// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
 /// attributes and dynamic tables
 #[derive(Debug, Clone)]
@@ -665,7 +677,8 @@ impl ExecutionPlan for WrappingExec {
                 let batch_elapsed = batch_start.elapsed();
                 // `starved`: time waiting on upstream for input. Node-local (not
                 // an edge), so downstream_id="" to match the blocked label set.
-                starved.add(batch_elapsed);
+                // A `None` poll is EOF, not starvation — attribute nothing for it.
+                starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
                 let starved_ms = starved.take_whole_millis();
                 if starved_ms > 0 {
                     metrics_recorder.record_count_w_tags(
@@ -1670,6 +1683,26 @@ mod tests {
         assert_eq!(
             rebuilt_we.backpressure_role(),
             &BackpressureRole::Edge("consumer".to_string())
+        );
+    }
+
+    /// A poll that yields a batch counts its wait as `starved`, but the final
+    /// poll that returns `None` (end-of-stream) must contribute nothing — that
+    /// poll-to-EOF wait is pipeline shutdown, not upstream starvation.
+    #[test]
+    fn end_of_stream_poll_is_not_counted_as_starved() {
+        let waited = Duration::from_millis(50);
+
+        // Delivered input: the wait is genuine starvation.
+        assert_eq!(
+            starved_span_for_poll(&Some(Ok::<(), ()>(())), waited),
+            waited
+        );
+
+        // End-of-stream: the teardown wait is not starvation.
+        assert_eq!(
+            starved_span_for_poll::<Result<(), ()>>(&None, waited),
+            Duration::ZERO
         );
     }
 }
