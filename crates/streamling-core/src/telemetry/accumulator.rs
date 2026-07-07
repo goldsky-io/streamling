@@ -1,17 +1,13 @@
 use std::time::Duration;
 
-/// Accumulates a running duration and drains it as whole milliseconds, carrying
-/// the sub-millisecond remainder forward so that many sub-millisecond spans are
-/// not each truncated to zero (which would consistently undercount at high
-/// throughput).
+/// Accumulates a duration and drains it as whole milliseconds, carrying the
+/// sub-millisecond remainder forward so many small spans aren't each truncated
+/// to zero (which would undercount at high throughput).
 ///
-/// Shared by every `node_wait` state emission:
-///   - **blocked** — yield->resume suspension in `WrappingExec`, and blocked-send
-///     time on a full fan-out channel in `BroadcastStream`; and
-///   - **starved** — time a `WrappingExec` waits on upstream for its next input.
-///
-/// Kept as a small, side-effect-free helper so the accumulation math is unit
-/// testable with hand-fed durations, independent of the async streams.
+/// Shared by every `node_wait` emission: `blocked` (yield->resume suspension in
+/// `WrappingExec`, and blocked-send time in `BroadcastStream`) and `starved`
+/// (upstream input wait). Side-effect-free so the math is unit testable with
+/// hand-fed durations.
 #[derive(Debug, Default)]
 pub struct MillisAccumulator {
     total: Duration,
@@ -26,9 +22,8 @@ impl MillisAccumulator {
     /// Drain the accrued time as whole milliseconds, retaining the
     /// sub-millisecond remainder. Returns 0 until at least 1ms has accrued.
     pub fn take_whole_millis(&mut self) -> u64 {
-        // `as_millis()` is u128; the `as u64` truncation is safe in practice —
-        // overflowing u64 milliseconds requires ~584 million years of accrued
-        // time, and the remainder is drained on every emission.
+        // `as u64` truncation of the u128 `as_millis()` is safe: overflowing u64
+        // ms takes ~584 million years, and the remainder is drained each call.
         let whole = self.total.as_millis() as u64;
         if whole > 0 {
             self.total -= Duration::from_millis(whole);

@@ -358,42 +358,37 @@ pub fn metric_key(app_id: &str, id: &str) -> String {
 /// Recover the plain topology node name from a `metric_key`-form identifier.
 ///
 /// Keys take three shapes:
-///   - `<app_id>::<node>`             (regular node)
-///   - `<app_id>::<node>::unbounded`  (hybrid source, unbounded phase)
-///   - `<app_id>::<node>::bounded::<idx>` (hybrid source, bounded phase per partition)
+///   - `<app_id>::<node>`                 (regular node)
+///   - `<app_id>::<node>::unbounded`      (hybrid source, unbounded phase)
+///   - `<app_id>::<node>::bounded::<idx>` (hybrid source, bounded phase)
 ///
-/// The hybrid phase suffix is stripped first so the node name is recovered in
-/// every case — otherwise a hybrid key would yield `unbounded` or the partition
-/// index instead of the node, mis-stamping `downstream_id` and breaking PromQL
-/// joins.
+/// The hybrid phase suffix is stripped first; otherwise a hybrid key would yield
+/// `unbounded` or the partition index instead of the node, mis-stamping
+/// `downstream_id` and breaking PromQL joins.
 pub fn get_reference_name_from_metric_key(metric_key: &str) -> String {
     let base = strip_hybrid_phase_suffix(metric_key);
     base.rsplit("::").next().unwrap_or(base).to_string()
 }
 
-/// Strip a hybrid-source phase suffix (`::unbounded` or `::bounded::<idx>`) from
-/// a metric key, leaving `<app_id>::<node>`. Returns the key unchanged when no
-/// recognized phase suffix is present.
+/// Strip a hybrid-source phase suffix (`::unbounded` or `::bounded::<idx>`),
+/// leaving `<app_id>::<node>`; returns the key unchanged otherwise.
 ///
-/// A phase suffix is only ever appended to a full `<app_id>::<node>` metric key,
-/// so the base before the suffix must still contain `::`. That guard is what
-/// keeps a regular node literally named `unbounded`/`bounded` (key
-/// `<app_id>::unbounded`) from being misread as a hybrid phase key and stripped
-/// down to the app id. This assumes `app_id` is a single `::`-free segment; a
-/// multi-segment app id sharing a node named `unbounded` is not string-
-/// distinguishable from a hybrid key here.
+/// A phase suffix is only appended to a full `<app_id>::<node>` key, so the base
+/// must still contain `::`. That guard keeps a regular node literally named
+/// `unbounded`/`bounded` (key `<app_id>::unbounded`) from being stripped to the
+/// app id. (Assumes a single `::`-free `app_id`; a multi-segment app id with a
+/// node named `unbounded` is not distinguishable here.)
 fn strip_hybrid_phase_suffix(metric_key: &str) -> &str {
     if let Some(base) = metric_key.strip_suffix("::unbounded") {
-        // Only a phase suffix when the base is still a full `<app_id>::<node>`
-        // key; otherwise this is a regular node literally named `unbounded`.
+        // Phase suffix only when the base is still `<app_id>::<node>`; else this
+        // is a regular node literally named `unbounded`.
         if base.contains("::") {
             return base;
         }
     }
     if let Some((base, idx)) = metric_key.rsplit_once("::bounded::") {
-        // Only treat it as a bounded-phase suffix when the base is a full
-        // `<app_id>::<node>` key and the trailing segment is a partition index,
-        // so a real node literally named `bounded` is unaffected.
+        // Bounded-phase suffix only when the base is `<app_id>::<node>` and the
+        // trailing segment is a partition index, so a node named `bounded` is safe.
         if base.contains("::") && !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) {
             return base;
         }
@@ -428,11 +423,9 @@ pub fn get_delta_meter() -> opentelemetry::metrics::Meter {
 mod tests {
     use super::*;
 
-    /// `get_reference_name_from_metric_key` must recover the plain topology node
-    /// name for every key shape, including the hybrid-source phase keys. Taking
-    /// only the last `::` segment breaks for hybrid keys: `<app>::<node>::unbounded`
-    /// would yield `unbounded` and `<app>::<node>::bounded::<idx>` would yield the
-    /// partition index, mis-stamping `downstream_id` and breaking PromQL joins.
+    /// Must recover the plain node name for every key shape, including hybrid
+    /// phase keys. Taking only the last `::` segment would yield `unbounded` or
+    /// the partition index for hybrid keys, breaking `downstream_id`/PromQL joins.
     #[test]
     fn reference_name_recovers_plain_node_for_all_key_shapes() {
         let app = "app-7f3c";
@@ -475,12 +468,10 @@ mod tests {
         );
     }
 
-    /// A regular node whose plain name collides with a hybrid phase marker
-    /// (`unbounded` / `bounded`) must still recover its own name. Its key is
-    /// `<app>::<node>`, so the phase suffix must only be stripped when the base
-    /// before it is a full `<app>::<node>` key (still contains `::`); otherwise
-    /// `<app>::unbounded` is misread as a hybrid key and the app id leaks in as
-    /// the node name, mis-stamping `downstream_id` and breaking PromQL joins.
+    /// A regular node named like a phase marker (`unbounded`/`bounded`) must
+    /// still recover its own name. Its key is `<app>::<node>`, so the suffix is
+    /// only stripped when the base still contains `::`; otherwise the app id
+    /// would leak in as the node name.
     #[test]
     fn reference_name_does_not_strip_regular_node_named_like_phase_marker() {
         let app = "app-7f3c";

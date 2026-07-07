@@ -69,9 +69,9 @@ pub struct SharedSourceHandle {
     channel_capacity: usize,
     expected_consumers: AtomicUsize,
     registered_consumers: Arc<AtomicUsize>,
-    /// `metric_metadata_id` (the `metric_key` form) of the shared producer node,
-    /// threaded into the `BroadcastStream` so per-consumer blocked-send time is
-    /// attributed to the producer via the data-plane recorder.
+    /// `metric_metadata_id` (metric_key form) of the shared producer, threaded
+    /// into the `BroadcastStream` so per-consumer blocked-send time is attributed
+    /// to the producer.
     upstream_metadata_id: Option<String>,
 }
 
@@ -172,10 +172,10 @@ impl SharedSourceHandle {
 pub struct BroadcastingExec {
     handle: Arc<SharedSourceHandle>,
     cache: PlanProperties,
-    /// Plain name of the consumer this broadcast leaf feeds, stamped by the
-    /// `DownstreamAttributionRule`. Passed to `add_consumer` so the producer's
-    /// per-consumer blocked-send time carries `downstream_id`. `None` opts out
-    /// (e.g. a scan-shared edge under a multi-sink, which the rule cannot reach).
+    /// Plain name of the consumer this leaf feeds, stamped by the
+    /// `DownstreamAttributionRule` and passed to `add_consumer` so blocked-send
+    /// time carries `downstream_id`. `None` opts out (e.g. a scan-shared edge
+    /// under a multi-sink, which the rule can't reach).
     downstream_id: Option<String>,
 }
 
@@ -260,10 +260,9 @@ impl ExecutionPlan for BroadcastingExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let broadcast = self.handle.get_or_start_broadcast_stream();
-        // Attribute this consumer's blocked-send time to the downstream the
-        // attribution rule stamped onto this leaf. `None` (e.g. a scan-shared
-        // edge under a multi-sink, unreachable by the rule) opts out via an
-        // empty id, preserving the prior behavior.
+        // Attribute this consumer's blocked-send time to the downstream stamped
+        // onto this leaf. `None` (e.g. a scan-shared edge under a multi-sink,
+        // unreachable by the rule) opts out via an empty id.
         let consumer = broadcast.add_consumer(self.downstream_id.clone().unwrap_or_default());
         self.handle.register_consumer();
         self.handle.start_if_needed(partition, context)?;

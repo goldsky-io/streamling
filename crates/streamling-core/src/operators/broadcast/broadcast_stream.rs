@@ -26,13 +26,11 @@ pub struct BroadcastStream {
     inner: Arc<BroadcastState>,
     stopped: Arc<AtomicBool>,
     channel_capacity: usize,
-    /// `metric_metadata_id` (the `metric_key` form `"{app}::{name}"`) of the
-    /// producer node feeding this broadcast. Per-consumer blocked-send time is
-    /// emitted as `node_wait{state="blocked"}` via the data-plane recorder, so it
-    /// carries `id=<producer>` plus the producer's full tag set and
-    /// `downstream_id=<consumer>`. Every production `BroadcastStream` threads the
-    /// producing node's id through its constructor; when `None` (only reachable in
-    /// tests) blocked-send time is simply not attributed.
+    /// `metric_metadata_id` (metric_key form `"{app}::{name}"`) of the producer
+    /// feeding this broadcast. Per-consumer blocked-send time is emitted as
+    /// `node_wait{state="blocked"}` carrying `id=<producer>` and
+    /// `downstream_id=<consumer>`. Always threaded through in production; `None`
+    /// (tests only) means blocked-send is not attributed.
     upstream_metadata_id: Option<String>,
 }
 
@@ -42,11 +40,10 @@ struct BroadcastState {
     consumers: Mutex<Vec<BroadcastSender>>,
 }
 
-/// A registered broadcast consumer's sending half, paired with the identity of
-/// the downstream node it feeds. `downstream_id` is the sink's reference name
-/// for multi-sink fan-out (used to attribute blocked-send time to the slow
-/// sink) and empty for consumers where attribution does not apply (the
-/// MultiSinkExec passthrough output and scan-sharing fan-out).
+/// A broadcast consumer's sending half plus the downstream node it feeds.
+/// `downstream_id` is the sink's reference name for multi-sink fan-out (to
+/// attribute blocked-send time to the slow sink), or empty when attribution
+/// doesn't apply (the passthrough output and scan-sharing fan-out).
 #[derive(Clone, Debug)]
 struct BroadcastSender {
     downstream_id: String,
@@ -86,12 +83,11 @@ impl BroadcastStream {
 
     /// Retry sending with fixed delay until success or channel closed.
     ///
-    /// Returns the time spent blocked on a full consumer channel (i.e. the
-    /// backpressure that consumer exerted on the shared broadcast for this
-    /// batch). On immediate success this is ~zero; while the consumer's channel
-    /// is full it grows by the retry delay each iteration. Returning the
-    /// `Duration` (rather than only emitting a metric) keeps the blocking
-    /// behavior unit-testable by value, independent of the metrics recorder.
+    /// Returns the time spent blocked on a full consumer channel (the
+    /// backpressure that consumer exerted for this batch): ~zero on immediate
+    /// success, growing by the retry delay while full. Returning the `Duration`
+    /// (rather than only emitting a metric) keeps the blocking behavior
+    /// unit-testable by value, independent of the recorder.
     async fn try_send_batch_with_retry_forever(
         tx: &Sender<DFResult<RecordBatch>>,
         batch_result: &DFResult<RecordBatch>,
@@ -118,12 +114,10 @@ impl BroadcastStream {
     /// The task that reads from the single source stream and broadcasts to all active consumers.
     async fn run_broadcast(&self, mut source_stream: SendableRecordBatchStream) {
         // Per-consumer blocked-send time is emitted as `node_wait{state="blocked"}`
-        // via the data-plane recorder so the series carries `id=<producer>` plus
-        // the producer's full tag set and `downstream_id=<consumer>`. Every
-        // production BroadcastStream is constructed with the producer id threaded
-        // through, so `upstream_metadata_id` is always set; consumers with an empty
-        // `downstream_id` (the passthrough output, or a fan-out edge the
-        // attribution rule could not reach) are not attributed.
+        // carrying `id=<producer>` and `downstream_id=<consumer>`. In production
+        // `upstream_metadata_id` is always set; consumers with an empty
+        // `downstream_id` (passthrough output, or a fan-out edge the rule couldn't
+        // reach) are not attributed.
         let data_plane_recorder = crate::telemetry::recorder::get_metrics_recorder();
         let upstream_metadata_id = self.upstream_metadata_id.clone();
         // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
@@ -157,10 +151,9 @@ impl BroadcastStream {
                     for (downstream_id, result) in results {
                         match result {
                             Ok(blocked) => {
-                                // Not attributed: a consumer without a downstream id
-                                // (passthrough output, scan-sharing fan-out), or a
-                                // broadcast with no producer id (tests only —
-                                // production always threads it through).
+                                // Not attributed: no producer id (tests only) or
+                                // an empty downstream id (passthrough output,
+                                // scan-sharing fan-out).
                                 let Some(metadata_id) = upstream_metadata_id.as_deref() else {
                                     continue;
                                 };
@@ -206,11 +199,10 @@ impl BroadcastStream {
 
     /// Add a new consumer. Returns a handle that can receive from this broadcast.
     ///
-    /// `downstream_id` identifies the node this consumer feeds so that time the
-    /// broadcast spends blocked on this consumer's full channel can be
-    /// attributed to it (multi-sink fan-out passes the slow sink's reference
-    /// name). Pass an empty string to opt out of attribution (the passthrough
-    /// output and scan-sharing fan-out).
+    /// `downstream_id` names the node this consumer feeds, so blocked-send time
+    /// on its full channel is attributed to it (multi-sink passes the slow sink's
+    /// reference name). Empty string opts out (passthrough output, scan-sharing
+    /// fan-out).
     pub fn add_consumer(&self, downstream_id: String) -> BroadcastConsumer {
         // Each consumer gets its own bounded receiver
         let (tx, rx) = channel(self.channel_capacity);

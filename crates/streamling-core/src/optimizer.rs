@@ -146,30 +146,26 @@ impl PhysicalOptimizerRule for StreamingUnnestRewritePhysicalOptimizerRule {
     }
 }
 
-/// Stamps each node with the identity of the downstream consumer it feeds, so
-/// the `node_wait{state="blocked"}` metric can be attributed per edge
-/// (`id=<producer>, downstream_id=<consumer>`).
+/// Stamps each node with the downstream consumer it feeds, so
+/// `node_wait{state="blocked"}` is attributed per edge (`id=<producer>,
+/// downstream_id=<consumer>`).
 ///
-/// It is a manual top-down recursion (not `transform_up`/`transform_down`)
-/// because it carries the *nearest enclosing named downstream* down the tree —
-/// stateless TreeNode passes cannot express that ancestor context. In a physical
-/// plan, data flows from the leaves (sources) up to the root (sink), so a node's
-/// downstream is its parent. On descent the rule:
+/// A manual top-down recursion (not `transform_up`/`transform_down`) because it
+/// carries the *nearest enclosing named downstream* down the tree, which
+/// stateless TreeNode passes can't express. Data flows leaves->root, so a node's
+/// downstream is its parent. On descent:
 ///
-/// - `DataSinkExec` (root): recovers the sink's name (from its `WrappingDataSink`)
-///   and passes it as the named downstream for its child (the topmost transform).
-/// - `WrappingExec`: stamps `Edge(named_downstream)` (or leaves it `Unattributed`
-///   when no downstream is known), then becomes the named downstream for its own
-///   children.
-/// - `MultiSinkExec`: marks the producer `WrappingExec` in its `input` as a
-///   `FanOutProducer` (suppressing its own emission — the `BroadcastStream` emits
-///   one per-edge series per sink instead) and continues stamping below it.
+/// - `DataSinkExec` (root): passes the sink's name (from its `WrappingDataSink`)
+///   as the downstream for its child (the topmost transform).
+/// - `WrappingExec`: stamps `Edge(named_downstream)` (or `Unattributed`), then
+///   becomes the named downstream for its children.
+/// - `MultiSinkExec`: marks its producer `WrappingExec` as `FanOutProducer`
+///   (the `BroadcastStream` emits per-sink edges instead) and continues below.
 /// - `BroadcastingExec` (scan-sharing leaf): stamps `downstream_id` with the
-///   consumer it feeds, so the shared producer's blocked-send time is attributed.
+///   consumer it feeds.
 ///
 /// Scan-shared producer `WrappingExec`s are stashed in `SharedSourceHandle`
-/// before this rule runs (unreachable here), so they are suppressed at
-/// construction instead.
+/// before this rule runs (unreachable here) and suppressed at construction.
 #[derive(Clone, Debug, Default)]
 pub struct DownstreamAttributionRule {}
 
@@ -187,9 +183,9 @@ fn attribute_downstream(
     named_downstream: Option<&str>,
     suppress_next_wrapping: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // MultiSinkExec boundary: the single `input` is the fan-out producer. Suppress
-    // its WrappingExec (the BroadcastStream emits its per-sink edges) and clear the
-    // named downstream below the boundary (the producer names its own children).
+    // MultiSinkExec boundary: the single `input` is the fan-out producer.
+    // Suppress its WrappingExec (the BroadcastStream emits per-sink edges) and
+    // clear the named downstream below (the producer names its own children).
     if node.as_any().is::<MultiSinkExec>() {
         let new_children = node
             .children()
@@ -215,8 +211,7 @@ fn attribute_downstream(
         } else {
             BackpressureRole::Unattributed
         };
-        // Owned here so its `&str` can be lent to every child recursion below
-        // without re-allocating the name per child.
+        // Owned once so its `&str` can be lent to every child recursion below.
         let child_downstream = get_reference_name_from_metric_key(wrapping.reference_name());
         let new_children = wrapping
             .children()
@@ -236,18 +231,15 @@ fn attribute_downstream(
         return stamped.with_new_children(new_children);
     }
 
-    // BroadcastingExec: scan-sharing leaf. Stamp the immediate consumer it feeds.
+    // BroadcastingExec: scan-sharing leaf. Attribute to the immediate consumer.
     //
-    // A scan-shared source is consumed once per downstream branch. Each branch's
-    // sub-plan (`WrappingExec(<transform>) -> ... -> BroadcastingExec`) is
-    // optimized before it is embedded into the consuming sink's plan, so this
-    // leaf is already stamped with the immediate consumer (the transform) by the
-    // time the sink-plan pass reaches it. The sink-plan pass must NOT overwrite
-    // that with the terminal sink's name: the transform's `WrappingExec` is not
-    // inlined into the sink plan, so `named_downstream` here is the sink, but the
-    // documented attribution is the immediate consumer. Preserve the existing
-    // stamp; only fall back to `named_downstream` when none was set — e.g. a sink
-    // that reads the shared source directly, with no transform in between.
+    // Each branch's sub-plan (`WrappingExec(<transform>) -> ... ->
+    // BroadcastingExec`) is optimized before being embedded in the sink's plan,
+    // so this leaf is already stamped with its immediate consumer (the
+    // transform). Don't overwrite that with the terminal sink's name (the
+    // transform isn't inlined, so `named_downstream` here is the sink). Only fall
+    // back to `named_downstream` when unstamped — e.g. a sink reading the shared
+    // source directly, no transform between.
     if let Some(broadcasting) = node.as_any().downcast_ref::<BroadcastingExec>() {
         if broadcasting.downstream_id().is_some() {
             return Ok(Arc::clone(&node));
@@ -356,9 +348,8 @@ mod attribution_tests {
     }
 
     /// A non-transparent single-child node placed between two `WrappingExec`s so
-    /// they don't fuse via `WrappingExec`'s delegated `children()` (which returns
-    /// the inner's children). In real plans the transform's computation plays
-    /// this role.
+    /// they don't fuse via `WrappingExec`'s delegated `children()`. In real plans
+    /// the transform's computation plays this role.
     fn mid(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Arc::new(CoalesceBatchesExec::new(input, 8192))
     }
@@ -517,13 +508,11 @@ mod attribution_tests {
         }
     }
 
-    /// A `BroadcastingExec` already stamped with its immediate consumer (the
-    /// transform — stamped when that transform's own sub-plan was optimized)
-    /// must NOT be overwritten with the terminal sink's name when the sink plan
-    /// is later optimized. In real plans the trivial transform is not inlined as
-    /// a `WrappingExec` into the sink plan, so the only named ancestor the rule
-    /// sees is the sink; preserving the existing stamp keeps the documented
-    /// "attribute to the immediate consumer" semantics.
+    /// A `BroadcastingExec` already stamped with its immediate consumer must NOT
+    /// be overwritten with the terminal sink's name when the sink plan is later
+    /// optimized. The transform isn't inlined into the sink plan, so the only
+    /// named ancestor is the sink; preserving the stamp keeps the "attribute to
+    /// the immediate consumer" semantics.
     #[test]
     fn broadcasting_preexisting_downstream_id_is_not_overwritten() {
         // DataSinkExec(webhook_slow) <- mid <- BroadcastingExec("slow_branch")

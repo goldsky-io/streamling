@@ -801,27 +801,21 @@ pub fn initialize_metrics_recorder(
                 .build(),
         );
 
-        // Node-wait metric — one monotonic counter in milliseconds modeling the
-        // time a node is idle rather than doing useful work, split by the `state`
-        // tag into the two idle states of the starved/busy/blocked triad (the
-        // `busy` complement is `elapsed_compute`):
-        //  - `state="blocked"` — held back by a downstream consumer. Modeled as a
-        //    property of an edge (producer -> consumer): every blocked series
-        //    also carries `downstream_id` (the consumer, or "" when unresolved).
-        //    Exactly one emitter per edge: a single-downstream node's
-        //    `WrappingExec` emits its one edge, measured as yield->resume
-        //    suspension; a fan-out producer's `WrappingExec` is suppressed while
-        //    the `BroadcastStream` emits one edge per consumer, measured as time
-        //    blocked on that consumer's full channel. Because the two layers
-        //    never coexist for the same node, `sum`/`max by (id)` and `... by
-        //    (downstream_id)` are safe with no double counting.
-        //  - `state="starved"` — waiting on upstream for input, measured as the
-        //    `WrappingExec`'s time in `data.next().await`. `downstream_id` is ""
-        //    (starvation is not an edge property).
-        // Every series carries both `state` and `downstream_id` so the two states
-        // share an identical label key set and cross-state math needs no
-        // per-series label surgery. The OTel Prometheus exporter appends the unit
-        // and `_total` suffixes, yielding `streamling_node_wait_milliseconds_total`.
+        // Node-wait metric — a monotonic ms counter for time a node is idle
+        // (not doing useful work), split by the `state` tag into the two idle
+        // states of the starved/busy/blocked triad (`busy` = `elapsed_compute`):
+        //  - `state="blocked"` — held back by a downstream consumer; an edge
+        //    property, so it also carries `downstream_id` (or "" when unresolved).
+        //    Exactly one emitter per edge: a single-downstream `WrappingExec`
+        //    emits its edge (yield->resume suspension), or a fan-out producer's
+        //    is suppressed while the `BroadcastStream` emits one edge per consumer
+        //    (blocked-send time). The two layers never coexist for a node, so
+        //    `sum`/`max by (id)` and `... by (downstream_id)` don't double count.
+        //  - `state="starved"` — waiting on upstream (`data.next().await`);
+        //    node-local, so `downstream_id` is "".
+        // Both states share an identical label key set. The OTel Prometheus
+        // exporter appends unit/`_total`, giving
+        // `streamling_node_wait_milliseconds_total`.
         count_registry.insert(
             String::from("node_wait"),
             meter

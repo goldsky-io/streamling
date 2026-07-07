@@ -133,9 +133,9 @@ pub struct MultiSinkEntry {
 pub struct MultiSinkLogicalNode {
     pub input: LogicalPlan,
     pub sinks: Vec<MultiSinkEntry>,
-    /// `metric_metadata_id` (the `metric_key` form) of the producer node feeding
-    /// this fan-out, threaded into the `BroadcastStream` so per-sink blocked-send
-    /// time is attributed to the producer via the unified `backpressure` metric.
+    /// `metric_metadata_id` (metric_key form) of the producer feeding this
+    /// fan-out, threaded into the `BroadcastStream` so per-sink blocked-send time
+    /// is attributed to the producer via `node_wait{state="blocked"}`.
     pub upstream_metadata_id: Option<String>,
 }
 
