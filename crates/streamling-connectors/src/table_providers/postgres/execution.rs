@@ -198,32 +198,41 @@ async fn handle_read_only_error(
     my_gen: u64,
     operation_name: &str,
 ) {
-    let mut guard = pool.lock().await;
-    if guard.1 == my_gen {
-        warn!(
-            "[{}] READ_ONLY error (SQLSTATE 25006) — pool is stale after failover; recreating (gen {} → {})",
-            operation_name,
-            my_gen,
-            my_gen + 1
-        );
-        match PostgresConnection::new_with_parallelism(config, parallelism).await {
-            Ok(conn) => {
-                let old_pool = std::mem::replace(&mut guard.0, conn.pool().clone());
-                guard.1 = my_gen + 1;
-                old_pool.close().await;
+    // Swap the pool and bump the generation while holding the lock, then drop the guard before
+    // closing the old pool — close() waits for in-flight queries and must not block writers.
+    let old_pool = {
+        let mut guard = pool.lock().await;
+        if guard.1 == my_gen {
+            warn!(
+                "[{}] READ_ONLY error (SQLSTATE 25006) — pool is stale after failover; recreating (gen {} → {})",
+                operation_name,
+                my_gen,
+                my_gen + 1
+            );
+            match PostgresConnection::new_with_parallelism(config, parallelism).await {
+                Ok(conn) => {
+                    let old = std::mem::replace(&mut guard.0, conn.pool().clone());
+                    guard.1 = my_gen + 1;
+                    Some(old)
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] Failed to recreate pool: {:?}; will retry with existing pool",
+                        operation_name, e
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                warn!(
-                    "[{}] Failed to recreate pool: {:?}; will retry with existing pool",
-                    operation_name, e
-                );
-            }
+        } else {
+            warn!(
+                "[{}] READ_ONLY error but pool already refreshed (gen {}); retrying with new pool",
+                operation_name, guard.1
+            );
+            None
         }
-    } else {
-        warn!(
-            "[{}] READ_ONLY error but pool already refreshed (gen {}); retrying with new pool",
-            operation_name, guard.1
-        );
+    };
+    if let Some(old_pool) = old_pool {
+        old_pool.close().await;
     }
 }
 
