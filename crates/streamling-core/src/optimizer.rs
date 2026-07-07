@@ -454,7 +454,7 @@ mod attribution_tests {
             vec![],
             vec![],
             1,
-            Some("app::sql".to_string()),
+            Some(Arc::from("app::sql")),
         ));
         let optimized = run(multi);
 
@@ -473,7 +473,7 @@ mod attribution_tests {
             leaf(),
             1,
             1,
-            Some("app::kafka_source".to_string()),
+            Some(Arc::from("app::kafka_source")),
         ));
         let broadcasting: Arc<dyn ExecutionPlan> = Arc::new(BroadcastingExec::new(handle));
         // DataSinkExec(pg_sink_a) <- W(sql_a) <- mid <- BroadcastingExec
@@ -499,7 +499,7 @@ mod attribution_tests {
             leaf(),
             1,
             1,
-            Some("app::kafka_source".to_string()),
+            Some(Arc::from("app::kafka_source")),
         ));
         let exec = BroadcastingExec::new(handle);
         match downstream_id {

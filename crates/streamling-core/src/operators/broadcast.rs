@@ -136,14 +136,14 @@ pub struct MultiSinkLogicalNode {
     /// `metric_metadata_id` (metric_key form) of the producer feeding this
     /// fan-out, threaded into the `BroadcastStream` so per-sink blocked-send time
     /// is attributed to the producer via `node_wait{state="blocked"}`.
-    pub upstream_metadata_id: Option<String>,
+    pub upstream_metadata_id: Option<Arc<str>>,
 }
 
 impl MultiSinkLogicalNode {
     pub fn new(
         input: LogicalPlan,
         sinks: Vec<MultiSinkEntry>,
-        upstream_metadata_id: Option<String>,
+        upstream_metadata_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             input,
@@ -292,7 +292,7 @@ pub(crate) struct MultiSinkExec {
     internal_buffer_size: usize,
     /// `metric_metadata_id` of the producer feeding this fan-out, passed to the
     /// `BroadcastStream` so blocked-send time is attributed to the producer.
-    upstream_metadata_id: Option<String>,
+    upstream_metadata_id: Option<Arc<str>>,
 }
 
 impl MultiSinkExec {
@@ -304,7 +304,7 @@ impl MultiSinkExec {
         sink_names: Vec<String>,
         sink_rebatch_configs: Vec<RebatchConfig>,
         internal_buffer_size: usize,
-        upstream_metadata_id: Option<String>,
+        upstream_metadata_id: Option<Arc<str>>,
     ) -> Self {
         let cache = Self::compute_properties(input.schema());
         Self {

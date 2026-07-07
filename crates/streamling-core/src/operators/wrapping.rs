@@ -377,7 +377,7 @@ impl TableProvider for WrappingSourceTableProvider {
                         wrapped_exec,
                         internal_buffer_size,
                         expected_count,
-                        Some(reference_name.clone()),
+                        Some(Arc::from(reference_name.as_str())),
                     ));
                     sources.insert(reference_name.clone(), handle.clone());
                     handle
@@ -1167,7 +1167,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             exec.clone(),
                             internal_buffer_size,
                             expected_count,
-                            Some(reference_name.clone()),
+                            Some(Arc::from(reference_name.as_str())),
                         ));
                         registry.insert(reference_name.clone(), handle.clone());
 

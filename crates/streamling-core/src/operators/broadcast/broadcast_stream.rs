@@ -31,7 +31,7 @@ pub struct BroadcastStream {
     /// `node_wait{state="blocked"}` carrying `id=<producer>` and
     /// `downstream_id=<consumer>`. Always threaded through in production; `None`
     /// (tests only) means blocked-send is not attributed.
-    upstream_metadata_id: Option<String>,
+    upstream_metadata_id: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -67,7 +67,7 @@ impl BroadcastStream {
 
     /// Set the producing node's `metric_metadata_id` so per-consumer blocked-send
     /// time is attributed to that node (data-plane). See `upstream_metadata_id`.
-    pub fn with_upstream_metadata_id(mut self, upstream_metadata_id: Option<String>) -> Self {
+    pub fn with_upstream_metadata_id(mut self, upstream_metadata_id: Option<Arc<str>>) -> Self {
         self.upstream_metadata_id = upstream_metadata_id;
         self
     }
@@ -436,7 +436,7 @@ mod tests {
             broadcast.upstream_metadata_id.is_none(),
             "default leaves blocked-send unattributed"
         );
-        let broadcast = broadcast.with_upstream_metadata_id(Some("app::producer".to_string()));
+        let broadcast = broadcast.with_upstream_metadata_id(Some(Arc::from("app::producer")));
         assert_eq!(
             broadcast.upstream_metadata_id.as_deref(),
             Some("app::producer")

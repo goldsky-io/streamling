@@ -72,7 +72,7 @@ pub struct SharedSourceHandle {
     /// `metric_metadata_id` (metric_key form) of the shared producer, threaded
     /// into the `BroadcastStream` so per-consumer blocked-send time is attributed
     /// to the producer.
-    upstream_metadata_id: Option<String>,
+    upstream_metadata_id: Option<Arc<str>>,
 }
 
 impl Debug for SharedSourceHandle {
@@ -95,7 +95,7 @@ impl SharedSourceHandle {
         base_exec: Arc<dyn ExecutionPlan>,
         channel_capacity: usize,
         expected_consumers: usize,
-        upstream_metadata_id: Option<String>,
+        upstream_metadata_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             schema,

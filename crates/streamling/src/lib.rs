@@ -2042,8 +2042,10 @@ impl Streamling {
                     // The map key is the producer's `from` reference name; its
                     // metric_key is the BroadcastStream's upstream_metadata_id so
                     // per-sink blocked-send is attributed to the producer node.
-                    let upstream_metadata_id =
-                        Some(metric_key(&application_id, producer_name.as_str()));
+                    let upstream_metadata_id: Option<Arc<str>> = Some(Arc::from(metric_key(
+                        &application_id,
+                        producer_name.as_str(),
+                    )));
                     LogicalPlan::Extension(Extension {
                         node: Arc::new(MultiSinkLogicalNode::new(
                             source_plan,
