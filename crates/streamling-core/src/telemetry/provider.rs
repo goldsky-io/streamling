@@ -485,4 +485,19 @@ mod tests {
             "bounded"
         );
     }
+
+    /// Boundary of the single-`::`-free-`app_id` assumption. For `app::bounded::42`
+    /// the base (`app`) has no `::`, so the guard reads `::bounded::` as node data
+    /// rather than a phase suffix and leaves the key unchanged; reference-name
+    /// extraction then yields the trailing `42`, not `bounded::42`. This is a known
+    /// limitation (a real bounded key is `<app>::<node>::bounded::<idx>`); the test
+    /// pins the behavior so a future refactor can't silently change it.
+    #[test]
+    fn strip_hybrid_phase_suffix_untouched_for_single_segment_app_bounded_key() {
+        assert_eq!(
+            strip_hybrid_phase_suffix("app::bounded::42"),
+            "app::bounded::42"
+        );
+        assert_eq!(get_reference_name_from_metric_key("app::bounded::42"), "42");
+    }
 }
