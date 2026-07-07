@@ -225,14 +225,9 @@ fn attribute_downstream(
                 attribute_downstream(Arc::clone(child), Some(child_downstream.as_str()), false)
             })
             .collect::<Result<Vec<_>>>()?;
-        // Clone the node once, then move it through the role builders.
-        let stamped = wrapping.clone();
-        let stamped = match role {
-            BackpressureRole::Edge(downstream) => stamped.with_downstream_id(downstream),
-            BackpressureRole::FanOutProducer => stamped.suppress_backpressure(),
-            BackpressureRole::Unattributed => stamped,
-        };
-        let stamped: Arc<dyn ExecutionPlan> = Arc::new(stamped);
+        // Rebuild the node with the stamped role (only `backpressure_role`
+        // changes — see WrappingExec::clone_with_role).
+        let stamped: Arc<dyn ExecutionPlan> = Arc::new(wrapping.clone_with_role(role));
         return stamped.with_new_children(new_children);
     }
 

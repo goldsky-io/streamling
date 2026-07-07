@@ -542,6 +542,20 @@ impl WrappingExec {
         self.backpressure_role = BackpressureRole::FanOutProducer;
         self
     }
+
+    /// Clone this node with a different `backpressure_role` stamped on it.
+    ///
+    /// The `DownstreamAttributionRule` reaches each node behind an `Arc`, so it
+    /// can't mutate in place and must rebuild. Only `backpressure_role` changes;
+    /// every other field is carried over by the clone — notably `side_outputs`
+    /// (a `Vec<Arc<_>>`), so each call is one `Vec` allocation plus arc refcount
+    /// bumps. Cheap enough for a once-per-plan optimizer pass. (A struct-update
+    /// literal can't be used here because `WrappingExec` implements `Drop`.)
+    pub fn clone_with_role(&self, role: BackpressureRole) -> Self {
+        let mut cloned = self.clone();
+        cloned.backpressure_role = role;
+        cloned
+    }
 }
 
 /// Used to intercept `execute()` calls and run additional logic like telemetry processing
