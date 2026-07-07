@@ -23,6 +23,7 @@ pub mod operators;
 pub mod optimizer;
 pub mod plugin;
 pub mod retry;
+pub mod schema;
 pub mod serde;
 pub mod session;
 pub mod side_output;

@@ -93,7 +93,7 @@ Streamling runs as a **single-node engine**. It can scale horizontally via Kafka
 
 ## Quick start
 
-This is the simplest path to a running pipeline. Most production flows add plugin stages and multiple transforms. See [Building data flows](#building-data-flows).
+This is the simplest path to a running pipeline. Most production flows add plugin stages and multiple transforms. See [Common patterns](#common-patterns).
 
 ```bash
 # 1. Install the runtime (macOS/Linux)
@@ -150,7 +150,7 @@ Mix the built-in connectors with [plugins](#plugin-system), SQL, WASM, and HTTP 
 
 | Flow                                 | Stages                                                                                                       | What the runtime provides                                                                                   |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Plugin → SQL → handler → WASM → sink | plugin source + sql + [HTTP handler](#http-handler-transform) + [WASM](#webassembly-script-transform) + sink | Ordered processing and at-least-once delivery through all stages. See [hero example](#building-data-flows). |
+| Plugin → SQL → handler → WASM → sink | plugin source + sql + [HTTP handler](#http-handler-transform) + [WASM](#webassembly-script-transform) + sink | Ordered processing and at-least-once delivery through all stages. See [Plugin examples](#plugin-examples). |
 | Plugin → plugin → sink               | custom source + custom transform + custom sink                                                               | Same guarantees on fully custom I/O (e.g. poll an API, apply domain logic, push to a partner system)        |
 | Kafka → plugin transform → sink      | built-in source + plugin transform + built-in sink                                                           | Built-in source convenience + custom compute (decoding, external lookups, multi-record logic)               |
 | Multi-source via hybrid              | bounded backfill in a datalake + live stream through kafka                                                   | Phase-ordered processing with checkpoint continuity. See [Hybrid Source](#hybrid-source).                   |
@@ -223,7 +223,7 @@ sinks:
       mode: batch
 ```
 
-**Community plugins are available in the [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository**.
+**Community plugins are available in the [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository — see [Including Plugins](#including-plugins) for setup**.
 
 ## Development setup
 
@@ -317,15 +317,19 @@ Sources return a `SendableRecordBatchStream` as a result.
 
 #### Kafka Source
 
-The Kafka source allows consuming data from Kafka topics using Avro serialization with Schema Registry integration. It's
-implemented as a custom DataFusion Table Provider (`TableProvider`) with the following key features:
+The Kafka source allows consuming data from Kafka topics using Avro (with Schema Registry integration) or JSON
+serialization. It's implemented as a custom DataFusion Table Provider (`TableProvider`) with the following key features:
 
-- **Schema Management**: Automatically fetches and converts Avro schemas from Schema Registry to Arrow schemas.
+- **Schema Management**:
+  - For Avro, automatically fetches and converts Avro schemas from Schema Registry to Arrow schemas.
+  - For JSON, uses the input schema declared in the source's `schema` field (Schema Registry is not used).
 - **Message Processing**:
-  - Converts Avro-encoded messages to Arrow `RecordBatch`es.
+  - Converts Avro- or JSON-encoded messages to Arrow `RecordBatch`es.
     - The size of the batches is controlled by the `record_batch_size` and `record_batch_interval_ms` parameters.
   - Adds operation type column (`_gs_op`) to track INSERT/UPDATE/DELETE operations (see `Upsert Semantics` section
     below). The operation type is determined by the `dbz.op` header value.
+  - Tombstone records (null/empty payloads, e.g. CDC deletes-as-tombstones) are **not supported** in any format
+    and fail the source. Represent deletes with a non-empty payload plus a `dbz.op=d` header instead.
 
 Kafka Source uses
 high-level [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html) which handles
@@ -348,6 +352,27 @@ sources:
     type: kafka
     topic: app.events
 ```
+
+**JSON format.** Set `data_format: json` (the default is `avro`) and declare the input schema as a `column → type` map.
+Each Kafka message payload is treated as a single UTF-8 JSON object (one row); Schema Registry is not used.
+
+```yaml
+sources:
+  raw_events:
+    type: kafka
+    topic: app.events
+    data_format: json
+    schema:
+      id: int64
+      name: string
+      amount: float64
+```
+
+Supported type names match Arrow's (`int8`..`int64`, `uint8`..`uint64`, `float32`/`float64`, `string`, `boolean`,
+`timestamp`, etc.). Decimals are written as `decimal128(precision, scale)` or `decimal256(precision, scale)`; the bare
+names `decimal128`/`decimal256` (alias `decimal`) default to `(38, 9)`. All declared columns are nullable. If the
+payload does not already contain `_gs_op`, it is added from the `dbz.op` header (defaulting to insert), exactly as for
+Avro.
 
 **Connection settings** — override the embedded defaults (local Kafka and Schema Registry) with these environment variables:
 
@@ -1397,6 +1422,51 @@ Each plugin configuration requires:
 
 - `type`: Unique plugin id, consisting of the plugin namespace (optional) and an operator name, separated by a dot (e.g., `basic_plugin.random_source`)
 - `options`: Key-value pairs for plugin-specific configuration
+
+### Including Plugins
+
+A plugin is a shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows) built against the Streamling plugin ABI. To make a plugin usable in a pipeline, point the runtime at it before startup via `STREAMLING__PLUGIN__PATH`. The path may be a single library file or a directory — every file in a directory is loaded:
+
+```bash
+# a single plugin library
+export STREAMLING__PLUGIN__PATH=/opt/streamling-plugins/libcommunity_plugins.so
+
+# or a directory holding several plugins (all files are loaded)
+export STREAMLING__PLUGIN__PATH=/opt/streamling-plugins
+```
+
+Loaded plugins are then referenced by id as the `type` of any source, transform, or sink (see [Plugin Pipeline Configuration](#plugin-pipeline-configuration)). Plugin ids may be bare (`s3_sink`) or namespaced (`basic_plugin.random_source`).
+
+#### Community plugins
+
+The [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository is a single workspace crate that compiles several sinks — `s3_sink`, `mysql_sink`, `sqs`, and `s2_sink` — into one shared library (`libcommunity_plugins.so` / `.dylib` / `community_plugins.dll`). Each release publishes prebuilt binaries for common platforms, so prefer those over building from source.
+
+1. Get the prebuilt library for your platform from the [releases page](https://github.com/goldsky-io/streamling-community-plugins/releases) and extract it:
+   ```bash
+   # latest release — swap linux-x86_64 for darwin-aarch64, darwin-x86_64,
+   # linux-aarch64, or windows-x86_64 (.zip) as needed
+   curl -L -o community-plugins.tar.gz \
+     https://github.com/goldsky-io/streamling-community-plugins/releases/latest/download/community-plugins-linux-x86_64.tar.gz
+   tar xzf community-plugins.tar.gz   # → libcommunity_plugins.so
+   ```
+   No prebuilt binary for your platform? Build from source: `git clone https://github.com/goldsky-io/streamling-community-plugins && cd streamling-community-plugins && just build-release` → `target/release/libcommunity_plugins.so`.
+2. Point the runtime at the library:
+   ```bash
+   export STREAMLING__PLUGIN__PATH=./libcommunity_plugins.so
+   ```
+3. Reference a plugin by its id in your pipeline. For example, write to S3 as Parquet:
+   ```yaml
+   sinks:
+     to_s3:
+       type: s3_sink
+       from: my_source
+       options:
+         bucket: my-bucket
+         region: us-east-1
+   ```
+   AWS credentials are required and best passed via the `STREAMLING__PLUGIN__S3_SINK__ACCESS_KEY_ID` / `...SECRET_ACCESS_KEY` environment variables (they take precedence over YAML). See the community-plugins README for the full option tables of each sink.
+
+To write and distribute your own plugin, see [Building Plugins](#building-plugins).
 
 ### Message-based Interface
 

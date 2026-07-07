@@ -524,6 +524,8 @@ mod tests {
                 telemetry: None,
                 batch_size: None,
                 batch_flush_interval: None,
+                data_format: None,
+                schema: None,
                 validate_writer_schema_ordering: None,
                 schema_id_overrides: None,
                 skip_schema_resolution: None,
