@@ -178,6 +178,11 @@ impl DownstreamAttributionRule {
 
 /// Recurse top-down carrying the nearest named downstream (plain name) and
 /// whether the next `WrappingExec` should be suppressed (multi-sink producer).
+///
+/// Returns DataFusion's `Result` (not `StreamlingError`) by design: this is a
+/// private helper for the `PhysicalOptimizerRule` impl, whose trait signature
+/// fixes the error type, and every fallible call here (`with_new_children`) is
+/// a DataFusion API. Errors feed the optimizer, never pipeline-level callers.
 fn attribute_downstream(
     node: Arc<dyn ExecutionPlan>,
     named_downstream: Option<&str>,
