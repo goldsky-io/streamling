@@ -179,6 +179,11 @@ impl DownstreamAttributionRule {
 /// Recurse top-down carrying the nearest named downstream (plain name) and
 /// whether the next `WrappingExec` should be suppressed (multi-sink producer).
 ///
+/// This is the recursion entry point driven by
+/// `DownstreamAttributionRule::optimize`; see `DownstreamAttributionRule` for
+/// why a manual top-down walk is used instead of DataFusion's stateless
+/// TreeNode passes.
+///
 /// Returns DataFusion's `Result` (not `StreamlingError`) by design: this is a
 /// private helper for the `PhysicalOptimizerRule` impl, whose trait signature
 /// fixes the error type, and every fallible call here (`with_new_children`) is
