@@ -130,7 +130,14 @@ impl BroadcastStream {
 
             match source_stream.next().await {
                 Some(batch_result) => {
-                    // Concurrent retry sends to avoid deadlocks during consumer startup
+                    // Concurrent retry sends (avoids deadlocks during consumer
+                    // startup). The sends race, so each consumer's blocked span is
+                    // timed independently and they overlap in wall-clock: the
+                    // producer's real block on this batch is the slowest edge
+                    // (join_all == max), not the sum. Per-edge blocked is therefore
+                    // correct for attribution (which consumer is slow), but
+                    // `sum by (id)` over a fan-out can exceed wall-clock (up to N×);
+                    // use `max by (id)` for a wall-clock producer-block signal.
                     let consumers = self.inner.consumers.lock().unwrap().clone();
                     let send_futures: Vec<_> = consumers
                         .iter()
