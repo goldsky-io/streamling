@@ -8,20 +8,39 @@ use datafusion::{
 use futures::StreamExt;
 use futures::future;
 use futures::stream::Stream;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::{
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// A batch stuck undelivered longer than this is treated as unrecoverable and
+/// triggers a process restart. Generous on purpose: a sink that briefly stalls
+/// (reconnecting, a slow write) self-heals well within this window, so a single
+/// transient hiccup never restarts the whole shared source.
+// ponytail: fixed 5min window; make it a config/env knob if some sink legitimately
+// needs longer to recover.
+const DEFAULT_STALL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How often the watchdog checks for a stalled delivery.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct BroadcastStream {
     inner: Arc<BroadcastState>,
     stopped: Arc<AtomicBool>,
     channel_capacity: usize,
+    /// Restart if a single fan-out delivery stays blocked longer than this.
+    stall_deadline: Duration,
+    /// `Some(t)` while a batch is mid-delivery (t = when it started); `None` when
+    /// the loop is idle waiting on the source. Lets the watchdog tell a genuine
+    /// wedge apart from a source that simply has no new data.
+    in_flight: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Debug)]
@@ -34,6 +53,15 @@ impl BroadcastStream {
     /// Create a new broadcast handle without starting the background task.
     /// Call `start()` after adding all consumers to avoid dropping batches.
     pub fn new(schema: SchemaRef, channel_capacity: usize) -> Self {
+        Self::with_stall_deadline(schema, channel_capacity, DEFAULT_STALL_DEADLINE)
+    }
+
+    /// Same as `new`, with an explicit stall deadline (used by tests).
+    pub(crate) fn with_stall_deadline(
+        schema: SchemaRef,
+        channel_capacity: usize,
+        stall_deadline: Duration,
+    ) -> Self {
         BroadcastStream {
             inner: Arc::new(BroadcastState {
                 schema,
@@ -41,15 +69,30 @@ impl BroadcastStream {
             }),
             stopped: Arc::new(AtomicBool::new(false)),
             channel_capacity,
+            stall_deadline,
+            in_flight: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Start the background broadcasting task.
-    /// Should be called after all consumers have been added.
+    /// Start the background broadcasting task plus a watchdog that forces a
+    /// restart if the fan-out gets wedged. Call after all consumers are added.
     pub fn start(&self, source_stream: SendableRecordBatchStream) {
         let clone_for_task = self.clone();
         tokio::spawn(async move {
             clone_for_task.run_broadcast(source_stream).await;
+        });
+
+        let in_flight = self.in_flight.clone();
+        let stopped = self.stopped.clone();
+        let deadline = self.stall_deadline;
+        tokio::spawn(async move {
+            Self::run_watchdog(in_flight, stopped, deadline, WATCHDOG_POLL_INTERVAL, || {
+                // The shared source can't make progress and this is unrecoverable
+                // in-process (a wedged consumer never drains). Exit so the
+                // orchestrator restarts us from the last checkpoint.
+                std::process::exit(1);
+            })
+            .await;
         });
     }
 
@@ -85,20 +128,29 @@ impl BroadcastStream {
 
             match source_stream.next().await {
                 Some(batch_result) => {
-                    // Concurrent retry sends to avoid deadlocks during consumer startup
-                    let consumers = self.inner.consumers.lock().unwrap().clone();
-                    let send_futures: Vec<_> = consumers
-                        .iter()
-                        .map(|tx| Self::try_send_batch_with_retry_forever(tx, &batch_result))
-                        .collect();
+                    // Mark the delivery in-flight so the watchdog can tell a wedge
+                    // (a batch we can't hand off) apart from an idle source.
+                    *self.in_flight.lock() = Some(Instant::now());
 
-                    let results = future::join_all(send_futures).await;
-                    for result in results {
-                        if result.is_err() {
-                            warn!(
-                                "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
-                            );
-                        }
+                    // Concurrent retry sends to avoid deadlocks during consumer startup.
+                    let consumers = self.inner.consumers.lock().clone();
+                    let results = future::join_all(
+                        consumers
+                            .iter()
+                            .map(|tx| Self::try_send_batch_with_retry_forever(tx, &batch_result)),
+                    )
+                    .await;
+
+                    *self.in_flight.lock() = None;
+
+                    // A closed consumer's branch already ended; actually prune it so
+                    // it stops being retried and re-warned on every batch.
+                    if results.iter().any(|r| r.is_err()) {
+                        warn!(
+                            "Consumer channel closed outside shutdown; removing it from the \
+                             broadcast. A downstream branch ended abnormally."
+                        );
+                        self.inner.consumers.lock().retain(|tx| !tx.is_closed());
                     }
                 }
                 None => {
@@ -107,9 +159,48 @@ impl BroadcastStream {
             }
         }
 
-        // Cleanup: clear all consumers so they see an end-of-stream
-        let mut guard = self.inner.consumers.lock().unwrap();
-        guard.clear(); // dropping all senders => all receivers get None
+        // Stop the watchdog and let every consumer see end-of-stream.
+        self.stopped.store(true, Ordering::SeqCst);
+        self.inner.consumers.lock().clear(); // dropping all senders => receivers get None
+    }
+
+    /// Watch for a wedged fan-out and force a restart when it can't recover.
+    ///
+    /// We deliberately do NOT fail fast on a single stuck consumer. A sink that
+    /// briefly stalls (reconnecting, a slow write) self-heals, and restarting the
+    /// whole shared source -- every dataset it feeds -- for one transient hiccup is
+    /// too aggressive. Instead we tolerate the stall for `deadline` (the head-of-
+    /// line block pauses the source meanwhile); if the consumer drains in time the
+    /// source resumes on its own with no restart. Only a delivery still stuck past
+    /// `deadline` is treated as unrecoverable. Exiting the process also covers the
+    /// all-consumers-wedged case, which an in-band error could not (no live
+    /// consumer left to receive it).
+    async fn run_watchdog(
+        in_flight: Arc<Mutex<Option<Instant>>>,
+        stopped: Arc<AtomicBool>,
+        deadline: Duration,
+        poll: Duration,
+        on_stall: impl Fn(),
+    ) {
+        loop {
+            tokio::time::sleep(poll).await;
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let started = *in_flight.lock();
+            if let Some(t) = started {
+                let stalled_for = t.elapsed();
+                if stalled_for >= deadline {
+                    error!(
+                        stall_secs = stalled_for.as_secs(),
+                        "Broadcast fan-out stuck past the stall deadline (a consumer stopped \
+                         draining and did not recover); forcing a restart."
+                    );
+                    on_stall();
+                    return;
+                }
+            }
+        }
     }
 
     /// Add a new consumer. Returns a handle that can receive from this broadcast.
@@ -117,7 +208,7 @@ impl BroadcastStream {
         // Each consumer gets its own bounded receiver
         let (tx, rx) = channel(self.channel_capacity);
 
-        let mut consumers = self.inner.consumers.lock().unwrap();
+        let mut consumers = self.inner.consumers.lock();
         consumers.push(tx);
 
         BroadcastConsumer {
@@ -172,7 +263,7 @@ impl BroadcastStream {
         self.stopped.store(true, Ordering::SeqCst);
 
         // Also drop all consumers immediately
-        let mut guard = self.inner.consumers.lock().unwrap();
+        let mut guard = self.inner.consumers.lock();
         guard.clear(); // dropping all senders => each consumer sees a `None` and shuts down
     }
 }
@@ -326,5 +417,63 @@ mod tests {
             "retriable flag should survive clone"
         );
         assert_eq!(recovered.to_string(), "bad input");
+    }
+
+    #[tokio::test]
+    async fn watchdog_fires_when_delivery_stuck_past_deadline() {
+        // in_flight is Some and never clears, so the delivery is "stuck"; the
+        // watchdog must fire once elapsed passes the (tiny) deadline.
+        let in_flight = Arc::new(Mutex::new(Some(Instant::now())));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_cb = fired.clone();
+
+        let ran = tokio::time::timeout(
+            Duration::from_secs(2),
+            BroadcastStream::run_watchdog(
+                in_flight,
+                stopped,
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                move || fired_cb.store(true, Ordering::SeqCst),
+            ),
+        )
+        .await;
+
+        assert!(
+            ran.is_ok(),
+            "watchdog should return after firing, not loop forever"
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "watchdog should force a restart when a delivery is stuck past the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_ignores_idle_source() {
+        // in_flight is None => the loop is idly waiting on the source, not wedged.
+        let in_flight = Arc::new(Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_cb = fired.clone();
+
+        // The watchdog loops forever while idle, so this times out -- expected.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(80),
+            BroadcastStream::run_watchdog(
+                in_flight,
+                stopped,
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                move || fired_cb.store(true, Ordering::SeqCst),
+            ),
+        )
+        .await;
+
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "watchdog must not fire while the source is merely idle (no batch in flight)"
+        );
     }
 }
