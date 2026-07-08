@@ -107,8 +107,7 @@ pub fn print_report(result: &BenchResult, comparison: &[MetricDelta]) {
     );
     println!(
         "  source rows seen : {} (expected ~{})",
-        result.source_output_rows_observed,
-        (result.selectivity * result.records as f64) as u64,
+        result.source_output_rows_observed, result.records,
     );
 
     if comparison.is_empty() {

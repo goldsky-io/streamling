@@ -19,7 +19,7 @@
 mod report;
 mod scenario;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -159,8 +159,9 @@ pub struct BenchResult {
     pub throughput_output_records_per_sec_median: f64,
     pub throughput_mb_per_sec_median: f64,
     pub compute_us_per_input_record_median: f64,
-    /// Rows the source emitted, from Prometheus — a sanity check, not the
-    /// throughput basis (filter pushdown can make this the post-filter count).
+    /// Rows the source emitted, from Prometheus — a sanity check that the source
+    /// read the whole topic. Filtering happens in the downstream transform, so
+    /// this should be ~records for every scenario, not the post-filter count.
     pub source_output_rows_observed: u64,
     pub runner_label: String,
     pub version: String,
@@ -381,7 +382,7 @@ sinks:
     })
 }
 
-fn load_baseline(path: &PathBuf) -> Result<Option<BenchResult>> {
+fn load_baseline(path: &Path) -> Result<Option<BenchResult>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -392,7 +393,7 @@ fn load_baseline(path: &PathBuf) -> Result<Option<BenchResult>> {
     Ok(Some(result))
 }
 
-fn write_json(path: &PathBuf, result: &BenchResult) -> Result<()> {
+fn write_json(path: &Path, result: &BenchResult) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
