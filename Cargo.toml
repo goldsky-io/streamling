@@ -11,6 +11,7 @@ members = [
     "crates/streamling",
     "crates/streamling-flink-compat",
     "crates/streamling-e2e",
+    "crates/streamling-bench",
 ]
 exclude = [
     "plugin_examples",
