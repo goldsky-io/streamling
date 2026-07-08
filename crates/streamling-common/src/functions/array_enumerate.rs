@@ -124,7 +124,13 @@ impl ScalarUDFImpl for ArrayEnumerateFunc {
         let list_array = input_array
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| streamling_user_err!("Input must be a list array"))?;
+            .ok_or_else(|| {
+                streamling_user_err!(
+                    "Input must be a list array, got array of type {:?} (declared field: {:?})",
+                    input_array.data_type(),
+                    args.arg_fields.first().map(|f| f.data_type())
+                )
+            })?;
 
         // Zero-copy optimization: reuse the flattened values buffer from the input list
         let values_array = list_array.values();
