@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
 
@@ -28,7 +27,7 @@ pub(crate) fn json_query_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(JsonQueryUdf::new())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonExistsUdf {
     signature: Signature,
 }
@@ -42,10 +41,6 @@ impl JsonExistsUdf {
 }
 
 impl ScalarUDFImpl for JsonExistsUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "JSON_EXISTS"
     }
@@ -112,7 +107,7 @@ impl ScalarUDFImpl for JsonExistsUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonValueUdf {
     signature: Signature,
 }
@@ -126,10 +121,6 @@ impl JsonValueUdf {
 }
 
 impl ScalarUDFImpl for JsonValueUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "JSON_VALUE"
     }
@@ -196,7 +187,7 @@ impl ScalarUDFImpl for JsonValueUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonQueryUdf {
     signature: Signature,
 }
@@ -223,10 +214,6 @@ impl JsonQueryUdf {
 }
 
 impl ScalarUDFImpl for JsonQueryUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "JSON_QUERY"
     }

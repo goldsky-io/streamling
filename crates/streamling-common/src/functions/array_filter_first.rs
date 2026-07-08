@@ -10,14 +10,13 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 /// array_filter_first(list<struct>, field_name_utf8, value_utf8) -> struct | null
 ///
 /// For each row, finds the first element in the list where the named Utf8 field
 /// equals the provided value, returning that struct or null if no match.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ArrayFilterFirstFunc {
     signature: Signature,
 }
@@ -37,10 +36,6 @@ impl ArrayFilterFirstFunc {
 }
 
 impl ScalarUDFImpl for ArrayFilterFirstFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "array_filter_first"
     }
@@ -235,6 +230,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -327,6 +323,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -420,6 +417,7 @@ mod tests {
             arg_fields: vec![arg0_field.into(), arg1_field.into(), arg2_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

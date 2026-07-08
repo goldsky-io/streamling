@@ -238,6 +238,66 @@ mod tests {
     }
 
     #[test]
+    fn test_avro_local_timestamp_decodes_without_panic() {
+        use datafusion::arrow::datatypes::TimeUnit;
+        // Local (timezone-naive) timestamps must decode through the value resolver
+        // into tz-less Arrow timestamps, not hit the `unreachable!()` arm (the bug
+        // a bare schema mapping would have relocated to per-row decode time).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let avro_schema = AvroSchema::parse_str(
+            r#"
+            {
+                "type": "record",
+                "name": "test_local_ts",
+                "fields": [
+                    {"name": "ts_ms", "type": {"type": "long", "logicalType": "local-timestamp-millis"}},
+                    {"name": "ts_us", "type": {"type": "long", "logicalType": "local-timestamp-micros"}}
+                ]
+            }
+        "#,
+        )
+        .unwrap();
+
+        let mut converter = AvroToArrowConverter::new(schema.clone(), avro_schema, None);
+        converter.buffer(Value::Record(vec![
+            (
+                "ts_ms".to_string(),
+                Value::LocalTimestampMillis(1_700_000_000_000),
+            ),
+            (
+                "ts_us".to_string(),
+                Value::LocalTimestampMicros(1_700_000_000_000_000),
+            ),
+        ]));
+
+        let batch = converter.convert_to_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let ms = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        let us = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ms.value(0), 1_700_000_000_000);
+        assert_eq!(us.value(0), 1_700_000_000_000_000);
+    }
+
+    #[test]
     fn test_decimal_precision_boundary() {
         // Test that precision <= 38 uses Decimal128
         let schema_128 = Arc::new(Schema::new(vec![Field::new(

@@ -3,7 +3,6 @@
 //! Some method delegation was added to make it easier to keep the code up to date with
 //! DataFusion changes.
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -46,7 +45,10 @@ use datafusion::physical_expr::{
     conjunction, split_conjunction,
 };
 use datafusion::physical_expr_common::physical_expr::fmt_sql;
-use datafusion::physical_plan::filter::{FilterExec, collect_columns_from_predicate};
+use datafusion::physical_plan::filter::FilterExec;
+// Deprecated in df54 ("will be internal in the future") but no public replacement yet.
+#[allow(deprecated)]
+use datafusion::physical_plan::filter::collect_columns_from_predicate;
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
     PushedDown,
@@ -71,7 +73,7 @@ pub struct StreamingFilterExec {
     /// Selectivity for statistics. 0 = no rows, 100 = all rows
     default_selectivity: u8,
     /// Properties equivalence properties, partitioning, etc.
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
     /// The projection indices of the columns in the output schema of join
     projection: Option<Vec<usize>>,
     /// Copy of the original FilterExec for method delegation
@@ -95,7 +97,7 @@ impl StreamingFilterExec {
                     input: Arc::clone(&input),
                     metrics: ExecutionPlanMetricsSet::new(),
                     default_selectivity,
-                    cache,
+                    cache: Arc::new(cache),
                     projection: None,
                     original_filter,
                 })
@@ -113,7 +115,7 @@ impl StreamingFilterExec {
             metrics: ExecutionPlanMetricsSet::new(),
             default_selectivity: original_filter.default_selectivity(),
             cache: original_filter.properties().clone(),
-            projection: original_filter.projection().cloned(),
+            projection: original_filter.projection().as_ref().map(|p| p.to_vec()),
             original_filter,
         })
     }
@@ -134,7 +136,7 @@ impl StreamingFilterExec {
     /// Return new instance of [StreamingFilterExec] with the given projection.
     pub fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
         //  Check if the projection is valid
-        can_project(&self.schema(), projection.as_ref())?;
+        can_project(&self.schema(), projection.as_deref())?;
 
         let projection = match projection {
             Some(projection) => match &self.projection {
@@ -155,7 +157,7 @@ impl StreamingFilterExec {
             input: Arc::clone(&self.input),
             metrics: self.metrics.clone(),
             default_selectivity: self.default_selectivity,
-            cache,
+            cache: Arc::new(cache),
             projection,
             original_filter: self.original_filter.clone(),
         })
@@ -228,7 +230,7 @@ impl StreamingFilterExec {
 
         let conjunctions = split_conjunction(predicate);
         for conjunction in conjunctions {
-            if let Some(binary) = conjunction.as_any().downcast_ref::<BinaryExpr>()
+            if let Some(binary) = conjunction.downcast_ref::<BinaryExpr>()
                 && binary.op() == &Operator::Eq
             {
                 // Filter evaluates to single value for all partitions
@@ -258,11 +260,12 @@ impl StreamingFilterExec {
         // to construct the equivalence properties:
         let stats = Self::statistics_helper(
             input.schema(),
-            input.partition_statistics(None)?,
+            input.partition_statistics(None)?.as_ref().clone(),
             predicate,
             default_selectivity,
         )?;
         let mut eq_properties = input.equivalence_properties().clone();
+        #[allow(deprecated)]
         let (equal_pairs, _) = collect_columns_from_predicate(predicate);
         for (lhs, rhs) in equal_pairs {
             eq_properties.add_equal_conditions(Arc::clone(lhs), Arc::clone(rhs))?
@@ -345,7 +348,7 @@ impl ExecutionPlan for StreamingFilterExec {
     delegate! {
         to self.original_filter {
             fn maintains_input_order(&self) -> Vec<bool>;
-            fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
+            fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
             fn cardinality_effect(&self) -> CardinalityEffect;
             fn gather_filters_for_pushdown(&self, phase: FilterPushdownPhase,
                 parent_filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -361,12 +364,7 @@ impl ExecutionPlan for StreamingFilterExec {
         "FilterExec"
     }
 
-    /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -483,12 +481,12 @@ impl ExecutionPlan for StreamingFilterExec {
                 input: Arc::clone(&filter_input),
                 metrics: self.metrics.clone(),
                 default_selectivity: self.default_selectivity,
-                cache: Self::compute_properties(
+                cache: Arc::new(Self::compute_properties(
                     &filter_input,
                     &new_predicate,
                     self.default_selectivity,
                     self.projection.as_ref(),
-                )?,
+                )?),
                 projection: None,
                 original_filter: self.original_filter.clone(),
             };
@@ -557,6 +555,7 @@ fn collect_new_statistics(
                         min_value: Precision::Exact(ScalarValue::Null),
                         sum_value: Precision::Exact(ScalarValue::Null),
                         distinct_count: Precision::Exact(0),
+                        byte_size: Precision::Absent,
                     };
                 };
                 let (lower, upper) = interval.into_bounds();
@@ -571,6 +570,7 @@ fn collect_new_statistics(
                     min_value,
                     sum_value: Precision::Absent,
                     distinct_count: distinct_count.to_inexact(),
+                    byte_size: Precision::Absent,
                 }
             },
         )

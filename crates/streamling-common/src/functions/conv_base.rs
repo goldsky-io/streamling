@@ -8,7 +8,6 @@ use datafusion::logical_expr::{
 };
 use num_bigint::BigInt;
 use num_traits::Num;
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::functions::util::get_three_args;
@@ -29,7 +28,7 @@ use crate::functions::util::get_three_args;
 /// # Examples
 /// * `conv_base('FF', 16, 10)` returns `'255'`
 /// * `conv_base('1010', 2, 16)` returns `'a'`
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ConvBaseFunc {
     signature: Signature,
 }
@@ -55,10 +54,6 @@ impl ConvBaseFunc {
 }
 
 impl ScalarUDFImpl for ConvBaseFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_conv_base"
     }
@@ -188,6 +183,7 @@ mod tests {
             ],
             number_rows: 3,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -223,6 +219,7 @@ mod tests {
             ],
             number_rows: 2,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

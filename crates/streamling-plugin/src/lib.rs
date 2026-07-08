@@ -577,6 +577,7 @@ pub fn invoke_plugin_udf(
         arg_fields,
         number_rows,
         return_field,
+        config_options: std::sync::Arc::new(datafusion::config::ConfigOptions::default()),
     };
 
     match instance.invoke_with_args(scalar_args) {

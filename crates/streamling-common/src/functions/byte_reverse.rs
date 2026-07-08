@@ -5,12 +5,11 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::streamling_user_err;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ReverseBytes32Func {
     signature: Signature,
 }
@@ -30,9 +29,6 @@ impl ReverseBytes32Func {
 }
 
 impl ScalarUDFImpl for ReverseBytes32Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "reverse_bytes32"
     }

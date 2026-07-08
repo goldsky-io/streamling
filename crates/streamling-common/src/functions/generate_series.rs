@@ -7,7 +7,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::functions::util::{get_optional_arg_or_default, get_typed_array, validate_arg_count};
@@ -29,7 +28,7 @@ use crate::functions::util::{get_optional_arg_or_default, get_typed_array, valid
 /// * `generate_series(1, 10)` returns `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]`
 /// * `generate_series(1, 10, 2)` returns `[1, 3, 5, 7, 9]`
 /// * `generate_series(10, 1, 1)` returns `[]` (incorrect step direction)
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct GenerateSeriesFunc {
     signature: Signature,
 }
@@ -55,10 +54,6 @@ impl GenerateSeriesFunc {
 }
 
 impl ScalarUDFImpl for GenerateSeriesFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_generate_series"
     }
@@ -171,6 +166,7 @@ mod tests {
                 ))),
                 false,
             )),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -223,6 +219,7 @@ mod tests {
                 ))),
                 false,
             )),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -275,6 +272,7 @@ mod tests {
                 ))),
                 false,
             )),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args);
@@ -316,6 +314,7 @@ mod tests {
                 ))),
                 false,
             )),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

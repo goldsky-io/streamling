@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, StringArray, StringBuilder};
@@ -27,7 +26,7 @@ pub(crate) fn is_json_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(IsJsonUdf::new())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ParseJsonUdf {
     signature: Signature,
     nullable_on_error: bool,
@@ -78,10 +77,6 @@ impl ParseJsonUdf {
 }
 
 impl ScalarUDFImpl for ParseJsonUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         if self.nullable_on_error {
             "TRY_PARSE_JSON"
@@ -149,7 +144,7 @@ impl ScalarUDFImpl for ParseJsonUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct IsJsonUdf {
     signature: Signature,
 }
@@ -169,10 +164,6 @@ impl IsJsonUdf {
 }
 
 impl ScalarUDFImpl for IsJsonUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "IS_JSON"
     }

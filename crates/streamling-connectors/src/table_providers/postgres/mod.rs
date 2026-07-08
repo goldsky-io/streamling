@@ -26,7 +26,6 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
 use projection::build_projection_for_postgres;
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use streamling_config::PostgresSinkConfig;
@@ -108,10 +107,6 @@ impl PostgresSinkTableProvider {
 
 #[async_trait]
 impl TableProvider for PostgresSinkTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -236,10 +231,6 @@ impl PostgresSinkExec {
 
 #[async_trait]
 impl DataSink for PostgresSinkExec {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }

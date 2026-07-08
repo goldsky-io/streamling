@@ -35,6 +35,7 @@ pub fn from_base58_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
             ColumnarValue::Scalar(_) => 1,
         },
         return_field: Arc::new(arrow_schema::Field::new("result", DataType::Binary, false)),
+        config_options: Arc::new(datafusion::config::ConfigOptions::default()),
     };
 
     unary_string_to_binary(&args_wrapper, "from_base58", |base58_str| {

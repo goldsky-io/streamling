@@ -41,7 +41,6 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use extism::{Manifest, Plugin, Pool, Wasm};
 use futures::StreamExt;
-use std::any::Any;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -187,7 +186,7 @@ impl WasmRunnerNode {
         } else {
             // Convert input schema to Arrow schema
             let df_schema = self.input.schema();
-            let arrow_schema = Schema::from(df_schema.as_ref().clone());
+            let arrow_schema = df_schema.as_arrow().clone();
             Ok(Arc::new(arrow_schema))
         }
     }
@@ -309,7 +308,7 @@ struct WasmRunnerExec {
     script: String,
     runtime_wasm_file_path: Option<String>,
     internal_buffer_size: u32,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
     schema: SchemaRef,
     /// Number of WASM plugin instances in the pool
     parallelism: usize,
@@ -358,7 +357,7 @@ impl WasmRunnerExec {
             script,
             runtime_wasm_file_path,
             internal_buffer_size,
-            cache,
+            cache: Arc::new(cache),
             schema,
             parallelism,
             batch_size,
@@ -433,11 +432,7 @@ impl ExecutionPlan for WasmRunnerExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -536,8 +531,8 @@ impl ExecutionPlan for WasmRunnerExec {
         Ok(builder.build())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 }
 

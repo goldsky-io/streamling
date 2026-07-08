@@ -6,7 +6,6 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use lazy_static::lazy_static;
-use std::any::Any;
 use std::sync::{Arc, RwLock};
 use streamling_plugin::{PluginUdfDescriptor, SafeArrowColumn, SafeUdfArg};
 use tracing::info;
@@ -83,6 +82,28 @@ struct PluginScalarUdf {
     ) -> RResult<SafeArrowColumn, RString>,
 }
 
+// UDF identity (required by df54's `ScalarUDFImpl: DynEq + DynHash`) is defined by the
+// descriptor fields. `invoke_fn` is excluded — comparing function pointers is not
+// meaningful (addresses are not guaranteed unique) and a plugin UDF is identified by
+// its name/signature/return type.
+impl PartialEq for PluginScalarUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.aliases == other.aliases
+            && self.signature == other.signature
+            && self.return_type == other.return_type
+    }
+}
+impl Eq for PluginScalarUdf {}
+impl std::hash::Hash for PluginScalarUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.aliases.hash(state);
+        self.signature.hash(state);
+        self.return_type.hash(state);
+    }
+}
+
 impl PluginScalarUdf {
     fn new(
         name: String,
@@ -122,10 +143,6 @@ impl PluginScalarUdf {
 }
 
 impl ScalarUDFImpl for PluginScalarUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }

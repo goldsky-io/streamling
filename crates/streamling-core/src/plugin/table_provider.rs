@@ -16,7 +16,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
@@ -40,7 +39,7 @@ use tracing::{debug, error, warn};
 struct PluginSourceExec {
     schema: SchemaRef,
     plugin_channels: Arc<PluginChannels>,
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
     internal_buffer_size: u32,
     metric_metadata_id: String,
 }
@@ -56,7 +55,7 @@ impl PluginSourceExec {
         Self {
             schema,
             plugin_channels,
-            cached_properties,
+            cached_properties: Arc::new(cached_properties),
             internal_buffer_size,
             metric_metadata_id,
         }
@@ -86,11 +85,7 @@ impl ExecutionPlan for PluginSourceExec {
         "PluginSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -316,10 +311,6 @@ impl PluginSourceProvider {
 
 #[async_trait]
 impl TableProvider for PluginSourceProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -370,10 +361,6 @@ impl PluginSink {
 
 #[async_trait]
 impl DataSink for PluginSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -542,10 +529,6 @@ impl PluginSinkProvider {
 
 #[async_trait]
 impl TableProvider for PluginSinkProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

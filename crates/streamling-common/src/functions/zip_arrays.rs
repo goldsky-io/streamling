@@ -6,7 +6,6 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::functions::util::{get_all_args_as_type, validate_arg_count};
@@ -37,7 +36,7 @@ use crate::streamling_user_err;
 /// FROM source
 /// CROSS JOIN UNNEST(_gs_zip_arrays(ids, values)) AS t (id, value)
 /// ```
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ZipArraysFunc {
     signature: Signature,
 }
@@ -57,10 +56,6 @@ impl ZipArraysFunc {
 }
 
 impl ScalarUDFImpl for ZipArraysFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_zip_arrays"
     }
@@ -74,10 +69,13 @@ impl ScalarUDFImpl for ZipArraysFunc {
 
         for (i, arg_type) in arg_types.iter().enumerate() {
             if let DataType::List(field) = arg_type {
+                // The execution path builds these struct fields as nullable (zipped
+                // elements may be absent); df54 asserts produced == promised, so the
+                // declared nullability must match the produced one (always `true`).
                 field_types.push(Field::new(
                     format!("f{}", i),
                     field.data_type().clone(),
-                    field.is_nullable(),
+                    true,
                 ));
             } else {
                 return Err(streamling_user_err!(
@@ -100,10 +98,12 @@ impl ScalarUDFImpl for ZipArraysFunc {
 
         for (i, field) in args.arg_fields.iter().enumerate() {
             if let DataType::List(list_field) = field.data_type() {
+                // Match the produced struct field nullability (always `true`) — see note
+                // in `return_type`; df54 asserts the produced array type equals this.
                 field_types.push(Field::new(
                     format!("f{}", i),
                     list_field.data_type().clone(),
-                    list_field.is_nullable(),
+                    true,
                 ));
             } else {
                 return Err(streamling_user_err!(
@@ -226,6 +226,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(Field::new("result", DataType::Null, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -291,6 +292,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(Field::new("result", DataType::Null, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -355,6 +357,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(Field::new("result", DataType::Null, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args);

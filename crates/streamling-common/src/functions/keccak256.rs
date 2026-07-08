@@ -6,7 +6,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use sha3::{Digest, Keccak256};
-use std::any::Any;
 use std::sync::Arc;
 
 /// Provides Keccak256 cryptographic hashing for strings.
@@ -24,7 +23,7 @@ use std::sync::Arc;
 /// # Examples
 /// * `keccak256('hello')` returns hash of UTF-8 bytes
 /// * `keccak256('0xdeadbeef')` returns hash of hex-decoded bytes
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Keccak256Func {
     signature: Signature,
 }
@@ -44,10 +43,6 @@ impl Keccak256Func {
 }
 
 impl ScalarUDFImpl for Keccak256Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_keccak256"
     }
@@ -105,6 +100,7 @@ mod tests {
             ))],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -134,6 +130,7 @@ mod tests {
             ))],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -163,6 +160,7 @@ mod tests {
             ))],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

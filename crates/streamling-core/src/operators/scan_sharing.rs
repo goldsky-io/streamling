@@ -8,9 +8,10 @@ use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use futures::StreamExt;
 use once_cell::sync::Lazy;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -161,17 +162,40 @@ impl SharedSourceHandle {
     }
 }
 
-/// Execution plan that broadcasts data from a source to multiple consumers
+/// Execution plan that broadcasts data from a source to multiple consumers.
+///
+/// A shared source broadcasts full rows so that consumers with different column
+/// projections can share one scan. Each consumer applies its own `projection`
+/// (column indices into the shared source's full schema) to the broadcast batches,
+/// keeping the physical schema aligned with the logical plan — which DataFusion 54
+/// strictly enforces for extension nodes. Projecting inside this operator (rather
+/// than wrapping it in a separate projection node) preserves the broadcast
+/// consumer-registration timing and the per-batch schema metadata that carries
+/// streamling's checkpoint signals.
 #[derive(Debug)]
 pub struct BroadcastingExec {
     handle: Arc<SharedSourceHandle>,
-    cache: PlanProperties,
+    /// Column indices into the shared source's full schema, or `None` for all columns.
+    projection: Option<Arc<[usize]>>,
+    /// Output schema after applying `projection` (full schema when `None`).
+    schema: SchemaRef,
+    cache: Arc<PlanProperties>,
 }
 
 impl BroadcastingExec {
-    pub fn new(handle: Arc<SharedSourceHandle>) -> Self {
-        let cache = Self::compute_properties(handle.schema());
-        Self { handle, cache }
+    pub fn new(handle: Arc<SharedSourceHandle>, projection: Option<Vec<usize>>) -> Result<Self> {
+        let projection: Option<Arc<[usize]>> = projection.map(Arc::from);
+        let schema: SchemaRef = match &projection {
+            Some(indices) => Arc::new(handle.schema().project(indices)?),
+            None => handle.schema(),
+        };
+        let cache = Self::compute_properties(schema.clone());
+        Ok(Self {
+            handle,
+            projection,
+            schema,
+            cache: Arc::new(cache),
+        })
     }
 
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
@@ -205,11 +229,7 @@ impl ExecutionPlan for BroadcastingExec {
         "BroadcastingExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -233,6 +253,22 @@ impl ExecutionPlan for BroadcastingExec {
         let consumer = broadcast.add_consumer();
         self.handle.register_consumer();
         self.handle.start_if_needed(partition, context)?;
-        Ok(Box::pin(consumer))
+
+        match &self.projection {
+            // Apply the consumer's projection to each broadcast batch. `RecordBatch::project`
+            // preserves the batch's schema metadata (checkpoint signals), so this is
+            // transparent to the streaming/checkpoint protocol.
+            Some(indices) => {
+                let indices = indices.clone();
+                let projected = consumer.map(move |item| {
+                    item.and_then(|batch| batch.project(&indices).map_err(Into::into))
+                });
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    projected,
+                )))
+            }
+            None => Ok(Box::pin(consumer)),
+        }
     }
 }
