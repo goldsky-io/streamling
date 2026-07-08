@@ -5,8 +5,9 @@ use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Message, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use schema_registry_converter::async_impl::avro::{AvroDecoder, AvroEncoder};
 use schema_registry_converter::async_impl::schema_registry::{post_schema, SrSettings};
@@ -167,6 +168,81 @@ impl KafkaResource {
             op
         );
         Ok(())
+    }
+
+    /// Bulk-produce `count` Avro records for benchmark preloading.
+    ///
+    /// Pre-encodes a pool of `distinct` payloads once via `generate`, then
+    /// fire-and-forget produces `count` records by cycling the pool with a
+    /// `dbz.op="c"` header (so the source synthesizes `_gs_op='i'`). Unlike
+    /// [`Self::produce_avro_records`], deliveries are not awaited per record — a
+    /// single `flush` at the end waits for all in-flight messages. That is the
+    /// difference between seconds and hours when loading millions of rows.
+    ///
+    /// The schema must already be registered (see [`Self::register_schema`]).
+    /// Returns the average encoded payload size in bytes, for byte-throughput
+    /// reporting.
+    ///
+    /// Panics if `distinct` is zero (there would be no payloads to cycle).
+    pub async fn produce_avro_bulk<T, F>(
+        &self,
+        count: u64,
+        distinct: u32,
+        generate: F,
+    ) -> Result<u64>
+    where
+        T: Serialize,
+        F: Fn(u64) -> T,
+    {
+        assert!(distinct > 0, "produce_avro_bulk requires distinct > 0");
+
+        let encoder = AvroEncoder::new(self.sr_settings.clone());
+        let subject_strategy = SubjectNameStrategy::TopicNameStrategy(self.topic.clone(), false);
+
+        // Non-empty by the assert above, so indexing and division are safe.
+        let mut pool: Vec<Vec<u8>> = Vec::with_capacity(distinct as usize);
+        for i in 0..distinct as u64 {
+            let payload = encoder
+                .encode_struct(generate(i), &subject_strategy)
+                .await
+                .map_err(|e| E2eError::Kafka(e.to_string()))?;
+            pool.push(payload);
+        }
+        let avg_payload_bytes = (pool.iter().map(|p| p.len()).sum::<usize>() / pool.len()) as u64;
+
+        for i in 0..count {
+            let payload = &pool[(i as usize) % pool.len()];
+            let mut record = FutureRecord::to(&self.topic)
+                .payload(payload.as_slice())
+                .key("")
+                .headers(OwnedHeaders::new().insert(Header {
+                    key: "dbz.op",
+                    value: Some("c"),
+                }));
+
+            // Fire-and-forget: enqueue without awaiting delivery, backing off
+            // only when the local producer queue fills up.
+            loop {
+                match self.producer.send_result(record) {
+                    Ok(_delivery) => break,
+                    Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), rejected)) => {
+                        record = rejected;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err((e, _)) => return Err(E2eError::Kafka(e.to_string())),
+                }
+            }
+        }
+
+        self.producer
+            .flush(Timeout::After(Duration::from_secs(120)))
+            .map_err(|e| E2eError::Kafka(e.to_string()))?;
+
+        info!(
+            "Bulk-produced {} Avro records to topic {} (avg {} bytes/payload)",
+            count, self.topic, avg_payload_bytes
+        );
+        Ok(avg_payload_bytes)
     }
 
     /// Produce raw bytes to the topic

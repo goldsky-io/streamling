@@ -1,0 +1,130 @@
+name: streamling-bench
+
+# Manual end-to-end throughput benchmark.
+#   - Preloads Kafka (Avro/CDC) and runs kafka -> sql transform -> blackhole sink.
+#   - Compares each scenario to its committed baseline and uploads the results JSON.
+#
+# Trigger:
+#   gh workflow run streamling-bench.yml --ref main
+#
+# Baselines are keyed by runner label (blacksmith-8vcpu). Only compare runs from
+# the same runner — absolute throughput is machine-specific. Re-seed a baseline
+# by committing the uploaded results JSON to bench/baselines/blacksmith-8vcpu/.
+
+on:
+  workflow_dispatch:
+    inputs:
+      records:
+        description: "Source records preloaded per iteration"
+        required: false
+        default: "5000000"
+      iterations:
+        description: "Measured iterations (excludes warmup)"
+        required: false
+        default: "5"
+      warmup:
+        description: "Warmup iterations (discarded)"
+        required: false
+        default: "1"
+
+concurrency:
+  group: streamling-bench
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      BENCH_RUNNER_LABEL: blacksmith-8vcpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Setup rust cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          shared-key: "v0-streamling-bench"
+          cache-targets: true
+          cache-on-failure: true
+
+      # Build the release binary the benchmark drives (the harness runs it as a
+      # subprocess). streamling-bench itself is built by `cargo run` below, which
+      # also runs streamling from crates/streamling — identical to `just bench`.
+      - name: Build streamling (release)
+        run: cargo build --release -p streamling
+
+      # Infrastructure setup (mirrors the e2e job).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Pre-pull benchmark images
+        run: |
+          set -euo pipefail
+          images=(
+            "postgres:15-alpine"
+            "redpandadata/redpanda:v24.2.4"
+            "prom/prometheus:latest"
+            "rancher/k3s:v1.28.4-k3s1"
+          )
+          for image in "${images[@]}"; do
+            echo "Pulling $image"
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                break
+              fi
+              echo "Retrying $image pull (attempt $attempt/3)..."
+              sleep 5
+            done
+          done
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+      - name: Setup k3s cluster
+        run: ./scripts/k3s-setup.sh
+        timeout-minutes: 5
+
+      - name: Run benchmark
+        run: |
+          set -euo pipefail
+          eval "$(./scripts/k3s-setup.sh --env-only)"
+          export E2E_STREAMLING_BIN="$(pwd)/target/release/streamling"
+          export E2E_SHOW_STREAMLING_OUTPUT=0
+          export BENCH_GIT_SHA="${GITHUB_SHA}"
+          mkdir -p bench-results
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo run -q --release -p streamling-bench -- \
+            --records "${{ inputs.records }}" \
+            --iterations "${{ inputs.iterations }}" \
+            --warmup "${{ inputs.warmup }}" \
+            --out-dir bench-results \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+        env:
+          # Keep stdout to the human report; silence info-level harness logs.
+          RUST_LOG: warn
+          STREAMLING__PLUGIN__PATH: ""
+          STREAMLING__PLUGIN__PREPROCESSOR_IDS: ""
+        timeout-minutes: 30
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results/
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n streamling-e2e -o wide
+          echo ""
+          echo "=== Pod Events ==="
+          kubectl get events -n streamling-e2e --sort-by='.lastTimestamp' | tail -30
+          echo ""
+          echo "=== Pod Logs ==="
+          for pod in $(kubectl get pods -n streamling-e2e -o name); do
+            echo "--- $pod ---"
+            kubectl logs $pod -n streamling-e2e --tail=100 || true
+          done

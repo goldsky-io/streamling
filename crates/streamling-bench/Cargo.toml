@@ -1,0 +1,26 @@
+[package]
+name = "streamling-bench"
+version = "0.2.0"
+edition = "2021"
+description = "End-to-end throughput benchmark harness for streamling"
+license-file.workspace = true
+repository.workspace = true
+# Internal tooling: never published to crates.io (and absent from the release
+# publish list in streamling-release.yml).
+publish = false
+
+[dependencies]
+# Reuses the e2e harness (TestContext, KafkaResource, PrometheusResource) to
+# drive the real streamling binary against the shared k3s stack.
+streamling-e2e = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "time"] }
+clap = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Forces the decimal field to serialize as Avro `bytes` (not an int array) so it
+# resolves to an Avro decimal logical type.
+serde_bytes = "0.11"
+anyhow = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
