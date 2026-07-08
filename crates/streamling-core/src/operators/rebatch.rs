@@ -52,6 +52,25 @@ impl RebatchExec {
             name,
         }
     }
+
+    /// The wrapped execution plan. `children()` delegates to `inner`, so it is
+    /// *see-through* (it exposes `inner`'s children, not `inner` itself); use
+    /// this accessor when you need the wrapped node directly — e.g. the
+    /// `DownstreamAttributionRule`, which must recurse into `inner` so the
+    /// `WrappingExec` it wraps is not skipped.
+    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.inner
+    }
+
+    /// Rebuild this `RebatchExec` around a new `inner`, preserving batch config.
+    pub fn clone_with_inner(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
+        RebatchExec::new(
+            inner,
+            self.batch_size,
+            self.batch_flush_interval,
+            self.name.clone(),
+        )
+    }
 }
 
 impl ExecutionPlan for RebatchExec {

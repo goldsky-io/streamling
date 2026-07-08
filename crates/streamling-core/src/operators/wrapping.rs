@@ -358,6 +358,15 @@ impl TableProvider for WrappingSourceTableProvider {
                 true,
             );
 
+            // This sub-plan is stashed in the SharedSourceHandle below and is
+            // unreachable by the main DownstreamAttributionRule pass. Attribute
+            // its upstream edges now (e.g. source -> this producer) so they carry
+            // a `downstream_id` instead of emitting an untagged `blocked` series;
+            // the producer's own WrappingExec stays suppressed (its per-consumer
+            // edges are emitted by the BroadcastStream).
+            let wrapped_exec =
+                crate::optimizer::attribute_scan_shared_producer_base_exec(wrapped_exec)?;
+
             // Get internal_buffer_size from Session config
             let internal_buffer_size =
                 get_streamling_config_from_session(state)?.internal_buffer_size;
@@ -554,6 +563,31 @@ impl WrappingExec {
     pub fn clone_with_role(&self, role: BackpressureRole) -> Self {
         let mut cloned = self.clone();
         cloned.backpressure_role = role;
+        cloned
+    }
+
+    /// The immediate wrapped plan. `children()` is *see-through* (it delegates to
+    /// `inner`, exposing `inner`'s children rather than `inner` itself), so the
+    /// `DownstreamAttributionRule` must use this accessor to recurse into `inner`
+    /// directly — otherwise an adjacent `WrappingExec` (e.g. an elided-identity
+    /// transform sitting directly on its source) would be skipped and never
+    /// stamped.
+    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.inner
+    }
+
+    /// Clone this node with a different `backpressure_role` **and** a new `inner`.
+    /// Attribution preserves schema/partitioning, so the cached `adjusted_schema`
+    /// carries over unchanged. Used by the attribution rule to rebuild after
+    /// recursing into `inner` (see `inner`).
+    pub fn clone_with_role_and_inner(
+        &self,
+        role: BackpressureRole,
+        inner: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.backpressure_role = role;
+        cloned.inner = inner;
         cloned
     }
 }
@@ -1155,8 +1189,22 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             existing_handle.clone(),
                         ))))
                     } else {
-                        // Create and store the handle for this transform
-                        let schema = exec.schema();
+                        // Create and store the handle for this transform.
+                        // `exec` (the suppressed producer WrappingExec plus its
+                        // whole upstream sub-plan) is stashed as the handle's
+                        // base_exec BEFORE the DownstreamAttributionRule runs, so
+                        // the main pass can't reach it. Attribute its upstream
+                        // edges now (e.g. `up_source -> this producer`) so they
+                        // carry a `downstream_id` instead of emitting an untagged
+                        // `blocked` series; the producer's own WrappingExec stays
+                        // suppressed (its per-consumer edges come from the
+                        // BroadcastStream). Mirrors the source path in
+                        // `WrappingSourceTableProvider::scan`.
+                        let attributed_exec =
+                            crate::optimizer::attribute_scan_shared_producer_base_exec(
+                                exec.clone(),
+                            )?;
+                        let schema = attributed_exec.schema();
                         let internal_buffer_size =
                             get_streamling_config(session_state)?.internal_buffer_size;
                         let expected_count =
@@ -1164,7 +1212,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                                 .unwrap_or(0);
                         let handle = Arc::new(SharedSourceHandle::new(
                             schema,
-                            exec.clone(),
+                            attributed_exec,
                             internal_buffer_size,
                             expected_count,
                             Some(Arc::from(reference_name.as_str())),

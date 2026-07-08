@@ -1,6 +1,7 @@
 use crate::operators::broadcast::MultiSinkExec;
 use crate::operators::filter::StreamingFilterExec;
 use crate::operators::projection::StreamingProjectionExec;
+use crate::operators::rebatch::RebatchExec;
 use crate::operators::scan_sharing::BroadcastingExec;
 use crate::operators::unnest::StreamingUnnestExec;
 use crate::operators::wrapping::{BackpressureRole, WrappingDataSink, WrappingExec};
@@ -221,19 +222,21 @@ fn attribute_downstream(
         } else {
             BackpressureRole::Unattributed
         };
-        // Owned once so its `&str` can be lent to every child recursion below.
         let child_downstream = get_reference_name_from_metric_key(wrapping.reference_name());
-        let new_children = wrapping
-            .children()
-            .into_iter()
-            .map(|child| {
-                attribute_downstream(Arc::clone(child), Some(child_downstream.as_str()), false)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Rebuild the node with the stamped role (only `backpressure_role`
-        // changes — see WrappingExec::clone_with_role).
-        let stamped: Arc<dyn ExecutionPlan> = Arc::new(wrapping.clone_with_role(role));
-        return stamped.with_new_children(new_children);
+        // Recurse into the *immediate* `inner`, not `children()`. `WrappingExec`'s
+        // `children()` is see-through (delegates to `inner`), so using it would
+        // skip an adjacent `WrappingExec` — e.g. an elided-identity transform
+        // sitting directly on its source, where `W(transform)` wraps `W(source)`
+        // with no compute node between. Descending into `inner` visits and stamps
+        // that source instead of jumping past it to its grandchildren.
+        let attributed_inner = attribute_downstream(
+            Arc::clone(wrapping.inner()),
+            Some(child_downstream.as_str()),
+            false,
+        )?;
+        return Ok(Arc::new(
+            wrapping.clone_with_role_and_inner(role, attributed_inner),
+        ));
     }
 
     // BroadcastingExec: scan-sharing leaf. Attribute to the immediate consumer.
@@ -255,6 +258,22 @@ fn attribute_downstream(
             )),
             None => Ok(Arc::clone(&node)),
         };
+    }
+
+    // RebatchExec: a see-through wrapper inserted above a sink's feeding transform
+    // when the sink sets `batch_size` (single-sink path). Its `children()`
+    // delegates to `inner`, so the generic traversal below would expose `inner`'s
+    // children and skip the wrapped `WrappingExec` — leaving the feeding transform
+    // untagged and stamping the sink name one node too far upstream. Recurse into
+    // `inner` directly; rebatch is not itself an edge endpoint, so the named
+    // downstream passes through unchanged.
+    if let Some(rebatch) = node.as_any().downcast_ref::<RebatchExec>() {
+        let attributed_inner = attribute_downstream(
+            Arc::clone(rebatch.inner()),
+            named_downstream,
+            suppress_next_wrapping,
+        )?;
+        return Ok(Arc::new(rebatch.clone_with_inner(attributed_inner)));
     }
 
     // DataSinkExec (root of a sink plan): the sink is the named downstream for
@@ -280,8 +299,8 @@ fn attribute_downstream(
         return node.with_new_children(new_children);
     }
 
-    // Generic node (filters, projections, rebatch, ...): pass the context through
-    // unchanged — it is not a named edge endpoint.
+    // Generic node (filters, projections, coalesce, ...): pass the context
+    // through unchanged — it is not a named edge endpoint.
     if node.children().is_empty() {
         return Ok(node);
     }
@@ -293,6 +312,25 @@ fn attribute_downstream(
         })
         .collect::<Result<Vec<_>>>()?;
     node.with_new_children(new_children)
+}
+
+/// Attribute the edges inside a scan-shared producer's stashed `base_exec`.
+///
+/// When a node has multiple consumers, scan sharing stashes the producer's whole
+/// sub-plan (`WrappingExec(producer) -> ... -> WrappingExec(source)`) inside a
+/// `SharedSourceHandle` *before* `DownstreamAttributionRule` runs, so the
+/// main-plan pass never reaches it. Without this, the upstream edges (e.g.
+/// `source -> producer`) emit an untagged `blocked` series (no `downstream_id`).
+///
+/// Run the same top-down attribution over `base_exec` at construction: the
+/// producer's own `WrappingExec` is already suppressed (`FanOutProducer`) — its
+/// per-consumer edges are emitted by the `BroadcastStream` — so it is preserved,
+/// while every upstream `WrappingExec` gets an `Edge(<nearest named downstream>)`
+/// stamp (the producer for the immediate source, and so on up the chain).
+pub(crate) fn attribute_scan_shared_producer_base_exec(
+    base_exec: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    attribute_downstream(base_exec, None, false)
 }
 
 impl PhysicalOptimizerRule for DownstreamAttributionRule {
@@ -332,6 +370,7 @@ impl StreamlingPhysicalOptimizerRules {
 mod attribution_tests {
     use super::*;
     use crate::operators::broadcast::MultiSinkExec;
+    use crate::operators::rebatch::RebatchExec;
     use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle};
     use crate::operators::wrapping::WrappingExec;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -367,6 +406,12 @@ mod attribution_tests {
             vec![],
             None,
         ))
+    }
+
+    /// A single-sink `RebatchExec` (see-through `children()`, like the one the
+    /// webhook/single-sink path inserts above the feeding transform).
+    fn rebatch(inner: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(RebatchExec::new(inner, 8192, None, "rebatch".to_string()))
     }
 
     #[derive(Debug)]
@@ -442,6 +487,38 @@ mod attribution_tests {
             BackpressureRole::Edge("pg_sink".to_string())
         );
         let w_src = child(&w_sql, 0);
+        assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
+    }
+
+    /// Regression: two `WrappingExec`s directly adjacent (no compute node between,
+    /// as when an identity `SELECT` projection is elided so `W(sql)` wraps
+    /// `W(source)` directly) must BOTH be stamped. `WrappingExec::children()` is
+    /// see-through, so a `children()`-based walk would skip the inner `W(source)`;
+    /// the rule recurses into `inner()` instead. Before that change the inner
+    /// source stayed `Unattributed` (untagged) — this is the true root cause of
+    /// the scan-share upstream-edge bug, which `mid()` masked in the tests above.
+    #[test]
+    fn adjacent_wrappers_without_compute_node_all_get_stamps() {
+        // DataSinkExec(pg_sink) <- W(sql) <- W(source) <- leaf  (no `mid`)
+        let plan = sink(
+            wrap(wrap(leaf(), "app::source"), "app::sql"),
+            "app::pg_sink",
+        );
+        let optimized = run(plan);
+
+        let w_sql = child(&optimized, 0);
+        assert_eq!(
+            role_of(&w_sql),
+            BackpressureRole::Edge("pg_sink".to_string())
+        );
+        // `child(&w_sql, 0)` would see-through past W(source); reach it via inner().
+        let w_src = Arc::clone(
+            w_sql
+                .as_any()
+                .downcast_ref::<WrappingExec>()
+                .expect("expected a WrappingExec")
+                .inner(),
+        );
         assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
     }
 
@@ -580,5 +657,136 @@ mod attribution_tests {
         let plan = wrap(leaf(), "app::orphan");
         let optimized = run(plan);
         assert_eq!(role_of(&optimized), BackpressureRole::Unattributed);
+    }
+
+    /// Regression (QA case B/D): a single-sink `RebatchExec` (inserted above the
+    /// feeding transform when a sink sets `batch_size`) must not hide that
+    /// transform from attribution. `RebatchExec::children()` is see-through
+    /// (delegates to `inner`), so the generic traversal would skip the wrapped
+    /// `WrappingExec`, leaving the feeding transform untagged and stamping the
+    /// sink name one node too far upstream. The rule recurses into `inner`
+    /// instead.
+    #[test]
+    fn rebatch_before_sink_still_attributes_feeding_transform() {
+        // DataSinkExec(web_sink) <- RebatchExec <- W(sql) <- mid <- W(source) <- leaf
+        let plan = sink(
+            rebatch(wrap(mid(wrap(leaf(), "app::source")), "app::sql")),
+            "app::web_sink",
+        );
+        let optimized = run(plan);
+
+        // The sink's child is the RebatchExec; get the transform it wraps.
+        let rebatch_node = child(&optimized, 0);
+        let w_sql = Arc::clone(
+            rebatch_node
+                .as_any()
+                .downcast_ref::<RebatchExec>()
+                .expect("expected a RebatchExec")
+                .inner(),
+        );
+        // The transform feeding the sink is attributed to the sink...
+        assert_eq!(
+            role_of(&w_sql),
+            BackpressureRole::Edge("web_sink".to_string())
+        );
+        // ...and its upstream source is attributed to the transform (not the sink).
+        let w_src = child(&w_sql, 0);
+        assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
+    }
+
+    /// Regression (latent variant of bug 2): a single-sink `RebatchExec` directly
+    /// above a scan-sharing `BroadcastingExec` (a sink reading the shared source
+    /// directly with `batch_size` set, no transform between) must still attribute
+    /// the leaf to the sink. Before the `RebatchExec` branch, its see-through
+    /// `children()` exposed the leaf's *empty* children, so the generic traversal
+    /// returned early and the `BroadcastingExec` was never stamped (untagged).
+    #[test]
+    fn rebatch_above_broadcasting_leaf_attributes_to_sink() {
+        // DataSinkExec(pg_sink) <- RebatchExec <- BroadcastingExec (unstamped)
+        let plan = sink(rebatch(broadcasting_leaf(None)), "app::pg_sink");
+        let optimized = run(plan);
+
+        let rebatch_node = child(&optimized, 0);
+        let broadcasting_out = Arc::clone(
+            rebatch_node
+                .as_any()
+                .downcast_ref::<RebatchExec>()
+                .expect("expected a RebatchExec")
+                .inner(),
+        );
+        let broadcasting_exec = broadcasting_out
+            .as_any()
+            .downcast_ref::<BroadcastingExec>()
+            .expect("expected a BroadcastingExec");
+        assert_eq!(broadcasting_exec.downstream_id(), Some("pg_sink"));
+    }
+
+    /// Regression (QA case D): a scan-shared producer's sub-plan is stashed in the
+    /// `SharedSourceHandle` before the main pass runs, so its upstream edges are
+    /// attributed at construction via `attribute_scan_shared_producer_base_exec`.
+    /// The producer stays suppressed (its per-consumer edges come from the
+    /// `BroadcastStream`), while `source -> producer` gets an `Edge(producer)`
+    /// stamp — previously the source emitted an untagged `blocked` series.
+    #[test]
+    fn scan_shared_producer_base_exec_attributes_upstream_edges() {
+        // base_exec = W(producer)[suppressed] <- mid <- W(source) <- leaf
+        let base_exec = Arc::new(
+            WrappingExec::new(
+                mid(wrap(leaf(), "app::source")),
+                "app::producer".to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .suppress_backpressure(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let attributed = attribute_scan_shared_producer_base_exec(base_exec).unwrap();
+
+        // The producer keeps its suppression.
+        assert_eq!(role_of(&attributed), BackpressureRole::FanOutProducer);
+        // `WrappingExec::children()` is see-through (delegates to `inner`), so one
+        // hop past the producer reaches the upstream source `WrappingExec`.
+        let w_source = child(&attributed, 0);
+        assert_eq!(
+            role_of(&w_source),
+            BackpressureRole::Edge("producer".to_string())
+        );
+    }
+
+    /// Regression (real QA case D shape): the scan-shared producer's identity
+    /// projection is elided, so its stashed `base_exec` is `W(producer)[suppressed]`
+    /// wrapping `W(source)` **directly** (no compute node between). The upstream
+    /// `source -> producer` edge must still be tagged. This is the shape the e2e
+    /// exercises; the `mid()`-separated test above did not catch it because
+    /// `children()` only skips an *immediately* adjacent `WrappingExec`.
+    #[test]
+    fn scan_shared_producer_base_exec_attributes_fused_upstream_edge() {
+        // base_exec = W(producer)[suppressed] <- W(source) <- leaf  (no `mid`)
+        let base_exec = Arc::new(
+            WrappingExec::new(
+                wrap(leaf(), "app::source"),
+                "app::producer".to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .suppress_backpressure(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let attributed = attribute_scan_shared_producer_base_exec(base_exec).unwrap();
+
+        assert_eq!(role_of(&attributed), BackpressureRole::FanOutProducer);
+        let w_source = Arc::clone(
+            attributed
+                .as_any()
+                .downcast_ref::<WrappingExec>()
+                .expect("expected a WrappingExec")
+                .inner(),
+        );
+        assert_eq!(
+            role_of(&w_source),
+            BackpressureRole::Edge("producer".to_string())
+        );
     }
 }
