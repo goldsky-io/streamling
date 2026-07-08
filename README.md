@@ -40,6 +40,7 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 - [Upsert Semantics](#upsert-semantics)
 - [Plugin System](#plugin-system)
 - [Profiling](#profiling)
+- [Benchmarking](#benchmarking)
 - [Telemetry and Metrics](#telemetry-and-metrics)
 
 ## Why Streamling
@@ -1992,6 +1993,69 @@ The project can be configured to be profiled with `perf`:
 Note: the `perf` binary may need to be compiled from scratch for the version of the linux kernel used in the Kubernetes cluster.
 
 Instructions for compiling can be found [here](https://gist.github.com/sap1ens/827558883e1bd01709a52a4dedd2f10a).
+
+## Benchmarking
+
+An end-to-end throughput benchmark drives the real `streamling` binary through `Kafka (Avro/CDC) → SQL transform → blackhole sink` against the local k3s stack and reports records/sec. It is meant to catch performance regressions between releases, not to microbenchmark individual operators.
+
+The harness lives in the `streamling-bench` crate and reuses the e2e stack (Redpanda + Prometheus). It runs two scenarios:
+
+- `avro_cdc_projection` — projects/computes every row (selectivity 1.0).
+- `avro_cdc_filter` — a predicate that passes ~10% of rows (selectivity 0.1).
+
+### Running locally
+
+First bring up the local environment (see [Using k3s for Local Development](#using-k3s-for-local-development)):
+
+```bash
+just env-setup
+```
+
+Then run the benchmark. It is **report-only** — it prints a comparison against the baseline but never fails on a regression:
+
+```bash
+# Both scenarios with defaults (5M records, 5 measured iterations + 1 warmup).
+just bench
+
+# A quick run with fewer records/iterations.
+just bench --records 500000 --iterations 3 --warmup 1
+
+# A single scenario.
+just bench --scenario avro_cdc_filter
+```
+
+Each measured iteration re-reads the topic and reports:
+
+- **Input throughput** — `records / wall_clock` (the headline) plus MB/s.
+- **`compute_us_per_input_record`** — per-record compute time (microseconds) derived from `streamling_elapsed_compute_milliseconds_sum`. It excludes process startup and Kafka I/O wait, making it the most noise-resistant regression signal.
+
+Pass `--out-dir <dir>` to also write a `<scenario>.json` result file per scenario.
+
+### Baselines
+
+Baselines are committed JSON files, one per scenario, under `bench/baselines/<runner_label>/<scenario>.json`. A run compares its median against the matching baseline and flags any metric that moved past `--regression-threshold` (default `0.10`, i.e. 10%).
+
+Absolute throughput is machine-specific, so baselines are keyed by a **runner label** (`BENCH_RUNNER_LABEL`, defaults to `local`) — only compare runs from the same machine. If no baseline exists yet, the run just prints its numbers. To (re)seed the local baseline from a fresh run:
+
+```bash
+# Writes bench/baselines/local/<scenario>.json for every scenario.
+just bench-update-baseline
+
+# Or a single scenario.
+just bench-update-baseline --scenario avro_cdc_projection
+```
+
+Commit the generated files to make them the reference for future local runs.
+
+### In CI
+
+The `streamling-bench.yml` workflow runs the same benchmark manually on a fixed runner (`blacksmith-8vcpu`) so its numbers are comparable across releases:
+
+```bash
+gh workflow run streamling-bench.yml --ref main
+```
+
+It writes the comparison to the job summary and uploads the results JSON as an artifact. To update the CI baseline, download that artifact and commit its files to `bench/baselines/blacksmith-8vcpu/`.
 
 ## Telemetry and Metrics
 

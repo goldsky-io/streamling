@@ -158,3 +158,32 @@ e2e-test-inspect *TEST_UUID:
     set -euo pipefail
     eval "$(./scripts/k3s-setup.sh --env-only)"
     cargo run --bin streamling-e2e-inspect -- {{TEST_UUID}}
+
+# ============================================================================
+# Benchmarks (requires env-setup first)
+# ============================================================================
+
+# Run the end-to-end throughput benchmark (report-only): builds the release
+# binary, preloads Kafka, runs kafka -> sql -> blackhole, and compares each
+# scenario to its committed baseline. Pass extra flags, e.g.
+#   just bench --records 500000 --iterations 3
+[group('bench')]
+bench *ARGS: e2e-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(./scripts/k3s-setup.sh --env-only)"
+    export E2E_STREAMLING_BIN="$(pwd)/target/release/streamling"
+    export E2E_SHOW_STREAMLING_OUTPUT="${E2E_SHOW_STREAMLING_OUTPUT:-0}"
+    export BENCH_RUNNER_LABEL="${BENCH_RUNNER_LABEL:-local}"
+    cargo run --release -p streamling-bench -- {{ARGS}}
+
+# Re-seed benchmark baselines from a fresh run (writes bench/baselines/<runner>/).
+[group('bench')]
+bench-update-baseline *ARGS: e2e-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(./scripts/k3s-setup.sh --env-only)"
+    export E2E_STREAMLING_BIN="$(pwd)/target/release/streamling"
+    export E2E_SHOW_STREAMLING_OUTPUT="${E2E_SHOW_STREAMLING_OUTPUT:-0}"
+    export BENCH_RUNNER_LABEL="${BENCH_RUNNER_LABEL:-local}"
+    cargo run --release -p streamling-bench -- --update-baseline {{ARGS}}
