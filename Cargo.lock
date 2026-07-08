@@ -6762,6 +6762,7 @@ dependencies = [
  "streamling-state",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

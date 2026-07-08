@@ -64,3 +64,4 @@ flate2.workspace = true
 mockito.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 streamling-state = { workspace = true, features = ["test-utils"] }
+tracing-subscriber.workspace = true

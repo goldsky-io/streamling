@@ -813,6 +813,57 @@ impl KafkaSourceExec {
     }
 }
 
+fn resolved_starting_position(start_at: Option<&str>) -> (Offset, &'static str) {
+    match start_at {
+        Some("latest") => (Offset::End, "latest"),
+        _ => (Offset::Beginning, "earliest"),
+    }
+}
+
+fn kafka_offset_range(topic_partition_list: &KafkaTopicPartitionList) -> Option<(i64, i64)> {
+    let mut offsets = topic_partition_list
+        .elements()
+        .into_iter()
+        .filter_map(|topic_partition| topic_partition.offset().to_raw());
+    let first = offsets.next()?;
+
+    Some(offsets.fold((first, first), |(min, max), offset| {
+        (min.min(offset), max.max(offset))
+    }))
+}
+
+fn log_kafka_seek_from_persisted_state(
+    reference_name: &str,
+    topic: &str,
+    topic_partition_list: &KafkaTopicPartitionList,
+) {
+    let partition_count = topic_partition_list.count();
+
+    if let Some((min_offset, max_offset)) = kafka_offset_range(topic_partition_list) {
+        info!(
+            "Kafka source '{}' seeking {} partitions of topic '{}' from persisted state (offset range: {}..={})",
+            reference_name, partition_count, topic, min_offset, max_offset
+        );
+    } else {
+        info!(
+            "Kafka source '{}' seeking {} partitions of topic '{}' from persisted state (offset range unavailable)",
+            reference_name, partition_count, topic
+        );
+    }
+}
+
+fn log_kafka_seek_from_configured_starting_offsets(
+    reference_name: &str,
+    topic: &str,
+    partition_count: usize,
+    resolved_starting_position: &str,
+) {
+    info!(
+        "Kafka source '{}' seeking {} partitions of topic '{}' from configured starting_offsets (resolved starting position: {})",
+        reference_name, partition_count, topic, resolved_starting_position
+    );
+}
+
 fn is_stalled_with_lag(
     has_received_data: bool,
     elapsed_since_last_input: Duration,
@@ -1204,17 +1255,15 @@ impl ExecutionPlan for KafkaSourceExec {
             ).await;
 
             if kafka_topic_partition_list_to_seek.count() > 0 {
-                // One info! summary so the multi-partition case doesn't dump
-                // N info! lines on startup; per-partition targets stay at
-                // debug! since this fires once per pipeline lifetime.
-                info!(
-                    "Seeking {} partitions of topic '{}' from persisted state",
-                    kafka_topic_partition_list_to_seek.count(),
-                    topic
+                log_kafka_seek_from_persisted_state(
+                    &reference_name,
+                    &topic,
+                    &kafka_topic_partition_list_to_seek,
                 );
                 for topic_partition in kafka_topic_partition_list_to_seek.elements() {
                     debug!(
-                        "Seeking to topic: {}, partition: {}, offset: {}",
+                        "Kafka source '{}' seeking topic: {}, partition: {}, offset: {} from persisted state",
+                        reference_name,
                         topic_partition.topic(),
                         topic_partition.partition(),
                         topic_partition.offset().to_raw().unwrap()
@@ -1240,13 +1289,13 @@ impl ExecutionPlan for KafkaSourceExec {
             } else {
                 // No offsets found in the state backend, so we need to seek to the configured
                 // starting position (earliest/latest) for all assigned partitions
-                let target_offset = match start_at.as_deref() {
-                    Some("latest") => Offset::End,
-                    _ => Offset::Beginning, // "earliest" or default
-                };
+                let (target_offset, resolved_starting_position) =
+                    resolved_starting_position(start_at.as_deref());
 
                 debug!(
-                    "No state found, seeking all partitions to {:?}",
+                    "Kafka source '{}' found no persisted state for topic '{}', seeking all partitions to {:?} from configured starting_offsets",
+                    reference_name,
+                    topic,
                     target_offset
                 );
 
@@ -1254,6 +1303,12 @@ impl ExecutionPlan for KafkaSourceExec {
                 let mut assignment = consumer
                     .assignment()
                     .streamling_with_context(|| format!("failed to get consumer assignment (topic: {})", topic))?;
+                log_kafka_seek_from_configured_starting_offsets(
+                    &reference_name,
+                    &topic,
+                    assignment.count(),
+                    resolved_starting_position,
+                );
 
                 assignment
                     .set_all_offsets(target_offset)
@@ -1273,15 +1328,16 @@ impl ExecutionPlan for KafkaSourceExec {
                     // Per-partition seek confirmation, kept at debug! since
                     // this fires once per pipeline lifetime.
                     debug!(
-                        "Seeked to topic: {}, partition: {}, offset: {:?}",
+                        "Kafka source '{}' seeked to topic: {}, partition: {}, offset: {:?} from configured starting_offsets",
+                        reference_name,
                         topic_partition.topic(),
                         topic_partition.partition(),
                         topic_partition.offset()
                     );
                 }
                 debug!(
-                    "Seeked {} partitions of topic '{}' to start_at={:?}",
-                    seek_count, topic, target_offset
+                    "Kafka source '{}' seeked {} partitions of topic '{}' to start_at={:?} from configured starting_offsets",
+                    reference_name, seek_count, topic, target_offset
                 );
             }
 
@@ -2859,6 +2915,81 @@ impl TableProvider for KafkaSinkTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct TestLogCapture {
+        logs: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl TestLogCapture {
+        fn new() -> Self {
+            Self {
+                logs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn logs(&self) -> Vec<String> {
+            self.logs
+                .lock()
+                .expect("test log capture mutex poisoned")
+                .iter()
+                .filter(|(level, _)| *level == tracing::Level::INFO)
+                .map(|(_, message)| message.clone())
+                .collect()
+        }
+    }
+
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer<S>
+        for TestLogCapture
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+
+            if !visitor.message.is_empty() {
+                self.logs
+                    .lock()
+                    .expect("test log capture mutex poisoned")
+                    .push((*event.metadata().level(), visitor.message));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: String,
+    }
+
+    impl Visit for MessageVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    fn capture_info_logs(f: impl FnOnce()) -> Vec<String> {
+        let capture = TestLogCapture::new();
+        let subscriber = tracing_subscriber::registry()
+            .with(LevelFilter::INFO)
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        capture.logs()
+    }
 
     #[test]
     fn json_payload_to_string_rejects_empty_payload() {
@@ -2948,6 +3079,67 @@ mod tests {
         // Invariants that must always hold for the sink producer.
         assert_eq!(cfg.get("acks"), Some("all"));
         assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
+    }
+
+    #[test]
+    fn persisted_state_offset_log_includes_source_topic_count_and_offset_range() {
+        let mut topic_partition_list = KafkaTopicPartitionList::new();
+        topic_partition_list
+            .add_partition_offset("orders", 0, Offset::Offset(42))
+            .unwrap();
+        topic_partition_list
+            .add_partition_offset("orders", 1, Offset::Offset(105))
+            .unwrap();
+
+        let logs = capture_info_logs(|| {
+            log_kafka_seek_from_persisted_state("orders_source", "orders", &topic_partition_list);
+        });
+
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let message = &logs[0];
+        assert!(
+            message.contains("Kafka source 'orders_source'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("2 partitions of topic 'orders'"),
+            "{message}"
+        );
+        assert!(message.contains("from persisted state"), "{message}");
+        assert!(message.contains("offset range: 42..=105"), "{message}");
+    }
+
+    #[test]
+    fn configured_starting_offsets_log_includes_source_topic_count_and_position() {
+        let (_, resolved_starting_position) = resolved_starting_position(Some("latest"));
+
+        let logs = capture_info_logs(|| {
+            log_kafka_seek_from_configured_starting_offsets(
+                "orders_source",
+                "orders",
+                3,
+                resolved_starting_position,
+            );
+        });
+
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let message = &logs[0];
+        assert!(
+            message.contains("Kafka source 'orders_source'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("3 partitions of topic 'orders'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("from configured starting_offsets"),
+            "{message}"
+        );
+        assert!(
+            message.contains("resolved starting position: latest"),
+            "{message}"
+        );
     }
 
     #[test]
