@@ -5,7 +5,6 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 /// Converts byte arrays to hexadecimal strings.
@@ -21,7 +20,7 @@ use std::sync::Arc;
 ///
 /// # Examples
 /// * `byte_to_hex([72, 101, 108, 108, 111])` returns `'48656c6c6f'` (hex for "Hello")
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ByteToHexFunc {
     signature: Signature,
 }
@@ -41,10 +40,6 @@ impl ByteToHexFunc {
 }
 
 impl ScalarUDFImpl for ByteToHexFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_byte_to_hex"
     }
@@ -96,6 +91,7 @@ mod tests {
             ))],
             number_rows: 4,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

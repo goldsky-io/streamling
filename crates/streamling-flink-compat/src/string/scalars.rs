@@ -383,7 +383,7 @@ fn evaluate_translate(name: &str, args: ScalarFunctionArgs) -> DataFusionResult<
     finalize_row_evaluation(all_scalar, array)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SplitIndexUdf(ScalarUDF);
 
 impl SplitIndexUdf {
@@ -393,9 +393,6 @@ impl SplitIndexUdf {
 }
 
 impl ScalarUDFImpl for SplitIndexUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "split_index"
     }
@@ -410,7 +407,7 @@ impl ScalarUDFImpl for SplitIndexUdf {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SelfImpl;
 
 impl SelfImpl {
@@ -420,9 +417,6 @@ impl SelfImpl {
 }
 
 impl ScalarUDFImpl for SelfImpl {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "split_index"
     }
@@ -985,7 +979,7 @@ fn parse_url_part(url: &str, part: &str, key: Option<&str>) -> DataFusionResult<
     Ok(result)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct InstrUdf {
     signature: Signature,
 }
@@ -999,10 +993,6 @@ impl InstrUdf {
 }
 
 impl ScalarUDFImpl for InstrUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "INSTR"
     }
@@ -1020,7 +1010,7 @@ impl ScalarUDFImpl for InstrUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct LocateUdf {
     signature: Signature,
 }
@@ -1034,10 +1024,6 @@ impl LocateUdf {
 }
 
 impl ScalarUDFImpl for LocateUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "LOCATE"
     }
@@ -1055,7 +1041,7 @@ impl ScalarUDFImpl for LocateUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct BinUdf {
     signature: Signature,
 }
@@ -1069,10 +1055,6 @@ impl BinUdf {
 }
 
 impl ScalarUDFImpl for BinUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "BIN"
     }
@@ -1090,7 +1072,7 @@ impl ScalarUDFImpl for BinUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct EltUdf {
     signature: Signature,
 }
@@ -1104,10 +1086,6 @@ impl EltUdf {
 }
 
 impl ScalarUDFImpl for EltUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "ELT"
     }
@@ -1125,7 +1103,7 @@ impl ScalarUDFImpl for EltUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ParseUrlUdf {
     signature: Signature,
 }
@@ -1139,10 +1117,6 @@ impl ParseUrlUdf {
 }
 
 impl ScalarUDFImpl for ParseUrlUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "PARSE_URL"
     }
@@ -1160,7 +1134,7 @@ impl ScalarUDFImpl for ParseUrlUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct SplitUdf {
     signature: Signature,
 }
@@ -1174,10 +1148,6 @@ impl SplitUdf {
 }
 
 impl ScalarUDFImpl for SplitUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "SPLIT"
     }
@@ -1199,7 +1169,7 @@ impl ScalarUDFImpl for SplitUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct TranslateUdf {
     signature: Signature,
 }
@@ -1213,10 +1183,6 @@ impl TranslateUdf {
 }
 
 impl ScalarUDFImpl for TranslateUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "TRANSLATE3"
     }
@@ -1234,7 +1200,7 @@ impl ScalarUDFImpl for TranslateUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct UnhexUdf {
     signature: Signature,
 }
@@ -1248,10 +1214,6 @@ impl UnhexUdf {
 }
 
 impl ScalarUDFImpl for UnhexUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "UNHEX"
     }
@@ -1269,7 +1231,7 @@ impl ScalarUDFImpl for UnhexUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct UrlEncodeUdf {
     signature: Signature,
 }
@@ -1283,10 +1245,6 @@ impl UrlEncodeUdf {
 }
 
 impl ScalarUDFImpl for UrlEncodeUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "URL_ENCODE"
     }
@@ -1304,7 +1262,7 @@ impl ScalarUDFImpl for UrlEncodeUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct UrlDecodeUdf {
     signature: Signature,
 }
@@ -1318,10 +1276,6 @@ impl UrlDecodeUdf {
 }
 
 impl ScalarUDFImpl for UrlDecodeUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "URL_DECODE"
     }

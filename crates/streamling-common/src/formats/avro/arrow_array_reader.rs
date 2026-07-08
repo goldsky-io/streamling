@@ -1322,7 +1322,11 @@ where
             Value::Long(l)
             | Value::TimeMicros(l)
             | Value::TimestampMillis(l)
-            | Value::TimestampMicros(l) => NumCast::from(*l),
+            | Value::TimestampMicros(l)
+            | Value::TimestampNanos(l)
+            | Value::LocalTimestampMillis(l)
+            | Value::LocalTimestampMicros(l)
+            | Value::LocalTimestampNanos(l) => NumCast::from(*l),
             Value::Float(f) => NumCast::from(*f),
             Value::Double(f) => NumCast::from(*f),
             Value::Duration(_d) => unimplemented!(), // shenanigans type

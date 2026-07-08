@@ -11,10 +11,9 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct VolatileCurrentDateFunc {
     signature: Signature,
     aliases: Vec<String>,
@@ -36,10 +35,6 @@ impl VolatileCurrentDateFunc {
 }
 
 impl ScalarUDFImpl for VolatileCurrentDateFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "current_date"
     }

@@ -10,7 +10,6 @@ use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::{ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::{Arc, Mutex};
 use streamling_core::error::{ResultExt, StreamlingError};
@@ -737,10 +736,6 @@ impl ClickHouseTableProvider {
 
 #[async_trait]
 impl TableProvider for ClickHouseTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -762,12 +757,12 @@ impl TableProvider for ClickHouseTableProvider {
             .ok_or_else(|| streamling_err!("ClickHouseTableProvider is not a source"))?;
 
         let clickhouse_source_exec = Arc::new(ClickHouseSourceExec {
-            cached_properties: PlanProperties::new(
+            cached_properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             provider: (*self).clone(),
             split: ClickHouseSourceSplit {
                 sorting_keys: source_params.sorting_keys.clone(),
@@ -930,10 +925,6 @@ pub struct ClickHouseSinkExec {
 
 #[async_trait]
 impl DataSink for ClickHouseSinkExec {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -1246,7 +1237,7 @@ impl DisplayAs for ClickHouseSinkExec {
 
 #[derive(Debug)]
 pub struct ClickHouseSourceExec {
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
     provider: ClickHouseTableProvider,
     split: ClickHouseSourceSplit,
 }
@@ -1262,11 +1253,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
         "ClickHouseSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -2403,6 +2390,9 @@ impl ClickHouseClient {
                                     scalar_arguments: &[None],
                                 },
                             )?,
+                            config_options: ::std::sync::Arc::new(
+                                ::datafusion::config::ConfigOptions::default(),
+                            ),
                         };
                         let result = ScalarUDFImpl::invoke_with_args(&func, args)?;
                         match result {
@@ -2493,6 +2483,9 @@ impl ClickHouseClient {
                         scalar_arguments: &[None],
                     },
                 )?,
+                config_options: ::std::sync::Arc::new(
+                    ::datafusion::config::ConfigOptions::default(),
+                ),
             };
             let result = ScalarUDFImpl::invoke_with_args(&func, args)?;
             let arr = match result {
@@ -2831,12 +2824,14 @@ impl ClickHouseClient {
             },
             arrow::datatypes::DataType::Duration(_) => "Int64".to_string(),
             arrow::datatypes::DataType::Interval(_) => "String".to_string(),
-            arrow::datatypes::DataType::Decimal128(precision, scale) => {
+            arrow::datatypes::DataType::Decimal32(precision, scale)
+            | arrow::datatypes::DataType::Decimal64(precision, scale)
+            | arrow::datatypes::DataType::Decimal128(precision, scale) => {
                 if *precision <= 76 {
                     format!("Decimal({}, {})", precision, scale)
                 } else {
                     warn!(
-                        "Decimal128 with precision {} exceeds ClickHouse max (76), using String",
+                        "Decimal with precision {} exceeds ClickHouse max (76), using String",
                         precision
                     );
                     "String".to_string()
@@ -4567,7 +4562,6 @@ mod tests {
             .expect("scan should succeed");
 
         let source_exec = plan
-            .as_any()
             .downcast_ref::<ClickHouseSourceExec>()
             .expect("scan should return ClickHouseSourceExec");
 

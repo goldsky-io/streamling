@@ -11,7 +11,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
-use std::any::Any;
 use std::fmt;
 use std::fmt::Debug;
 use streamling_core::checkpoints::channels::send;
@@ -52,10 +51,6 @@ impl BlackholeSink {
 
 #[async_trait]
 impl DataSink for BlackholeSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -159,10 +154,6 @@ impl BlackholeTableProvider {
 
 #[async_trait]
 impl TableProvider for BlackholeTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

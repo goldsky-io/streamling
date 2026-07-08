@@ -15,7 +15,6 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -100,10 +99,6 @@ impl MemorySink {
 
 #[async_trait]
 impl DataSink for MemorySink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -266,10 +261,6 @@ impl MemoryTableProvider {
 
 #[async_trait]
 impl TableProvider for MemoryTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

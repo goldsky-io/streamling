@@ -25,7 +25,6 @@ use futures::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_derive::Serialize;
 use serde_json::value::RawValue;
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fmt::Debug;
@@ -139,7 +138,7 @@ impl ExtensionPlanner for ExternalHandlerExtensionPlanner {
 struct ExternalHandlerExec {
     input: Arc<dyn ExecutionPlan>,
     config: ExternalHandlerConfig,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl ExternalHandlerExec {
@@ -148,7 +147,7 @@ impl ExternalHandlerExec {
         Self {
             input,
             config,
-            cache,
+            cache: Arc::new(cache),
         }
     }
 
@@ -187,11 +186,7 @@ impl ExecutionPlan for ExternalHandlerExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -288,8 +283,8 @@ impl ExecutionPlan for ExternalHandlerExec {
         Ok(builder.build())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 }
 

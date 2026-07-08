@@ -8,7 +8,7 @@ use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum JsonConstructorNullBehavior {
     NullOnNull,
     AbsentOnNull,
