@@ -1,21 +1,16 @@
 use crate::utils::batch_accumulator::AsyncBatchAccumulator;
 use async_trait::async_trait;
-use datafusion::common::{DFSchemaRef, Result};
-use datafusion::config::ConfigOptions;
+use datafusion::common::{DFSchemaRef, Result, internal_err};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::{
     Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
-use datafusion::physical_expr::{Distribution, OrderingRequirements};
-use datafusion::physical_plan::execution_plan::{CardinalityEffect, InvariantLevel};
-use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use delegate::delegate;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -53,42 +48,66 @@ impl RebatchExec {
     }
 }
 
+/// RebatchExec must be a *real* plan node, not a transparent alias for its
+/// input. It used to `delegate!` most `ExecutionPlan` methods to `self.inner`
+/// — including `children()` and the optimizer-negotiation hooks
+/// (`try_swapping_with_projection`, `with_fetch`, `repartitioned`,
+/// `supports_limit_pushdown`). Each of those hooks returns a rewritten
+/// subtree that does NOT contain this wrapper, so DataFusion 54's hook-driven
+/// physical optimizer rules (e.g. ProjectionPushdown) replaced the wrapper
+/// with the returned plan and silently deleted the rebatcher; sinks then
+/// received raw per-scan batches (one INSERT round-trip per scan batch on
+/// Postgres). The hooks now fall back to the trait's no-op defaults, making
+/// this node an optimizer barrier — see tests/rebatch_elision.rs.
 impl ExecutionPlan for RebatchExec {
-    delegate! {
-        to self.inner {
-            fn name(&self) -> &str;
-            fn schema(&self) -> arrow_schema::SchemaRef;
-            fn properties(&self) -> &Arc<PlanProperties>;
-            fn check_invariants(&self, check: InvariantLevel) -> Result<()>;
-            fn required_input_distribution(&self) -> Vec<Distribution>;
-            fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>>;
-            fn maintains_input_order(&self) -> Vec<bool>;
-            fn benefits_from_input_partitioning(&self) -> Vec<bool>;
-            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
-            fn repartitioned(
-                &self,
-                target_partitions: usize,
-                config: &ConfigOptions,
-            ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
-            fn metrics(&self) -> Option<MetricsSet>;
-            fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
-            fn supports_limit_pushdown(&self) -> bool;
-            fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>>;
-            fn cardinality_effect(&self) -> CardinalityEffect;
-            fn try_swapping_with_projection(
-                &self,
-                projection: &ProjectionExec,
-            ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
-        }
+    fn name(&self) -> &str {
+        "RebatchExec"
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        // Row-, order-, and partitioning-preserving: the input's properties
+        // describe this node's output too.
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // Rebatching is per-partition stream accumulation; don't invite the
+        // optimizer to insert repartitions below it.
+        vec![false]
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.inner.partition_statistics(partition)
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let new_inner = self.inner.clone().with_new_children(children)?;
+        if children.len() != 1 {
+            return internal_err!(
+                "RebatchExec expects exactly one child, got {}",
+                children.len()
+            );
+        }
         Ok(Arc::new(RebatchExec::new(
-            new_inner,
+            children.swap_remove(0),
             self.batch_size,
             self.batch_flush_interval,
             self.name.clone(),
