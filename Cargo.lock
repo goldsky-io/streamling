@@ -6891,6 +6891,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamling-bench"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "streamling-e2e",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "streamling-common"
 version = "0.2.0"
 dependencies = [
