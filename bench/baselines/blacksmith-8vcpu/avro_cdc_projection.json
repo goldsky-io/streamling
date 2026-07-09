@@ -1,0 +1,19 @@
+{
+  "scenario": "avro_cdc_projection",
+  "format": "avro",
+  "selectivity": 1.0,
+  "records": 5000000,
+  "payload_bytes": 76,
+  "iterations": 5,
+  "wall_clock_seconds_median": 46.333442308,
+  "wall_clock_seconds_min": 46.240698559,
+  "input_rows": 5000000,
+  "throughput_input_records_per_sec_median": 107913.41525550094,
+  "throughput_output_records_per_sec_median": 107913.41525550094,
+  "throughput_mb_per_sec_median": 8.20141955941807,
+  "compute_us_per_input_record_median": 29.0184,
+  "source_output_rows_observed": 5000000,
+  "runner_label": "blacksmith-8vcpu",
+  "version": "9abfd93f38e3d5a9268d1ac2dca784e07dd515d4",
+  "timestamp_unix_secs": 1783555266
+}
