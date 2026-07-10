@@ -2242,8 +2242,7 @@ impl ClickHouseClient {
                 "ClickHouse returned an error body while listing columns of '{}': {}",
                 table_name,
                 body.lines().next().unwrap_or_default()
-            )
-            .into());
+            ));
         }
         Ok(body
             .lines()
