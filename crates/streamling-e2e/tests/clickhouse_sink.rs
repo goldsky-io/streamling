@@ -895,11 +895,22 @@ sinks:
     table: append_only_false_update_test
     primary_key: id
     append_only_mode: false
+    batch_size: 1
 "#,
         topic = ctx.kafka_topic,
     );
 
-    let mut opts = PipelineOpts::new().record_limit(insert_records.len() as u64);
+    // The sink's record limit counts WRITTEN rows, and with
+    // append_only_mode: false rows are deduplicated by primary key within a
+    // batch before writing. Depending on how the consumer batches the two
+    // produce calls, the 3 input records yield 2 or 3 written rows — no
+    // input-based limit is deterministic on its own. Force one record per
+    // batch (sink batch_size: 1 + record batch size 1, per the repo test
+    // guidance) so every produced record is written and counted, then count
+    // them all.
+    let mut opts = PipelineOpts::new()
+        .record_limit((insert_records.len() + update_records.len()) as u64)
+        .env("STREAMLING__RECORD_BATCH_SIZE", "1");
     for (k, v) in clickhouse_env(&ctx) {
         opts = opts.env(&k, &v);
     }
