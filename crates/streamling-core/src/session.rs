@@ -86,6 +86,29 @@ impl SessionManager {
             .set_bool("datafusion.catalog.create_default_catalog_and_schema", true)
             // this increases e2e latency and can keep intermediate results in memory indefinitely, so we disable it
             .set_bool("datafusion.execution.coalesce_batches", false)
+            // DataFusion 54's ExtractLeafExpressions rule rewrites plans by
+            // pulling leaf expressions (struct/map field access) into
+            // extraction projections aliased `__datafusion_extracted_N`, with
+            // recovery projections meant to hide the extra columns again. Our
+            // user-defined extension nodes (Wrapper/Rebatch/MultiSink/...)
+            // capture their schema when built, and the rule's alias counter is
+            // not stable across re-optimization, so with the rule enabled
+            // plans that contain such extension nodes fail in three ways:
+            //   - "Extension planner for Wrapper ... created an ExecutionPlan
+            //     with mismatched schema" (the logical schema carries one set
+            //     of `__datafusion_extracted_N` names, physical planning
+            //     regenerates different ones) — a hard planning error,
+            //   - extraction columns leaking past the recovery projection
+            //     into sinks ("number of columns(N+1) must match number of
+            //     fields(N)" when building the sink batch),
+            //   - `arrow-schema` index-out-of-bounds panic in `Schema::field`
+            //     (the leaked phantom column reaching an unchecked index).
+            // Disable the rule to keep pre-54 planning semantics for
+            // streaming plans built around extension nodes.
+            .set_bool(
+                "datafusion.optimizer.enable_leaf_expression_pushdown",
+                false,
+            )
             .set_u64("datafusion.execution.batch_size", batch_size)
             .set_str(
                 "datafusion.catalog.default_catalog",

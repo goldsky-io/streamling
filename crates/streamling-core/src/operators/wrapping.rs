@@ -17,7 +17,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::not_impl_err;
 use datafusion::common::{DFSchemaRef, DataFusionError, Result};
-use datafusion::config::ConfigOptions;
 use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -28,7 +27,6 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::{Distribution, OrderingRequirements};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, InvariantLevel};
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics, execute_input_stream,
@@ -479,22 +477,21 @@ impl ExecutionPlan for WrappingExec {
             fn maintains_input_order(&self) -> Vec<bool>;
             fn benefits_from_input_partitioning(&self) -> Vec<bool>;
             fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
-            fn repartitioned(
-                &self,
-                target_partitions: usize,
-                config: &ConfigOptions,
-            ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
             fn metrics(&self) -> Option<MetricsSet>;
             fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
-            fn supports_limit_pushdown(&self) -> bool;
-            fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>>;
             fn cardinality_effect(&self) -> CardinalityEffect;
-            fn try_swapping_with_projection(
-                &self,
-                projection: &ProjectionExec,
-            ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
         }
     }
+
+    // `try_swapping_with_projection`, `with_fetch`, `repartitioned`, and
+    // `supports_limit_pushdown` are deliberately NOT delegated to `self.inner`
+    // (they fall back to the trait's no-op defaults). Each of those hooks
+    // returns a rewritten subtree that does NOT contain this wrapper, so
+    // DataFusion 54's hook-driven physical optimizer rules (e.g.
+    // ProjectionPushdown) would replace the wrapper with the returned plan —
+    // silently deleting the telemetry/billing instrumentation (output_rows),
+    // side-output processing, and live inspection this node provides. Same
+    // hazard class as the RebatchExec elision (see tests/rebatch_elision.rs).
 
     fn schema(&self) -> SchemaRef {
         self.adjusted_schema.clone()
