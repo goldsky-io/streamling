@@ -3,6 +3,7 @@ use crate::checkpoints::checkpoint_management::{
 };
 use crate::operators::filter::StreamingFilterExec;
 use crate::operators::inspect::LiveDataInspect;
+use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, SharedSourceRegistry};
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
@@ -234,6 +235,43 @@ impl WrappingSourceTableProvider {
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
     ) -> Arc<dyn ExecutionPlan> {
+        // A pushed-down scan projection may sit above the source filter (the
+        // filter plans against the full payload schema and the projection is
+        // re-applied above it — see the Kafka source). See through the
+        // projection so the wrapper still lands below the filter, then
+        // rebuild the filter and projection on top (R7: side outputs and
+        // event-time freshness must observe the pre-filter row stream).
+        if let Some(projection_exec) = inner_exec.downcast_ref::<StreamingProjectionExec>()
+            && let Some(filter_exec) = projection_exec
+                .input()
+                .downcast_ref::<StreamingFilterExec>()
+        {
+            let source_exec = filter_exec.input().clone();
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+                source_exec,
+                reference_name.to_string(),
+                side_outputs.clone(),
+                Vec::new(),
+                event_time_instrumentation.clone(),
+            ));
+            let rebuilt = Arc::new(filter_exec.clone())
+                .with_new_children(vec![wrapped_source])
+                .and_then(|new_filter| {
+                    Arc::new(projection_exec.clone()).with_new_children(vec![new_filter])
+                });
+            match rebuilt {
+                Ok(plan) => return plan,
+                Err(e) => {
+                    warn!(
+                        "Failed to rebuild projection+filter around WrappingExec for '{}': {}. \
+                         Falling back to wrapping the projected plan.",
+                        reference_name, e
+                    );
+                    // fall through to the default wrap below
+                }
+            }
+        }
+
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
             let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
@@ -1051,6 +1089,73 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_wrap_with_side_outputs_sees_through_scan_projection() {
+        use crate::operators::projection::StreamingProjectionExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema.clone(), vec![vec![test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let source_exec =
+            futures::executor::block_on(mem_table.scan(&state, None, &[], None)).unwrap();
+
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = FilterExec::try_new(predicate, source_exec.clone()).unwrap();
+        let streaming_filter =
+            Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
+
+        // Scan projection re-applied above the source filter (as the Kafka
+        // source does when the engine pushes a projection down).
+        let first_col = schema.field(0).name().clone();
+        let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new(&first_col, 0));
+        let projection =
+            ProjectionExec::try_new(vec![(col_expr, first_col)], streaming_filter).unwrap();
+        let streaming_projection =
+            Arc::new(StreamingProjectionExec::from_original(projection).unwrap())
+                as Arc<dyn ExecutionPlan>;
+
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let side_output = Arc::new(CountingSideOutput {
+            rows_seen: rows_seen.clone(),
+        });
+
+        let result = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            streaming_projection,
+            "test_source",
+            vec![side_output],
+            None,
+        );
+
+        // Order must be projection -> filter -> wrapper -> source, so side
+        // outputs / event-time observe every pre-filter row (R7).
+        assert!(
+            result.downcast_ref::<StreamingProjectionExec>().is_some(),
+            "Expected top-level plan to be StreamingProjectionExec, got: {}",
+            result.name()
+        );
+        let proj_children = result.children();
+        assert_eq!(proj_children.len(), 1);
+        assert!(
+            proj_children[0]
+                .downcast_ref::<StreamingFilterExec>()
+                .is_some(),
+            "Expected projection's child to be StreamingFilterExec, got: {}",
+            proj_children[0].name()
+        );
+        let filter_children = proj_children[0].children();
+        assert_eq!(filter_children.len(), 1);
+        assert!(
+            filter_children[0].downcast_ref::<WrappingExec>().is_some(),
+            "Expected filter's child to be WrappingExec, got: {}",
+            filter_children[0].name()
+        );
     }
 
     #[test]
