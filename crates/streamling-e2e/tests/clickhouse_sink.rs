@@ -945,3 +945,105 @@ sinks:
         "id=1 should have the updated value"
     );
 }
+
+// =============================================================================
+// SELECT * EXCEPT with same-name re-add
+// =============================================================================
+
+/// `SELECT * EXCEPT (col, _gs_op), <expr> AS col2, <expr> AS _gs_op` — the
+/// wildcard excludes a source column and the enriched `_gs_op`, then re-adds
+/// computed columns, one under the same name. The sink batch must match the
+/// transform's declared schema (no duplicated/leftover columns).
+#[tokio::test]
+async fn test_select_except_same_name_readd() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx
+        .clickhouse
+        .as_ref()
+        .expect("ClickHouse should be enabled");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Pre-create the sink table WITHOUT the `ts` column: the upstream `*`
+    // has widened since the table was created (source schema evolution), so
+    // the transform now emits one more column than the table has. The write
+    // path must tolerate extra batch columns (project to the table schema),
+    // as it did before the DataFusion 54 upgrade.
+    clickhouse
+        .execute(
+            "CREATE TABLE select_except_readd_test (\
+                 id Int64, value String, is_deleted UInt8 DEFAULT 0, \
+                 insert_time DateTime DEFAULT now() \
+             ) ENGINE = ReplacingMergeTree(insert_time) ORDER BY id",
+        )
+        .await
+        .expect("Failed to pre-create sink table");
+
+    let total_records = 4;
+    let records: Vec<TestRecord> = (1..=total_records)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records_with_op(&records, "c")
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  except_transform:
+    type: sql
+    primary_key: id
+    sql: >-
+      SELECT * EXCEPT (timestamp, _gs_op), timestamp AS ts,
+      CASE WHEN _gs_op = 'c' THEN 'i' ELSE _gs_op END AS _gs_op
+      FROM kafka_source
+
+sinks:
+  ch_sink:
+    type: clickhouse
+    from: except_transform
+    table: select_except_readd_test
+    primary_key: id
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let mut opts = PipelineOpts::new().record_limit(total_records as u64);
+    for (k, v) in clickhouse_env(&ctx) {
+        opts = opts.env(&k, &v);
+    }
+
+    let status = ctx
+        .run_pipeline_with_opts(&pipeline, opts)
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let count = clickhouse
+        .count("SELECT COUNT(*) FROM select_except_readd_test FINAL")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(count, total_records as u64, "all rows written");
+}
