@@ -1046,4 +1046,27 @@ sinks:
         .await
         .expect("Failed to query count");
     assert_eq!(count, total_records as u64, "all rows written");
+
+    // Value-level check: by-name pairing must not mislabel the surviving
+    // columns when the extra one is dropped.
+    #[derive(Row, Deserialize)]
+    struct OutRow {
+        id: i64,
+        value: String,
+    }
+    let rows: Vec<OutRow> = clickhouse
+        .query("SELECT id, value FROM select_except_readd_test FINAL ORDER BY id")
+        .await
+        .expect("Failed to query rows");
+    let got: Vec<(i64, &str)> = rows.iter().map(|r| (r.id, r.value.as_str())).collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, "value_1"),
+            (2, "value_2"),
+            (3, "value_3"),
+            (4, "value_4")
+        ],
+        "surviving columns must keep their own data"
+    );
 }

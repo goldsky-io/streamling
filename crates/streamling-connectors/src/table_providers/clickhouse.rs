@@ -969,6 +969,18 @@ impl DataSink for ClickHouseSinkExec {
         // ClickHouse and every INSERT naming them fails. `_gs_op` is kept —
         // the CDC split below needs it, and it is stripped before INSERT.
         let normalized_schema = match client.fetch_table_column_names(&self.table_name).await {
+            // An empty listing right after CREATE TABLE IF NOT EXISTS succeeded
+            // means the lookup is unreliable (database/name resolution mismatch,
+            // system.columns lag) — treat it like a failed fetch rather than
+            // dropping every column and issuing empty INSERTs.
+            Ok(live_columns) if live_columns.is_empty() => {
+                warn!(
+                    "[{}] ClickHouse column listing for table '{}' came back empty; \
+                     writing with the sink's declared schema",
+                    node_label, self.table_name
+                );
+                self.schema.clone()
+            }
             Ok(live_columns) => {
                 let live: std::collections::HashSet<&str> =
                     live_columns.iter().map(|s| s.as_str()).collect();
@@ -2221,7 +2233,19 @@ impl ClickHouseClient {
         let bytes = self
             .process_http_response(response_result, &query, "table columns")
             .await?;
-        Ok(String::from_utf8_lossy(&bytes)
+        let body = String::from_utf8_lossy(&bytes);
+        // ClickHouse can return HTTP 200 with an exception in the body (the
+        // same quirk check_ddl_response guards against); parsing those lines
+        // as column names would drop every real column downstream.
+        if CLICKHOUSE_ERROR_RE.is_match(&body) {
+            return Err(streamling_core::streamling_err!(
+                "ClickHouse returned an error body while listing columns of '{}': {}",
+                table_name,
+                body.lines().next().unwrap_or_default()
+            )
+            .into());
+        }
+        Ok(body
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
@@ -2433,17 +2457,29 @@ impl ClickHouseClient {
 
         let original_schema = batch.schema();
 
-        let extra_columns: Vec<&str> = original_schema
+        // Single O(n) pass to index the incoming columns by name; per-field
+        // `index_of` would make this O(n^2) on every batch.
+        let index_by_name: std::collections::HashMap<&str, usize> = original_schema
             .fields()
             .iter()
-            .map(|f| f.name().as_str())
-            .filter(|name| normalized_schema.field_with_name(name).is_err())
+            .enumerate()
+            .map(|(i, f)| (f.name().as_str(), i))
             .collect();
-        if !extra_columns.is_empty() {
+
+        if index_by_name.len() < original_schema.fields().len() {
             tracing::debug!(
-                "dropping {} column(s) not present in the ClickHouse sink schema: {:?}",
-                extra_columns.len(),
-                extra_columns
+                "incoming batch has duplicate column names; later occurrences win \
+                 ({} unique of {} columns)",
+                index_by_name.len(),
+                original_schema.fields().len()
+            );
+        }
+        if original_schema.fields().len() > normalized_schema.fields().len() {
+            tracing::debug!(
+                "batch is wider than the ClickHouse sink schema ({} vs {} columns); \
+                 extra columns are dropped",
+                original_schema.fields().len(),
+                normalized_schema.fields().len()
             );
         }
 
@@ -2451,9 +2487,9 @@ impl ClickHouseClient {
             .fields()
             .iter()
             .map(|normalized_field| {
-                let idx = original_schema
-                    .index_of(normalized_field.name())
-                    .map_err(|_| {
+                let idx = *index_by_name
+                    .get(normalized_field.name().as_str())
+                    .ok_or_else(|| {
                         DataFusionError::from(streamling_core::streamling_err!(
                             "ClickHouse sink schema column '{}' missing from the incoming batch",
                             normalized_field.name()
