@@ -774,7 +774,11 @@ sinks:
         topic = ctx.kafka_topic,
     );
 
-    let mut opts = PipelineOpts::new().record_limit(insert_records.len() as u64);
+    // Cover ALL produced records (inserts + the delete) — same batching race
+    // as test_append_only_mode_false_with_updates: with only the insert count
+    // the sink can stop before the delete arrives.
+    let mut opts =
+        PipelineOpts::new().record_limit((insert_records.len() + delete_records.len()) as u64);
     for (k, v) in clickhouse_env(&ctx) {
         opts = opts.env(&k, &v);
     }
@@ -899,7 +903,12 @@ sinks:
         topic = ctx.kafka_topic,
     );
 
-    let mut opts = PipelineOpts::new().record_limit(insert_records.len() as u64);
+    // The limit must cover ALL produced records (inserts + the update). With
+    // only the insert count, the sink can hit the limit and stop before the
+    // update arrives whenever the consumer batches the two produce calls
+    // separately — a timing race that intermittently drops the update.
+    let mut opts =
+        PipelineOpts::new().record_limit((insert_records.len() + update_records.len()) as u64);
     for (k, v) in clickhouse_env(&ctx) {
         opts = opts.env(&k, &v);
     }
