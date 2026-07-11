@@ -5,6 +5,11 @@ use tracing::{error, warn};
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
+/// Per-round sleep cap applied when `on_error` reports a remediation that makes
+/// the next attempt likely to succeed (e.g. a fresh pool was installed). The
+/// exponential backoff state is untouched, so sustained failure windows still
+/// grow and pace remediation — only this round's sleep is shortened.
+const REMEDIATED_BACKOFF_CAP_MS: u64 = 5_000;
 
 /// Retry the provided operation indefinitely with exponential backoff and small jitter.
 /// The operation should return `Ok(())` on success and `Err` with a StreamlingError on failure.
@@ -112,6 +117,11 @@ where
 /// to `on_error` before the retry sleep so the caller can run remediation — for
 /// example, swapping a stale connection pool after a failover error.
 ///
+/// `on_error` returns `true` when its remediation makes the next attempt likely
+/// to succeed (e.g. a fresh pool was installed); that caps the following sleep at
+/// [`REMEDIATED_BACKOFF_CAP_MS`] without resetting the exponential backoff, so
+/// sustained failure windows still back off and pace remediation.
+///
 /// Unlike [`retry_forever_with_backoff_async`], the operation returns a
 /// [`StreamlingError`], so each failure is logged with `error.internal` /
 /// `error.retriable` structured fields, and `on_error` receives the error by
@@ -124,14 +134,14 @@ pub async fn retry_forever_with_backoff_async_on_error<Op, Fut, OnErr, OnErrFut>
     Op: FnMut() -> Fut,
     Fut: core::future::Future<Output = Result<()>>,
     OnErr: FnMut(StreamlingError) -> OnErrFut,
-    OnErrFut: core::future::Future<Output = ()>,
+    OnErrFut: core::future::Future<Output = bool>,
 {
     let mut attempt: u32 = 0;
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
     loop {
         attempt = attempt.saturating_add(1);
-        match operation().await {
+        let remediated = match operation().await {
             Ok(()) => {
                 if attempt > 1 {
                     warn!("{} recovered after {} attempts", operation_name, attempt);
@@ -158,12 +168,20 @@ pub async fn retry_forever_with_backoff_async_on_error<Op, Fut, OnErr, OnErrFut>
                         err
                     );
                 }
-                on_error(err).await;
+                on_error(err).await
             }
-        }
+        };
 
         let jitter = (attempt as u64 % 100) * 7; // small deterministic jitter
         let sleep_ms = std::cmp::min(MAX_BACKOFF_MS, backoff_ms + jitter);
+        // Remediation (e.g. a fresh pool) makes the next attempt likely to
+        // succeed — cap this round's sleep without touching the exponential
+        // state, so sustained failure windows still grow.
+        let sleep_ms = if remediated {
+            sleep_ms.min(REMEDIATED_BACKOFF_CAP_MS)
+        } else {
+            sleep_ms
+        };
         sleep(Duration::from_millis(sleep_ms)).await;
         backoff_ms = std::cmp::min(backoff_ms.saturating_mul(2), MAX_BACKOFF_MS);
     }
@@ -309,6 +327,7 @@ mod tests {
                         err.to_string().contains("fail"),
                         "hook should see the failing error, got: {err}"
                     );
+                    false
                 }
             },
             "test_operation",

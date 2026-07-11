@@ -107,7 +107,9 @@ pub async fn execute_batch_insert(
                         observed_gen.load(Ordering::Relaxed),
                         &operation_name,
                     )
-                    .await;
+                    .await
+                } else {
+                    false
                 }
             }
         },
@@ -179,7 +181,9 @@ pub async fn execute_batch_delete(
                         observed_gen.load(Ordering::Relaxed),
                         &operation_name,
                     )
-                    .await;
+                    .await
+                } else {
+                    false
                 }
             }
         },
@@ -191,16 +195,22 @@ pub async fn execute_batch_delete(
 /// Handle a READ_ONLY error by performing a deduplicated pool swap.
 /// If this task is the first to detect the stale generation, it closes the old pool
 /// and creates a new one. Otherwise it logs that another task already refreshed.
+///
+/// Returns `true` when a pool newer than `my_gen` is installed when this function
+/// returns — i.e. on a successful swap or when another task already refreshed it —
+/// and `false` when pool recreation failed.
 async fn handle_read_only_error(
     pool: &SharedPool,
     config: &PostgresSinkConfig,
     parallelism: usize,
     my_gen: u64,
     operation_name: &str,
-) {
+) -> bool {
     // Swap the pool and bump the generation while holding the lock, then drop the guard before
     // closing the old pool — close() waits for in-flight queries and must not block writers.
-    let old_pool = {
+    // The reconnect deliberately runs under the lock: every waiter is a write path that cannot
+    // make progress until the swap completes, so holding the lock dedups concurrent reconnects.
+    let (old_pool, remediated) = {
         let mut guard = pool.lock().await;
         if guard.1 == my_gen {
             warn!(
@@ -213,14 +223,14 @@ async fn handle_read_only_error(
                 Ok(conn) => {
                     let old = std::mem::replace(&mut guard.0, conn.pool().clone());
                     guard.1 = my_gen + 1;
-                    Some(old)
+                    (Some(old), true)
                 }
                 Err(e) => {
                     warn!(
                         "[{}] Failed to recreate pool: {:?}; will retry with existing pool",
                         operation_name, e
                     );
-                    None
+                    (None, false)
                 }
             }
         } else {
@@ -228,12 +238,13 @@ async fn handle_read_only_error(
                 "[{}] READ_ONLY error but pool already refreshed (gen {}); retrying with new pool",
                 operation_name, guard.1
             );
-            None
+            (None, true)
         }
     };
     if let Some(old_pool) = old_pool {
         old_pool.close().await;
     }
+    remediated
 }
 
 #[cfg(test)]
