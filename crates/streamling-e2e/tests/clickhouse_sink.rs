@@ -474,7 +474,9 @@ sinks:
 // Deduplication Test (ReplacingMergeTree behavior)
 // =============================================================================
 
-/// Test deduplication with primary key (ReplacingMergeTree)
+/// Test deduplication with primary key (ReplacingMergeTree).
+/// Like every test in this file that omits `compression:`, this exercises the
+/// default codec (zstd) end-to-end against real ClickHouse.
 #[tokio::test]
 async fn test_deduplication() {
     init_tracing();
