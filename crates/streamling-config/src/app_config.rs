@@ -340,16 +340,19 @@ impl<'de> SerdeDeserialize<'de> for KafkaCompression {
 }
 
 /// Wire-format compression to apply to outbound HTTP request bodies sent to
-/// ClickHouse. Accepted values: `"none"` (default) or `"gzip"`. Parsing is
-/// case-insensitive so env-var overrides arriving as strings work. The
-/// compression *level* (when applicable) is configured separately via
-/// `compression_level`.
+/// ClickHouse. Accepted values: `"none"`, `"gzip"`, `"zstd"` (default), or
+/// `"lz4"`. Parsing is case-insensitive so env-var overrides arriving as
+/// strings work. The gzip compression *level* is configured separately via
+/// `compression_level`; `zstd` uses its default level (3) and `lz4` (frame
+/// format) has no level knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClickHouseCompression {
-    #[default]
     None,
+    #[default]
+    Zstd,
     Gzip,
+    Lz4,
 }
 
 impl<'de> SerdeDeserialize<'de> for ClickHouseCompression {
@@ -357,9 +360,11 @@ impl<'de> SerdeDeserialize<'de> for ClickHouseCompression {
         let s = String::deserialize(deserializer)?;
         match s.trim().to_lowercase().as_str() {
             "none" => Ok(ClickHouseCompression::None),
+            "zstd" => Ok(ClickHouseCompression::Zstd),
             "gzip" => Ok(ClickHouseCompression::Gzip),
+            "lz4" => Ok(ClickHouseCompression::Lz4),
             other => Err(DeError::custom(format!(
-                "unknown ClickHouse compression `{}`; expected `none` or `gzip`",
+                "unknown ClickHouse compression `{}`; expected `none`, `gzip`, `zstd`, or `lz4`",
                 other
             ))),
         }
@@ -406,13 +411,14 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub user: String,
     pub password: String,
-    /// Wire compression for INSERTs. Accepts `"none"` (default) or `"gzip"`.
-    /// Set here for the global default; optionally override per sink via the
-    /// pipeline YAML.
+    /// Wire compression for INSERTs. Accepts `"none"`, `"gzip"`, `"zstd"`
+    /// (default), or `"lz4"`. Set here for the global default; optionally
+    /// override per sink via the pipeline YAML.
     #[serde(default)]
     pub compression: ClickHouseCompression,
     /// gzip compression level, 0–9. Defaults to 6 (`flate2::Compression::default()`).
-    /// Ignored when `compression` is `"none"`.
+    /// Applies to `"gzip"` only; ignored for `"none"`, `"zstd"` (uses its
+    /// default level 3), and `"lz4"` (frame format has no level knob).
     #[serde(default)]
     pub compression_level: GzipCompressionLevel,
 }
@@ -955,14 +961,18 @@ password: ""
     }
 
     #[test]
-    fn clickhouse_compression_accepts_none_and_gzip() {
-        let cfg: ClickHouseConfig =
-            serde_yaml::from_str(&clickhouse_yaml(r#"compression: "none""#)).unwrap();
-        assert_eq!(cfg.compression, ClickHouseCompression::None);
-
-        let cfg: ClickHouseConfig =
-            serde_yaml::from_str(&clickhouse_yaml(r#"compression: "gzip""#)).unwrap();
-        assert_eq!(cfg.compression, ClickHouseCompression::Gzip);
+    fn clickhouse_compression_accepts_all_codecs() {
+        for (s, expected) in [
+            ("none", ClickHouseCompression::None),
+            ("gzip", ClickHouseCompression::Gzip),
+            ("zstd", ClickHouseCompression::Zstd),
+            ("lz4", ClickHouseCompression::Lz4),
+        ] {
+            let cfg: ClickHouseConfig =
+                serde_yaml::from_str(&clickhouse_yaml(&format!(r#"compression: "{}""#, s)))
+                    .unwrap();
+            assert_eq!(cfg.compression, expected, "input: {s:?}");
+        }
     }
 
     #[test]
@@ -974,6 +984,10 @@ password: ""
             (" None ", ClickHouseCompression::None),
             ("gzip", ClickHouseCompression::Gzip),
             ("GZIP", ClickHouseCompression::Gzip),
+            ("zstd", ClickHouseCompression::Zstd),
+            ("ZSTD", ClickHouseCompression::Zstd),
+            ("lz4", ClickHouseCompression::Lz4),
+            ("LZ4", ClickHouseCompression::Lz4),
         ] {
             let cfg: ClickHouseConfig =
                 serde_yaml::from_str(&clickhouse_yaml(&format!(r#"compression: "{}""#, s)))
@@ -983,9 +997,9 @@ password: ""
     }
 
     #[test]
-    fn clickhouse_compression_defaults_to_none_when_omitted() {
+    fn clickhouse_compression_defaults_to_zstd_when_omitted() {
         let cfg: ClickHouseConfig = serde_yaml::from_str(&clickhouse_yaml("")).unwrap();
-        assert_eq!(cfg.compression, ClickHouseCompression::None);
+        assert_eq!(cfg.compression, ClickHouseCompression::Zstd);
     }
 
     #[test]
@@ -994,21 +1008,23 @@ password: ""
             serde_yaml::from_str::<ClickHouseConfig>(&clickhouse_yaml(r#"compression: "brotli""#))
                 .unwrap_err();
         assert!(
-            err.to_string().contains("expected `none` or `gzip`"),
+            err.to_string()
+                .contains("expected `none`, `gzip`, `zstd`, or `lz4`"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
     fn clickhouse_compression_rejects_bool() {
-        // Only the strings `"none"` / `"gzip"` are accepted. serde_yaml
-        // coerces bool to its string form on the string visitor, so the
-        // failure path is the same "unknown compression" branch — the point
-        // is that the bool form is no longer a successful disable.
+        // Only the strings `"none"` / `"gzip"` / `"zstd"` / `"lz4"` are
+        // accepted. serde_yaml coerces bool to its string form on the string
+        // visitor, so the failure path is the same "unknown compression"
+        // branch — the point is that the bool form is not a valid codec.
         for bad in ["compression: false", "compression: true"] {
             let err = serde_yaml::from_str::<ClickHouseConfig>(&clickhouse_yaml(bad)).unwrap_err();
             assert!(
-                err.to_string().contains("expected `none` or `gzip`"),
+                err.to_string()
+                    .contains("expected `none`, `gzip`, `zstd`, or `lz4`"),
                 "unexpected error for {bad}: {err}"
             );
         }

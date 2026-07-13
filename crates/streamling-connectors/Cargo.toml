@@ -59,6 +59,8 @@ reqwest-retry.workspace = true
 reqwest-middleware.workspace = true
 bytes.workspace = true
 flate2.workspace = true
+zstd.workspace = true
+lz4_flex.workspace = true
 
 [dev-dependencies]
 mockito.workspace = true
