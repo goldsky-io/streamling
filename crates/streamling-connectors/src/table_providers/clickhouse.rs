@@ -963,7 +963,57 @@ impl DataSink for ClickHouseSinkExec {
         let client = self.client.clone();
         let table_name = self.table_name.clone();
         let num_records_before_stop = self.num_records_before_stop;
-        let normalized_schema = self.schema.clone();
+        // Adopt the LIVE table's column set for writes. The input schema can
+        // be wider than a pre-existing table (e.g. an upstream `SELECT *`
+        // widened after the table was created); those columns don't exist in
+        // ClickHouse and every INSERT naming them fails. `_gs_op` is kept —
+        // the CDC split below needs it, and it is stripped before INSERT.
+        let normalized_schema = match client.fetch_table_column_names(&self.table_name).await {
+            // An empty listing right after CREATE TABLE IF NOT EXISTS succeeded
+            // means the lookup is unreliable (database/name resolution mismatch,
+            // system.columns lag) — treat it like a failed fetch rather than
+            // dropping every column and issuing empty INSERTs.
+            Ok(live_columns) if live_columns.is_empty() => {
+                warn!(
+                    "[{}] ClickHouse column listing for table '{}' came back empty; \
+                     writing with the sink's declared schema",
+                    node_label, self.table_name
+                );
+                self.schema.clone()
+            }
+            Ok(live_columns) => {
+                let live: std::collections::HashSet<&str> =
+                    live_columns.iter().map(|s| s.as_str()).collect();
+                let (kept, dropped): (Vec<_>, Vec<_>) =
+                    self.schema.fields().iter().cloned().partition(|f| {
+                        live.contains(f.name().as_str()) || f.name() == COLUMN_NAME_OP
+                    });
+                if !dropped.is_empty() {
+                    warn!(
+                        "[{}] dropping {} column(s) not present in ClickHouse table '{}': {:?}",
+                        node_label,
+                        dropped.len(),
+                        self.table_name,
+                        dropped
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                    kept,
+                    self.schema.metadata().clone(),
+                ))
+            }
+            Err(e) => {
+                warn!(
+                    "[{}] could not list columns of ClickHouse table '{}' ({}); \
+                     writing with the sink's declared schema",
+                    node_label, self.table_name, e
+                );
+                self.schema.clone()
+            }
+        };
         let primary_keys = self.primary_keys.clone();
         let parallelism = self.parallelism.max(1);
         let write_batch_size = self.write_batch_size;
@@ -2162,6 +2212,45 @@ impl ClickHouseClient {
         })
     }
 
+    /// List the column names of a live table from `system.columns`.
+    /// Async (unlike `fetch_schema`, which uses `block_on` internally and
+    /// must not be called from async contexts like `write_all`).
+    pub async fn fetch_table_column_names(
+        &self,
+        table_name: &str,
+    ) -> streamling_core::error::Result<Vec<String>> {
+        let (database_expr, bare_table) = match table_name.split_once('.') {
+            Some((db, tbl)) => (format!("'{}'", db.replace('\'', "''")), tbl),
+            None => ("currentDatabase()".to_string(), table_name),
+        };
+        let query = format!(
+            "SELECT name FROM system.columns WHERE database = {} AND table = '{}' \
+             ORDER BY position FORMAT TabSeparated",
+            database_expr,
+            bare_table.replace('\'', "''")
+        );
+        let response_result = self.send_query(reqwest::Method::GET, &query).await;
+        let bytes = self
+            .process_http_response(response_result, &query, "table columns")
+            .await?;
+        let body = String::from_utf8_lossy(&bytes);
+        // ClickHouse can return HTTP 200 with an exception in the body (the
+        // same quirk check_ddl_response guards against); parsing those lines
+        // as column names would drop every real column downstream.
+        if CLICKHOUSE_ERROR_RE.is_match(&body) {
+            return Err(streamling_core::streamling_err!(
+                "ClickHouse returned an error body while listing columns of '{}': {}",
+                table_name,
+                body.lines().next().unwrap_or_default()
+            ));
+        }
+        Ok(body
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+
     pub fn fetch_schema(
         &self,
         table_name: &str,
@@ -2348,6 +2437,16 @@ impl ClickHouseClient {
 
     /// Convert a RecordBatch to use the provided normalized schema
     /// TODO: Move this to a projection expr instead so it can be folded?
+    /// Columns are paired against `normalized_schema` **by name**, mirroring
+    /// `normalize_batch_from_clickhouse`. The incoming batch may carry more
+    /// columns than the sink's table — e.g. an upstream `SELECT *` widened
+    /// after the table was created — and those extras are dropped (the table
+    /// schema is authoritative for writes). A sink column missing from the
+    /// batch is an error. The previous positional triple-zip built the output
+    /// batch with every incoming column, so a wider batch failed
+    /// `RecordBatch::try_new` with "number of columns(N+1) must match number
+    /// of fields(N)", and a same-width-but-reordered batch would silently
+    /// mislabel columns.
     fn normalize_batch_for_clickhouse(
         batch: &RecordBatch,
         normalized_schema: &SchemaRef,
@@ -2357,12 +2456,46 @@ impl ClickHouseClient {
 
         let original_schema = batch.schema();
 
-        let normalized_columns: Result<Vec<_>, DataFusionError> = batch
-            .columns()
+        // Single O(n) pass to index the incoming columns by name; per-field
+        // `index_of` would make this O(n^2) on every batch.
+        let index_by_name: std::collections::HashMap<&str, usize> = original_schema
+            .fields()
             .iter()
-            .zip(original_schema.fields().iter())
-            .zip(normalized_schema.fields().iter())
-            .map(|((column, original_field), normalized_field)| {
+            .enumerate()
+            .map(|(i, f)| (f.name().as_str(), i))
+            .collect();
+
+        if index_by_name.len() < original_schema.fields().len() {
+            tracing::debug!(
+                "incoming batch has duplicate column names; later occurrences win \
+                 ({} unique of {} columns)",
+                index_by_name.len(),
+                original_schema.fields().len()
+            );
+        }
+        if original_schema.fields().len() > normalized_schema.fields().len() {
+            tracing::debug!(
+                "batch is wider than the ClickHouse sink schema ({} vs {} columns); \
+                 extra columns are dropped",
+                original_schema.fields().len(),
+                normalized_schema.fields().len()
+            );
+        }
+
+        let normalized_columns: Result<Vec<_>, DataFusionError> = normalized_schema
+            .fields()
+            .iter()
+            .map(|normalized_field| {
+                let idx = *index_by_name
+                    .get(normalized_field.name().as_str())
+                    .ok_or_else(|| {
+                        DataFusionError::from(streamling_core::streamling_err!(
+                            "ClickHouse sink schema column '{}' missing from the incoming batch",
+                            normalized_field.name()
+                        ))
+                    })?;
+                let column = &batch.columns()[idx];
+                let original_field = &original_schema.fields()[idx];
                 match (original_field.data_type(), normalized_field.data_type()) {
                     (DataType::Utf8View, DataType::Utf8) => {
                         Ok(cast(column.as_ref(), &DataType::Utf8)
