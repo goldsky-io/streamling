@@ -5,11 +5,28 @@
 //!
 //! Ported from crates/streamling/tests/pipeline_checkpoint_test.rs
 
+use serde::Serialize;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
 
 // ============================================================================
 // Checkpoint Tests
 // ============================================================================
+
+/// Test record for the Kafka-sourced checkpoint tests
+#[derive(Debug, Clone, Serialize)]
+struct MarkerTestRecord {
+    id: i64,
+    value: String,
+}
+
+const MARKER_TEST_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "MarkerTestRecord",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "value", "type": "string"}
+    ]
+}"#;
 
 /// Checkpoints must progress even when an unnest never produces any rows.
 ///
@@ -27,53 +44,52 @@ use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions
 async fn test_checkpoint_progresses_when_unnest_yields_no_rows() {
     init_tracing();
 
-    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+    let ctx = TestContext::with_options(TestContextOptions::new())
         .await
         .expect("Failed to create test context");
 
-    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
-
-    clickhouse
-        .execute(
-            "CREATE TABLE unnest_marker_test (
-                id UInt32,
-                name String
-            ) ENGINE = MergeTree()
-            ORDER BY id",
-        )
+    ctx.kafka
+        .register_schema(MARKER_TEST_SCHEMA)
         .await
-        .expect("Failed to create ClickHouse table");
+        .expect("Failed to register schema");
 
-    let values: Vec<String> = (0..100).map(|i| format!("({}, 'name_{}')", i, i)).collect();
-    clickhouse
-        .execute(&format!(
-            "INSERT INTO unnest_marker_test (id, name) VALUES {}",
-            values.join(", ")
-        ))
+    let records: Vec<MarkerTestRecord> = (1..=50)
+        .map(|i| MarkerTestRecord {
+            id: i,
+            value: format!("value_{}", i),
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
         .await
-        .expect("Failed to insert ClickHouse data");
+        .expect("Failed to produce records");
 
     let state_table = format!("unnest_marker_state_{}", ctx.test_id.replace("-", "_"));
     let application_id = format!("unnest_marker_test_{}", ctx.test_id);
 
     // The filter matches no rows, so the unnest downstream of it only ever
     // receives empty batches carrying checkpoint markers.
-    let pipeline = r#"
+    let pipeline = format!(
+        r#"
 sources:
-  checkpoint_source:
-    type: clickhouse
-    table_name: unnest_marker_test
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
     primary_key: id
 
 transforms:
   filtered:
     type: sql
     primary_key: id
-    sql: SELECT id, make_array(id, id + 1) AS items FROM checkpoint_source WHERE id > 1000000
+    sql: SELECT id, make_array(id, id + 1) AS items FROM kafka_source WHERE id > 1000000
   expanded:
     type: sql
     primary_key: id
-    sql: SELECT id, unnest(items) AS item FROM filtered
+    sql: |-
+      SELECT id, item FROM (
+        SELECT id, unnest(items) AS item FROM filtered
+      ) t WHERE item IS NOT NULL
 
 sinks:
   pg_sink:
@@ -85,13 +101,15 @@ sinks:
     on_conflict: update
     batch_size: 10
     batch_flush_interval: 100ms
-"#;
+"#,
+        topic = ctx.kafka_topic,
+    );
 
     // No record limit: the sink never receives data rows, so the pipeline
     // only stops when the harness timeout kills it.
     let run_result = ctx
         .run_pipeline_with_opts(
-            pipeline,
+            &pipeline,
             PipelineOpts::new()
                 .timeout(std::time::Duration::from_secs(25))
                 .env("STREAMLING__APPLICATION_ID", &application_id)
