@@ -66,7 +66,7 @@ fn clickhouse_env(ctx: &TestContext) -> Vec<(String, String)> {
 
 /// Basic test: read records from Kafka and write to ClickHouse.
 /// Also exercises `compression: gzip` end-to-end against real ClickHouse so
-/// we cover the gzip request path (the default is no compression).
+/// we cover the gzip request path (the default is zstd).
 #[tokio::test]
 async fn test_basic_kafka_to_clickhouse() {
     init_tracing();
@@ -145,7 +145,9 @@ sinks:
 // Multiple Batches Test
 // =============================================================================
 
-/// Test processing multiple batches of records
+/// Test processing multiple batches of records.
+/// Uses `compression: lz4` to exercise the lz4 request path against real
+/// ClickHouse.
 #[tokio::test]
 async fn test_multiple_batches() {
     init_tracing();
@@ -196,6 +198,7 @@ sinks:
     from: kafka_source
     table: test_multi_batch
     primary_key: id
+    compression: lz4
     batch_size: 5
     batch_flush_interval: 100ms
 "#,
@@ -471,7 +474,9 @@ sinks:
 // Deduplication Test (ReplacingMergeTree behavior)
 // =============================================================================
 
-/// Test deduplication with primary key (ReplacingMergeTree)
+/// Test deduplication with primary key (ReplacingMergeTree).
+/// Like every test in this file that omits `compression:`, this exercises the
+/// default codec (zstd) end-to-end against real ClickHouse.
 #[tokio::test]
 async fn test_deduplication() {
     init_tracing();
