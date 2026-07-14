@@ -387,13 +387,10 @@ sinks:
 /// webhook sink sets `batch_size: 1`, so the pipeline inserts a `RebatchExec`
 /// between the feeding transform and the sink.
 ///
-/// `RebatchExec::children()` is see-through (it delegates to its `inner`), so the
-/// attribution rule's generic traversal walked *past* the transform's
-/// `WrappingExec`, leaving it `Unattributed`: the `transform -> webhook` edge
-/// emitted with no `downstream_id`, and the sink name got mislabeled one node too
-/// far upstream. The fix recurses into `RebatchExec::inner()` (plus the
+/// The attribution rule recurses into `RebatchExec::inner()` (plus the
 /// `WrappingExec` inner-recursion), so the feeding transform is tagged
-/// `downstream_id="<webhook sink>"`.
+/// `downstream_id="<webhook sink>"` even with the sink-local rebatcher between
+/// the transform and sink.
 ///
 /// The assertion pins BOTH `id` (the feeding transform) and `downstream_id` (the
 /// sink). This matters: pre-fix the sink name was stamped on the *wrong* node, so
@@ -486,7 +483,11 @@ sinks:
                 .record_limit(records_to_produce as u64)
                 .timeout(std::time::Duration::from_secs(120))
                 .env("STREAMLING__RECORD_BATCH_SIZE", "1")
-                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1"),
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1")
+                // Keep the webhook sink from prefetching the full input before
+                // its artificial delay applies; otherwise there may be no
+                // sustained linear backpressure for WrappingExec to measure.
+                .env("STREAMLING__EXTERNAL_HTTP_HANDLER__BUFFER_SIZE", "1"),
         )
         .await
         .expect("Streamling execution failed");

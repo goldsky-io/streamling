@@ -259,13 +259,9 @@ fn attribute_downstream(
         };
     }
 
-    // RebatchExec: a see-through wrapper inserted above a sink's feeding transform
-    // when the sink sets `batch_size` (single-sink path). Its `children()`
-    // delegates to `inner`, so the generic traversal below would expose `inner`'s
-    // children and skip the wrapped `WrappingExec` — leaving the feeding transform
-    // untagged and stamping the sink name one node too far upstream. Recurse into
-    // `inner` directly; rebatch is not itself an edge endpoint, so the named
-    // downstream passes through unchanged.
+    // RebatchExec: a sink-local wrapper inserted above a sink's feeding transform
+    // when the sink sets `batch_size` (single-sink path). It is not itself an
+    // edge endpoint, so the named downstream passes through unchanged.
     if let Some(rebatch) = node.downcast_ref::<RebatchExec>() {
         let attributed_inner = attribute_downstream(
             Arc::clone(rebatch.inner()),
@@ -375,8 +371,9 @@ mod attribution_tests {
     use datafusion::datasource::sink::{DataSink, DataSinkExec};
     use datafusion::error::Result as DFResult;
     use datafusion::execution::TaskContext;
-    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+    use datafusion::physical_expr::expressions::col;
     use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
     use std::fmt;
 
@@ -392,7 +389,13 @@ mod attribution_tests {
     /// they don't fuse via `WrappingExec`'s delegated `children()`. In real plans
     /// the transform's computation plays this role.
     fn mid(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(CoalesceBatchesExec::new(input, 8192))
+        Arc::new(
+            ProjectionExec::try_new(
+                vec![(col("v", &input.schema()).unwrap(), "v".to_string())],
+                input,
+            )
+            .unwrap(),
+        )
     }
 
     fn wrap(inner: Arc<dyn ExecutionPlan>, metric_key_name: &str) -> Arc<dyn ExecutionPlan> {
@@ -652,11 +655,8 @@ mod attribution_tests {
 
     /// Regression (QA case B/D): a single-sink `RebatchExec` (inserted above the
     /// feeding transform when a sink sets `batch_size`) must not hide that
-    /// transform from attribution. `RebatchExec::children()` is see-through
-    /// (delegates to `inner`), so the generic traversal would skip the wrapped
-    /// `WrappingExec`, leaving the feeding transform untagged and stamping the
-    /// sink name one node too far upstream. The rule recurses into `inner`
-    /// instead.
+    /// transform from attribution. The rule recurses into `inner`, preserving the
+    /// rebatch node while stamping the feeding transform with the sink name.
     #[test]
     fn rebatch_before_sink_still_attributes_feeding_transform() {
         // DataSinkExec(web_sink) <- RebatchExec <- W(sql) <- mid <- W(source) <- leaf
