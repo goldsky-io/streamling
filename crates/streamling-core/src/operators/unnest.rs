@@ -202,7 +202,6 @@ impl ExecutionPlan for StreamingUnnestExec {
             options: self.options.clone(),
             metrics,
             resolved_schema: None,
-            pending_checkpoints: Vec::new(),
         }))
     }
 
@@ -259,10 +258,6 @@ struct UnnestStream {
     /// type promotion occurred (e.g., Utf8 -> LargeUtf8 via safe_take fallback).
     /// Used to ensure empty batches use consistent types with non-empty batches.
     resolved_schema: Option<SchemaRef>,
-    /// Pending checkpoint messages from early empty batches.
-    /// These are queued until we have a resolved schema to ensure schema consistency.
-    /// They will be emitted with the first non-empty batch or when the stream ends.
-    pending_checkpoints: Vec<CheckpointMessage>,
 }
 
 impl RecordBatchStream for UnnestStream {
@@ -338,49 +333,25 @@ impl UnnestStream {
                     timer.done();
 
                     let result_batch = match result {
-                        Some(mut batch) => {
+                        Some(batch) => {
                             // Track the resolved schema from actual batch processing.
                             // This may have different types than self.schema if type promotion
                             // occurred (e.g., Utf8 -> LargeUtf8 via safe_take fallback).
                             self.resolved_schema = Some(batch.schema());
-
-                            // Merge any pending checkpoints from early empty batches
-                            // into this non-empty batch to ensure they're propagated
-                            if !self.pending_checkpoints.is_empty() {
-                                use std::collections::HashMap as StdHashMap;
-                                let mut all_checkpoints =
-                                    std::mem::take(&mut self.pending_checkpoints);
-                                all_checkpoints.extend(checkpoint_messages.clone());
-                                let mut metadata = StdHashMap::new();
-                                crate::checkpoints::checkpoint_management::enrich_batch_metadata_with_checkpoints(
-                                    &mut metadata,
-                                    &all_checkpoints,
-                                );
-                                // Rebuild batch with merged checkpoint metadata
-                                let enriched_schema = Arc::new(Schema::new_with_metadata(
-                                    batch.schema().fields().clone(),
-                                    metadata,
-                                ));
-                                batch = RecordBatch::try_new(
-                                    enriched_schema,
-                                    batch.columns().to_vec(),
-                                )?;
-                            }
                             batch
                         }
                         None => {
-                            // Empty result - queue checkpoints if schema not yet resolved
+                            // Empty result - forward any checkpoint markers immediately.
+                            // Holding them until a non-empty batch arrives would stall
+                            // checkpointing whenever this operator yields no rows for long
+                            // stretches (e.g. a highly selective upstream filter): the
+                            // checkpoint producer does not start a new epoch until the
+                            // in-flight one resolves, so no later batch would ever arrive
+                            // to flush a held marker. `create_empty_checkpoint_batch`
+                            // falls back to the static plan schema when no batch has
+                            // resolved yet - the same fallback the end-of-stream path uses.
                             if !checkpoint_messages.is_empty() {
-                                if self.resolved_schema.is_none() {
-                                    // Schema not yet resolved - queue checkpoints to avoid
-                                    // emitting empty batch with potentially wrong schema types.
-                                    // These will be emitted with the first non-empty batch or at stream end.
-                                    self.pending_checkpoints.extend(checkpoint_messages);
-                                    continue;
-                                } else {
-                                    // Schema resolved - safe to emit empty batch with correct types
-                                    self.create_empty_checkpoint_batch(&checkpoint_messages)?
-                                }
+                                self.create_empty_checkpoint_batch(&checkpoint_messages)?
                             } else {
                                 // No checkpoint metadata, safe to skip
                                 continue;
@@ -409,15 +380,7 @@ impl UnnestStream {
                         self.metrics.baseline_metrics.output_rows(),
                         self.metrics.baseline_metrics.elapsed_compute(),
                     );
-                    // Stream ended - emit any pending checkpoints as an empty batch
-                    if !self.pending_checkpoints.is_empty() {
-                        let checkpoints = std::mem::take(&mut self.pending_checkpoints);
-                        // Use resolved_schema if available, otherwise fall back to self.schema
-                        // (if no non-empty batch was ever processed, no type promotion occurred)
-                        Some(self.create_empty_checkpoint_batch(&checkpoints))
-                    } else {
-                        None
-                    }
+                    None
                 }
                 Some(Err(e)) => Some(Err(e)),
             });
@@ -1253,7 +1216,6 @@ mod tests {
             options: UnnestOptions::default(),
             metrics,
             resolved_schema: None,
-            pending_checkpoints: Vec::new(),
         };
 
         // Process the stream
@@ -1284,6 +1246,87 @@ mod tests {
             ),
             "Checkpoint message should match"
         );
+
+        Ok(())
+    }
+
+    /// A marker arriving before any non-empty batch must be forwarded
+    /// immediately, not held until a non-empty batch or end of stream: the
+    /// checkpoint producer does not start a new epoch until the in-flight one
+    /// resolves, so on a long-running pipeline whose unnest yields no rows
+    /// (highly selective upstream filter) a held marker would never be
+    /// flushed and checkpointing would stall permanently.
+    #[tokio::test]
+    async fn test_unnest_forwards_marker_immediately_on_open_stream() -> Result<()> {
+        let checkpoint_messages = vec![CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(7),
+            created_at_ms: 1000,
+        }];
+        let mut metadata = HashMap::new();
+        enrich_batch_metadata_with_checkpoints(&mut metadata, &checkpoint_messages);
+
+        let input_fields = Fields::from(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+        ]);
+        let input_schema = Arc::new(Schema::new_with_metadata(input_fields, metadata));
+
+        // Batch with only empty lists: build_batch returns None, so the only
+        // thing to forward is the checkpoint marker.
+        let mut list_builder = ListBuilder::new(Int32Array::builder(0));
+        list_builder.append_value([]);
+        let empty_list = list_builder.finish();
+        let marker_batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(Int32Array::from(vec![1])), Arc::new(empty_list)],
+        )?;
+
+        let output_fields = Fields::from(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("item", DataType::Int32, true),
+        ]);
+        let output_schema = Arc::new(Schema::new(output_fields));
+
+        // The stream stays open after the marker batch - like a live pipeline.
+        let input_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&input_schema),
+            stream::iter(vec![Ok(marker_batch)]).chain(stream::pending()),
+        ));
+
+        let metrics = UnnestMetrics::new(0, &ExecutionPlanMetricsSet::new());
+        let mut unnest_stream = UnnestStream {
+            input: input_stream,
+            schema: Arc::clone(&output_schema),
+            list_type_columns: vec![ListUnnest {
+                index_in_input_schema: 1,
+                depth: 1,
+            }],
+            struct_column_indices: HashSet::new(),
+            options: UnnestOptions::default(),
+            metrics,
+            resolved_schema: None,
+        };
+
+        let output_batch =
+            tokio::time::timeout(std::time::Duration::from_secs(5), unnest_stream.next())
+                .await
+                .expect("marker should be forwarded without waiting for more input")
+                .expect("stream should yield a batch")?;
+
+        assert_eq!(output_batch.num_rows(), 0, "Marker batch should be empty");
+        let extracted = extract_checkpoint_messages(output_batch.schema().metadata());
+        assert_eq!(extracted.len(), 1, "Should carry the checkpoint marker");
+        assert!(matches!(
+            &extracted[0],
+            CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(7),
+                ..
+            }
+        ));
 
         Ok(())
     }
@@ -1352,7 +1395,6 @@ mod tests {
             options: UnnestOptions::default(),
             metrics,
             resolved_schema: None,
-            pending_checkpoints: Vec::new(),
         };
 
         // Process the stream
@@ -1468,7 +1510,6 @@ mod tests {
             options: UnnestOptions::default(),
             metrics,
             resolved_schema: None,
-            pending_checkpoints: Vec::new(),
         };
 
         // Process the stream
