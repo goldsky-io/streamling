@@ -741,3 +741,108 @@ sinks:
         output.stderr
     );
 }
+
+// ============================================================================
+// postgres_aggregate sink must not connect to Postgres during --validate
+// ============================================================================
+
+/// Test that `--validate` passes for a `postgres_aggregate` sink without a
+/// reachable Postgres.
+///
+/// Secrets are not resolved during dry-run validation, so the validator may
+/// have no usable DB credentials. The aggregation sink used to eagerly create
+/// its trigger/tables during plan building, which made every
+/// postgres_aggregate pipeline fail validation with "pool timed out while
+/// waiting for an open connection" regardless of the target database.
+#[tokio::test]
+async fn test_validate_postgres_aggregate_sink_without_postgres() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records: Vec<TestRecord> = (0..3)
+        .map(|i| TestRecord {
+            block: i,
+            id: format!("id_{}", i),
+            data: format!("data{}", i),
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  test_kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  postgres_agg:
+    type: postgres_aggregate
+    from: test_kafka_source
+    landing_table: blocks_landing
+    agg_table: block_totals
+    schema: streamling
+    primary_key: id
+    group_by:
+      data:
+        type: text
+    aggregate:
+      total_blocks:
+        from: block
+        fn: sum
+"#,
+        topic = ctx.kafka_topic
+    );
+
+    // Point the sink at an address where nothing listens: validation must not
+    // need Postgres at all. The short acquire timeout keeps this test fast if
+    // the connect-during-validate regression ever comes back.
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new()
+                .arg("--validate")
+                .env("STREAMLING__POSTGRES_SINK__HOST", "127.0.0.1")
+                .env("STREAMLING__POSTGRES_SINK__PORT", "9")
+                .env("STREAMLING__POSTGRES_SINK__POOL_ACQUIRE_TIMEOUT_SECS", "2"),
+        )
+        .await
+        .expect("Failed to run pipeline");
+
+    let validation: ValidationOutput = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "Failed to parse validation JSON from stdout: {}\nstdout was:\n{}\nstderr was:\n{}",
+            e, output.stdout, output.stderr
+        )
+    });
+
+    assert!(
+        validation.success && validation.is_valid && validation.errors.is_empty(),
+        "postgres_aggregate pipeline should validate without a reachable Postgres, \
+         got errors: {:?}\nstderr:\n{}",
+        validation.errors,
+        output.stderr
+    );
+    assert!(
+        output.status.success(),
+        "Pipeline should exit zero when validation passes.\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+}
