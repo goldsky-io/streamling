@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, StringArray, StringBuilder};
@@ -114,7 +113,7 @@ fn json_unquote_scalar(value: &ScalarValue) -> DataFusionResult<ScalarValue> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonArrayUdf {
     signature: Signature,
     name: &'static str,
@@ -135,10 +134,6 @@ impl JsonArrayUdf {
 }
 
 impl ScalarUDFImpl for JsonArrayUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -175,7 +170,7 @@ impl ScalarUDFImpl for JsonArrayUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonObjectUdf {
     signature: Signature,
     name: &'static str,
@@ -196,10 +191,6 @@ impl JsonObjectUdf {
 }
 
 impl ScalarUDFImpl for JsonObjectUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -248,7 +239,7 @@ impl ScalarUDFImpl for JsonObjectUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonUnquoteUdf {
     signature: Signature,
 }
@@ -262,10 +253,6 @@ impl JsonUnquoteUdf {
 }
 
 impl ScalarUDFImpl for JsonUnquoteUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "JSON_UNQUOTE"
     }
@@ -319,7 +306,7 @@ impl ScalarUDFImpl for JsonUnquoteUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonLiteralUdf {
     signature: Signature,
 }
@@ -333,10 +320,6 @@ impl JsonLiteralUdf {
 }
 
 impl ScalarUDFImpl for JsonLiteralUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "JSON"
     }

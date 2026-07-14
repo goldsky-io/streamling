@@ -16,7 +16,6 @@ datafusion.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-json.workspace = true
-datafusion-datasource-avro.workspace = true
 
 # Logging
 tracing.workspace = true

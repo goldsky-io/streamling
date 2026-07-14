@@ -7,7 +7,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::common::{not_impl_err, project_schema};
+use datafusion::common::{DataFusionError, not_impl_err, project_schema};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -16,7 +16,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
@@ -39,8 +38,13 @@ use tracing::{debug, error, warn};
 #[derive(Debug)]
 struct PluginSourceExec {
     schema: SchemaRef,
+    /// Column indices into the plugin's full schema, pushed down from the scan.
+    /// The plugin always emits full rows; the projection is applied here so the
+    /// emitted batches match `schema` (DataFusion 54 resolves downstream column
+    /// indices against the projected scan schema).
+    projection: Option<Vec<usize>>,
     plugin_channels: Arc<PluginChannels>,
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
     internal_buffer_size: u32,
     metric_metadata_id: String,
 }
@@ -48,6 +52,7 @@ struct PluginSourceExec {
 impl PluginSourceExec {
     pub fn new(
         schema: SchemaRef,
+        projection: Option<Vec<usize>>,
         plugin_channels: Arc<PluginChannels>,
         internal_buffer_size: u32,
         metric_metadata_id: String,
@@ -55,8 +60,9 @@ impl PluginSourceExec {
         let cached_properties = Self::compute_properties(schema.clone());
         Self {
             schema,
+            projection,
             plugin_channels,
-            cached_properties,
+            cached_properties: Arc::new(cached_properties),
             internal_buffer_size,
             metric_metadata_id,
         }
@@ -86,11 +92,7 @@ impl ExecutionPlan for PluginSourceExec {
         "PluginSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -130,6 +132,7 @@ impl ExecutionPlan for PluginSourceExec {
         let metrics_receiver = self.plugin_channels.metrics.receiver.clone();
         let metrics_recorder = get_metrics_recorder();
         let metric_metadata_id = self.metric_metadata_id.clone();
+        let projection = self.projection.clone();
 
         builder.spawn(async move {
             tokio::spawn(process_plugin_metrics(
@@ -153,6 +156,22 @@ impl ExecutionPlan for PluginSourceExec {
                             match message.into_enum() {
                                 Ok(PluginMsg::NextBatch { data }) => {
                                     let mut record_batch: RecordBatch = data.into();
+                                    // The plugin emits full rows; apply the scan's column
+                                    // projection so batches match the declared (projected)
+                                    // schema. `RecordBatch::project` preserves schema
+                                    // metadata, so checkpoint signals survive.
+                                    if let Some(indices) = &projection {
+                                        record_batch = match record_batch.project(indices) {
+                                            Ok(projected) => projected,
+                                            Err(e) => {
+                                                let _ = tx
+                                                    .send(Err(DataFusionError::from(e)
+                                                        .context("projecting plugin source batch")))
+                                                    .await;
+                                                return Ok(());
+                                            }
+                                        };
+                                    }
                                     batch_count += 1;
 
                                     if !checkpoint_buffer.is_empty() {
@@ -305,8 +324,13 @@ impl PluginSourceProvider {
         internal_buffer_size: u32,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema_projected = project_schema(&schema_ref, projections)?;
+        // An identity projection (all columns in order) needs no per-batch work.
+        let projection = projections
+            .filter(|indices| !indices.iter().copied().eq(0..schema_ref.fields().len()))
+            .cloned();
         Ok(Arc::new(PluginSourceExec::new(
             schema_projected,
+            projection,
             plugin_channels,
             internal_buffer_size,
             self.metric_metadata_id.clone(),
@@ -316,10 +340,6 @@ impl PluginSourceProvider {
 
 #[async_trait]
 impl TableProvider for PluginSourceProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -370,10 +390,6 @@ impl PluginSink {
 
 #[async_trait]
 impl DataSink for PluginSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -542,10 +558,6 @@ impl PluginSinkProvider {
 
 #[async_trait]
 impl TableProvider for PluginSinkProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

@@ -30,6 +30,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::expressions::col as physical_col;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
@@ -38,6 +39,7 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
     filter::FilterExec,
     project_schema,
+    projection::ProjectionExec,
 };
 use streamling_core::formats::avro::{
     AvroToArrowConverter, FromArrowToAvroConverter, convert_avro_schema_to_arrow,
@@ -46,6 +48,7 @@ use streamling_core::formats::avro::{
 use streamling_core::formats::json::{FromArrowToJsonConverter, JsonToArrowConverter};
 use streamling_core::formats::{FromArrowConverter, ToArrowConverter};
 use streamling_core::operators::filter::StreamingFilterExec;
+use streamling_core::operators::projection::StreamingProjectionExec;
 use streamling_core::schema::arrow_schema_from_type_map;
 use streamling_core::session::SessionManager;
 use streamling_core::topology::SchemaIdOverride;
@@ -75,7 +78,6 @@ use schema_registry_converter::schema_registry_common::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
-use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
@@ -535,7 +537,7 @@ struct KafkaSourceExec {
     topic: String,
     start_at: Option<String>,
     filter: Option<String>,
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
     record_batch_interval_ms: u64,
     record_batch_size: u32,
     internal_buffer_size: u32,
@@ -618,7 +620,7 @@ impl KafkaSourceExec {
             topic,
             start_at,
             filter,
-            cached_properties,
+            cached_properties: Arc::new(cached_properties),
             record_batch_interval_ms,
             record_batch_size,
             internal_buffer_size,
@@ -1062,11 +1064,7 @@ impl ExecutionPlan for KafkaSourceExec {
         "KafkaSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -1158,6 +1156,16 @@ impl ExecutionPlan for KafkaSourceExec {
         };
 
         let should_enrich_op_column = self.should_enrich_op_column;
+        // Append the enriched op column to the data only when the pushed-down
+        // scan projection kept it: a transform that recomputes `_gs_op` (or
+        // never reads it) lets the engine prune it from the scan schema, and
+        // appending the array anyway makes every batch one column wider than
+        // the schema ("number of columns(N+1) must match number of fields(N)").
+        let append_op_column = self.should_enrich_op_column
+            && self
+                .full_schema_projected
+                .field_with_name(COLUMN_NAME_OP)
+                .is_ok();
         let start_at = self.start_at.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let num_records_before_stop = self.num_records_before_stop;
@@ -1380,7 +1388,9 @@ impl ExecutionPlan for KafkaSourceExec {
                                             vec!(("kind", row_kind.to_str().as_ref())),
                                             metric_metadata_id.as_str()
                                         );
-                                        row_kinds.push(row_kind.to_str());
+                                        if append_op_column {
+                                            row_kinds.push(row_kind.to_str());
+                                        }
                                     }
 
                                     if let Some(meta) = &mut metadata {
@@ -1421,7 +1431,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 let payload_batch = converter.convert_to_batch()?;
 
                 let mut record_columns = payload_batch.columns().to_vec();
-                if should_enrich_op_column {
+                if append_op_column {
                     record_columns.push(Arc::new(StringArray::from(row_kinds.clone())));
                     row_kinds.clear();
                 }
@@ -1892,9 +1902,15 @@ impl KafkaSourceTableProvider {
         include_metadata: bool,
         state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // The topology-level source `filter:` is defined against the source's
+        // full payload schema. A scan projection pushed down by the engine may
+        // prune columns the filter references, so when a filter is present the
+        // source is built UNPROJECTED, the filter planned against the full
+        // schema, and the projection re-applied on top of the filter.
+        let exec_projections = if filter.is_some() { None } else { projections };
         let kafka_source_exec = Arc::new(KafkaSourceExec::new(
             reference_name.clone(),
-            projections,
+            exec_projections,
             full_schema,
             payload_schema,
             config,
@@ -1914,17 +1930,39 @@ impl KafkaSourceTableProvider {
         ));
 
         if let Some(filter_expr) = &filter {
+            let unprojected_schema = kafka_source_exec.schema();
             let filter_predicate = Self::prepare_filter_expression(
                 filter_expr,
-                &kafka_source_exec.schema(),
+                &unprojected_schema,
                 &self.session_manager,
             )
             .streamling_with_context(|| format!("invalid filter for source '{reference_name}'"))?;
             // Use StreamingFilterExec to preserve batch metadata (including checkpoint markers)
             let original_filter = FilterExec::try_new(filter_predicate, kafka_source_exec)?;
-            Ok(Arc::new(StreamingFilterExec::from_original(
-                original_filter,
-            )?))
+            let filtered: Arc<dyn ExecutionPlan> =
+                Arc::new(StreamingFilterExec::from_original(original_filter)?);
+            match projections {
+                Some(indices) => {
+                    // Re-apply the pushed-down projection above the filter so the
+                    // scan still returns the projected schema. StreamingProjectionExec
+                    // preserves batch metadata (checkpoint markers), like the filter.
+                    let exprs = indices
+                        .iter()
+                        .map(|&i| {
+                            let field = unprojected_schema.field(i);
+                            Ok((
+                                physical_col(field.name(), &unprojected_schema)?,
+                                field.name().clone(),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let projection = ProjectionExec::try_new(exprs, filtered)?;
+                    Ok(Arc::new(StreamingProjectionExec::from_original(
+                        projection,
+                    )?))
+                }
+                None => Ok(filtered),
+            }
         } else {
             Ok(kafka_source_exec)
         }
@@ -2039,10 +2077,6 @@ impl KafkaSourceTableProvider {
 
 #[async_trait]
 impl TableProvider for KafkaSourceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -2564,10 +2598,6 @@ impl KafkaSink {
 
 #[async_trait]
 impl DataSink for KafkaSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -2801,10 +2831,6 @@ impl KafkaSinkTableProvider {
 
 #[async_trait]
 impl TableProvider for KafkaSinkTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -2859,6 +2885,69 @@ impl TableProvider for KafkaSinkTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A topology-level source `filter:` is defined against the source's full
+    /// payload schema. When the engine pushes a scan projection that prunes a
+    /// column the filter references, the filter must still plan against the
+    /// full schema (and the projection applied afterwards) — otherwise a
+    /// perfectly valid filter becomes a fatal "invalid filter for source"
+    /// error at startup.
+    #[tokio::test]
+    async fn source_filter_survives_scan_projection_pushdown() {
+        use datafusion::catalog::TableProvider;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+
+        let session_manager = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<TopicPartitionOffset>("test-kafka-filter");
+
+        let mut json_schema = BTreeMap::new();
+        json_schema.insert("a".to_string(), "string".to_string());
+        json_schema.insert("b".to_string(), "int64".to_string());
+        json_schema.insert("c".to_string(), "string".to_string());
+
+        let provider = KafkaSourceTableProvider::new(
+            "src".to_string(),
+            "src-metrics".to_string(),
+            test_kafka_config(),
+            "test-topic".to_string(),
+            None,
+            Some("c = 'x'".to_string()),
+            1000,
+            10,
+            10,
+            false,
+            state_backend,
+            session_manager.clone(),
+            None,
+            false,
+            vec![],
+            true,
+            vec![],
+            KafkaFormat::Json,
+            Some(json_schema),
+        )
+        .unwrap();
+
+        // The engine pushes a projection that keeps only column `a` (index 0)
+        // — pruning `c`, which the source filter references.
+        let state = session_manager.session_state();
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[], None)
+            .await
+            .expect(
+                "source filter must plan against the full payload schema, \
+                 not the projected scan schema",
+            );
+
+        // The scan contract still holds: output schema is the projected one.
+        let schema = plan.schema();
+        let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(fields, vec!["a"], "scan must project to the pushed columns");
+    }
 
     #[test]
     fn json_payload_to_string_rejects_empty_payload() {

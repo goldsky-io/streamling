@@ -11,6 +11,7 @@ members = [
     "crates/streamling",
     "crates/streamling-flink-compat",
     "crates/streamling-e2e",
+    "crates/streamling-bench",
 ]
 exclude = [
     "plugin_examples",
@@ -39,15 +40,14 @@ streamling-plugin-derive = { path = "crates/streamling-plugin/streamling-plugin-
 streamling-e2e           = { path = "crates/streamling-e2e", version = "0.2.0" }
 
 # Core DataFusion ecosystem
-datafusion = { version = "49.0.2", features = ["avro", "backtrace"] }
-datafusion-expr = "49.0.2"
-datafusion-datasource-avro = "49.0.2"
-arrow = "55.2.0"
-arrow-schema = { version = "55.2.0", default-features = false }
-arrow-data = "55.2.0"
-arrow-json = "55.2.0"
-# Pinned to 0.12 to match DataFusion 49's `object_store = "0.12.3"`
-object_store = { version = "0.12", features = ["aws", "gcp"] }
+datafusion = { version = "54.0.0", features = ["avro", "backtrace"] }
+datafusion-expr = "54.0.0"
+arrow = "58.3.0"
+arrow-schema = { version = "58.3.0", default-features = false }
+arrow-data = "58.3.0"
+arrow-json = "58.3.0"
+# Bumped to 0.13 to match DataFusion 54's `object_store = "0.13.x"`
+object_store = { version = "0.13", features = ["aws", "gcp"] }
 
 tokio = { version = "1.0", features = ["rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -85,6 +85,8 @@ reqwest-retry = "0.7.0"
 reqwest-middleware = "0.4.0"
 bytes = "1.11"
 flate2 = "1.0"
+zstd = "0.13"
+lz4_flex = "0.11"
 indoc = "2.0.6"
 regex = "1.11.1"
 percent-encoding = "2.3.1"
@@ -104,7 +106,7 @@ swc_ecma_lexer = "23.0.1"
 heck = "0.5.0"
 
 # Plugin / FFI dependencies
-datafusion-ffi = "49.0.2"
+datafusion-ffi = "54.0.0"
 abi_stable = "0.11.3"
 async-ffi   = { version = "0.5", features = ["abi_stable"] }
 
@@ -128,7 +130,7 @@ chrono = "0.4.41"
 
 # Encoding and hashing
 bs58 = "0.5.1"
-arrow-buffer = "55.2.0"
+arrow-buffer = "58.3.0"
 base64 = "0.22.1"
 xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
 sha3 = "0.10"

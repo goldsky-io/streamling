@@ -26,7 +26,6 @@ use datafusion::physical_plan::{
 
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use std::any::Any;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -41,7 +40,7 @@ use tracing::debug;
 struct StreamSourcePlan {
     schema: SchemaRef,
     stream: std::sync::Mutex<Option<SendableRecordBatchStream>>,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl StreamSourcePlan {
@@ -57,7 +56,7 @@ impl StreamSourcePlan {
         Self {
             schema,
             stream: std::sync::Mutex::new(Some(stream)),
-            cache,
+            cache: Arc::new(cache),
         }
     }
 }
@@ -79,11 +78,7 @@ impl ExecutionPlan for StreamSourcePlan {
         "StreamSourcePlan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -110,8 +105,8 @@ impl ExecutionPlan for StreamSourcePlan {
         })
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
     }
 }
 
@@ -247,7 +242,6 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
                         .await?;
 
                     let has_transforms = sink_plan
-                        .as_any()
                         .downcast_ref::<DataSinkExec>()
                         .map(|dse| !Arc::ptr_eq(dse.input(), &input_physical))
                         .unwrap_or(false);
@@ -288,7 +282,7 @@ pub(crate) struct MultiSinkExec {
     /// Per-sink rebatching applied at `execute` time between the broadcast
     /// consumer and the sink's write path. Parallel to `sink_names`.
     sink_rebatch_configs: Vec<RebatchConfig>,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
     internal_buffer_size: usize,
     /// `metric_metadata_id` of the producer feeding this fan-out, passed to the
     /// `BroadcastStream` so blocked-send time is attributed to the producer.
@@ -313,7 +307,7 @@ impl MultiSinkExec {
             sink_has_transforms,
             sink_names,
             sink_rebatch_configs,
-            cache,
+            cache: Arc::new(cache),
             internal_buffer_size,
             upstream_metadata_id,
         }
@@ -385,11 +379,7 @@ impl ExecutionPlan for MultiSinkExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -458,7 +448,6 @@ impl ExecutionPlan for MultiSinkExec {
 
             tokio::spawn(async move {
                 let data_sink_exec = sink
-                    .as_any()
                     .downcast_ref::<DataSinkExec>()
                     .expect("MultiSinkExec: sink must be a DataSinkExec");
                 let data_sink = data_sink_exec.sink();
@@ -536,7 +525,7 @@ impl ExecutionPlan for MultiSinkExec {
         Ok(Box::pin(output_consumer))
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 }

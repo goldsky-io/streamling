@@ -40,7 +40,7 @@ impl PhysicalOptimizerRule for StreamingFilterRewritePhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
-            if let Some(original_filter) = input_plan.as_any().downcast_ref::<FilterExec>() {
+            if let Some(original_filter) = input_plan.downcast_ref::<FilterExec>() {
                 let streaming_filter =
                     StreamingFilterExec::from_original(original_filter.clone()).unwrap();
                 Ok(Transformed::yes(Arc::new(streaming_filter)))
@@ -83,8 +83,7 @@ impl PhysicalOptimizerRule for StreamingProjectionRewritePhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
-            if let Some(original_projection) = input_plan.as_any().downcast_ref::<ProjectionExec>()
-            {
+            if let Some(original_projection) = input_plan.downcast_ref::<ProjectionExec>() {
                 let streaming_projection =
                     StreamingProjectionExec::from_original(original_projection.clone()).unwrap();
                 Ok(Transformed::yes(Arc::new(streaming_projection)))
@@ -127,7 +126,7 @@ impl PhysicalOptimizerRule for StreamingUnnestRewritePhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
-            if let Some(original_unnest) = input_plan.as_any().downcast_ref::<UnnestExec>() {
+            if let Some(original_unnest) = input_plan.downcast_ref::<UnnestExec>() {
                 let streaming_unnest =
                     StreamingUnnestExec::from_original(original_unnest.clone()).unwrap();
                 Ok(Transformed::yes(Arc::new(streaming_unnest)))
@@ -197,7 +196,7 @@ fn attribute_downstream(
     // MultiSinkExec boundary: the single `input` is the fan-out producer.
     // Suppress its WrappingExec (the BroadcastStream emits per-sink edges) and
     // clear the named downstream below (the producer names its own children).
-    if node.as_any().is::<MultiSinkExec>() {
+    if node.downcast_ref::<MultiSinkExec>().is_some() {
         let new_children = node
             .children()
             .into_iter()
@@ -208,7 +207,7 @@ fn attribute_downstream(
 
     // WrappingExec: stamp this node's role, then recurse with this node as the
     // named downstream for its children.
-    if let Some(wrapping) = node.as_any().downcast_ref::<WrappingExec>() {
+    if let Some(wrapping) = node.downcast_ref::<WrappingExec>() {
         let role = if suppress_next_wrapping
             || matches!(
                 wrapping.backpressure_role(),
@@ -248,7 +247,7 @@ fn attribute_downstream(
     // transform isn't inlined, so `named_downstream` here is the sink). Only fall
     // back to `named_downstream` when unstamped — e.g. a sink reading the shared
     // source directly, no transform between.
-    if let Some(broadcasting) = node.as_any().downcast_ref::<BroadcastingExec>() {
+    if let Some(broadcasting) = node.downcast_ref::<BroadcastingExec>() {
         if broadcasting.downstream_id().is_some() {
             return Ok(Arc::clone(&node));
         }
@@ -267,7 +266,7 @@ fn attribute_downstream(
     // untagged and stamping the sink name one node too far upstream. Recurse into
     // `inner` directly; rebatch is not itself an edge endpoint, so the named
     // downstream passes through unchanged.
-    if let Some(rebatch) = node.as_any().downcast_ref::<RebatchExec>() {
+    if let Some(rebatch) = node.downcast_ref::<RebatchExec>() {
         let attributed_inner = attribute_downstream(
             Arc::clone(rebatch.inner()),
             named_downstream,
@@ -278,10 +277,9 @@ fn attribute_downstream(
 
     // DataSinkExec (root of a sink plan): the sink is the named downstream for
     // the topmost transform. Recover its plain name from the WrappingDataSink.
-    if let Some(dse) = node.as_any().downcast_ref::<DataSinkExec>() {
+    if let Some(dse) = node.downcast_ref::<DataSinkExec>() {
         let sink_downstream: Option<String> = dse
             .sink()
-            .as_any()
             .downcast_ref::<WrappingDataSink>()
             .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
             .or_else(|| named_downstream.map(str::to_string));
@@ -380,7 +378,6 @@ mod attribution_tests {
     use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
-    use std::any::Any;
     use std::fmt;
 
     fn schema() -> SchemaRef {
@@ -427,9 +424,6 @@ mod attribution_tests {
 
     #[async_trait::async_trait]
     impl DataSink for NoopDataSink {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> &SchemaRef {
             &self.schema
         }
@@ -453,8 +447,7 @@ mod attribution_tests {
     }
 
     fn role_of(node: &Arc<dyn ExecutionPlan>) -> BackpressureRole {
-        node.as_any()
-            .downcast_ref::<WrappingExec>()
+        node.downcast_ref::<WrappingExec>()
             .expect("expected a WrappingExec")
             .backpressure_role()
             .clone()
@@ -514,7 +507,6 @@ mod attribution_tests {
         // `child(&w_sql, 0)` would see-through past W(source); reach it via inner().
         let w_src = Arc::clone(
             w_sql
-                .as_any()
                 .downcast_ref::<WrappingExec>()
                 .expect("expected a WrappingExec")
                 .inner(),
@@ -557,7 +549,9 @@ mod attribution_tests {
             1,
             Some(Arc::from("app::kafka_source")),
         ));
-        let broadcasting: Arc<dyn ExecutionPlan> = Arc::new(BroadcastingExec::new(handle));
+        let broadcasting: Arc<dyn ExecutionPlan> = Arc::new(
+            BroadcastingExec::new(handle, None).expect("broadcasting plan should be valid"),
+        );
         // DataSinkExec(pg_sink_a) <- W(sql_a) <- mid <- BroadcastingExec
         let plan = sink(wrap(mid(broadcasting), "app::sql_a"), "app::pg_sink_a");
         let optimized = run(plan);
@@ -569,7 +563,6 @@ mod attribution_tests {
         );
         let broadcasting_out = child(&w_sql, 0);
         let broadcasting_exec = broadcasting_out
-            .as_any()
             .downcast_ref::<BroadcastingExec>()
             .expect("expected a BroadcastingExec");
         assert_eq!(broadcasting_exec.downstream_id(), Some("sql_a"));
@@ -583,7 +576,7 @@ mod attribution_tests {
             1,
             Some(Arc::from("app::kafka_source")),
         ));
-        let exec = BroadcastingExec::new(handle);
+        let exec = BroadcastingExec::new(handle, None).expect("broadcasting plan should be valid");
         match downstream_id {
             Some(id) => Arc::new(exec.with_downstream_id(id.to_string())),
             None => Arc::new(exec),
@@ -608,7 +601,6 @@ mod attribution_tests {
         let mid_out = child(&optimized, 0);
         let broadcasting_out = child(&mid_out, 0);
         let broadcasting_exec = broadcasting_out
-            .as_any()
             .downcast_ref::<BroadcastingExec>()
             .expect("expected a BroadcastingExec");
         assert_eq!(broadcasting_exec.downstream_id(), Some("slow_branch"));
@@ -626,7 +618,6 @@ mod attribution_tests {
         let mid_out = child(&optimized, 0);
         let broadcasting_out = child(&mid_out, 0);
         let broadcasting_exec = broadcasting_out
-            .as_any()
             .downcast_ref::<BroadcastingExec>()
             .expect("expected a BroadcastingExec");
         assert_eq!(broadcasting_exec.downstream_id(), Some("pg_sink"));
@@ -679,7 +670,6 @@ mod attribution_tests {
         let rebatch_node = child(&optimized, 0);
         let w_sql = Arc::clone(
             rebatch_node
-                .as_any()
                 .downcast_ref::<RebatchExec>()
                 .expect("expected a RebatchExec")
                 .inner(),
@@ -709,13 +699,11 @@ mod attribution_tests {
         let rebatch_node = child(&optimized, 0);
         let broadcasting_out = Arc::clone(
             rebatch_node
-                .as_any()
                 .downcast_ref::<RebatchExec>()
                 .expect("expected a RebatchExec")
                 .inner(),
         );
         let broadcasting_exec = broadcasting_out
-            .as_any()
             .downcast_ref::<BroadcastingExec>()
             .expect("expected a BroadcastingExec");
         assert_eq!(broadcasting_exec.downstream_id(), Some("pg_sink"));
@@ -779,7 +767,6 @@ mod attribution_tests {
         assert_eq!(role_of(&attributed), BackpressureRole::FanOutProducer);
         let w_source = Arc::clone(
             attributed
-                .as_any()
                 .downcast_ref::<WrappingExec>()
                 .expect("expected a WrappingExec")
                 .inner(),

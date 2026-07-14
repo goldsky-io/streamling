@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,7 +38,7 @@ pub struct StreamingProjectionExec {
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Cache holding plan properties
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
     /// Copy of the original DataFusion ProjectionExec for method delegation
     original_projection: ProjectionExec,
 }
@@ -47,7 +46,11 @@ pub struct StreamingProjectionExec {
 impl StreamingProjectionExec {
     pub fn from_original(original_projection: ProjectionExec) -> Result<Self> {
         Ok(Self {
-            expr: original_projection.expr().to_vec(),
+            expr: original_projection
+                .expr()
+                .iter()
+                .map(|pe| (pe.expr.clone(), pe.alias.clone()))
+                .collect(),
             schema: original_projection.schema(),
             input: original_projection.input().clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -110,7 +113,7 @@ impl ExecutionPlan for StreamingProjectionExec {
             fn benefits_from_input_partitioning(&self) -> Vec<bool>;
             fn supports_limit_pushdown(&self) -> bool;
             fn cardinality_effect(&self) -> CardinalityEffect;
-            fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
+            fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
         }
     }
 
@@ -118,11 +121,7 @@ impl ExecutionPlan for StreamingProjectionExec {
         "StreamingProjectionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -245,20 +244,19 @@ impl RecordBatchStream for StreamingProjectionStream {
 pub fn remove_unnecessary_projections(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let maybe_modified =
-        if let Some(projection) = plan.as_any().downcast_ref::<StreamingProjectionExec>() {
-            // If the projection does not cause any change on the input, we can
-            // safely remove it:
-            if is_projection_removable(projection) {
-                return Ok(Transformed::yes(Arc::clone(projection.input())));
-            }
-            // If it does, check if we can push it under its child(ren):
-            projection
-                .input()
-                .try_swapping_with_projection(&projection.original_projection)?
-        } else {
-            return Ok(Transformed::no(plan));
-        };
+    let maybe_modified = if let Some(projection) = plan.downcast_ref::<StreamingProjectionExec>() {
+        // If the projection does not cause any change on the input, we can
+        // safely remove it:
+        if is_projection_removable(projection) {
+            return Ok(Transformed::yes(Arc::clone(projection.input())));
+        }
+        // If it does, check if we can push it under its child(ren):
+        projection
+            .input()
+            .try_swapping_with_projection(&projection.original_projection)?
+    } else {
+        return Ok(Transformed::no(plan));
+    };
     Ok(maybe_modified.map_or_else(|| Transformed::no(plan), Transformed::yes))
 }
 
@@ -269,7 +267,7 @@ pub fn remove_unnecessary_projections(
 fn is_projection_removable(projection: &StreamingProjectionExec) -> bool {
     let exprs = projection.expr();
     exprs.iter().enumerate().all(|(idx, (expr, alias))| {
-        let Some(col) = expr.as_any().downcast_ref::<Column>() else {
+        let Some(col) = expr.downcast_ref::<Column>() else {
             return false;
         };
         col.name() == alias && col.index() == idx
@@ -317,7 +315,7 @@ pub fn update_expr(
                 return Ok(Transformed::no(expr));
             }
 
-            let Some(column) = expr.as_any().downcast_ref::<Column>() else {
+            let Some(column) = expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(expr));
             };
             if sync_with_child {
@@ -334,16 +332,16 @@ pub fn update_expr(
                     .iter()
                     .enumerate()
                     .find_map(|(index, (projected_expr, alias))| {
-                        projected_expr.as_any().downcast_ref::<Column>().and_then(
-                            |projected_column| {
+                        projected_expr
+                            .downcast_ref::<Column>()
+                            .and_then(|projected_column| {
                                 (column.name().eq(projected_column.name())
                                     && column.index() == projected_column.index())
                                 .then(|| {
                                     state = RewriteState::RewrittenValid;
                                     Arc::new(Column::new(alias, index)) as _
                                 })
-                            },
-                        )
+                            })
                     })
                     .map_or_else(|| Ok(Transformed::no(expr)), |c| Ok(Transformed::yes(c)))
             }
@@ -365,7 +363,7 @@ fn try_unifying_projections(
     projection.expr().iter().for_each(|(expr, _)| {
         expr.apply(|expr| {
             Ok({
-                if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+                if let Some(column) = expr.downcast_ref::<Column>() {
                     *column_ref_map.entry(column.clone()).or_default() += 1;
                 }
                 TreeNodeRecursion::Continue
@@ -401,6 +399,5 @@ fn try_unifying_projections(
 /// Checks if the given expression is trivial.
 /// An expression is considered trivial if it is either a `Column` or a `Literal`.
 fn is_expr_trivial(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.as_any().downcast_ref::<Column>().is_some()
-        || expr.as_any().downcast_ref::<Literal>().is_some()
+    expr.downcast_ref::<Column>().is_some() || expr.downcast_ref::<Literal>().is_some()
 }

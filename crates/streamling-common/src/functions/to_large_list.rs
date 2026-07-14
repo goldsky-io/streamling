@@ -7,7 +7,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::{streamling_err, streamling_user_bail};
@@ -22,7 +21,7 @@ use crate::{streamling_err, streamling_user_bail};
 /// ```sql
 /// SELECT unnest(to_large_list(my_array_column)) FROM table
 /// ```
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToLargeListFunc {
     signature: Signature,
 }
@@ -42,10 +41,6 @@ impl ToLargeListFunc {
 }
 
 impl ScalarUDFImpl for ToLargeListFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "to_large_list"
     }
@@ -140,6 +135,7 @@ mod tests {
             arg_fields: vec![arg_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -182,6 +178,7 @@ mod tests {
             arg_fields: vec![arg_field.into()],
             number_rows: 2,
             return_field: return_field.into(),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

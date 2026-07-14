@@ -502,7 +502,7 @@ fn regex_replace_row(
     ))
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpExtractUdf {
     signature: Signature,
     name: &'static str,
@@ -528,10 +528,6 @@ impl RegexpExtractUdf {
 }
 
 impl ScalarUDFImpl for RegexpExtractUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -554,7 +550,7 @@ impl ScalarUDFImpl for RegexpExtractUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpExtractAllUdf {
     signature: Signature,
     name: &'static str,
@@ -576,10 +572,6 @@ impl RegexpExtractAllUdf {
 }
 
 impl ScalarUDFImpl for RegexpExtractAllUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -601,7 +593,7 @@ impl ScalarUDFImpl for RegexpExtractAllUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpSubstrUdf {
     signature: Signature,
     name: &'static str,
@@ -629,10 +621,6 @@ impl RegexpSubstrUdf {
 }
 
 impl ScalarUDFImpl for RegexpSubstrUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -650,7 +638,7 @@ impl ScalarUDFImpl for RegexpSubstrUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpCountUdf {
     signature: Signature,
     name: &'static str,
@@ -669,10 +657,6 @@ impl RegexpCountUdf {
 }
 
 impl ScalarUDFImpl for RegexpCountUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -690,7 +674,7 @@ impl ScalarUDFImpl for RegexpCountUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpInstrUdf {
     signature: Signature,
     name: &'static str,
@@ -706,10 +690,6 @@ impl RegexpInstrUdf {
 }
 
 impl ScalarUDFImpl for RegexpInstrUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -727,7 +707,7 @@ impl ScalarUDFImpl for RegexpInstrUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpReplaceUdf {
     signature: Signature,
     name: &'static str,
@@ -750,10 +730,6 @@ impl RegexpReplaceUdf {
 }
 
 impl ScalarUDFImpl for RegexpReplaceUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }

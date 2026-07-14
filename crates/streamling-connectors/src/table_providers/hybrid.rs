@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -58,7 +57,6 @@ pub trait OffsetProvider: Send + Sync + Debug {
 /// `WrappingSourceTableProvider`.
 fn bounded_has_persisted_state(source: &Arc<dyn TableProvider>) -> bool {
     let inner_arc = source
-        .as_any()
         .downcast_ref::<WrappingSourceTableProvider>()
         .map(|w| w.get_inner());
     let inner: &dyn TableProvider = match &inner_arc {
@@ -66,15 +64,12 @@ fn bounded_has_persisted_state(source: &Arc<dyn TableProvider>) -> bool {
         None => source.as_ref(),
     };
 
-    if let Some(ch) = inner.as_any().downcast_ref::<ClickHouseTableProvider>() {
+    if let Some(ch) = inner.downcast_ref::<ClickHouseTableProvider>() {
         return ch.has_persisted_source_state();
     }
 
     #[cfg(test)]
-    if let Some(mock) = inner
-        .as_any()
-        .downcast_ref::<tests::MockStatefulBoundedProvider>()
-    {
+    if let Some(mock) = inner.downcast_ref::<tests::MockStatefulBoundedProvider>() {
         return mock.has_persisted_state();
     }
 
@@ -161,7 +156,6 @@ impl HybridTableProvider {
         if let Some(kafka_provider) = self
             .config
             .unbounded_source
-            .as_any()
             .downcast_ref::<KafkaSourceTableProvider>()
         {
             info!("Shutting down kafka table provider");
@@ -173,17 +167,13 @@ impl HybridTableProvider {
     /// Propagate a side output to all inner phase sources so it sees pre-filter data.
     pub fn add_side_output_to_inner_sources(&self, side_output: Arc<dyn SourceSideOutput>) {
         for source in &self.config.bounded_sources {
-            if let Some(wrapping) = source
-                .as_any()
-                .downcast_ref::<WrappingSourceTableProvider>()
-            {
+            if let Some(wrapping) = source.downcast_ref::<WrappingSourceTableProvider>() {
                 wrapping.add_side_output(side_output.clone());
             }
         }
         if let Some(wrapping) = self
             .config
             .unbounded_source
-            .as_any()
             .downcast_ref::<WrappingSourceTableProvider>()
         {
             wrapping.add_side_output(side_output);
@@ -560,13 +550,12 @@ impl HybridTableProvider {
         let kafka_inner = self
             .config
             .unbounded_source
-            .as_any()
             .downcast_ref::<WrappingSourceTableProvider>()
             .map(|w| w.get_inner());
 
         let kafka_provider = kafka_inner
             .as_ref()
-            .and_then(|inner| inner.as_any().downcast_ref::<KafkaSourceTableProvider>());
+            .and_then(|inner| inner.downcast_ref::<KafkaSourceTableProvider>());
 
         // Cheap state-backend probe before touching the (potentially remote)
         // offset provider. Recovery to unbounded REQUIRES the kafka source to
@@ -730,7 +719,6 @@ impl HybridTableProvider {
     pub async fn get_current_inner_source(&self) -> DataFusionResult<Arc<dyn TableProvider>> {
         let current_src = self.get_current_source().await?;
         let wrapping_table_provider = current_src
-            .as_any()
             .downcast_ref::<WrappingSourceTableProvider>()
             .ok_or_else(|| {
                 streamling_err!(
@@ -747,7 +735,6 @@ impl HybridTableProvider {
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let bounded_src = self.config.bounded_sources[idx].clone();
         let wrapping_table_provider = bounded_src
-            .as_any()
             .downcast_ref::<WrappingSourceTableProvider>()
             .ok_or_else(|| {
                 streamling_err!(
@@ -761,7 +748,6 @@ impl HybridTableProvider {
     pub async fn get_unbounded_inner_source(&self) -> DataFusionResult<Arc<dyn TableProvider>> {
         let bounded_src = self.config.unbounded_source.clone();
         let wrapping_table_provider = bounded_src
-            .as_any()
             .downcast_ref::<WrappingSourceTableProvider>()
             .ok_or_else(|| {
                 streamling_err!(
@@ -805,11 +791,9 @@ impl HybridTableProvider {
             if let Some(wrapping_provider) = self
                 .config
                 .unbounded_source
-                .as_any()
                 .downcast_ref::<WrappingSourceTableProvider>()
                 && let Some(kafka_provider) = wrapping_provider
                     .get_inner()
-                    .as_any()
                     .downcast_ref::<KafkaSourceTableProvider>()
             {
                 kafka_provider.seed_offsets(&offsets).await?;
@@ -839,10 +823,6 @@ impl HybridTableProvider {
 
 #[async_trait]
 impl TableProvider for HybridTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -879,7 +859,7 @@ impl TableProvider for HybridTableProvider {
 pub struct HybridSourceExec {
     inner: Arc<dyn ExecutionPlan>,
     provider: HybridTableProvider,
-    cached_properties: PlanProperties,
+    cached_properties: Arc<PlanProperties>,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -905,7 +885,7 @@ impl HybridSourceExec {
         Self {
             inner,
             provider,
-            cached_properties,
+            cached_properties: Arc::new(cached_properties),
             projection,
             filters,
             limit,
@@ -925,15 +905,11 @@ impl ExecutionPlan for HybridSourceExec {
         "HybridSourceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.provider.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cached_properties
     }
 
@@ -1503,10 +1479,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
@@ -1554,10 +1526,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockStatefulBoundedProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
@@ -1760,7 +1728,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1772,7 +1739,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1784,7 +1750,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1833,7 +1798,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1868,7 +1832,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1904,7 +1867,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1941,7 +1903,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1953,7 +1914,6 @@ mod tests {
         let final_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             final_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -1978,10 +1938,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for BoundedSourceWithSchema {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
@@ -2009,10 +1965,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for UnboundedSourceWithSchema {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
@@ -2297,7 +2249,6 @@ mod tests {
         let current_source = hybrid_provider.get_current_source().await.unwrap();
         assert_eq!(
             current_source
-                .as_any()
                 .downcast_ref::<MockTableProvider>()
                 .unwrap()
                 .name,
@@ -2333,9 +2284,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for FiniteMockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
@@ -2351,12 +2299,12 @@ mod tests {
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(FiniteMockExec {
                 schema: self.schema.clone(),
-                properties: PlanProperties::new(
+                properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(self.schema.clone()),
                     datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
                     datafusion::physical_plan::execution_plan::EmissionType::Final,
                     datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-                ),
+                )),
             }))
         }
     }
@@ -2365,7 +2313,7 @@ mod tests {
     #[derive(Debug)]
     struct FiniteMockExec {
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl DisplayAs for FiniteMockExec {
@@ -2378,13 +2326,10 @@ mod tests {
         fn name(&self) -> &str {
             "FiniteMockExec"
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

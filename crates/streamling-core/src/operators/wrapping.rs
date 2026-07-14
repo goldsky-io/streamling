@@ -3,6 +3,7 @@ use crate::checkpoints::checkpoint_management::{
 };
 use crate::operators::filter::StreamingFilterExec;
 use crate::operators::inspect::LiveDataInspect;
+use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, SharedSourceRegistry};
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
@@ -18,7 +19,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::not_impl_err;
 use datafusion::common::{DFSchemaRef, DataFusionError, Result};
-use datafusion::config::ConfigOptions;
 use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -29,7 +29,6 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::{Distribution, OrderingRequirements};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, InvariantLevel};
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics, execute_input_stream,
@@ -37,7 +36,6 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use delegate::delegate;
 use futures::StreamExt;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Debug;
@@ -261,7 +259,43 @@ impl WrappingSourceTableProvider {
                 exec
             }
         };
-        if let Some(filter_exec) = inner_exec.as_any().downcast_ref::<StreamingFilterExec>() {
+
+        // A pushed-down scan projection may sit above the source filter (the
+        // filter plans against the full payload schema and the projection is
+        // re-applied above it — see the Kafka source). See through the
+        // projection so the wrapper still lands below the filter, then
+        // rebuild the filter and projection on top (R7: side outputs and
+        // event-time freshness must observe the pre-filter row stream).
+        if let Some(projection_exec) = inner_exec.downcast_ref::<StreamingProjectionExec>()
+            && let Some(filter_exec) = projection_exec
+                .input()
+                .downcast_ref::<StreamingFilterExec>()
+        {
+            let source_exec = filter_exec.input().clone();
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(build(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
+            ));
+            let rebuilt = Arc::new(filter_exec.clone())
+                .with_new_children(vec![wrapped_source])
+                .and_then(|new_filter| {
+                    Arc::new(projection_exec.clone()).with_new_children(vec![new_filter])
+                });
+            match rebuilt {
+                Ok(plan) => return plan,
+                Err(e) => {
+                    warn!(
+                        "Failed to rebuild projection+filter around WrappingExec for '{}': {}. \
+                         Falling back to wrapping the projected plan.",
+                        reference_name, e
+                    );
+                    // fall through to the default wrap below
+                }
+            }
+        }
+
+        if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
             let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(build(
                 source_exec,
@@ -297,10 +331,6 @@ impl SupportsSideOutputs for WrappingSourceTableProvider {
 
 #[async_trait]
 impl TableProvider for WrappingSourceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -329,16 +359,22 @@ impl TableProvider for WrappingSourceTableProvider {
                         "Reusing existing shared source handle for: {}",
                         reference_name
                     );
-                    return Ok(Arc::new(BroadcastingExec::new(handle.clone())));
+                    return Ok(Arc::new(BroadcastingExec::new(
+                        handle.clone(),
+                        projection.cloned(),
+                    )?));
                 }
             }
 
-            // First scan - call inner.scan and create the handle
+            // First scan - call inner.scan and create the handle.
+            // The shared source broadcasts full rows so each consumer can apply its own
+            // projection independently (see `project_broadcast`); pass `None` here so the
+            // first consumer's projection isn't baked into the shared scan.
             debug!(
                 "First scan for source: {}, calling inner.scan",
                 reference_name
             );
-            let inner_exec = self.inner.scan(state, projection, filters, limit).await?;
+            let inner_exec = self.inner.scan(state, None, filters, limit).await?;
 
             let side_outputs: Vec<Arc<dyn SourceSideOutput>> = self
                 .side_outputs
@@ -393,7 +429,10 @@ impl TableProvider for WrappingSourceTableProvider {
                 }
             };
 
-            Ok(Arc::new(BroadcastingExec::new(handle)))
+            Ok(Arc::new(BroadcastingExec::new(
+                handle,
+                projection.cloned(),
+            )?))
         } else {
             // No scan sharing - use the old behavior
             let inner_exec = self.inner.scan(state, projection, filters, limit).await?;
@@ -597,36 +636,31 @@ impl ExecutionPlan for WrappingExec {
     delegate! {
         to self.inner {
             fn name(&self) -> &str;
-            fn properties(&self) -> &PlanProperties;
+            fn properties(&self) -> &Arc<PlanProperties>;
             fn check_invariants(&self, check: InvariantLevel) -> Result<()>;
             fn required_input_distribution(&self) -> Vec<Distribution>;
             fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>>;
             fn maintains_input_order(&self) -> Vec<bool>;
             fn benefits_from_input_partitioning(&self) -> Vec<bool>;
             fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
-            fn repartitioned(
-                &self,
-                target_partitions: usize,
-                config: &ConfigOptions,
-            ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
             fn metrics(&self) -> Option<MetricsSet>;
-            fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
-            fn supports_limit_pushdown(&self) -> bool;
-            fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>>;
+            fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
             fn cardinality_effect(&self) -> CardinalityEffect;
-            fn try_swapping_with_projection(
-                &self,
-                projection: &ProjectionExec,
-            ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
         }
     }
 
+    // `try_swapping_with_projection`, `with_fetch`, `repartitioned`, and
+    // `supports_limit_pushdown` are deliberately NOT delegated to `self.inner`
+    // (they fall back to the trait's no-op defaults). Each of those hooks
+    // returns a rewritten subtree that does NOT contain this wrapper, so
+    // DataFusion 54's hook-driven physical optimizer rules (e.g.
+    // ProjectionPushdown) would replace the wrapper with the returned plan —
+    // silently deleting the telemetry/billing instrumentation (output_rows),
+    // side-output processing, and live inspection this node provides. Same
+    // hazard class as the RebatchExec elision (see tests/rebatch_elision.rs).
+
     fn schema(&self) -> SchemaRef {
         self.adjusted_schema.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn with_new_children(
@@ -888,9 +922,6 @@ impl DataSink for WrappingDataSink {
             fn schema(&self) -> &SchemaRef;
         }
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     async fn write_all(
         &self,
@@ -1125,7 +1156,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             "Transform '{}' using scan sharing (reusing existing handle)",
                             reference_name
                         );
-                        return Ok(Some(Arc::new(BroadcastingExec::new(handle.clone()))));
+                        return Ok(Some(Arc::new(BroadcastingExec::new(handle.clone(), None)?)));
                     }
                 }
 
@@ -1187,7 +1218,8 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                         );
                         Ok(Some(Arc::new(BroadcastingExec::new(
                             existing_handle.clone(),
-                        ))))
+                            None,
+                        )?)))
                     } else {
                         // Create and store the handle for this transform.
                         // `exec` (the suppressed producer WrappingExec plus its
@@ -1223,7 +1255,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             "Transform '{}' has {} consumers - created shared handle",
                             reference_name, expected_count
                         );
-                        Ok(Some(Arc::new(BroadcastingExec::new(handle))))
+                        Ok(Some(Arc::new(BroadcastingExec::new(handle, None)?)))
                     };
                 }
 
@@ -1284,6 +1316,74 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_with_side_outputs_sees_through_scan_projection() {
+        use crate::operators::projection::StreamingProjectionExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema.clone(), vec![vec![test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let source_exec =
+            futures::executor::block_on(mem_table.scan(&state, None, &[], None)).unwrap();
+
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = FilterExec::try_new(predicate, source_exec.clone()).unwrap();
+        let streaming_filter =
+            Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
+
+        // Scan projection re-applied above the source filter (as the Kafka
+        // source does when the engine pushes a projection down).
+        let first_col = schema.field(0).name().clone();
+        let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new(&first_col, 0));
+        let projection =
+            ProjectionExec::try_new(vec![(col_expr, first_col)], streaming_filter).unwrap();
+        let streaming_projection =
+            Arc::new(StreamingProjectionExec::from_original(projection).unwrap())
+                as Arc<dyn ExecutionPlan>;
+
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let side_output = Arc::new(CountingSideOutput {
+            rows_seen: rows_seen.clone(),
+        });
+
+        let result = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            streaming_projection,
+            "test_source",
+            vec![side_output],
+            None,
+            false,
+        );
+
+        // Order must be projection -> filter -> wrapper -> source, so side
+        // outputs / event-time observe every pre-filter row (R7).
+        assert!(
+            result.downcast_ref::<StreamingProjectionExec>().is_some(),
+            "Expected top-level plan to be StreamingProjectionExec, got: {}",
+            result.name()
+        );
+        let proj_children = result.children();
+        assert_eq!(proj_children.len(), 1);
+        assert!(
+            proj_children[0]
+                .downcast_ref::<StreamingFilterExec>()
+                .is_some(),
+            "Expected projection's child to be StreamingFilterExec, got: {}",
+            proj_children[0].name()
+        );
+        let filter_children = proj_children[0].children();
+        assert_eq!(filter_children.len(), 1);
+        assert!(
+            filter_children[0].downcast_ref::<WrappingExec>().is_some(),
+            "Expected filter's child to be WrappingExec, got: {}",
+            filter_children[0].name()
+        );
+    }
+
+    #[test]
     fn test_wrap_with_side_outputs_before_filter_reorders_plan() {
         let schema = test_schema();
         let mem_table = MemTable::try_new(schema.clone(), vec![vec![test_batch()]]).unwrap();
@@ -1314,10 +1414,7 @@ mod tests {
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
         assert!(
-            result
-                .as_any()
-                .downcast_ref::<StreamingFilterExec>()
-                .is_some(),
+            result.downcast_ref::<StreamingFilterExec>().is_some(),
             "Expected top-level plan to be StreamingFilterExec, got: {}",
             result.name()
         );
@@ -1326,10 +1423,7 @@ mod tests {
         let filter_children = result.children();
         assert_eq!(filter_children.len(), 1);
         assert!(
-            filter_children[0]
-                .as_any()
-                .downcast_ref::<WrappingExec>()
-                .is_some(),
+            filter_children[0].downcast_ref::<WrappingExec>().is_some(),
             "Expected filter's child to be WrappingExec, got: {}",
             filter_children[0].name()
         );
@@ -1360,7 +1454,7 @@ mod tests {
 
         // Without a filter, the top-level plan should be WrappingExec directly
         assert!(
-            result.as_any().downcast_ref::<WrappingExec>().is_some(),
+            result.downcast_ref::<WrappingExec>().is_some(),
             "Expected top-level plan to be WrappingExec, got: {}",
             result.name()
         );
@@ -1546,7 +1640,6 @@ mod tests {
 
         let rebuilt = original.with_new_children(vec![source_exec]).unwrap();
         let rebuilt_wrapping = rebuilt
-            .as_any()
             .downcast_ref::<WrappingExec>()
             .expect("with_new_children must return a WrappingExec");
         let rebuilt_inst = rebuilt_wrapping
@@ -1595,7 +1688,6 @@ mod tests {
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.
         let filter_children = result.children();
         let wrapping = filter_children[0]
-            .as_any()
             .downcast_ref::<WrappingExec>()
             .expect("expected WrappingExec under filter");
         let inst = wrapping
@@ -1739,7 +1831,6 @@ mod tests {
             edge_arc.children().into_iter().cloned().collect();
         let rebuilt = edge_arc.with_new_children(children).unwrap();
         let rebuilt_we = rebuilt
-            .as_any()
             .downcast_ref::<WrappingExec>()
             .expect("rebuilt node must still be a WrappingExec");
         assert_eq!(

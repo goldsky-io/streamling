@@ -40,6 +40,7 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 - [Upsert Semantics](#upsert-semantics)
 - [Plugin System](#plugin-system)
 - [Profiling](#profiling)
+- [Benchmarking](#benchmarking)
 - [Telemetry and Metrics](#telemetry-and-metrics)
 
 ## Why Streamling
@@ -93,7 +94,7 @@ Streamling runs as a **single-node engine**. It can scale horizontally via Kafka
 
 ## Quick start
 
-This is the simplest path to a running pipeline. Most production flows add plugin stages and multiple transforms. See [Building data flows](#building-data-flows).
+This is the simplest path to a running pipeline. Most production flows add plugin stages and multiple transforms. See [Common patterns](#common-patterns).
 
 ```bash
 # 1. Install the runtime (macOS/Linux)
@@ -150,7 +151,7 @@ Mix the built-in connectors with [plugins](#plugin-system), SQL, WASM, and HTTP 
 
 | Flow                                 | Stages                                                                                                       | What the runtime provides                                                                                   |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Plugin → SQL → handler → WASM → sink | plugin source + sql + [HTTP handler](#http-handler-transform) + [WASM](#webassembly-script-transform) + sink | Ordered processing and at-least-once delivery through all stages. See [hero example](#building-data-flows). |
+| Plugin → SQL → handler → WASM → sink | plugin source + sql + [HTTP handler](#http-handler-transform) + [WASM](#webassembly-script-transform) + sink | Ordered processing and at-least-once delivery through all stages. See [Plugin examples](#plugin-examples). |
 | Plugin → plugin → sink               | custom source + custom transform + custom sink                                                               | Same guarantees on fully custom I/O (e.g. poll an API, apply domain logic, push to a partner system)        |
 | Kafka → plugin transform → sink      | built-in source + plugin transform + built-in sink                                                           | Built-in source convenience + custom compute (decoding, external lookups, multi-record logic)               |
 | Multi-source via hybrid              | bounded backfill in a datalake + live stream through kafka                                                   | Phase-ordered processing with checkpoint continuity. See [Hybrid Source](#hybrid-source).                   |
@@ -223,7 +224,7 @@ sinks:
       mode: batch
 ```
 
-**Community plugins are available in the [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository**.
+**Community plugins are available in the [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository — see [Including Plugins](#including-plugins) for setup**.
 
 ## Development setup
 
@@ -1423,6 +1424,51 @@ Each plugin configuration requires:
 - `type`: Unique plugin id, consisting of the plugin namespace (optional) and an operator name, separated by a dot (e.g., `basic_plugin.random_source`)
 - `options`: Key-value pairs for plugin-specific configuration
 
+### Including Plugins
+
+A plugin is a shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows) built against the Streamling plugin ABI. To make a plugin usable in a pipeline, point the runtime at it before startup via `STREAMLING__PLUGIN__PATH`. The path may be a single library file or a directory — every file in a directory is loaded:
+
+```bash
+# a single plugin library
+export STREAMLING__PLUGIN__PATH=/opt/streamling-plugins/libcommunity_plugins.so
+
+# or a directory holding several plugins (all files are loaded)
+export STREAMLING__PLUGIN__PATH=/opt/streamling-plugins
+```
+
+Loaded plugins are then referenced by id as the `type` of any source, transform, or sink (see [Plugin Pipeline Configuration](#plugin-pipeline-configuration)). Plugin ids may be bare (`s3_sink`) or namespaced (`basic_plugin.random_source`).
+
+#### Community plugins
+
+The [streamling-community-plugins](https://github.com/goldsky-io/streamling-community-plugins) repository is a single workspace crate that compiles several sinks — `s3_sink`, `mysql_sink`, `sqs`, and `s2_sink` — into one shared library (`libcommunity_plugins.so` / `.dylib` / `community_plugins.dll`). Each release publishes prebuilt binaries for common platforms, so prefer those over building from source.
+
+1. Get the prebuilt library for your platform from the [releases page](https://github.com/goldsky-io/streamling-community-plugins/releases) and extract it:
+   ```bash
+   # latest release — swap linux-x86_64 for darwin-aarch64, darwin-x86_64,
+   # linux-aarch64, or windows-x86_64 (.zip) as needed
+   curl -L -o community-plugins.tar.gz \
+     https://github.com/goldsky-io/streamling-community-plugins/releases/latest/download/community-plugins-linux-x86_64.tar.gz
+   tar xzf community-plugins.tar.gz   # → libcommunity_plugins.so
+   ```
+   No prebuilt binary for your platform? Build from source: `git clone https://github.com/goldsky-io/streamling-community-plugins && cd streamling-community-plugins && just build-release` → `target/release/libcommunity_plugins.so`.
+2. Point the runtime at the library:
+   ```bash
+   export STREAMLING__PLUGIN__PATH=./libcommunity_plugins.so
+   ```
+3. Reference a plugin by its id in your pipeline. For example, write to S3 as Parquet:
+   ```yaml
+   sinks:
+     to_s3:
+       type: s3_sink
+       from: my_source
+       options:
+         bucket: my-bucket
+         region: us-east-1
+   ```
+   AWS credentials are required and best passed via the `STREAMLING__PLUGIN__S3_SINK__ACCESS_KEY_ID` / `...SECRET_ACCESS_KEY` environment variables (they take precedence over YAML). See the community-plugins README for the full option tables of each sink.
+
+To write and distribute your own plugin, see [Building Plugins](#building-plugins).
+
 ### Message-based Interface
 
 Communication between Streamling and plugins happens through a message-based interface built on crossbeam channels. Each plugin receives three channels:
@@ -1947,6 +1993,69 @@ The project can be configured to be profiled with `perf`:
 Note: the `perf` binary may need to be compiled from scratch for the version of the linux kernel used in the Kubernetes cluster.
 
 Instructions for compiling can be found [here](https://gist.github.com/sap1ens/827558883e1bd01709a52a4dedd2f10a).
+
+## Benchmarking
+
+An end-to-end throughput benchmark drives the real `streamling` binary through `Kafka (Avro/CDC) → SQL transform → blackhole sink` against the local k3s stack and reports records/sec. It is meant to catch performance regressions between releases, not to microbenchmark individual operators.
+
+The harness lives in the `streamling-bench` crate and reuses the e2e stack (Redpanda + Prometheus). It runs two scenarios:
+
+- `avro_cdc_projection` — projects/computes every row (selectivity 1.0).
+- `avro_cdc_filter` — a predicate that passes ~10% of rows (selectivity 0.1).
+
+### Running locally
+
+First bring up the local environment (see [Using k3s for Local Development](#using-k3s-for-local-development)):
+
+```bash
+just env-setup
+```
+
+Then run the benchmark. It is **report-only** — it prints a comparison against the baseline but never fails on a regression:
+
+```bash
+# Both scenarios with defaults (5M records, 5 measured iterations + 1 warmup).
+just bench
+
+# A quick run with fewer records/iterations.
+just bench --records 500000 --iterations 3 --warmup 1
+
+# A single scenario.
+just bench --scenario avro_cdc_filter
+```
+
+Each measured iteration re-reads the topic and reports:
+
+- **Input throughput** — `records / wall_clock` (the headline) plus MB/s.
+- **`compute_us_per_input_record`** — per-record compute time (microseconds) derived from `streamling_elapsed_compute_milliseconds_sum`. It excludes process startup and Kafka I/O wait, making it the most noise-resistant regression signal.
+
+Pass `--out-dir <dir>` to also write a `<scenario>.json` result file per scenario.
+
+### Baselines
+
+Baselines are committed JSON files, one per scenario, under `bench/baselines/<runner_label>/<scenario>.json`. A run compares its median against the matching baseline and flags any metric that moved past `--regression-threshold` (default `0.10`, i.e. 10%).
+
+Absolute throughput is machine-specific, so baselines are keyed by a **runner label** (`BENCH_RUNNER_LABEL`, defaults to `local`) — only compare runs from the same machine. If no baseline exists yet, the run just prints its numbers. To (re)seed the local baseline from a fresh run:
+
+```bash
+# Writes bench/baselines/local/<scenario>.json for every scenario.
+just bench-update-baseline
+
+# Or a single scenario.
+just bench-update-baseline --scenario avro_cdc_projection
+```
+
+Commit the generated files to make them the reference for future local runs.
+
+### In CI
+
+The `streamling-bench.yml` workflow runs the same benchmark manually on a fixed runner (`blacksmith-8vcpu`) so its numbers are comparable across releases:
+
+```bash
+gh workflow run streamling-bench.yml --ref main
+```
+
+It writes the comparison to the job summary and uploads the results JSON as an artifact. To update the CI baseline, download that artifact and commit its files to `bench/baselines/blacksmith-8vcpu/`.
 
 ## Telemetry and Metrics
 

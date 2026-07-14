@@ -8,7 +8,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use serde_json::Value;
-use std::any::Any;
 use std::sync::Arc;
 
 /// Converts a JSON array of objects into ClickHouse-compatible tuple format.
@@ -31,7 +30,7 @@ use std::sync::Arc;
 ///
 /// * Input: `[{"pubkey": "abc", "signer": true}]`, keys: `["pubkey"]`
 /// * Output: `[('abc')]`
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct JsonObjectsToClickhouseTuplesFunc {
     signature: Signature,
 }
@@ -61,10 +60,6 @@ impl JsonObjectsToClickhouseTuplesFunc {
 }
 
 impl ScalarUDFImpl for JsonObjectsToClickhouseTuplesFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_gs_json_objects_to_clickhouse_tuples"
     }
@@ -258,6 +253,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -297,6 +293,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -340,6 +337,7 @@ mod tests {
             ],
             number_rows: 3,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

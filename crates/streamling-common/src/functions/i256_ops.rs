@@ -8,7 +8,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 // ================================
@@ -16,7 +15,7 @@ use std::sync::Arc;
 // ================================
 
 /// Convert string or other types to I256
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToI256Func {
     signature: Signature,
 }
@@ -51,10 +50,6 @@ impl ToI256Func {
 }
 
 impl ScalarUDFImpl for ToI256Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "to_i256"
     }
@@ -212,7 +207,7 @@ impl ScalarUDFImpl for ToI256Func {
 }
 
 /// Convert I256 to decimal string
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct I256ToStringFunc {
     signature: Signature,
 }
@@ -232,10 +227,6 @@ impl I256ToStringFunc {
 }
 
 impl ScalarUDFImpl for I256ToStringFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "i256_to_string"
     }
@@ -293,7 +284,7 @@ impl ScalarUDFImpl for I256ToStringFunc {
 }
 
 /// Convert I256 to Int64 (errors if value overflows i64 range)
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToInt64Func {
     signature: Signature,
 }
@@ -313,10 +304,6 @@ impl ToInt64Func {
 }
 
 impl ScalarUDFImpl for ToInt64Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "to_int64"
     }
@@ -395,7 +382,7 @@ impl ScalarUDFImpl for ToInt64Func {
 
 macro_rules! impl_i256_binary_op {
     ($name:ident, $func_name:expr, $op:ident) => {
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, Eq, Hash)]
         pub struct $name {
             signature: Signature,
         }
@@ -418,10 +405,6 @@ macro_rules! impl_i256_binary_op {
         }
 
         impl ScalarUDFImpl for $name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-
             fn name(&self) -> &str {
                 $func_name
             }
@@ -548,7 +531,7 @@ pub fn get_i256_udf(name: &str) -> Result<datafusion::logical_expr::ScalarUDF> {
 
 // Unary operations
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct I256NegFunc {
     signature: Signature,
 }
@@ -568,10 +551,6 @@ impl I256NegFunc {
 }
 
 impl ScalarUDFImpl for I256NegFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "i256_neg"
     }
@@ -627,7 +606,7 @@ impl ScalarUDFImpl for I256NegFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct I256AbsFunc {
     signature: Signature,
 }
@@ -647,10 +626,6 @@ impl I256AbsFunc {
 }
 
 impl ScalarUDFImpl for I256AbsFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "i256_abs"
     }
@@ -725,6 +700,7 @@ mod tests {
             ))],
             number_rows: 2,
             return_field: Arc::new(arrow_schema::Field::new("result", I256Type::new(), false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -762,6 +738,7 @@ mod tests {
             )],
             number_rows: 3,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Int64, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -788,6 +765,7 @@ mod tests {
             )],
             number_rows: 2,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Int64, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -822,6 +800,7 @@ mod tests {
             )],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Int64, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -881,6 +860,7 @@ mod tests {
             )],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Int64, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -915,6 +895,7 @@ mod tests {
             )],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Int64, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();
@@ -955,6 +936,7 @@ mod tests {
             ],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", I256Type::new(), false)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
         };
 
         let result = func.invoke_with_args(args).unwrap();

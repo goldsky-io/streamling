@@ -10,13 +10,12 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::error::ResultExt;
 use crate::streamling_user_bail;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct VolatileCurrentTimeFunc {
     signature: Signature,
 }
@@ -36,10 +35,6 @@ impl VolatileCurrentTimeFunc {
 }
 
 impl ScalarUDFImpl for VolatileCurrentTimeFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "current_time"
     }
@@ -92,6 +87,9 @@ mod tests {
                 arg_fields: vec![],
                 number_rows: batch_size,
                 return_field: Field::new("current_time", Time64(Nanosecond), false).into(),
+                config_options: ::std::sync::Arc::new(
+                    ::datafusion::config::ConfigOptions::default(),
+                ),
             };
 
             let result = func.invoke_with_args(args).unwrap();

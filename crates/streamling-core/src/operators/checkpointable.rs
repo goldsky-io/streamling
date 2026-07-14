@@ -23,10 +23,8 @@ use crate::checkpoints::checkpoint_management::{
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::StreamExt;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -110,19 +108,13 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
             if let Some(checkpointable_node) = node.as_any().downcast_ref::<CheckpointableNode>() {
-                let mut input_physical = planner
+                let input_physical = planner
                     .create_physical_plan(&checkpointable_node.input, session_state)
                     .await?;
 
-                // In case multiple input partitions are detected, repartition everything to 1
-                // This can happen for some SQL operators, e.g. UNION ALL
-                if input_physical.output_partitioning().partition_count() > 1 {
-                    input_physical = Arc::new(RepartitionExec::try_new(
-                        input_physical,
-                        Partitioning::RoundRobinBatch(1),
-                    )?);
-                }
-
+                // Multi-partition inputs (e.g. from `UNION ALL`) are coalesced inside
+                // `CheckpointableExec::execute`, which preserves checkpoint-marker metadata.
+                // We deliberately avoid a stock `RepartitionExec` here, which would drop it.
                 let exec = Arc::new(CheckpointableExec::new(
                     input_physical,
                     checkpointable_node.internal_buffer_size,
@@ -140,7 +132,7 @@ struct CheckpointableExec {
     input: Arc<dyn ExecutionPlan>,
     internal_buffer_size: u32,
     reference_name: String,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl CheckpointableExec {
@@ -154,7 +146,7 @@ impl CheckpointableExec {
             input,
             internal_buffer_size,
             reference_name,
-            cache,
+            cache: Arc::new(cache),
         }
     }
 
@@ -193,16 +185,16 @@ impl ExecutionPlan for CheckpointableExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        // We coalesce the input partitions ourselves in `execute` (preserving checkpoint
+        // markers). Requiring `SinglePartition` here would make DataFusion insert a stock
+        // `CoalescePartitionsExec`/`RepartitionExec`, which rebuild batches with a
+        // metadata-less schema and silently drop the checkpoint markers.
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -222,69 +214,78 @@ impl ExecutionPlan for CheckpointableExec {
 
     fn execute(
         &self,
-        partition: usize,
+        _partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let data = execute_input_stream(
-            Arc::clone(&self.input),
-            Arc::clone(&self.schema()),
-            partition,
-            Arc::clone(&context),
-        )?;
-
         let output_schema = self.schema();
-        let reference_name = self.reference_name.clone();
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             output_schema.clone(),
             self.internal_buffer_size as usize,
         );
-        let tx = builder.tx();
 
-        builder.spawn(async move {
-            let mut stream = data;
+        // Coalesce all input partitions into this single output partition, forwarding
+        // each batch with its checkpoint-marker metadata intact. We merge here rather
+        // than via a stock DataFusion `RepartitionExec`/`CoalescePartitionsExec`, which
+        // rebuild batches with a metadata-less schema and would drop checkpoint markers,
+        // stalling checkpoint finalization (e.g. for `UNION ALL`, which is multi-partition).
+        let input_partitions = self.input.output_partitioning().partition_count();
+        for input_partition in 0..input_partitions {
+            let data = execute_input_stream(
+                Arc::clone(&self.input),
+                Arc::clone(&output_schema),
+                input_partition,
+                Arc::clone(&context),
+            )?;
+            let tx = builder.tx();
+            let output_schema = output_schema.clone();
+            let reference_name = self.reference_name.clone();
 
-            while let Some(batch) = stream.next().await {
-                match batch {
-                    Ok(batch) => {
-                        // Extract checkpoint messages from input batch metadata
-                        let checkpoint_messages =
-                            extract_checkpoint_messages(batch.schema().metadata());
+            builder.spawn(async move {
+                let mut stream = data;
 
-                        // Create output batch with checkpoint messages preserved in schema metadata
-                        // Preserve existing metadata from output_schema and merge with checkpoint messages
-                        let output_batch = if !checkpoint_messages.is_empty() {
-                            let mut metadata: HashMap<String, String> =
-                                output_schema.metadata().clone();
-                            enrich_batch_metadata_with_checkpoints(
-                                &mut metadata,
-                                &checkpoint_messages,
-                            );
-                            let enriched_schema = Arc::new(Schema::new_with_metadata(
-                                output_schema.fields().clone(),
-                                metadata,
-                            ));
-                            RecordBatch::try_new(enriched_schema, batch.columns().to_vec())
-                                .unwrap_or(batch)
-                        } else {
-                            batch
-                        };
+                while let Some(batch) = stream.next().await {
+                    match batch {
+                        Ok(batch) => {
+                            // Extract checkpoint messages from input batch metadata
+                            let checkpoint_messages =
+                                extract_checkpoint_messages(batch.schema().metadata());
 
-                        // Forward the batch to the output stream
-                        if tx.send(Ok(output_batch)).await.is_err() {
-                            // The receiver was dropped, stop processing
+                            // Create output batch with checkpoint messages preserved in schema metadata
+                            // Preserve existing metadata from output_schema and merge with checkpoint messages
+                            let output_batch = if !checkpoint_messages.is_empty() {
+                                let mut metadata: HashMap<String, String> =
+                                    output_schema.metadata().clone();
+                                enrich_batch_metadata_with_checkpoints(
+                                    &mut metadata,
+                                    &checkpoint_messages,
+                                );
+                                let enriched_schema = Arc::new(Schema::new_with_metadata(
+                                    output_schema.fields().clone(),
+                                    metadata,
+                                ));
+                                RecordBatch::try_new(enriched_schema, batch.columns().to_vec())
+                                    .unwrap_or(batch)
+                            } else {
+                                batch
+                            };
+
+                            // Forward the batch to the output stream
+                            if tx.send(Ok(output_batch)).await.is_err() {
+                                // The receiver was dropped, stop processing
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("CheckpointableExec [{}]: Error from inner SQL plan, stream will terminate: {}", reference_name, e);
+                            let _ = tx.send(Err(e)).await;
                             break;
                         }
                     }
-                    Err(e) => {
-                        debug!("CheckpointableExec [{}]: Error from inner SQL plan, stream will terminate: {}", reference_name, e);
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    }
                 }
-            }
 
-            Ok(())
-        });
+                Ok(())
+            });
+        }
 
         Ok(builder.build())
     }
@@ -293,8 +294,8 @@ impl ExecutionPlan for CheckpointableExec {
         self.input.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 }
 
@@ -352,7 +353,7 @@ mod tests {
     struct TestSourceExec {
         batch: RecordBatch,
         schema: SchemaRef,
-        cache: PlanProperties,
+        cache: Arc<PlanProperties>,
     }
 
     impl TestSourceExec {
@@ -367,7 +368,7 @@ mod tests {
             Self {
                 batch,
                 schema,
-                cache,
+                cache: Arc::new(cache),
             }
         }
     }
@@ -389,11 +390,7 @@ mod tests {
             "TestSourceExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.cache
         }
 
