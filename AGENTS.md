@@ -158,6 +158,12 @@ Label constraints (enforced at config load):
 
 A node's idle time — time spent *not* doing useful work — is exported as a single counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the two idle states of the utilization triad. The third state, **busy**, is derived from the existing `streamling_elapsed_compute_milliseconds`; together the three localize a bottleneck at a glance:
 
+> **Measurement model:** `blocked` is measured at async polling/channel
+> boundaries, not as downstream service latency. Prefetch, bounded queues, and
+> concurrency can move observed wait between `blocked`, `starved`, and adjacent
+> edges. Read [`docs/node-wait-measurement-model.md`](docs/node-wait-measurement-model.md)
+> before changing buffering, connector scheduling, or plugin channels.
+
 | State | Series | Meaning |
 |-------|--------|---------|
 | **starved** | `node_wait{state="starved"}` | waiting on upstream for input (slow source, or backpressure arriving from below) |
