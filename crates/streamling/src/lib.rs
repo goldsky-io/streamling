@@ -1713,9 +1713,19 @@ impl Streamling {
                         format!("{}: failed to create PostgresAggregator", ctx.format())
                     })?;
 
-                    pg_aggregator
-                        .create_trigger_and_tables(&app_config.postgres_sink)
-                        .await?;
+                    if dry_run {
+                        // Secrets are not resolved during dry-run (see
+                        // secret_name_to_resolve), so there are no DB credentials
+                        // to connect with. Still generate the DDL so aggregation
+                        // config errors fail validation.
+                        pg_aggregator.generate_target_table_sql()?;
+                        pg_aggregator.generate_function_sql()?;
+                        pg_aggregator.generate_trigger_statement_sql()?;
+                    } else {
+                        pg_aggregator
+                            .create_trigger_and_tables(&app_config.postgres_sink)
+                            .await?;
+                    }
 
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
