@@ -66,7 +66,7 @@ fn clickhouse_env(ctx: &TestContext) -> Vec<(String, String)> {
 
 /// Basic test: read records from Kafka and write to ClickHouse.
 /// Also exercises `compression: gzip` end-to-end against real ClickHouse so
-/// we cover the gzip request path (the default is no compression).
+/// we cover the gzip request path (the default is zstd).
 #[tokio::test]
 async fn test_basic_kafka_to_clickhouse() {
     init_tracing();
@@ -145,7 +145,9 @@ sinks:
 // Multiple Batches Test
 // =============================================================================
 
-/// Test processing multiple batches of records
+/// Test processing multiple batches of records.
+/// Uses `compression: lz4` to exercise the lz4 request path against real
+/// ClickHouse.
 #[tokio::test]
 async fn test_multiple_batches() {
     init_tracing();
@@ -196,6 +198,7 @@ sinks:
     from: kafka_source
     table: test_multi_batch
     primary_key: id
+    compression: lz4
     batch_size: 5
     batch_flush_interval: 100ms
 "#,
@@ -471,7 +474,9 @@ sinks:
 // Deduplication Test (ReplacingMergeTree behavior)
 // =============================================================================
 
-/// Test deduplication with primary key (ReplacingMergeTree)
+/// Test deduplication with primary key (ReplacingMergeTree).
+/// Like every test in this file that omits `compression:`, this exercises the
+/// default codec (zstd) end-to-end against real ClickHouse.
 #[tokio::test]
 async fn test_deduplication() {
     init_tracing();
@@ -1069,4 +1074,139 @@ sinks:
         ],
         "surviving columns must keep their own data"
     );
+}
+
+// =============================================================================
+// Wide-source EXCEPT shape against a pre-created two-arg ReplacingMergeTree
+// =============================================================================
+
+const WIDE_POSITIONS_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "topLevelRecord",
+    "fields": [
+        {"name": "user_addr", "type": "string"},
+        {"name": "token_id", "type": "string"},
+        {"name": "amount", "type": ["null", "string"], "default": null},
+        {"name": "avg_price", "type": ["null", "string"], "default": null},
+        {"name": "realized_pnl", "type": ["null", "string"], "default": null},
+        {"name": "total_bought", "type": ["null", "string"], "default": null},
+        {"name": "last_updated_block", "type": ["null", "long"], "default": null},
+        {"name": "_sm_version", "type": "long"},
+        {"name": "_sm_deleted", "type": "boolean"}
+    ]
+}"#;
+
+#[derive(serde::Serialize)]
+struct WidePositionRecord {
+    user_addr: String,
+    token_id: String,
+    amount: Option<String>,
+    avg_price: Option<String>,
+    realized_pnl: Option<String>,
+    total_bought: Option<String>,
+    last_updated_block: Option<i64>,
+    _sm_version: i64,
+    _sm_deleted: bool,
+}
+
+/// A 9-field source, a 4-way `SELECT * EXCEPT` with a rename and a same-named
+/// recomputed `_gs_op`, writing into a pre-created two-argument
+/// ReplacingMergeTree(version, is_deleted) table. Mirrors a pipeline shape
+/// that fails on DataFusion 54 with "number of columns(9) must match number
+/// of fields(8)" raised from inside the engine's sink machinery.
+#[tokio::test]
+async fn test_wide_source_except_precreated_versioned_table() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx
+        .clickhouse
+        .as_ref()
+        .expect("ClickHouse should be enabled");
+
+    ctx.kafka
+        .register_schema(WIDE_POSITIONS_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE wide_positions_out (\
+                 token_id String, amount Nullable(String), avg_price Nullable(String), \
+                 realized_pnl Nullable(String), total_bought Nullable(String), \
+                 last_updated_block Nullable(Int64), user String, \
+                 is_deleted UInt8, insert_time DateTime DEFAULT now() \
+             ) ENGINE = ReplacingMergeTree(insert_time, is_deleted) \
+             ORDER BY (user, token_id)",
+        )
+        .await
+        .expect("Failed to pre-create sink table");
+
+    let records: Vec<WidePositionRecord> = (1..=4)
+        .map(|i| WidePositionRecord {
+            user_addr: format!("0xuser{i}"),
+            token_id: format!("token{i}"),
+            amount: Some(format!("{i}")),
+            avg_price: Some("1.5".to_string()),
+            realized_pnl: None,
+            total_bought: Some(format!("{i}0")),
+            last_updated_block: Some(1000 + i),
+            _sm_version: i,
+            _sm_deleted: false,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records_with_op(&records, "c")
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  user_positions:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: user_addr
+
+transforms:
+  positions_transform:
+    type: sql
+    primary_key: user
+    sql: >-
+      SELECT * EXCEPT (_sm_version, _sm_deleted, _gs_op, user_addr),
+      user_addr AS user,
+      CASE WHEN _sm_deleted = false THEN 'i' ELSE 'd' END AS _gs_op
+      FROM user_positions
+
+sinks:
+  clickhouse_sink:
+    type: clickhouse
+    from: positions_transform
+    table: wide_positions_out
+    primary_key: user
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let mut opts = PipelineOpts::new().record_limit(4);
+    for (k, v) in clickhouse_env(&ctx) {
+        opts = opts.env(&k, &v);
+    }
+
+    let status = ctx
+        .run_pipeline_with_opts(&pipeline, opts)
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let count = clickhouse
+        .count("SELECT COUNT(*) FROM wide_positions_out FINAL")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(count, 4, "all rows written");
 }

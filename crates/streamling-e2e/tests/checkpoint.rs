@@ -5,11 +5,155 @@
 //!
 //! Ported from crates/streamling/tests/pipeline_checkpoint_test.rs
 
+use serde::Serialize;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
 
 // ============================================================================
 // Checkpoint Tests
 // ============================================================================
+
+/// Test record for the Kafka-sourced checkpoint tests
+#[derive(Debug, Clone, Serialize)]
+struct MarkerTestRecord {
+    id: i64,
+    value: String,
+}
+
+const MARKER_TEST_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "MarkerTestRecord",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "value", "type": "string"}
+    ]
+}"#;
+
+/// Checkpoints must progress even when an unnest never produces any rows.
+///
+/// This pipeline filters out every source row before an unnest, so the unnest
+/// only ever sees empty marker-carrying batches. Checkpoint markers must flow
+/// through to the sink regardless: the checkpoint producer does not start a
+/// new epoch until the in-flight one resolves, so an operator that holds a
+/// marker while waiting for data deadlocks checkpointing permanently on any
+/// pipeline whose filter matches nothing for a while after startup.
+///
+/// The pipeline never terminates on its own (no record limit is reachable),
+/// so the run is stopped by the harness timeout; the assertion is that
+/// checkpoint state was persisted while it ran.
+#[tokio::test]
+async fn test_checkpoint_progresses_when_unnest_yields_no_rows() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new())
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(MARKER_TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records: Vec<MarkerTestRecord> = (1..=50)
+        .map(|i| MarkerTestRecord {
+            id: i,
+            value: format!("value_{}", i),
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let state_table = format!("unnest_marker_state_{}", ctx.test_id.replace("-", "_"));
+    let application_id = format!("unnest_marker_test_{}", ctx.test_id);
+
+    // The filter matches no rows, so the unnest downstream of it only ever
+    // receives empty batches carrying checkpoint markers.
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  filtered:
+    type: sql
+    primary_key: id
+    sql: SELECT id, make_array(id, id + 1) AS items FROM kafka_source WHERE id > 1000000
+  expanded:
+    type: sql
+    primary_key: id
+    sql: |-
+      SELECT id, item FROM (
+        SELECT id, unnest(items) AS item FROM filtered
+      ) t WHERE item IS NOT NULL
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: expanded
+    table: unnest_marker_out
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 10
+    batch_flush_interval: 100ms
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    // No record limit: the sink never receives data rows, so the pipeline
+    // only stops when the harness timeout kills it.
+    let run_result = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .timeout(std::time::Duration::from_secs(25))
+                .env("STREAMLING__APPLICATION_ID", &application_id)
+                .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+                .env(
+                    "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+                    &ctx.postgres.host,
+                )
+                .env(
+                    "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+                    ctx.postgres.port.to_string(),
+                )
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+                .env(
+                    "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+                    &state_table,
+                )
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+                .env("STREAMLING__RECORD_BATCH_SIZE", "10"),
+        )
+        .await;
+
+    // The run is expected to end via the harness timeout; a clean exit is
+    // also acceptable. Either way, checkpoints must have been persisted.
+    tracing::info!("Pipeline run ended: {:?}", run_result.is_ok());
+
+    let checkpoint_count = ctx
+        .postgres
+        .count(&format!(
+            "SELECT COUNT(*) FROM streamling.\"{}\"",
+            state_table
+        ))
+        .await
+        .expect("Failed to query checkpoint state table");
+
+    assert!(
+        checkpoint_count > 0,
+        "At least one checkpoint should complete while the unnest yields no rows, got {}",
+        checkpoint_count
+    );
+}
 
 /// Test that ClickHouse source correctly checkpoints and resumes from saved state.
 ///

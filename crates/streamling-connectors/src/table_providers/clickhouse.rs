@@ -2650,7 +2650,7 @@ impl ClickHouseClient {
         batch: &RecordBatch,
         schema: &SchemaRef,
     ) -> streamling_core::error::Result<()> {
-        // Offload Arrow IPC encoding (and gzip compression when enabled) to a
+        // Offload Arrow IPC encoding (and compression when enabled) to a
         // blocking thread to avoid stalling the async runtime. Compressing
         // inline with encoding avoids an extra allocation/copy of the
         // uncompressed buffer.
@@ -2671,6 +2671,23 @@ impl ClickHouseClient {
                     .streamling_context("failed to finish Arrow IPC write")?;
                 Ok::<_, StreamlingError>(buf)
             }
+            ClickHouseCompression::Zstd => {
+                let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3)
+                    .streamling_context("failed to create zstd encoder")?;
+                {
+                    let mut writer = FileWriter::try_new(&mut encoder, &schema_for_encode)
+                        .streamling_context("failed to create Arrow IPC FileWriter")?;
+                    writer
+                        .write(&batch_for_encode)
+                        .streamling_context("failed to write batch to Arrow IPC")?;
+                    writer
+                        .finish()
+                        .streamling_context("failed to finish Arrow IPC write")?;
+                }
+                encoder
+                    .finish()
+                    .streamling_context("failed to finish zstd encoding")
+            }
             ClickHouseCompression::Gzip => {
                 let mut encoder = flate2::write::GzEncoder::new(
                     Vec::new(),
@@ -2689,6 +2706,22 @@ impl ClickHouseClient {
                 encoder
                     .finish()
                     .streamling_context("failed to finish gzip encoding")
+            }
+            ClickHouseCompression::Lz4 => {
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                {
+                    let mut writer = FileWriter::try_new(&mut encoder, &schema_for_encode)
+                        .streamling_context("failed to create Arrow IPC FileWriter")?;
+                    writer
+                        .write(&batch_for_encode)
+                        .streamling_context("failed to write batch to Arrow IPC")?;
+                    writer
+                        .finish()
+                        .streamling_context("failed to finish Arrow IPC write")?;
+                }
+                encoder
+                    .finish()
+                    .streamling_context("failed to finish lz4 encoding")
             }
         })
         .await
@@ -2719,8 +2752,14 @@ impl ClickHouseClient {
             .timeout(std::time::Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
             .body(body);
 
-        if matches!(self.compression, ClickHouseCompression::Gzip) {
-            request = request.header(reqwest::header::CONTENT_ENCODING, "gzip");
+        let content_encoding = match self.compression {
+            ClickHouseCompression::None => None,
+            ClickHouseCompression::Zstd => Some("zstd"),
+            ClickHouseCompression::Gzip => Some("gzip"),
+            ClickHouseCompression::Lz4 => Some("lz4"),
+        };
+        if let Some(encoding) = content_encoding {
+            request = request.header(reqwest::header::CONTENT_ENCODING, encoding);
         }
 
         let resp = request.send().await.streamling_with_context(|| {
@@ -4953,6 +4992,76 @@ mod tests {
             .send_arrow_batch("test_table", &batch, &schema)
             .await
             .expect("send_arrow_batch should succeed when mock matches the gzip header");
+
+        mock.assert_async().await;
+    }
+    /// With `compression = Zstd`, `send_arrow_batch` must set
+    /// `Content-Encoding: zstd` on the outbound request. The mock only matches
+    /// when that header is present, so the request would otherwise fall
+    /// through to mockito's default 501 and the call would error out.
+    #[tokio::test]
+    async fn test_send_arrow_batch_sets_zstd_content_encoding() {
+        use arrow::array::Int64Array;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("content-encoding", "zstd")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            create_test_client_with_compression(&server.url(), ClickHouseCompression::Zstd);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        client
+            .send_arrow_batch("test_table", &batch, &schema)
+            .await
+            .expect("send_arrow_batch should succeed when mock matches the zstd header");
+
+        mock.assert_async().await;
+    }
+
+    /// With `compression = Lz4`, `send_arrow_batch` must set
+    /// `Content-Encoding: lz4` on the outbound request. The mock only matches
+    /// when that header is present, so the request would otherwise fall
+    /// through to mockito's default 501 and the call would error out.
+    #[tokio::test]
+    async fn test_send_arrow_batch_sets_lz4_content_encoding() {
+        use arrow::array::Int64Array;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("content-encoding", "lz4")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_compression(&server.url(), ClickHouseCompression::Lz4);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        client
+            .send_arrow_batch("test_table", &batch, &schema)
+            .await
+            .expect("send_arrow_batch should succeed when mock matches the lz4 header");
 
         mock.assert_async().await;
     }

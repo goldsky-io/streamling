@@ -1156,6 +1156,16 @@ impl ExecutionPlan for KafkaSourceExec {
         };
 
         let should_enrich_op_column = self.should_enrich_op_column;
+        // Append the enriched op column to the data only when the pushed-down
+        // scan projection kept it: a transform that recomputes `_gs_op` (or
+        // never reads it) lets the engine prune it from the scan schema, and
+        // appending the array anyway makes every batch one column wider than
+        // the schema ("number of columns(N+1) must match number of fields(N)").
+        let append_op_column = self.should_enrich_op_column
+            && self
+                .full_schema_projected
+                .field_with_name(COLUMN_NAME_OP)
+                .is_ok();
         let start_at = self.start_at.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let num_records_before_stop = self.num_records_before_stop;
@@ -1378,7 +1388,9 @@ impl ExecutionPlan for KafkaSourceExec {
                                             vec!(("kind", row_kind.to_str().as_ref())),
                                             metric_metadata_id.as_str()
                                         );
-                                        row_kinds.push(row_kind.to_str());
+                                        if append_op_column {
+                                            row_kinds.push(row_kind.to_str());
+                                        }
                                     }
 
                                     if let Some(meta) = &mut metadata {
@@ -1419,7 +1431,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 let payload_batch = converter.convert_to_batch()?;
 
                 let mut record_columns = payload_batch.columns().to_vec();
-                if should_enrich_op_column {
+                if append_op_column {
                     record_columns.push(Arc::new(StringArray::from(row_kinds.clone())));
                     row_kinds.clear();
                 }
