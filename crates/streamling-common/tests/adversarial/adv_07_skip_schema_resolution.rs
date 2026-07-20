@@ -807,7 +807,7 @@ fn nested_reader(y_type: &str) -> String {
     )
 }
 
-fn nested_struct<'a>(b: &'a RecordBatch) -> &'a StructArray {
+fn nested_struct(b: &RecordBatch) -> &StructArray {
     column(b, "sub")
         .as_any()
         .downcast_ref::<StructArray>()

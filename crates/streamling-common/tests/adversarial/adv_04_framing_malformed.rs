@@ -491,11 +491,10 @@ fn truncated_string_length_prefix_no_row() {
     let body = string_body("a fairly long string value");
     // Drop the tail so the declared length overruns the buffer.
     let frame = confluent_frame(1, &body[..2]);
-    if d.decode(&frame).is_ok() {
-        match d.flush() {
-            Ok(Some(b)) => assert_eq!(b.num_rows(), 0, "overrun string produced a row"),
-            _ => {}
-        }
+    if d.decode(&frame).is_ok()
+        && let Ok(Some(b)) = d.flush()
+    {
+        assert_eq!(b.num_rows(), 0, "overrun string produced a row");
     }
 }
 
@@ -506,20 +505,20 @@ fn truncated_string_length_prefix_no_row() {
 /// After a valid record plus trailing junk, the decoder must not fabricate extra rows nor corrupt
 /// the first. Accept an error; if it produces rows, there is at most one and it equals `expected`.
 fn assert_trailing_junk_clean(d: &mut ConfluentAvroDecoder, frame: &[u8], expected: i64) {
-    if d.decode(frame).is_ok() {
-        if let Ok(Some(b)) = d.flush() {
-            assert!(
-                b.num_rows() <= 1,
-                "trailing junk produced {} phantom rows",
-                b.num_rows()
+    if d.decode(frame).is_ok()
+        && let Ok(Some(b)) = d.flush()
+    {
+        assert!(
+            b.num_rows() <= 1,
+            "trailing junk produced {} phantom rows",
+            b.num_rows()
+        );
+        if b.num_rows() == 1 {
+            assert_eq!(
+                id_col(&b).value(0),
+                expected,
+                "the real record's value must not be corrupted by trailing bytes"
             );
-            if b.num_rows() == 1 {
-                assert_eq!(
-                    id_col(&b).value(0),
-                    expected,
-                    "the real record's value must not be corrupted by trailing bytes"
-                );
-            }
         }
     }
 }
@@ -566,12 +565,12 @@ fn full_second_frame_appended_is_not_two_rows_in_one_decode() {
     let mut frame = confluent_frame(1, &long_body(100));
     frame.extend_from_slice(&confluent_frame(1, &long_body(200)));
     let mut d = long_decoder(1);
-    if d.decode(&frame).is_ok() {
-        if let Ok(Some(b)) = d.flush() {
-            assert!(b.num_rows() >= 1);
-            // Whatever it decodes, the FIRST row must be the first message's value, never garbage.
-            assert_eq!(id_col(&b).value(0), 100);
-        }
+    if d.decode(&frame).is_ok()
+        && let Ok(Some(b)) = d.flush()
+    {
+        assert!(b.num_rows() >= 1);
+        // Whatever it decodes, the FIRST row must be the first message's value, never garbage.
+        assert_eq!(id_col(&b).value(0), 100);
     }
 }
 
@@ -655,12 +654,12 @@ fn valid_magic_registered_id_but_garbage_body_no_row() {
     let mut frame = confluent_frame(1, &[]);
     frame.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
     // long field: 10 continuation-marked bytes overflow the varint -> must not yield a valid row.
-    if d.decode(&frame).is_ok() {
-        if let Ok(Some(b)) = d.flush() {
-            // If anything decodes it must not exceed one row; correctness of a garbage long is
-            // undefined, so we only guard against a phantom row explosion / corruption crash.
-            assert!(b.num_rows() <= 1);
-        }
+    if d.decode(&frame).is_ok()
+        && let Ok(Some(b)) = d.flush()
+    {
+        // If anything decodes it must not exceed one row; correctness of a garbage long is
+        // undefined, so we only guard against a phantom row explosion / corruption crash.
+        assert!(b.num_rows() <= 1);
     }
 }
 

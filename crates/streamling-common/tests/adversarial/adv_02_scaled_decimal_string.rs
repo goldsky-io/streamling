@@ -96,13 +96,6 @@ fn nullable_decimal_json(precision: u64, scale: u64) -> String {
     )
 }
 
-/// Non-nullable single-field avro record with a bare `decimal(p,s)` field.
-fn plain_decimal_json(precision: u64, scale: u64) -> String {
-    format!(
-        r#"{{"type":"record","name":"R","fields":[{{"name":"v","type":{{"type":"bytes","logicalType":"decimal","precision":{precision},"scale":{scale}}}}}]}}"#
-    )
-}
-
 fn target_schema(precision: u64, scale: u64) -> SchemaRef {
     let schema = AvroWriterSchema::parse_str(&nullable_decimal_json(precision, scale)).unwrap();
     convert_avro_schema_to_arrow(schema)
@@ -422,7 +415,7 @@ fn edge_value_needing_more_than_32_bytes() {
 
 #[test]
 fn edge_huge_positive_scale18() {
-    let v = bi_str(&format!("{}", "1234567890".repeat(4))); // 40 digits
+    let v = bi_str(&"1234567890".repeat(4).to_string()); // 40 digits
     assert_eq!(fmt(100, 18, &v), oracle(&v, 18));
 }
 
