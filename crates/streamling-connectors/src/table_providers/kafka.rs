@@ -944,7 +944,7 @@ async fn calculate_lag_task(
     reference_name: String,
     metric_metadata_id: String,
     kafka_topic_partition_list: KafkaTopicPartitionList,
-    consumer: StreamConsumer,
+    consumer: SafeKafkaConsumer,
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     metrics_recorder: Arc<MetricsRecorder>,
     lag_report_interval_ms: Option<u64>,
@@ -1172,12 +1172,15 @@ impl ExecutionPlan for KafkaSourceExec {
         let metric_metadata_id = self.metric_metadata_id.clone();
         let kafka_lag_reporter_interval = self.kafka_config.lag_report_interval_ms;
         let metrics_recorder = get_metrics_recorder().clone();
-        let lag_consumer = Self::create_consumer(
+        // Wrap the lag consumer so its rd_kafka_destroy is deferred to a
+        // blocking thread on drop, instead of running inline on a tokio worker
+        // (the documented deadlock the main consumer is already protected from).
+        let lag_consumer = SafeKafkaConsumer::new(Self::create_consumer(
             &self.kafka_config,
             &self.start_at,
             &self.reference_name,
             true,
-        );
+        ));
         let topic = self.topic.clone();
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
