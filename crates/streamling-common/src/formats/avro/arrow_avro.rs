@@ -320,6 +320,13 @@ fn as_binary_iter(src: &ArrayRef) -> Result<Vec<Option<Vec<u8>>>> {
         Ok((0..b.len())
             .map(|i| (!b.is_null(i)).then(|| b.value(i).to_vec()))
             .collect())
+    } else if let Some(b) = src.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        // A high-precision decimal whose underlying avro type is `fixed(n)` (not `bytes`) decodes
+        // as FixedSizeBinary(n) after the logicalType strip. The wire bytes are the same
+        // big-endian two's-complement payload, so reinterpret them identically.
+        Ok((0..b.len())
+            .map(|i| (!b.is_null(i)).then(|| b.value(i).to_vec()))
+            .collect())
     } else {
         Err(DataFusionError::Internal(format!(
             "arrow-avro: expected Binary for high-precision decimal column, got {:?}",
@@ -348,7 +355,9 @@ fn binary_to_fixed256(src: &ArrayRef, kind: BigIntKind) -> Result<ArrayRef> {
 fn binary_or_passthrough_decimal128(src: &ArrayRef, p: u8, s: i8) -> Result<ArrayRef> {
     let dt = DataType::Decimal128(p, s);
     match src.data_type() {
-        DataType::Binary | DataType::LargeBinary => {
+        // FixedSizeBinary: a stripped high-precision decimal whose underlying avro type was
+        // `fixed(n)` — same big-endian two's-complement payload as the `bytes` case.
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             let rows = as_binary_iter(src)?;
             let arr: PrimitiveArray<Decimal128Type> = rows
                 .iter()
@@ -393,7 +402,9 @@ fn binary_or_passthrough_decimal128(src: &ArrayRef, p: u8, s: i8) -> Result<Arra
 fn binary_or_passthrough_decimal256(src: &ArrayRef, p: u8, s: i8) -> Result<ArrayRef> {
     let dt = DataType::Decimal256(p, s);
     match src.data_type() {
-        DataType::Binary | DataType::LargeBinary => {
+        // FixedSizeBinary: a stripped high-precision decimal whose underlying avro type was
+        // `fixed(n)` — same big-endian two's-complement payload as the `bytes` case.
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             let rows = as_binary_iter(src)?;
             let arr: PrimitiveArray<Decimal256Type> = rows
                 .iter()
@@ -1479,6 +1490,94 @@ mod tests {
             coerce_batch_to_target(&src_batch, &bad_target).is_err(),
             "missing required nested field must error"
         );
+    }
+
+    // Regression (Bugbot): a high-precision decimal whose underlying avro type is `fixed(n)` (not
+    // `bytes`) decodes as FixedSizeBinary(n) after the logicalType strip; the reinterpretation
+    // helpers must accept it identically to Binary. apache-avro produced Value::Decimal for both
+    // physical encodings, so the vendored reader handled fixed-backed decimals — errors here would
+    // be a migration regression. Covers all three targets: u256, nested Decimal128, scaled Utf8.
+    #[test]
+    fn fixed_backed_high_precision_decimals_decode() {
+        // -- u256 on fixed(32), top level --
+        const U256_FIXED: &str = r#"{"type":"record","name":"R","fields":[{"name":"v","type":{"type":"fixed","name":"F32","size":32,"logicalType":"decimal","precision":100,"scale":0}}]}"#;
+        let mut payload = [0u8; 32];
+        payload[0] = 0x0A;
+        payload[31] = 0x01;
+        let schema = AvroWriterSchema::parse_str(U256_FIXED).unwrap();
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put("v", Value::Decimal(Decimal::from(payload.to_vec())));
+        let body = to_avro_datum(&schema, rec).unwrap();
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(1, U256_FIXED).unwrap();
+        decoder.decode(&confluent_frame(1, &body)).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert!(U256Type::is_u256_field(&batch.schema().field(0).clone()));
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(32)");
+        assert_eq!(col.value(0), &payload, "fixed-backed u256 round-trips");
+
+        // -- nested decimal on fixed(32) inside a record: target Decimal128(100, 0) --
+        const NESTED_FIXED: &str = r#"{"type":"record","name":"R","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[{"name":"amt","type":{"type":"fixed","name":"FA","size":32,"logicalType":"decimal","precision":100,"scale":0}}]}}]}"#;
+        let mut amt = [0u8; 32];
+        amt[30] = 0x04; // 0x04D2 == 1234
+        amt[31] = 0xD2;
+        let schema = AvroWriterSchema::parse_str(NESTED_FIXED).unwrap();
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put(
+            "inner",
+            Value::Record(vec![(
+                "amt".to_string(),
+                Value::Decimal(Decimal::from(amt.to_vec())),
+            )]),
+        );
+        let body = to_avro_datum(&schema, rec).unwrap();
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(2, NESTED_FIXED).unwrap();
+        decoder.decode(&confluent_frame(2, &body)).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+        let st = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let amt_col = st
+            .column_by_name("amt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Decimal128Type>>()
+            .expect("nested fixed-backed decimal is Decimal128");
+        assert_eq!(amt_col.value(0), 1234_i128);
+
+        // -- scaled (precision 85, scale 4) on fixed(32): target Utf8 decimal string --
+        const SCALED_FIXED: &str = r#"{"type":"record","name":"R","fields":[{"name":"amt","type":{"type":"fixed","name":"FS","size":32,"logicalType":"decimal","precision":85,"scale":4}}]}"#;
+        let mut unscaled = [0u8; 32];
+        unscaled[29] = 0x12; // 0x12D687 == 1234567 -> "123.4567" at scale 4
+        unscaled[30] = 0xD6;
+        unscaled[31] = 0x87;
+        let schema = AvroWriterSchema::parse_str(SCALED_FIXED).unwrap();
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put("amt", Value::Decimal(Decimal::from(unscaled.to_vec())));
+        let body = to_avro_datum(&schema, rec).unwrap();
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(3, SCALED_FIXED).unwrap();
+        decoder.decode(&confluent_frame(3, &body)).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("scaled fixed-backed decimal is Utf8");
+        assert_eq!(col.value(0), "123.4567");
     }
 
     // Regression (Bugbot): a top-level decimal with precision > 76 AND non-zero scale maps to Utf8
