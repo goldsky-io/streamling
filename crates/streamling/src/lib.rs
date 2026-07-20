@@ -2099,20 +2099,32 @@ impl Streamling {
                     let checkpoint_control = checkpoint_control.clone();
                     let sink_future = async move {
                         let result = session_manager.new_df(sink_plan).collect().await;
-                        if let Err(err) = &result {
-                            error!(
-                                "Sink future [{}] completed with error: {}",
-                                future_name, err
-                            );
-                        }
-                        // The sink has drained its input and will not ack any
-                        // further checkpoint epochs. Tell the coordinator so it
-                        // drops these sinks from the expected-ack set and can
-                        // finalize in-flight epochs the remaining live sinks
-                        // already acked, instead of blocking on a sink that is
-                        // gone (the multi-source completion case).
-                        for sink_name in &sink_names {
-                            checkpoint_control.sink_completed(sink_name);
+                        match &result {
+                            Ok(_) => {
+                                // The sink has SUCCESSFULLY drained its input and
+                                // will not ack any further checkpoint epochs. Tell
+                                // the coordinator so it drops these sinks from the
+                                // expected-ack set and can finalize in-flight
+                                // epochs the remaining live sinks already acked,
+                                // instead of blocking on a sink that is gone (the
+                                // multi-source completion case).
+                                for sink_name in &sink_names {
+                                    checkpoint_control.sink_completed(sink_name);
+                                }
+                            }
+                            Err(err) => {
+                                // A FAILED sink must NOT be deregistered: its
+                                // missing acks are the coordinator's only signal
+                                // that the epochs it touched are not durable.
+                                // Removing it would let those epochs (including
+                                // the terminal one) finalize as if the data had
+                                // been written. The pipeline is failing anyway —
+                                // let the epochs stall and the error propagate.
+                                error!(
+                                    "Sink future [{}] completed with error: {}",
+                                    future_name, err
+                                );
+                            }
                         }
                         result
                     };
