@@ -1610,7 +1610,15 @@ impl ExecutionPlan for KafkaSourceExec {
 
                                 consumer_offsets.remove(&epoch);
                             } else {
-                                error!("No position found for epoch: {:?}", epoch);
+                                // Expected for epochs whose Marker never reached this
+                                // source — notably the terminal epoch, whose Marker
+                                // travels inline to the sinks only. Commits are
+                                // cumulative, so a missed epoch never loses data; the
+                                // uncommitted tail replays on restart (at-least-once).
+                                debug!(
+                                    "No recorded position for finalized epoch {:?}; skipping commit (cumulative commits make this safe)",
+                                    epoch
+                                );
                             }
                         }
                         CheckpointMessage::SourceComplete(name) => {

@@ -462,9 +462,15 @@ pub struct PluginChannels {
 #[non_exhaustive]
 pub enum PluginMsg {
     Init,
-    NextBatch { data: SafeArrowArray },
-    CheckpointMarker { epoch: PluginCheckpointEpoch },
-    CheckpointAck { epoch: PluginCheckpointEpoch },
+    NextBatch {
+        data: SafeArrowArray,
+    },
+    CheckpointMarker {
+        epoch: PluginCheckpointEpoch,
+    },
+    CheckpointAck {
+        epoch: PluginCheckpointEpoch,
+    },
     /// The epoch finalized end-to-end (every live sink acked it). Consumer
     /// contract: handling MUST be idempotent, MUST NOT block, and MUST NEVER
     /// wait for one specific epoch's Finalizer — at shutdown the host drops
@@ -472,8 +478,14 @@ pub enum PluginMsg {
     /// a later terminal epoch (covering their work) finalizes. Treat this as
     /// "everything up to and including `epoch` is durable", not as a
     /// guaranteed per-epoch event.
-    CheckpointFinalizer { epoch: PluginCheckpointEpoch },
+    CheckpointFinalizer {
+        epoch: PluginCheckpointEpoch,
+    },
     Terminate,
-    Topology { config: RString },
-    Error { message: RString },
+    Topology {
+        config: RString,
+    },
+    Error {
+        message: RString,
+    },
 }
