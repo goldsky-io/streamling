@@ -31,22 +31,10 @@ pub fn is_requested() -> bool {
     *SHUTDOWN.subscribe().borrow()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn subscribe_observes_request() {
-        // NOTE: the channel is process-global, so this test only asserts the
-        // one-way transition (false -> true); it cannot assert the initial
-        // state without racing other tests in the binary.
-        let mut rx = subscribe();
-        request_shutdown();
-        assert!(is_requested());
-        // A subscriber created before the request wakes and sees true.
-        if !*rx.borrow() {
-            rx.changed().await.expect("sender is static, never dropped");
-        }
-        assert!(*rx.borrow());
-    }
-}
+// NOTE: deliberately no unit test calls `request_shutdown()` here. The signal
+// is process-global and one-way — flipping it in a test would permanently
+// contaminate every later test in the same binary that exercises production
+// code paths which subscribe to it (e.g. the Postgres/ClickHouse sink retry
+// loops). The end-to-end behaviour is covered by the SIGTERM drain e2e test
+// (`crates/streamling-e2e/tests/shutdown_drain.rs`), which runs the signal
+// path in a dedicated child process.
