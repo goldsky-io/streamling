@@ -24,8 +24,8 @@ use crate::types::i256::I256Type;
 use crate::types::u256::U256Type;
 use apache_avro::Schema as ApacheAvroSchema;
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, ListArray,
-    PrimitiveArray, StructArray, new_null_array,
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
+    ListArray, PrimitiveArray, StringArray, StructArray, new_null_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{cast, concat_batches};
@@ -34,6 +34,8 @@ use arrow::record_batch::RecordBatch;
 use arrow_avro::reader::{Decoder, ReaderBuilder};
 use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
 use arrow_schema::{DataType, Field, FieldRef, Fields, SchemaRef};
+use bigdecimal::BigDecimal;
+use bigdecimal::num_bigint::BigInt;
 use datafusion::error::{DataFusionError, Result};
 use serde_json::Value as Json;
 use std::collections::{BTreeSet, HashMap};
@@ -44,6 +46,13 @@ use super::convert_avro_schema_to_arrow;
 /// Arrow's `Decimal256` max precision; avro decimals above this can't be decoded natively
 /// by arrow-avro, so we strip the logicalType and reinterpret the raw bytes afterward.
 const DECIMAL256_MAX_PRECISION: u64 = 76;
+
+/// Field-metadata key carrying the avro decimal `scale` for a high-precision (precision > 76)
+/// *scaled* decimal that `convert_avro_schema_to_arrow` maps to `Utf8` (it can't fit `Decimal256`,
+/// and `u256`/`i256` only cover scale 0). `coerce_array` reads it to format the raw decoded decimal
+/// bytes as a scale-aware decimal string, matching the vendored reader (which looked the scale up
+/// from the avro schema). Absent for every other `Utf8` field, so plain strings pass through.
+pub const AVRO_DECIMAL_SCALE_META: &str = "avro.decimal.scale";
 
 fn arrow_err(e: arrow_schema::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
@@ -159,6 +168,16 @@ fn coerce_array(src: &ArrayRef, target: &Field) -> Result<ArrayRef> {
         DataType::Decimal256(p, s) => binary_or_passthrough_decimal256(src, *p, *s),
         DataType::List(child) => coerce_list(src, child),
         DataType::Struct(fields) => coerce_struct(src, fields),
+        // High-precision (>76) *scaled* decimal → Utf8: arrow-avro decoded the stripped decimal as
+        // raw big-endian bytes, so a generic `cast` to Utf8 would reinterpret those bytes as text
+        // (garbage / invalid UTF-8). Format them as scale-aware decimal strings instead, matching
+        // the vendored reader. Only decimal-derived Utf8 fields carry the scale metadata; plain
+        // string fields fall through to the pass-through/cast arms below.
+        DataType::Utf8 | DataType::LargeUtf8
+            if target.metadata().contains_key(AVRO_DECIMAL_SCALE_META) =>
+        {
+            binary_to_decimal_string(src, target)
+        }
         // Anything else: identical types pass through, otherwise lean on arrow's cast kernel
         // (handles enum Dictionary→Utf8, timestamp tz adjustments, integer widening, etc.).
         tdt if src.data_type() == tdt => Ok(src.clone()),
@@ -184,8 +203,20 @@ fn coerce_list(src: &ArrayRef, target_child: &FieldRef) -> Result<ArrayRef> {
                 .as_any()
                 .downcast_ref::<arrow::array::LargeListArray>()
                 .expect("LargeList downcast");
-            // Narrow i64 offsets to i32 for the target `List` type.
-            let off: Vec<i32> = la.offsets().iter().map(|&o| o as i32).collect();
+            // Narrow i64 offsets to i32 for the target `List` type. Guard the narrowing instead of
+            // an `as` cast so a LargeList with > i32::MAX total elements errors loudly rather than
+            // silently wrapping into a corrupt offset buffer.
+            let off: Vec<i32> = la
+                .offsets()
+                .iter()
+                .map(|&o| {
+                    i32::try_from(o).map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "arrow-avro coerce_list: LargeList offset {o} exceeds i32::MAX"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i32>>>()?;
             (
                 OffsetBuffer::new(ScalarBuffer::from(off)),
                 la.values().clone(),
@@ -232,6 +263,42 @@ fn coerce_struct(src: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef> {
     let struct_arr = StructArray::try_new(target_fields.clone(), children, sa.nulls().cloned())
         .map_err(arrow_err)?;
     Ok(Arc::new(struct_arr))
+}
+
+/// Format a high-precision *scaled* decimal column (arrow-avro decoded the stripped decimal as raw
+/// big-endian two's-complement `Binary`) as scale-aware decimal strings, matching the removed
+/// vendored `format_decimal_with_scale`. `target` is the `Utf8`/`LargeUtf8` field carrying the avro
+/// scale in [`AVRO_DECIMAL_SCALE_META`].
+fn binary_to_decimal_string(src: &ArrayRef, target: &Field) -> Result<ArrayRef> {
+    let scale: i64 = target
+        .metadata()
+        .get(AVRO_DECIMAL_SCALE_META)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "arrow-avro: field '{}' missing/invalid {AVRO_DECIMAL_SCALE_META} metadata",
+                target.name()
+            ))
+        })?;
+    let strings: Vec<Option<String>> = as_binary_iter(src)?
+        .into_iter()
+        .map(|opt| opt.map(|bytes| format_decimal_bytes_with_scale(&bytes, scale)))
+        .collect();
+    match target.data_type() {
+        DataType::LargeUtf8 => Ok(Arc::new(LargeStringArray::from(strings))),
+        _ => Ok(Arc::new(StringArray::from(strings))),
+    }
+}
+
+/// Big-endian two's-complement decimal `bytes` + `scale` → a plain decimal string with trailing
+/// fractional zeros trimmed (mirrors the vendored reader's `format_decimal_with_scale`).
+fn format_decimal_bytes_with_scale(bytes: &[u8], scale: i64) -> String {
+    let big_int = BigInt::from_signed_bytes_be(bytes);
+    let mut s = BigDecimal::new(big_int, scale).to_plain_string();
+    if scale > 0 && s.contains('.') {
+        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +744,14 @@ impl ConfluentAvroDecoder {
             return Err(DataFusionError::Internal(
                 "Confluent frame shorter than 5 bytes".into(),
             ));
+        }
+        // Confluent wire format: 0x00 magic + 4-byte big-endian schema id. The Kafka source already
+        // checks this, but validating here keeps `decode` correct as a standalone unit.
+        if framed[0] != 0x00 {
+            return Err(DataFusionError::Internal(format!(
+                "Confluent frame missing 0x00 magic byte (first byte {:#04x})",
+                framed[0]
+            )));
         }
         let id = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]);
 
@@ -1382,6 +1457,54 @@ mod tests {
         assert!(
             coerce_batch_to_target(&src_batch, &bad_target).is_err(),
             "missing required nested field must error"
+        );
+    }
+
+    // Regression (Bugbot): a top-level decimal with precision > 76 AND non-zero scale maps to Utf8
+    // (too wide for Decimal256, not a scale-0 u256/i256). arrow-avro decodes the stripped decimal as
+    // raw bytes; a generic Binary→Utf8 cast would yield garbage. The decode path must instead format
+    // it as a scale-aware decimal string (matching the vendored reader).
+    #[test]
+    fn scaled_high_precision_decimal_formats_as_string() {
+        // precision 85, scale 4 → Utf8 with scale metadata.
+        const SCHEMA: &str = r#"{"type":"record","name":"R","fields":[{"name":"amt","type":{"type":"bytes","logicalType":"decimal","precision":85,"scale":4}}]}"#;
+        let schema = AvroWriterSchema::parse_str(SCHEMA).unwrap();
+
+        // The target field is Utf8 and carries the avro scale.
+        let target = convert_avro_schema_to_arrow(schema.clone());
+        let amt_field = target.field(0);
+        assert_eq!(amt_field.data_type(), &DataType::Utf8);
+        assert_eq!(
+            amt_field
+                .metadata()
+                .get(AVRO_DECIMAL_SCALE_META)
+                .map(String::as_str),
+            Some("4"),
+            "scale carried on the Utf8 field"
+        );
+
+        let id = 1u32;
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(id, SCHEMA).unwrap();
+
+        // unscaled integer 1_234_567 with scale 4 → "123.4567".
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put("amt", Value::Decimal(Decimal::from(vec![0x12, 0xD6, 0x87])));
+        let body = to_avro_datum(&schema, rec).unwrap();
+        decoder.decode(&confluent_frame(id, &body)).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("amt is Utf8");
+        assert_eq!(
+            col.value(0),
+            "123.4567",
+            "scaled high-precision decimal formats as a decimal string, not raw bytes"
         );
     }
 }
