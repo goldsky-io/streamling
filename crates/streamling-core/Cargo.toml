@@ -89,3 +89,4 @@ paste.workspace = true
 [dev-dependencies]
 rand.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+serial_test.workspace = true

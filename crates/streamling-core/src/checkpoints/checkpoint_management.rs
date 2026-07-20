@@ -1,4 +1,4 @@
-use crate::checkpoints::channels::{send, subscribe};
+use crate::checkpoints::channels::{SubscriberId, send, subscribe_with_id, unsubscribe};
 use crate::telemetry::recorder::{
     ControlPlaneMetricsRecorder, MetricsRecorder, get_control_plane_metrics_recorder,
 };
@@ -118,9 +118,174 @@ pub struct CheckpointCoordinator {
     /// Monotonically increasing epoch counter. Never reuses epoch numbers,
     /// even if previous epochs are removed due to timeout.
     next_epoch: Arc<AtomicU64>,
+    /// The sinks the coordinator waits on to ack an epoch before finalizing it.
+    /// Mutable so a sink whose upstream source has completed can be dropped
+    /// (via [`CheckpointControl::sink_completed`]) and stop blocking
+    /// finalization. Populated in [`CheckpointCoordinator::start`]; shared with
+    /// the subscriber/producer tasks and any [`CheckpointControl`] handle.
+    expected_sinks: Arc<Mutex<HashSet<String>>>,
+    /// Set once a terminal checkpoint has begun (a bounded source is completing
+    /// or a shutdown was requested). Gates the timer producer so it stops
+    /// issuing new epochs and never clears the terminal epoch out of the map.
+    terminal_started: Arc<AtomicBool>,
+    /// The terminal epoch, once begun. [`CheckpointControl::await_terminal_finalized`]
+    /// resolves when this epoch reaches `Finalized`.
+    terminal_epoch: Arc<Mutex<Option<CheckpointEpoch>>>,
     running: Arc<AtomicBool>,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Subscriber id for the coordinator's own channel subscription, so
+    /// [`CheckpointCoordinator::stop`] can unsubscribe and not leave a dead
+    /// sender in the global channel map.
+    subscriber_id: Option<SubscriberId>,
     timeout_sec: u64,
+}
+
+/// A cloneable handle for signalling checkpoint lifecycle events to the
+/// coordinator from outside its subscriber task — e.g. the pipeline run loop
+/// observing a sink future drain, or a bounded source completing. These are
+/// control-plane signals, so they are handle methods rather than
+/// `CheckpointMessage` variants: the on-the-wire protocol stays limited to
+/// data-plane markers, acks, and finalizers.
+#[derive(Clone)]
+pub struct CheckpointControl {
+    epochs: Arc<Mutex<BTreeMap<CheckpointEpoch, EpochState>>>,
+    expected_sinks: Arc<Mutex<HashSet<String>>>,
+    next_epoch: Arc<AtomicU64>,
+    terminal_started: Arc<AtomicBool>,
+    terminal_epoch: Arc<Mutex<Option<CheckpointEpoch>>>,
+}
+
+impl CheckpointControl {
+    /// Mark a sink as drained: it will never ack again, so drop it from the
+    /// expected-ack set and finalize any in-flight epoch the remaining live
+    /// sinks have already acked. Without this, an epoch waiting on a completed
+    /// sink — and any shutdown gated on finalization — blocks forever (the
+    /// multi-source completion case: one branch finishes while others run on).
+    pub fn sink_completed(&self, sink_id: &str) {
+        // Snapshot the remaining set and release its lock before touching
+        // `epochs`, so we never hold both locks at once. The subscriber/producer
+        // paths lock epochs-then-expected; taking only one lock at a time here
+        // keeps the lock order acyclic.
+        let expected_snapshot: HashSet<String> = {
+            let mut expected = self.expected_sinks.lock();
+            if !expected.remove(sink_id) {
+                // Unknown sink or already removed — nothing to do.
+                return;
+            }
+            expected.clone()
+        };
+        info!(
+            "Sink completed: {} (removed from expected ack set, {} live sink(s) remain)",
+            sink_id,
+            expected_snapshot.len()
+        );
+
+        let newly_finalized = finalize_ready_epochs(&self.epochs, &expected_snapshot);
+        if newly_finalized.is_empty() {
+            return;
+        }
+
+        let metrics_recorder = get_checkpoint_metrics_recorder();
+        for epoch in newly_finalized {
+            metrics_recorder.record_count("checkpoint_epochs_succeeded", 1);
+            metrics_recorder.record_count("checkpoint_finalizers_sent", 1);
+            info!("Epoch {} finalized after sink completion", epoch.0);
+            let _ = send(
+                CHECKPOINT_COORDINATOR_CHANNEL,
+                CheckpointMessage::Finalizer(epoch),
+            );
+        }
+        record_in_flight_gauge(&self.epochs, &metrics_recorder);
+    }
+
+    /// Begin the terminal checkpoint: the single final epoch a completing
+    /// bounded source (or the shutdown path) emits inline after the last data,
+    /// so the sinks flush and ack a checkpoint covering all of it before the
+    /// pipeline tears down. The caller must emit the returned epoch as a
+    /// `Marker` on a final (synthetic) batch so it flows to the sinks after the
+    /// last data.
+    ///
+    /// Setting `terminal_started` first, then minting and inserting under the
+    /// epochs lock, prevents the timer producer from clearing this epoch: the
+    /// producer re-checks `terminal_started` under the same lock before it
+    /// clears/inserts, so it can never race a fresh timer epoch over the
+    /// terminal one. Idempotent: a second call returns the existing terminal
+    /// epoch.
+    pub fn begin_terminal_checkpoint(&self) -> CheckpointEpoch {
+        self.terminal_started.store(true, Ordering::SeqCst);
+
+        let mut epochs = self.epochs.lock();
+        if let Some(existing) = self.terminal_epoch.lock().clone() {
+            return existing;
+        }
+        // Drop any in-flight timer epochs. The source is done producing data,
+        // so their markers can no longer reach the sinks and they would never
+        // finalize. The terminal epoch is the only one that matters now.
+        epochs.clear();
+        let epoch_num = self.next_epoch.fetch_add(1, Ordering::SeqCst);
+        let terminal = CheckpointEpoch(epoch_num);
+        epochs.insert(
+            terminal.clone(),
+            EpochState::Started {
+                created_at: Instant::now(),
+            },
+        );
+        *self.terminal_epoch.lock() = Some(terminal.clone());
+        info!("Begin terminal checkpoint: epoch {}", terminal.0);
+        terminal
+    }
+
+    /// Resolve once the terminal checkpoint has finalized (all live sinks
+    /// acked it). Returns immediately if no terminal checkpoint was begun.
+    pub async fn await_terminal_finalized(&self) {
+        loop {
+            let terminal = self.terminal_epoch.lock().clone();
+            match terminal {
+                None => return,
+                Some(epoch) => {
+                    if matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized)) {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Returns true if a terminal checkpoint was begun and has finalized.
+    pub fn is_terminal_finalized(&self) -> bool {
+        match self.terminal_epoch.lock().clone() {
+            None => false,
+            Some(epoch) => matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized)),
+        }
+    }
+}
+
+/// Transition every non-finalized epoch that the given (already shrunk)
+/// expected-sink set has fully acked into `Finalized`, returning the epochs
+/// that newly finalized so the caller can broadcast their `Finalizer`.
+fn finalize_ready_epochs(
+    epochs: &Arc<Mutex<BTreeMap<CheckpointEpoch, EpochState>>>,
+    expected: &HashSet<String>,
+) -> Vec<CheckpointEpoch> {
+    let mut newly_finalized = Vec::new();
+    let mut epochs_guard = epochs.lock();
+    for (epoch, state) in epochs_guard.iter_mut() {
+        let is_complete = match state {
+            // A Started epoch has no acks yet; it can only be considered
+            // complete if no sinks remain to ack it at all.
+            EpochState::Started { .. } => expected.is_empty(),
+            EpochState::InProgress { acked_sinks, .. } => {
+                expected.iter().all(|s| acked_sinks.contains(s))
+            }
+            EpochState::Finalized => false,
+        };
+        if is_complete {
+            *state = EpochState::Finalized;
+            newly_finalized.push(epoch.clone());
+        }
+    }
+    newly_finalized
 }
 
 /// Record the current number of non-finalized epochs as a gauge metric.
@@ -149,9 +314,27 @@ impl CheckpointCoordinator {
         Self {
             epochs: Arc::new(Mutex::new(BTreeMap::new())),
             next_epoch: Arc::new(AtomicU64::new(1)),
+            expected_sinks: Arc::new(Mutex::new(HashSet::new())),
+            terminal_started: Arc::new(AtomicBool::new(false)),
+            terminal_epoch: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
+            subscriber_id: None,
             timeout_sec,
+        }
+    }
+
+    /// Returns a cloneable control handle for signalling lifecycle events
+    /// (sink completion, beginning the terminal checkpoint) from outside the
+    /// coordinator's tasks. The handle shares the coordinator's state, so it is
+    /// valid before or after [`CheckpointCoordinator::start`].
+    pub fn control(&self) -> CheckpointControl {
+        CheckpointControl {
+            epochs: Arc::clone(&self.epochs),
+            expected_sinks: Arc::clone(&self.expected_sinks),
+            next_epoch: Arc::clone(&self.next_epoch),
+            terminal_started: Arc::clone(&self.terminal_started),
+            terminal_epoch: Arc::clone(&self.terminal_epoch),
         }
     }
 
@@ -164,9 +347,13 @@ impl CheckpointCoordinator {
 
         self.running.store(true, Ordering::SeqCst);
 
-        let expected_sinks = Arc::new(expected_sinks);
+        // Populate the shared expected-ack set in place (rather than replacing
+        // the Arc) so any control handle taken before `start` observes it.
+        *self.expected_sinks.lock() = expected_sinks.into_iter().collect();
+        let expected_sinks = Arc::clone(&self.expected_sinks);
 
-        let receiver = subscribe(CHECKPOINT_COORDINATOR_CHANNEL);
+        let (receiver, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+        self.subscriber_id = Some(subscriber_id);
         let epochs = Arc::clone(&self.epochs);
         let running = Arc::clone(&self.running);
         let expected_sinks_sub = Arc::clone(&expected_sinks);
@@ -183,10 +370,11 @@ impl CheckpointCoordinator {
                         );
 
                         // Warn if this sink_id is not in the expected list
-                        if !expected_sinks_sub.contains(&sink_id) {
+                        if !expected_sinks_sub.lock().contains(&sink_id) {
+                            let expected = expected_sinks_sub.lock();
                             warn!(
                                 "Received ack from unexpected sink '{}' for epoch {} (expected: {:?})",
-                                sink_id, epoch.0, *expected_sinks_sub
+                                sink_id, epoch.0, *expected
                             );
                             continue;
                         }
@@ -221,6 +409,7 @@ impl CheckpointCoordinator {
                                         );
 
                                         let is_complete = expected_sinks_sub
+                                            .lock()
                                             .iter()
                                             .all(|s| acked_sinks.contains(s));
                                         if is_complete {
@@ -256,6 +445,7 @@ impl CheckpointCoordinator {
                                         );
 
                                         let is_complete = expected_sinks_sub
+                                            .lock()
                                             .iter()
                                             .all(|s| acked_sinks.contains(s));
                                         if is_complete {
@@ -317,6 +507,7 @@ impl CheckpointCoordinator {
         let running = Arc::clone(&self.running);
         let next_epoch_counter = Arc::clone(&self.next_epoch);
         let expected_sinks_prod = Arc::clone(&expected_sinks);
+        let terminal_started_prod = Arc::clone(&self.terminal_started);
 
         let producer_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
@@ -355,6 +546,15 @@ impl CheckpointCoordinator {
                     break;
                 }
 
+                // A terminal checkpoint has begun (a bounded source completed or
+                // shutdown was requested). Stop the timer producer: the terminal
+                // epoch is the only one that should exist now, and the source
+                // will not produce more data for a fresh timer marker to ride.
+                if terminal_started_prod.load(Ordering::SeqCst) {
+                    debug!("Terminal checkpoint started; stopping timer producer");
+                    break;
+                }
+
                 // Wait for previous epoch to be finalized before creating a new one
                 let finalization_start = Instant::now();
                 let mut last_log = Instant::now();
@@ -384,12 +584,15 @@ impl CheckpointCoordinator {
                                 match state {
                                     EpochState::InProgress { acked_sinks, .. } => {
                                         expected_sinks_prod
+                                            .lock()
                                             .iter()
                                             .filter(|s| !acked_sinks.contains(*s))
                                             .cloned()
                                             .collect()
                                     }
-                                    EpochState::Started { .. } => expected_sinks_prod.to_vec(),
+                                    EpochState::Started { .. } => {
+                                        expected_sinks_prod.lock().iter().cloned().collect()
+                                    }
                                     _ => vec![],
                                 }
                             } else {
@@ -428,14 +631,24 @@ impl CheckpointCoordinator {
 
                 let created_at = Instant::now();
                 let created_at_ms = now_ms();
-                let epoch_num = next_epoch_counter.fetch_add(1, Ordering::SeqCst);
-                let new_epoch = CheckpointEpoch(epoch_num);
-                {
+                // Mint and insert under the epochs lock, re-checking the terminal
+                // flag inside that same critical section. `begin_terminal_checkpoint`
+                // clears the map and inserts its own epoch under this lock, so this
+                // re-check guarantees we never clear the terminal epoch by racing a
+                // fresh timer epoch over it.
+                let new_epoch = {
                     let mut epochs_guard = epochs.lock();
+                    if terminal_started_prod.load(Ordering::SeqCst) {
+                        debug!("Terminal checkpoint started; stopping timer producer");
+                        break;
+                    }
+                    let epoch_num = next_epoch_counter.fetch_add(1, Ordering::SeqCst);
+                    let new_epoch = CheckpointEpoch(epoch_num);
                     // Previous epoch is finalized; clear it before inserting the new one
                     epochs_guard.clear();
                     epochs_guard.insert(new_epoch.clone(), EpochState::Started { created_at });
-                }
+                    new_epoch
+                };
 
                 record_in_flight_gauge(&epochs, &metrics_recorder);
 
@@ -555,6 +768,13 @@ impl CheckpointCoordinator {
             let _ = handle.await;
         }
 
+        // The subscriber task has exited and dropped its receiver; remove the
+        // now-dead sender from the global channel map so later sends don't fail
+        // against it.
+        if let Some(subscriber_id) = self.subscriber_id.take() {
+            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, subscriber_id);
+        }
+
         info!("Checkpoint coordinator stopped");
     }
 }
@@ -606,6 +826,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Fields};
+    use serial_test::serial;
     use tokio::time::sleep;
 
     fn create_test_batch_with_metadata(
@@ -672,6 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_unexpected_ack_does_not_finalize_epoch() {
         let mut coordinator = CheckpointCoordinator::with_timeout(300);
         let epoch = CheckpointEpoch(42);
@@ -724,5 +946,170 @@ mod tests {
         }
 
         coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_sink_completion_unblocks_finalization() {
+        // Two sinks are expected. The epoch is acked by sink_b only, so it
+        // stays in progress waiting on sink_a. When sink_a's branch finishes (a
+        // bounded source completed), sink_a will never ack again. Marking it
+        // complete must remove it from the expected set and let the epoch
+        // finalize on the remaining live sink — otherwise the coordinator (and
+        // any shutdown gated on finalization) blocks forever.
+        let mut coordinator = CheckpointCoordinator::with_timeout(300);
+        let epoch = CheckpointEpoch(1042);
+
+        {
+            let mut epochs = coordinator.epochs.lock();
+            epochs.insert(
+                epoch.clone(),
+                EpochState::Started {
+                    created_at: Instant::now(),
+                },
+            );
+        }
+
+        coordinator.start(
+            3600,
+            vec!["sink_a_dereg".to_string(), "sink_b_dereg".to_string()],
+        );
+
+        // Only sink_b acks; epoch is now InProgress waiting on sink_a.
+        send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Ack {
+                epoch: epoch.clone(),
+                sink_id: "sink_b_dereg".to_string(),
+            },
+        )
+        .unwrap();
+
+        sleep(Duration::from_millis(100)).await;
+
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                matches!(epochs.get(&epoch), Some(EpochState::InProgress { .. })),
+                "epoch should still be in progress, waiting on sink_a"
+            );
+        }
+
+        // sink_a's branch finished and will never ack. Deregister it via the
+        // control handle (no checkpoint message involved).
+        coordinator.control().sink_completed("sink_a_dereg");
+
+        sleep(Duration::from_millis(100)).await;
+
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                matches!(epochs.get(&epoch), Some(EpochState::Finalized)),
+                "epoch should finalize once the only outstanding sink completes"
+            );
+        }
+
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_terminal_checkpoint_blocks_until_acked() {
+        // A bounded source, on completion, begins a terminal checkpoint and the
+        // pipeline must not tear down until that epoch finalizes. The await must
+        // block until the sink acks the terminal marker, then return.
+        let mut coordinator = CheckpointCoordinator::with_timeout(300);
+        coordinator.start(3600, vec!["sink_terminal".to_string()]);
+        let control = coordinator.control();
+
+        let terminal = control.begin_terminal_checkpoint();
+
+        // No sink has acked the terminal marker yet, so the await must block.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                control.await_terminal_finalized()
+            )
+            .await
+            .is_err(),
+            "await_terminal_finalized must block until the terminal epoch is acked"
+        );
+
+        // The sink processes the terminal marker, flushes, and acks.
+        send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Ack {
+                epoch: terminal.clone(),
+                sink_id: "sink_terminal".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Now the terminal checkpoint finalizes and the await returns.
+        tokio::time::timeout(Duration::from_secs(2), control.await_terminal_finalized())
+            .await
+            .expect("await_terminal_finalized must return once the terminal epoch finalizes");
+
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                matches!(epochs.get(&terminal), Some(EpochState::Finalized)),
+                "terminal epoch should be finalized after the sink acks"
+            );
+        }
+
+        coordinator.stop().await;
+    }
+
+    #[test]
+    fn test_sink_completion_unblocks_finalization_synchronous() {
+        // Direct-state variant of the multi-source case with no coordinator
+        // tasks running: an InProgress epoch acked by sink_b, waiting on sink_a,
+        // must finalize synchronously the moment sink_a is marked completed.
+        let coordinator = CheckpointCoordinator::with_timeout(300);
+        let epoch = CheckpointEpoch(1042);
+
+        {
+            let mut expected = coordinator.expected_sinks.lock();
+            expected.insert("sink_a_dereg".to_string());
+            expected.insert("sink_b_dereg".to_string());
+        }
+
+        {
+            let mut epochs = coordinator.epochs.lock();
+            let mut acked_sinks = HashSet::new();
+            acked_sinks.insert("sink_b_dereg".to_string());
+            epochs.insert(
+                epoch.clone(),
+                EpochState::InProgress {
+                    acked_sinks,
+                    created_at: Instant::now(),
+                },
+            );
+        }
+
+        let control = coordinator.control();
+        control.sink_completed("sink_a_dereg");
+
+        let epochs = coordinator.epochs.lock();
+        assert!(
+            matches!(epochs.get(&epoch), Some(EpochState::Finalized)),
+            "epoch should finalize synchronously once the only outstanding sink completes"
+        );
+    }
+
+    #[test]
+    fn test_begin_terminal_checkpoint_is_idempotent() {
+        // A second begin returns the same terminal epoch and does not mint a new
+        // one (e.g. if both a bounded-completion path and the shutdown path fire).
+        let coordinator = CheckpointCoordinator::with_timeout(300);
+        let control = coordinator.control();
+
+        let first = control.begin_terminal_checkpoint();
+        let second = control.begin_terminal_checkpoint();
+        assert_eq!(first, second, "terminal epoch must be stable across calls");
+
+        let epochs = coordinator.epochs.lock();
+        assert_eq!(epochs.len(), 1, "only the single terminal epoch should exist");
     }
 }
