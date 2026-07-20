@@ -2334,17 +2334,12 @@ impl Streamling {
         Ok(())
     }
 
-    /// The total time budget for graceful shutdown, from
-    /// `STREAMLING__SHUTDOWN_BUDGET_SECS` (default 25s, sized to sit under the
-    /// k8s default 30s grace period). The whole drain + teardown must fit here.
+    /// The total time budget for graceful shutdown. Delegates to the shared
+    /// definition in `streamling_core::shutdown` so every consumer (this run
+    /// loop's watchdog, the hybrid source's terminal-finalize wait) reads the
+    /// same value and they can never drift.
     fn shutdown_budget() -> Duration {
-        const DEFAULT_SHUTDOWN_BUDGET_SECS: u64 = 25;
-        let secs = std::env::var("STREAMLING__SHUTDOWN_BUDGET_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|s| *s > 0)
-            .unwrap_or(DEFAULT_SHUTDOWN_BUDGET_SECS);
-        Duration::from_secs(secs)
+        streamling_core::shutdown::shutdown_budget()
     }
 
     /// Arm a last-resort watchdog: a plain OS thread that hard-exits the process
@@ -2364,7 +2359,7 @@ impl Streamling {
         static WATCHDOG_DEADLINE: OnceLock<std::time::Instant> = OnceLock::new();
         *WATCHDOG_DEADLINE.get_or_init(|| {
             let deadline = std::time::Instant::now() + budget;
-            let _ = std::thread::Builder::new()
+            let spawn_result = std::thread::Builder::new()
                 .name("shutdown-watchdog".to_string())
                 .spawn(move || {
                     std::thread::sleep(budget);
@@ -2376,6 +2371,16 @@ impl Streamling {
                     );
                     std::process::exit(1);
                 });
+            if let Err(e) = spawn_result {
+                // Without the watchdog nothing guarantees the process exits
+                // before the grace period; make that loudly visible instead of
+                // failing silently (behaviour then degrades to pre-watchdog).
+                eprintln!(
+                    "[streamling] FAILED to spawn shutdown watchdog thread: {}; \
+                     a wedged teardown can no longer be force-exited",
+                    e
+                );
+            }
             deadline
         })
     }

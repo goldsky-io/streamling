@@ -6,6 +6,10 @@ use streamling_core::streamling_err;
 
 use crate::table_providers::postgres::value_binding;
 
+/// Upper bound for a single INSERT/DELETE attempt. Attempts are retried (with
+/// shutdown-aware backoff) on timeout; both operations are idempotent.
+const PER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Context for sink operations, providing identifying information for error messages
 #[derive(Clone)]
 pub struct SinkContext {
@@ -59,8 +63,14 @@ pub async fn execute_batch_insert(
                         q = q.bind(epoch as i64);
                     }
                 }
-                q.execute(&pool)
+                // Bound each attempt so a hung connection cannot silently eat
+                // the whole shutdown budget: cancellation is only checked
+                // BETWEEN attempts, so an unbounded in-flight attempt would
+                // leave the watchdog as the only way out. A timed-out attempt
+                // is retried; the upsert is idempotent.
+                tokio::time::timeout(PER_ATTEMPT_TIMEOUT, q.execute(&pool))
                     .await
+                    .streamling_context("INSERT attempt timed out")?
                     .streamling_context("failed to execute INSERT query")?;
                 Ok(())
             }
@@ -118,8 +128,12 @@ pub async fn execute_batch_delete(
                             .streamling_context("failed to bind Arrow value to query")?;
                     }
                 }
-                q.execute(&pool)
+                // See the INSERT path: bound each attempt so a hung connection
+                // can't eat the shutdown budget. Deletes by primary key are
+                // idempotent, so a timed-out attempt is safely retried.
+                tokio::time::timeout(PER_ATTEMPT_TIMEOUT, q.execute(&pool))
                     .await
+                    .streamling_context("DELETE attempt timed out")?
                     .streamling_context("failed to execute DELETE query")?;
                 Ok(())
             }

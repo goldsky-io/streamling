@@ -131,6 +131,10 @@ pub struct CheckpointCoordinator {
     /// The terminal epoch, once begun. [`CheckpointControl::await_terminal_finalized`]
     /// resolves when this epoch reaches `Finalized`.
     terminal_epoch: Arc<Mutex<Option<CheckpointEpoch>>>,
+    /// Woken whenever any epoch transitions to `Finalized`, so
+    /// [`CheckpointControl::await_terminal_finalized`] wakes immediately
+    /// instead of polling.
+    finalized_notify: Arc<tokio::sync::Notify>,
     running: Arc<AtomicBool>,
     handles: Vec<tokio::task::JoinHandle<()>>,
     /// Subscriber id for the coordinator's own channel subscription, so
@@ -153,6 +157,7 @@ pub struct CheckpointControl {
     next_epoch: Arc<AtomicU64>,
     terminal_started: Arc<AtomicBool>,
     terminal_epoch: Arc<Mutex<Option<CheckpointEpoch>>>,
+    finalized_notify: Arc<tokio::sync::Notify>,
 }
 
 impl CheckpointControl {
@@ -185,6 +190,13 @@ impl CheckpointControl {
             return;
         }
 
+        // Single-sender guarantee: the transition to `Finalized` happens under
+        // the epochs lock (here in `finalize_ready_epochs`, or in the
+        // subscriber's ack arm), and only the path that performed the
+        // transition broadcasts the Finalizer — the ack arm no-ops on an
+        // already-`Finalized` epoch. Even if a duplicate ever slipped through,
+        // every Finalizer consumer is idempotent (offset commits, state saves,
+        // `DELETE <= N-1` truncation).
         let metrics_recorder = get_checkpoint_metrics_recorder();
         for epoch in newly_finalized {
             metrics_recorder.record_count("checkpoint_epochs_succeeded", 1);
@@ -195,6 +207,7 @@ impl CheckpointControl {
                 CheckpointMessage::Finalizer(epoch),
             );
         }
+        self.finalized_notify.notify_waiters();
         record_in_flight_gauge(&self.epochs, &metrics_recorder);
     }
 
@@ -256,7 +269,14 @@ impl CheckpointControl {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wake immediately on a finalization (every transition to
+            // `Finalized` calls `notify_waiters`), with a coarse fallback poll
+            // so an edge lost between the state check above and waiter
+            // registration can never wedge the wait.
+            tokio::select! {
+                _ = self.finalized_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
         }
     }
 
@@ -325,6 +345,7 @@ impl CheckpointCoordinator {
             expected_sinks: Arc::new(Mutex::new(HashSet::new())),
             terminal_started: Arc::new(AtomicBool::new(false)),
             terminal_epoch: Arc::new(Mutex::new(None)),
+            finalized_notify: Arc::new(tokio::sync::Notify::new()),
             running: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
             subscriber_id: None,
@@ -343,6 +364,7 @@ impl CheckpointCoordinator {
             next_epoch: Arc::clone(&self.next_epoch),
             terminal_started: Arc::clone(&self.terminal_started),
             terminal_epoch: Arc::clone(&self.terminal_epoch),
+            finalized_notify: Arc::clone(&self.finalized_notify),
         }
     }
 
@@ -365,6 +387,7 @@ impl CheckpointCoordinator {
         let epochs = Arc::clone(&self.epochs);
         let running = Arc::clone(&self.running);
         let expected_sinks_sub = Arc::clone(&expected_sinks);
+        let finalized_notify_sub = Arc::clone(&self.finalized_notify);
 
         let subscriber_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
@@ -489,6 +512,7 @@ impl CheckpointCoordinator {
                                 CheckpointMessage::Finalizer(epoch),
                             )
                             .unwrap();
+                            finalized_notify_sub.notify_waiters();
 
                             record_in_flight_gauge(&epochs, &metrics_recorder);
                         }
