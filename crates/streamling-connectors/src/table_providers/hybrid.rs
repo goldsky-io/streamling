@@ -1412,20 +1412,21 @@ fn merge_pending_markers(
 }
 
 /// The bound on how long a completing source waits for the terminal checkpoint
-/// to finalize before giving up and emitting the finalizer best-effort. Keeps a
-/// sink that never acks from hanging the source task.
+/// to finalize. On timeout the terminal Finalizer is SKIPPED (never emitted
+/// for an unconfirmed epoch — see `emit_terminal_checkpoint`); this bound only
+/// keeps a sink that never acks from hanging the source task.
 ///
 /// Derived from the run loop's shared shutdown budget
 /// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
-/// is armed with), minus a margin so this wait always expires — and the
-/// best-effort finalizer is still emitted — BEFORE the watchdog hard-exits the
-/// process. A fixed value larger than the budget would let the watchdog kill
-/// the process mid-wait, dropping the finalizer entirely.
+/// is armed with), minus a margin so this wait always expires BEFORE the
+/// watchdog hard-exits the process. The minimum-floor is itself capped at
+/// budget − 2s so a deliberately tiny budget can never invert the invariant.
 fn terminal_checkpoint_finalize_timeout() -> Duration {
     const MARGIN_SECS: u64 = 10;
     const MIN_TIMEOUT_SECS: u64 = 5;
     let budget = streamling_core::shutdown::shutdown_budget().as_secs();
-    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(MIN_TIMEOUT_SECS))
+    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2).max(1));
+    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(capped_floor))
 }
 
 /// Emit the terminal checkpoint round-trip inline on the data stream, so both
