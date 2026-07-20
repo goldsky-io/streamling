@@ -1447,6 +1447,11 @@ fn terminal_checkpoint_finalize_timeout() -> Duration {
 /// multi-source pipeline: the first caller mints the epoch, the rest reuse it,
 /// and it finalizes once every sink has acked it (or been dropped from the
 /// expected set via `sink_completed`).
+///
+/// Send failures on `tx` are logged, not surfaced: every call site is a
+/// completion path that ends the stream immediately after this returns, and
+/// the only way the receiver is gone is that downstream already tore down —
+/// there is no caller decision an error could change.
 async fn emit_terminal_checkpoint(
     control: &CheckpointControl,
     pending: &Arc<Mutex<Vec<CheckpointMessage>>>,

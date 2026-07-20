@@ -255,6 +255,11 @@ impl CheckpointControl {
     pub fn begin_terminal_checkpoint(&self) -> CheckpointEpoch {
         self.terminal_started.store(true, Ordering::SeqCst);
 
+        // Lock order: `epochs` then `terminal_epoch` — the ONE place both are
+        // held at once, which makes this order the pipeline-wide invariant.
+        // Every other path must either take `terminal_epoch` alone and drop it
+        // before touching `epochs` (see `await_terminal_finalized` /
+        // `is_terminal_finalized`), or nest inside `epochs` like here.
         let mut epochs = self.epochs.lock();
         if let Some(existing) = self.terminal_epoch.lock().clone() {
             return existing;
