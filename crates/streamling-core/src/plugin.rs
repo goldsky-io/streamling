@@ -29,6 +29,7 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
 };
@@ -38,7 +39,6 @@ pub use streamling_plugin::{
     PluginMsg, PluginOptions, PluginStateBackendConfig,
 };
 use tokio::runtime::Handle;
-use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]

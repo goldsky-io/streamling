@@ -2221,7 +2221,9 @@ impl Streamling {
                     .await
                     .is_err()
             {
-                warn!("Terminal checkpoint did not finalize within budget; proceeding with shutdown");
+                warn!(
+                    "Terminal checkpoint did not finalize within budget; proceeding with shutdown"
+                );
             }
             // Ensure sources observe shutdown even on a clean job-mode completion
             // (so any lingering helper tasks — lag reporters — wind down).
