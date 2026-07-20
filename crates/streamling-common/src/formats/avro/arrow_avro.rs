@@ -365,6 +365,27 @@ fn binary_or_passthrough_decimal128(src: &ArrayRef, p: u8, s: i8) -> Result<Arra
                 .with_data_type(dt);
             Ok(Arc::new(a))
         }
+        // arrow-avro decodes an avro decimal with precision in (38, 76] as `Decimal256`, but a
+        // NESTED decimal's target is always `Decimal128(p,s)` (convert_avro_schema_to_arrow maps
+        // nested decimals to Decimal128 regardless of precision). arrow's `Decimal256 -> Decimal128`
+        // cast rejects `p > 38`, whereas the vendored reader built `Decimal128(p,s)` directly from
+        // the unscaled i128 via `with_data_type` (no precision validation). Match the vendored
+        // behavior: reinterpret each value's low 128 bits and stamp the target type unvalidated.
+        DataType::Decimal256(_, _) => {
+            let a = src
+                .as_any()
+                .downcast_ref::<PrimitiveArray<Decimal256Type>>()
+                .expect("Decimal256 downcast");
+            let arr: PrimitiveArray<Decimal128Type> = (0..a.len())
+                .map(|i| {
+                    (!a.is_null(i)).then(|| {
+                        let be = a.value(i).to_be_bytes();
+                        be_bytes_to_i128(&be[16..])
+                    })
+                })
+                .collect();
+            Ok(Arc::new(arr.with_data_type(dt)))
+        }
         _ => cast(src, &dt).map_err(arrow_err),
     }
 }
