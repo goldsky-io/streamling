@@ -528,6 +528,9 @@ impl ExecutionPlan for MultiSinkExec {
         // the run loop's teardown ordering (and the shutdown drain guarantee)
         // relies on. Note this means the plan's wall-clock now includes sink
         // write latency (and any residual retry backoff), by design.
+        // ASSUMPTION: downstream drains this stream to completion before
+        // dropping it (DataFusion's collect() does). Dropping it early skips
+        // the handle-join below and aborts in-flight sink writers mid-flush.
         let schema = self.schema();
         let output = async_stream::stream! {
             let mut out = output_consumer;
