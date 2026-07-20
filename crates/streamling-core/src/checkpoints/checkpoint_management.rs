@@ -26,6 +26,21 @@ pub struct CheckpointEpoch(pub u64);
 ///   Contains epoch and creation timestamp (ms since UNIX epoch) for propagation timing.
 /// - Ack: An acknowledgment for a checkpoint epoch. Sinks MUST flush/commit their state before sending this.
 /// - Finalizer: A message to finalize a checkpoint epoch. Should be used by sources/operators to flush/commit their state.
+///
+/// # Finalizer consumer contract (load-bearing — read before adding a connector)
+///
+/// Every Finalizer consumer MUST be idempotent and non-blocking, and MUST
+/// NEVER gate progress on receiving the Finalizer for one specific epoch:
+/// - Finalizers can be delivered more than once for the same epoch.
+/// - Finalizers can be SKIPPED entirely: the coordinator drops non-finalized
+///   timer epochs when a terminal checkpoint begins
+///   (`CheckpointControl::begin_terminal_checkpoint`), and a terminal epoch
+///   that never finalizes has its Finalizer withheld deliberately.
+/// - Commit/cleanup semantics must therefore be cumulative (offsets, current
+///   state snapshots) or range-based (`<= N-1` truncation), so a later
+///   Finalizer covers any skipped one.
+/// A consumer that waits for an exact epoch's Finalizer will wedge terminal
+/// checkpoints and hang shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CheckpointMessage {
     Marker {

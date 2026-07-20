@@ -1537,7 +1537,7 @@ async fn flush_pending_to_synth_batch(
     reference_name: &str,
 ) {
     let drained: Vec<CheckpointMessage> = {
-        let mut g = pending.lock().unwrap();
+        let mut g = pending.lock().expect("pending markers mutex poisoned");
         std::mem::take(&mut *g)
     };
     if drained.is_empty() {
@@ -1570,7 +1570,18 @@ async fn flush_pending_to_synth_batch(
         md,
     ));
     let synth = RecordBatch::new_empty(synth_schema);
-    let _ = tx.send(Ok(synth)).await;
+    if tx.send(Ok(synth)).await.is_err() {
+        // Downstream already gone. On teardown paths this is expected; on the
+        // terminal-checkpoint path it means the Marker/Finalizer batch was
+        // dropped and the epoch will not finalize (at-least-once replay covers
+        // the data). Either way, make it visible instead of silent.
+        warn!(
+            "Hybrid source '{}': downstream closed; dropped a synthetic batch \
+             carrying {} checkpoint message(s)",
+            reference_name,
+            to_flush.len()
+        );
+    }
 }
 
 struct ClickHouseSchemaAdapter {
