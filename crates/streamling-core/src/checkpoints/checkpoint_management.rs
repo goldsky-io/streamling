@@ -39,6 +39,7 @@ pub struct CheckpointEpoch(pub u64);
 /// - Commit/cleanup semantics must therefore be cumulative (offsets, current
 ///   state snapshots) or range-based (`<= N-1` truncation), so a later
 ///   Finalizer covers any skipped one.
+///
 /// A consumer that waits for an exact epoch's Finalizer will wedge terminal
 /// checkpoints and hang shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
