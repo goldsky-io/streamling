@@ -7031,6 +7031,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml",
+ "serial_test",
  "sqlx",
  "streamling-common",
  "streamling-config",

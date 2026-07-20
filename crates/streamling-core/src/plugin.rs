@@ -12,7 +12,7 @@ use crate::data::COLUMN_NAME_OP;
 use crate::error::Result;
 use crate::telemetry::provider::metric_key;
 use crate::telemetry::recorder::merge_metadata_tags;
-use crate::{streamling_bail, streamling_err, streamling_user_bail};
+use crate::{streamling_err, streamling_user_bail};
 use abi_stable::StableAbi;
 use abi_stable::derive_macro_reexports::{NonExhaustive, TD_Opaque};
 use abi_stable::external_types::crossbeam_channel;
@@ -28,7 +28,6 @@ use std::fmt;
 use std::fmt::Debug;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
@@ -39,7 +38,8 @@ pub use streamling_plugin::{
     PluginMsg, PluginOptions, PluginStateBackendConfig,
 };
 use tokio::runtime::Handle;
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct PluginId {
@@ -89,8 +89,6 @@ lazy_static! {
         RwLock::new(HashMap::new());
 }
 
-static SHUTDOWN_WATCH_STARTED: OnceLock<()> = OnceLock::new();
-
 fn register_plugin_instance(instance_key: &str, channels: PluginChannels) {
     let mut reg = PLUGIN_INSTANCE_REGISTRY.write().unwrap();
     reg.insert(instance_key.to_string(), channels);
@@ -105,31 +103,6 @@ pub fn terminate_all_plugins() -> Result<()> {
     let ids: Vec<(String, PluginChannels)> = reg.drain().collect();
     drop(reg);
     terminate_plugins(ids)
-}
-
-fn start_shutdown_watcher_once() {
-    if SHUTDOWN_WATCH_STARTED.set(()).is_ok() {
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut sigterm =
-                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-                let mut sigint =
-                    signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-                tokio::select! {
-                    _ = sigterm.recv() => {},
-                    _ = sigint.recv() => {},
-                    _ = tokio::signal::ctrl_c() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-            let _ = self::terminate_all_plugins();
-        });
-    }
 }
 
 #[repr(transparent)]
@@ -406,7 +379,6 @@ pub fn create_source_plugin(
     create_result
         .into_rust()
         .map(|result| {
-            start_shutdown_watcher_once();
             register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
             merge_metadata_tags(
                 &metric_key(&app_config.application_id, &reference_name),
@@ -459,7 +431,6 @@ pub fn create_transform_plugin(
     create_result
         .into_rust()
         .map(|result| {
-            start_shutdown_watcher_once();
             register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
             merge_metadata_tags(
                 &metric_key(&app_config.application_id, &reference_name),
@@ -512,7 +483,6 @@ pub fn create_sink_plugin(
     create_result
         .into_rust()
         .map(|result| {
-            start_shutdown_watcher_once();
             register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
             merge_metadata_tags(
                 &metric_key(&app_config.application_id, &reference_name),
@@ -573,15 +543,25 @@ pub fn create_preprocessor_plugin(
 }
 
 pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
+    // Bound the send so a plugin whose input channel is full (a wedged
+    // dispatcher) cannot park this call — and thus the whole shutdown path —
+    // forever on a blocking crossbeam send. A failure to signal one plugin must
+    // not stop us from terminating the rest, so warn and continue rather than
+    // bailing; the host awaits the dispatchers afterwards and the shutdown
+    // watchdog is the final backstop.
+    const TERMINATE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
     for (plugin_id, channels) in plugins {
         info!("Terminating plugin {}", plugin_id);
 
-        if let Err(e) = channels
-            .input
-            .sender
-            .send(NonExhaustive::new(PluginMsg::Terminate))
-        {
-            streamling_bail!("Failed to send termination message: {}", e);
+        if let Err(e) = channels.input.sender.send_timeout(
+            NonExhaustive::new(PluginMsg::Terminate),
+            TERMINATE_SEND_TIMEOUT,
+        ) {
+            warn!(
+                "Failed to send termination message to plugin {} within {:?}: {}. \
+                 Continuing to terminate remaining plugins.",
+                plugin_id, TERMINATE_SEND_TIMEOUT, e
+            );
         }
     }
 
