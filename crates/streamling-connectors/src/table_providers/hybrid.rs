@@ -1185,10 +1185,8 @@ impl ExecutionPlan for HybridSourceExec {
                 )
                 .await;
 
-                let shutdown_requested = shutdown_rx
-                    .as_ref()
-                    .map(|rx| *rx.borrow())
-                    .unwrap_or(false);
+                let shutdown_requested =
+                    shutdown_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false);
 
                 // Stream ended — use our local knowledge of what phase we were
                 // executing to decide whether to advance or exit.

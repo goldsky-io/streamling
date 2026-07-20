@@ -1110,6 +1110,10 @@ mod tests {
         assert_eq!(first, second, "terminal epoch must be stable across calls");
 
         let epochs = coordinator.epochs.lock();
-        assert_eq!(epochs.len(), 1, "only the single terminal epoch should exist");
+        assert_eq!(
+            epochs.len(),
+            1,
+            "only the single terminal epoch should exist"
+        );
     }
 }
