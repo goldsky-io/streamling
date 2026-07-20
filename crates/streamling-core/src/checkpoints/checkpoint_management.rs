@@ -313,7 +313,10 @@ impl CheckpointControl {
             // Wake immediately on a finalization (every transition to
             // `Finalized` calls `notify_waiters`), with a coarse fallback poll
             // so an edge lost between the state check above and waiter
-            // registration can never wedge the wait.
+            // registration can never wedge the wait. 200ms is deliberate:
+            // rare enough to be free, and worst-case latency only applies to
+            // the lost-edge race — the notify path is the fast path. Don't
+            // tighten it into a busy-poll or widen it into drain latency.
             tokio::select! {
                 _ = self.finalized_notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
