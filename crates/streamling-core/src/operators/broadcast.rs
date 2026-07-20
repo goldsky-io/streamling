@@ -579,24 +579,38 @@ impl ExecutionPlan for MultiSinkExec {
         // failure as a stream error. `collect()` on this plan therefore
         // resolves only once all sinks have durably drained — which is what
         // the run loop's teardown ordering (and the shutdown drain guarantee)
-        // relies on.
+        // relies on. Note this means the plan's wall-clock now includes sink
+        // write latency (and any residual retry backoff), by design.
         let schema = self.schema();
         let output = async_stream::stream! {
             let mut out = output_consumer;
             while let Some(item) = futures::StreamExt::next(&mut out).await {
                 yield item;
             }
+            // Join ALL writers before yielding any failure: consumers like
+            // `collect()` stop pulling on the first error and drop this
+            // stream, and dropping it before the remaining handles are joined
+            // would abort the sibling writers mid-flush — the exact tail loss
+            // this gating exists to prevent. So: drain everyone first, then
+            // report the first failure.
+            let mut first_error: Option<datafusion::error::DataFusionError> = None;
             for handle in sink_handles {
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => yield Err(e),
-                    Err(join_err) => {
-                        yield Err(datafusion::error::DataFusionError::Execution(format!(
-                            "MultiSinkExec: sink writer task panicked: {}",
-                            join_err
-                        )));
+                let failure = match handle.await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(join_err) => Some(datafusion::error::DataFusionError::Execution(
+                        format!("MultiSinkExec: sink writer task panicked: {}", join_err),
+                    )),
+                };
+                if let Some(e) = failure {
+                    tracing::warn!("MultiSinkExec: sink writer failed: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
                 }
+            }
+            if let Some(e) = first_error {
+                yield Err(e);
             }
         };
 
