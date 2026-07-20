@@ -120,11 +120,13 @@ async fn process_checkpoint_messages_with_truncation(
                 );
 
                 let sink_id = get_reference_name_from_metric_key(&context.metric_metadata_id);
-                send(
+                // Best-effort: during shutdown a source may have dropped its
+                // channel receiver already; a failed ack broadcast must not
+                // panic the sink mid-drain (the epoch simply never finalizes).
+                let _ = send(
                     CHECKPOINT_COORDINATOR_CHANNEL,
                     CheckpointMessage::Ack { epoch, sink_id },
-                )
-                .unwrap();
+                );
 
                 // Record sink flush time (time from batch arrival to ack sent)
                 context.metrics_recorder.record_time(
