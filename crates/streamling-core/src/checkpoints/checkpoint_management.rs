@@ -73,14 +73,16 @@ pub fn process_checkpoint_acks(
                 Duration::from_millis(arrival_latency_ms),
                 metric_metadata_id,
             );
-            send(
+            // Best-effort: during shutdown a source may have dropped its
+            // channel receiver already; a failed broadcast must not panic the
+            // sink mid-drain.
+            let _ = send(
                 CHECKPOINT_COORDINATOR_CHANNEL,
                 CheckpointMessage::Ack {
                     epoch,
                     sink_id: sink_id.to_string(),
                 },
-            )
-            .unwrap();
+            );
             metrics_recorder.record_time(
                 "checkpoint_sink_flush",
                 ack_start.elapsed(),
@@ -528,11 +530,12 @@ impl CheckpointCoordinator {
                             metrics_recorder.record_count("checkpoint_finalizers_sent", 1);
 
                             info!("Epoch finalized: {}", epoch.0);
-                            send(
+                            // Best-effort: a receiver dropped during shutdown
+                            // must not panic the coordinator.
+                            let _ = send(
                                 CHECKPOINT_COORDINATOR_CHANNEL,
                                 CheckpointMessage::Finalizer(epoch),
-                            )
-                            .unwrap();
+                            );
                             finalized_notify_sub.notify_waiters();
 
                             record_in_flight_gauge(&epochs, &metrics_recorder);

@@ -3,7 +3,7 @@ mod metadata;
 mod schema_registry;
 
 use streamling_config::{KafkaCompression, KafkaConfig};
-use streamling_core::checkpoints::channels::{send, subscribe};
+use streamling_core::checkpoints::channels::{send, subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
@@ -1163,7 +1163,13 @@ impl ExecutionPlan for KafkaSourceExec {
         let batch_size_limit = self.record_batch_size as u64;
 
         let reference_name = self.reference_name.clone();
-        let receiver = subscribe(CHECKPOINT_COORDINATOR_CHANNEL);
+        // Keep the subscriber id so the consume task can unsubscribe on exit:
+        // dropping the receiver while the sender stays in the global channel
+        // map makes every later broadcast return SendError — which used to
+        // panic sinks/coordinator mid-drain the moment this source exited on
+        // shutdown.
+        let (receiver, checkpoint_subscriber_id) =
+            subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
 
         let mut metadata = if self.include_metadata {
             Some(KafkaMetadata::default())
@@ -1632,6 +1638,7 @@ impl ExecutionPlan for KafkaSourceExec {
             }
 
             info!("Shutting down Kafka consumer: unsubscribing and unassigning");
+            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
             consumer.unsubscribe();
             consumer.unassign().expect("Failed to unassign consumer");
             // Always forget after explicit cleanup to avoid redundant drop overhead.
@@ -2742,11 +2749,12 @@ impl DataSink for KafkaSink {
                     }
 
                     let sink_id = get_reference_name_from_metric_key(&self.metric_metadata_id);
-                    send(
+                    // Best-effort: see the postgres sink — a receiver dropped
+                    // during shutdown must not panic the sink mid-drain.
+                    let _ = send(
                         CHECKPOINT_COORDINATOR_CHANNEL,
                         CheckpointMessage::Ack { epoch, sink_id },
-                    )
-                    .unwrap();
+                    );
                     metrics_recorder.record_time(
                         "checkpoint_sink_flush",
                         ack_start.elapsed(),
