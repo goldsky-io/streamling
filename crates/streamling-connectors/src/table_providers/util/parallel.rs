@@ -54,10 +54,21 @@ where
         .buffer_unordered(effective_workers)
         .collect::<Vec<_>>()
         .await;
+    let mut first_error = None;
     for result in results {
-        result?;
+        if let Err(e) = result {
+            // Log every slice failure (not just the one we return) so a
+            // backend rejecting several slices in one batch stays diagnosable.
+            tracing::warn!("parallel_execute: slice failed: {}", e);
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
+        }
     }
-    Ok(())
+    match first_error {
+        None => Ok(()),
+        Some(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

@@ -295,7 +295,13 @@ impl CheckpointControl {
 
     /// Returns true if a terminal checkpoint was begun and has finalized.
     pub fn is_terminal_finalized(&self) -> bool {
-        match self.terminal_epoch.lock().clone() {
+        // Bind (and drop) the terminal_epoch guard BEFORE locking epochs: a
+        // match-scrutinee temporary lives to the end of the match, which would
+        // acquire terminal_epoch -> epochs and invert
+        // begin_terminal_checkpoint's epochs -> terminal_epoch order (silent
+        // parking_lot deadlock). Same pattern as await_terminal_finalized.
+        let terminal = self.terminal_epoch.lock().clone();
+        match terminal {
             None => false,
             Some(epoch) => matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized)),
         }

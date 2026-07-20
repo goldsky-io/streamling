@@ -1315,6 +1315,9 @@ impl ExecutionPlan for HybridSourceExec {
             // abort it so it doesn't pin the provider Arc until process exit.
             if let Some(handle) = shutdown_watcher_handle {
                 handle.abort();
+                // Await the aborted task so the provider Arc it captured is
+                // deterministically dropped before this task ends.
+                let _ = handle.await;
             }
         });
 
@@ -1466,11 +1469,20 @@ async fn emit_terminal_checkpoint(
         .await
         .is_err()
     {
+        // At least one live sink never confirmed its writes. Do NOT emit the
+        // Finalizer: it tells inline consumers to commit/truncate past the
+        // terminal epoch, and doing that for an epoch that never finalized
+        // would advance durable state past unconfirmed data — the restart
+        // would then skip replaying exactly the tail this mechanism exists to
+        // protect. Skipping only costs the end-of-job finalize work (e.g.
+        // staging cleanup); at-least-once replay covers the data itself.
         warn!(
             "Hybrid source '{}': terminal checkpoint did not finalize within {:?}; \
-             emitting finalizer best-effort",
+             SKIPPING the terminal Finalizer so no consumer commits past \
+             unconfirmed data (it will be replayed on restart)",
             reference_name, finalize_timeout
         );
+        return;
     }
 
     pending
@@ -1513,7 +1525,7 @@ async fn flush_pending_to_synth_batch(
     // reason to make them exercise that property.
     let mut seen_marker = HashSet::new();
     let mut seen_finalizer = HashSet::new();
-    let leftover: Vec<CheckpointMessage> = drained
+    let to_flush: Vec<CheckpointMessage> = drained
         .into_iter()
         .filter(|msg| match msg {
             CheckpointMessage::Marker { epoch, .. } => seen_marker.insert(epoch.0),
@@ -1524,10 +1536,10 @@ async fn flush_pending_to_synth_batch(
     debug!(
         "Hybrid source '{}': flushing {} unattached marker(s) on a synthetic empty batch",
         reference_name,
-        leftover.len()
+        to_flush.len()
     );
     let mut md = HashMap::new();
-    enrich_batch_metadata_with_checkpoints(&mut md, &leftover);
+    enrich_batch_metadata_with_checkpoints(&mut md, &to_flush);
     let synth_schema = Arc::new(Schema::new_with_metadata(
         schema_for_synth.fields().clone(),
         md,
