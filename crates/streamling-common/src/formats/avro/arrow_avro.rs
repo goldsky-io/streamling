@@ -36,7 +36,7 @@ use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaSt
 use arrow_schema::{DataType, Field, FieldRef, Fields, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use serde_json::Value as Json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use super::convert_avro_schema_to_arrow;
@@ -213,13 +213,21 @@ fn coerce_struct(src: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef> {
     })?;
     let mut children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
     for tf in target_fields {
-        let col = sa.column_by_name(tf.name()).ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "arrow-avro coerce_struct: missing nested field '{}'",
-                tf.name()
-            ))
-        })?;
-        children.push(coerce_array(col, tf)?);
+        match sa.column_by_name(tf.name()) {
+            Some(col) => children.push(coerce_array(col, tf)?),
+            // Field absent from the decoded struct. Mirror `coerce_batch_to_target`'s top-level
+            // handling (and the vendored reader): a nullable target field becomes an all-null
+            // column; a required one is a genuine error.
+            None if tf.is_nullable() => {
+                children.push(new_null_array(tf.data_type(), sa.len()));
+            }
+            None => {
+                return Err(DataFusionError::Internal(format!(
+                    "arrow-avro coerce_struct: missing required nested field '{}'",
+                    tf.name()
+                )));
+            }
+        }
     }
     let struct_arr = StructArray::try_new(target_fields.clone(), children, sa.nulls().cloned())
         .map_err(arrow_err)?;
@@ -410,11 +418,14 @@ pub struct ConfluentAvroDecoder {
     store: SchemaStore,
     reader_schema_json: Option<String>,
     target_schema: Option<SchemaRef>,
-    /// When the writer schema's root is a `["null", record]`-style union (the Debezium/Confluent
+    /// When a writer schema's root is a `["null", record]`-style union (the Debezium/Confluent
     /// convention), arrow-avro can't build a decoder for the union root, so we register the
-    /// unwrapped record and strip the leading union-branch varint from each body. This holds the
-    /// avro union index of the record branch (what the wire prefix must equal).
-    union_record_index: Option<i64>,
+    /// unwrapped record and strip the leading union-branch varint from each body. This maps each
+    /// union-rooted writer id to its record-branch index (what the wire prefix must equal).
+    /// Keyed per writer id because a single subject can carry writer schemas with differing root
+    /// framing (union-wrapped vs plain) across schema evolution; a global index would apply the
+    /// last-registered framing to every id and corrupt the others.
+    union_record_indices: HashMap<u32, i64>,
     /// The writer id the live `decoder` is currently accumulating (its "generation"). `None` when
     /// no decoder is live (start, or just after a flush). Invariant: `active_writer_id.is_some()`
     /// iff a decoder exists and is bound to that single writer schema.
@@ -524,7 +535,7 @@ impl ConfluentAvroDecoder {
             store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
             reader_schema_json: None,
             target_schema: None,
-            union_record_index: None,
+            union_record_indices: HashMap::new(),
             active_writer_id: None,
             pending: Vec::new(),
             decoder: None,
@@ -575,9 +586,17 @@ impl ConfluentAvroDecoder {
         {
             self.writer_aliases.insert(writer_name);
         }
-        // The wire framing (union-wrapped or not) is consistent per subject; record it so
-        // `decode` can strip the union-branch prefix from each body.
-        self.union_record_index = union_idx;
+        // Record this writer id's root framing so `decode` can strip the union-branch prefix from
+        // its bodies. Keyed per id: a later registration of a differently-framed writer must not
+        // change how earlier ids are decoded.
+        match union_idx {
+            Some(idx) => {
+                self.union_record_indices.insert(id, idx);
+            }
+            None => {
+                self.union_record_indices.remove(&id);
+            }
+        }
         self.store
             .set(Fingerprint::Id(id), AvroSchema::new(record_json))
             .map_err(arrow_err)?;
@@ -674,8 +693,9 @@ impl ConfluentAvroDecoder {
         self.active_writer_id = Some(id);
 
         // For union-rooted writer schemas, strip the leading union-branch varint so the body lines
-        // up with the unwrapped record schema registered in the store.
-        if let Some(record_index) = self.union_record_index {
+        // up with the unwrapped record schema registered in the store. Looked up per writer id so
+        // mixed union/plain framings in one subject each decode correctly.
+        if let Some(&record_index) = self.union_record_indices.get(&id) {
             let body = &framed[5..];
             let (branch, consumed) = read_avro_long(body)?;
             if branch != record_index {
@@ -1188,6 +1208,180 @@ mod tests {
             i256_be_bytes(&[0x01]).unwrap()[..31]
                 .iter()
                 .all(|&x| x == 0)
+        );
+    }
+
+    // Debezium/Confluent union-root framing: the writer schema's root is a `["null", record]`
+    // union, so each body carries a leading union-branch varint that must be stripped before the
+    // unwrapped record decodes. Exercises `union_record_indices` + `read_avro_long` re-framing,
+    // which is otherwise only hit through the live pipeline.
+    #[test]
+    fn union_root_record_strips_branch_prefix_and_decodes() {
+        const REC: &str = r#"{"type":"record","name":"Envelope","fields":[{"name":"id","type":"long"},{"name":"name","type":["null","string"],"default":null}]}"#;
+        let union_json = format!(r#"["null",{REC}]"#);
+        let union_schema = AvroWriterSchema::parse_str(&union_json).unwrap();
+        let reader = AvroWriterSchema::parse_str(&union_json).unwrap();
+
+        let id = 5u32;
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&reader)
+            .unwrap();
+        decoder.register_writer_schema(id, &union_json).unwrap();
+
+        // Value::Union(1, record) — to_avro_datum writes the record-branch varint + the record body,
+        // exactly the wire shape a Debezium producer emits.
+        let record_val = Value::Record(vec![
+            ("id".to_string(), Value::Long(99)),
+            (
+                "name".to_string(),
+                Value::Union(1, Box::new(Value::String("hi".into()))),
+            ),
+        ]);
+        let body = to_avro_datum(&union_schema, Value::Union(1, Box::new(record_val))).unwrap();
+        decoder.decode(&confluent_frame(id, &body)).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+
+        assert_eq!(batch.num_rows(), 1);
+        let ids = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("id is int64");
+        assert_eq!(
+            ids.value(0),
+            99,
+            "union-root body decodes after prefix strip"
+        );
+    }
+
+    // Regression (Bugbot): the union branch index must be tracked PER writer id, not globally.
+    // A single subject can carry a union-rooted writer (id A) and a plain-rooted writer (id B).
+    // Registering the plain writer last must NOT change how the union writer's messages are
+    // decoded. A global index would have union-stripping skipped for id A after B registers,
+    // corrupting its bodies.
+    #[test]
+    fn mixed_union_and_plain_framing_decode_per_writer_id() {
+        const REC: &str = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let union_json = format!(r#"["null",{REC}]"#);
+        let union_schema = AvroWriterSchema::parse_str(&union_json).unwrap();
+        let plain_schema = AvroWriterSchema::parse_str(REC).unwrap();
+        let reader = AvroWriterSchema::parse_str(REC).unwrap();
+        let (union_id, plain_id): (u32, u32) = (1, 2);
+
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&reader)
+            .unwrap();
+        // Register union-rooted first, then plain-rooted — the ordering that a global index botches.
+        decoder
+            .register_writer_schema(union_id, &union_json)
+            .unwrap();
+        decoder.register_writer_schema(plain_id, REC).unwrap();
+
+        // union-framed message (needs prefix strip)
+        let union_body = to_avro_datum(
+            &union_schema,
+            Value::Union(
+                1,
+                Box::new(Value::Record(vec![("id".to_string(), Value::Long(11))])),
+            ),
+        )
+        .unwrap();
+        decoder
+            .decode(&confluent_frame(union_id, &union_body))
+            .unwrap();
+        // plain-framed message (must NOT be prefix-stripped)
+        let plain_body = to_avro_datum(
+            &plain_schema,
+            Value::Record(vec![("id".to_string(), Value::Long(22))]),
+        )
+        .unwrap();
+        decoder
+            .decode(&confluent_frame(plain_id, &plain_body))
+            .unwrap();
+
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert_eq!(batch.num_rows(), 2, "both writer generations present");
+        let ids = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("id is int64");
+        let mut vals: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
+        vals.sort();
+        assert_eq!(
+            vals,
+            vec![11, 22],
+            "each writer id decoded with its own framing"
+        );
+    }
+
+    // Regression (Bugbot): a nullable target field absent from a decoded *nested* struct must be
+    // filled with nulls (mirroring `coerce_batch_to_target`'s top-level handling and the vendored
+    // reader), not error. A missing *required* nested field is still an error.
+    #[test]
+    fn coerce_struct_fills_missing_nullable_nested_field_with_nulls() {
+        use arrow::array::Int64Array;
+        use arrow_schema::Schema;
+
+        // Source struct `s` has only `a`; the target adds a nullable `b` and (later) a required `c`.
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let src_struct = StructArray::new(
+            Fields::from(vec![Field::new("a", DataType::Int64, false)]),
+            vec![a],
+            None,
+        );
+        let src_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                src_struct.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(src_struct)],
+        )
+        .unwrap();
+
+        // Nullable `b` absent from the source → filled with nulls, `a` preserved.
+        let ok_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let ok_target = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(ok_fields),
+            false,
+        )]));
+        let out = coerce_batch_to_target(&src_batch, &ok_target).unwrap();
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            s.column_by_name("b").unwrap().null_count(),
+            3,
+            "missing nullable nested field is all-null"
+        );
+        let a_out = s
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(a_out.values(), &[1, 2, 3], "present nested field preserved");
+
+        // A missing *required* nested field is still a hard error.
+        let bad_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("c", DataType::Utf8, false),
+        ]);
+        let bad_target = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(bad_fields),
+            false,
+        )]));
+        assert!(
+            coerce_batch_to_target(&src_batch, &bad_target).is_err(),
+            "missing required nested field must error"
         );
     }
 }
