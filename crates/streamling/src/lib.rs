@@ -2186,34 +2186,61 @@ impl Streamling {
         // A plugin dispatcher exiting on its own is NOT terminal unless it
         // errored — otherwise we would drop in-flight sink work and lose the
         // tail, exactly the previous behaviour.
+        // The sinks are driven individually (not try_join_all): a failing sink
+        // must not CANCEL its siblings mid-flush — dropping their futures would
+        // abort in-flight writes and re-widen the very tail-loss window this
+        // change closes. Instead, the first failure triggers the same graceful
+        // drain as SIGTERM (sources stop, streams end, the remaining sinks
+        // finish flushing — all bounded by the watchdog), and the error is
+        // propagated once every sink has wound down. No epoch a failed sink
+        // touched is ever acked, so at-least-once is preserved either way.
         let app_result: Result<()> = {
             use futures::StreamExt as _;
-            let sinks_fut = futures::future::try_join_all(sink_futures);
-            tokio::pin!(sinks_fut);
-            if plugin_set.is_empty() {
-                (&mut sinks_fut).await.map(|_| ()).map_err(Into::into)
-            } else {
-                loop {
-                    tokio::select! {
-                        sinks = &mut sinks_fut => {
-                            break sinks.map(|_| ()).map_err(|e| {
-                                debug!("Terminating because a sink future completed with error");
-                                e.into()
-                            });
+            let mut sink_set: futures::stream::FuturesUnordered<_> =
+                sink_futures.into_iter().collect();
+            let mut first_error: Option<streamling_core::error::StreamlingError> = None;
+            let mut fail_drain = |err: streamling_core::error::StreamlingError,
+                                  first_error: &mut Option<
+                streamling_core::error::StreamlingError,
+            >| {
+                if first_error.is_none() {
+                    if !dry_run {
+                        warn!(
+                            "Pipeline component failed; draining remaining sinks before exit: {}",
+                            err
+                        );
+                        streamling_core::shutdown::request_shutdown();
+                        Self::arm_shutdown_watchdog(Self::shutdown_budget());
+                    }
+                    *first_error = Some(err);
+                }
+            };
+            while !sink_set.is_empty() {
+                tokio::select! {
+                    Some(sink_res) = sink_set.next() => {
+                        if let Err(e) = sink_res {
+                            debug!("A sink future completed with error");
+                            fail_drain(e.into(), &mut first_error);
                         }
-                        Some(plugin_res) = plugin_set.next() => {
-                            match plugin_res {
-                                Ok(()) => {
-                                    debug!("A plugin future completed; continuing to drain sinks");
-                                    continue;
-                                }
-                                Err(msg) => {
-                                    break Err(streamling_err!("Plugin error: {}", msg));
-                                }
+                    }
+                    Some(plugin_res) = plugin_set.next() => {
+                        match plugin_res {
+                            Ok(()) => {
+                                debug!("A plugin future completed; continuing to drain sinks");
+                            }
+                            Err(msg) => {
+                                fail_drain(
+                                    streamling_err!("Plugin error: {}", msg),
+                                    &mut first_error,
+                                );
                             }
                         }
                     }
                 }
+            }
+            match first_error {
+                None => Ok(()),
+                Some(e) => Err(e),
             }
         };
 
