@@ -226,6 +226,16 @@ impl CheckpointControl {
     /// clears/inserts, so it can never race a fresh timer epoch over the
     /// terminal one. Idempotent: a second call returns the existing terminal
     /// epoch.
+    ///
+    /// Known trade-off (multi-source completion): the FIRST completing source
+    /// stops the timer producer for the whole pipeline, so branches that are
+    /// still producing get no further periodic checkpoints — their tail's
+    /// durability rides entirely on the shared terminal epoch. A crash in that
+    /// window replays those branches from their last finalized epoch
+    /// (at-least-once preserved; the window is bounded by job length). Keeping
+    /// per-branch timer checkpoints alive would require per-branch epoch
+    /// tracking in the coordinator — a larger redesign deliberately out of
+    /// scope here (see shutdown-investigation.md §5.4).
     pub fn begin_terminal_checkpoint(&self) -> CheckpointEpoch {
         self.terminal_started.store(true, Ordering::SeqCst);
 
