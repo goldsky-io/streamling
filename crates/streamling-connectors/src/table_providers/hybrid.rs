@@ -1465,11 +1465,35 @@ async fn emit_terminal_checkpoint(
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
     // here does not block their consumption of the marker batch.
+    //
+    // How long to wait depends on WHY we are completing:
+    // - Shutdown requested (SIGTERM): the watchdog is armed, so the wait must
+    //   be bounded under the shutdown budget.
+    // - Natural job-mode completion: no deadline is running, and in a
+    //   multi-source job the shared terminal epoch cannot finalize until the
+    //   SLOWEST branch completes and its sinks ack — sibling skew can
+    //   legitimately exceed any SIGTERM-sized budget. Wait until finalized or
+    //   until a shutdown request arrives (then fall back to the bounded wait).
+    //   A sink wedged forever with no shutdown request keeps the pipeline
+    //   alive-but-stalled, exactly as an unacked epoch does on main; the
+    //   operator-initiated SIGTERM then drains it under the budget.
+    let mut shutdown = streamling_core::shutdown::subscribe();
     let finalize_timeout = terminal_checkpoint_finalize_timeout();
-    if tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
-        .await
-        .is_err()
-    {
+    let finalized = if *shutdown.borrow() {
+        tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
+            .await
+            .is_ok()
+    } else {
+        tokio::select! {
+            _ = control.await_terminal_finalized() => true,
+            _ = shutdown.changed() => {
+                tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
+                    .await
+                    .is_ok()
+            }
+        }
+    };
+    if !finalized {
         // At least one live sink never confirmed its writes. Do NOT emit the
         // Finalizer: it tells inline consumers to commit/truncate past the
         // terminal epoch, and doing that for an epoch that never finalized
@@ -1478,7 +1502,7 @@ async fn emit_terminal_checkpoint(
         // protect. Skipping only costs the end-of-job finalize work (e.g.
         // staging cleanup); at-least-once replay covers the data itself.
         warn!(
-            "Hybrid source '{}': terminal checkpoint did not finalize within {:?}; \
+            "Hybrid source '{}': terminal checkpoint did not finalize within {:?} of shutdown; \
              SKIPPING the terminal Finalizer so no consumer commits past \
              unconfirmed data (it will be replayed on restart)",
             reference_name, finalize_timeout
