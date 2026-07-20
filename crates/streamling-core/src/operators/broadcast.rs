@@ -409,6 +409,15 @@ impl ExecutionPlan for MultiSinkExec {
 
         let total_sinks = self.sinks.len();
         let completed_sinks = Arc::new(Mutex::new(0));
+        // Handles for the per-sink writer tasks. The output stream below only
+        // ends after every one of these is joined: the tasks keep flushing
+        // their rebatched tails after the broadcast input ends, and completing
+        // the plan while they are still writing lets the pipeline start
+        // teardown (or exit) mid-flush — dropping the tail of every sink that
+        // didn't win the race (observed as ClickHouse receiving 0 rows in the
+        // multi-sink e2e test once shutdown began cancelling in-flight writes).
+        let mut sink_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+            Vec::with_capacity(total_sinks);
 
         for (i, sink) in self.sinks.iter().enumerate() {
             let sink = sink.clone();
@@ -423,7 +432,7 @@ impl ExecutionPlan for MultiSinkExec {
             let broadcast_stream = broadcast_stream.clone();
             let completed_sinks = completed_sinks.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let data_sink_exec = sink
                     .downcast_ref::<DataSinkExec>()
                     .expect("MultiSinkExec: sink must be a DataSinkExec");
@@ -468,28 +477,43 @@ impl ExecutionPlan for MultiSinkExec {
                         .expect("Failed to execute sink input plan over broadcast data")
                 };
 
-                match data_sink.write_all(input_stream, &task_context).await {
-                    Ok(_) => {}
+                let write_result = data_sink.write_all(input_stream, &task_context).await;
+
+                // Count this sink as done on BOTH paths (success and failure)
+                // so the broadcast's all-sinks-completed stop can never stall
+                // on a failed sink.
+                {
+                    let mut count = completed_sinks.lock().await;
+                    *count += 1;
+                    if *count >= total_sinks {
+                        broadcast_stream.stop();
+                    }
+                }
+
+                match write_result {
+                    Ok(_) => {
+                        debug!("MultiSinkExec [{}]: Sink completed", sink_name);
+                        Ok(())
+                    }
                     Err(e) => {
+                        // Surface the failure as a plan error via the joined
+                        // handle below — previously this panicked inside a
+                        // detached task whose JoinHandle nobody awaited, so a
+                        // failed sink silently dropped out of the fan-out while
+                        // the pipeline kept running.
                         tracing::warn!(
                             "MultiSinkExec [{}]: Sink write_all failed: {}",
                             sink_name,
                             e
                         );
-                        panic!(
+                        Err(datafusion::error::DataFusionError::Execution(format!(
                             "MultiSinkExec [{}]: Sink write_all failed: {}",
                             sink_name, e
-                        );
+                        )))
                     }
                 }
-
-                debug!("MultiSinkExec [{}]: Sink completed", sink_name);
-                let mut count = completed_sinks.lock().await;
-                *count += 1;
-                if *count >= total_sinks {
-                    broadcast_stream.stop();
-                }
             });
+            sink_handles.push(handle);
         }
 
         let output_consumer = broadcast_stream.add_consumer();
@@ -497,7 +521,33 @@ impl ExecutionPlan for MultiSinkExec {
         // Start broadcasting after all consumers (sinks + output) are registered
         broadcast_stream.start(data);
 
-        Ok(Box::pin(output_consumer))
+        // Gate the plan's completion on every sink writer finishing: forward
+        // the output consumer, then join the writer tasks and surface any
+        // failure as a stream error. `collect()` on this plan therefore
+        // resolves only once all sinks have durably drained — which is what
+        // the run loop's teardown ordering (and the shutdown drain guarantee)
+        // relies on.
+        let schema = self.schema();
+        let output = async_stream::stream! {
+            let mut out = output_consumer;
+            while let Some(item) = futures::StreamExt::next(&mut out).await {
+                yield item;
+            }
+            for handle in sink_handles {
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => yield Err(e),
+                    Err(join_err) => {
+                        yield Err(datafusion::error::DataFusionError::Execution(format!(
+                            "MultiSinkExec: sink writer task panicked: {}",
+                            join_err
+                        )));
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output)))
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {

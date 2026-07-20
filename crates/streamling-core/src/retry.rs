@@ -68,12 +68,15 @@ pub enum RetryOutcome {
 /// Like [`retry_forever_with_backoff_async`], but the loop gives up (returns
 /// [`RetryOutcome::Cancelled`]) when the shutdown watch flips to `true`.
 ///
-/// Cancellation is checked before the first attempt and during every backoff
-/// sleep, so a sink stuck retrying against a sick backend can no longer pin the
-/// drain forever — once shutdown is requested it stops between attempts. A
-/// single in-flight attempt is allowed to finish (or hit its own I/O timeout);
-/// callers relying on prompt cancellation must give each attempt a bounded
-/// timeout of its own.
+/// The FIRST attempt always runs, even when shutdown has already been
+/// requested: graceful drain means in-flight work still gets written — a sink
+/// flushing its final batches during shutdown must attempt the write, not
+/// abandon it (abandoning it is exactly the tail loss the drain exists to
+/// prevent). Cancellation is only checked during the backoff sleeps between
+/// attempts, so what shutdown cuts short is the infinite RE-try loop against a
+/// sick backend. A single in-flight attempt is allowed to finish (or hit its
+/// own I/O timeout); callers relying on prompt cancellation must give each
+/// attempt a bounded timeout of its own.
 pub async fn retry_forever_with_backoff_until_cancelled<Op, Fut>(
     mut operation: Op,
     operation_name: &str,
@@ -83,11 +86,6 @@ where
     Op: FnMut() -> Fut,
     Fut: core::future::Future<Output = Result<()>>,
 {
-    if *shutdown.borrow() {
-        warn!("{} not started: shutdown already requested", operation_name);
-        return RetryOutcome::Cancelled;
-    }
-
     let mut attempt: u32 = 0;
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
@@ -123,6 +121,16 @@ where
             }
         }
 
+        // Between attempts: give up if shutdown has been requested. The
+        // borrow check covers a watch that flipped before we got here (its
+        // `changed()` would never fire again).
+        if *shutdown.borrow() {
+            warn!(
+                "{} cancelled by shutdown after {} attempt(s)",
+                operation_name, attempt
+            );
+            return RetryOutcome::Cancelled;
+        }
         let jitter = (attempt as u64 % 100) * 7; // small deterministic jitter
         let sleep_ms = std::cmp::min(MAX_BACKOFF_MS, backoff_ms + jitter);
         tokio::select! {
@@ -429,12 +437,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_until_cancelled_returns_immediately_if_already_shutdown() {
+    async fn test_until_cancelled_first_attempt_runs_even_when_already_shutdown() {
+        // Graceful drain: work already in flight when shutdown is requested
+        // still gets its first attempt (a sink flushing final batches must
+        // write them, not abandon them). A successful first attempt completes.
         let (_tx, mut rx) = tokio::sync::watch::channel(true);
-        let operation = || async { Err::<(), _>(streamling_err!("should not be called")) };
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let operation = move || {
+            let count = cc.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
         let outcome =
             retry_forever_with_backoff_until_cancelled(operation, "test_cancel", &mut rx).await;
+        assert_eq!(outcome, RetryOutcome::Completed);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_until_cancelled_no_retries_when_already_shutdown() {
+        // A FAILING first attempt is not retried once shutdown is requested:
+        // cancellation cuts the re-try loop, not the initial attempt.
+        let (_tx, mut rx) = tokio::sync::watch::channel(true);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let operation = move || {
+            let count = cc.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(streamling_err!("always fails"))
+            }
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_forever_with_backoff_until_cancelled(operation, "test_cancel", &mut rx),
+        )
+        .await
+        .expect("must return promptly, not keep retrying");
         assert_eq!(outcome, RetryOutcome::Cancelled);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
