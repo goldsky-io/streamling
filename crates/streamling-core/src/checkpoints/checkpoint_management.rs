@@ -242,6 +242,19 @@ impl CheckpointControl {
         // terminal epoch's Finalizer. This also mirrors the timer producer,
         // which has always cleared the previous epoch before inserting a new
         // one.
+        //
+        // Audited consumers (all fire-and-forget; none matches an exact epoch
+        // in a way that can stall):
+        // - Kafka source: exact-match offset lookup with a silent no-op on
+        //   miss; commits are cumulative, so the next finalized epoch covers
+        //   any skipped one (bounded replay, never a wait).
+        // - ClickHouse source: persists its CURRENT split state on any
+        //   Finalizer; a skipped epoch delays persistence to the next one.
+        // - Postgres sink: range truncation (`DELETE <= N-1`).
+        // - Plugin operators/sinks: Finalizers are forwarded to the plugin,
+        //   whose contract requires idempotent, non-blocking handling.
+        // Any FUTURE consumer must follow the same rule: never gate progress
+        // on receiving the Finalizer for one specific epoch.
         epochs.clear();
         let epoch_num = self.next_epoch.fetch_add(1, Ordering::SeqCst);
         let terminal = CheckpointEpoch(epoch_num);
@@ -401,13 +414,15 @@ impl CheckpointCoordinator {
                         );
 
                         // Warn if this sink_id is not in the expected list
-                        if !expected_sinks_sub.lock().contains(&sink_id) {
+                        {
                             let expected = expected_sinks_sub.lock();
-                            warn!(
-                                "Received ack from unexpected sink '{}' for epoch {} (expected: {:?})",
-                                sink_id, epoch.0, *expected
-                            );
-                            continue;
+                            if !expected.contains(&sink_id) {
+                                warn!(
+                                    "Received ack from unexpected sink '{}' for epoch {} (expected: {:?})",
+                                    sink_id, epoch.0, *expected
+                                );
+                                continue;
+                            }
                         }
 
                         // Record ack received metric
@@ -1136,6 +1151,53 @@ mod tests {
             matches!(epochs.get(&epoch), Some(EpochState::Finalized)),
             "epoch should finalize synchronously once the only outstanding sink completes"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_failed_sink_keeps_epochs_stalled() {
+        // The inverse of sink completion: a sink that FAILED is deliberately
+        // NOT deregistered (the run loop only calls sink_completed on Ok), so
+        // an epoch it never acked must stay un-finalized — its missing acks
+        // are the coordinator's only signal that the data is not durable.
+        // Offsets must not commit; the watchdog bounds the resulting stall.
+        let mut coordinator = CheckpointCoordinator::with_timeout(300);
+        coordinator.start(
+            3600,
+            vec!["sink_ok_stall".to_string(), "sink_failed_stall".to_string()],
+        );
+        let control = coordinator.control();
+
+        let terminal = control.begin_terminal_checkpoint();
+
+        // The healthy sink acks; the failed sink never does and is never
+        // deregistered.
+        send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Ack {
+                epoch: terminal.clone(),
+                sink_id: "sink_ok_stall".to_string(),
+            },
+        )
+        .unwrap();
+        control.sink_completed("sink_ok_stall");
+
+        // The terminal epoch must NOT finalize.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                control.await_terminal_finalized()
+            )
+            .await
+            .is_err(),
+            "an epoch missing a failed sink's ack must stay un-finalized"
+        );
+        assert!(
+            !control.is_terminal_finalized(),
+            "failed sink's epoch must not report finalized"
+        );
+
+        coordinator.stop().await;
     }
 
     #[test]
