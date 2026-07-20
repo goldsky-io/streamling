@@ -1420,12 +1420,14 @@ fn merge_pending_markers(
 /// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
 /// is armed with), minus a margin so this wait always expires BEFORE the
 /// watchdog hard-exits the process. The minimum-floor is itself capped at
-/// budget − 2s so a deliberately tiny budget can never invert the invariant.
+/// budget − 2s so a deliberately tiny budget can never invert the invariant:
+/// for budgets ≤ 2s the timeout collapses to zero, which expires immediately
+/// and takes the safe branch (Finalizer skipped).
 fn terminal_checkpoint_finalize_timeout() -> Duration {
     const MARGIN_SECS: u64 = 10;
     const MIN_TIMEOUT_SECS: u64 = 5;
     let budget = streamling_core::shutdown::shutdown_budget().as_secs();
-    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2).max(1));
+    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2));
     Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(capped_floor))
 }
 
