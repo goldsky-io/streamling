@@ -1499,13 +1499,28 @@ async fn flush_pending_to_synth_batch(
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
     reference_name: &str,
 ) {
-    let leftover: Vec<CheckpointMessage> = {
+    let drained: Vec<CheckpointMessage> = {
         let mut g = pending.lock().unwrap();
         std::mem::take(&mut *g)
     };
-    if leftover.is_empty() {
+    if drained.is_empty() {
         return;
     }
+    // Dedup by epoch within the flush: the terminal path can buffer the same
+    // Finalizer twice (once forwarded from the checkpoint channel by the
+    // forwarder task, once pushed inline by `emit_terminal_checkpoint`).
+    // Consumers are idempotent for duplicate Finalizers, but there is no
+    // reason to make them exercise that property.
+    let mut seen_marker = HashSet::new();
+    let mut seen_finalizer = HashSet::new();
+    let leftover: Vec<CheckpointMessage> = drained
+        .into_iter()
+        .filter(|msg| match msg {
+            CheckpointMessage::Marker { epoch, .. } => seen_marker.insert(epoch.0),
+            CheckpointMessage::Finalizer(epoch) => seen_finalizer.insert(epoch.0),
+            _ => true,
+        })
+        .collect();
     debug!(
         "Hybrid source '{}': flushing {} unattached marker(s) on a synthetic empty batch",
         reference_name,
@@ -1639,6 +1654,60 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
         ]))
+    }
+
+    /// The terminal path can buffer the same Finalizer twice: once forwarded
+    /// from the checkpoint channel by the forwarder task, once pushed inline by
+    /// `emit_terminal_checkpoint` after the finalize wait. The synthetic flush
+    /// must collapse duplicates so inline consumers never see the same epoch's
+    /// Marker/Finalizer twice on one batch — making the "duplicate Finalizers
+    /// are idempotent" contract a defence-in-depth property instead of a
+    /// load-bearing one.
+    #[tokio::test]
+    async fn test_flush_pending_dedups_duplicate_markers_and_finalizers() {
+        use streamling_core::checkpoints::checkpoint_management::now_ms;
+
+        let pending: Arc<Mutex<Vec<CheckpointMessage>>> = Arc::new(Mutex::new(vec![
+            CheckpointMessage::Marker {
+                epoch: streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+                created_at_ms: now_ms(),
+            },
+            CheckpointMessage::Marker {
+                epoch: streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+                created_at_ms: now_ms(),
+            },
+            CheckpointMessage::Finalizer(
+                streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+            ),
+            CheckpointMessage::Finalizer(
+                streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+            ),
+        ]));
+        let schema = create_test_schema();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        flush_pending_to_synth_batch(&pending, &schema, &tx, "dedup_test").await;
+
+        let batch = rx
+            .recv()
+            .await
+            .expect("a synthetic batch should be flushed")
+            .expect("synthetic batch should not be an error");
+        let messages = extract_checkpoint_messages(batch.schema().metadata());
+        let markers = messages
+            .iter()
+            .filter(|m| matches!(m, CheckpointMessage::Marker { .. }))
+            .count();
+        let finalizers = messages
+            .iter()
+            .filter(|m| matches!(m, CheckpointMessage::Finalizer(_)))
+            .count();
+        assert_eq!(markers, 1, "duplicate Markers for one epoch must collapse");
+        assert_eq!(
+            finalizers, 1,
+            "duplicate Finalizers for one epoch must collapse"
+        );
+        assert!(pending.lock().unwrap().is_empty(), "pending fully drained");
     }
 
     async fn create_state_backend(name: &str) -> Arc<dyn StateOperatorBackend<HybridSourceState>> {

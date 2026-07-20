@@ -32,13 +32,17 @@ pub fn subscribe() -> watch::Receiver<bool> {
 /// consumer — the run loop's watchdog and any component slicing its own
 /// bounded wait from the budget — so the values can never drift.
 pub fn shutdown_budget() -> std::time::Duration {
-    const DEFAULT_SHUTDOWN_BUDGET_SECS: u64 = 25;
-    let secs = std::env::var("STREAMLING__SHUTDOWN_BUDGET_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_SHUTDOWN_BUDGET_SECS);
-    std::time::Duration::from_secs(secs)
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<std::time::Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        const DEFAULT_SHUTDOWN_BUDGET_SECS: u64 = 25;
+        let secs = std::env::var("STREAMLING__SHUTDOWN_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_SHUTDOWN_BUDGET_SECS);
+        std::time::Duration::from_secs(secs)
+    })
 }
 
 // NOTE: deliberately no unit test calls `request_shutdown()` here. The signal
