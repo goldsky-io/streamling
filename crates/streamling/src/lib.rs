@@ -2226,8 +2226,8 @@ impl Streamling {
             let mut sink_set: futures::stream::FuturesUnordered<_> =
                 sink_futures.into_iter().collect();
             let mut first_error: Option<streamling_core::error::StreamlingError> = None;
-            let mut fail_drain = |err: streamling_core::error::StreamlingError,
-                                  first_error: &mut Option<
+            let fail_drain = |err: streamling_core::error::StreamlingError,
+                              first_error: &mut Option<
                 streamling_core::error::StreamlingError,
             >| {
                 if first_error.is_none() {
