@@ -197,6 +197,12 @@ impl CheckpointControl {
             }
             expected.clone()
         };
+        // Deliberate relaxation: two sinks completing concurrently may each
+        // snapshot before the other's removal lands, so a snapshot can be
+        // stale-LARGER than the live set — `finalize_ready_epochs` then
+        // conservatively declines to finalize, and the other call (whose
+        // snapshot does reflect both removals) finishes the job. Snapshots are
+        // never stale-smaller, so nothing finalizes early.
         info!(
             "Sink completed: {} (removed from expected ack set, {} live sink(s) remain)",
             sink_id,
@@ -1170,10 +1176,15 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sink_completion_unblocks_finalization_synchronous() {
         // Direct-state variant of the multi-source case with no coordinator
         // tasks running: an InProgress epoch acked by sink_b, waiting on sink_a,
         // must finalize synchronously the moment sink_a is marked completed.
+        // `#[serial]` because `sink_completed` broadcasts the Finalizer on the
+        // global coordinator channel — running in parallel with a
+        // channel-driving serial test would inject a spurious message into its
+        // subscription.
         let coordinator = CheckpointCoordinator::with_timeout(300);
         let epoch = CheckpointEpoch(1042);
 
