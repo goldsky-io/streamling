@@ -2418,18 +2418,29 @@ impl Streamling {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
+            let handlers = (|| {
+                Ok::<_, std::io::Error>((
+                    signal(SignalKind::terminate())?,
+                    signal(SignalKind::interrupt())?,
+                ))
+            })();
+            let (mut sigterm, mut sigint) = match handlers {
+                Ok(h) => h,
                 Err(e) => {
-                    error!("Failed to install SIGTERM handler: {}", e);
-                    return;
-                }
-            };
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to install SIGINT handler: {}", e);
-                    return;
+                    // Installation failed: the caller treats this function
+                    // returning as "signal received" and starts a drain, so
+                    // returning here would trigger a SPURIOUS shutdown at
+                    // startup. Pend forever instead — the process keeps
+                    // running and degrades to the OS default SIGTERM
+                    // disposition (immediate kill, no graceful drain), which
+                    // is the pre-existing behaviour without a handler.
+                    error!(
+                        "Failed to install SIGTERM/SIGINT handlers ({}); \
+                         graceful shutdown on signal is DISABLED for this run",
+                        e
+                    );
+                    futures::future::pending::<()>().await;
+                    unreachable!("pending() never resolves");
                 }
             };
             tokio::select! {
