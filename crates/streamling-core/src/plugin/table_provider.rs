@@ -19,7 +19,7 @@ use futures::StreamExt;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
-use crate::checkpoints::channels::{send, subscribe};
+use crate::checkpoints::channels::{send, subscribe_with_id, unsubscribe};
 use crate::operators::wrapping::WrappingDataSink;
 use crate::plugin::telemetry::process_plugin_metrics;
 use crate::telemetry::recorder::get_metrics_recorder;
@@ -33,7 +33,7 @@ use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use std::sync::Arc;
 use streamling_plugin::{PluginChannels, PluginCheckpointEpoch, PluginMsg};
 use tracing::log::trace;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 struct PluginSourceExec {
@@ -118,7 +118,8 @@ impl ExecutionPlan for PluginSourceExec {
             .send(NonExhaustive::new(PluginMsg::Init))
             .unwrap();
 
-        let checkpoint_receiver = subscribe(CHECKPOINT_COORDINATOR_CHANNEL);
+        let (checkpoint_receiver, checkpoint_subscriber_id) =
+            subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
 
         let plugin_input_sender = self.plugin_channels.input.sender.clone();
         let plugin_output_receiver = self.plugin_channels.output.receiver.clone();
@@ -133,6 +134,7 @@ impl ExecutionPlan for PluginSourceExec {
         let metrics_recorder = get_metrics_recorder();
         let metric_metadata_id = self.metric_metadata_id.clone();
         let projection = self.projection.clone();
+        let schema_for_flush = self.schema.clone();
 
         builder.spawn(async move {
             tokio::spawn(process_plugin_metrics(
@@ -149,9 +151,36 @@ impl ExecutionPlan for PluginSourceExec {
             let mut batches_with_markers: u64 = 0;
             let mut batches_without_markers: u64 = 0;
 
-            loop {
+            // Observe the process-wide shutdown signal so a plugin source stops
+            // producing and ends its stream (front-to-back drain), instead of
+            // emitting until the watchdog hard-exits. The plugin process itself
+            // keeps running until the run loop sends Terminate AFTER the sinks
+            // drain — here we only stop forwarding: drain the messages the
+            // plugin had already emitted at signal time (a snapshot, so a
+            // still-producing plugin cannot pin the drain), then end the
+            // stream so downstream sinks see stream-end and flush.
+            let shutdown_rx = crate::shutdown::subscribe();
+            // Some(n) once shutdown was observed: at most n more messages are
+            // forwarded before the stream ends.
+            let mut drain_remaining: Option<usize> = None;
+
+            'outer: loop {
                 loop {
+                    if drain_remaining.is_none() && *shutdown_rx.borrow() {
+                        let in_flight = plugin_output_receiver.len();
+                        info!(
+                            "PluginSourceExec: shutdown requested; draining {} in-flight plugin message(s), then ending stream",
+                            in_flight
+                        );
+                        drain_remaining = Some(in_flight);
+                    }
+                    if drain_remaining == Some(0) {
+                        break 'outer;
+                    }
                     if !plugin_output_receiver.is_empty() {
+                        if let Some(n) = drain_remaining.as_mut() {
+                            *n -= 1;
+                        }
                         if let Ok(message) = plugin_output_receiver.recv() {
                             match message.into_enum() {
                                 Ok(PluginMsg::NextBatch { data }) => {
@@ -168,6 +197,10 @@ impl ExecutionPlan for PluginSourceExec {
                                                     .send(Err(DataFusionError::from(e)
                                                         .context("projecting plugin source batch")))
                                                     .await;
+                                                unsubscribe(
+                                                    CHECKPOINT_COORDINATOR_CHANNEL,
+                                                    checkpoint_subscriber_id,
+                                                );
                                                 return Ok(());
                                             }
                                         };
@@ -286,6 +319,38 @@ impl ExecutionPlan for PluginSourceExec {
                     }
                 }
             }
+
+            // Shutdown drain complete. Flush any checkpoint markers the plugin
+            // emitted that never got a data batch to ride on, on a synthetic
+            // empty batch, so the sinks can still ack their epochs before the
+            // stream ends (the same shape as the hybrid source's pending-marker
+            // flush).
+            if !checkpoint_buffer.is_empty() {
+                info!(
+                    "PluginSourceExec: flushing {} pending checkpoint message(s) on a synthetic final batch",
+                    checkpoint_buffer.len()
+                );
+                let empty = RecordBatch::new_empty(schema_for_flush.clone());
+                let mut metadata = schema_for_flush.metadata().clone();
+                enrich_batch_metadata_with_checkpoints(&mut metadata, &checkpoint_buffer);
+                match enrich_batch_with_metadata(empty, metadata) {
+                    Ok(batch) => {
+                        if tx.send(Ok(batch)).await.is_err() {
+                            warn!(
+                                "PluginSourceExec: downstream closed before the synthetic final batch could be sent"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        "PluginSourceExec: failed to build synthetic final batch: {:?}",
+                        e
+                    ),
+                }
+            }
+            // Drop our coordinator subscription cleanly so later broadcasts
+            // don't hit a dead sender.
+            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
+            Ok(())
         });
 
         Ok(builder.build())
