@@ -299,6 +299,16 @@ impl CheckpointControl {
 
     /// Resolve once the terminal checkpoint has finalized (all live sinks
     /// acked it). Returns immediately if no terminal checkpoint was begun.
+    ///
+    /// Ordering requirement: this is "wait for the terminal checkpoint that
+    /// EXISTS", not "wait for one to appear" — a caller that races ahead of
+    /// [`Self::begin_terminal_checkpoint`] falls through the `None` arm and
+    /// skips the wait entirely. Callers must therefore hold the same
+    /// `CheckpointControl` that minted the terminal epoch and only await
+    /// AFTER `begin_terminal_checkpoint` returned (as the completion paths in
+    /// the hybrid provider do), or gate on a signal that implies it (as the
+    /// run loop does: it awaits only after every sink future drained, which a
+    /// bounded source's stream-end — and thus its `begin` call — precedes).
     pub async fn await_terminal_finalized(&self) {
         loop {
             let terminal = self.terminal_epoch.lock().clone();

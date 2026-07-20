@@ -456,6 +456,16 @@ impl DataSink for PluginSink {
                             "Sending extracted checkpoint Finalizer with epoch {} to plugin",
                             epoch.0
                         );
+                        // External plugins are bound by the Finalizer consumer
+                        // contract on `CheckpointMessage::Finalizer`: idempotent,
+                        // non-blocking, never gate on a specific epoch (during a
+                        // terminal checkpoint, in-flight timer epochs are dropped
+                        // without their Finalizers ever broadcasting). The host
+                        // cannot verify an out-of-repo plugin honors this; a
+                        // violating plugin stalls only its own dispatcher, which
+                        // the run loop awaits under the shutdown budget before
+                        // the watchdog hard-exits — it cannot wedge the process
+                        // past the grace period.
                         self.plugin_channels
                             .input
                             .sender
