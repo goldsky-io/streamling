@@ -1,4 +1,5 @@
 use crate::formats::avro::MAX_SCHEMA_PRECISION;
+use crate::formats::avro::arrow_avro::AVRO_DECIMAL_SCALE_META;
 use crate::types::u256::U256Type;
 use apache_avro::schema::{
     Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordField, RecordSchema,
@@ -76,11 +77,17 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                             field.is_nullable(),
                         ))
                     }
-                    _ => Arc::new(Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    )),
+                    // precision > 76 with non-zero scale: too wide for Decimal256 and not a scale-0
+                    // u256/i256. Map to Utf8, but carry the scale so the arrow-avro decode path
+                    // (`coerce_array`) formats the raw decimal bytes as a scale-aware decimal string
+                    // instead of reinterpreting them as text.
+                    (_, s) => Arc::new(
+                        Field::new(field.name(), DataType::Utf8, field.is_nullable())
+                            .with_metadata(HashMap::from([(
+                                AVRO_DECIMAL_SCALE_META.to_string(),
+                                s.to_string(),
+                            )])),
+                    ),
                 };
             }
             field.clone()
