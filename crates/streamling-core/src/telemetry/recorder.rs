@@ -576,6 +576,33 @@ pub fn initialize_metrics_recorder(
 ) {
     let mut instance = METRICS_RECORDER_INSTANCE.lock().unwrap();
     if instance.is_none() {
+        *instance = Some(Arc::new(build_metrics_recorder(metric_metadata_registry)));
+    } else {
+        debug!("MetricsRecorder already initialized; merging metric metadata registry.");
+        // Merge new metadata into existing recorder so subsequent pipelines are tracked
+        if let Some(existing) = instance.as_ref() {
+            let mut reg_lock = existing.metric_metadata_registry.lock().unwrap();
+            let mut tags_lock = existing.metric_metadata_tags_registry.lock().unwrap();
+            for (id, meta) in metric_metadata_registry.into_iter() {
+                reg_lock.insert(id.clone(), meta.clone());
+                tags_lock.insert(id, meta.to_tags());
+            }
+        }
+    }
+}
+
+/// Construct a fully-initialized [`MetricsRecorder`] with every metric
+/// pre-registered against the current global meter provider.
+///
+/// Split out of [`initialize_metrics_recorder`] (pure refactor — the
+/// production build path is unchanged) so tests can atomically replace the
+/// singleton with a freshly built recorder whose counters are bound to a
+/// test-controlled meter provider, without ever exposing a `None` singleton
+/// (see `test_support`).
+fn build_metrics_recorder(
+    metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
+) -> MetricsRecorder {
+    {
         let meter = get_meter();
         let delta_meter = crate::telemetry::get_delta_meter();
         let mut count_registry: HashMap<String, Counter<u64>> = HashMap::new();
@@ -833,7 +860,7 @@ pub fn initialize_metrics_recorder(
         for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
             metric_metadata_tags_registry.insert(metric_metadata_id, metric_metadata.to_tags());
         }
-        *instance = Some(Arc::new(MetricsRecorder {
+        MetricsRecorder {
             service_instance_id: metric_metadata_registry
                 .values()
                 .next()
@@ -845,17 +872,6 @@ pub fn initialize_metrics_recorder(
             gauge_registry: Mutex::new(gauge_registry),
             histogram_registry: Mutex::new(histogram_registry),
             metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
-        }));
-    } else {
-        debug!("MetricsRecorder already initialized; merging metric metadata registry.");
-        // Merge new metadata into existing recorder so subsequent pipelines are tracked
-        if let Some(existing) = instance.as_ref() {
-            let mut reg_lock = existing.metric_metadata_registry.lock().unwrap();
-            let mut tags_lock = existing.metric_metadata_tags_registry.lock().unwrap();
-            for (id, meta) in metric_metadata_registry.into_iter() {
-                reg_lock.insert(id.clone(), meta.clone());
-                tags_lock.insert(id, meta.to_tags());
-            }
         }
     }
 }
@@ -1145,6 +1161,180 @@ pub fn get_control_plane_metrics_recorder(component_id: &str) -> Arc<ControlPlan
     recorder
 }
 
+/// Crate-internal test harness for observing emitted metric values.
+///
+/// The production emission path funnels every counter through the global OTEL
+/// meter provider, which is a no-op unless an SDK provider is installed — so a
+/// unit test cannot otherwise read back what `record_*` emitted. This module
+/// installs an in-process [`ManualReader`]-backed provider once, and exposes a
+/// helper to (re)build the recorder singleton bound to it plus a `node_wait`
+/// collect/sum helper.
+///
+/// Concurrency contract: every test that mutates the global recorder singleton
+/// or reads emitted metrics MUST hold [`TEST_LOCK`] for its duration. The
+/// recorder is a process-global singleton and the meter provider is
+/// process-global; the shared lock is the only thing preventing one test's
+/// reset from being observed as a half-built recorder by another.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{METRICS_RECORDER_INSTANCE, build_metrics_recorder};
+    use crate::node_context::{NodeContext, TopologyNodeType};
+    use crate::telemetry::PipelineMetricMetadata;
+    use opentelemetry::global;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::reader::MetricReader;
+    use opentelemetry_sdk::metrics::{
+        InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    use std::time::Duration;
+
+    /// Serializes every test across the crate that mutates the global recorder
+    /// singleton or the global meter provider (recorder tests, `WrappingExec`
+    /// runtime tests, `BroadcastStream` runtime tests).
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `ManualReader` is not `Clone`, but `SdkMeterProvider::with_reader` takes
+    /// the reader by value while we also need a handle to call `collect`. Share
+    /// one reader behind an `Arc` via this thin delegating wrapper.
+    #[derive(Debug, Clone)]
+    struct SharedReader(Arc<ManualReader>);
+
+    impl MetricReader for SharedReader {
+        fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+            self.0.register_pipeline(pipeline);
+        }
+        fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
+            self.0.collect(rm)
+        }
+        fn force_flush(&self) -> OTelSdkResult {
+            self.0.force_flush()
+        }
+        fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+            self.0.shutdown_with_timeout(timeout)
+        }
+        fn temporality(&self, kind: InstrumentKind) -> Temporality {
+            self.0.temporality(kind)
+        }
+    }
+
+    struct Harness {
+        reader: SharedReader,
+        // Kept alive for the process: the reader holds only a `Weak` to the
+        // provider's pipeline, so dropping the provider would make `collect`
+        // fail with "reader is shut down or not registered".
+        _provider: SdkMeterProvider,
+    }
+
+    static HARNESS: OnceLock<Harness> = OnceLock::new();
+
+    fn harness() -> &'static Harness {
+        HARNESS.get_or_init(|| {
+            let reader = SharedReader(Arc::new(ManualReader::builder().build()));
+            let provider = SdkMeterProvider::builder()
+                .with_reader(reader.clone())
+                .with_resource(
+                    Resource::builder()
+                        .with_service_name("streamling-test")
+                        .build(),
+                )
+                .build();
+            // Install as the process-global provider BEFORE any counters are
+            // built so instruments bind to this collectable provider.
+            global::set_meter_provider(provider.clone());
+            Harness {
+                reader,
+                _provider: provider,
+            }
+        })
+    }
+
+    /// Atomically (re)build the recorder singleton with a single source node's
+    /// metadata, bound to the collectable test meter provider. Force-replacing
+    /// the whole recorder — rather than merging into whatever exists — both
+    /// guarantees `node_wait` counters point at our reader and avoids ever
+    /// exposing a `None`/half-built singleton to a concurrent reader. Must be
+    /// called while holding [`TEST_LOCK`]; `reference_name` is used both as the
+    /// recorder metadata key and as the emitted `id` tag value.
+    pub(crate) fn init_recorder_with_node(reference_name: &str) {
+        init_recorder_with_nodes(&[reference_name]);
+    }
+
+    /// Like [`init_recorder_with_node`] but registers several nodes in a single
+    /// recorder build, so a test can drive multiple `WrappingExec`s without an
+    /// intervening singleton rebuild.
+    pub(crate) fn init_recorder_with_nodes(reference_names: &[&str]) {
+        harness();
+        let mut map = HashMap::new();
+        for reference_name in reference_names {
+            map.insert(
+                reference_name.to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(
+                        TopologyNodeType::Source,
+                        "memory",
+                        reference_name,
+                    ),
+                    service_instance_id: "test-instance".to_string(),
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+        }
+        let recorder = build_metrics_recorder(map);
+        *METRICS_RECORDER_INSTANCE
+            .lock()
+            .expect("recorder instance mutex poisoned") = Some(Arc::new(recorder));
+    }
+
+    /// Sum every `streamling_node_wait` data point matching the given `id` and
+    /// `state`, optionally also pinning `downstream_id`. Values are cumulative,
+    /// so tests should use a unique node `id` to isolate from cross-test series.
+    pub(crate) fn node_wait_ms(id: &str, state: &str, downstream_id: Option<&str>) -> u64 {
+        let mut rm = ResourceMetrics::default();
+        harness()
+            .reader
+            .collect(&mut rm)
+            .expect("collect metrics from manual reader");
+        let mut total = 0u64;
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "streamling_node_wait" {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    continue;
+                };
+                for dp in sum.data_points() {
+                    let mut id_ok = false;
+                    let mut state_ok = false;
+                    let mut ds_ok = downstream_id.is_none();
+                    for kv in dp.attributes() {
+                        let value = kv.value.as_str();
+                        match kv.key.as_str() {
+                            "id" => id_ok = &*value == id,
+                            "state" => state_ok = &*value == state,
+                            "downstream_id" => {
+                                if let Some(want) = downstream_id {
+                                    ds_ok = &*value == want;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if id_ok && state_ok && ds_ok {
+                        total += dp.value();
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,9 +1348,9 @@ mod tests {
     /// bleed into another under parallel execution.
     mod merge_metadata_tags_tests {
         use super::*;
-        use std::sync::Mutex;
-
-        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        // Shared with the `WrappingExec`/`BroadcastStream` runtime metric tests
+        // so every test mutating the global recorder singleton is serialized.
+        use crate::telemetry::recorder::test_support::TEST_LOCK;
 
         fn reset_instance() {
             let mut instance = METRICS_RECORDER_INSTANCE.lock().unwrap();

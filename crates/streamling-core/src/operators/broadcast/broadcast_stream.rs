@@ -510,6 +510,77 @@ mod tests {
         );
     }
 
+    /// End-to-end runtime proof that `run_broadcast` emits
+    /// `node_wait{state="blocked"}` tagged `id=<producer>` +
+    /// `downstream_id=<consumer>`, attributing blocked-send time to the *slow*
+    /// consumer and materially less to the fast one. Complements the
+    /// helper-level `blocked_send_time_attributed_to_slow_consumer` (which
+    /// checks the returned `Duration`) by asserting the emitted counter tags.
+    // The std `TEST_LOCK` is held across await to serialize against every other
+    // test mutating the global recorder singleton. Safe here: this
+    // `#[tokio::test]` owns its single-threaded runtime and neither the spawned
+    // broadcast task nor the drainer task ever contends this lock.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_broadcast_emits_blocked_tagged_to_slow_consumer() {
+        use crate::telemetry::recorder::test_support;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let producer_id = "bcast_producer_unit";
+        test_support::init_recorder_with_node(producer_id);
+
+        let schema = one_row_batch().schema();
+        // Capacity 1 so a slow consumer's channel fills after one batch and the
+        // producer blocks on subsequent sends.
+        let broadcast = BroadcastStream::new(schema.clone(), 1)
+            .with_upstream_metadata_id(Some(Arc::from(producer_id)));
+        let mut slow_consumer = broadcast.add_consumer("slow_consumer".to_string());
+        let mut fast_consumer = broadcast.add_consumer("fast_consumer".to_string());
+
+        // Source yields several batches back-to-back; the backpressure comes
+        // from the slow consumer, not the source.
+        let batches: Vec<DFResult<RecordBatch>> = (0..6).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source);
+
+        // Slow consumer: drains with a delay so its bounded channel stays full
+        // and the producer accrues blocked-send time on this edge.
+        let slow_drainer = tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Some(_batch) = slow_consumer.next().await {
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            n
+        });
+        // Fast consumer: drain promptly.
+        let mut fast_n = 0usize;
+        while let Some(_batch) = fast_consumer.next().await {
+            fast_n += 1;
+        }
+        let slow_n = slow_drainer.await.expect("slow drainer task panicked");
+
+        assert_eq!(slow_n, 6, "slow consumer must receive every batch");
+        assert_eq!(fast_n, 6, "fast consumer must receive every batch");
+
+        let slow_blocked =
+            test_support::node_wait_ms(producer_id, "blocked", Some("slow_consumer"));
+        let fast_blocked =
+            test_support::node_wait_ms(producer_id, "blocked", Some("fast_consumer"));
+        assert!(
+            slow_blocked >= 3,
+            "producer must accrue blocked-send time on the slow edge, got {slow_blocked}ms"
+        );
+        assert!(
+            slow_blocked > fast_blocked,
+            "slow edge ({slow_blocked}ms) must be charged more than fast edge ({fast_blocked}ms)"
+        );
+    }
+
     /// A closed consumer channel surfaces as `Err`, which `run_broadcast` logs
     /// (typically during shutdown) rather than attributing as backpressure.
     #[tokio::test]

@@ -1839,6 +1839,234 @@ mod tests {
         );
     }
 
+    /// A test-only source that delays before yielding each input batch, so the
+    /// `WrappingExec`'s `data.next().await` genuinely blocks on upstream — the
+    /// condition that produces `node_wait{state="starved"}`. Delegates schema
+    /// and plan properties to a wrapped `inner` (a `MemTable` scan) so we don't
+    /// have to hand-build `PlanProperties`.
+    #[derive(Debug)]
+    struct SlowInputExec {
+        inner: Arc<dyn ExecutionPlan>,
+        per_batch_delay: Duration,
+    }
+
+    impl DisplayAs for SlowInputExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SlowInputExec")
+        }
+    }
+
+    impl ExecutionPlan for SlowInputExec {
+        fn name(&self) -> &str {
+            "SlowInputExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(SlowInputExec {
+                inner: children.swap_remove(0),
+                per_batch_delay: self.per_batch_delay,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let mut input = self.inner.execute(partition, context)?;
+            let delay = self.per_batch_delay;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                loop {
+                    // The sleep happens inside the poll the WrappingExec awaits,
+                    // so it is measured as time waiting on upstream input.
+                    tokio::time::sleep(delay).await;
+                    match input.next().await {
+                        Some(batch) => yield batch,
+                        None => break,
+                    }
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    /// `WrappingExec::execute` must emit `node_wait{state="starved"}` when its
+    /// input stream makes it wait on upstream. Drives a slow source (10ms per
+    /// batch) under a fast consumer and reads the emitted counter back via the
+    /// in-process collectable meter provider.
+    // The std `TEST_LOCK` is intentionally held across await points to serialize
+    // these tests against every other test that mutates the global recorder
+    // singleton. Each `#[tokio::test]` runs on its own single-threaded runtime
+    // and no task on that runtime ever contends this lock, so the usual
+    // await-holding-lock starvation hazard does not apply.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wrapping_exec_emits_starved_when_input_is_slow() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_unit_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // Three batches → three delayed input polls that each count as starvation.
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(10),
+        });
+
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        // Fast consumer: no sleep, so backpressure stays ~0 and the wait we
+        // observe is upstream starvation, not downstream blocking.
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.expect("batch must be Ok").num_rows();
+        }
+        assert_eq!(
+            total_rows,
+            test_batch().num_rows() * 3,
+            "all rows must flow through"
+        );
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        // ~30ms expected (3 × 10ms); assert well below that so scheduling
+        // jitter on a loaded CI box can't flake it, but high enough to prove
+        // real starvation was recorded rather than a stray sub-ms tick.
+        assert!(
+            starved >= 10,
+            "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
+        );
+    }
+
+    /// Drive a `WrappingExec` with the given `backpressure_role` under a slow
+    /// consumer (sleeps between polls so each yield→resume gap is real blocked
+    /// time) and return the rows streamed. The recorder must already be
+    /// initialized with `node_id`.
+    async fn run_under_slow_consumer(node_id: &str, role: BackpressureRole) -> usize {
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let wrapping = Arc::new(
+            WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                .clone_with_role(role),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.expect("batch must be Ok").num_rows();
+            // Slow consumer: force >1ms of yield→resume backpressure per batch.
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        total_rows
+    }
+
+    /// Runtime proof of the fan-out suppression invariant: with an `Edge` role a
+    /// `WrappingExec` emits `node_wait{state="blocked", downstream_id=...}`, but
+    /// with `FanOutProducer` its blocked emission is skipped entirely (the
+    /// `BroadcastStream` owns that edge). Both nodes stream identical data under
+    /// the same slow consumer, so the FanOut node's absence of a blocked series
+    /// reflects suppression, not missing traffic.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn fanout_producer_suppresses_blocked_while_edge_emits() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let edge_id = "blocked_edge_unit_node";
+        let fanout_id = "blocked_fanout_unit_node";
+        test_support::init_recorder_with_nodes(&[edge_id, fanout_id]);
+
+        let expected_rows = test_batch().num_rows() * 3;
+
+        let edge_rows =
+            run_under_slow_consumer(edge_id, BackpressureRole::Edge("consumer".to_string())).await;
+        assert_eq!(edge_rows, expected_rows, "edge node must stream all rows");
+
+        let fanout_rows =
+            run_under_slow_consumer(fanout_id, BackpressureRole::FanOutProducer).await;
+        assert_eq!(
+            fanout_rows, expected_rows,
+            "fan-out node must stream all rows too (absence of metric is suppression, not missing data)"
+        );
+
+        // Edge role: emits blocked, attributed to its named downstream.
+        let edge_blocked = test_support::node_wait_ms(edge_id, "blocked", Some("consumer"));
+        assert!(
+            edge_blocked >= 4,
+            "Edge role must emit blocked for downstream_id=consumer, got {edge_blocked}ms"
+        );
+
+        // FanOutProducer role: no blocked series for this node at all (any
+        // downstream_id), because emission is suppressed in favor of the
+        // BroadcastStream's per-edge series.
+        let fanout_blocked = test_support::node_wait_ms(fanout_id, "blocked", None);
+        assert_eq!(
+            fanout_blocked, 0,
+            "FanOutProducer must suppress its own blocked emission, got {fanout_blocked}ms"
+        );
+    }
+
+    /// Complements `fanout_producer_suppresses_blocked_while_edge_emits`: an
+    /// `Edge` role stamps the emitted `blocked` series with exactly the named
+    /// `downstream_id`, so a query pinning the wrong consumer sees nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn edge_role_blocked_carries_downstream_id_tag() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_edge_tag_node";
+        test_support::init_recorder_with_node(node_id);
+
+        let rows =
+            run_under_slow_consumer(node_id, BackpressureRole::Edge("real_sink".to_string())).await;
+        assert_eq!(rows, test_batch().num_rows() * 3);
+
+        assert!(
+            test_support::node_wait_ms(node_id, "blocked", Some("real_sink")) >= 4,
+            "blocked must be tagged with the real downstream_id"
+        );
+        assert_eq!(
+            test_support::node_wait_ms(node_id, "blocked", Some("wrong_sink")),
+            0,
+            "no blocked series should exist for a downstream the node doesn't feed"
+        );
+    }
+
     /// A poll that yields a batch counts its wait as `starved`, but the final
     /// poll that returns `None` (end-of-stream) must contribute nothing — that
     /// poll-to-EOF wait is pipeline shutdown, not upstream starvation.
