@@ -246,7 +246,13 @@ sinks:
 /// 3. Exit happens within the deadline (30s, the default k8s grace period) —
 ///    no lag-task rd_kafka_destroy deadlock, no wedged worker at teardown.
 /// 4. No records are lost: everything consumed before the signal is in the
-///    sink after exit.
+///    sink after exit. Records keep being PRODUCED right up to the signal (a
+///    background producer runs concurrently with the pipeline), so the signal
+///    genuinely lands mid-stream — the drain path is exercised on in-flight
+///    data, not only on an idle pipeline that finished long before the signal.
+///    Sequential zero-padded ids let us assert a gap-free prefix
+///    (`count == numeric(max(id))`): nothing consumed before the signal was
+///    dropped mid-drain.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_sigterm_drains_and_exits_promptly() {
@@ -302,22 +308,44 @@ sinks:
         topic = ctx.kafka_topic,
     );
 
-    // Give the pipeline time to start and consume the seeded records, then
-    // SIGTERM while it idles on the live topic. The exit deadline matches the
-    // default k8s grace period: exceeding it is exactly the hang-then-SIGKILL
-    // failure this suite guards against.
-    let status = ctx
-        .run_pipeline_with_sigterm(
-            &pipeline,
-            PipelineOpts::new()
-                .env("STREAMLING__APPLICATION_ID", &application_id)
-                .env("STREAMLING__RECORD_BATCH_SIZE", "50")
-                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1"),
-            std::time::Duration::from_secs(15),
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .expect("streamling must exit within the grace period after SIGTERM");
+    // Run the pipeline and a background producer CONCURRENTLY: fresh records
+    // keep arriving right up to (and past) the signal, so SIGTERM lands while
+    // data is genuinely in flight. The exit deadline matches the default k8s
+    // grace period: exceeding it is exactly the hang-then-SIGKILL failure this
+    // suite guards against.
+    const SIGNAL_AFTER_SECS: u64 = 15;
+    let run = ctx.run_pipeline_with_sigterm(
+        &pipeline,
+        PipelineOpts::new()
+            .env("STREAMLING__APPLICATION_ID", &application_id)
+            .env("STREAMLING__RECORD_BATCH_SIZE", "50")
+            .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1"),
+        std::time::Duration::from_secs(SIGNAL_AFTER_SECS),
+        std::time::Duration::from_secs(30),
+    );
+    let producer = async {
+        // Produce small batches every 250ms until just past the signal, ids
+        // continuing the seeded sequence so the whole stream stays sequential.
+        let mut next_id = NUM_RECORDS as i64 + 1;
+        let rounds = SIGNAL_AFTER_SECS * 4 + 4;
+        for _ in 0..rounds {
+            let batch: Vec<TestRecord> = (next_id..next_id + 10)
+                .map(|i| TestRecord {
+                    block: i,
+                    id: format!("sig_{i:05}"),
+                    data: format!("payload_{i}"),
+                    timestamp: 1000 + i,
+                })
+                .collect();
+            if ctx.kafka.produce_avro_records(&batch).await.is_err() {
+                break;
+            }
+            next_id += 10;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    };
+    let (status, _) = tokio::join!(run, producer);
+    let status = status.expect("streamling must exit within the grace period after SIGTERM");
 
     assert!(
         status.success(),
@@ -325,15 +353,29 @@ sinks:
         status.code()
     );
 
-    // No tail loss: everything consumed before the signal must be durable in
-    // the sink. The upsert primary key makes the count duplicate-free.
-    let count = ctx
+    // No tail loss and no mid-stream gaps: ids are sequential and zero-padded,
+    // consumption is in order (single partition), and the upsert primary key
+    // makes the count duplicate-free — so everything the pipeline consumed up
+    // to the signal forms a contiguous prefix, and `count == numeric(max(id))`
+    // proves no consumed record was dropped during the drain.
+    let rows: Vec<(i64, Option<String>)> = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.sigterm_drain_results")
+        .query("SELECT COUNT(*), MAX(id) FROM public.sigterm_drain_results")
         .await
-        .expect("Failed to count sink rows");
+        .expect("Failed to query sink rows");
+    let (count, max_id) = (rows[0].0, rows[0].1.clone().unwrap_or_default());
+    assert!(
+        count >= NUM_RECORDS as i64,
+        "all pre-seeded records must be drained to the sink (got {count})"
+    );
+    let max_numeric: i64 = max_id
+        .strip_prefix("sig_")
+        .and_then(|n| n.parse().ok())
+        .expect("max id should be a sig_NNNNN key");
     assert_eq!(
-        count, NUM_RECORDS as i64,
-        "all records consumed before SIGTERM must be drained to the sink"
+        count, max_numeric,
+        "sink rows must form a gap-free prefix of the produced stream \
+         (count {count} vs max id {max_numeric}): a gap means a record consumed \
+         before SIGTERM was dropped mid-drain"
     );
 }

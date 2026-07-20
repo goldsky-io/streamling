@@ -1082,7 +1082,7 @@ impl ExecutionPlan for HybridSourceExec {
         // this the loop would block indefinitely in `stream.next()` on a live
         // topic and never observe the signal. Bounded-phase (ClickHouse)
         // sources observe the same signal directly in their pagination loop.
-        if let Some(mut sd) = shutdown_rx.clone() {
+        let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
             let provider_for_shutdown = provider.clone();
             let ref_name = reference_name_for_spawn.clone();
             tokio::spawn(async move {
@@ -1096,8 +1096,8 @@ impl ExecutionPlan for HybridSourceExec {
                     ref_name
                 );
                 provider_for_shutdown.shutdown();
-            });
-        }
+            })
+        });
 
         tokio::spawn(async move {
             // Every exit path from the loop falls through to the
@@ -1311,6 +1311,11 @@ impl ExecutionPlan for HybridSourceExec {
             let _ = forwarder_shutdown_tx.send(());
             let _ = forwarder_handle.await;
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, hybrid_marker_sub_id);
+            // The shutdown watcher may never fire (clean job-mode completion);
+            // abort it so it doesn't pin the provider Arc until process exit.
+            if let Some(handle) = shutdown_watcher_handle {
+                handle.abort();
+            }
         });
 
         Ok(builder.build())
@@ -1407,21 +1412,16 @@ fn merge_pending_markers(
 /// to finalize before giving up and emitting the finalizer best-effort. Keeps a
 /// sink that never acks from hanging the source task.
 ///
-/// Derived from the same `STREAMLING__SHUTDOWN_BUDGET_SECS` the run loop's
-/// watchdog uses (see `Streamling::shutdown_budget`), minus a margin so this
-/// wait always expires — and the best-effort finalizer is still emitted —
-/// BEFORE the watchdog hard-exits the process. A fixed value larger than the
-/// budget would let the watchdog kill the process mid-wait, dropping the
-/// finalizer entirely.
+/// Derived from the run loop's shared shutdown budget
+/// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
+/// is armed with), minus a margin so this wait always expires — and the
+/// best-effort finalizer is still emitted — BEFORE the watchdog hard-exits the
+/// process. A fixed value larger than the budget would let the watchdog kill
+/// the process mid-wait, dropping the finalizer entirely.
 fn terminal_checkpoint_finalize_timeout() -> Duration {
-    const DEFAULT_SHUTDOWN_BUDGET_SECS: u64 = 25;
     const MARGIN_SECS: u64 = 10;
     const MIN_TIMEOUT_SECS: u64 = 5;
-    let budget = std::env::var("STREAMLING__SHUTDOWN_BUDGET_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_SHUTDOWN_BUDGET_SECS);
+    let budget = streamling_core::shutdown::shutdown_budget().as_secs();
     Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(MIN_TIMEOUT_SECS))
 }
 
