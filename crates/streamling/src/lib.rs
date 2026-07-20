@@ -549,9 +549,11 @@ impl Streamling {
         // checkpoint) and sink futures (to signal completion). Valid before the
         // coordinator is started since it shares the coordinator's state.
         let checkpoint_control = checkpoint_coordinator.control();
-        // Process-wide shutdown signal. A single SIGTERM/SIGINT handler flips it
-        // (installed below); every source observes it and drains front-to-back.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Process-wide shutdown signal (streamling_core::shutdown). A single
+        // SIGTERM/SIGINT handler flips it (installed below); every source
+        // observes it and drains front-to-back, and deep call sites (sink
+        // retry loops) subscribe to it directly.
+        let shutdown_rx = streamling_core::shutdown::subscribe();
         let mut checkpoint_sink_names: Vec<String> = Vec::new();
 
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
@@ -2151,11 +2153,10 @@ impl Streamling {
         // replaces the per-component signal handlers (notably the plugin
         // watcher that used to kill plugins first, inverting the drain order).
         if !dry_run {
-            let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 Self::wait_for_shutdown_signal().await;
                 info!("Shutdown signal received; draining pipeline front-to-back");
-                let _ = shutdown_tx.send(true);
+                streamling_core::shutdown::request_shutdown();
                 Self::arm_shutdown_watchdog(Self::shutdown_budget());
             });
         }
@@ -2204,13 +2205,23 @@ impl Streamling {
             }
         };
 
-        // Teardown. Everything below is bounded by a single deadline; the
-        // watchdog (armed here for the clean-completion path that never saw a
-        // SIGTERM) hard-exits the process at the deadline no matter what.
-        let deadline = std::time::Instant::now() + Self::shutdown_budget();
+        // Teardown. Everything below is bounded by a single deadline shared
+        // with the watchdog: arming is idempotent and returns the deadline of
+        // the FIRST arming (SIGTERM time, if one arrived), so after a long
+        // drain the bounded waits below correctly see less time remaining
+        // instead of overrunning into the hard exit. A 2s margin keeps these
+        // waits expiring before the watchdog fires. Dry runs never arm the
+        // watchdog (there is nothing to drain).
+        let deadline = if dry_run {
+            std::time::Instant::now() + Self::shutdown_budget()
+        } else {
+            let watchdog_deadline = Self::arm_shutdown_watchdog(Self::shutdown_budget());
+            watchdog_deadline
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or(watchdog_deadline)
+        };
         let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
         if !dry_run {
-            Self::arm_shutdown_watchdog(Self::shutdown_budget());
             // The sinks drained. Before tearing anything down, wait (bounded)
             // for the terminal checkpoint to finalize so the tail is durably
             // checkpointed and its Finalizer reaches components that commit on
@@ -2227,7 +2238,7 @@ impl Streamling {
             }
             // Ensure sources observe shutdown even on a clean job-mode completion
             // (so any lingering helper tasks — lag reporters — wind down).
-            let _ = shutdown_tx.send(true);
+            streamling_core::shutdown::request_shutdown();
         }
 
         // Issue SourceComplete to plugin sources so the checkpoint channels are
@@ -2300,25 +2311,34 @@ impl Streamling {
     /// Arm a last-resort watchdog: a plain OS thread that hard-exits the process
     /// after `budget`, so a wedged FFI/rdkafka teardown or a plugin that never
     /// finishes its drain can never hold the process past the k8s grace period.
-    /// Idempotent — the first arming wins; later calls are no-ops.
-    fn arm_shutdown_watchdog(budget: Duration) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static ARMED: AtomicBool = AtomicBool::new(false);
-        if ARMED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let _ = std::thread::Builder::new()
-            .name("shutdown-watchdog".to_string())
-            .spawn(move || {
-                std::thread::sleep(budget);
-                // A plain OS thread's exit cannot be blocked by a wedged tokio
-                // worker or a hung FFI call, so this always fires.
-                eprintln!(
-                    "[streamling] shutdown budget of {:?} exceeded; forcing process exit",
-                    budget
-                );
-                std::process::exit(0);
-            });
+    ///
+    /// Idempotent — the first arming wins and later calls are no-ops. Always
+    /// returns the deadline of the FIRST arming so callers slice their bounded
+    /// waits against the watchdog's real deadline (e.g. teardown after a long
+    /// SIGTERM-triggered drain must not assume a fresh budget).
+    ///
+    /// The forced exit is non-zero: this path only fires when teardown failed
+    /// to complete in time, and it must surface to k8s/alerting as an abnormal
+    /// exit, not a clean completion.
+    fn arm_shutdown_watchdog(budget: Duration) -> std::time::Instant {
+        use std::sync::OnceLock;
+        static WATCHDOG_DEADLINE: OnceLock<std::time::Instant> = OnceLock::new();
+        *WATCHDOG_DEADLINE.get_or_init(|| {
+            let deadline = std::time::Instant::now() + budget;
+            let _ = std::thread::Builder::new()
+                .name("shutdown-watchdog".to_string())
+                .spawn(move || {
+                    std::thread::sleep(budget);
+                    // A plain OS thread's exit cannot be blocked by a wedged
+                    // tokio worker or a hung FFI call, so this always fires.
+                    eprintln!(
+                        "[streamling] shutdown budget of {:?} exceeded; forcing process exit",
+                        budget
+                    );
+                    std::process::exit(1);
+                });
+            deadline
+        })
     }
 
     /// Await SIGTERM / SIGINT / Ctrl-C — the single shutdown trigger for the

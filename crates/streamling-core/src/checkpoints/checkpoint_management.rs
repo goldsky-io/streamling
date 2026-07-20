@@ -221,6 +221,14 @@ impl CheckpointControl {
         // Drop any in-flight timer epochs. The source is done producing data,
         // so their markers can no longer reach the sinks and they would never
         // finalize. The terminal epoch is the only one that matters now.
+        //
+        // Dropping a non-finalized epoch without broadcasting its Finalizer is
+        // safe: no consumer blocks waiting for a Finalizer — sinks ack Markers
+        // and treat Finalizers as best-effort commit/truncate signals, and the
+        // work those dropped epochs would have committed is re-covered by the
+        // terminal epoch's Finalizer. This also mirrors the timer producer,
+        // which has always cleared the previous epoch before inserting a new
+        // one.
         epochs.clear();
         let epoch_num = self.next_epoch.fetch_add(1, Ordering::SeqCst);
         let terminal = CheckpointEpoch(epoch_num);
@@ -1026,6 +1034,10 @@ mod tests {
 
         // No sink has acked the terminal marker yet, so the await must block.
         assert!(
+            !control.is_terminal_finalized(),
+            "terminal epoch must not be finalized before any sink acks"
+        );
+        assert!(
             tokio::time::timeout(
                 Duration::from_millis(150),
                 control.await_terminal_finalized()
@@ -1049,6 +1061,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), control.await_terminal_finalized())
             .await
             .expect("await_terminal_finalized must return once the terminal epoch finalizes");
+        assert!(
+            control.is_terminal_finalized(),
+            "is_terminal_finalized must report true once the terminal epoch finalizes"
+        );
 
         {
             let epochs = coordinator.epochs.lock();

@@ -1,7 +1,8 @@
 use datafusion::arrow::array::Array;
 use std::sync::Arc;
-use streamling_core::error::ResultExt;
-use streamling_core::retry::retry_forever_with_backoff_async;
+use streamling_core::error::{Result, ResultExt};
+use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
+use streamling_core::streamling_err;
 
 use crate::table_providers::postgres::value_binding;
 
@@ -13,9 +14,11 @@ pub struct SinkContext {
     pub table_name: String,
 }
 
-/// Execute a batch insert query with retry logic
-/// Never returns an error as retries continue indefinitely until success
-/// If checkpoint_epoch is provided, binds the epoch value for each row
+/// Execute a batch insert query with retry logic.
+/// Retries indefinitely until success — unless process shutdown is requested,
+/// in which case it stops between attempts and returns an error so the sink
+/// fails instead of acking a checkpoint for data that was never written.
+/// If checkpoint_epoch is provided, binds the epoch value for each row.
 pub async fn execute_batch_insert(
     pool: &sqlx::PgPool,
     query: &str,
@@ -24,7 +27,7 @@ pub async fn execute_batch_insert(
     num_rows: usize,
     ctx: &SinkContext,
     checkpoint_epoch: Option<u64>,
-) {
+) -> Result<()> {
     let query = query.to_string();
     let pool = pool.clone();
     let batch_columns: Vec<_> = batch_columns.to_vec();
@@ -35,7 +38,8 @@ pub async fn execute_batch_insert(
         ctx.schema_name, ctx.table_name, ctx.sink_name
     );
 
-    retry_forever_with_backoff_async(
+    let mut shutdown = streamling_core::shutdown::subscribe();
+    let outcome = retry_forever_with_backoff_until_cancelled(
         move || {
             let query = query.clone();
             let pool = pool.clone();
@@ -62,12 +66,23 @@ pub async fn execute_batch_insert(
             }
         },
         &operation_name,
+        &mut shutdown,
     )
-    .await
+    .await;
+
+    match outcome {
+        RetryOutcome::Completed => Ok(()),
+        RetryOutcome::Cancelled => Err(streamling_err!(
+            "{} aborted: shutdown requested before the write succeeded",
+            operation_name
+        )),
+    }
 }
 
-/// Execute a batch delete query with retry logic
-/// Never returns an error as retries continue indefinitely until success
+/// Execute a batch delete query with retry logic.
+/// Retries indefinitely until success — unless process shutdown is requested,
+/// in which case it stops between attempts and returns an error so the sink
+/// fails instead of acking a checkpoint for a delete that never applied.
 pub async fn execute_batch_delete(
     pool: &sqlx::PgPool,
     query: &str,
@@ -75,7 +90,7 @@ pub async fn execute_batch_delete(
     primary_key_indices: &[usize],
     num_rows: usize,
     ctx: &SinkContext,
-) {
+) -> Result<()> {
     let query = query.to_string();
     let pool = pool.clone();
     let batch_columns: Vec<_> = batch_columns.to_vec();
@@ -86,7 +101,8 @@ pub async fn execute_batch_delete(
         ctx.schema_name, ctx.table_name, ctx.sink_name
     );
 
-    retry_forever_with_backoff_async(
+    let mut shutdown = streamling_core::shutdown::subscribe();
+    let outcome = retry_forever_with_backoff_until_cancelled(
         move || {
             let query = query.clone();
             let pool = pool.clone();
@@ -109,8 +125,17 @@ pub async fn execute_batch_delete(
             }
         },
         &operation_name,
+        &mut shutdown,
     )
-    .await
+    .await;
+
+    match outcome {
+        RetryOutcome::Completed => Ok(()),
+        RetryOutcome::Cancelled => Err(streamling_err!(
+            "{} aborted: shutdown requested before the delete succeeded",
+            operation_name
+        )),
+    }
 }
 
 // Note: Comprehensive testing of batch execution is done via integration tests

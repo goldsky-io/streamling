@@ -1405,9 +1405,25 @@ fn merge_pending_markers(
 
 /// The bound on how long a completing source waits for the terminal checkpoint
 /// to finalize before giving up and emitting the finalizer best-effort. Keeps a
-/// sink that never acks from hanging the source task; the host-side wait and the
-/// shutdown watchdog provide the outer bounds.
-const TERMINAL_CHECKPOINT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// sink that never acks from hanging the source task.
+///
+/// Derived from the same `STREAMLING__SHUTDOWN_BUDGET_SECS` the run loop's
+/// watchdog uses (see `Streamling::shutdown_budget`), minus a margin so this
+/// wait always expires — and the best-effort finalizer is still emitted —
+/// BEFORE the watchdog hard-exits the process. A fixed value larger than the
+/// budget would let the watchdog kill the process mid-wait, dropping the
+/// finalizer entirely.
+fn terminal_checkpoint_finalize_timeout() -> Duration {
+    const DEFAULT_SHUTDOWN_BUDGET_SECS: u64 = 25;
+    const MARGIN_SECS: u64 = 10;
+    const MIN_TIMEOUT_SECS: u64 = 5;
+    let budget = std::env::var("STREAMLING__SHUTDOWN_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_SHUTDOWN_BUDGET_SECS);
+    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(MIN_TIMEOUT_SECS))
+}
 
 /// Emit the terminal checkpoint round-trip inline on the data stream, so both
 /// the marker and the finalizer keep a consistent cut and reach inline
@@ -1434,31 +1450,32 @@ async fn emit_terminal_checkpoint(
 ) {
     let terminal = control.begin_terminal_checkpoint();
 
-    pending.lock().unwrap().push(CheckpointMessage::Marker {
-        epoch: terminal.clone(),
-        created_at_ms: now_ms(),
-    });
+    pending
+        .lock()
+        .expect("pending markers mutex poisoned")
+        .push(CheckpointMessage::Marker {
+            epoch: terminal.clone(),
+            created_at_ms: now_ms(),
+        });
     flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
     // here does not block their consumption of the marker batch.
-    if tokio::time::timeout(
-        TERMINAL_CHECKPOINT_FINALIZE_TIMEOUT,
-        control.await_terminal_finalized(),
-    )
-    .await
-    .is_err()
+    let finalize_timeout = terminal_checkpoint_finalize_timeout();
+    if tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
+        .await
+        .is_err()
     {
         warn!(
             "Hybrid source '{}': terminal checkpoint did not finalize within {:?}; \
              emitting finalizer best-effort",
-            reference_name, TERMINAL_CHECKPOINT_FINALIZE_TIMEOUT
+            reference_name, finalize_timeout
         );
     }
 
     pending
         .lock()
-        .unwrap()
+        .expect("pending markers mutex poisoned")
         .push(CheckpointMessage::Finalizer(terminal));
     flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
 }

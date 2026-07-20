@@ -59,7 +59,7 @@ pub use streamling_config::{
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::node_context::get_node_context;
 use streamling_core::operators::wrapping::WrappingDataSink;
-use streamling_core::retry::retry_forever_with_backoff_async;
+use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
@@ -1089,7 +1089,8 @@ impl DataSink for ClickHouseSinkExec {
                         async move {
                             let operation_name =
                                 format!("{}: INSERT into '{}'", node_label, table_name);
-                            retry_forever_with_backoff_async(
+                            let mut shutdown = streamling_core::shutdown::subscribe();
+                            match retry_forever_with_backoff_until_cancelled(
                                 || async {
                                     client
                                         .send_arrow_batch(&table_name, &slice, &schema)
@@ -1097,12 +1098,20 @@ impl DataSink for ClickHouseSinkExec {
                                         .streamling_context("failed to send Arrow batch")
                                 },
                                 &operation_name,
+                                &mut shutdown,
                             )
-                            .await;
+                            .await
+                            {
+                                RetryOutcome::Completed => Ok(()),
+                                RetryOutcome::Cancelled => Err(streamling_core::streamling_err!(
+                                    "{} aborted: shutdown requested before the write succeeded",
+                                    operation_name
+                                )),
+                            }
                         }
                     }
                 })
-                .await;
+                .await?;
             } else {
                 // append_only_mode=false: split rows by _gs_op into inserts vs deletes
                 use datafusion::arrow::array::StringArray;
@@ -1177,7 +1186,8 @@ impl DataSink for ClickHouseSinkExec {
                             async move {
                                 let operation_name =
                                     format!("{}: INSERT into '{}'", node_label, table_name);
-                                retry_forever_with_backoff_async(
+                                let mut shutdown = streamling_core::shutdown::subscribe();
+                                match retry_forever_with_backoff_until_cancelled(
                                     || async {
                                         client
                                             .send_arrow_batch(&table_name, &slice, &schema)
@@ -1185,12 +1195,22 @@ impl DataSink for ClickHouseSinkExec {
                                             .streamling_context("failed to send Arrow batch")
                                     },
                                     &operation_name,
+                                    &mut shutdown,
                                 )
-                                .await;
+                                .await
+                                {
+                                    RetryOutcome::Completed => Ok(()),
+                                    RetryOutcome::Cancelled => {
+                                        Err(streamling_core::streamling_err!(
+                                            "{} aborted: shutdown requested before the write succeeded",
+                                            operation_name
+                                        ))
+                                    }
+                                }
                             }
                         }
                     })
-                    .await;
+                    .await?;
                 }
 
                 // Process deletes: extract PK columns and issue ALTER TABLE DELETE
@@ -1214,7 +1234,8 @@ impl DataSink for ClickHouseSinkExec {
                     let client_for_delete = client.clone();
                     let table_for_delete = table_name.clone();
                     let pks = primary_keys.clone();
-                    retry_forever_with_backoff_async(
+                    let mut shutdown = streamling_core::shutdown::subscribe();
+                    match retry_forever_with_backoff_until_cancelled(
                         || {
                             let client = client_for_delete.clone();
                             let table = table_for_delete.clone();
@@ -1223,8 +1244,18 @@ impl DataSink for ClickHouseSinkExec {
                             async move { client.delete_by_primary_keys(&table, &pks, &batch).await }
                         },
                         &operation_name,
+                        &mut shutdown,
                     )
-                    .await;
+                    .await
+                    {
+                        RetryOutcome::Completed => {}
+                        RetryOutcome::Cancelled => {
+                            return Err(DataFusionError::from(streamling_core::streamling_err!(
+                                "{} aborted: shutdown requested before the delete succeeded",
+                                operation_name
+                            )));
+                        }
+                    }
                 }
             }
 
