@@ -1,6 +1,6 @@
 [package]
 name = "streamling-e2e"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "End-to-end tests for streamling"
 license-file.workspace = true

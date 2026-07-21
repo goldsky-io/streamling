@@ -29,15 +29,15 @@ too_many_arguments = "allow"
 [workspace.dependencies]
 # Internal crates. path + version lets `cargo publish` rewrite the path deps into
 # registry deps; the version is maintained here once and inherited via `{ workspace = true }`.
-streamling-config        = { path = "crates/streamling-config", version = "0.2.0" }
-streamling-common        = { path = "crates/streamling-common", version = "0.2.0" }
-streamling-state         = { path = "crates/streamling-state", version = "0.2.0" }
-streamling-core          = { path = "crates/streamling-core", version = "0.2.0" }
-streamling-connectors    = { path = "crates/streamling-connectors", version = "0.2.0" }
-streamling-flink-compat  = { path = "crates/streamling-flink-compat", version = "0.2.0" }
-streamling-plugin        = { path = "crates/streamling-plugin", version = "0.2.0" }
-streamling-plugin-derive = { path = "crates/streamling-plugin/streamling-plugin-derive", version = "0.2.0" }
-streamling-e2e           = { path = "crates/streamling-e2e", version = "0.2.0" }
+streamling-config        = { path = "crates/streamling-config", version = "0.3.0" }
+streamling-common        = { path = "crates/streamling-common", version = "0.3.0" }
+streamling-state         = { path = "crates/streamling-state", version = "0.3.0" }
+streamling-core          = { path = "crates/streamling-core", version = "0.3.0" }
+streamling-connectors    = { path = "crates/streamling-connectors", version = "0.3.0" }
+streamling-flink-compat  = { path = "crates/streamling-flink-compat", version = "0.3.0" }
+streamling-plugin        = { path = "crates/streamling-plugin", version = "0.2.1" }
+streamling-plugin-derive = { path = "crates/streamling-plugin/streamling-plugin-derive", version = "0.3.0" }
+streamling-e2e           = { path = "crates/streamling-e2e", version = "0.3.0" }
 
 # Core DataFusion ecosystem
 datafusion = { version = "54.0.0", features = ["avro", "backtrace"] }
