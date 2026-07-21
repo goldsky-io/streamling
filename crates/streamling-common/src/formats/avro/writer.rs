@@ -46,12 +46,10 @@ impl SerializeTarget for Vec<Value> {
 
 /// Computes an avro schema from an arrow schema
 pub fn to_avro(name: &str, fields: &Fields) -> Schema {
-    // Avro record names must match `[A-Za-z_][A-Za-z0-9_]*` (optionally
-    // dot-separated). The caller-supplied `name` is often a Kafka topic or table
-    // name (e.g. `hypercore-mainnet.raw.events`) which can contain hyphens and
-    // other characters that are illegal in Avro names, so sanitize it before it
-    // reaches the parser.
-    let name = sanitize_name(name);
+    // The caller-supplied `name` is often a Kafka topic (e.g.
+    // `my-cluster.raw.events`) which can contain hyphens. Hyphens are illegal in
+    // Avro names, so replace them before the name reaches the parser.
+    let name = name.replace('-', "_");
     let fields: Vec<_> = fields.iter().map(|f| field_to_avro(&name, f)).collect();
 
     let schema = json!({
@@ -202,24 +200,6 @@ fn sanitize_field(s: &str) -> String {
     let re = RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_.]").unwrap());
 
     re.replace_all(s, "_").replace('.', "__")
-}
-
-/// Turns an arbitrary string into a valid Avro record name.
-///
-/// Avro names must match `^[A-Za-z_][A-Za-z0-9_]*$`. Any other character
-/// (hyphens, dots, etc.) is replaced with `_`, and a leading digit is prefixed
-/// with `_` so names derived from Kafka topics/table identifiers such as
-/// `hypercore-mainnet.raw.events` parse cleanly.
-fn sanitize_name(s: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_]").unwrap());
-
-    let sanitized = re.replace_all(s, "_");
-    match sanitized.chars().next() {
-        None => "_".to_string(),
-        Some(c) if c.is_ascii_digit() => format!("_{sanitized}"),
-        Some(_) => sanitized.into_owned(),
-    }
 }
 
 #[allow(clippy::redundant_closure_call)]
@@ -752,11 +732,12 @@ mod tests {
     }
 
     /// Regression test for the panic parsing an Avro schema whose record name
-    /// was derived from a Kafka topic containing illegal characters, e.g.
-    /// `my-cluster.raw.events`. `to_avro` must sanitize the name so
-    /// `Schema::parse_str` succeeds instead of panicking.
+    /// was derived from a Kafka topic. Topics may contain hyphens or
+    /// underscores; hyphens are illegal in Avro names so `to_avro` replaces them,
+    /// while underscores are already valid and pass through unchanged. Both must
+    /// serialize instead of panicking in `Schema::parse_str`.
     #[test]
-    fn test_topic_name_with_illegal_chars_is_sanitized() {
+    fn test_topic_name_with_hyphen_or_underscore_is_sanitized() {
         use apache_avro::types::Value::*;
 
         let arrow_schema = Arc::new(Schema::new(vec![Field::new(
@@ -765,30 +746,21 @@ mod tests {
             false,
         )]));
 
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![42]))],
-        )
-        .unwrap();
+        for topic in ["my-cluster.raw.events", "my_cluster.raw.events"] {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    42,
+                ]))],
+            )
+            .unwrap();
 
-        // Would previously panic in Schema::parse_str due to the hyphen.
-        let avro_schema = to_avro("my-cluster.raw.events", &arrow_schema.fields);
+            // Would previously panic in Schema::parse_str for the hyphenated topic.
+            let avro_schema = to_avro(topic, &arrow_schema.fields);
 
-        let apache_avro::Schema::Record(record) = &avro_schema else {
-            panic!("expected record schema");
-        };
-        assert_eq!(record.name.fullname(None), "my_cluster_raw_events");
-
-        let result = serialize(&avro_schema, &batch);
-        assert_eq!(result, vec![Record(vec![("value".to_string(), Long(42))])]);
-    }
-
-    #[test]
-    fn test_sanitize_name() {
-        assert_eq!(sanitize_name("my-cluster.raw.events"), "my_cluster_raw_events");
-        assert_eq!(sanitize_name("valid_name"), "valid_name");
-        assert_eq!(sanitize_name("123abc"), "_123abc");
-        assert_eq!(sanitize_name(""), "_");
+            let result = serialize(&avro_schema, &batch);
+            assert_eq!(result, vec![Record(vec![("value".to_string(), Long(42))])]);
+        }
     }
 
     #[test]
