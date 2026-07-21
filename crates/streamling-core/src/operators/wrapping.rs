@@ -486,18 +486,27 @@ pub enum BackpressureRole {
     /// Feeds a `BroadcastStream` fan-out (multi-sink or scan sharing). Don't emit
     /// `blocked` here — the broadcast emits one per-edge series per consumer;
     /// emitting the aggregate too would double count.
+    ///
+    /// Invariant: the two blocked-emission layers must never coexist for the
+    /// same node. Only stamp this (via [`WrappingExec::suppress_backpressure`])
+    /// on a node that actually feeds a `BroadcastStream`; using it on a non-
+    /// fan-out node would silently swallow that node's `blocked` series with no
+    /// per-edge emitter to replace it.
     FanOutProducer,
 }
 
 /// The span of an input poll to attribute to `starved`. A poll only counts as
-/// starvation when it actually yields input; a `None` result is end-of-stream,
-/// so its poll-to-EOF wait is pipeline shutdown/teardown (source teardown, a
-/// producer finishing) rather than time genuinely spent waiting for the next
-/// batch — attribute nothing for it.
-fn starved_span_for_poll<T>(poll_result: &Option<T>, waited: Duration) -> Duration {
+/// starvation when it actually yields an input batch (`Some(Ok(_))`). A `None`
+/// result is end-of-stream, so its poll-to-EOF wait is pipeline
+/// shutdown/teardown (source teardown, a producer finishing); a `Some(Err(_))`
+/// is an upstream failure/termination, not a batch that arrived. Neither is
+/// time genuinely spent waiting for the next batch, and neither is folded into
+/// `elapsed_compute` (which also only counts `Ok` batches) — attribute nothing
+/// for them.
+fn starved_span_for_poll<T, E>(poll_result: &Option<Result<T, E>>, waited: Duration) -> Duration {
     match poll_result {
-        Some(_) => waited,
-        None => Duration::ZERO,
+        Some(Ok(_)) => waited,
+        _ => Duration::ZERO,
     }
 }
 
@@ -585,7 +594,9 @@ impl WrappingExec {
     }
 
     /// Stamp this node as a fan-out producer, suppressing its own `blocked`
-    /// emission (the `BroadcastStream` emits per-edge instead).
+    /// emission (the `BroadcastStream` emits per-edge instead). Only call this on
+    /// a node that genuinely feeds a `BroadcastStream`; see the invariant on
+    /// [`BackpressureRole::FanOutProducer`].
     pub fn suppress_backpressure(mut self) -> Self {
         self.backpressure_role = BackpressureRole::FanOutProducer;
         self
@@ -759,7 +770,9 @@ impl ExecutionPlan for WrappingExec {
                 let batch_elapsed = batch_start.elapsed();
                 // `starved`: time waiting on upstream for input. Node-local (not
                 // an edge), so downstream_id="" to match the blocked label set.
-                // A `None` poll is EOF, not starvation — attribute nothing for it.
+                // Only a delivered batch (`Some(Ok)`) counts; a `None` poll is EOF
+                // and a `Some(Err)` is an upstream failure — attribute nothing for
+                // either.
                 starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
                 let starved_ms = starved.take_whole_millis();
                 if starved_ms > 0 {
@@ -2067,11 +2080,12 @@ mod tests {
         );
     }
 
-    /// A poll that yields a batch counts its wait as `starved`, but the final
-    /// poll that returns `None` (end-of-stream) must contribute nothing — that
-    /// poll-to-EOF wait is pipeline shutdown, not upstream starvation.
+    /// A poll that yields a batch counts its wait as `starved`, but a poll that
+    /// returns `None` (end-of-stream) or `Some(Err)` (upstream failure) must
+    /// contribute nothing — those waits are pipeline shutdown / error handling,
+    /// not upstream starvation, and neither is folded into `elapsed_compute`.
     #[test]
-    fn end_of_stream_poll_is_not_counted_as_starved() {
+    fn only_delivered_batch_poll_is_counted_as_starved() {
         let waited = Duration::from_millis(50);
 
         // Delivered input: the wait is genuine starvation.
@@ -2082,7 +2096,13 @@ mod tests {
 
         // End-of-stream: the teardown wait is not starvation.
         assert_eq!(
-            starved_span_for_poll::<Result<(), ()>>(&None, waited),
+            starved_span_for_poll::<(), ()>(&None, waited),
+            Duration::ZERO
+        );
+
+        // Upstream error: no batch arrived, so this is not starvation either.
+        assert_eq!(
+            starved_span_for_poll(&Some(Err::<(), ()>(())), waited),
             Duration::ZERO
         );
     }

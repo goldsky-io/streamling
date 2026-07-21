@@ -1094,19 +1094,6 @@ impl ControlPlaneMetricsRecorder {
             .record_count_w_tags(name, value, vec![], &self.component_id);
     }
 
-    /// Record a counter metric with extra per-call label dimensions.
-    ///
-    /// `tags` are merged on top of this recorder's identity tags (`id`,
-    /// `service_instance_id`); use them for context dimensions such as
-    /// `downstream_id`. This method does not define the counter — the caller is
-    /// responsible for the metric `name` being pre-registered (see
-    /// `initialize_metrics_recorder`, e.g. `node_wait`) so it carries the curated
-    /// definition rather than a lazily-created default.
-    pub fn record_count_w_tags(&self, name: &str, value: u64, tags: Vec<(&str, &str)>) {
-        self.inner
-            .record_count_w_tags(name, value, tags, &self.component_id);
-    }
-
     /// Record a gauge metric.
     pub fn record_gauge(&self, name: &str, value: u64) {
         self.inner

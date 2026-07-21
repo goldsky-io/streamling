@@ -149,13 +149,16 @@ impl BroadcastStream {
                                 let result =
                                     Self::try_send_batch_with_retry_forever(&tx, batch_result)
                                         .await;
-                                (downstream_id, result)
+                                (downstream_id, tx, result)
                             }
                         })
                         .collect();
 
                     let results = future::join_all(send_futures).await;
-                    for (downstream_id, result) in results {
+                    // Consumers whose channel closed (receiver dropped) are removed
+                    // below so later batches don't re-schedule doomed sends to them.
+                    let mut closed_txs: Vec<Sender<DFResult<RecordBatch>>> = Vec::new();
+                    for (downstream_id, tx, result) in results {
                         match result {
                             Ok(blocked) => {
                                 // Not attributed: no producer id (tests only) or
@@ -189,8 +192,21 @@ impl BroadcastStream {
                                 warn!(
                                     "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
                                 );
+                                closed_txs.push(tx);
                             }
                         }
+                    }
+
+                    // Actually drop the closed consumers from the shared list so we
+                    // stop retrying dead channels every batch. Identity is compared
+                    // by channel (not `downstream_id`, which need not be unique).
+                    if !closed_txs.is_empty() {
+                        let mut guard = self.inner.consumers.lock().unwrap();
+                        guard.retain(|consumer| {
+                            !closed_txs
+                                .iter()
+                                .any(|closed| closed.same_channel(&consumer.tx))
+                        });
                     }
                 }
                 None => {
@@ -590,5 +606,56 @@ mod tests {
         drop(rx);
         let result = BroadcastStream::try_send_batch_with_retry_forever(&tx, &batch_result).await;
         assert!(result.is_err(), "closed channel must return Err");
+    }
+
+    /// A consumer whose receiver has been dropped (closed channel) must be
+    /// pruned from the shared consumer list after its first failed send, so the
+    /// producer stops re-scheduling doomed sends to it on every later batch.
+    #[tokio::test]
+    async fn run_broadcast_prunes_closed_consumer() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = one_row_batch().schema();
+        // Capacity 1: after the first batch the live consumer's channel is full,
+        // so the producer parks on it and never reaches end-of-stream (which
+        // would otherwise clear all consumers), keeping the assertion stable.
+        let broadcast = BroadcastStream::new(schema.clone(), 1);
+        // Live consumer we keep in scope (but never drain), plus a dead one whose
+        // receiver we drop to close its channel.
+        let _live_consumer = broadcast.add_consumer("live".to_string());
+        let dead_consumer = broadcast.add_consumer("dead".to_string());
+        drop(dead_consumer);
+
+        assert_eq!(
+            broadcast.inner.consumers.lock().unwrap().len(),
+            2,
+            "both consumers are registered before broadcasting starts"
+        );
+
+        let batches: Vec<DFResult<RecordBatch>> = (0..5).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source);
+
+        // Give the background task time to send the first batch (Err to the dead
+        // consumer) and prune it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        {
+            let remaining = broadcast.inner.consumers.lock().unwrap();
+            assert_eq!(
+                remaining.len(),
+                1,
+                "the closed consumer must be pruned after its first failed send"
+            );
+            assert_eq!(
+                remaining[0].downstream_id, "live",
+                "the surviving consumer is the live one"
+            );
+        }
+
+        broadcast.stop();
     }
 }
