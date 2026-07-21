@@ -1,6 +1,6 @@
 [package]
 name = "streamling-plugin"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Plugin SDK and FFI for extending Streamling."

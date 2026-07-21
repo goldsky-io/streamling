@@ -7093,7 +7093,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "abi_stable",
  "arrow",
