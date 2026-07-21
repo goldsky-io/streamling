@@ -581,8 +581,14 @@ pub fn initialize_metrics_recorder(
         debug!("MetricsRecorder already initialized; merging metric metadata registry.");
         // Merge new metadata into existing recorder so subsequent pipelines are tracked
         if let Some(existing) = instance.as_ref() {
-            let mut reg_lock = existing.metric_metadata_registry.lock().unwrap();
-            let mut tags_lock = existing.metric_metadata_tags_registry.lock().unwrap();
+            let mut reg_lock = existing
+                .metric_metadata_registry
+                .lock()
+                .expect("metric_metadata_registry lock poisoned");
+            let mut tags_lock = existing
+                .metric_metadata_tags_registry
+                .lock()
+                .expect("metric_metadata_tags_registry lock poisoned");
             for (id, meta) in metric_metadata_registry.into_iter() {
                 reg_lock.insert(id.clone(), meta.clone());
                 tags_lock.insert(id, meta.to_tags());

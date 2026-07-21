@@ -201,7 +201,11 @@ impl BroadcastStream {
                     // stop retrying dead channels every batch. Identity is compared
                     // by channel (not `downstream_id`, which need not be unique).
                     if !closed_txs.is_empty() {
-                        let mut guard = self.inner.consumers.lock().unwrap();
+                        let mut guard = self
+                            .inner
+                            .consumers
+                            .lock()
+                            .expect("broadcast consumers mutex poisoned");
                         guard.retain(|consumer| {
                             !closed_txs
                                 .iter()
