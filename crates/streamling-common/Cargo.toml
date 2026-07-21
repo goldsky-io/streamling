@@ -1,6 +1,6 @@
 [package]
 name = "streamling-common"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Shared types, formats, and utilities for Streamling."
@@ -16,6 +16,7 @@ datafusion.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-json.workspace = true
+arrow-avro.workspace = true
 
 # Logging
 tracing.workspace = true

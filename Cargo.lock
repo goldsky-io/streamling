@@ -6870,7 +6870,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streamling"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-schema",
  "cc",
@@ -6895,7 +6895,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -6910,11 +6910,12 @@ dependencies = [
 
 [[package]]
 name = "streamling-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apache-avro",
  "arrow",
+ "arrow-avro",
  "arrow-buffer",
  "arrow-json",
  "arrow-schema",
@@ -6938,7 +6939,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6956,7 +6957,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-connectors"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -6994,7 +6995,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "anyhow",
@@ -7050,7 +7051,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-e2e"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "apache-avro",
  "aws-config",
@@ -7078,7 +7079,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-flink-compat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.21.7",
  "datafusion",
@@ -7092,7 +7093,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "abi_stable",
  "arrow",
@@ -7115,7 +7116,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin-derive"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7124,7 +7125,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-state"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "parking_lot 0.12.5",
