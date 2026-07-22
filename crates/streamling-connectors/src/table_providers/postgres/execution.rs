@@ -27,6 +27,13 @@ pub struct SinkContext {
 /// socket, and sqlx's return-to-pool cleanup can itself block on it. Dropping
 /// a detached connection closes the socket without any await, and the pool
 /// opens a fresh replacement on the next acquire.
+///
+/// Delivery semantics: like every retried error in this sink (e.g. a
+/// connection drop after the server committed but before the response
+/// arrived), a timeout can re-execute a statement that already committed —
+/// at-least-once. Upsert/delete statements absorb this; sinks configured
+/// without a primary key issue plain INSERTs and can observe duplicates,
+/// which is the sink's pre-existing contract, not a property of this bound.
 async fn execute_bounded(
     pool: &sqlx::PgPool,
     query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
