@@ -381,6 +381,141 @@ sinks:
 }
 
 // ============================================================================
+// Streaming mode: SIGTERM during a BOUNDED phase drains and exits promptly
+// ============================================================================
+
+/// SIGTERM while a hybrid source is still in its bounded (ClickHouse) phase:
+/// the scan must end early, the terminal checkpoint must cover what was
+/// emitted, and the process must exit 0 well inside the k8s grace period.
+///
+/// Regression: the shutdown signal used to be observed only by the Kafka
+/// unbounded phase (via the hybrid shutdown watcher) and by the post-stream
+/// check in the hybrid forwarding loop — a bounded scan sat in
+/// `stream.next()` until the whole table had been read, blew the shutdown
+/// budget, and the watchdog force-exited without a terminal drain. The table
+/// here is large enough that the scan is still running when the signal
+/// lands; if a fast machine finishes it first the test degrades to the
+/// (already covered) streaming-phase path rather than flaking.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_sigterm_during_bounded_phase_drains_and_exits() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE bounded_sigterm_source (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+    // Server-side seed: large enough that the bounded scan (throttled by the
+    // downstream Postgres sink) is still in flight when the signal fires.
+    clickhouse
+        .execute(
+            "INSERT INTO bounded_sigterm_source
+             SELECT number, concat('bp_', toString(number)), 'bounded_payload',
+                    1000 + number, 0
+             FROM numbers(500000)",
+        )
+        .await
+        .expect("Failed to seed ClickHouse table");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_bounded_sigterm (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let application_id = format!("bounded_sigterm_{}", ctx.test_id);
+
+    let pipeline = format!(
+        r#"
+sources:
+  source_a:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: bounded_sigterm_source
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {topic}
+      table_name: kafka_offsets_bounded_sigterm
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: source_a
+    table: bounded_sigterm_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 200
+    batch_flush_interval: 100ms
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_sigterm(
+            &pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__APPLICATION_ID", &application_id)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "100")
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1"),
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("streamling must exit within the grace period after SIGTERM mid-bounded-scan");
+    assert!(
+        status.success(),
+        "SIGTERM during a bounded phase must be a clean exit (code 0), got: {:?}",
+        status.code()
+    );
+
+    // The scan ran for several seconds before the signal — some prefix of the
+    // table must have been drained into the sink. Completeness is NOT
+    // expected: ending the scan early is the point of the test.
+    let count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.bounded_sigterm_results")
+        .await
+        .expect("Failed to count sink rows");
+    assert!(
+        count > 0,
+        "sink must contain the drained prefix of the bounded scan"
+    );
+}
+
+// ============================================================================
 // Job mode: plugin sink terminal ack must finalize the terminal epoch
 // ============================================================================
 

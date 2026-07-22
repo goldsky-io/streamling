@@ -1577,6 +1577,14 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let mut query_retry_attempts: u32 = 0;
             let mut query_retry_backoff_ms: u64 = 100;
 
+            // Observe the process-wide shutdown signal between pages so a
+            // SIGTERM during a long bounded scan ends the stream at a page
+            // boundary instead of running the table to completion (and
+            // blowing the shutdown budget). Nothing past the last emitted
+            // page is checkpoint-covered, so a restart resumes from the last
+            // finalized cursor.
+            let shutdown = streamling_core::shutdown::subscribe();
+
             // Attach any buffered checkpoint messages to a batch about to be emitted.
             // Clears the buffer after attaching, so messages ride exactly one batch.
             let attach_checkpoints = {
@@ -1597,6 +1605,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
             };
 
             while !controller.is_done() {
+                if *shutdown.borrow() {
+                    info!(
+                        "[{}] shutdown requested; ending bounded scan early after {} page(s)",
+                        reference_name, page_count
+                    );
+                    break;
+                }
                 page_count += 1;
                 // Count-first sizing: probe the exact row count for the range the
                 // cursor covers and shrink the width to fit BEFORE the data read.
