@@ -1420,9 +1420,12 @@ impl ExecutionPlan for KafkaSourceExec {
                 // A shutdown requested before this iteration started (e.g.
                 // before the first poll, or while sending the previous batch)
                 // would not wake `changed()` below — the subscription has
-                // already observed the value. Check it explicitly; nothing is
-                // buffered at the top of an iteration, so exiting here drops
-                // no data.
+                // already observed the value. Check it explicitly. No DATA is
+                // buffered at the top of an iteration, but
+                // `checkpoint_messages_buffer` may hold Markers/Finalizers
+                // that arrived after the last batch was built (they ride the
+                // NEXT batch, which never comes) — the post-loop flush below
+                // delivers them on a synthetic batch.
                 if drain_and_stop || *global_shutdown_rx.borrow() {
                     info!("Kafka source '{}': shutdown requested; stopping", reference_name);
                     break 'outer;
@@ -1704,6 +1707,29 @@ impl ExecutionPlan for KafkaSourceExec {
                     }
                 }
                 metrics_recorder.record_elapsed_compute(outer_loop_start_at.elapsed(), metric_metadata_id.as_str());
+            }
+
+            // Flush any checkpoint messages buffered to ride the next batch —
+            // no exit path from the loop above produces one. Without this, a
+            // Marker/Finalizer that arrived after the last batch was built is
+            // silently dropped: the sinks never see it, the epoch cannot
+            // collect this branch's acks, and its offsets are never committed
+            // before teardown (replayed on restart, but the clean drain is
+            // lost). Mirrors the end-of-stream flush in the ClickHouse and
+            // hybrid sources.
+            {
+                let flush_batch = crate::table_providers::clickhouse::build_checkpoint_flush_batch(
+                    &mut checkpoint_messages_buffer,
+                    full_schema.clone(),
+                );
+                if let Some(batch) = flush_batch
+                    && tx.send(Ok(batch)).await.is_err()
+                {
+                    warn!(
+                        "Kafka source '{}': receiver dropped before final checkpoint flush",
+                        reference_name
+                    );
+                }
             }
 
             info!("Shutting down Kafka consumer: unsubscribing and unassigning");
