@@ -564,9 +564,15 @@ async fn test_postgres_dynamic_table_cache_loads_and_refreshes_after_append() {
         .await
         .expect("failed to begin seed transaction");
     lock_cached_table(&mut seed_transaction, "cached_members").await;
+    // Cross a cache-load page boundary during initial cache population.
     sqlx::query(
         "INSERT INTO public.cached_members (value, updated_at) \
-         VALUES ('initial', clock_timestamp())",
+         SELECT value, clock_timestamp() \
+         FROM ( \
+             SELECT 'seed_' || value::TEXT AS value \
+             FROM generate_series(1, 1000) AS seed(value) \
+             UNION ALL SELECT 'initial' \
+         ) seeded",
     )
     .execute(&mut *seed_transaction)
     .await

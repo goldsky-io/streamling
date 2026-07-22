@@ -985,9 +985,9 @@ transforms:
 ```
 
 The cache is off by default and is used only when both settings are present. The initial lookup
-loads the full table. Each later `dynamic_table_check` batch reads `MAX(time_column)` and appends
-only rows newer than the cached maximum. Index the time column so these checks and range reads stay
-cheap.
+loads the full table through bounded PostgreSQL cursor pages. Each later `dynamic_table_check`
+batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
+column so these checks and range reads stay cheap.
 
 PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
 existing membership, including removals, is not supported in this mode. Keeping `time_column` current

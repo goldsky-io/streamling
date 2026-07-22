@@ -23,6 +23,8 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 20;
 const DEFAULT_SCHEMA_NAME: &str = "streamling";
 const IDENTIFIER_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_]*$";
 const CACHE_WRITE_LOCK_QUERY: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+const CACHE_LOAD_CURSOR_NAME: &str = "streamling_dynamic_table_cache";
+const CACHE_LOAD_PAGE_SIZE: usize = 1_000;
 /// Statement timeout for each individual database query (30 seconds)
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -314,74 +316,101 @@ impl PostgresDynamicTableBackend {
     ) -> PostgresDynamicTableCache {
         // Serialized append-only writers assign CLOCK_TIMESTAMP after taking the
         // table lock; use a dedicated version cursor if that contract changes.
-        let query: Arc<str> = if updated_since.is_some() {
+        let max_query: Arc<str> = format!(
+            r#"SELECT MAX("{}")::TEXT FROM {}"#,
+            self.time_column_name, self.full_table_name
+        )
+        .into();
+        let declare_cursor_query: Arc<str> = if updated_since.is_some() {
             format!(
                 r#"
-                SELECT
-                    COALESCE(
-                        ARRAY_AGG("{}"::TEXT) FILTER (WHERE "{}" IS NOT NULL),
-                        ARRAY[]::TEXT[]
-                    ),
-                    (SELECT MAX("{}")::TEXT FROM {})
+                DECLARE {CACHE_LOAD_CURSOR_NAME} NO SCROLL CURSOR FOR
+                SELECT "{}"::TEXT
                 FROM {}
-                WHERE "{}" > $1::TIMESTAMPTZ
+                WHERE "{}" IS NOT NULL AND "{}" > $1::TIMESTAMPTZ
                 "#,
-                self.column_name,
-                self.column_name,
-                self.time_column_name,
-                self.full_table_name,
-                self.full_table_name,
-                self.time_column_name
+                self.column_name, self.full_table_name, self.column_name, self.time_column_name
             )
         } else {
             format!(
                 r#"
-                SELECT
-                    COALESCE(
-                        ARRAY_AGG("{}"::TEXT) FILTER (WHERE "{}" IS NOT NULL),
-                        ARRAY[]::TEXT[]
-                    ),
-                    MAX("{}")::TEXT
+                DECLARE {CACHE_LOAD_CURSOR_NAME} NO SCROLL CURSOR FOR
+                SELECT "{}"::TEXT
                 FROM {}
+                WHERE "{}" IS NOT NULL
                 "#,
-                self.column_name, self.column_name, self.time_column_name, self.full_table_name
+                self.column_name, self.full_table_name, self.column_name
             )
         }
         .into();
+        let fetch_page_query: Arc<str> =
+            format!("FETCH FORWARD {CACHE_LOAD_PAGE_SIZE} FROM {CACHE_LOAD_CURSOR_NAME}").into();
         let updated_since = updated_since.map(str::to_owned);
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
 
-        let (values, updated_at): (Vec<String>, Option<String>) =
-            retry_forever_with_backoff_async_returning(
-                || {
-                    let pool = pool.clone();
-                    let query = query.clone();
-                    let updated_since = updated_since.clone();
-                    let full_table_name = full_table_name.clone();
-                    async move {
-                        let sqlx_query = sqlx::query_as(query.as_ref());
-                        let sqlx_query = if let Some(updated_since) = updated_since {
-                            sqlx_query.bind(updated_since)
-                        } else {
-                            sqlx_query
-                        };
-                        sqlx_query
-                            .fetch_one(pool.as_ref())
+        retry_forever_with_backoff_async_returning(
+            || {
+                let pool = pool.clone();
+                let max_query = max_query.clone();
+                let declare_cursor_query = declare_cursor_query.clone();
+                let fetch_page_query = fetch_page_query.clone();
+                let updated_since = updated_since.clone();
+                let full_table_name = full_table_name.clone();
+                async move {
+                    let mut transaction = pool.begin().await.streamling_with_context(|| {
+                        format!("failed to begin cache load for table {full_table_name}")
+                    })?;
+                    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                        .execute(&mut *transaction)
+                        .await
+                        .streamling_with_context(|| {
+                            format!("failed to configure cache load for table {full_table_name}")
+                        })?;
+
+                    let updated_at = sqlx::query_scalar::<_, Option<String>>(max_query.as_ref())
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .streamling_with_context(|| {
+                            format!("failed to read cache version from table {full_table_name}")
+                        })?;
+
+                    let cursor_query = sqlx::query(declare_cursor_query.as_ref());
+                    let cursor_query = if let Some(updated_since) = updated_since {
+                        cursor_query.bind(updated_since)
+                    } else {
+                        cursor_query
+                    };
+                    cursor_query
+                        .execute(&mut *transaction)
+                        .await
+                        .streamling_with_context(|| {
+                            format!("failed to open cache cursor for table {full_table_name}")
+                        })?;
+
+                    let mut values = HashSet::new();
+                    loop {
+                        let page: Vec<String> = sqlx::query_scalar(fetch_page_query.as_ref())
+                            .fetch_all(&mut *transaction)
                             .await
                             .streamling_with_context(|| {
-                                format!("failed to load cache from table {full_table_name}")
-                            })
+                                format!("failed to fetch cache page from table {full_table_name}")
+                            })?;
+                        if page.is_empty() {
+                            break;
+                        }
+                        values.extend(page.into_iter().map(String::into_boxed_str));
                     }
-                },
-                &operation_name,
-            )
-            .await;
 
-        PostgresDynamicTableCache {
-            updated_at,
-            values: values.into_iter().map(String::into_boxed_str).collect(),
-        }
+                    transaction.commit().await.streamling_with_context(|| {
+                        format!("failed to finish cache load for table {full_table_name}")
+                    })?;
+                    Ok(PostgresDynamicTableCache { updated_at, values })
+                }
+            },
+            &operation_name,
+        )
+        .await
     }
 
     async fn refresh_cache(&self, pool: Arc<PgPool>) {
