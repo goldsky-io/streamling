@@ -226,7 +226,14 @@ impl PostgresDynamicTableBackendFactory {
 #[derive(Debug)]
 struct PostgresDynamicTableCache {
     updated_at: Option<String>,
-    values: Arc<HashSet<Box<str>>>,
+    values: HashSet<Box<str>>,
+}
+
+impl PostgresDynamicTableCache {
+    fn append(&mut self, update: Self) {
+        self.updated_at = update.updated_at;
+        self.values.extend(update.values);
+    }
 }
 
 /// A lightweight PostgreSQL backend instance that shares the connection pool
@@ -300,20 +307,48 @@ impl PostgresDynamicTableBackend {
         .await
     }
 
-    async fn load_cache(&self, pool: Arc<PgPool>) -> PostgresDynamicTableCache {
-        let query: Arc<str> = format!(
-            r#"
-            SELECT
-                COALESCE(
-                    ARRAY_AGG("{}"::TEXT) FILTER (WHERE "{}" IS NOT NULL),
-                    ARRAY[]::TEXT[]
-                ),
-                MAX("{}")::TEXT
-            FROM {}
-            "#,
-            self.column_name, self.column_name, self.time_column_name, self.full_table_name
-        )
+    async fn load_cache(
+        &self,
+        pool: Arc<PgPool>,
+        updated_since: Option<&str>,
+    ) -> PostgresDynamicTableCache {
+        // ponytail: serialized append-only writers assign CLOCK_TIMESTAMP after taking the
+        // table lock; use a dedicated version cursor if that contract changes.
+        let query: Arc<str> = if updated_since.is_some() {
+            format!(
+                r#"
+                SELECT
+                    COALESCE(
+                        ARRAY_AGG("{}"::TEXT) FILTER (WHERE "{}" IS NOT NULL),
+                        ARRAY[]::TEXT[]
+                    ),
+                    (SELECT MAX("{}")::TEXT FROM {})
+                FROM {}
+                WHERE "{}" > $1::TIMESTAMPTZ
+                "#,
+                self.column_name,
+                self.column_name,
+                self.time_column_name,
+                self.full_table_name,
+                self.full_table_name,
+                self.time_column_name
+            )
+        } else {
+            format!(
+                r#"
+                SELECT
+                    COALESCE(
+                        ARRAY_AGG("{}"::TEXT) FILTER (WHERE "{}" IS NOT NULL),
+                        ARRAY[]::TEXT[]
+                    ),
+                    MAX("{}")::TEXT
+                FROM {}
+                "#,
+                self.column_name, self.column_name, self.time_column_name, self.full_table_name
+            )
+        }
         .into();
+        let updated_since = updated_since.map(str::to_owned);
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
 
@@ -322,9 +357,16 @@ impl PostgresDynamicTableBackend {
                 || {
                     let pool = pool.clone();
                     let query = query.clone();
+                    let updated_since = updated_since.clone();
                     let full_table_name = full_table_name.clone();
                     async move {
-                        sqlx::query_as(query.as_ref())
+                        let sqlx_query = sqlx::query_as(query.as_ref());
+                        let sqlx_query = if let Some(updated_since) = updated_since {
+                            sqlx_query.bind(updated_since)
+                        } else {
+                            sqlx_query
+                        };
+                        sqlx_query
                             .fetch_one(pool.as_ref())
                             .await
                             .streamling_with_context(|| {
@@ -338,34 +380,63 @@ impl PostgresDynamicTableBackend {
 
         PostgresDynamicTableCache {
             updated_at,
-            values: Arc::new(values.into_iter().map(String::into_boxed_str).collect()),
+            values: values.into_iter().map(String::into_boxed_str).collect(),
         }
     }
 
-    async fn cached_values(&self, pool: Arc<PgPool>) -> Arc<HashSet<Box<str>>> {
+    async fn refresh_cache(&self, pool: Arc<PgPool>) {
         let cache = self
             .cache
             .as_ref()
-            .expect("cache is present when cached_values is called");
+            .expect("cache is present when refresh_cache is called");
         let updated_at = self.latest_update(pool.clone()).await;
 
         if let Some(cached) = cache.read().await.as_ref()
             && cached.updated_at == updated_at
         {
-            return cached.values.clone();
+            return;
         }
 
         let mut cached = cache.write().await;
         if let Some(current) = cached.as_ref()
             && current.updated_at == updated_at
         {
-            return current.values.clone();
+            return;
         }
 
-        let refreshed = self.load_cache(pool).await;
-        let values = refreshed.values.clone();
-        *cached = Some(refreshed);
-        values
+        let updated_since = cached
+            .as_ref()
+            .and_then(|current| current.updated_at.as_deref())
+            .map(str::to_owned);
+        let refreshed = self.load_cache(pool, updated_since.as_deref()).await;
+
+        if let Some(current) = cached.as_mut() {
+            current.append(refreshed);
+        } else {
+            *cached = Some(refreshed);
+        }
+    }
+
+    fn build_contains_result(
+        &self,
+        string_array: &StringArray,
+        existing_set: &HashSet<Box<str>>,
+    ) -> ArrayRef {
+        let mut builder = BooleanBuilder::with_capacity(string_array.len());
+        for i in 0..string_array.len() {
+            if string_array.is_null(i) {
+                builder.append_null();
+            } else {
+                let value = string_array.value(i);
+                let contains_value = existing_set.contains(value);
+                builder.append_value(contains_value);
+                trace!(
+                    "[contains] for table name '{}' with value '{}' result '{:?}'",
+                    self.full_table_name, value, contains_value
+                );
+            }
+        }
+        Arc::new(builder.finish())
     }
 
     async fn validate_cache_time_column(
@@ -373,8 +444,8 @@ impl PostgresDynamicTableBackend {
         pool: &PgPool,
     ) -> Result<(), DynamicTableBackendError> {
         let query = format!(
-            r#"SELECT MAX("{}")::TEXT FROM {} WHERE FALSE"#,
-            self.time_column_name, self.full_table_name
+            r#"SELECT MAX("{}")::TEXT FROM {} WHERE "{}" >= CURRENT_TIMESTAMP AND FALSE"#,
+            self.time_column_name, self.full_table_name, self.time_column_name
         );
 
         sqlx::query(&query).execute(pool).await.map_err(|e| {
@@ -793,7 +864,18 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             .downcast_ref::<StringArray>()
             .ok_or(DynamicTableBackendError::StringArrayExpected)?;
 
-        // Collect non-null values with their indices (owned strings for retry)
+        if let Some(cache) = &self.cache {
+            // Check for table changes on every invocation, including empty/all-null batches.
+            self.refresh_cache(pool).await;
+            let cached = cache.read().await;
+            let existing_set = &cached
+                .as_ref()
+                .expect("cache is loaded after refresh_cache")
+                .values;
+            return Ok(self.build_contains_result(string_array, existing_set));
+        }
+
+        // Uncached queries need owned strings for retries.
         let value_indices: Vec<(usize, String)> = (0..string_array.len())
             .filter_map(|i| {
                 if !string_array.is_null(i) {
@@ -804,77 +886,46 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             })
             .collect();
 
-        // Check for table changes on every invocation, including empty/all-null batches.
-        let cached_values = if self.cache.is_some() {
-            Some(self.cached_values(pool.clone()).await)
-        } else {
-            None
-        };
-
-        let mut builder = BooleanBuilder::with_capacity(string_array.len());
-
         if value_indices.is_empty() {
-            // Handle case where all values are null
-            for _ in 0..string_array.len() {
-                builder.append_null();
-            }
-        } else {
-            // Use the opt-in full-table cache, otherwise query only the requested values.
-            let existing_set = if let Some(cached_values) = cached_values {
-                cached_values
-            } else if value_indices.len() <= self.max_batch_size {
-                // Single batch - process directly
-                Arc::new(self.contains_batch(pool, value_indices).await)
-            } else {
-                // Split into multiple batches and process concurrently
-                let chunks: Vec<Vec<(usize, String)>> = value_indices
-                    .chunks(self.max_batch_size)
-                    .map(|chunk| chunk.to_vec())
-                    .collect();
-
-                trace!(
-                    "Splitting {} values into {} concurrent batches for contains() on table {}",
-                    chunks.iter().map(|c| c.len()).sum::<usize>(),
-                    chunks.len(),
-                    self.full_table_name
-                );
-
-                // Process all chunks concurrently
-                let futures: Vec<_> = chunks
-                    .into_iter()
-                    .map(|chunk| {
-                        let pool = pool.clone();
-                        async move { self.contains_batch(pool, chunk).await }
-                    })
-                    .collect();
-
-                // Wait for all batches to complete and combine results
-                let results = join_all(futures).await;
-                let mut combined_set = HashSet::new();
-                for chunk_set in results {
-                    combined_set.extend(chunk_set);
-                }
-                Arc::new(combined_set)
-            };
-
-            // Build result array maintaining original order
-            for i in 0..string_array.len() {
-                if string_array.is_null(i) {
-                    builder.append_null();
-                } else {
-                    let value = string_array.value(i);
-                    let contains_value = existing_set.contains(value);
-                    builder.append_value(contains_value);
-                    trace!(
-                        "[contains] for table name '{}' with value '{}' result '{:?}'",
-                        self.full_table_name, value, contains_value
-                    );
-                }
-            }
+            return Ok(self.build_contains_result(string_array, &HashSet::new()));
         }
 
-        let boolean_array = builder.finish();
-        Ok(Arc::new(boolean_array))
+        let existing_set = if value_indices.len() <= self.max_batch_size {
+            // Single batch - process directly
+            self.contains_batch(pool, value_indices).await
+        } else {
+            // Split into multiple batches and process concurrently
+            let chunks: Vec<Vec<(usize, String)>> = value_indices
+                .chunks(self.max_batch_size)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+
+            trace!(
+                "Splitting {} values into {} concurrent batches for contains() on table {}",
+                chunks.iter().map(|c| c.len()).sum::<usize>(),
+                chunks.len(),
+                self.full_table_name
+            );
+
+            // Process all chunks concurrently
+            let futures: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let pool = pool.clone();
+                    async move { self.contains_batch(pool, chunk).await }
+                })
+                .collect();
+
+            // Wait for all batches to complete and combine results
+            let results = join_all(futures).await;
+            let mut combined_set = HashSet::new();
+            for chunk_set in results {
+                combined_set.extend(chunk_set);
+            }
+            combined_set
+        };
+
+        Ok(self.build_contains_result(string_array, &existing_set))
     }
 }
 
@@ -894,6 +945,25 @@ mod tests {
             dt_schema_name: None,
             cache_enabled,
         }
+    }
+
+    #[test]
+    fn cache_append_preserves_existing_values() {
+        let mut cache = PostgresDynamicTableCache {
+            updated_at: Some("old".to_string()),
+            values: HashSet::from([Box::<str>::from("existing")]),
+        };
+        let update = PostgresDynamicTableCache {
+            updated_at: Some("new".to_string()),
+            values: HashSet::from([Box::<str>::from("appended")]),
+        };
+
+        cache.append(update);
+
+        assert_eq!(cache.updated_at.as_deref(), Some("new"));
+        assert_eq!(cache.values.len(), 2);
+        assert!(cache.values.contains("existing"));
+        assert!(cache.values.contains("appended"));
     }
 
     #[tokio::test]

@@ -162,7 +162,7 @@ pub struct PostgresDynamicTableBackendConfig {
     pub sslmode: String,
     pub max_connections: Option<u32>,
     pub dt_schema_name: Option<String>,
-    /// Enables full-table caching for dynamic tables that explicitly set `time_column`.
+    /// Enables incremental in-memory caching for dynamic tables that explicitly set `time_column`.
     #[serde(default)]
     pub cache_enabled: bool,
 }

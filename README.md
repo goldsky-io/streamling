@@ -964,7 +964,7 @@ transforms:
     backend_entity_name: persistent_data
 ```
 
-Enable the full-table cache in the application config (or with
+Enable the in-memory cache in the application config (or with
 `STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_ENABLED=true`):
 
 ```yaml
@@ -984,11 +984,12 @@ transforms:
     time_column: updated_at
 ```
 
-The cache is off by default and is used only when both settings are present. Each
-`dynamic_table_check` batch reads only `MAX(time_column)` and reloads the cache when it changes.
-Index the time column so this check stays cheap.
+The cache is off by default and is used only when both settings are present. The initial lookup
+loads the full table. Each later `dynamic_table_check` batch reads `MAX(time_column)` and appends
+only rows newer than the cached maximum. Index the time column so these checks and range reads stay
+cheap.
 
-PostgreSQL dynamic tables are append-only when the full-table cache is enabled. Updating or deleting
+PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
 existing membership, including removals, is not supported in this mode. Keeping `time_column` current
 is a user requirement and part of the cache's correctness contract. Every process that appends table
 membership must use the same serialized-writer protocol:
