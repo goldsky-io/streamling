@@ -973,7 +973,7 @@ dynamic_table_backend:
     cache_enabled: true
 ```
 
-Then set `time_column` on each backing table whose timestamp advances on every change:
+Then set `time_column` on each backing table whose timestamp advances on every append:
 
 ```yaml
 transforms:
@@ -988,33 +988,31 @@ The cache is off by default and is used only when both settings are present. Eac
 `dynamic_table_check` batch reads only `MAX(time_column)` and reloads the cache when it changes.
 Index the time column so this check stays cheap.
 
-Keeping `time_column` current is a user requirement and part of the cache's correctness contract.
-Every process that can insert, update, or delete table membership must use the same serialized-writer
-protocol:
+PostgreSQL dynamic tables are append-only when the full-table cache is enabled. Updating or deleting
+existing membership, including removals, is not supported in this mode. Keeping `time_column` current
+is a user requirement and part of the cache's correctness contract. Every process that appends table
+membership must use the same serialized-writer protocol:
 
 ```sql
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtextextended('public.persistent_data', 0));
--- Perform the mutation and assign updated_at after taking the lock.
-UPDATE public.persistent_data
-SET value = 'new-value', updated_at = clock_timestamp()
-WHERE value = 'old-value';
+INSERT INTO public.persistent_data (value, updated_at)
+VALUES ('new-value', clock_timestamp())
+ON CONFLICT (value) DO NOTHING;
 COMMIT;
 ```
 
 Use the schema-qualified table name as the lock key, exactly as shown. Transaction-scoped advisory
-locks coordinate only writers that follow this protocol. The mutation must atomically make
-`MAX(time_column)` different; normally it should set a non-null timestamp strictly newer than the
-previous maximum. For a physical delete, also bump a surviving row or retained change-marker row in
-the same transaction. `NOW()` and `CURRENT_TIMESTAMP` are unsafe here because PostgreSQL fixes them
-at transaction start, which can precede waiting for the writer lock; use `clock_timestamp()` after
-the lock instead.
+locks coordinate only writers that follow this protocol. Each successful append must atomically make
+`MAX(time_column)` different by assigning a non-null timestamp strictly newer than the previous
+maximum. `NOW()` and `CURRENT_TIMESTAMP` are unsafe here because PostgreSQL fixes them at transaction
+start, which can precede waiting for the writer lock; use `clock_timestamp()` after the lock instead.
 
 Streamling takes this lock automatically for its own cached appends and creates new backing tables
 with `updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()`. It does not alter existing tables.
 Tables created by older Streamling versions with nullable `TIMESTAMPTZ DEFAULT NOW()` need no schema
 or data migration: cached Streamling appends explicitly write `clock_timestamp()` after taking the
-lock. Future mutations from other writers must still follow the protocol above. Cache initialization
+lock. Future appends from other writers must still follow the protocol above. Cache initialization
 checks that the configured column exists and supports `MAX`, but it cannot verify that other writers
 obey the protocol. If that cannot be guaranteed, leave caching disabled; uncached tables continue to
 use batched PostgreSQL lookups.

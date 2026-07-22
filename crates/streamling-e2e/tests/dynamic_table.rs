@@ -536,7 +536,7 @@ async fn test_postgres_dynamic_table_cache_flag_preserves_uncached_legacy_table(
 }
 
 #[tokio::test]
-async fn test_postgres_dynamic_table_cache_loads_and_refreshes_membership() {
+async fn test_postgres_dynamic_table_cache_loads_and_refreshes_after_append() {
     init_tracing();
 
     let ctx = TestContext::new()
@@ -585,38 +585,37 @@ async fn test_postgres_dynamic_table_cache_loads_and_refreshes_membership() {
         &pipeline,
         cached_postgres_opts(&ctx, 3, Duration::from_secs(45)),
     );
-    let mutation_fut = async {
+    let append_fut = async {
         wait_for_count(&ctx, "cache_refresh_output", 1).await;
         let mut transaction = ctx
             .postgres
             .pool()
             .begin()
             .await
-            .expect("failed to begin update transaction");
+            .expect("failed to begin append transaction");
         lock_cached_table(&mut transaction, "cached_members").await;
         sqlx::query(
-            "UPDATE public.cached_members \
-             SET value = 'replacement', updated_at = clock_timestamp() \
-             WHERE value = 'initial'",
+            "INSERT INTO public.cached_members (value, updated_at) \
+             VALUES ('appended_member', clock_timestamp())",
         )
         .execute(&mut *transaction)
         .await
-        .expect("failed to update dynamic table and its time column");
+        .expect("failed to append dynamic table value and its time column");
         transaction
             .commit()
             .await
-            .expect("failed to commit dynamic-table update");
+            .expect("failed to commit dynamic-table append");
         ctx.kafka
-            .produce_avro_records(&[record("replacement"), record("not_a_member")])
+            .produce_avro_records(&[record("appended_member"), record("not_a_member")])
             .await
             .expect("failed to produce refreshed records");
     };
 
-    let (status, ()) = tokio::join!(pipeline_fut, mutation_fut);
+    let (status, ()) = tokio::join!(pipeline_fut, append_fut);
     let status = status.expect("pipeline failed");
     assert!(status.success(), "pipeline should exit successfully");
     assert_eq!(
         output_ids(&ctx, "cache_refresh_output").await,
-        ["initial", "replacement"]
+        ["appended_member", "initial"]
     );
 }
