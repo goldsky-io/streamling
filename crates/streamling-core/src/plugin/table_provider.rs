@@ -26,6 +26,7 @@ use crate::telemetry::recorder::get_metrics_recorder;
 use crate::topology::Telemetry;
 use crate::utils::metrics::metric_metadata_id_to_reference_name;
 use abi_stable::nonexhaustive_enum::NonExhaustive;
+use crossbeam::channel::TryRecvError;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -475,6 +476,57 @@ impl DataSink for PluginSink {
             self.metric_metadata_id.clone(),
         ));
 
+        // Forward plugin checkpoint acks to the coordinator independently of
+        // batch arrival. An ack lands on the plugin output channel only after
+        // the plugin's durable flush completes, and the terminal marker rides
+        // the LAST batch — so an ack drained only from inside the batch loop
+        // is never picked up: the loop is parked on a stream that ends only
+        // once the coordinator finalizes the terminal epoch, which needs this
+        // very ack. A dedicated task breaks that cycle. Same polling pattern
+        // as process_plugin_metrics (the channel is a sync crossbeam channel;
+        // a blocking recv() here would pin an executor thread); exits when the
+        // plugin output channel disconnects at plugin teardown.
+        let ack_receiver = self.plugin_channels.output.receiver.clone();
+        let sink_id = metric_metadata_id_to_reference_name(&self.metric_metadata_id)
+            .unwrap_or_else(|| self.metric_metadata_id.clone());
+        tokio::spawn(async move {
+            loop {
+                match ack_receiver.try_recv() {
+                    Ok(message) => match message.into_enum() {
+                        Ok(PluginMsg::CheckpointAck { epoch }) => {
+                            debug!(
+                                "Propagating checkpoint Ack with epoch {} from plugin",
+                                epoch.0
+                            );
+                            if let Err(e) = send(
+                                CHECKPOINT_COORDINATOR_CHANNEL,
+                                CheckpointMessage::Ack {
+                                    epoch: CheckpointEpoch(epoch.0),
+                                    sink_id: sink_id.clone(),
+                                },
+                            ) {
+                                warn!(
+                                    "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
+                                    epoch.0, e
+                                );
+                                break;
+                            }
+                        }
+                        _ => {
+                            warn!("Received unexpected message from plugin channel");
+                        }
+                    },
+                    Err(TryRecvError::Empty) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        debug!("Plugin output channel disconnected, stopping ack forwarder");
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut row_count = 0;
 
         self.plugin_channels
@@ -545,35 +597,8 @@ impl DataSink for PluginSink {
                 }
             }
 
-            if !self.plugin_channels.output.receiver.is_empty()
-                && let Ok(message) = self.plugin_channels.output.receiver.recv()
-            {
-                match message.into_enum() {
-                    Ok(PluginMsg::CheckpointAck { epoch }) => {
-                        debug!(
-                            "Propagating checkpoint Ack with epoch {} from plugin",
-                            epoch.0
-                        );
-
-                        let sink_id =
-                            metric_metadata_id_to_reference_name(&self.metric_metadata_id)
-                                .unwrap_or_else(|| self.metric_metadata_id.clone());
-                        send(
-                            CHECKPOINT_COORDINATOR_CHANNEL,
-                            CheckpointMessage::Ack {
-                                epoch: CheckpointEpoch(epoch.0),
-                                sink_id,
-                            },
-                        )
-                        .unwrap();
-                    }
-                    _ => {
-                        warn!("Received unexpected message from plugin channel");
-                    }
-                }
-            }
-
-            // Metrics are now handled by a separate task spawned above
+            // Checkpoint acks and metrics are handled by the dedicated tasks
+            // spawned above — nothing to drain per-batch here.
 
             if let Some(num_records_before_stop) = self.num_records_before_stop
                 && row_count >= num_records_before_stop as usize
@@ -670,5 +695,120 @@ impl TableProvider for PluginSinkProvider {
             self.telemetry.as_ref(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, telemetry_sink, None)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoints::checkpoint_management::now_ms;
+    use abi_stable::external_types::crossbeam_channel as ffi_channel;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use serial_test::serial;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use streamling_plugin::ffi::{PluginChannel, PluginMetricsChannel};
+
+    fn test_channels() -> Arc<PluginChannels> {
+        Arc::new(PluginChannels {
+            input: PluginChannel::new(ffi_channel::bounded(64)),
+            output: PluginChannel::new(ffi_channel::bounded(64)),
+            metrics: PluginMetricsChannel::new(ffi_channel::bounded(64)),
+        })
+    }
+
+    /// Regression: in job mode the terminal checkpoint marker rides the LAST
+    /// batch, so the plugin's `CheckpointAck` lands on the output channel only
+    /// after `write_all`'s batch loop has already parked on the exhausted
+    /// stream. Ack propagation must therefore not be coupled to batch arrival:
+    /// the coordinator has to receive the ack even though no further batch
+    /// ever shows up (the upstream source is itself waiting on epoch
+    /// finalization before ending its stream).
+    ///
+    /// `#[serial]`: the coordinator channel is a process-wide global.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_sink_forwards_ack_that_arrives_after_the_last_batch() {
+        let channels = test_channels();
+        let (coordinator_rx, coordinator_sub_id) =
+            subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+
+        // Fake plugin: consume the input channel; when the checkpoint marker
+        // arrives, ack it only after a delay — strictly after the sink's
+        // batch loop has seen stream end. Exits when the input channel closes.
+        let plugin_input_rx = channels.input.receiver.clone();
+        let plugin_output_tx = channels.output.sender.clone();
+        let fake_plugin = std::thread::spawn(move || {
+            while let Ok(msg) = plugin_input_rx.recv() {
+                if let Ok(PluginMsg::CheckpointMarker { epoch }) = msg.into_enum() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    plugin_output_tx
+                        .send(NonExhaustive::new(PluginMsg::CheckpointAck { epoch }))
+                        .expect("test plugin failed to send ack");
+                    break;
+                }
+            }
+        });
+
+        // A single (final) batch carrying the terminal marker in its metadata.
+        let mut metadata = HashMap::new();
+        enrich_batch_metadata_with_checkpoints(
+            &mut metadata,
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(1),
+                created_at_ms: now_ms(),
+            }],
+        );
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            metadata,
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("failed to build test batch");
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+
+        let sink = PluginSink::new(
+            schema,
+            channels.clone(),
+            None,
+            "plugin::ack_after_last_batch_sink".to_string(),
+        );
+        let task_ctx = Arc::new(TaskContext::default());
+        let rows = tokio::time::timeout(Duration::from_secs(10), sink.write_all(stream, &task_ctx))
+            .await
+            .expect("write_all must complete once its input stream ends")
+            .expect("write_all failed");
+        assert_eq!(rows, 1);
+
+        // The ack must reach the coordinator even though no further batch
+        // arrives after the marker.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (epoch, sink_id) = loop {
+            match coordinator_rx.try_recv() {
+                Ok(CheckpointMessage::Ack { epoch, sink_id }) => break (epoch, sink_id),
+                Ok(_) => {} // unrelated coordinator traffic
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "coordinator never received the plugin's checkpoint ack — \
+                         ack propagation is coupled to batch arrival again"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        assert_eq!(epoch, CheckpointEpoch(1));
+        assert_eq!(sink_id, "ack_after_last_batch_sink");
+
+        unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, coordinator_sub_id);
+        fake_plugin.join().expect("test plugin thread panicked");
     }
 }

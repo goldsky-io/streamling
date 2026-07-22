@@ -379,3 +379,161 @@ sinks:
          before SIGTERM was dropped mid-drain"
     );
 }
+
+// ============================================================================
+// Job mode: plugin sink terminal ack must finalize the terminal epoch
+// ============================================================================
+
+/// Build the in-repo example plugin (`plugin_examples/basic`, registers the
+/// `print_sink` sink plugin) as a cdylib and return the shared-library path.
+/// It lives in its own cargo workspace, so this is a separate (cached) build.
+async fn build_basic_example_plugin() -> std::path::PathBuf {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/streamling-e2e must sit two levels below the repo root")
+        .to_path_buf();
+    let plugin_dir = repo_root.join("plugin_examples/basic");
+
+    let status = tokio::process::Command::new("cargo")
+        .args(["build", "--lib"])
+        .current_dir(&plugin_dir)
+        .status()
+        .await
+        .expect("failed to invoke cargo build for plugin_examples/basic");
+    assert!(status.success(), "building plugin_examples/basic failed");
+
+    let debug_dir = plugin_dir.join("target/debug");
+    [
+        "libplugin_example_basic.so",
+        "libplugin_example_basic.dylib",
+    ]
+    .iter()
+    .map(|name| debug_dir.join(name))
+    .find(|p| p.exists())
+    .expect("built plugin cdylib not found in plugin_examples/basic/target/debug")
+}
+
+/// Job-mode pipelines with FFI plugin sinks must terminate: the terminal
+/// checkpoint marker rides the LAST batch of the stream, and the plugin's
+/// `CheckpointAck` reaches the host only after the plugin has processed the
+/// marker — strictly after the sink's batch loop has parked on the exhausted
+/// stream. The ack must still be forwarded to the checkpoint coordinator so
+/// the terminal epoch finalizes and the process exits.
+///
+/// Regression: ack propagation used to happen only from inside the sink's
+/// batch loop (at most one ack per incoming batch), so the terminal ack was
+/// never drained — the coordinator retried "Checkpoint epoch 1 timed out"
+/// forever and the job hung until an external kill. Streaming pipelines
+/// masked this because continuous batches kept draining the channel.
+#[tokio::test]
+async fn test_job_mode_plugin_sink_terminal_ack_exits() {
+    init_tracing();
+
+    let plugin_lib = build_basic_example_plugin().await;
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    // Small bounded table: the whole job completes within a few batches, so
+    // the terminal marker rides the last (often only) batch the sink sees.
+    clickhouse
+        .execute(
+            "CREATE TABLE plugin_drain_source (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+    let inserts = (1..=20)
+        .map(|i| format!("({i}, 'p_{i:04}', 'plugin_branch', {}, 0)", 100 + i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    clickhouse
+        .execute(&format!("INSERT INTO plugin_drain_source VALUES {inserts}"))
+        .await
+        .expect("Failed to insert into ClickHouse table");
+
+    // Hybrid source scaffolding: the unbounded Kafka phase is never consumed
+    // in job mode but the provider is constructed at topology build time.
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_plugin_drain (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let application_id = format!("plugin_drain_{}", ctx.test_id);
+
+    // `print_sink` is not a built-in sink type, so the config resolves it as
+    // a plugin sink and binds it to the plugin registered under that id.
+    let pipeline = format!(
+        r#"
+sources:
+  source_a:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: plugin_drain_source
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {topic}
+      table_name: kafka_offsets_plugin_drain
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  sink_a:
+    type: print_sink
+    from: source_a
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    // No record limit: termination is bounded-phase completion + job mode.
+    // A regression wedges the process on terminal-epoch finalization, so the
+    // harness timeout is the failure detector — keep it well below the suite
+    // timeout so a hang fails fast instead of stalling CI.
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .timeout(std::time::Duration::from_secs(120))
+                .env("STREAMLING__JOB_MODE", "true")
+                .env("STREAMLING__APPLICATION_ID", &application_id)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "10")
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+                .env(
+                    "STREAMLING__PLUGIN__PATH",
+                    plugin_lib.to_string_lossy().as_ref(),
+                ),
+        )
+        .await
+        .expect("Pipeline execution failed (hang on terminal ack, or crash)");
+    assert!(
+        status.success(),
+        "job-mode pipeline with a plugin sink must exit 0 after the terminal \
+         checkpoint finalizes"
+    );
+}
