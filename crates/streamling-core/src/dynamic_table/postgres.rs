@@ -11,11 +11,12 @@ use regex::Regex;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Executor, PgPool, Postgres};
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use streamling_config::app_config::PostgresDynamicTableBackendConfig;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, RwLock};
 use tracing::{debug, error, info, trace};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
@@ -194,16 +195,16 @@ impl PostgresDynamicTableBackendFactory {
             err
         })?;
 
-        // Use provided time_column or default to "updated_at"
-        let time_column_name = time_column.unwrap_or_else(|| "updated_at".to_string());
-        Self::validate_identifier(&time_column_name).map_err(|e| {
-            let err = DynamicTableBackendError::Initialization(format!(
-                "Invalid time column name: {}",
-                e
-            ));
-            error!("{}", err);
-            err
-        })?;
+        if let Some(time_column_name) = &time_column {
+            Self::validate_identifier(time_column_name).map_err(|e| {
+                let err = DynamicTableBackendError::Initialization(format!(
+                    "Invalid time column name: {}",
+                    e
+                ));
+                error!("{}", err);
+                err
+            })?;
+        }
 
         let full_table_name = format!("{}.{}", schema_name, backend_entity_name);
         trace!("Full table name: {}", full_table_name);
@@ -215,10 +216,16 @@ impl PostgresDynamicTableBackendFactory {
             full_table_name,
             schema_name,
             column_name,
-            time_column_name,
+            time_column,
             max_batch_size,
         ))
     }
+}
+
+#[derive(Debug)]
+struct PostgresDynamicTableCache {
+    updated_at: Option<String>,
+    values: Arc<HashSet<Box<str>>>,
 }
 
 /// A lightweight PostgreSQL backend instance that shares the connection pool
@@ -230,6 +237,7 @@ pub struct PostgresDynamicTableBackend {
     dt_schema_name: String,
     column_name: String,
     time_column_name: String,
+    cache: Option<RwLock<Option<PostgresDynamicTableCache>>>,
     max_batch_size: usize,
 }
 
@@ -240,13 +248,16 @@ impl PostgresDynamicTableBackend {
         full_table_name: String,
         dt_schema_name: String,
         column_name: String,
-        time_column_name: String,
+        time_column_name: Option<String>,
         max_batch_size: usize,
     ) -> Self {
         debug!(
             "Creating PostgreSQL dynamic table backend instance for table: {}",
             full_table_name
         );
+
+        let cache = (config.cache_enabled && time_column_name.is_some()).then(|| RwLock::new(None));
+        let time_column_name = time_column_name.unwrap_or_else(|| "updated_at".to_string());
 
         Self {
             pool,
@@ -255,8 +266,105 @@ impl PostgresDynamicTableBackend {
             dt_schema_name,
             column_name,
             time_column_name,
+            cache,
             max_batch_size,
         }
+    }
+
+    async fn latest_update(&self, pool: Arc<PgPool>) -> Option<String> {
+        let query: Arc<str> = format!(
+            r#"SELECT MAX("{}")::TEXT FROM {}"#,
+            self.time_column_name, self.full_table_name
+        )
+        .into();
+        let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
+        let operation_name = format!("DynamicTable latest_update ({})", self.full_table_name);
+
+        retry_forever_with_backoff_async_returning(
+            || {
+                let pool = pool.clone();
+                let query = query.clone();
+                let full_table_name = full_table_name.clone();
+                async move {
+                    sqlx::query_scalar::<_, Option<String>>(query.as_ref())
+                        .fetch_one(pool.as_ref())
+                        .await
+                        .streamling_with_context(|| {
+                            format!("failed to read latest update from table {full_table_name}")
+                        })
+                }
+            },
+            &operation_name,
+        )
+        .await
+    }
+
+    async fn load_cache(&self, pool: Arc<PgPool>) -> PostgresDynamicTableCache {
+        let query: Arc<str> = format!(
+            r#"
+            SELECT
+                COALESCE(
+                    ARRAY_AGG("{}"::TEXT) FILTER (WHERE "{}" IS NOT NULL),
+                    ARRAY[]::TEXT[]
+                ),
+                MAX("{}")::TEXT
+            FROM {}
+            "#,
+            self.column_name, self.column_name, self.time_column_name, self.full_table_name
+        )
+        .into();
+        let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
+        let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
+
+        let (values, updated_at): (Vec<String>, Option<String>) =
+            retry_forever_with_backoff_async_returning(
+                || {
+                    let pool = pool.clone();
+                    let query = query.clone();
+                    let full_table_name = full_table_name.clone();
+                    async move {
+                        sqlx::query_as(query.as_ref())
+                            .fetch_one(pool.as_ref())
+                            .await
+                            .streamling_with_context(|| {
+                                format!("failed to load cache from table {full_table_name}")
+                            })
+                    }
+                },
+                &operation_name,
+            )
+            .await;
+
+        PostgresDynamicTableCache {
+            updated_at,
+            values: Arc::new(values.into_iter().map(String::into_boxed_str).collect()),
+        }
+    }
+
+    async fn cached_values(&self, pool: Arc<PgPool>) -> Arc<HashSet<Box<str>>> {
+        let cache = self
+            .cache
+            .as_ref()
+            .expect("cache is present when cached_values is called");
+        let updated_at = self.latest_update(pool.clone()).await;
+
+        if let Some(cached) = cache.read().await.as_ref()
+            && cached.updated_at == updated_at
+        {
+            return cached.values.clone();
+        }
+
+        let mut cached = cache.write().await;
+        if let Some(current) = cached.as_ref()
+            && current.updated_at == updated_at
+        {
+            return current.values.clone();
+        }
+
+        let refreshed = self.load_cache(pool).await;
+        let values = refreshed.values.clone();
+        *cached = Some(refreshed);
+        values
     }
 
     /// Check if a batch of values exist in the table (internal method that doesn't split batches)
@@ -266,9 +374,9 @@ impl PostgresDynamicTableBackend {
         &self,
         pool: Arc<PgPool>,
         value_indices: Vec<(usize, String)>,
-    ) -> std::collections::HashSet<String> {
+    ) -> HashSet<Box<str>> {
         if value_indices.is_empty() {
-            return std::collections::HashSet::new();
+            return HashSet::new();
         }
 
         // Wrap in Arc once before the retry loop to avoid cloning Vec on each retry
@@ -316,7 +424,10 @@ impl PostgresDynamicTableBackend {
                             )
                         })?;
 
-                    Ok(existing_values.into_iter().collect())
+                    Ok(existing_values
+                        .into_iter()
+                        .map(String::into_boxed_str)
+                        .collect())
                 }
             },
             &operation_name,
@@ -618,6 +729,13 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             })
             .collect();
 
+        // Check for table changes on every invocation, including empty/all-null batches.
+        let cached_values = if self.cache.is_some() {
+            Some(self.cached_values(pool.clone()).await)
+        } else {
+            None
+        };
+
         let mut builder = BooleanBuilder::with_capacity(string_array.len());
 
         if value_indices.is_empty() {
@@ -626,10 +744,12 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
                 builder.append_null();
             }
         } else {
-            // Split into batches if exceeding max_batch_size
-            let existing_set = if value_indices.len() <= self.max_batch_size {
+            // Use the opt-in full-table cache, otherwise query only the requested values.
+            let existing_set = if let Some(cached_values) = cached_values {
+                cached_values
+            } else if value_indices.len() <= self.max_batch_size {
                 // Single batch - process directly
-                self.contains_batch(pool, value_indices).await
+                Arc::new(self.contains_batch(pool, value_indices).await)
             } else {
                 // Split into multiple batches and process concurrently
                 let chunks: Vec<Vec<(usize, String)>> = value_indices
@@ -655,11 +775,11 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
                 // Wait for all batches to complete and combine results
                 let results = join_all(futures).await;
-                let mut combined_set = std::collections::HashSet::new();
+                let mut combined_set = HashSet::new();
                 for chunk_set in results {
                     combined_set.extend(chunk_set);
                 }
-                combined_set
+                Arc::new(combined_set)
             };
 
             // Build result array maintaining original order
@@ -680,5 +800,63 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
         let boolean_array = builder.finish();
         Ok(Arc::new(boolean_array))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn postgres_config(cache_enabled: bool) -> PostgresDynamicTableBackendConfig {
+        PostgresDynamicTableBackendConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            db: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: "postgres".to_string(),
+            sslmode: "disable".to_string(),
+            max_connections: None,
+            dt_schema_name: None,
+            cache_enabled,
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_requires_flag_and_explicit_time_column() {
+        let disabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(false))
+            .expect("factory should be valid");
+
+        let disabled = disabled_factory
+            .create_backend(
+                "disabled".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(disabled.cache.is_none());
+
+        let enabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let missing_time_column = enabled_factory
+            .create_backend("missing_time_column".to_string(), None, None, None, 1000)
+            .await
+            .expect("backend should be valid");
+        assert!(missing_time_column.cache.is_none());
+        assert_eq!(missing_time_column.time_column_name, "updated_at");
+
+        let cached = enabled_factory
+            .create_backend(
+                "cached".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(cached.cache.is_some());
     }
 }

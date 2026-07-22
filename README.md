@@ -964,6 +964,31 @@ transforms:
     backend_entity_name: persistent_data
 ```
 
+Enable the full-table cache in the application config (or with
+`STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_ENABLED=true`):
+
+```yaml
+dynamic_table_backend:
+  postgres:
+    cache_enabled: true
+```
+
+Then set `time_column` on each backing table whose timestamp advances on every change:
+
+```yaml
+transforms:
+  persistent_table:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: persistent_data
+    time_column: updated_at
+```
+
+The cache is off by default and is used only when both settings are present. Each
+`dynamic_table_check` batch reads `MAX(time_column)` and reloads the cache only when it changes.
+Index the time column so this check stays cheap. Tables without a reliable update timestamp, or
+deployments with `cache_enabled: false`, continue to use batched PostgreSQL lookups.
+
 ### Usage with SQL Transforms
 
 Dynamic tables are accessed within SQL transforms using the `dynamic_table_check` UDF (User Defined Function). This function checks if a value exists in the specified dynamic table.

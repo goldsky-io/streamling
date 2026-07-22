@@ -34,6 +34,7 @@ dynamic_table_backend:
     user: "graph-node"
     password: ""
     sslmode: "require"
+    cache_enabled: false
 external_http_handler:
   trigger_max_count: "2000"
   operator_timeout_sec: "300"
