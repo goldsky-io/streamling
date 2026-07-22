@@ -142,8 +142,9 @@ const MAX_PAGE_BYTES: u64 = (i32::MAX as u64) / 2;
 ///
 /// Extracted as a free function so the drain logic is unit-testable without a
 /// ClickHouse connection or a multi-minute scan. Returns `None` when the buffer
-/// is empty (nothing to flush).
-fn build_checkpoint_flush_batch(
+/// is empty (nothing to flush). Shared with the Kafka source, whose exit paths
+/// have the same buffered-message shape.
+pub(crate) fn build_checkpoint_flush_batch(
     buffer: &mut Vec<CheckpointMessage>,
     schema: SchemaRef,
 ) -> Option<RecordBatch> {
