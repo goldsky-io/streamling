@@ -457,15 +457,12 @@ jobs:
           echo "  - $TAG_LATEST"
 
   # ==========================================================================
-  # Rolling 'nightly' prerelease from every green main commit.
+  # Manually triggered immutable nightly prerelease from main.
   # Linux binaries only; versioned releases remain the 'latest' release.
   # ==========================================================================
   publish-prerelease:
     needs: [validate-and-test, e2e-tests, build-release-main]
-    if: github.ref_name == 'main'
-    # Serialize delete/recreate of the rolling tag across overlapping main runs.
-    concurrency:
-      group: publish-prerelease
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -492,10 +489,11 @@ jobs:
             echo "No release artifact directories found" >&2
             exit 1
           fi
-      - name: Publish rolling prerelease
+      - name: Publish nightly prerelease
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release delete nightly --cleanup-tag --yes || true
-          gh release create nightly --prerelease --target "$GITHUB_SHA" --title "nightly (${GITHUB_SHA:0:7})" --notes "Rolling prerelease from main @ $GITHUB_SHA. Linux binaries only; use the versioned releases for macOS/Windows." release-assets/*
+          set -euo pipefail
+          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "$tag" --notes "Nightly prerelease from main @ $GITHUB_SHA. Linux binaries only; use the versioned releases for macOS/Windows." release-assets/*
