@@ -1583,8 +1583,10 @@ impl ExecutionPlan for ClickHouseSourceExec {
             // boundary instead of running the table to completion (and
             // blowing the shutdown budget). Nothing past the last emitted
             // page is checkpoint-covered, so a restart resumes from the last
-            // finalized cursor.
-            let shutdown = streamling_core::shutdown::subscribe();
+            // finalized cursor. The retry/timeout backoff sleeps below select
+            // on the same signal — an uncancellable 30s backoff would outlive
+            // the shutdown budget all by itself.
+            let mut shutdown = streamling_core::shutdown::subscribe();
 
             // Attach any buffered checkpoint messages to a batch about to be emitted.
             // Clears the buffer after attaching, so messages ride exactly one batch.
@@ -1918,7 +1920,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 reference_name, page_count, old_width, controller.width()
                             );
                             page_count -= 1;
-                            tokio::time::sleep(Duration::from_millis(1_000)).await;
+                            // Shutdown-aware backoff: fall through to the
+                            // loop-top check as soon as the signal flips.
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(1_000)) => {}
+                                _ = shutdown.changed() => {}
+                            }
                             continue;
                         }
 
@@ -1937,7 +1944,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         page_count -= 1;
                         let jitter = (query_retry_attempts as u64 % 100) * 7;
                         let sleep_ms = std::cmp::min(30_000u64, query_retry_backoff_ms + jitter);
-                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        // Shutdown-aware backoff: a full 30s uncancellable
+                        // sleep would outlive the shutdown budget on its own;
+                        // fall through to the loop-top check on signal.
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+                            _ = shutdown.changed() => {}
+                        }
                         query_retry_backoff_ms = std::cmp::min(query_retry_backoff_ms.saturating_mul(2), 30_000);
                         continue;
                     }
