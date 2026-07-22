@@ -985,9 +985,39 @@ transforms:
 ```
 
 The cache is off by default and is used only when both settings are present. Each
-`dynamic_table_check` batch reads `MAX(time_column)` and reloads the cache only when it changes.
-Index the time column so this check stays cheap. Tables without a reliable update timestamp, or
-deployments with `cache_enabled: false`, continue to use batched PostgreSQL lookups.
+`dynamic_table_check` batch reads only `MAX(time_column)` and reloads the cache when it changes.
+Index the time column so this check stays cheap.
+
+Keeping `time_column` current is a user requirement and part of the cache's correctness contract.
+Every process that can insert, update, or delete table membership must use the same serialized-writer
+protocol:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('public.persistent_data', 0));
+-- Perform the mutation and assign updated_at after taking the lock.
+UPDATE public.persistent_data
+SET value = 'new-value', updated_at = clock_timestamp()
+WHERE value = 'old-value';
+COMMIT;
+```
+
+Use the schema-qualified table name as the lock key, exactly as shown. Transaction-scoped advisory
+locks coordinate only writers that follow this protocol. The mutation must atomically make
+`MAX(time_column)` different; normally it should set a non-null timestamp strictly newer than the
+previous maximum. For a physical delete, also bump a surviving row or retained change-marker row in
+the same transaction. `NOW()` and `CURRENT_TIMESTAMP` are unsafe here because PostgreSQL fixes them
+at transaction start, which can precede waiting for the writer lock; use `clock_timestamp()` after
+the lock instead.
+
+Streamling takes this lock automatically for its own cached appends and creates new backing tables
+with `updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()`. It does not alter existing tables.
+Tables created by older Streamling versions with nullable `TIMESTAMPTZ DEFAULT NOW()` need no schema
+or data migration: cached Streamling appends explicitly write `clock_timestamp()` after taking the
+lock. Future mutations from other writers must still follow the protocol above. Cache initialization
+checks that the configured column exists and supports `MAX`, but it cannot verify that other writers
+obey the protocol. If that cannot be guaranteed, leave caching disabled; uncached tables continue to
+use batched PostgreSQL lookups.
 
 ### Usage with SQL Transforms
 

@@ -22,6 +22,7 @@ use tracing::{debug, error, info, trace};
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
 const DEFAULT_SCHEMA_NAME: &str = "streamling";
 const IDENTIFIER_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_]*$";
+const CACHE_WRITE_LOCK_QUERY: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 /// Statement timeout for each individual database query (30 seconds)
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -367,6 +368,27 @@ impl PostgresDynamicTableBackend {
         values
     }
 
+    async fn validate_cache_time_column(
+        &self,
+        pool: &PgPool,
+    ) -> Result<(), DynamicTableBackendError> {
+        let query = format!(
+            r#"SELECT MAX("{}")::TEXT FROM {} WHERE FALSE"#,
+            self.time_column_name, self.full_table_name
+        );
+
+        sqlx::query(&query).execute(pool).await.map_err(|e| {
+            let err = DynamicTableBackendError::Initialization(format!(
+                "Failed to validate cache time column '{}' for table {}: {}",
+                self.time_column_name, self.full_table_name, e
+            ));
+            error!("{}", err);
+            err
+        })?;
+
+        Ok(())
+    }
+
     /// Check if a batch of values exist in the table (internal method that doesn't split batches)
     /// Retries forever with exponential backoff. Statement timeout prevents individual queries from hanging.
     /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
@@ -448,6 +470,8 @@ impl PostgresDynamicTableBackend {
         let values: Arc<[String]> = Arc::from(values.into_boxed_slice());
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let column_name: Arc<str> = Arc::from(self.column_name.as_str());
+        let time_column_name: Arc<str> = Arc::from(self.time_column_name.as_str());
+        let serialize_write = self.cache.is_some();
         let operation_name = format!("DynamicTable append_batch ({})", self.full_table_name);
 
         retry_forever_with_backoff_async_returning(
@@ -457,33 +481,80 @@ impl PostgresDynamicTableBackend {
                 let values = values.clone();
                 let full_table_name = full_table_name.clone();
                 let column_name = column_name.clone();
+                let time_column_name = time_column_name.clone();
                 async move {
                     // Create batch insert query with UNNEST for multiple values
                     let placeholders: Vec<String> =
                         (1..=values.len()).map(|i| format!("${}", i)).collect();
-                    let query = format!(
-                        r#"
-                        INSERT INTO {} ("{}")
-                        SELECT DISTINCT unnest(ARRAY[{}])
-                        ON CONFLICT ("{}") DO NOTHING
-                        "#,
-                        full_table_name,
-                        column_name,
-                        placeholders.join(", "),
-                        column_name
-                    );
+                    let query = if serialize_write {
+                        format!(
+                            r#"
+                            INSERT INTO {} ("{}", "{}")
+                            SELECT new_value, CLOCK_TIMESTAMP()
+                            FROM (
+                                SELECT DISTINCT unnest(ARRAY[{}]) AS new_value
+                            ) AS new_values
+                            ON CONFLICT ("{}") DO NOTHING
+                            "#,
+                            full_table_name,
+                            column_name,
+                            time_column_name,
+                            placeholders.join(", "),
+                            column_name
+                        )
+                    } else {
+                        format!(
+                            r#"
+                            INSERT INTO {} ("{}")
+                            SELECT DISTINCT unnest(ARRAY[{}])
+                            ON CONFLICT ("{}") DO NOTHING
+                            "#,
+                            full_table_name,
+                            column_name,
+                            placeholders.join(", "),
+                            column_name
+                        )
+                    };
 
                     let mut sqlx_query = sqlx::query(&query);
                     for value in values.iter() {
                         sqlx_query = sqlx_query.bind(value);
                     }
 
-                    sqlx_query
-                        .execute(pool.as_ref())
-                        .await
-                        .streamling_with_context(|| {
-                            format!("failed to append values to table {}", full_table_name)
+                    if serialize_write {
+                        let mut transaction = pool.begin().await.streamling_with_context(|| {
+                            format!("failed to begin cached write to table {full_table_name}")
                         })?;
+
+                        // ponytail: cached writes serialize per table; add a dedicated version row
+                        // only if write throughput makes this lock material.
+                        sqlx::query(CACHE_WRITE_LOCK_QUERY)
+                            .bind(full_table_name.as_ref())
+                            .execute(&mut *transaction)
+                            .await
+                            .streamling_with_context(|| {
+                                format!(
+                                    "failed to serialize cached writes to table {full_table_name}"
+                                )
+                            })?;
+
+                        sqlx_query
+                            .execute(&mut *transaction)
+                            .await
+                            .streamling_with_context(|| {
+                                format!("failed to append values to table {full_table_name}")
+                            })?;
+                        transaction.commit().await.streamling_with_context(|| {
+                            format!("failed to commit cached write to table {full_table_name}")
+                        })?;
+                    } else {
+                        sqlx_query
+                            .execute(pool.as_ref())
+                            .await
+                            .streamling_with_context(|| {
+                                format!("failed to append values to table {full_table_name}")
+                            })?;
+                    }
 
                     Ok(())
                 }
@@ -609,7 +680,7 @@ impl PostgresDynamicTableBackend {
                             r#"
                             CREATE TABLE IF NOT EXISTS {} (
                                 "{}" TEXT PRIMARY KEY,
-                                "{}" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                                "{}" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CLOCK_TIMESTAMP()
                             );
                         "#,
                             self.full_table_name, self.column_name, self.time_column_name
@@ -637,6 +708,10 @@ impl PostgresDynamicTableBackend {
                         "Table {} already exists, skipping creation",
                         self.full_table_name
                     );
+                }
+
+                if self.cache.is_some() {
+                    self.validate_cache_time_column(pool_arc.as_ref()).await?;
                 }
 
                 Ok::<Arc<PgPool>, DynamicTableBackendError>(pool_arc)
