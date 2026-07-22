@@ -14,7 +14,7 @@ use sqlx::{Executor, PgPool, Postgres};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use streamling_config::app_config::PostgresDynamicTableBackendConfig;
 use tokio::sync::{OnceCell, RwLock};
 use tracing::{debug, error, info, trace};
@@ -261,12 +261,15 @@ impl PostgresDynamicTableBackend {
         time_column_name: Option<String>,
         max_batch_size: usize,
     ) -> Self {
+        let cache_enabled = config.cache_enabled && time_column_name.is_some();
         debug!(
-            "Creating PostgreSQL dynamic table backend instance for table: {}",
-            full_table_name
+            table = %full_table_name,
+            cache_enabled,
+            time_column = ?time_column_name.as_deref(),
+            "Creating PostgreSQL dynamic table backend"
         );
 
-        let cache = (config.cache_enabled && time_column_name.is_some()).then(|| RwLock::new(None));
+        let cache = cache_enabled.then(|| RwLock::new(None));
         let time_column_name = time_column_name.unwrap_or_else(|| "updated_at".to_string());
 
         Self {
@@ -313,7 +316,7 @@ impl PostgresDynamicTableBackend {
         &self,
         pool: Arc<PgPool>,
         updated_since: Option<&str>,
-    ) -> PostgresDynamicTableCache {
+    ) -> (PostgresDynamicTableCache, usize) {
         // Serialized append-only writers assign CLOCK_TIMESTAMP after taking the
         // table lock; use a dedicated version cursor if that contract changes.
         let max_query: Arc<str> = format!(
@@ -389,6 +392,7 @@ impl PostgresDynamicTableBackend {
                         })?;
 
                     let mut values = HashSet::new();
+                    let mut pages_loaded = 0;
                     loop {
                         let page: Vec<String> = sqlx::query_scalar(fetch_page_query.as_ref())
                             .fetch_all(&mut *transaction)
@@ -399,13 +403,17 @@ impl PostgresDynamicTableBackend {
                         if page.is_empty() {
                             break;
                         }
+                        pages_loaded += 1;
                         values.extend(page.into_iter().map(String::into_boxed_str));
                     }
 
                     transaction.commit().await.streamling_with_context(|| {
                         format!("failed to finish cache load for table {full_table_name}")
                     })?;
-                    Ok(PostgresDynamicTableCache { updated_at, values })
+                    Ok((
+                        PostgresDynamicTableCache { updated_at, values },
+                        pages_loaded,
+                    ))
                 }
             },
             &operation_name,
@@ -437,11 +445,32 @@ impl PostgresDynamicTableBackend {
             .as_ref()
             .and_then(|current| current.updated_at.as_deref())
             .map(str::to_owned);
-        let refreshed = self.load_cache(pool, updated_since.as_deref()).await;
+        let load_started_at = Instant::now();
+        let (refreshed, pages_loaded) = self.load_cache(pool, updated_since.as_deref()).await;
+        let elapsed_ms = load_started_at.elapsed().as_millis();
 
         if let Some(current) = cached.as_mut() {
+            let added_entries = refreshed.values.len();
             current.append(refreshed);
+            debug!(
+                table = %self.full_table_name,
+                added_entries,
+                total_entries = current.values.len(),
+                pages_loaded,
+                elapsed_ms = ?elapsed_ms,
+                previous_watermark = ?updated_since.as_deref(),
+                watermark = ?current.updated_at.as_deref(),
+                "Refreshed PostgreSQL dynamic table cache"
+            );
         } else {
+            info!(
+                table = %self.full_table_name,
+                total_entries = refreshed.values.len(),
+                pages_loaded,
+                elapsed_ms = ?elapsed_ms,
+                watermark = ?refreshed.updated_at.as_deref(),
+                "Populated PostgreSQL dynamic table cache"
+            );
             *cached = Some(refreshed);
         }
     }
