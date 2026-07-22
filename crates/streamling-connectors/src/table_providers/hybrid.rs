@@ -1081,7 +1081,9 @@ impl ExecutionPlan for HybridSourceExec {
         // loop below falls through to the terminal-checkpoint path. Without
         // this the loop would block indefinitely in `stream.next()` on a live
         // topic and never observe the signal. Bounded-phase (ClickHouse)
-        // sources observe the same signal directly in their pagination loop.
+        // streams have no equivalent stop hook — the forwarding loop below
+        // selects on the shutdown watch instead, and the ClickHouse scan also
+        // checks the signal between pages.
         let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
             let provider_for_shutdown = provider.clone();
             let ref_name = reference_name_for_spawn.clone();
@@ -1139,7 +1141,51 @@ impl ExecutionPlan for HybridSourceExec {
                     }
                 };
 
-                while let Some(batch_result) = stream.next().await {
+                // Forward batches until the inner stream ends — or, during a
+                // BOUNDED phase, until the process-wide shutdown signal flips.
+                // The select on the shutdown watch is what makes bounded
+                // (ClickHouse) phases shutdown-aware: the watcher task above
+                // only stops the Kafka unbounded source, and the post-loop
+                // check below only runs after the stream ends, so without
+                // this arm a SIGTERM during a long bounded scan would sit in
+                // `stream.next()` until the scan finished and the watchdog
+                // force-exited instead of draining. Ending a bounded stream
+                // early is safe: nothing past the last emitted batch is
+                // checkpoint-covered, so a restart resumes from the last
+                // finalized cursor. The unbounded (Kafka) phase is exempt on
+                // purpose — its source observes the signal itself and drains
+                // the in-flight batch before ending its stream, which this
+                // loop must keep consuming.
+                let mut shutdown_for_stream = shutdown_rx.clone();
+                let mut shutdown_watch_dead = false;
+                loop {
+                    let next = match (&mut shutdown_for_stream, shutdown_watch_dead) {
+                        (Some(sd), false) if !is_executing_unbounded => {
+                            if *sd.borrow() {
+                                info!(
+                                    "Hybrid source '{}': shutdown requested; ending bounded stream early",
+                                    reference_name_for_spawn,
+                                );
+                                break;
+                            }
+                            tokio::select! {
+                                biased;
+                                changed = sd.changed() => {
+                                    // On a real change the next iteration sees
+                                    // borrow()==true and breaks; a closed
+                                    // sender means no shutdown signal exists,
+                                    // so stop watching rather than spin.
+                                    shutdown_watch_dead = changed.is_err();
+                                    continue;
+                                }
+                                n = stream.next() => n,
+                            }
+                        }
+                        _ => stream.next().await,
+                    };
+                    let Some(batch_result) = next else {
+                        break;
+                    };
                     match batch_result {
                         Ok(batch) => {
                             // Bounded sources (ClickHouse) emit u256/i256 columns as
@@ -1509,10 +1555,12 @@ async fn emit_terminal_checkpoint(
         // protect. Skipping only costs the end-of-job finalize work (e.g.
         // staging cleanup); at-least-once replay covers the data itself.
         warn!(
-            "Hybrid source '{}': terminal checkpoint did not finalize within {:?} of shutdown; \
-             SKIPPING the terminal Finalizer so no consumer commits past \
-             unconfirmed data (it will be replayed on restart)",
-            reference_name, finalize_timeout
+            "Hybrid source '{}': terminal checkpoint did not finalize within {:?} of shutdown \
+             (sinks that never acked: {:?}); SKIPPING the terminal Finalizer so no consumer \
+             commits past unconfirmed data (it will be replayed on restart)",
+            reference_name,
+            finalize_timeout,
+            control.pending_terminal_ack_sinks()
         );
         return;
     }

@@ -178,6 +178,14 @@ pub struct CheckpointControl {
     finalized_notify: Arc<tokio::sync::Notify>,
 }
 
+/// Lock discipline for [`CheckpointControl`]'s fields:
+/// `begin_terminal_checkpoint` is the only method allowed to hold `epochs`
+/// and `terminal_epoch` simultaneously (acquired in that order). Every other
+/// method takes ONE lock at a time, binding-and-dropping each guard before
+/// acquiring the next — see `is_terminal_finalized` for the match-scrutinee
+/// temporary that silently violates this. The subscriber/producer paths lock
+/// `epochs` then `expected_sinks`, so no method here may hold
+/// `expected_sinks` while acquiring `epochs`.
 impl CheckpointControl {
     /// Mark a sink as drained: it will never ack again, so drop it from the
     /// expected-ack set and finalize any in-flight epoch the remaining live
@@ -343,6 +351,36 @@ impl CheckpointControl {
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
         }
+    }
+
+    /// Sink ids still expected to ack the terminal epoch, sorted. Empty when
+    /// no terminal checkpoint was begun or it already finalized. Diagnostic
+    /// only — the answer can be stale by the time the caller logs it, so it
+    /// must not gate control flow.
+    pub fn pending_terminal_ack_sinks(&self) -> Vec<String> {
+        // One lock at a time (see the impl-level lock discipline): clone the
+        // terminal epoch, then the expected set, then inspect epochs.
+        let terminal = self.terminal_epoch.lock().clone();
+        let Some(epoch) = terminal else {
+            return Vec::new();
+        };
+        let expected: HashSet<String> = self.expected_sinks.lock().clone();
+        let mut pending: Vec<String> = {
+            let epochs = self.epochs.lock();
+            match epochs.get(&epoch) {
+                Some(EpochState::Finalized) => Vec::new(),
+                Some(EpochState::InProgress { acked_sinks, .. }) => expected
+                    .iter()
+                    .filter(|s| !acked_sinks.contains(*s))
+                    .cloned()
+                    .collect(),
+                // No acks yet (or the epoch is gone): every live sink is
+                // still outstanding.
+                Some(EpochState::Started { .. }) | None => expected.into_iter().collect(),
+            }
+        };
+        pending.sort();
+        pending
     }
 
     /// Returns true if a terminal checkpoint was begun and has finalized.
