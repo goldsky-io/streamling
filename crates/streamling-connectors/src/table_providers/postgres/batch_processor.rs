@@ -71,6 +71,9 @@ pub struct BatchProcessorContext {
     pub current_checkpoint_epoch: Arc<Mutex<u64>>,
     pub parallelism: usize,
     pub write_batch_size: u32,
+    /// Client-side bound for a single statement execution; see
+    /// `PostgresSinkConfig::client_statement_timeout`.
+    pub client_statement_timeout: Duration,
 }
 
 /// Handle checkpoint truncation for finalized epochs
@@ -183,6 +186,7 @@ async fn execute_insert_slice(
         slice.num_rows(),
         &sink_ctx,
         epoch_for_rows,
+        context.client_statement_timeout,
     )
     .await;
 }
@@ -217,6 +221,7 @@ async fn execute_delete_slice(context: &BatchProcessorContext, slice: &RecordBat
         &context.primary_key_indices,
         slice.num_rows(),
         &sink_ctx,
+        context.client_statement_timeout,
     )
     .await;
 }
@@ -450,6 +455,7 @@ mod tests {
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
             parallelism: 1,
             write_batch_size: 1000,
+            client_statement_timeout: Duration::from_secs(120),
         };
 
         let empty_batch = RecordBatch::new_empty(schema);
@@ -493,6 +499,7 @@ mod tests {
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
             parallelism: 1,
             write_batch_size: 1000,
+            client_statement_timeout: Duration::from_secs(120),
         };
 
         let cloned = context.clone();
