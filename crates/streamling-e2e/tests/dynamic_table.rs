@@ -619,3 +619,154 @@ async fn test_postgres_dynamic_table_cache_loads_and_refreshes_after_append() {
         ["appended_member", "initial"]
     );
 }
+
+/// Verify that deduplication in the uncached `contains()` path produces identical
+/// results for duplicate values. This exercises the exact code path the dedup
+/// changes: with MAX_BATCH_SIZE=3 and 6 total values (3 unique), without dedup
+/// the query would split into 2 batches; with dedup it fits in 1. If dedup
+/// dropped or mis-mapped a value, a duplicate of an existing value would be
+/// incorrectly filtered out.
+#[tokio::test]
+async fn test_uncached_dedup_identical_results_for_duplicate_values() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("failed to create test context");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("failed to register schema");
+
+    // Pre-seed the backing table so the positive filter has known membership.
+    ctx.postgres
+        .execute("CREATE TABLE public.dedup_membership (value TEXT PRIMARY KEY)")
+        .await
+        .expect("failed to create backing table");
+    ctx.postgres
+        .execute("INSERT INTO public.dedup_membership (value) VALUES ('group_a'), ('group_c')")
+        .await
+        .expect("failed to seed backing table");
+
+    // Produce records with duplicate values in the column being checked.
+    // group_a ×3, group_b ×2, group_c ×1 → 6 values, 3 unique.
+    // With MAX_BATCH_SIZE=3 the dedup collapses 6 values into 3, turning a
+    // 2-batch query into a 1-batch query.
+    ctx.kafka
+        .produce_avro_records(&[
+            TestRecord {
+                id: "r1".into(),
+                data: "group_a".into(),
+            },
+            TestRecord {
+                id: "r2".into(),
+                data: "group_b".into(),
+            },
+            TestRecord {
+                id: "r3".into(),
+                data: "group_a".into(),
+            },
+            TestRecord {
+                id: "r4".into(),
+                data: "group_a".into(),
+            },
+            TestRecord {
+                id: "r5".into(),
+                data: "group_c".into(),
+            },
+            TestRecord {
+                id: "r6".into(),
+                data: "group_b".into(),
+            },
+        ])
+        .await
+        .expect("failed to produce records");
+
+    // source_drain (blackhole) consumes all 6 source records directly, triggering
+    // shutdown via num_records_before_stop. Without it, only 4 records reach the
+    // postgres sink (2 filtered out by dynamic_table_check) and the pipeline hangs.
+    let pipeline_yaml = format!(
+        r#"
+sources:
+  input:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  membership:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: dedup_membership
+    schema: public
+    column: value
+  matched:
+    type: sql
+    sql: "SELECT id, data FROM input WHERE dynamic_table_check('membership', data)"
+    primary_key: id
+
+sinks:
+  matched_output:
+    type: postgres
+    from: matched
+    table: dedup_output
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+  source_drain:
+    type: blackhole
+    from: input
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let opts = PipelineOpts::new()
+        .record_limit(6)
+        .timeout(Duration::from_secs(60))
+        .env(
+            "STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__HOST",
+            &ctx.postgres.host,
+        )
+        .env(
+            "STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__PORT",
+            ctx.postgres.port.to_string(),
+        )
+        .env(
+            "STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__DB",
+            &ctx.pg_database,
+        )
+        .env(
+            "STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__USER",
+            &ctx.postgres.user,
+        )
+        .env(
+            "STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__PASSWORD",
+            &ctx.postgres.password,
+        )
+        .env(
+            "STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__SSLMODE",
+            "disable",
+        )
+        // Force a small batch size so 6 values would split into 2 queries
+        // without dedup, but 3 unique values fit in 1 query with dedup.
+        .env("STREAMLING__DYNAMIC_TABLE_BACKEND__MAX_BATCH_SIZE", "3");
+
+    let status = ctx
+        .run_pipeline_with_opts(&pipeline_yaml, opts)
+        .await
+        .expect("pipeline failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    // group_a (×3) and group_c (×1) exist in the table → 4 records pass.
+    // group_b (×2) does NOT exist → 2 records filtered.
+    // If dedup dropped a duplicate, a group_a record would be missing.
+    let output = output_ids(&ctx, "dedup_output").await;
+    assert_eq!(
+        output,
+        vec!["r1", "r3", "r4", "r5"],
+        "all duplicates of existing values must pass identically"
+    );
+}

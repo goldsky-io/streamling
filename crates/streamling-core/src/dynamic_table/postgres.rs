@@ -312,7 +312,7 @@ impl PostgresDynamicTableBackend {
         pool: Arc<PgPool>,
         updated_since: Option<&str>,
     ) -> PostgresDynamicTableCache {
-        // ponytail: serialized append-only writers assign CLOCK_TIMESTAMP after taking the
+        // Serialized append-only writers assign CLOCK_TIMESTAMP after taking the
         // table lock; use a dedicated version cursor if that contract changes.
         let query: Arc<str> = if updated_since.is_some() {
             format!(
@@ -597,7 +597,7 @@ impl PostgresDynamicTableBackend {
                             format!("failed to begin cached write to table {full_table_name}")
                         })?;
 
-                        // ponytail: cached writes serialize per table; add a dedicated version row
+                        // Cached writes serialize per table; add a dedicated version row
                         // only if write throughput makes this lock material.
                         sqlx::query(CACHE_WRITE_LOCK_QUERY)
                             .bind(full_table_name.as_ref())
@@ -792,6 +792,19 @@ impl PostgresDynamicTableBackend {
     }
 }
 
+/// Remove duplicate values from `(index, value)` pairs, keeping only the first
+/// occurrence of each value. This shrinks the SQL parameter list and may reduce
+/// batch count in `contains()` without changing results, because
+/// `build_contains_result` looks up every original row value in the returned
+/// set — not in `value_indices`.
+fn deduplicate_value_indices(value_indices: Vec<(usize, String)>) -> Vec<(usize, String)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    value_indices
+        .into_iter()
+        .filter(|(_, value)| seen.insert(value.clone()))
+        .collect()
+}
+
 #[async_trait]
 impl DynamicTableBackend for PostgresDynamicTableBackend {
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError> {
@@ -889,6 +902,9 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
         if value_indices.is_empty() {
             return Ok(self.build_contains_result(string_array, &HashSet::new()));
         }
+
+        // Deduplicate values so each unique value is queried only once.
+        let value_indices = deduplicate_value_indices(value_indices);
 
         let existing_set = if value_indices.len() <= self.max_batch_size {
             // Single batch - process directly
@@ -1003,5 +1019,39 @@ mod tests {
             .await
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
+    }
+    #[test]
+    fn deduplicate_value_indices_removes_duplicates() {
+        let input = vec![
+            (0, "a".to_string()),
+            (1, "b".to_string()),
+            (2, "a".to_string()), // duplicate of 0
+            (3, "c".to_string()),
+            (4, "b".to_string()), // duplicate of 1
+            (5, "a".to_string()), // duplicate of 0
+        ];
+
+        let result = deduplicate_value_indices(input);
+
+        // Only first occurrence of each value survives.
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], (0, "a".to_string()));
+        assert_eq!(result[1], (1, "b".to_string()));
+        assert_eq!(result[2], (3, "c".to_string()));
+    }
+
+    #[test]
+    fn deduplicate_value_indices_preserves_all_unique() {
+        let input: Vec<(usize, String)> = (0..5).map(|i| (i, format!("val{}", i))).collect();
+
+        let result = deduplicate_value_indices(input);
+
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn deduplicate_value_indices_empty_input() {
+        let result = deduplicate_value_indices(vec![]);
+        assert!(result.is_empty());
     }
 }
