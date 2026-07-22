@@ -321,7 +321,26 @@ impl ExecutionPlan for PluginSourceExec {
                 }
             }
 
-            // Shutdown drain complete. Flush any checkpoint markers the plugin
+            // Shutdown drain complete. Coordinator messages still queued on
+            // our subscription never made the plugin round-trip (e.g. the
+            // terminal epoch's Marker, broadcast during the shutdown window).
+            // The plugin is about to be terminated, so forwarding them to it
+            // is pointless — but the SINKS still need to see the Marker for
+            // the epoch to collect acks and finalize. Fold them into the
+            // synthetic-final-batch flush below.
+            while let Ok(message) = checkpoint_receiver.try_recv() {
+                if let m @ (CheckpointMessage::Marker { .. } | CheckpointMessage::Finalizer(_)) =
+                    message
+                {
+                    debug!(
+                        "PluginSourceExec: attaching still-queued coordinator message to final flush: {:?}",
+                        m
+                    );
+                    checkpoint_buffer.push(m);
+                }
+            }
+
+            // Flush any checkpoint markers the plugin
             // emitted that never got a data batch to ride on, on a synthetic
             // empty batch, so the sinks can still ack their epochs before the
             // stream ends (the same shape as the hybrid source's pending-marker
