@@ -60,7 +60,22 @@ impl PostgresConnection {
             .acquire_timeout(Duration::from_secs(config.pool_acquire_timeout_secs))
             .idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs))
             .max_lifetime(Duration::from_secs(config.pool_max_lifetime_secs))
-            .test_before_acquire(true)
+            .test_before_acquire(false)
+            // Discard idle connections that can no longer accept writes. After a
+            // primary→replica failover, pooled connections keep pointing at a
+            // read-only server and every write fails with SQLSTATE 25006 until
+            // the process restarts; evicting them here forces the pool to
+            // reconnect, so sinks resume as soon as a writable primary is
+            // reachable again. The SHOW round-trip also doubles as the liveness
+            // ping `test_before_acquire` used to perform.
+            .before_acquire(|conn, _meta| {
+                Box::pin(async move {
+                    let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    Ok(read_only == "off")
+                })
+            })
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     conn.execute(
