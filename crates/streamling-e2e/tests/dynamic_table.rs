@@ -27,6 +27,21 @@ fn record(id: &str) -> TestRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ArrayMembershipRecord {
+    id: String,
+    accounts: Vec<String>,
+}
+
+const ARRAY_MEMBERSHIP_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "ArrayMembershipRecord",
+    "fields": [
+        {"name": "id", "type": "string"},
+        {"name": "accounts", "type": {"type": "array", "items": "string"}}
+    ]
+}"#;
+
 fn pipeline(
     ctx: &TestContext,
     backing_table: &str,
@@ -774,5 +789,115 @@ sinks:
         output,
         vec!["r1", "r3", "r4", "r5"],
         "all duplicates of existing values must pass identically"
+    );
+}
+
+/// Any-match `text[]` overload end-to-end: a source `accounts` array column is
+/// checked against a dynamic table, and a row passes iff ANY element is a
+/// member. Also covers the empty-array-is-false case.
+#[tokio::test]
+async fn test_dynamic_table_check_text_array_any_match() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("failed to create test context");
+    ctx.kafka
+        .register_schema(ARRAY_MEMBERSHIP_SCHEMA)
+        .await
+        .expect("failed to register schema");
+
+    ctx.postgres
+        .execute("CREATE TABLE public.array_membership (value TEXT PRIMARY KEY)")
+        .await
+        .expect("failed to create backing table");
+    ctx.postgres
+        .execute("INSERT INTO public.array_membership (value) VALUES ('allowed_1'), ('allowed_2')")
+        .await
+        .expect("failed to seed backing table");
+
+    ctx.kafka
+        .produce_avro_records(&[
+            // any-match: a later element is a member
+            ArrayMembershipRecord {
+                id: "r1".into(),
+                accounts: vec!["nobody".into(), "allowed_1".into()],
+            },
+            // no element is a member
+            ArrayMembershipRecord {
+                id: "r2".into(),
+                accounts: vec!["nobody".into(), "stranger".into()],
+            },
+            // empty array → false
+            ArrayMembershipRecord {
+                id: "r3".into(),
+                accounts: vec![],
+            },
+            // single element is a member
+            ArrayMembershipRecord {
+                id: "r4".into(),
+                accounts: vec!["allowed_2".into()],
+            },
+        ])
+        .await
+        .expect("failed to produce records");
+
+    // source_drain (blackhole) consumes all 4 source records directly, triggering
+    // shutdown via num_records_before_stop. Without it the 2 filtered rows never
+    // reach the sink and the pipeline hangs.
+    let pipeline_yaml = format!(
+        r#"
+sources:
+  input:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  membership:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: array_membership
+    schema: public
+    column: value
+  matched:
+    type: sql
+    sql: "SELECT id FROM input WHERE dynamic_table_check('membership', accounts)"
+    primary_key: id
+
+sinks:
+  matched_output:
+    type: postgres
+    from: matched
+    table: array_membership_output
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+  source_drain:
+    type: blackhole
+    from: input
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline_yaml,
+            cached_postgres_opts(&ctx, 4, Duration::from_secs(60)),
+        )
+        .await
+        .expect("pipeline failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    // Only r1 (allowed_1) and r4 (allowed_2) have any member element; r2 misses
+    // and r3 is empty.
+    let output = output_ids(&ctx, "array_membership_output").await;
+    assert_eq!(
+        output,
+        vec!["r1", "r4"],
+        "only rows with any member element should pass"
     );
 }

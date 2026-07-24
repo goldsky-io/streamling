@@ -1072,8 +1072,18 @@ The `dynamic_table_check` function has the following signature:
 
 - **Parameters**:
   - `table_name` (string): Name of the dynamic table to query
-  - `value` (string): Value to check for existence
+  - `value` (string **or** `text[]`): Value(s) to check for existence
 - **Returns**: `boolean` - `true` if the value exists in the table, `false` otherwise
+
+`value` accepts two forms:
+
+- **Scalar `text`** — returns `true` iff the single value is present in the table.
+- **Array `text[]`** (`List` or `LargeList` of `text`) — **any-match**: returns `true` iff **any** element of the array is present in the table. Null handling is explicit: a **null array yields null**, an **empty array yields `false`**, and **null elements are skipped**. Distinct values are deduplicated per batch before the lookup. Nested arrays (`text[][]`) are not supported — dynamic tables are a flat set of strings.
+
+```sql
+-- any element of the array present in the table?
+SELECT * FROM src WHERE dynamic_table_check('tracked_wallets', accounts)
+```
 
 ### Source Validation
 
