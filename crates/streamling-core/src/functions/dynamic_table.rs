@@ -11,7 +11,7 @@ use datafusion::arrow::datatypes::DataType::Utf8;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,22 +44,13 @@ impl DynamicTableCheckFunc {
     pub fn new(registry: DynamicTableRegistry) -> Self {
         Self {
             registry,
-            signature: Signature::one_of(
-                vec![
-                    // dynamic table name, scalar value
-                    TypeSignature::Exact(vec![Utf8, Utf8]),
-                    // dynamic table name, array of values (any-match)
-                    TypeSignature::Exact(vec![
-                        Utf8,
-                        DataType::List(Arc::new(Field::new_list_field(Utf8, true))),
-                    ]),
-                    TypeSignature::Exact(vec![
-                        Utf8,
-                        DataType::LargeList(Arc::new(Field::new_list_field(Utf8, true))),
-                    ]),
-                ],
-                Volatility::Volatile,
-            ),
+            // Accept `(Utf8, Utf8)` plus any list-of-strings as the value arg.
+            // `coerce_types` normalises the value arg to a canonical scalar
+            // `Utf8` or `List(Utf8)`/`LargeList(Utf8)` so the exact child field
+            // name / nullability of the input (e.g. Avro `array<string>` uses a
+            // different child field) never prevents the list overload from
+            // matching and does not fall back to casting the list to a string.
+            signature: Signature::user_defined(Volatility::Volatile),
         }
     }
 
@@ -254,6 +245,47 @@ impl ScalarUDFImpl for DynamicTableCheckFunc {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(Boolean)
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        if arg_types.len() != 2 {
+            streamling_user_bail!("dynamic_table_check requires exactly two arguments");
+        }
+
+        fn is_stringish(dt: &DataType) -> bool {
+            matches!(dt, Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+        }
+
+        // Table name: any string type → Utf8.
+        let name_type = if is_stringish(&arg_types[0]) {
+            Utf8
+        } else {
+            streamling_user_bail!(
+                "dynamic_table_check table name must be a string, got {:?}",
+                arg_types[0]
+            );
+        };
+
+        // Value: a scalar string, or a list/fixed-size-list/large-list of
+        // strings. Normalise lists to a canonical `List(Utf8)` / `LargeList(Utf8)`
+        // (child field name / nullability agnostic) so the list overload always
+        // matches and DataFusion never falls back to casting the list to a string.
+        let list_field = || Arc::new(Field::new_list_field(Utf8, true));
+        let value_type = match &arg_types[1] {
+            dt if is_stringish(dt) => Utf8,
+            DataType::List(f) | DataType::FixedSizeList(f, _) if is_stringish(f.data_type()) => {
+                DataType::List(list_field())
+            }
+            DataType::LargeList(f) if is_stringish(f.data_type()) => {
+                DataType::LargeList(list_field())
+            }
+            other => streamling_user_bail!(
+                "dynamic_table_check value must be a string or array of strings, got {:?}",
+                other
+            ),
+        };
+
+        Ok(vec![name_type, value_type])
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -464,6 +496,65 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&schema), vec![ids, arr]).expect("batch build failed");
         let table = MemTable::try_new(schema, vec![vec![batch]]).expect("memtable build failed");
 
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(table))
+            .expect("register table failed");
+        ctx.register_udf(ScalarUDF::from(func));
+
+        let batches = ctx
+            .sql("SELECT id FROM t WHERE dynamic_table_check('tbl', arr) ORDER BY id")
+            .await
+            .expect("planning failed")
+            .collect()
+            .await
+            .expect("execution failed");
+
+        let mut ids_out = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("id column is Utf8");
+            for i in 0..col.len() {
+                ids_out.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(ids_out, vec!["r1"]);
+    }
+
+    /// Regression for STRM-6445: a list column whose child field name /
+    /// nullability differs from the canonical `List(Field("item", Utf8, true))`
+    /// (e.g. Avro `array<string>`, which uses a non-nullable "element" child)
+    /// must still hit the list overload. Before the `coerce_types` fix,
+    /// DataFusion fell back to casting the list to a string and this returned
+    /// zero rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_overload_matches_alternate_child_field() {
+        use datafusion::arrow::array::ListArray;
+        use datafusion::arrow::buffer::OffsetBuffer;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::ScalarUDF;
+        use datafusion::prelude::SessionContext;
+
+        let func = make_func(&["hit"]).await;
+        let ids: ArrayRef = Arc::new(StringArray::from(vec!["r1", "r2"]));
+        // r1 => [miss, hit], r2 => [nope]. Non-canonical child: name "element",
+        // non-nullable — mirrors what the Avro reader produces.
+        let values = StringArray::from(vec![Some("miss"), Some("hit"), Some("nope")]);
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 3].into());
+        let field = Arc::new(Field::new("element", Utf8, false));
+        let list = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let arr: ArrayRef = Arc::new(list);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("arr", DataType::List(field), true),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![ids, arr]).expect("batch build failed");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("memtable build failed");
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(table))
             .expect("register table failed");
