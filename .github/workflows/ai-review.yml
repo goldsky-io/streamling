@@ -129,6 +129,10 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           use_sticky_comment: true
+          # Maestro opens/updates PRs as the goldsky-maestro GitHub App. Without
+          # allowlisting it, claude-code-action aborts with "Workflow initiated by
+          # non-human actor" before reviewing, failing this check on every bot PR.
+          allowed_bots: "goldsky-maestro"
           claude_args: |
             --model ${{ steps.config.outputs.model }}
             --max-turns ${{ steps.config.outputs.max_turns }}
