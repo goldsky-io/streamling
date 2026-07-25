@@ -323,6 +323,7 @@ impl DataSink for PostgresSinkExec {
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
             parallelism: self.parallelism,
             write_batch_size: self.write_batch_size,
+            client_statement_timeout: self.config.client_statement_timeout(),
         };
 
         // Process each batch directly — accumulation is handled by RebatchExec

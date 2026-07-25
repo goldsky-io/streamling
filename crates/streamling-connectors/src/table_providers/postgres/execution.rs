@@ -1,7 +1,9 @@
 use datafusion::arrow::array::Array;
 use std::sync::Arc;
+use std::time::Duration;
 use streamling_core::error::ResultExt;
 use streamling_core::retry::retry_forever_with_backoff_async;
+use streamling_core::utils::pg::execute_bounded;
 
 use crate::table_providers::postgres::value_binding;
 
@@ -24,6 +26,7 @@ pub async fn execute_batch_insert(
     num_rows: usize,
     ctx: &SinkContext,
     checkpoint_epoch: Option<u64>,
+    client_statement_timeout: Option<Duration>,
 ) {
     let query = query.to_string();
     let pool = pool.clone();
@@ -55,7 +58,7 @@ pub async fn execute_batch_insert(
                         q = q.bind(epoch as i64);
                     }
                 }
-                q.execute(&pool)
+                execute_bounded(&pool, q, client_statement_timeout)
                     .await
                     .streamling_context("failed to execute INSERT query")?;
                 Ok(())
@@ -75,6 +78,7 @@ pub async fn execute_batch_delete(
     primary_key_indices: &[usize],
     num_rows: usize,
     ctx: &SinkContext,
+    client_statement_timeout: Option<Duration>,
 ) {
     let query = query.to_string();
     let pool = pool.clone();
@@ -102,7 +106,7 @@ pub async fn execute_batch_delete(
                             .streamling_context("failed to bind Arrow value to query")?;
                     }
                 }
-                q.execute(&pool)
+                execute_bounded(&pool, q, client_statement_timeout)
                     .await
                     .streamling_context("failed to execute DELETE query")?;
                 Ok(())
@@ -115,5 +119,7 @@ pub async fn execute_batch_delete(
 
 // Note: Comprehensive testing of batch execution is done via integration tests
 // in `crates/streamling/tests/pipeline_postgres_sink.rs` which verify that batches
-// are correctly inserted into PostgreSQL with proper retry logic.
-// Unit testing here would require mocking sqlx::PgPool and database connections.
+// are correctly inserted into PostgreSQL with proper retry logic. The client-side
+// statement bound itself is unit-tested next to its implementation in
+// `streamling_core::utils::pg` (fake silent-server reproduction) and covered
+// end-to-end by `streamling-e2e/tests/postgres_sink_recovery.rs`.
