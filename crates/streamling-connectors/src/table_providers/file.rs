@@ -8,9 +8,9 @@
 //!   EOF (inferring the schema and Hive-style partition columns), and the job
 //!   terminates on its own.
 //! - **Continuous** ([`FileSourceTableProvider`]) keeps watching the path: a poll
-//!   loop lists the prefix every `poll_interval`, ingests files whose
-//!   `last_modified` exceeds a persisted [`FileWatermark`], and never
-//!   self-terminates.
+//!   loop lists the prefix (or HEADs the path when it names a single object)
+//!   every `poll_interval`, ingests files whose `last_modified` exceeds a
+//!   persisted [`FileWatermark`], and never self-terminates.
 //!
 //! Because file reads are append-only, a constant `_gs_op = 'i'` column is
 //! synthesized when the inferred schema lacks it. Files that already carry
@@ -52,6 +52,7 @@ use datafusion::physical_plan::{
     project_schema,
 };
 use futures::StreamExt;
+use object_store::ObjectStoreExt;
 use serde_derive::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -792,7 +793,16 @@ impl ExecutionPlan for FileSourceExec {
                 let boundary: HashSet<String> = watermark.boundary_paths.iter().cloned().collect();
                 let mut new_files: Vec<PartitionedFile> = Vec::new();
                 let mut max_seen = watermark.last_modified_ms;
-                let mut listing = object_store.list(Some(table_url.prefix()));
+                // A non-collection URL names one exact object, which a prefix
+                // listing never returns (object_store prefixes match whole
+                // path segments), so HEAD it instead — the resulting
+                // ObjectMeta flows through the same watermark and extension
+                // checks below, so an unchanged object is only ingested once.
+                let mut listing = if table_url.is_collection() {
+                    object_store.list(Some(table_url.prefix()))
+                } else {
+                    futures::stream::iter([object_store.head(table_url.prefix()).await]).boxed()
+                };
                 while let Some(meta) = listing.next().await {
                     let meta = meta?;
                     let last_modified_ms = meta.last_modified.timestamp_millis();
@@ -1257,6 +1267,77 @@ mod tests {
         assert!(
             empty_batches >= 2,
             "idle polls must emit empty heartbeat batches; got {empty_batches}"
+        );
+    }
+
+    /// A path naming one exact object (no trailing slash) must be ingested by
+    /// the continuous source. The poll loop's prefix listing never returns a
+    /// key equal to the prefix (object_store prefixes match whole path
+    /// segments), so this exercises the HEAD branch — without it the source
+    /// heartbeats forever with zero rows.
+    #[tokio::test]
+    async fn continuous_source_ingests_single_file_path() {
+        use std::time::Duration;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+        use tokio::time::timeout;
+
+        let dir =
+            std::env::temp_dir().join(format!("streamling_single_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("1.csv");
+        std::fs::write(&file, "id,name\n1,alice\n2,bob\n3,carol").unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<FileWatermark>("single_file_test");
+
+        let provider = FileSourceTableProvider::try_new(
+            "single_file_src",
+            file.to_str().unwrap(),
+            FileSourceFormat::Csv,
+            Duration::from_millis(100),
+            &session_manager,
+            state_backend,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
+            .await
+            .unwrap();
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+
+        // First poll HEADs and reads the file (3 rows); the watermark then
+        // filters the unchanged object, so later polls are idle heartbeats.
+        let mut data_rows = 0usize;
+        let mut empty_batches = 0usize;
+        for _ in 0..5 {
+            let batch = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream should yield within timeout")
+                .expect("stream should not end")
+                .unwrap();
+            if batch.num_rows() == 0 {
+                empty_batches += 1;
+            } else {
+                data_rows += batch.num_rows();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(data_rows, 3, "the object's 3 rows are read exactly once");
+        assert!(
+            empty_batches >= 2,
+            "polls after ingest must emit empty heartbeat batches; got {empty_batches}"
         );
     }
 
