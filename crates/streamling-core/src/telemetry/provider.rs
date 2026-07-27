@@ -202,7 +202,9 @@ pub fn shutdown_delta_meter_provider() {
     if let Some(provider) = DELTA_METER_PROVIDER.get() {
         info!("Shutting down delta telemetry meter provider");
         if let Err(e) = provider.force_flush() {
-            error!("Failed to flush delta meter provider; billing counts since the last export tick may be lost: {e}");
+            error!(
+                "Failed to flush delta meter provider; billing counts since the last export tick may be lost: {e}"
+            );
         }
         if let Err(e) = provider.shutdown() {
             error!("Failed to shut down delta meter provider: {e}");

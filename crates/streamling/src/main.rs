@@ -198,8 +198,10 @@ async fn run_pipeline(
     if let Some(provider) = telemetry_provider {
         let _ = provider.force_flush();
         let _ = provider.shutdown();
-        streamling_core::telemetry::shutdown_delta_meter_provider();
     }
+    // Independent of the cumulative provider above: flushes billing counts
+    // even if a future code path initializes only the delta provider.
+    streamling_core::telemetry::shutdown_delta_meter_provider();
 
     result
 }
