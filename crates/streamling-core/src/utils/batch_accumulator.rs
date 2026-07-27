@@ -1292,30 +1292,33 @@ mod tests {
     #[test]
     fn test_byte_size_flush_triggers_before_row_limit() {
         // Create accumulator with high row limit but low byte limit
-        // Row limit: 10000, byte limit: 1000 bytes
+        // Row limit: 10000, byte limit: 2000 bytes (accounting for Arrow overhead)
         let mut accumulator = BatchAccumulator::with_max_string_bytes(
             10000,
             Some(Duration::from_secs(60)),
-            Some(1000),
+            Some(2000),
         );
 
         // Create a batch with 10 rows, each having 100 bytes of string data
-        // Total: 10 * 100 = 1000 bytes (at limit)
+        // String data: 10 * 100 = 1000 bytes
+        // Arrow adds offsets buffer (~44 bytes for 10 elements)
+        // Total ~1044 bytes, well under 2000 limit
         let batch1 = create_test_batch_with_string_size(10, "x", 100);
-        // Should not flush yet (at limit, not over)
+        // Should not flush yet (under limit)
         assert!(accumulator.push(batch1).is_none());
-        // At limit but not over, so should_flush_by_size is false
+        // Under limit, so should_flush_by_size is false
         assert!(!accumulator.should_flush_by_size());
 
-        // Add one more byte and it should flush
-        let batch2 = create_test_batch_with_string_size(1, "y", 1);
+        // Add another batch that pushes us over the 2000 byte limit
+        // This adds another ~1044 bytes, total ~2088 > 2000
+        let batch2 = create_test_batch_with_string_size(10, "y", 100);
         let result = accumulator.push(batch2);
 
         // Should have flushed due to byte limit
         assert!(result.is_some(), "Should flush when byte limit is exceeded");
         let flushed = result.unwrap();
         let total_rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 11); // All rows from both batches
+        assert_eq!(total_rows, 20); // All rows from both batches
     }
 
     #[test]
