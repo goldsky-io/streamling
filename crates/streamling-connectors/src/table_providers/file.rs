@@ -42,12 +42,13 @@ use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType, ViewTable, provider_as_source};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, lit};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
+    coalesce_partitions::CoalescePartitionsExec,
     execution_plan::{Boundedness, EmissionType},
     project_schema,
 };
@@ -151,6 +152,46 @@ fn register_object_store_for_url(
     Ok(())
 }
 
+/// Merges the bounded scan's parallel file groups back into a single output
+/// partition, delegating projection/filter/limit pushdown to the inner
+/// [`ListingTable`] so splitting the files costs nothing at plan time.
+#[derive(Debug)]
+struct CoalescedFileScan {
+    inner: Arc<ListingTable>,
+}
+
+#[async_trait]
+impl TableProvider for CoalescedFileScan {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let plan = self.inner.scan(state, projection, filters, limit).await?;
+        if plan.output_partitioning().partition_count() > 1 {
+            return Ok(Arc::new(CoalescePartitionsExec::new(plan)));
+        }
+        Ok(plan)
+    }
+}
+
 /// Builds the runtime provider for a **bounded** `file` source backed by
 /// DataFusion's [`ListingTable`]. The schema is inferred from the files at
 /// startup. Because file reads are append-only, a constant `_gs_op = 'i'` column
@@ -182,8 +223,14 @@ pub async fn build_bounded_file_source_provider(
     let object_store = state.runtime_env().object_store(table_url.object_store())?;
     let partition_cols =
         infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
-    let listing_options =
-        ListingOptions::new(file_format).with_table_partition_cols(partition_cols);
+    // `ListingOptions::new` defaults to one target partition, which reads every
+    // file serially on a single core. Split the files across the session's target
+    // partitions instead; `CoalescedFileScan` merges them back into one output
+    // partition. Set explicitly rather than via `with_session_config_options`,
+    // which would also turn on `collect_stat` (a footer fetch per file at startup).
+    let listing_options = ListingOptions::new(file_format)
+        .with_table_partition_cols(partition_cols)
+        .with_target_partitions(state.config().target_partitions());
     // Partition columns are detected ourselves above (`infer_partition_columns`),
     // not via DataFusion's `infer_partitions_from_path` (which treats every parent
     // directory as a partition level and errors on plain nested subfolders).
@@ -210,9 +257,11 @@ pub async fn build_bounded_file_source_provider(
             return Err(e.into());
         }
     };
-    let listing_table = Arc::new(ListingTable::try_new(config)?);
+    let provider: Arc<dyn TableProvider> = Arc::new(CoalescedFileScan {
+        inner: Arc::new(ListingTable::try_new(config)?),
+    });
 
-    let schema = listing_table.schema();
+    let schema = provider.schema();
 
     // Schema inference over a path that matches no files yields an empty schema
     // and a silent zero-row source; fail fast instead.
@@ -240,7 +289,7 @@ pub async fn build_bounded_file_source_provider(
                 op_field.is_nullable()
             );
         }
-        return Ok(listing_table);
+        return Ok(provider);
     }
 
     // Reference each column by its exact name. `col(name)` would parse the name as a
@@ -252,13 +301,9 @@ pub async fn build_bounded_file_source_provider(
         .map(|f| Expr::Column(Column::new_unqualified(f.name())))
         .collect();
     projection.push(lit(ScalarValue::Utf8(Some(RowKind::Insert.to_str()))).alias(COLUMN_NAME_OP));
-    let plan = LogicalPlanBuilder::scan(
-        reference_name,
-        provider_as_source(listing_table as Arc<dyn TableProvider>),
-        None,
-    )?
-    .project(projection)?
-    .build()?;
+    let plan = LogicalPlanBuilder::scan(reference_name, provider_as_source(provider), None)?
+        .project(projection)?
+        .build()?;
 
     Ok(Arc::new(ViewTable::new(plan, None)))
 }
@@ -1285,6 +1330,55 @@ mod tests {
             empty_batches >= 2,
             "idle polls must emit empty heartbeat batches; got {empty_batches}"
         );
+    }
+
+    /// The bounded source splits its files across the session's target partitions
+    /// but must expose exactly one output partition: `DataSinkExec` reads only
+    /// input partition 0, and streamling's optimizer never inserts a coalesce, so
+    /// a multi-partition source feeding a sink directly would drop rows.
+    #[tokio::test]
+    async fn bounded_source_coalesces_file_groups_into_one_partition() {
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+
+        let dir = std::env::temp_dir().join(format!("streamling_bounded_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..3 {
+            std::fs::write(
+                dir.join(format!("{file}.csv")),
+                format!("id,name\n{file}0,alice\n{file}1,bob\n{file}2,carol"),
+            )
+            .unwrap();
+        }
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let provider = build_bounded_file_source_provider(
+            "bounded_src",
+            &format!("{}/", dir.to_str().unwrap()),
+            FileSourceFormat::Csv,
+            &session_manager,
+        )
+        .await
+        .unwrap();
+
+        let state = session_manager.session_state();
+        let plan = provider.scan(&state, None, &[], None).await.unwrap();
+        assert_eq!(
+            plan.output_partitioning().partition_count(),
+            1,
+            "the bounded source must expose a single output partition"
+        );
+
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch.unwrap().num_rows();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(rows, 9, "every file group's rows must reach partition 0");
     }
 
     /// A remote directory URL without a trailing slash is not a collection, so
