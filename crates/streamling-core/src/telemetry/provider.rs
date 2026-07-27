@@ -193,6 +193,19 @@ pub fn init_telemetry_provider(
     }
 }
 
+/// Flush and shut down the delta meter provider. Must be called on process
+/// exit: the delta provider is not the global provider, so it is not covered
+/// by the cumulative provider's shutdown — without this, jobs that finish
+/// before the PeriodicReader's first tick lose their output_rows_delta
+/// (billing) counts entirely.
+pub fn shutdown_delta_meter_provider() {
+    if let Some(provider) = DELTA_METER_PROVIDER.get() {
+        info!("Shutting down delta telemetry meter provider");
+        let _ = provider.force_flush();
+        let _ = provider.shutdown();
+    }
+}
+
 pub fn shutdown_test_meter_providers() {
     info!("Shutting down telemetry meter providers");
     if let Some(provider) = SHARED_TEST_METER.get() {

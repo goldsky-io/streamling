@@ -198,6 +198,7 @@ async fn run_pipeline(
     if let Some(provider) = telemetry_provider {
         let _ = provider.force_flush();
         let _ = provider.shutdown();
+        streamling_core::telemetry::shutdown_delta_meter_provider();
     }
 
     result
