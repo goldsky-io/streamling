@@ -104,9 +104,7 @@ impl BatchAccumulator {
         }
         // Also flush if string/binary bytes exceed the cap
         if let Some(max_bytes) = self.max_string_bytes {
-            if self.accumulated_string_bytes >= max_bytes {
-                return true;
-            }
+            return self.accumulated_string_bytes >= max_bytes;
         }
         false
     }
@@ -133,23 +131,18 @@ impl BatchAccumulator {
 
         let mut batches_to_return = VecDeque::new();
         let mut rows_included = 0;
-        let mut bytes_returned = 0usize;
         let mut partial_batch = None;
 
         while let Some(batch) = self.accumulated_batches.pop_front() {
             let batch_rows = batch.num_rows();
-            let batch_bytes = Self::batch_string_bytes(&batch);
 
             if rows_included + batch_rows <= self.batch_size {
                 batches_to_return.push_back(batch);
                 rows_included += batch_rows;
-                bytes_returned += batch_bytes;
             } else {
                 let rows_needed = self.batch_size - rows_included;
                 if rows_needed > 0 {
-                    let slice = batch.slice(0, rows_needed);
-                    bytes_returned += Self::batch_string_bytes(&slice);
-                    batches_to_return.push_back(slice);
+                    batches_to_return.push_back(batch.slice(0, rows_needed));
                 }
 
                 let remaining_rows = batch_rows - rows_needed;
@@ -174,7 +167,7 @@ impl BatchAccumulator {
                 + self
                     .accumulated_batches
                     .iter()
-                    .map(|b| Self::batch_string_bytes(b))
+                    .map(Self::batch_string_bytes)
                     .sum::<usize>();
             self.accumulated_string_bytes = remaining_bytes;
             self.accumulated_batches.push_back(batch);
@@ -186,7 +179,7 @@ impl BatchAccumulator {
             self.accumulated_string_bytes = self
                 .accumulated_batches
                 .iter()
-                .map(|b| Self::batch_string_bytes(b))
+                .map(Self::batch_string_bytes)
                 .sum();
         }
 
@@ -1364,7 +1357,7 @@ mod tests {
         // Verify the constant is approximately 1 GiB (half of i32::MAX)
         assert_eq!(DEFAULT_MAX_STRING_BYTES, (i32::MAX as usize) / 2);
         // Should be approximately 1 GiB
-        assert!(DEFAULT_MAX_STRING_BYTES > 1_000_000_000); // > 1 GB
-        assert!(DEFAULT_MAX_STRING_BYTES < 2_000_000_000); // < 2 GB
+        assert!(DEFAULT_MAX_STRING_BYTES > 1_000_000_000, "> 1 GB");
+        assert!(DEFAULT_MAX_STRING_BYTES < 2_000_000_000, "< 2 GB");
     }
 }
