@@ -923,13 +923,24 @@ impl ExecutionPlan for FileSourceExec {
                     // TableSchema (set at construction), so the builder takes just
                     // (object_store_url, file_source) and no longer accepts the
                     // file schema or partition cols directly.
+                    //
+                    // Spread the poll's files over the session's target partitions so
+                    // they are read concurrently, then merge them back into the single
+                    // stream this loop emits from: the watermark, the checkpoint drain,
+                    // and the record limit all assume one emission point.
+                    let file_groups = FileGroup::new(new_files)
+                        .split_files(context.session_config().target_partitions());
                     let config =
                         FileScanConfigBuilder::new(object_store_url.clone(), file_source.clone())
-                            .with_file_group(FileGroup::new(new_files))
+                            .with_file_groups(file_groups)
                             .build();
 
-                    let mut stream =
-                        DataSourceExec::from_data_source(config).execute(0, context.clone())?;
+                    let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+                    let mut stream = if scan.output_partitioning().partition_count() > 1 {
+                        CoalescePartitionsExec::new(scan).execute(0, context.clone())?
+                    } else {
+                        scan.execute(0, context.clone())?
+                    };
                     while let Some(batch) = stream.next().await {
                         // Drain again before every batch so markers arriving mid-read
                         // ride the next batch (within one batch interval) instead of
@@ -1379,6 +1390,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(rows, 9, "every file group's rows must reach partition 0");
+    }
+
+    /// A poll's files are split across the session's target partitions and read
+    /// concurrently, but the source still emits from one stream: every row must
+    /// arrive exactly once (the watermark's boundary set covers the files sharing
+    /// the poll's newest timestamp), and idle polls must still heartbeat.
+    #[tokio::test]
+    async fn continuous_source_reads_split_file_groups_exactly_once() {
+        use datafusion::arrow::array::Array;
+        use std::time::Duration;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+        use tokio::time::timeout;
+
+        let dir = std::env::temp_dir().join(format!("streamling_split_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Non-numeric ids keep the inferred column Utf8, so the assertion below can
+        // name the exact rows rather than just count them.
+        for file in ["a", "b", "c"] {
+            std::fs::write(
+                dir.join(format!("{file}.csv")),
+                format!("id,name\n{file}0,alice\n{file}1,bob\n{file}2,carol"),
+            )
+            .unwrap();
+        }
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<FileWatermark>("split_test");
+
+        let provider = FileSourceTableProvider::try_new(
+            "split_src",
+            &format!("{}/", dir.to_str().unwrap()),
+            FileSourceFormat::Csv,
+            Duration::from_millis(100),
+            &session_manager,
+            state_backend,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.output_partitioning().partition_count(),
+            1,
+            "concurrent file groups must still surface as one output partition"
+        );
+
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        let mut empty_batches = 0usize;
+        for _ in 0..8 {
+            let batch = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream should yield within timeout")
+                .expect("stream should not end")
+                .unwrap();
+            if batch.num_rows() == 0 {
+                empty_batches += 1;
+                continue;
+            }
+            let column = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            ids.extend((0..column.len()).map(|row| column.value(row).to_string()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a0", "a1", "a2", "b0", "b1", "b2", "c0", "c1", "c2"],
+            "every row from every file group must arrive exactly once"
+        );
+        assert!(
+            empty_batches >= 2,
+            "polls after ingest must emit empty heartbeat batches; got {empty_batches}"
+        );
     }
 
     /// A remote directory URL without a trailing slash is not a collection, so
