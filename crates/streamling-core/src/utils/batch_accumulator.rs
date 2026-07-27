@@ -104,7 +104,7 @@ impl BatchAccumulator {
         }
         // Also flush if string/binary bytes exceed the cap
         if let Some(max_bytes) = self.max_string_bytes {
-            return self.accumulated_string_bytes >= max_bytes;
+            return self.accumulated_string_bytes > max_bytes;
         }
         false
     }
@@ -1304,7 +1304,8 @@ mod tests {
         let batch1 = create_test_batch_with_string_size(10, "x", 100);
         // Should not flush yet (at limit, not over)
         assert!(accumulator.push(batch1).is_none());
-        assert!(accumulator.should_flush_by_size()); // Should be at the threshold
+        // At limit but not over, so should_flush_by_size is false
+        assert!(!accumulator.should_flush_by_size());
 
         // Add one more byte and it should flush
         let batch2 = create_test_batch_with_string_size(1, "y", 1);
