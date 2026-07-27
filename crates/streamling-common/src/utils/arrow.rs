@@ -167,6 +167,16 @@ enum IsolatedTakeResult {
     Panicked,
 }
 
+/// Check if an Arrow error message indicates an offset overflow.
+///
+/// Arrow 58+ returns `"Offset overflow error: <value>"` as an `ArrowError`
+/// (rather than panicking) when the cumulative byte offset of a `Utf8`/`Binary`
+/// column exceeds `i32::MAX` during a `take` operation. This helper detects
+/// that error so we can fall back to `manual_safe_take` for type promotion.
+fn is_offset_overflow_error(msg: &str) -> bool {
+    msg.contains("Offset overflow")
+}
+
 /// Safe wrapper around arrow's take kernel that catches overflow panics.
 ///
 /// Arrow-select's `take` kernel can panic with "overflow" when processing very large
@@ -218,7 +228,17 @@ pub fn safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Result<
     match handle.join() {
         Ok(IsolatedTakeResult::Success(result)) => Ok(result),
         Ok(IsolatedTakeResult::ArrowError(err)) => {
-            Err(exec_datafusion_err!("Arrow take error: {}", err))
+            if is_offset_overflow_error(&err) {
+                tracing::warn!(
+                    "Arrow take overflow (ArrowError) detected for type {:?}, using manual safe path. \
+                     This means minimally slower performance but could also signal a batch size that is \
+                     too large if seen multiple times a second.",
+                    arr.data_type()
+                );
+                manual_safe_take(arr, indices)
+            } else {
+                Err(exec_datafusion_err!("Arrow take error: {}", err))
+            }
         }
         Ok(IsolatedTakeResult::Panicked) => {
             // Panic was caught inside the thread - no panic hook fired
@@ -272,43 +292,67 @@ pub fn safe_take_record_batch(batch: &RecordBatch, indices: &UInt32Array) -> Res
     };
     match result {
         Ok(Ok(rb)) => Ok(rb),
-        Ok(Err(e)) => Err(exec_datafusion_err!("Arrow take_record_batch error: {e}")),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if is_offset_overflow_error(&msg) {
+                tracing::warn!(
+                    "Arrow take_record_batch overflow (ArrowError) detected on {} columns, \
+                     falling back to per-column safe_take. This means minimally slower performance \
+                     but could also signal a batch size that is too large if seen multiple times a second.",
+                    batch.num_columns()
+                );
+                rebuild_batch_with_safe_take(batch, indices)
+            } else {
+                Err(exec_datafusion_err!("Arrow take_record_batch error: {e}"))
+            }
+        }
         Err(_panic) => {
             tracing::warn!(
-                "Arrow take_record_batch overflow detected on {} columns, falling back to per-column safe_take. This means minimally slower performance but could also signal a batch size that is too large if seen multiple times a second.",
+                "Arrow take_record_batch overflow (panic) detected on {} columns, falling back to \
+                 per-column safe_take. This means minimally slower performance but could also signal \
+                 a batch size that is too large if seen multiple times a second.",
                 batch.num_columns()
             );
-            // Convert UInt32 -> Int64 once; safe_take's signature is Int64.
-            // Use `from_iter` (yielding `Option<i64>`) rather than
-            // `from_iter_values` so null bits propagate explicitly to the
-            // resulting array. `safe_take`'s `manual_safe_take` checks
-            // `indices.is_null(i)` first; if we used a non-null array with
-            // a sentinel value we'd be depending on the sentinel landing
-            // outside `input.len()` after a signed-to-unsigned cast, which
-            // is fragile (and arch-dependent for very large sentinels).
-            let int64_indices =
-                PrimitiveArray::<Int64Type>::from_iter((0..indices.len()).map(|i| {
-                    if indices.is_null(i) {
-                        None
-                    } else {
-                        Some(indices.value(i) as i64)
-                    }
-                }));
-            let new_columns: Vec<ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(|col| safe_take(col, &int64_indices))
-                .collect::<Result<Vec<_>>>()?;
-            let new_schema = build_schema_from_columns(
-                batch.schema_ref(),
-                &new_columns,
-                batch.schema().metadata().clone(),
-            );
-            RecordBatch::try_new(new_schema, new_columns).map_err(|e| {
-                exec_datafusion_err!("Failed to rebuild RecordBatch after safe_take fallback: {e}")
-            })
+            rebuild_batch_with_safe_take(batch, indices)
         }
     }
+}
+
+/// Rebuild a RecordBatch column-by-column using [`safe_take`].
+///
+/// This is the fallback path when the native `take_record_batch` fails due to
+/// overflow (either as a panic or as an ArrowError). It converts the UInt32 indices
+/// to Int64 and calls `safe_take` on each column, which handles type promotion
+/// for overflowing `Utf8`/`Binary` columns.
+fn rebuild_batch_with_safe_take(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
+    // Convert UInt32 -> Int64 once; safe_take's signature is Int64.
+    // Use `from_iter` (yielding `Option<i64>`) rather than
+    // `from_iter_values` so null bits propagate explicitly to the
+    // resulting array. `safe_take`'s `manual_safe_take` checks
+    // `indices.is_null(i)` first; if we used a non-null array with
+    // a sentinel value we'd be depending on the sentinel landing
+    // outside `input.len()` after a signed-to-unsigned cast, which
+    // is fragile (and arch-dependent for very large sentinels).
+    let int64_indices = PrimitiveArray::<Int64Type>::from_iter((0..indices.len()).map(|i| {
+        if indices.is_null(i) {
+            None
+        } else {
+            Some(indices.value(i) as i64)
+        }
+    }));
+    let new_columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|col| safe_take(col, &int64_indices))
+        .collect::<Result<Vec<_>>>()?;
+    let new_schema = build_schema_from_columns(
+        batch.schema_ref(),
+        &new_columns,
+        batch.schema().metadata().clone(),
+    );
+    RecordBatch::try_new(new_schema, new_columns).map_err(|e| {
+        exec_datafusion_err!("Failed to rebuild RecordBatch after safe_take fallback: {e}")
+    })
 }
 
 /// Manual implementation of take that handles overflow by using larger types.
@@ -792,5 +836,90 @@ mod tests {
 
         let result = safe_take(&arr, &indices).expect("safe_take should succeed");
         assert_eq!(result.len(), 6);
+    }
+
+    #[test]
+    fn test_is_offset_overflow_error_matches_known_messages() {
+        // Arrow 58+ returns "Offset overflow error: <value>" as an ArrowError
+        assert!(is_offset_overflow_error("Offset overflow error: 2147483652"));
+        assert!(is_offset_overflow_error("Offset overflow error: 2147483656"));
+        assert!(is_offset_overflow_error("Offset overflow error: 2147483689"));
+        // Partial match should also work
+        assert!(is_offset_overflow_error("Some prefix Offset overflow error suffix"));
+        // But unrelated errors should not match
+        assert!(!is_offset_overflow_error("Out of memory"));
+        assert!(!is_offset_overflow_error("Index out of bounds"));
+        assert!(!is_offset_overflow_error(""));
+    }
+
+    #[test]
+    fn test_safe_take_fallback_on_overflow_produces_large_utf8() {
+        // This tests that manual_safe_take is correctly called when overflow would occur.
+        // We can't easily trigger a real overflow in a unit test, but we can verify
+        // that manual_safe_take produces the expected LargeUtf8 type.
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["hello", "world", "test"]));
+        let indices = PrimitiveArray::<Int64Type>::from(vec![0i64, 1, 2, 0, 1]);
+
+        // Call manual_safe_take directly to verify type promotion
+        let result = manual_safe_take(&arr, &indices).expect("manual_safe_take should succeed");
+
+        // Should be LargeUtf8, not Utf8
+        assert_eq!(result.data_type(), &DataType::LargeUtf8);
+        assert_eq!(result.len(), 5);
+
+        let result_arr = result.as_string::<i64>();
+        assert_eq!(result_arr.value(0), "hello");
+        assert_eq!(result_arr.value(1), "world");
+        assert_eq!(result_arr.value(2), "test");
+        assert_eq!(result_arr.value(3), "hello");
+        assert_eq!(result_arr.value(4), "world");
+    }
+
+    #[test]
+    fn test_rebuild_batch_with_safe_take_preserves_data() {
+        // Test that rebuild_batch_with_safe_take produces correct results
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["one", "two", "three"]));
+        let batch = RecordBatch::try_new(schema, vec![a, b]).unwrap();
+
+        let indices = UInt32Array::from(vec![2u32, 0, 1]);
+        let out = rebuild_batch_with_safe_take(&batch, &indices)
+            .expect("rebuild_batch_with_safe_take should succeed");
+
+        assert_eq!(out.num_rows(), 3);
+        let out_a = out.column(0).as_primitive::<Int64Type>();
+        assert_eq!(out_a.value(0), 30);
+        assert_eq!(out_a.value(1), 10);
+        assert_eq!(out_a.value(2), 20);
+
+        // Note: String column may be promoted to LargeUtf8 by manual_safe_take
+        // if it goes through that path, but in normal cases it stays Utf8
+    }
+
+    #[test]
+    fn test_rebuild_batch_with_safe_take_preserves_null_indices() {
+        // Test that null indices are properly preserved
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["one", "two", "three"]));
+        let batch = RecordBatch::try_new(schema, vec![a, b]).unwrap();
+
+        // Index 1 is null
+        let indices = UInt32Array::from(vec![Some(2u32), None, Some(0u32)]);
+        let out = rebuild_batch_with_safe_take(&batch, &indices)
+            .expect("rebuild_batch_with_safe_take should succeed");
+
+        assert_eq!(out.num_rows(), 3);
+        let out_a = out.column(0).as_primitive::<Int64Type>();
+        assert_eq!(out_a.value(0), 30);
+        assert!(out_a.is_null(1), "null index should produce null value");
+        assert_eq!(out_a.value(2), 10);
     }
 }

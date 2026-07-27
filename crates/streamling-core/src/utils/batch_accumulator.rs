@@ -3,7 +3,8 @@ use crate::checkpoints::checkpoint_management::{
     strip_checkpoint_messages,
 };
 use crate::utils::batch::enrich_batch_with_metadata;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, RecordBatch};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::compute::concat_batches;
 use datafusion::error::DataFusionError;
 use futures::StreamExt;
@@ -11,23 +12,67 @@ use futures::stream::Stream;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Default byte-size cap for `Utf8`/`Binary` columns in accumulated batches.
+/// This is half of `i32::MAX` (~1 GiB), providing a safety margin against the
+/// Arrow take kernel's 2 GiB offset overflow limit.
+pub const DEFAULT_MAX_STRING_BYTES: usize = (i32::MAX as usize) / 2;
+
 pub struct BatchAccumulator {
     batch_size: usize,
     batch_flush_interval: Option<Duration>,
+    /// Maximum cumulative bytes in `Utf8`/`Binary`/`LargeUtf8`/`LargeBinary` columns
+    /// before triggering a flush. Defaults to `None` (no byte-based flushing).
+    max_string_bytes: Option<usize>,
     accumulated_batches: VecDeque<RecordBatch>,
     current_row_count: usize,
+    /// Cached sum of string/binary buffer bytes across all accumulated batches.
+    /// Avoids re-computing on every push.
+    accumulated_string_bytes: usize,
     last_flush_time: Instant,
 }
 
 impl BatchAccumulator {
     pub fn new(batch_size: usize, batch_flush_interval: Option<Duration>) -> Self {
+        Self::with_max_string_bytes(batch_size, batch_flush_interval, None)
+    }
+
+    /// Create a new `BatchAccumulator` with an optional byte-size cap for string/binary columns.
+    ///
+    /// When `max_string_bytes` is `Some(n)`, the accumulator will flush early if the cumulative
+    /// byte size of `Utf8`/`Binary`/`LargeUtf8`/`LargeBinary` columns exceeds `n` bytes, even if
+    /// the row count threshold hasn't been reached. This prevents the Arrow take kernel's 2 GiB
+    /// offset overflow for wide string columns.
+    ///
+    /// Use [`DEFAULT_MAX_STRING_BYTES`] (~1 GiB) as the recommended threshold.
+    pub fn with_max_string_bytes(
+        batch_size: usize,
+        batch_flush_interval: Option<Duration>,
+        max_string_bytes: Option<usize>,
+    ) -> Self {
         Self {
             batch_size,
             batch_flush_interval,
+            max_string_bytes,
             accumulated_batches: VecDeque::new(),
             current_row_count: 0,
+            accumulated_string_bytes: 0,
             last_flush_time: Instant::now(),
         }
+    }
+
+    /// Compute the total byte size of string/binary columns in a single batch.
+    fn batch_string_bytes(batch: &RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|col| match col.data_type() {
+                DataType::Utf8
+                | DataType::Binary
+                | DataType::LargeUtf8
+                | DataType::LargeBinary => col.get_buffer_memory_size(),
+                _ => 0,
+            })
+            .sum()
     }
 
     pub fn push(&mut self, batch: RecordBatch) -> Option<VecDeque<RecordBatch>> {
@@ -44,6 +89,7 @@ impl BatchAccumulator {
         }
 
         self.current_row_count += batch.num_rows();
+        self.accumulated_string_bytes += Self::batch_string_bytes(&batch);
         self.accumulated_batches.push_back(batch);
 
         if self.should_flush_by_size() {
@@ -54,8 +100,18 @@ impl BatchAccumulator {
     }
 
     pub fn should_flush_by_size(&self) -> bool {
-        self.current_row_count >= self.batch_size
+        if self.current_row_count >= self.batch_size {
+            return true;
+        }
+        // Also flush if string/binary bytes exceed the cap
+        if let Some(max_bytes) = self.max_string_bytes {
+            if self.accumulated_string_bytes >= max_bytes {
+                return true;
+            }
+        }
+        false
     }
+
 
     pub fn should_flush_by_time(&self) -> bool {
         match self.batch_flush_interval {
@@ -79,18 +135,23 @@ impl BatchAccumulator {
 
         let mut batches_to_return = VecDeque::new();
         let mut rows_included = 0;
+        let mut bytes_returned = 0usize;
         let mut partial_batch = None;
 
         while let Some(batch) = self.accumulated_batches.pop_front() {
             let batch_rows = batch.num_rows();
+            let batch_bytes = Self::batch_string_bytes(&batch);
 
             if rows_included + batch_rows <= self.batch_size {
                 batches_to_return.push_back(batch);
                 rows_included += batch_rows;
+                bytes_returned += batch_bytes;
             } else {
                 let rows_needed = self.batch_size - rows_included;
                 if rows_needed > 0 {
-                    batches_to_return.push_back(batch.slice(0, rows_needed));
+                    let slice = batch.slice(0, rows_needed);
+                    bytes_returned += Self::batch_string_bytes(&slice);
+                    batches_to_return.push_back(slice);
                 }
 
                 let remaining_rows = batch_rows - rows_needed;
@@ -110,9 +171,25 @@ impl BatchAccumulator {
         }
 
         if let Some(batch) = partial_batch {
+            // Recalculate remaining bytes from partial batch + any remaining accumulated batches
+            let remaining_bytes = Self::batch_string_bytes(&batch)
+                + self
+                    .accumulated_batches
+                    .iter()
+                    .map(|b| Self::batch_string_bytes(b))
+                    .sum::<usize>();
+            self.accumulated_string_bytes = remaining_bytes;
             self.accumulated_batches.push_back(batch);
         } else if self.accumulated_batches.is_empty() {
             self.current_row_count = 0;
+            self.accumulated_string_bytes = 0;
+        } else {
+            // Some batches remain but no partial batch was created
+            self.accumulated_string_bytes = self
+                .accumulated_batches
+                .iter()
+                .map(|b| Self::batch_string_bytes(b))
+                .sum();
         }
 
         self.last_flush_time = Instant::now();
@@ -131,6 +208,7 @@ impl BatchAccumulator {
 
         let batches = std::mem::take(&mut self.accumulated_batches);
         self.current_row_count = 0;
+        self.accumulated_string_bytes = 0;
         self.last_flush_time = Instant::now();
 
         Some(batches)
@@ -1192,5 +1270,97 @@ mod tests {
 
         let merged = accumulator.flush_all_merged().unwrap().unwrap();
         assert_eq!(merged.num_rows(), 60);
+    }
+
+    /// Create a test batch with a configurable string column that has predictable byte size.
+    /// Each row's string value is `content` repeated `repeats` times.
+    fn create_test_batch_with_string_size(
+        num_rows: usize,
+        content: &str,
+        repeats: usize,
+    ) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("data", DataType::Utf8, false),
+        ]);
+
+        let ids: Vec<i32> = (0..num_rows as i32).collect();
+        let value = content.repeat(repeats);
+        let names: Vec<&str> = (0..num_rows).map(|_| value.as_str()).collect();
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_byte_size_flush_triggers_before_row_limit() {
+        // Create accumulator with high row limit but low byte limit
+        // Row limit: 10000, byte limit: 1000 bytes
+        let mut accumulator =
+            BatchAccumulator::with_max_string_bytes(10000, Some(Duration::from_secs(60)), Some(1000));
+
+        // Create a batch with 10 rows, each having 100 bytes of string data
+        // Total: 10 * 100 = 1000 bytes (at limit)
+        let batch1 = create_test_batch_with_string_size(10, "x", 100);
+        // Should not flush yet (at limit, not over)
+        assert!(accumulator.push(batch1).is_none());
+        assert!(accumulator.should_flush_by_size()); // Should be at the threshold
+
+        // Add one more byte and it should flush
+        let batch2 = create_test_batch_with_string_size(1, "y", 1);
+        let result = accumulator.push(batch2);
+
+        // Should have flushed due to byte limit
+        assert!(result.is_some(), "Should flush when byte limit is exceeded");
+        let flushed = result.unwrap();
+        let total_rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 11); // All rows from both batches
+    }
+
+    #[test]
+    fn test_byte_size_not_checked_when_none() {
+        // Create accumulator without byte limit
+        let mut accumulator = BatchAccumulator::new(100, Some(Duration::from_secs(60)));
+
+        // Create large batch that would exceed any reasonable byte limit
+        let batch = create_test_batch_with_string_size(50, "x", 10000); // 50 * 10000 = 500KB
+        assert!(accumulator.push(batch).is_none()); // Should not flush (only 50 rows < 100)
+
+        // Only row count matters
+        let batch2 = create_test_batch_with_string_size(50, "x", 10000);
+        let result = accumulator.push(batch2);
+        assert!(result.is_some()); // Now flushes because row count hit 100
+    }
+
+    #[test]
+    fn test_accumulated_string_bytes_reset_on_flush_all() {
+        let mut accumulator =
+            BatchAccumulator::with_max_string_bytes(10000, Some(Duration::from_secs(60)), Some(1000));
+
+        let batch = create_test_batch_with_string_size(10, "x", 50); // ~500 bytes
+        accumulator.push(batch);
+
+        // After flush_all, accumulated_string_bytes should be reset
+        let _ = accumulator.flush_all();
+        assert!(accumulator.is_empty());
+
+        // Push another batch - should not trigger flush since we're starting fresh
+        let batch2 = create_test_batch_with_string_size(5, "x", 50); // ~250 bytes
+        assert!(accumulator.push(batch2).is_none());
+    }
+
+    #[test]
+    fn test_default_max_string_bytes_constant() {
+        // Verify the constant is approximately 1 GiB (half of i32::MAX)
+        assert_eq!(DEFAULT_MAX_STRING_BYTES, (i32::MAX as usize) / 2);
+        // Should be approximately 1 GiB
+        assert!(DEFAULT_MAX_STRING_BYTES > 1_000_000_000); // > 1 GB
+        assert!(DEFAULT_MAX_STRING_BYTES < 2_000_000_000); // < 2 GB
     }
 }

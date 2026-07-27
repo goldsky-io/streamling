@@ -2076,7 +2076,13 @@ impl Streamling {
                 if !dry_run {
                     let session_manager = session_manager.clone();
                     let sink_future = async move {
-                        let result = session_manager.new_df(sink_plan).collect().await;
+                        let result = session_manager
+                            .new_df(sink_plan)
+                            .collect()
+                            .await
+                            .streamling_with_context(|| {
+                                format!("sink '{}' execution failed", future_name)
+                            });
                         if let Err(err) = &result {
                             error!(
                                 "Sink future [{}] completed with error: {}",
