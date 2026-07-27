@@ -52,7 +52,8 @@ use datafusion::physical_plan::{
     project_schema,
 };
 use futures::StreamExt;
-use object_store::ObjectStoreExt;
+use futures::stream::BoxStream;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use serde_derive::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -279,6 +280,29 @@ pub struct FileWatermark {
 
 fn watermark_state_key(reference_name: &str) -> StateKey {
     StateKey::from(format!("{reference_name}:watermark"))
+}
+
+/// The candidate objects for one poll.
+///
+/// A non-collection URL names one exact object, which a prefix listing never
+/// returns (object_store matches prefixes on whole path segments), so it is
+/// HEADed instead. A `NotFound` falls back to a prefix listing, mirroring
+/// DataFusion's `ListingTableUrl::list_prefixed_files`: a remote directory URL
+/// without a trailing slash is also non-collection, and schema inference
+/// resolves it through that same fallback, so a source configured that way would
+/// otherwise start and then tear down on its first poll. Other errors ride the
+/// stream, keeping one error path in the caller.
+async fn list_poll_candidates(
+    object_store: &dyn ObjectStore,
+    table_url: &ListingTableUrl,
+) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    if table_url.is_collection() {
+        return object_store.list(Some(table_url.prefix()));
+    }
+    match object_store.head(table_url.prefix()).await {
+        Err(object_store::Error::NotFound { .. }) => object_store.list(Some(table_url.prefix())),
+        result => futures::stream::iter([result]).boxed(),
+    }
 }
 
 /// Whether a listed object should be ingested: it must carry the format's
@@ -793,16 +817,9 @@ impl ExecutionPlan for FileSourceExec {
                 let boundary: HashSet<String> = watermark.boundary_paths.iter().cloned().collect();
                 let mut new_files: Vec<PartitionedFile> = Vec::new();
                 let mut max_seen = watermark.last_modified_ms;
-                // A non-collection URL names one exact object, which a prefix
-                // listing never returns (object_store prefixes match whole
-                // path segments), so HEAD it instead — the resulting
-                // ObjectMeta flows through the same watermark and extension
-                // checks below, so an unchanged object is only ingested once.
-                let mut listing = if table_url.is_collection() {
-                    object_store.list(Some(table_url.prefix()))
-                } else {
-                    futures::stream::iter([object_store.head(table_url.prefix()).await]).boxed()
-                };
+                // A HEADed single object flows through the same watermark and
+                // extension checks as a listed one, so it is ingested only once.
+                let mut listing = list_poll_candidates(object_store.as_ref(), &table_url).await;
                 while let Some(meta) = listing.next().await {
                     let meta = meta?;
                     let last_modified_ms = meta.last_modified.timestamp_millis();
@@ -1268,6 +1285,34 @@ mod tests {
             empty_batches >= 2,
             "idle polls must emit empty heartbeat batches; got {empty_batches}"
         );
+    }
+
+    /// A remote directory URL without a trailing slash is not a collection, so
+    /// the poll HEADs it and gets NotFound. Schema inference resolves such a URL
+    /// by falling back to a prefix listing, so the poll loop must agree —
+    /// otherwise the source starts and dies on its first poll.
+    #[tokio::test]
+    async fn poll_candidates_fall_back_to_listing_when_head_misses() {
+        use futures::TryStreamExt;
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+
+        let store = InMemory::new();
+        store
+            .put(&Path::from("data/1.csv"), "id\n1".into())
+            .await
+            .unwrap();
+
+        let table_url = ListingTableUrl::parse("memory:///data").unwrap();
+        assert!(!table_url.is_collection(), "no trailing slash");
+
+        let found: Vec<ObjectMeta> = list_poll_candidates(&store, &table_url)
+            .await
+            .try_collect()
+            .await
+            .unwrap();
+        let locations: Vec<&str> = found.iter().map(|meta| meta.location.as_ref()).collect();
+        assert_eq!(locations, vec!["data/1.csv"]);
     }
 
     /// A path naming one exact object (no trailing slash) must be ingested by
