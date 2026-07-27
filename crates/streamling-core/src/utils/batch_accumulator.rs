@@ -4,8 +4,8 @@ use crate::checkpoints::checkpoint_management::{
 };
 use crate::utils::batch::enrich_batch_with_metadata;
 use datafusion::arrow::array::{Array, RecordBatch};
-use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::error::DataFusionError;
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -66,10 +66,9 @@ impl BatchAccumulator {
             .columns()
             .iter()
             .map(|col| match col.data_type() {
-                DataType::Utf8
-                | DataType::Binary
-                | DataType::LargeUtf8
-                | DataType::LargeBinary => col.get_buffer_memory_size(),
+                DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
+                    col.get_buffer_memory_size()
+                }
                 _ => 0,
             })
             .sum()
