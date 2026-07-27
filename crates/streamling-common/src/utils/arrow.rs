@@ -841,11 +841,19 @@ mod tests {
     #[test]
     fn test_is_offset_overflow_error_matches_known_messages() {
         // Arrow 58+ returns "Offset overflow error: <value>" as an ArrowError
-        assert!(is_offset_overflow_error("Offset overflow error: 2147483652"));
-        assert!(is_offset_overflow_error("Offset overflow error: 2147483656"));
-        assert!(is_offset_overflow_error("Offset overflow error: 2147483689"));
+        assert!(is_offset_overflow_error(
+            "Offset overflow error: 2147483652"
+        ));
+        assert!(is_offset_overflow_error(
+            "Offset overflow error: 2147483656"
+        ));
+        assert!(is_offset_overflow_error(
+            "Offset overflow error: 2147483689"
+        ));
         // Partial match should also work
-        assert!(is_offset_overflow_error("Some prefix Offset overflow error suffix"));
+        assert!(is_offset_overflow_error(
+            "Some prefix Offset overflow error suffix"
+        ));
         // But unrelated errors should not match
         assert!(!is_offset_overflow_error("Out of memory"));
         assert!(!is_offset_overflow_error("Index out of bounds"));

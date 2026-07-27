@@ -112,7 +112,6 @@ impl BatchAccumulator {
         false
     }
 
-
     pub fn should_flush_by_time(&self) -> bool {
         match self.batch_flush_interval {
             Some(interval) => self.last_flush_time.elapsed() >= interval,
@@ -1302,8 +1301,11 @@ mod tests {
     fn test_byte_size_flush_triggers_before_row_limit() {
         // Create accumulator with high row limit but low byte limit
         // Row limit: 10000, byte limit: 1000 bytes
-        let mut accumulator =
-            BatchAccumulator::with_max_string_bytes(10000, Some(Duration::from_secs(60)), Some(1000));
+        let mut accumulator = BatchAccumulator::with_max_string_bytes(
+            10000,
+            Some(Duration::from_secs(60)),
+            Some(1000),
+        );
 
         // Create a batch with 10 rows, each having 100 bytes of string data
         // Total: 10 * 100 = 1000 bytes (at limit)
@@ -1340,8 +1342,11 @@ mod tests {
 
     #[test]
     fn test_accumulated_string_bytes_reset_on_flush_all() {
-        let mut accumulator =
-            BatchAccumulator::with_max_string_bytes(10000, Some(Duration::from_secs(60)), Some(1000));
+        let mut accumulator = BatchAccumulator::with_max_string_bytes(
+            10000,
+            Some(Duration::from_secs(60)),
+            Some(1000),
+        );
 
         let batch = create_test_batch_with_string_size(10, "x", 50); // ~500 bytes
         accumulator.push(batch);
