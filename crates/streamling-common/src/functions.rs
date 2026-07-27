@@ -2,6 +2,7 @@ use crate::functions::array_enumerate::ArrayEnumerateFunc;
 use crate::functions::array_filter::ArrayFilterFunc;
 use crate::functions::array_filter_first::ArrayFilterFirstFunc;
 use crate::functions::array_filter_in::ArrayFilterInFunc;
+use crate::functions::array_struct_field::ArrayStructFieldFunc;
 use crate::functions::byte_reverse::ReverseBytes32Func;
 use crate::functions::byte_to_hex::ByteToHexFunc;
 use crate::functions::coalesce_meta::CoalesceMetaUdf;
@@ -33,6 +34,7 @@ pub mod array_enumerate;
 pub mod array_filter;
 pub mod array_filter_first;
 pub mod array_filter_in;
+pub mod array_struct_field;
 pub mod byte_reverse;
 pub mod byte_to_hex;
 pub mod coalesce_meta;
@@ -72,6 +74,7 @@ impl CommonFunctions {
             ScalarUDF::from(ArrayFilterFunc::new()),
             ScalarUDF::from(ArrayFilterFirstFunc::new()),
             ScalarUDF::from(ArrayFilterInFunc::new()),
+            ScalarUDF::from(ArrayStructFieldFunc::new()),
             ScalarUDF::from(ToLargeListFunc::new()),
             ScalarUDF::from(XxHashFunc::new()),
             ScalarUDF::from(Keccak256Func::new()),
