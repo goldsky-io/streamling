@@ -1354,10 +1354,7 @@ mod tests {
 
     #[test]
     fn test_default_max_string_bytes_constant() {
-        // Verify the constant is approximately 1 GiB (half of i32::MAX)
+        // Verify the constant is half of i32::MAX
         assert_eq!(DEFAULT_MAX_STRING_BYTES, (i32::MAX as usize) / 2);
-        // Should be approximately 1 GiB
-        assert!(DEFAULT_MAX_STRING_BYTES > 1_000_000_000, "> 1 GB");
-        assert!(DEFAULT_MAX_STRING_BYTES < 2_000_000_000, "< 2 GB");
     }
 }
