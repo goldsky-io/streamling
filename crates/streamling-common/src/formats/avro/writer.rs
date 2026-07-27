@@ -249,6 +249,10 @@ fn serialize_column<T: SerializeTarget>(
             write_arrow_value!(ArrayRef::as_string::<i32>, Value::String, |v: &str| v
                 .into())
         }
+        DataType::LargeUtf8 => {
+            write_arrow_value!(ArrayRef::as_string::<i64>, Value::String, |v: &str| v
+                .into())
+        }
         DataType::Utf8View => {
             write_arrow_value!(ArrayRef::as_string_view, Value::String, |v: &str| v.into())
         }
@@ -1117,6 +1121,70 @@ mod tests {
                 Record(vec![(
                     "payload".to_string(),
                     Union(1, Box::new(Bytes(b"world".to_vec())))
+                )]),
+            ]
+        );
+    }
+
+    /// Regression test for the `unimplemented!("unsupported data type:
+    /// LargeUtf8")` panic. EVM datasets declare unbounded string columns
+    /// (log `data`, transaction calldata `input`) as `LargeUtf8` to avoid
+    /// i32 string-offset overflow; serializing them to a Kafka avro sink
+    /// must emit plain avro strings, exactly like `Utf8`.
+    #[test]
+    fn test_large_utf8_serialization() {
+        use apache_avro::types::Value::*;
+        use datafusion::arrow::array::LargeStringArray;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeUtf8,
+            false,
+        )]));
+
+        let array = LargeStringArray::from(vec!["0xdeadbeef", ""]);
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        let avro_schema = to_avro("LogData", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        assert_eq!(
+            result,
+            vec![
+                Record(vec![("data".to_string(), String("0xdeadbeef".to_string()))]),
+                Record(vec![("data".to_string(), String("".to_string()))]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_large_utf8_nullable_serialization() {
+        use apache_avro::types::Value::*;
+        use datafusion::arrow::array::LargeStringArray;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "input",
+            DataType::LargeUtf8,
+            true,
+        )]));
+
+        let array = LargeStringArray::from(vec![Some("0x00"), None, Some("0xffff")]);
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        let avro_schema = to_avro("TxInput", &arrow_schema.fields);
+        let result = serialize(&avro_schema, &batch);
+
+        assert_eq!(
+            result,
+            vec![
+                Record(vec![(
+                    "input".to_string(),
+                    Union(1, Box::new(String("0x00".to_string())))
+                )]),
+                Record(vec![("input".to_string(), Union(0, Box::new(Null)))]),
+                Record(vec![(
+                    "input".to_string(),
+                    Union(1, Box::new(String("0xffff".to_string())))
                 )]),
             ]
         );
