@@ -201,8 +201,12 @@ pub fn init_telemetry_provider(
 pub fn shutdown_delta_meter_provider() {
     if let Some(provider) = DELTA_METER_PROVIDER.get() {
         info!("Shutting down delta telemetry meter provider");
-        let _ = provider.force_flush();
-        let _ = provider.shutdown();
+        if let Err(e) = provider.force_flush() {
+            error!("Failed to flush delta meter provider; billing counts since the last export tick may be lost: {e}");
+        }
+        if let Err(e) = provider.shutdown() {
+            error!("Failed to shut down delta meter provider: {e}");
+        }
     }
 }
 
@@ -393,4 +397,41 @@ pub fn get_delta_meter() -> opentelemetry::metrics::Meter {
     // This should rarely happen in practice
     trace!("Delta provider not found, falling back to global meter");
     global::meter("execution_metrics_delta")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporterBuilder;
+
+    /// Regression test for short-lived jobs losing billing counts: delta
+    /// measurements recorded after the last PeriodicReader tick must still be
+    /// exported when shutdown_delta_meter_provider() runs on process exit.
+    #[test]
+    fn shutdown_delta_meter_provider_flushes_pending_counts() {
+        let exporter = InMemoryMetricExporterBuilder::new()
+            .with_temporality(Temporality::Delta)
+            .build();
+        // Interval far longer than the test: nothing exports unless shutdown flushes.
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        DELTA_METER_PROVIDER
+            .set(provider)
+            .expect("DELTA_METER_PROVIDER already set; no other test may initialize it");
+
+        get_delta_meter()
+            .u64_counter("streamling_output_rows_delta")
+            .build()
+            .add(42, &[]);
+
+        shutdown_delta_meter_provider();
+
+        let exported = exporter.get_finished_metrics().unwrap();
+        assert!(
+            !exported.is_empty(),
+            "delta counts recorded before exit were not exported on shutdown"
+        );
+    }
 }
