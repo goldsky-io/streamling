@@ -2149,9 +2149,8 @@ impl Streamling {
                 result = futures::future::try_join_all(sink_futures) => {
                     result
                         .map(|_| ())
-                        .map_err(|e| {
+                        .inspect_err(|_| {
                             debug!("Terminating because a sink future completed with error");
-                            e
                         })
                 }
             };
