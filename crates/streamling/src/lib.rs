@@ -2151,7 +2151,7 @@ impl Streamling {
                         .map(|_| ())
                         .map_err(|e| {
                             debug!("Terminating because a sink future completed with error");
-                            e.into()
+                            e
                         })
                 }
             };
@@ -2161,7 +2161,6 @@ impl Streamling {
             futures::future::try_join_all(sink_futures)
                 .await
                 .map(|_| ())
-                .map_err(Into::into)
         };
 
         // Issue SourceComplete message to plugins. This is needed to fully clean up checkpoint channels when plugins
