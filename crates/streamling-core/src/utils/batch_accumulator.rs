@@ -3,9 +3,9 @@ use crate::checkpoints::checkpoint_management::{
     strip_checkpoint_messages,
 };
 use crate::utils::batch::enrich_batch_with_metadata;
-use datafusion::arrow::array::{Array, AsArray, RecordBatch};
+use datafusion::arrow::array::{Array, AsArray, RecordBatch, make_array};
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, UnionMode};
 use datafusion::error::DataFusionError;
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -22,10 +22,11 @@ const MAX_MERGED_COLUMN_BYTES: usize = i32::MAX as usize;
 
 /// The largest payload this array feeds into any single i32-offset buffer
 /// during `concat_batches`: value bytes for Utf8/Binary, child element counts
-/// for List/Map, recursing into nested children. Fixed-width and i64-offset
-/// (Large*/View) data cannot overflow and contributes nothing. Sliced
-/// List/Map children are counted at full length, which only over-estimates
-/// (flushing early is safe).
+/// for List/Map and dense unions. Fixed-width and i64-offset (Large*/View)
+/// offsets cannot themselves overflow, but their children are still
+/// concatenated, so every other type recurses into its children (scalar types
+/// have none and contribute nothing). Sliced children are counted at full
+/// length, which only over-estimates (flushing early is safe).
 fn max_i32_offset_payload_size(array: &dyn Array) -> usize {
     match array.data_type() {
         DataType::Utf8 => {
@@ -50,20 +51,26 @@ fn max_i32_offset_payload_size(array: &dyn Array) -> usize {
             let child_elements = (offsets[array.len()] - offsets[0]) as usize;
             child_elements.max(max_i32_offset_payload_size(array.entries()))
         }
-        DataType::Struct(_) => array
-            .as_struct()
-            .columns()
+        // Dense union offsets index each child with i32, so a child's total
+        // length is itself a payload.
+        DataType::Union(fields, UnionMode::Dense) => {
+            let array = array.as_union();
+            fields
+                .iter()
+                .map(|(type_id, _)| {
+                    let child = array.child(type_id);
+                    child.len().max(max_i32_offset_payload_size(child.as_ref()))
+                })
+                .max()
+                .unwrap_or(0)
+        }
+        _ => array
+            .to_data()
+            .child_data()
             .iter()
-            .map(|column| max_i32_offset_payload_size(column.as_ref()))
+            .map(|child| max_i32_offset_payload_size(make_array(child.clone()).as_ref()))
             .max()
             .unwrap_or(0),
-        DataType::FixedSizeList(_, _) => {
-            max_i32_offset_payload_size(array.as_fixed_size_list().values().as_ref())
-        }
-        DataType::Dictionary(_, _) => {
-            max_i32_offset_payload_size(array.as_any_dictionary().values().as_ref())
-        }
-        _ => 0,
     }
 }
 
@@ -1256,6 +1263,20 @@ mod tests {
         let list = builder.finish();
         // 12 child elements dominate the Int32 child (payload 0).
         assert_eq!(max_i32_offset_payload_size(&list), 12);
+    }
+
+    #[test]
+    fn test_payload_large_list_recurses_into_child() {
+        use datafusion::arrow::array::{LargeListBuilder, StringBuilder};
+
+        let mut builder = LargeListBuilder::new(StringBuilder::new());
+        builder.values().append_value("abc");
+        builder.values().append_value("defg");
+        builder.append(true);
+        let list = builder.finish();
+        // LargeList offsets are i64, but the Utf8 child still carries i32
+        // offsets that overflow on concatenation.
+        assert_eq!(max_i32_offset_payload_size(&list), 7);
     }
 
     #[test]
