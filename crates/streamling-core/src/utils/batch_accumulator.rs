@@ -3,19 +3,79 @@ use crate::checkpoints::checkpoint_management::{
     strip_checkpoint_messages,
 };
 use crate::utils::batch::enrich_batch_with_metadata;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::error::DataFusionError;
 use futures::StreamExt;
 use futures::stream::Stream;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Utf8/Binary/List columns store offsets as `i32`, so the data a single
+/// `concat_batches` call may combine is hard-capped at `i32::MAX` bytes (or
+/// child elements) per column; exceeding it fails with
+/// `ArrowError::OffsetOverflowError`. The accumulator flushes before any
+/// column crosses this, so `batch_size` is a row-count target that wide rows
+/// may cut short.
+const MAX_MERGED_COLUMN_BYTES: usize = i32::MAX as usize;
+
+/// The largest payload this array feeds into any single i32-offset buffer
+/// during `concat_batches`: value bytes for Utf8/Binary, child element counts
+/// for List/Map, recursing into nested children. Fixed-width and i64-offset
+/// (Large*/View) data cannot overflow and contributes nothing. Sliced
+/// List/Map children are counted at full length, which only over-estimates
+/// (flushing early is safe).
+fn max_i32_offset_payload_size(array: &dyn Array) -> usize {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let array = array.as_string::<i32>();
+            let offsets = array.value_offsets();
+            (offsets[array.len()] - offsets[0]) as usize
+        }
+        DataType::Binary => {
+            let array = array.as_binary::<i32>();
+            let offsets = array.value_offsets();
+            (offsets[array.len()] - offsets[0]) as usize
+        }
+        DataType::List(_) => {
+            let array = array.as_list::<i32>();
+            let offsets = array.value_offsets();
+            let child_elements = (offsets[array.len()] - offsets[0]) as usize;
+            child_elements.max(max_i32_offset_payload_size(array.values().as_ref()))
+        }
+        DataType::Map(_, _) => {
+            let array = array.as_map();
+            let offsets = array.value_offsets();
+            let child_elements = (offsets[array.len()] - offsets[0]) as usize;
+            child_elements.max(max_i32_offset_payload_size(array.entries()))
+        }
+        DataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .map(|column| max_i32_offset_payload_size(column.as_ref()))
+            .max()
+            .unwrap_or(0),
+        DataType::FixedSizeList(_, _) => {
+            max_i32_offset_payload_size(array.as_fixed_size_list().values().as_ref())
+        }
+        DataType::Dictionary(_, _) => {
+            max_i32_offset_payload_size(array.as_any_dictionary().values().as_ref())
+        }
+        _ => 0,
+    }
+}
+
 pub struct BatchAccumulator {
     batch_size: usize,
     batch_flush_interval: Option<Duration>,
+    max_column_bytes: usize,
     accumulated_batches: VecDeque<RecordBatch>,
     current_row_count: usize,
+    /// Per-column accumulated `max_i32_offset_payload_size`, aligned with the
+    /// schema's columns.
+    current_column_payload_sizes: Vec<usize>,
     last_flush_time: Instant,
 }
 
@@ -24,10 +84,18 @@ impl BatchAccumulator {
         Self {
             batch_size,
             batch_flush_interval,
+            max_column_bytes: MAX_MERGED_COLUMN_BYTES,
             accumulated_batches: VecDeque::new(),
             current_row_count: 0,
+            current_column_payload_sizes: Vec::new(),
             last_flush_time: Instant::now(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_column_bytes(mut self, max_column_bytes: usize) -> Self {
+        self.max_column_bytes = max_column_bytes;
+        self
     }
 
     pub fn push(&mut self, batch: RecordBatch) -> Option<VecDeque<RecordBatch>> {
@@ -44,6 +112,17 @@ impl BatchAccumulator {
         }
 
         self.current_row_count += batch.num_rows();
+        if self.current_column_payload_sizes.len() < batch.num_columns() {
+            self.current_column_payload_sizes
+                .resize(batch.num_columns(), 0);
+        }
+        for (payload_size, column) in self
+            .current_column_payload_sizes
+            .iter_mut()
+            .zip(batch.columns())
+        {
+            *payload_size += max_i32_offset_payload_size(column.as_ref());
+        }
         self.accumulated_batches.push_back(batch);
 
         if self.should_flush_by_size() {
@@ -55,6 +134,10 @@ impl BatchAccumulator {
 
     pub fn should_flush_by_size(&self) -> bool {
         self.current_row_count >= self.batch_size
+            || self
+                .current_column_payload_sizes
+                .iter()
+                .any(|&payload_size| payload_size > self.max_column_bytes)
     }
 
     pub fn should_flush_by_time(&self) -> bool {
@@ -79,12 +162,32 @@ impl BatchAccumulator {
 
         let mut batches_to_return = VecDeque::new();
         let mut rows_included = 0;
-        let mut partial_batch = None;
+        let mut payload_sizes_included = vec![0usize; self.current_column_payload_sizes.len()];
 
         while let Some(batch) = self.accumulated_batches.pop_front() {
             let batch_rows = batch.num_rows();
 
+            // A batch is never split for the byte budget: a single valid batch
+            // cannot itself overflow i32 offsets, and merging one batch alone
+            // performs no concatenation.
+            let crosses_byte_budget = !batches_to_return.is_empty()
+                && payload_sizes_included
+                    .iter()
+                    .zip(batch.columns())
+                    .any(|(included, column)| {
+                        included + max_i32_offset_payload_size(column.as_ref())
+                            > self.max_column_bytes
+                    });
+            if crosses_byte_budget {
+                self.accumulated_batches.push_front(batch);
+                break;
+            }
+
             if rows_included + batch_rows <= self.batch_size {
+                for (payload_size, column) in payload_sizes_included.iter_mut().zip(batch.columns())
+                {
+                    *payload_size += max_i32_offset_payload_size(column.as_ref());
+                }
                 batches_to_return.push_back(batch);
                 rows_included += batch_rows;
             } else {
@@ -97,22 +200,29 @@ impl BatchAccumulator {
                 if remaining_rows > 0 {
                     if rows_needed > 0 {
                         let remainder = batch.slice(rows_needed, remaining_rows);
-                        partial_batch = Some(strip_checkpoint_messages(&remainder));
+                        self.accumulated_batches
+                            .push_front(strip_checkpoint_messages(&remainder));
                     } else {
-                        partial_batch = Some(batch);
+                        self.accumulated_batches.push_front(batch);
                     }
-                    self.current_row_count = remaining_rows;
-                } else {
-                    self.current_row_count = 0;
                 }
                 break;
             }
         }
 
-        if let Some(batch) = partial_batch {
-            self.accumulated_batches.push_back(batch);
-        } else if self.accumulated_batches.is_empty() {
-            self.current_row_count = 0;
+        // Sliced remainders make incremental bookkeeping error-prone; the
+        // queue is short, so recompute the counters from what stayed behind.
+        self.current_row_count = 0;
+        self.current_column_payload_sizes.fill(0);
+        for batch in &self.accumulated_batches {
+            self.current_row_count += batch.num_rows();
+            for (payload_size, column) in self
+                .current_column_payload_sizes
+                .iter_mut()
+                .zip(batch.columns())
+            {
+                *payload_size += max_i32_offset_payload_size(column.as_ref());
+            }
         }
 
         self.last_flush_time = Instant::now();
@@ -121,32 +231,6 @@ impl BatchAccumulator {
             None
         } else {
             Some(batches_to_return)
-        }
-    }
-
-    pub fn flush_all(&mut self) -> Option<VecDeque<RecordBatch>> {
-        if self.accumulated_batches.is_empty() {
-            return None;
-        }
-
-        let batches = std::mem::take(&mut self.accumulated_batches);
-        self.current_row_count = 0;
-        self.last_flush_time = Instant::now();
-
-        Some(batches)
-    }
-
-    pub fn flush_merged(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
-        match self.flush() {
-            Some(batches) => merge_batches(batches),
-            None => Ok(None),
-        }
-    }
-
-    pub fn flush_all_merged(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
-        match self.flush_all() {
-            Some(batches) => merge_batches(batches),
-            None => Ok(None),
         }
     }
 
@@ -227,6 +311,12 @@ impl AsyncBatchAccumulator {
         self
     }
 
+    #[cfg(test)]
+    fn with_max_column_bytes(mut self, max_column_bytes: usize) -> Self {
+        self.accumulator = self.accumulator.with_max_column_bytes(max_column_bytes);
+        self
+    }
+
     /// Transforms an input stream into a stream of merged, re-batched RecordBatches.
     ///
     /// Each output batch contains up to `batch_size` rows (merged via `concat_batches`
@@ -287,7 +377,7 @@ impl AsyncBatchAccumulator {
                                     return;
                                 }
                                 None => {
-                                    if let Some(batches) = self.accumulator.flush_all() {
+                                    while let Some(batches) = self.accumulator.flush() {
                                         yield_merged!(batches);
                                     }
                                     break;
@@ -315,7 +405,7 @@ impl AsyncBatchAccumulator {
                     }
                 }
                 // Flush remaining
-                if let Some(batches) = self.accumulator.flush_all() {
+                while let Some(batches) = self.accumulator.flush() {
                     yield_merged!(batches);
                 }
             }
@@ -326,7 +416,7 @@ impl AsyncBatchAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use futures::stream;
     use std::sync::Arc;
@@ -414,22 +504,20 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_all() {
+    fn test_flush_drains_below_batch_size() {
         let mut accumulator = BatchAccumulator::new(1000, Some(Duration::from_secs(60)));
 
         accumulator.push(create_test_batch(10));
         accumulator.push(create_test_batch(20));
         accumulator.push(create_test_batch(30));
 
-        let result = accumulator.flush_all();
-        assert!(result.is_some());
-
-        let flushed = result.unwrap();
+        let flushed = accumulator.flush().unwrap();
         assert_eq!(flushed.len(), 3);
         let total_rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 60);
         assert_eq!(accumulator.current_row_count(), 0);
         assert!(accumulator.is_empty());
+        assert!(accumulator.flush().is_none());
     }
 
     #[test]
@@ -736,12 +824,10 @@ mod tests {
         let flushed_rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
 
         // Get the remaining data to verify total
-        let remaining_data = accumulator.flush_all();
-        let remaining_rows = if let Some(batches) = remaining_data {
-            batches.iter().map(|b| b.num_rows()).sum::<usize>()
-        } else {
-            0
-        };
+        let remaining_rows = accumulator
+            .flush()
+            .map(|batches| batches.iter().map(|b| b.num_rows()).sum::<usize>())
+            .unwrap_or(0);
 
         // Expected: 100 flushed + 35 remaining = 135 total
         assert_eq!(flushed_rows + remaining_rows, 135);
@@ -1061,6 +1147,128 @@ mod tests {
         assert!(all_epochs.contains(&2), "Should contain epoch 2");
     }
 
+    // ==================== byte budget tests ====================
+
+    /// Payload of the single Utf8 column in `create_test_batch(n)`:
+    /// "name_0".."name_{n-1}" concatenated.
+    fn name_column_payload_size(num_rows: usize) -> usize {
+        (0..num_rows).map(|i| format!("name_{}", i).len()).sum()
+    }
+
+    #[test]
+    fn test_byte_budget_triggers_flush_before_overflow() {
+        // Cap chosen so two 10-row batches (60 bytes of string payload each)
+        // exceed it but one does not.
+        let cap = 100;
+        let mut accumulator = BatchAccumulator::new(1_000_000, None).with_max_column_bytes(cap);
+
+        let batch_payload_size = name_column_payload_size(10);
+        assert!(batch_payload_size <= cap && 2 * batch_payload_size > cap);
+
+        assert!(accumulator.push(create_test_batch(10)).is_none());
+        let flushed = accumulator
+            .push(create_test_batch(10))
+            .expect("crossing the byte budget must trigger a flush");
+
+        // The flush must only contain what fits under the cap; the rest stays
+        // accumulated.
+        let flushed_rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(flushed_rows, 10);
+        assert_eq!(accumulator.current_row_count(), 10);
+
+        let merged = merge_batches(flushed).unwrap().unwrap();
+        assert!(max_i32_offset_payload_size(merged.column(1).as_ref()) <= cap);
+    }
+
+    #[test]
+    fn test_byte_budget_single_batch_over_cap_still_flushes() {
+        // A single batch above the cap must pass through alone (merge of one
+        // batch never concatenates, so it cannot overflow).
+        let cap = 10;
+        let mut accumulator = BatchAccumulator::new(1_000_000, None).with_max_column_bytes(cap);
+
+        let flushed = accumulator
+            .push(create_test_batch(10))
+            .expect("over-cap batch must flush immediately");
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].num_rows(), 10);
+        assert!(accumulator.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_async_accumulator_byte_budget_bounds_merged_batches() {
+        let cap = 150;
+        let accumulator = AsyncBatchAccumulator::new(1_000_000, None).with_max_column_bytes(cap);
+
+        let input = stream::iter((0..20).map(|_| Ok(create_test_batch(10))));
+
+        let output: Vec<RecordBatch> = accumulator
+            .process_stream(Box::pin(input))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let total_rows: usize = output.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 200, "no rows may be lost");
+        for batch in &output {
+            for column in batch.columns() {
+                assert!(
+                    max_i32_offset_payload_size(column.as_ref()) <= cap,
+                    "merged batch exceeds byte budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_payload_utf8_and_slice() {
+        let batch = create_test_batch(10);
+        let column = batch.column(1);
+        assert_eq!(
+            max_i32_offset_payload_size(column.as_ref()),
+            name_column_payload_size(10)
+        );
+
+        // A slice must report only its own window of the values buffer.
+        let sliced = batch.slice(5, 5);
+        let full = name_column_payload_size(10);
+        let sliced_payload_size = max_i32_offset_payload_size(sliced.column(1).as_ref());
+        assert!(sliced_payload_size < full);
+    }
+
+    #[test]
+    fn test_payload_fixed_width_is_zero() {
+        let batch = create_test_batch(10);
+        assert_eq!(max_i32_offset_payload_size(batch.column(0).as_ref()), 0);
+    }
+
+    #[test]
+    fn test_payload_list_counts_child_elements() {
+        use datafusion::arrow::array::{Int32Builder, ListBuilder};
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for _ in 0..4 {
+            builder.values().append_slice(&[1, 2, 3]);
+            builder.append(true);
+        }
+        let list = builder.finish();
+        // 12 child elements dominate the Int32 child (payload 0).
+        assert_eq!(max_i32_offset_payload_size(&list), 12);
+    }
+
+    #[test]
+    fn test_payload_struct_recurses() {
+        use datafusion::arrow::array::{StringArray, StructArray};
+        use datafusion::arrow::datatypes::Fields;
+
+        let strings: StringArray = vec!["abc", "defg"].into();
+        let fields = Fields::from(vec![Field::new("s", DataType::Utf8, false)]);
+        let strukt = StructArray::new(fields, vec![Arc::new(strings) as ArrayRef], None);
+        assert_eq!(max_i32_offset_payload_size(&strukt), 7);
+    }
+
     // ==================== merge_batches tests ====================
 
     #[test]
@@ -1183,14 +1391,16 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_all_merged_returns_single_batch() {
+    fn test_flush_below_batch_size_merges_to_single_batch() {
         let mut accumulator = BatchAccumulator::new(1000, Some(Duration::from_secs(60)));
 
         accumulator.push(create_test_batch(10));
         accumulator.push(create_test_batch(20));
         accumulator.push(create_test_batch(30));
 
-        let merged = accumulator.flush_all_merged().unwrap().unwrap();
+        let merged = merge_batches(accumulator.flush().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(merged.num_rows(), 60);
     }
 }
