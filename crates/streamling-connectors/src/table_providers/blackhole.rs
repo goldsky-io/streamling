@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -18,6 +18,7 @@ use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
     process_checkpoint_acks,
 };
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -190,10 +191,6 @@ impl TableProvider for BlackholeTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            telemetry_data_sink,
-            None,
-        )))
+        Ok(Arc::new(ParallelSinkExec::new(input, telemetry_data_sink)))
     }
 }

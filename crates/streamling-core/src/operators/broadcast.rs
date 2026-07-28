@@ -31,7 +31,7 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 
-use datafusion::datasource::sink::DataSinkExec;
+use crate::operators::parallel_sink::ParallelSinkExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use std::fmt;
 use std::fmt::Debug;
@@ -282,8 +282,8 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
                     let sink_plan = rewrite_sink_transform_chain(sink_plan, &input_physical)?;
 
                     let has_transforms = sink_plan
-                        .downcast_ref::<DataSinkExec>()
-                        .map(|dse| !Arc::ptr_eq(dse.input(), &input_physical))
+                        .downcast_ref::<ParallelSinkExec>()
+                        .map(|sink_exec| !Arc::ptr_eq(sink_exec.input(), &input_physical))
                         .unwrap_or(false);
                     sink_has_transforms.push(has_transforms);
                     sinks.push(sink_plan);
@@ -478,8 +478,8 @@ impl ExecutionPlan for MultiSinkExec {
 
             tokio::spawn(async move {
                 let data_sink_exec = sink
-                    .downcast_ref::<DataSinkExec>()
-                    .expect("MultiSinkExec: sink must be a DataSinkExec");
+                    .downcast_ref::<ParallelSinkExec>()
+                    .expect("MultiSinkExec: sink must be a ParallelSinkExec");
                 let data_sink = data_sink_exec.sink();
 
                 // Per-sink rebatching: run the broadcast consumer through an

@@ -4,7 +4,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -26,6 +26,7 @@ use streamling_core::checkpoints::checkpoint_management::{
     process_checkpoint_acks,
 };
 use streamling_core::data::COLUMN_NAME_OP;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
@@ -320,10 +321,9 @@ impl TableProvider for MemoryTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(
+        Ok(Arc::new(ParallelSinkExec::new(
             final_input,
             telemetry_data_sink,
-            None,
         )))
     }
 }

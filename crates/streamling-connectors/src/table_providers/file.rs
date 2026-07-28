@@ -42,7 +42,7 @@ use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType, ViewTable, provider_as_source};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, lit};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
@@ -152,46 +152,6 @@ fn register_object_store_for_url(
     Ok(())
 }
 
-/// Merges the bounded scan's parallel file groups back into a single output
-/// partition, delegating projection/filter/limit pushdown to the inner
-/// [`ListingTable`] so splitting the files costs nothing at plan time.
-#[derive(Debug)]
-struct CoalescedFileScan {
-    inner: Arc<ListingTable>,
-}
-
-#[async_trait]
-impl TableProvider for CoalescedFileScan {
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let plan = self.inner.scan(state, projection, filters, limit).await?;
-        if plan.output_partitioning().partition_count() > 1 {
-            return Ok(Arc::new(CoalescePartitionsExec::new(plan)));
-        }
-        Ok(plan)
-    }
-}
-
 /// Builds the runtime provider for a **bounded** `file` source backed by
 /// DataFusion's [`ListingTable`]. The schema is inferred from the files at
 /// startup. Because file reads are append-only, a constant `_gs_op = 'i'` column
@@ -225,9 +185,13 @@ pub async fn build_bounded_file_source_provider(
         infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
     // `ListingOptions::new` defaults to one target partition, which reads every
     // file serially on a single core. Split the files across the session's target
-    // partitions instead; `CoalescedFileScan` merges them back into one output
-    // partition. Set explicitly rather than via `with_session_config_options`,
-    // which would also turn on `collect_stat` (a footer fetch per file at startup).
+    // partitions instead; the scan keeps them as separate output partitions, which
+    // stay parallel end-to-end: transforms are partition-preserving and
+    // `ParallelSinkExec` writes every partition concurrently. The remaining
+    // partition-0-only consumers are guarded elsewhere (`MultiSinkExec` by the
+    // `EnforceSinglePartition` optimizer rule, scan sharing by `SharedSourceHandle`).
+    // Set explicitly rather than via `with_session_config_options`, which would also
+    // turn on `collect_stat` (a footer fetch per file at startup).
     let listing_options = ListingOptions::new(file_format)
         .with_table_partition_cols(partition_cols)
         .with_target_partitions(state.config().target_partitions());
@@ -257,9 +221,7 @@ pub async fn build_bounded_file_source_provider(
             return Err(e.into());
         }
     };
-    let provider: Arc<dyn TableProvider> = Arc::new(CoalescedFileScan {
-        inner: Arc::new(ListingTable::try_new(config)?),
-    });
+    let provider: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
 
     let schema = provider.schema();
 
@@ -1344,11 +1306,13 @@ mod tests {
     }
 
     /// The bounded source splits its files across the session's target partitions
-    /// but must expose exactly one output partition: `DataSinkExec` reads only
-    /// input partition 0, and streamling's optimizer never inserts a coalesce, so
-    /// a multi-partition source feeding a sink directly would drop rows.
+    /// and keeps them as separate output partitions, which stay parallel through
+    /// transforms and into `ParallelSinkExec`'s concurrent per-partition writes.
+    /// The remaining partition-0-only consumers are guarded elsewhere
+    /// (`MultiSinkExec` by the `EnforceSinglePartition` optimizer rule, scan
+    /// sharing by `SharedSourceHandle`).
     #[tokio::test]
-    async fn bounded_source_coalesces_file_groups_into_one_partition() {
+    async fn bounded_source_splits_files_across_partitions() {
         use streamling_core::dynamic_table::DynamicTableRegistry;
 
         let dir = std::env::temp_dir().join(format!("streamling_bounded_{}", std::process::id()));
@@ -1374,22 +1338,28 @@ mod tests {
 
         let state = session_manager.session_state();
         let plan = provider.scan(&state, None, &[], None).await.unwrap();
+        let expected_partitions = state.config().target_partitions().min(3);
         assert_eq!(
             plan.output_partitioning().partition_count(),
-            1,
-            "the bounded source must expose a single output partition"
+            expected_partitions,
+            "the bounded source must spread its files across the target partitions"
         );
 
-        let mut stream = plan
-            .execute(0, session_manager.session_context().task_ctx())
-            .unwrap();
         let mut rows = 0usize;
-        while let Some(batch) = stream.next().await {
-            rows += batch.unwrap().num_rows();
+        for partition in 0..expected_partitions {
+            let mut stream = plan
+                .execute(partition, session_manager.session_context().task_ctx())
+                .unwrap();
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_eq!(rows, 9, "every file group's rows must reach partition 0");
+        assert_eq!(
+            rows, 9,
+            "every row must arrive exactly once across partitions"
+        );
     }
 
     /// A poll's files are split across the session's target partitions and read

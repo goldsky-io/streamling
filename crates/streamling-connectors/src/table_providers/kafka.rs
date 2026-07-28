@@ -60,7 +60,7 @@ use streamling_state::StateOperatorBackend;
 use crate::util::lag::LagResult;
 use apache_avro::types::Value::Union;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
@@ -89,6 +89,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
@@ -2939,7 +2940,7 @@ impl TableProvider for KafkaSinkTableProvider {
             self.primary_key.clone(),
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(input, wrapper_data_sink, None)))
+        Ok(Arc::new(ParallelSinkExec::new(input, wrapper_data_sink)))
     }
 }
 

@@ -2,8 +2,6 @@
 //! It propagates the input data as is, preserving checkpoint messages in batch metadata.
 //! This is useful for adding checkpointing support to SQL transformations.
 
-use arrow::record_batch::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::{DFSchemaRef, Statistics};
 use datafusion::error::Result;
@@ -13,23 +11,17 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    execute_input_stream,
 };
 
-use crate::checkpoints::checkpoint_management::{
-    enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
-};
+use crate::operators::coalesce::spawn_marker_preserving_forwarder;
 use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use futures::StreamExt;
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
-use tracing::debug;
 
 #[derive(PartialEq, Eq, PartialOrd, Hash)]
 pub struct CheckpointableNode {
@@ -141,7 +133,7 @@ impl CheckpointableExec {
         internal_buffer_size: u32,
         reference_name: String,
     ) -> Self {
-        let cache = Self::compute_properties(input.schema());
+        let cache = Self::compute_properties(&input);
         Self {
             input,
             internal_buffer_size,
@@ -150,10 +142,14 @@ impl CheckpointableExec {
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            EquivalenceProperties::new(input.schema()),
+            // Partition-transparent: each input partition is forwarded as its own
+            // output partition, so a multi-partition source stays parallel through
+            // the transform all the way to the sink (`ParallelSinkExec` writes every
+            // partition concurrently).
+            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -190,8 +186,8 @@ impl ExecutionPlan for CheckpointableExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        // We coalesce the input partitions ourselves in `execute` (preserving checkpoint
-        // markers). Requiring `SinglePartition` here would make DataFusion insert a stock
+        // Partition-transparent, no distribution requirement. Requiring
+        // `SinglePartition` here would make DataFusion insert a stock
         // `CoalescePartitionsExec`/`RepartitionExec`, which rebuild batches with a
         // metadata-less schema and silently drop the checkpoint markers.
         vec![Distribution::UnspecifiedDistribution]
@@ -214,79 +210,28 @@ impl ExecutionPlan for CheckpointableExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Forward this partition's batches with their checkpoint-marker metadata
+        // intact, through a channel task so the transform keeps computing while
+        // downstream (e.g. a sink write) is busy. Checkpoint markers ride per
+        // partition: a marker is forwarded on the partition stream it arrived on
+        // (no cross-partition barrier alignment — today's only multi-partition
+        // source, the bounded file source, emits no markers).
         let output_schema = self.schema();
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             output_schema.clone(),
             self.internal_buffer_size as usize,
         );
-
-        // Coalesce all input partitions into this single output partition, forwarding
-        // each batch with its checkpoint-marker metadata intact. We merge here rather
-        // than via a stock DataFusion `RepartitionExec`/`CoalescePartitionsExec`, which
-        // rebuild batches with a metadata-less schema and would drop checkpoint markers,
-        // stalling checkpoint finalization (e.g. for `UNION ALL`, which is multi-partition).
-        let input_partitions = self.input.output_partitioning().partition_count();
-        for input_partition in 0..input_partitions {
-            let data = execute_input_stream(
-                Arc::clone(&self.input),
-                Arc::clone(&output_schema),
-                input_partition,
-                Arc::clone(&context),
-            )?;
-            let tx = builder.tx();
-            let output_schema = output_schema.clone();
-            let reference_name = self.reference_name.clone();
-
-            builder.spawn(async move {
-                let mut stream = data;
-
-                while let Some(batch) = stream.next().await {
-                    match batch {
-                        Ok(batch) => {
-                            // Extract checkpoint messages from input batch metadata
-                            let checkpoint_messages =
-                                extract_checkpoint_messages(batch.schema().metadata());
-
-                            // Create output batch with checkpoint messages preserved in schema metadata
-                            // Preserve existing metadata from output_schema and merge with checkpoint messages
-                            let output_batch = if !checkpoint_messages.is_empty() {
-                                let mut metadata: HashMap<String, String> =
-                                    output_schema.metadata().clone();
-                                enrich_batch_metadata_with_checkpoints(
-                                    &mut metadata,
-                                    &checkpoint_messages,
-                                );
-                                let enriched_schema = Arc::new(Schema::new_with_metadata(
-                                    output_schema.fields().clone(),
-                                    metadata,
-                                ));
-                                RecordBatch::try_new(enriched_schema, batch.columns().to_vec())
-                                    .unwrap_or(batch)
-                            } else {
-                                batch
-                            };
-
-                            // Forward the batch to the output stream
-                            if tx.send(Ok(output_batch)).await.is_err() {
-                                // The receiver was dropped, stop processing
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("CheckpointableExec [{}]: Error from inner SQL plan, stream will terminate: {}", reference_name, e);
-                            let _ = tx.send(Err(e)).await;
-                            break;
-                        }
-                    }
-                }
-
-                Ok(())
-            });
-        }
-
+        spawn_marker_preserving_forwarder(
+            &mut builder,
+            &self.input,
+            partition,
+            &output_schema,
+            &context,
+            format!("CheckpointableExec [{}]", self.reference_name),
+        )?;
         Ok(builder.build())
     }
 
@@ -302,15 +247,21 @@ impl ExecutionPlan for CheckpointableExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoints::checkpoint_management::{CheckpointEpoch, CheckpointMessage};
+    use crate::checkpoints::checkpoint_management::{
+        CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+        extract_checkpoint_messages,
+    };
     use crate::optimizer::StreamlingPhysicalOptimizerRules;
     use arrow::array::{BooleanArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_expr::Partitioning as PhysicalPartitioning;
     use datafusion::prelude::*;
     use futures::StreamExt;
+    use std::collections::HashMap;
 
     fn create_test_schema_with_metadata(metadata: HashMap<String, String>) -> SchemaRef {
         Arc::new(Schema::new_with_metadata(

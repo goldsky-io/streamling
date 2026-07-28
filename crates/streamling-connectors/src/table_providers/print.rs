@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -24,6 +24,7 @@ use streamling_core::checkpoints::checkpoint_management::{
 use streamling_core::data::RowKind;
 use streamling_core::formats::FromArrowConverter;
 use streamling_core::formats::json::FromArrowToJsonConverter;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
@@ -236,6 +237,6 @@ impl TableProvider for PrintTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(input, with_telemetry, None)))
+        Ok(Arc::new(ParallelSinkExec::new(input, with_telemetry)))
     }
 }

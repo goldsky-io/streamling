@@ -17,7 +17,7 @@ use batch_processor::{BatchProcessorContext, process_batch};
 use columns::ColumnInfo;
 use datafusion::catalog::Session;
 use datafusion::common::{Result, not_impl_err};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -32,6 +32,7 @@ use streamling_config::PostgresSinkConfig;
 use streamling_core::data::COLUMN_NAME_OP;
 use streamling_core::error::ResultExt;
 use streamling_core::node_context::get_node_context;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
@@ -160,10 +161,9 @@ impl TableProvider for PostgresSinkTableProvider {
             self.telemetry.as_ref(),
         ));
 
-        Ok(Arc::new(DataSinkExec::new(
+        Ok(Arc::new(ParallelSinkExec::new(
             adjusted_input,
             wrapper_sink,
-            None,
         )))
     }
 }

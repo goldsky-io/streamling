@@ -2,13 +2,14 @@ use crate::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
 };
+use crate::operators::parallel_sink::ParallelSinkExec;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::{DataFusionError, not_impl_err, project_schema};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -594,6 +595,6 @@ impl TableProvider for PluginSinkProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(input, telemetry_sink, None)))
+        Ok(Arc::new(ParallelSinkExec::new(input, telemetry_sink)))
     }
 }

@@ -3,13 +3,16 @@
 //! only once even if multiple downstream transforms/sinks consume from it.
 
 use crate::operators::broadcast::broadcast_stream::BroadcastStream;
+use crate::operators::coalesce::StreamingCoalesceExec;
 use arrow_schema::SchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+};
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -93,6 +96,17 @@ impl SharedSourceHandle {
         channel_capacity: usize,
         expected_consumers: usize,
     ) -> Self {
+        // The base plan is executed at exactly one partition into the broadcast
+        // (`start_if_needed`), and it is not a plan-tree child of `BroadcastingExec`,
+        // so the `EnforceSinglePartition` optimizer rule cannot see it — a
+        // multi-partition base plan must be coalesced here or its other partitions
+        // would silently never execute.
+        let base_partitions = base_exec.output_partitioning().partition_count();
+        let base_exec: Arc<dyn ExecutionPlan> = if base_partitions > 1 {
+            Arc::new(StreamingCoalesceExec::new(base_exec, base_partitions))
+        } else {
+            base_exec
+        };
         Self {
             schema,
             base_exec,

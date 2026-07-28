@@ -1,8 +1,10 @@
 pub mod broadcast;
 pub mod checkpointable;
+pub mod coalesce;
 pub mod external_handlers;
 pub mod filter;
 pub mod inspect;
+pub mod parallel_sink;
 pub mod pg_aggregation;
 pub mod planner;
 pub mod projection;

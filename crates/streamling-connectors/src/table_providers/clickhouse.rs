@@ -38,7 +38,7 @@ use streamling_core::checkpoints::checkpoint_management::{
 use streamling_core::utils::batch::enrich_batch_with_metadata;
 
 use bytes::Bytes;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::Operator;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::PhysicalExpr;
@@ -58,6 +58,7 @@ pub use streamling_config::{
 };
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::node_context::get_node_context;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::retry::retry_forever_with_backoff_async;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
@@ -898,10 +899,9 @@ impl TableProvider for ClickHouseTableProvider {
             Some(sink_params.primary_keys.join(",")),
             sink_params.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(
+        Ok(Arc::new(ParallelSinkExec::new(
             projection_exec,
             wrapper_sink,
-            None,
         )))
     }
 }

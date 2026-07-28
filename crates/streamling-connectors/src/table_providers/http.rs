@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 
 use std::time::Instant;
 use streamling_config::ExternalHttpHandlerConfig;
@@ -312,10 +313,6 @@ impl TableProvider for HttpTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            telemetry_data_sink,
-            None,
-        )))
+        Ok(Arc::new(ParallelSinkExec::new(input, telemetry_data_sink)))
     }
 }
