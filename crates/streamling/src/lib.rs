@@ -4,6 +4,7 @@ use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::{ViewTable, provider_as_source};
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, dml::InsertOp};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -469,6 +470,20 @@ fn merge_labels(tags: &mut BTreeMap<String, String>, labels: Option<&BTreeMap<St
             tags.insert(k.clone(), v.clone());
         }
     }
+}
+
+/// The largest partition count anywhere in a physical plan — how parallel the
+/// pipeline actually runs. Read from the whole tree rather than the root because
+/// the sink always reports a single output partition; the parallelism lives
+/// below it, in the scan, the transforms and the per-partition writes.
+fn peak_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    plan.output_partitioning().partition_count().max(
+        plan.children()
+            .iter()
+            .map(|child| peak_partition_count(child))
+            .max()
+            .unwrap_or(0),
+    )
 }
 
 impl Streamling {
@@ -2076,7 +2091,21 @@ impl Streamling {
                 if !dry_run {
                     let session_manager = session_manager.clone();
                     let sink_future = async move {
-                        let result = session_manager.new_df(sink_plan).collect().await;
+                        // `DataFrame::collect`, split so the planned parallelism
+                        // is reported before execution starts.
+                        let df = session_manager.new_df(sink_plan);
+                        let task_ctx = Arc::new(df.task_ctx());
+                        let result = match df.create_physical_plan().await {
+                            Ok(plan) => {
+                                info!(
+                                    "Pipeline [{}] executing with {} partition(s)",
+                                    future_name,
+                                    peak_partition_count(&plan)
+                                );
+                                collect(plan, task_ctx).await
+                            }
+                            Err(err) => Err(err),
+                        };
                         if let Err(err) = &result {
                             error!(
                                 "Sink future [{}] completed with error: {}",
