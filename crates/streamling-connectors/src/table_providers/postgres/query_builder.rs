@@ -142,8 +142,11 @@ impl PostgresQueryBuilder {
                 "$VALUES_PLACEHOLDER"
             )
         } else {
-            // INSERT ... ON CONFLICT
-            if on_conflict == "nothing" {
+            // INSERT ... ON CONFLICT. With no non-PK columns there is nothing to
+            // update, so an `update` conflict must degrade to DO NOTHING —
+            // otherwise the SET clause is empty and Postgres rejects the query
+            // with "syntax error at end of input".
+            if on_conflict == "nothing" || update_columns.is_empty() {
                 format!(
                     r#"INSERT INTO "{}"."{}" ({}) VALUES {}
                     ON CONFLICT ({}) DO NOTHING"#,
@@ -329,6 +332,31 @@ mod tests {
         assert!(query.contains(r#""id""#));
         assert!(query.contains(r#""name" = EXCLUDED."name""#));
         assert!(query.contains(r#""value" = EXCLUDED."value""#));
+    }
+
+    #[test]
+    fn test_build_upsert_query_pk_only_columns_falls_back_to_do_nothing() {
+        // When every column is part of the primary key there is nothing to
+        // update, so `on_conflict: update` must not emit an empty `DO UPDATE SET`
+        // (which is invalid SQL — `syntax error at end of input`). It must fall
+        // back to `DO NOTHING`.
+        let columns = vec!["id".to_string()];
+        let pk_columns = vec!["id".to_string()];
+
+        let (query, placeholders) = PostgresQueryBuilder::build_upsert_query(
+            "public",
+            "test",
+            &columns,
+            &pk_columns,
+            "update",
+            None,
+            "test",
+        );
+
+        assert_eq!(placeholders, 1);
+        assert!(query.contains("ON CONFLICT"));
+        assert!(query.contains("DO NOTHING"), "query was: {query}");
+        assert!(!query.contains("DO UPDATE SET"), "query was: {query}");
     }
 
     #[test]
