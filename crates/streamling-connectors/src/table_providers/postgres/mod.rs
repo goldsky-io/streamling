@@ -187,6 +187,9 @@ pub struct PostgresSinkExec {
     checkpoint_truncation: bool,
     parallelism: usize,
     write_batch_size: u32,
+    /// Pool + DDL shared across `ParallelSinkExec`'s concurrent per-partition
+    /// `write_all` calls.
+    connection: tokio::sync::OnceCell<PostgresConnection>,
 }
 
 impl PostgresSinkExec {
@@ -225,6 +228,7 @@ impl PostgresSinkExec {
             checkpoint_truncation,
             parallelism,
             write_batch_size,
+            connection: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -253,28 +257,43 @@ impl DataSink for PostgresSinkExec {
             node_label, self.schema_name, self.table, self.parallelism
         );
 
-        // Create connection pool with enough connections for parallel tasks
-        let connection = PostgresConnection::new_with_parallelism(&self.config, self.parallelism)
-            .await
-            .streamling_with_context(|| format!("{}: failed to create connection", node_label))?;
+        // One shared pool and one DDL pass regardless of how many partition
+        // streams `ParallelSinkExec` writes concurrently: Postgres `IF NOT EXISTS`
+        // DDL is racy across sessions (the loser fails with a duplicate-key
+        // error), and a pool per stream would multiply connections by the
+        // partition count.
+        let connection = self
+            .connection
+            .get_or_try_init(|| async {
+                // Create connection pool with enough connections for parallel tasks
+                let connection =
+                    PostgresConnection::new_with_parallelism(&self.config, self.parallelism)
+                        .await
+                        .streamling_with_context(|| {
+                            format!("{}: failed to create connection", node_label)
+                        })?;
 
-        // Create schema and table if needed (use original schema for correct column types)
-        create_schema_and_table_if_needed(
-            connection.pool(),
-            &self.schema_name,
-            &self.table,
-            &self.original_schema,
-            self.primary_key.as_ref(),
-            self.append_only_mode,
-            self.checkpoint_truncation,
-        )
-        .await
-        .streamling_with_context(|| {
-            format!(
-                "{}: failed to create schema/table '{}.{}'",
-                node_label, self.schema_name, self.table
-            )
-        })?;
+                // Create schema and table if needed (use original schema for correct column types)
+                create_schema_and_table_if_needed(
+                    connection.pool(),
+                    &self.schema_name,
+                    &self.table,
+                    &self.original_schema,
+                    self.primary_key.as_ref(),
+                    self.append_only_mode,
+                    self.checkpoint_truncation,
+                )
+                .await
+                .streamling_with_context(|| {
+                    format!(
+                        "{}: failed to create schema/table '{}.{}'",
+                        node_label, self.schema_name, self.table
+                    )
+                })?;
+
+                Ok::<_, datafusion::common::DataFusionError>(connection)
+            })
+            .await?;
 
         // Get primary key columns
         let mut primary_key_columns: Vec<String> = if let Some(pk_str) = &self.primary_key {

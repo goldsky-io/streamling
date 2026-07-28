@@ -371,6 +371,9 @@ struct PluginSink {
     plugin_channels: Arc<PluginChannels>,
     num_records_before_stop: Option<u64>, // for integration tests only!
     metric_metadata_id: String,
+    /// One `PluginMsg::Init` and one metrics-forwarder task regardless of how
+    /// many partition streams `ParallelSinkExec` writes concurrently.
+    init: std::sync::Once,
 }
 
 impl PluginSink {
@@ -385,6 +388,7 @@ impl PluginSink {
             plugin_channels,
             num_records_before_stop,
             metric_metadata_id,
+            init: std::sync::Once::new(),
         }
     }
 }
@@ -405,19 +409,21 @@ impl DataSink for PluginSink {
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let metrics_recorder = get_metrics_recorder();
-        tokio::spawn(process_plugin_metrics(
-            self.plugin_channels.metrics.receiver.clone(),
-            metrics_recorder.clone(),
-            self.metric_metadata_id.clone(),
-        ));
+        self.init.call_once(|| {
+            tokio::spawn(process_plugin_metrics(
+                self.plugin_channels.metrics.receiver.clone(),
+                metrics_recorder.clone(),
+                self.metric_metadata_id.clone(),
+            ));
+
+            self.plugin_channels
+                .input
+                .sender
+                .send(NonExhaustive::new(PluginMsg::Init))
+                .unwrap();
+        });
 
         let mut row_count = 0;
-
-        self.plugin_channels
-            .input
-            .sender
-            .send(NonExhaustive::new(PluginMsg::Init))
-            .unwrap();
 
         while let Some(batch) = data.next().await.transpose()? {
             row_count += batch.num_rows();

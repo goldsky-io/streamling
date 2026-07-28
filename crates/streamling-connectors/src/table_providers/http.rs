@@ -40,6 +40,9 @@ struct HttpSink {
     schema: SchemaRef,
     buffer_size: u32,
     num_records_before_stop: Option<u64>, // for integration tests only!
+    /// Global `num_records_before_stop` progress across the concurrent
+    /// per-partition `write_all` streams (`ParallelSinkExec`).
+    rows_received: std::sync::atomic::AtomicU64,
     source_name: String,
     metric_metadata_id: String,
 }
@@ -76,6 +79,7 @@ impl HttpSink {
             client,
             schema,
             num_records_before_stop,
+            rows_received: std::sync::atomic::AtomicU64::new(0),
             source_name,
             buffer_size: config.buffer_size,
             metric_metadata_id,
@@ -155,6 +159,10 @@ impl DataSink for HttpSink {
                 match item {
                     Ok((_batch_opt, delivered_rows, skipped_rows)) => {
                         row_count += delivered_rows + skipped_rows;
+                        self.rows_received.fetch_add(
+                            delivered_rows + skipped_rows,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         metrics_recorder.record_output_rows_count(
                             delivered_rows,
                             self.metric_metadata_id.as_str(),
@@ -178,9 +186,12 @@ impl DataSink for HttpSink {
                 &self.metric_metadata_id,
                 &sink_id,
             );
+            // Compare against the global received count so the stop threshold
+            // stays global across the concurrent per-partition streams.
+            let total_received = self.rows_received.load(std::sync::atomic::Ordering::SeqCst);
             if let Some(num_records_before_stop) = self.num_records_before_stop
-                && row_count >= num_records_before_stop
-                && !(num_records_before_stop == 0 && row_count == 0)
+                && total_received >= num_records_before_stop
+                && !(num_records_before_stop == 0 && total_received == 0)
             {
                 // Notify the coordinator (and sources) that the sink has received the expected rows
                 let _ = send(

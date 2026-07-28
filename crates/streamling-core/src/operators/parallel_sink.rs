@@ -9,7 +9,12 @@
 //! nondeterministic order. Today the only multi-partition input is the bounded
 //! file source (append-only inserts, no checkpoint markers), where ordering is
 //! immaterial; order-sensitive streams (CDC upserts/deletes, checkpoint
-//! markers) all flow through single-partition sources.
+//! markers) all flow through single-partition sources, and `UNION ALL` fan-ins
+//! are merged back to one partition by the `EnforceSinglePartition` optimizer
+//! rule. `write_all` implementations must tolerate concurrent invocation:
+//! one-time setup (DDL, plugin init) belongs behind a `OnceCell`, and
+//! `num_records_before_stop` counting must use state shared on the sink
+//! instance, not `write_all`-locals.
 
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;

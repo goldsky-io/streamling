@@ -892,6 +892,8 @@ impl TableProvider for ClickHouseTableProvider {
             append_only_mode: sink_params.append_only_mode,
             version_column_name: sink_params.version_column_name.clone(),
             schema_override: sink_params.schema_override.clone(),
+            table_created: tokio::sync::OnceCell::new(),
+            records_processed: std::sync::atomic::AtomicU64::new(0),
         });
         let wrapper_sink = Arc::new(WrappingDataSink::new(
             clickhouse_sink,
@@ -921,6 +923,12 @@ pub struct ClickHouseSinkExec {
     append_only_mode: bool,
     version_column_name: Option<String>,
     schema_override: Option<std::collections::HashMap<String, String>>,
+    /// One CREATE TABLE across `ParallelSinkExec`'s concurrent per-partition
+    /// `write_all` calls: concurrent `CREATE TABLE IF NOT EXISTS` on replicated
+    /// ClickHouse can fail with "Table already exists".
+    table_created: tokio::sync::OnceCell<()>,
+    /// Global `num_records_before_stop` progress across all partition streams.
+    records_processed: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -943,22 +951,27 @@ impl DataSink for ClickHouseSinkExec {
             node_label, self.table_name
         );
         // Use sink schema (normalized) for table creation
-        self.client
-            .create_table_if_not_exists(
-                &self.table_name,
-                &self.schema,
-                (*self.primary_keys).clone(),
-                self.append_only_mode,
-                self.version_column_name.as_deref(),
-                self.schema_override.as_ref(),
-            )
-            .await
-            .streamling_with_context(|| {
-                format!(
-                    "{}: failed to create table '{}'",
-                    node_label, self.table_name
-                )
-            })?;
+        self.table_created
+            .get_or_try_init(|| async {
+                self.client
+                    .create_table_if_not_exists(
+                        &self.table_name,
+                        &self.schema,
+                        (*self.primary_keys).clone(),
+                        self.append_only_mode,
+                        self.version_column_name.as_deref(),
+                        self.schema_override.as_ref(),
+                    )
+                    .await
+                    .streamling_with_context(|| {
+                        format!(
+                            "{}: failed to create table '{}'",
+                            node_label, self.table_name
+                        )
+                    })?;
+                Ok::<_, datafusion::common::DataFusionError>(())
+            })
+            .await?;
 
         let client = self.client.clone();
         let table_name = self.table_name.clone();
@@ -1022,7 +1035,6 @@ impl DataSink for ClickHouseSinkExec {
         let metric_metadata_id = self.metric_metadata_id.clone();
         let metrics_recorder = get_metrics_recorder().clone();
         let mut row_count: usize = 0;
-        let mut records_processed: u64 = 0;
         let mut data = data;
 
         while let Some(result) = data.next().await {
@@ -1249,7 +1261,12 @@ impl DataSink for ClickHouseSinkExec {
             );
 
             if let Some(limit) = num_records_before_stop {
-                records_processed += num_rows;
+                // Shared across the concurrent per-partition streams so the stop
+                // threshold stays global, matching the single-stream behavior.
+                let records_processed = self
+                    .records_processed
+                    .fetch_add(num_rows, std::sync::atomic::Ordering::SeqCst)
+                    + num_rows;
 
                 tracing::info!(
                     "[{}] records processed: {}, just added: {} (table '{}')",

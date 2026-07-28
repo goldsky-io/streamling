@@ -8,7 +8,9 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::Distribution;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::unnest::UnnestExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
@@ -183,6 +185,33 @@ impl PhysicalOptimizerRule for EnforceSinglePartitionPhysicalOptimizerRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|input_plan| {
+            // `UNION ALL` sums its children's partitions, and its branches can carry
+            // checkpoint markers and CDC streams whose correctness (marker acking,
+            // upsert/delete ordering, keep-last dedup) depends on one ordered stream
+            // at the sink — merge it back to a single partition here. This is where
+            // the pre-partition-transparent `CheckpointableExec` used to merge.
+            if input_plan.downcast_ref::<UnionExec>().is_some()
+                && input_plan.output_partitioning().partition_count() > 1
+            {
+                let partitions = input_plan.output_partitioning().partition_count();
+                return Ok(Transformed::yes(Arc::new(StreamingCoalesceExec::new(
+                    input_plan, partitions,
+                ))));
+            }
+            // Streamling removed DataFusion's `JoinSelection` rule, so a hash join
+            // planned in `Auto` partition mode is never resolved and fails at
+            // runtime with an internal error; fail at plan time instead. Top-level
+            // JOINs are rejected by transform validation, but decorrelated
+            // IN/EXISTS/scalar subqueries still plan joins.
+            if let Some(join) = input_plan.downcast_ref::<HashJoinExec>()
+                && matches!(join.partition_mode(), PartitionMode::Auto)
+            {
+                return plan_err!(
+                    "the query plans a hash join in Auto partition mode, which \
+                     streamling cannot execute; rewrite the query to avoid joins or \
+                     IN/EXISTS/scalar subqueries in this context"
+                );
+            }
             let requirements = input_plan.required_input_distribution();
             for (child, distribution) in input_plan.children().iter().zip(requirements.iter()) {
                 if matches!(distribution, Distribution::HashPartitioned(_))
@@ -327,6 +356,51 @@ mod tests {
             written, 6,
             "rows from every input partition must be written"
         );
+    }
+
+    /// `UNION ALL` sums its children's partitions and its branches can carry
+    /// checkpoint markers and CDC streams that need one ordered stream at the
+    /// sink; the rule must merge a multi-partition union back to a single
+    /// partition (marker-preserving), and every branch's rows must survive.
+    #[tokio::test]
+    async fn multi_partition_union_is_coalesced() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = MemTable::try_new(
+            schema.clone(),
+            vec![vec![batch_with_ids(&schema, vec![1, 2, 3])]],
+        )
+        .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let ctx = session_manager.session_context();
+        ctx.register_table("source_table", Arc::new(source))
+            .unwrap();
+
+        let union = ctx
+            .sql("SELECT id FROM source_table UNION ALL SELECT id FROM source_table")
+            .await
+            .unwrap();
+        let physical_plan = union.clone().create_physical_plan().await.unwrap();
+        assert_eq!(
+            count_streaming_coalesce(&physical_plan),
+            1,
+            "the union's summed partitions must be merged by a marker-preserving \
+             coalesce"
+        );
+        assert_eq!(
+            physical_plan.output_partitioning().partition_count(),
+            1,
+            "the plan above the union must be single-partition"
+        );
+
+        let rows: usize = union
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        assert_eq!(rows, 6, "every union branch's rows must survive the merge");
     }
 
     /// With `target_partitions > 1` DataFusion plans GROUP BY as

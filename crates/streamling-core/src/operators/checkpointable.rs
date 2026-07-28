@@ -104,9 +104,12 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
                     .create_physical_plan(&checkpointable_node.input, session_state)
                     .await?;
 
-                // Multi-partition inputs (e.g. from `UNION ALL`) are coalesced inside
-                // `CheckpointableExec::execute`, which preserves checkpoint-marker metadata.
-                // We deliberately avoid a stock `RepartitionExec` here, which would drop it.
+                // `CheckpointableExec` is partition-transparent (N in, N out); it no
+                // longer merges multi-partition inputs. `UNION ALL` outputs are
+                // coalesced by the `EnforceSinglePartition` optimizer rule, and other
+                // partition-0-only consumers guard themselves (`SharedSourceHandle`).
+                // We deliberately avoid a stock `RepartitionExec` here, which would
+                // drop checkpoint-marker metadata.
                 let exec = Arc::new(CheckpointableExec::new(
                     input_physical,
                     checkpointable_node.internal_buffer_size,
@@ -300,24 +303,24 @@ mod tests {
         .unwrap()
     }
 
-    /// A simple test source that emits a single batch with checkpoint metadata
+    /// A simple test source that emits one batch per partition
     struct TestSourceExec {
-        batch: RecordBatch,
+        partitions: Vec<RecordBatch>,
         schema: SchemaRef,
         cache: Arc<PlanProperties>,
     }
 
     impl TestSourceExec {
-        fn new(batch: RecordBatch) -> Self {
-            let schema = batch.schema();
+        fn new(partitions: Vec<RecordBatch>) -> Self {
+            let schema = partitions[0].schema();
             let cache = PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
-                PhysicalPartitioning::UnknownPartitioning(1),
+                PhysicalPartitioning::UnknownPartitioning(partitions.len()),
                 datafusion::physical_plan::execution_plan::EmissionType::Incremental,
                 datafusion::physical_plan::execution_plan::Boundedness::Bounded,
             );
             Self {
-                batch,
+                partitions,
                 schema,
                 cache: Arc::new(cache),
             }
@@ -358,10 +361,10 @@ mod tests {
 
         fn execute(
             &self,
-            _partition: usize,
+            partition: usize,
             _context: Arc<TaskContext>,
         ) -> Result<SendableRecordBatchStream> {
-            let batch = self.batch.clone();
+            let batch = self.partitions[partition].clone();
             let schema = self.schema.clone();
             let stream = futures::stream::once(async move { Ok(batch) });
             Ok(Box::pin(
@@ -389,7 +392,7 @@ mod tests {
         let batch = create_test_batch_with_checkpoint(&checkpoint_messages);
 
         // Create test source with checkpoint metadata
-        let source = Arc::new(TestSourceExec::new(batch));
+        let source = Arc::new(TestSourceExec::new(vec![batch]));
 
         // Wrap with CheckpointableExec
         let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
@@ -603,7 +606,7 @@ mod tests {
         assert_eq!(input_checkpoint.len(), 1);
 
         // Create test source and wrap with CheckpointableExec
-        let source = Arc::new(TestSourceExec::new(batch));
+        let source = Arc::new(TestSourceExec::new(vec![batch]));
         let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
 
         // Execute and collect output
@@ -643,5 +646,57 @@ mod tests {
             Some(&"another_value".to_string()),
             "Custom metadata 'another_key' should be preserved"
         );
+    }
+
+    /// Pins the partition-transparent contract: N input partitions surface as N
+    /// output partitions, `execute(i)` forwards exactly input partition i, and
+    /// checkpoint markers stay on the partition stream they arrived on.
+    #[tokio::test]
+    async fn test_checkpointable_exec_forwards_partitions_independently() {
+        let marker = vec![CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(7),
+            created_at_ms: 0,
+        }];
+        let batch_with_marker = create_test_batch_with_checkpoint(&marker);
+        let plain_batch = create_test_batch_with_checkpoint(&[]);
+
+        let source = Arc::new(TestSourceExec::new(vec![
+            batch_with_marker,
+            plain_batch.clone(),
+        ]));
+        let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
+
+        assert_eq!(
+            checkpointable
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            2,
+            "input partitions must surface as output partitions"
+        );
+
+        let ctx = SessionContext::new();
+        let mut with_marker_rows = 0;
+        let mut plain_rows = 0;
+        for partition in 0..2 {
+            let mut stream = checkpointable.execute(partition, ctx.task_ctx()).unwrap();
+            let mut markers_seen = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                markers_seen += extract_checkpoint_messages(batch.schema().metadata()).len();
+                if partition == 0 {
+                    with_marker_rows += batch.num_rows();
+                } else {
+                    plain_rows += batch.num_rows();
+                }
+            }
+            assert_eq!(
+                markers_seen,
+                if partition == 0 { 1 } else { 0 },
+                "markers must stay on the partition stream they arrived on"
+            );
+        }
+        assert_eq!(with_marker_rows, 5, "partition 0 forwards its own rows");
+        assert_eq!(plain_rows, 5, "partition 1 forwards its own rows");
     }
 }
