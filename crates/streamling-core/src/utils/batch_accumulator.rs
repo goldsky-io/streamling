@@ -162,6 +162,10 @@ impl BatchAccumulator {
         }
     }
 
+    /// Flushes up to `batch_size` rows — and at most `max_column_bytes` of
+    /// i32-offset payload per column — from the front of the queue. A single
+    /// call may leave data accumulated; call in a loop until `None` (queue
+    /// empty) to drain everything.
     pub fn flush(&mut self) -> Option<VecDeque<RecordBatch>> {
         if self.accumulated_batches.is_empty() {
             return None;
@@ -174,26 +178,30 @@ impl BatchAccumulator {
         while let Some(batch) = self.accumulated_batches.pop_front() {
             let batch_rows = batch.num_rows();
 
+            let column_payload_sizes: Vec<usize> = batch
+                .columns()
+                .iter()
+                .map(|column| max_i32_offset_payload_size(column.as_ref()))
+                .collect();
+
             // A batch is never split for the byte budget: a single valid batch
             // cannot itself overflow i32 offsets, and merging one batch alone
             // performs no concatenation.
             let crosses_byte_budget = !batches_to_return.is_empty()
                 && payload_sizes_included
                     .iter()
-                    .zip(batch.columns())
-                    .any(|(included, column)| {
-                        included + max_i32_offset_payload_size(column.as_ref())
-                            > self.max_column_bytes
-                    });
+                    .zip(&column_payload_sizes)
+                    .any(|(included, size)| included + size > self.max_column_bytes);
             if crosses_byte_budget {
                 self.accumulated_batches.push_front(batch);
                 break;
             }
 
             if rows_included + batch_rows <= self.batch_size {
-                for (payload_size, column) in payload_sizes_included.iter_mut().zip(batch.columns())
+                for (payload_size, size) in
+                    payload_sizes_included.iter_mut().zip(&column_payload_sizes)
                 {
-                    *payload_size += max_i32_offset_payload_size(column.as_ref());
+                    *payload_size += size;
                 }
                 batches_to_return.push_back(batch);
                 rows_included += batch_rows;
@@ -1424,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_merged_returns_single_batch() {
+    fn test_size_triggered_flush_merges_to_single_batch() {
         let mut accumulator = BatchAccumulator::new(100, Some(Duration::from_secs(60)));
 
         // Push batches that exceed batch_size. The third push triggers flush via push(),
