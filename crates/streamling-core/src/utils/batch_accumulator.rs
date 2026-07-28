@@ -199,6 +199,13 @@ impl BatchAccumulator {
                 rows_included += batch_rows;
             } else {
                 let rows_needed = self.batch_size - rows_included;
+                // With batch_size 0 nothing would ever be packed and flush()
+                // could return None while still holding data; emit the batch
+                // whole so every flush makes progress.
+                if rows_needed == 0 && batches_to_return.is_empty() {
+                    batches_to_return.push_back(batch);
+                    break;
+                }
                 if rows_needed > 0 {
                     batches_to_return.push_back(batch.slice(0, rows_needed));
                 }
@@ -1227,6 +1234,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_async_accumulator_batch_size_zero_loses_no_rows() {
+        // batch_size 0 means "no accumulation": every batch passes through,
+        // and the end-of-stream drain must not drop queued data.
+        let accumulator = AsyncBatchAccumulator::new(0, None);
+
+        let input = stream::iter((0..3).map(|_| Ok(create_test_batch(10))));
+
+        let output: Vec<RecordBatch> = accumulator
+            .process_stream(Box::pin(input))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let total_rows: usize = output.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 30);
     }
 
     #[test]
