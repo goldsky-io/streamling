@@ -130,23 +130,31 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 }
 
 /// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
-/// into `out`, stopping at any nested [`WrappingExec`].
+/// into `out`, stopping at any [`WrappingExec`].
 ///
-/// A nested `WrappingExec` is a *separate* topology node that records its own
+/// A `WrappingExec` is a *separate* topology node that records its own
 /// `elapsed_compute`; descending into it would fold another node's compute into
 /// this transform's aggregate, double-counting it. Everything strictly between
 /// this `CheckpointableExec` and the next topology boundary is this transform's
 /// own compute and belongs in its aggregate.
+///
+/// The boundary check is applied to `plan` itself, not just its children:
+/// `WrappingExec` delegates both `metrics()` and `children()` to its inner
+/// plan, so if the boundary node were reached as the recursion root (e.g. the
+/// `CheckpointableExec`'s input is a passthrough SQL whose projection was
+/// pushed down, leaving the upstream `WrappingExec` directly beneath it), a
+/// children-only guard would collect its delegated metrics and descend into the
+/// nested topology anyway.
 fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) {
+    if plan.downcast_ref::<WrappingExec>().is_some() {
+        return;
+    }
     if let Some(set) = plan.metrics() {
         for metric in set.iter() {
             out.push(Arc::clone(metric));
         }
     }
     for child in plan.children() {
-        if child.downcast_ref::<WrappingExec>().is_some() {
-            continue;
-        }
         collect_subtree_metrics(child, out);
     }
 }
@@ -945,6 +953,66 @@ mod tests {
         assert!(
             aggregated_ms < 10,
             "compute below a nested WrappingExec must be excluded, got {aggregated_ms}ms"
+        );
+    }
+
+    /// `CheckpointableExec::metrics` must also stop when the *root* of its input
+    /// is itself a `WrappingExec` (e.g. a passthrough SQL transform whose
+    /// projection was pushed down, leaving the upstream node's `WrappingExec`
+    /// directly beneath the boundary). Because `WrappingExec` delegates both
+    /// `metrics()` and `children()` to its inner plan, a boundary check that
+    /// only inspected *children* would collect this node's delegated metrics and
+    /// descend into the nested topology — folding another node's compute in.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_root_wrapping_exec() {
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // Record real `elapsed_compute` on the operator that lives below the
+        // nested `WrappingExec`, without executing the `WrappingExec` itself
+        // (see sibling test for why direct execution is used).
+        let nested_compute: Arc<dyn ExecutionPlan> =
+            Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+
+        let ctx = SessionContext::new();
+        drain(nested_compute.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let below_ms = nested_compute
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert!(
+            below_ms >= 25,
+            "test setup: compute below the boundary must have recorded \
+             elapsed_compute, got {below_ms}ms"
+        );
+
+        // The `WrappingExec` is the input's ROOT this time — no intervening
+        // operator between it and the `CheckpointableExec`.
+        let root_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            nested_compute,
+            "nested_upstream".to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root_wrapping, 1, "t".to_string()));
+
+        let aggregated_ms = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+
+        // The entire subtree lives beyond the `WrappingExec` boundary, so none
+        // of the 3×15ms belongs to this transform. If the boundary check only
+        // guarded children (not the root), this would pick up >=25ms.
+        assert!(
+            aggregated_ms < 10,
+            "compute at/below a root WrappingExec must be excluded, got {aggregated_ms}ms"
         );
     }
 }
