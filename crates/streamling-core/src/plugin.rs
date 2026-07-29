@@ -12,7 +12,7 @@ use crate::data::COLUMN_NAME_OP;
 use crate::error::Result;
 use crate::telemetry::provider::metric_key;
 use crate::telemetry::recorder::merge_metadata_tags;
-use crate::{streamling_bail, streamling_err, streamling_user_bail};
+use crate::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use abi_stable::StableAbi;
 use abi_stable::derive_macro_reexports::{NonExhaustive, TD_Opaque};
 use abi_stable::external_types::crossbeam_channel;
@@ -386,8 +386,12 @@ pub fn create_source_plugin(
     options: HashMap<String, String>,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
+        streamling_user_err!(
+            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
+            plugin_type
+        )
+    })?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -403,32 +407,30 @@ pub fn create_source_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            start_shutdown_watcher_once();
-            register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-            merge_metadata_tags(
-                &metric_key(&app_config.application_id, &reference_name),
-                collect_labels(result.labels),
-            );
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin::new(
-                plugin_type.to_string(),
-                Box::pin(mapped_future),
-                plugin_channels,
-                Some(
-                    result
-                        .output_schema
-                        .expect("Source plugin must provide an output schema")
-                        .into(),
-                ),
-            )
-            .unwrap()
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    start_shutdown_watcher_once();
+    register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        collect_labels(result.labels),
+    );
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let output_schema = result.output_schema.into_option().ok_or_else(|| {
+        streamling_user_err!(
+            "source plugin '{}' did not provide an output schema",
+            plugin_type
+        )
+    })?;
+    InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels,
+        Some(output_schema.into()),
+    )
 }
 
 pub fn create_transform_plugin(
@@ -439,8 +441,12 @@ pub fn create_transform_plugin(
     input_schema: SchemaRef,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
+        streamling_user_err!(
+            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
+            plugin_type
+        )
+    })?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -456,32 +462,30 @@ pub fn create_transform_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            start_shutdown_watcher_once();
-            register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-            merge_metadata_tags(
-                &metric_key(&app_config.application_id, &reference_name),
-                collect_labels(result.labels),
-            );
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin::new(
-                plugin_type.to_string(),
-                Box::pin(mapped_future),
-                plugin_channels,
-                Some(
-                    result
-                        .output_schema
-                        .expect("Transform plugin must provide an output schema")
-                        .into(),
-                ),
-            )
-            .unwrap()
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    start_shutdown_watcher_once();
+    register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        collect_labels(result.labels),
+    );
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let output_schema = result.output_schema.into_option().ok_or_else(|| {
+        streamling_user_err!(
+            "transform plugin '{}' did not provide an output schema",
+            plugin_type
+        )
+    })?;
+    InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels,
+        Some(output_schema.into()),
+    )
 }
 
 pub fn create_sink_plugin(
@@ -492,8 +496,12 @@ pub fn create_sink_plugin(
     input_schema: SchemaRef,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
+        streamling_user_err!(
+            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
+            plugin_type
+        )
+    })?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -509,27 +517,24 @@ pub fn create_sink_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            start_shutdown_watcher_once();
-            register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-            merge_metadata_tags(
-                &metric_key(&app_config.application_id, &reference_name),
-                collect_labels(result.labels),
-            );
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin::new(
-                plugin_type.to_string(),
-                Box::pin(mapped_future),
-                plugin_channels,
-                None,
-            )
-            .unwrap()
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    start_shutdown_watcher_once();
+    register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        collect_labels(result.labels),
+    );
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels,
+        None,
+    )
 }
 
 pub fn create_preprocessor_plugin(
@@ -539,8 +544,12 @@ pub fn create_preprocessor_plugin(
     options: HashMap<String, String>,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
+        streamling_user_err!(
+            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
+            plugin_type
+        )
+    })?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
