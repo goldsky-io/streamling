@@ -702,7 +702,6 @@ impl ExecutionPlan for WrappingExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let metric_metadata_id = self.reference_name.clone();
-        let metrics = self.metrics();
         let metrics_recorder = get_metrics_recorder().clone();
         let live_data_inspect = LiveDataInspect::get_instance();
 
@@ -719,6 +718,16 @@ impl ExecutionPlan for WrappingExec {
             partition,
             Arc::clone(&context),
         )?;
+
+        // Read the input's metrics AFTER `execute_input_stream` has run: a
+        // DataFusion operator only registers its `BaselineMetrics`
+        // (`elapsed_compute`, ...) when its `execute` is called. Snapshotting
+        // before that returned an empty set whose live Arc-backed counters were
+        // never captured, so a SQL transform's compute never reached
+        // `elapsed_compute` and `busy = elapsed_compute - starved` collapsed to
+        // the per-batch seed. The `MetricsSet` holds Arc-shared counters, so
+        // this single read stays live as batches flow.
+        let metrics = self.metrics();
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();

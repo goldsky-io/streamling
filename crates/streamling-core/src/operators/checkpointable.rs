@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
 use crate::checkpoints::checkpoint_management::{
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
 };
+use crate::operators::wrapping::WrappingExec;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::StreamExt;
@@ -125,6 +126,28 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
                 None
             },
         )
+    }
+}
+
+/// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
+/// into `out`, stopping at any nested [`WrappingExec`].
+///
+/// A nested `WrappingExec` is a *separate* topology node that records its own
+/// `elapsed_compute`; descending into it would fold another node's compute into
+/// this transform's busy triad, double-counting it. Everything strictly between
+/// this `CheckpointableExec` and the next topology boundary is this transform's
+/// own compute and belongs in its aggregate.
+fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) {
+    if let Some(set) = plan.metrics() {
+        for metric in set.iter() {
+            out.push(Arc::clone(metric));
+        }
+    }
+    for child in plan.children() {
+        if child.downcast_ref::<WrappingExec>().is_some() {
+            continue;
+        }
+        collect_subtree_metrics(child, out);
     }
 }
 
@@ -291,7 +314,23 @@ impl ExecutionPlan for CheckpointableExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        self.input.metrics()
+        // Aggregate DataFusion metrics across this transform's ENTIRE physical
+        // subtree, not just the root operator.
+        //
+        // The topology for a SQL transform is
+        // `WrappingExec -> CheckpointableExec -> <SQL plan>`, and
+        // `WrappingExec` folds these DataFusion metrics into the node's
+        // `elapsed_compute` (via `record_execution_plan_metrics`). Forwarding
+        // only `self.input.metrics()` (the SQL plan's ROOT operator) drops the
+        // `elapsed_compute` recorded by deeper operators — e.g. a `FilterExec`
+        // beneath a `ProjectionExec` does the real work but sits below the root.
+        // With the deep compute missing, `elapsed_compute` collapsed to the
+        // starved-fold plus per-batch seed, so `busy = elapsed_compute -
+        // starved` stayed near the seed and a compute-bound transform looked
+        // `starved` (upstream's fault) instead of `busy`.
+        let mut aggregated = MetricsSet::new();
+        collect_subtree_metrics(&self.input, &mut aggregated);
+        Some(aggregated)
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -307,10 +346,14 @@ mod tests {
     use arrow::array::{BooleanArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use datafusion::datasource::MemTable;
+    use datafusion::datasource::TableProvider;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_expr::Partitioning as PhysicalPartitioning;
+    use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::*;
     use futures::StreamExt;
+    use std::time::Duration;
 
     fn create_test_schema_with_metadata(metadata: HashMap<String, String>) -> SchemaRef {
         Arc::new(Schema::new_with_metadata(
@@ -691,6 +734,252 @@ mod tests {
             output_metadata.get("another_key"),
             Some(&"another_value".to_string()),
             "Custom metadata 'another_key' should be preserved"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Busy-triad metrics aggregation (regression for compute-bound SQL
+    // transforms looking `starved` instead of `busy`).
+    // ------------------------------------------------------------------
+
+    /// A test operator that records a fixed `elapsed_compute` per input batch
+    /// via DataFusion's `BaselineMetrics`, modeling a compute-bound SQL operator
+    /// (e.g. `FilterExec`). Used to prove `CheckpointableExec::metrics` gathers
+    /// compute from operators *below* the SQL plan root, and stops at nested
+    /// `WrappingExec` topology boundaries.
+    #[derive(Debug)]
+    struct ComputeExec {
+        input: Arc<dyn ExecutionPlan>,
+        per_batch_compute: Duration,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl ComputeExec {
+        fn new(input: Arc<dyn ExecutionPlan>, per_batch_compute: Duration) -> Self {
+            Self {
+                input,
+                per_batch_compute,
+                metrics: ExecutionPlanMetricsSet::new(),
+            }
+        }
+    }
+
+    impl DisplayAs for ComputeExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "ComputeExec")
+        }
+    }
+
+    impl ExecutionPlan for ComputeExec {
+        fn name(&self) -> &'static str {
+            "ComputeExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ComputeExec::new(
+                children.swap_remove(0),
+                self.per_batch_compute,
+            )))
+        }
+        fn metrics(&self) -> Option<MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let baseline = BaselineMetrics::new(&self.metrics, partition);
+            let mut input = self.input.execute(partition, context)?;
+            let compute = self.per_batch_compute;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                while let Some(item) = input.next().await {
+                    match item {
+                        Ok(batch) => {
+                            // The timer measures wall-clock exactly as a real
+                            // operator's `elapsed_compute` does; the sleep
+                            // simulates the transform's own compute.
+                            let timer = baseline.elapsed_compute().timer();
+                            if !compute.is_zero() {
+                                tokio::time::sleep(compute).await;
+                            }
+                            timer.done();
+                            yield Ok(batch);
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            break;
+                        }
+                    }
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    fn multi_batch_source(num_batches: usize) -> Arc<dyn ExecutionPlan> {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let schema = batch.schema();
+        let batches = std::iter::repeat_n(batch, num_batches).collect();
+        let mem_table = MemTable::try_new(schema, vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        futures::executor::block_on(mem_table.scan(&ctx.state(), None, &[], None)).unwrap()
+    }
+
+    async fn drain(mut stream: SendableRecordBatchStream) {
+        while let Some(b) = stream.next().await {
+            b.unwrap();
+        }
+    }
+
+    /// Regression: `CheckpointableExec::metrics` must aggregate `elapsed_compute`
+    /// from operators *below* the SQL plan root. Previously it forwarded only
+    /// `self.input.metrics()` (the root operator), so compute recorded by deeper
+    /// operators was dropped and never reached the node's `elapsed_compute` —
+    /// the reason a compute-bound transform's `busy = elapsed_compute - starved`
+    /// stayed pinned near the per-batch seed.
+    #[tokio::test]
+    async fn checkpointable_metrics_aggregate_subtree_compute() {
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // Root is a zero-compute passthrough; the real work happens one level
+        // deeper (mirroring a `FilterExec` beneath a `ProjectionExec`). Root-only
+        // forwarding would therefore report ~0 compute.
+        let deep_compute = Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let root: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(deep_compute, Duration::ZERO));
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
+
+        let ctx = SessionContext::new();
+        drain(checkpointable.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let aggregated = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .expect("CheckpointableExec must expose aggregated elapsed_compute");
+
+        // ~NUM_BATCHES * 15ms of deep compute; assert well below the nominal
+        // total so scheduling jitter can't flake it, but far above the ~0 a
+        // root-only forward would report.
+        let aggregated_ms = aggregated as u64 / 1_000_000;
+        assert!(
+            aggregated_ms >= 25,
+            "expected aggregated subtree elapsed_compute >= 25ms (got {aggregated_ms}ms); \
+             deep-operator compute was dropped"
+        );
+    }
+
+    /// `CheckpointableExec::metrics` must stop at a nested `WrappingExec`: that is
+    /// a separate topology node recording its own `elapsed_compute`, so folding
+    /// its subtree in here would double-count another node's compute against this
+    /// transform's busy triad.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_nested_wrapping_exec() {
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // The heavy compute sits *below* a nested WrappingExec, which represents
+        // an upstream topology node. It must NOT be attributed to this transform.
+        let nested_compute = Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let nested_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            nested_compute,
+            "nested_upstream".to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+        // A zero-compute root above the boundary, so this transform's own
+        // compute is ~0.
+        let root: Arc<dyn ExecutionPlan> =
+            Arc::new(ComputeExec::new(nested_wrapping, Duration::ZERO));
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
+
+        let ctx = SessionContext::new();
+        drain(checkpointable.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let aggregated_ms = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+
+        // The 3×15ms below the nested WrappingExec must be excluded; only the
+        // zero-compute root remains, so this stays near zero.
+        assert!(
+            aggregated_ms < 10,
+            "compute below a nested WrappingExec must be excluded, got {aggregated_ms}ms"
+        );
+    }
+
+    /// End-to-end busy triad: for `WrappingExec -> CheckpointableExec ->
+    /// <compute-bound plan>`, `busy = elapsed_compute - starved` must reflect the
+    /// transform's compute instead of collapsing to the per-batch seed. The
+    /// `WrappingExec`'s `data.next().await` conflates the spawned compute task
+    /// with upstream wait (inflating `starved`), so the compute must be recovered
+    /// through `elapsed_compute` — which requires `CheckpointableExec::metrics`
+    /// to surface the deep-operator compute.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn busy_triad_reflects_compute_for_sql_transform() {
+        use crate::operators::wrapping::WrappingExec;
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_busy_transform";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let per_batch = Duration::from_millis(12);
+
+        // Deep compute under a zero-compute root, wrapped by CheckpointableExec
+        // (spawns the compute into its own task) and then WrappingExec (the
+        // instrumented topology boundary).
+        let deep_compute = Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let root: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(deep_compute, Duration::ZERO));
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, node_id.to_string()));
+        let wrapping = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let ctx = SessionContext::new();
+        // Fast consumer: no downstream sleep, so wait is upstream/compute, not
+        // blocked. `data.next().await` still absorbs the spawned compute task.
+        drain(wrapping.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        let busy = elapsed_compute.saturating_sub(starved);
+
+        // Pre-fix, the deep compute never reached `elapsed_compute`, so
+        // `elapsed_compute` was just the starved-fold plus per-batch seed and
+        // `busy` sat at ~NUM_BATCHES (the 1ms seed). With the fix it reflects the
+        // transform's real compute.
+        assert!(
+            busy >= 24,
+            "busy (elapsed_compute {elapsed_compute}ms - starved {starved}ms = {busy}ms) must \
+             reflect the compute-bound transform, not collapse to the per-batch seed"
         );
     }
 }
