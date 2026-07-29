@@ -8,9 +8,9 @@
 //!   EOF (inferring the schema and Hive-style partition columns), and the job
 //!   terminates on its own.
 //! - **Continuous** ([`FileSourceTableProvider`]) keeps watching the path: a poll
-//!   loop lists the prefix every `poll_interval`, ingests files whose
-//!   `last_modified` exceeds a persisted [`FileWatermark`], and never
-//!   self-terminates.
+//!   loop lists the prefix (or HEADs the path when it names a single object)
+//!   every `poll_interval`, ingests files whose `last_modified` exceeds a
+//!   persisted [`FileWatermark`], and never self-terminates.
 //!
 //! Because file reads are append-only, a constant `_gs_op = 'i'` column is
 //! synthesized when the inferred schema lacks it. Files that already carry
@@ -42,16 +42,19 @@ use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType, ViewTable, provider_as_source};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, lit};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
+    coalesce_partitions::CoalescePartitionsExec,
     execution_plan::{Boundedness, EmissionType},
     project_schema,
 };
 use futures::StreamExt;
+use futures::stream::BoxStream;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use serde_derive::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -149,6 +152,46 @@ fn register_object_store_for_url(
     Ok(())
 }
 
+/// Merges the bounded scan's parallel file groups back into a single output
+/// partition, delegating projection/filter/limit pushdown to the inner
+/// [`ListingTable`] so splitting the files costs nothing at plan time.
+#[derive(Debug)]
+struct CoalescedFileScan {
+    inner: Arc<ListingTable>,
+}
+
+#[async_trait]
+impl TableProvider for CoalescedFileScan {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let plan = self.inner.scan(state, projection, filters, limit).await?;
+        if plan.output_partitioning().partition_count() > 1 {
+            return Ok(Arc::new(CoalescePartitionsExec::new(plan)));
+        }
+        Ok(plan)
+    }
+}
+
 /// Builds the runtime provider for a **bounded** `file` source backed by
 /// DataFusion's [`ListingTable`]. The schema is inferred from the files at
 /// startup. Because file reads are append-only, a constant `_gs_op = 'i'` column
@@ -180,8 +223,14 @@ pub async fn build_bounded_file_source_provider(
     let object_store = state.runtime_env().object_store(table_url.object_store())?;
     let partition_cols =
         infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
-    let listing_options =
-        ListingOptions::new(file_format).with_table_partition_cols(partition_cols);
+    // `ListingOptions::new` defaults to one target partition, which reads every
+    // file serially on a single core. Split the files across the session's target
+    // partitions instead; `CoalescedFileScan` merges them back into one output
+    // partition. Set explicitly rather than via `with_session_config_options`,
+    // which would also turn on `collect_stat` (a footer fetch per file at startup).
+    let listing_options = ListingOptions::new(file_format)
+        .with_table_partition_cols(partition_cols)
+        .with_target_partitions(state.config().target_partitions());
     // Partition columns are detected ourselves above (`infer_partition_columns`),
     // not via DataFusion's `infer_partitions_from_path` (which treats every parent
     // directory as a partition level and errors on plain nested subfolders).
@@ -208,9 +257,11 @@ pub async fn build_bounded_file_source_provider(
             return Err(e.into());
         }
     };
-    let listing_table = Arc::new(ListingTable::try_new(config)?);
+    let provider: Arc<dyn TableProvider> = Arc::new(CoalescedFileScan {
+        inner: Arc::new(ListingTable::try_new(config)?),
+    });
 
-    let schema = listing_table.schema();
+    let schema = provider.schema();
 
     // Schema inference over a path that matches no files yields an empty schema
     // and a silent zero-row source; fail fast instead.
@@ -238,7 +289,7 @@ pub async fn build_bounded_file_source_provider(
                 op_field.is_nullable()
             );
         }
-        return Ok(listing_table);
+        return Ok(provider);
     }
 
     // Reference each column by its exact name. `col(name)` would parse the name as a
@@ -250,13 +301,9 @@ pub async fn build_bounded_file_source_provider(
         .map(|f| Expr::Column(Column::new_unqualified(f.name())))
         .collect();
     projection.push(lit(ScalarValue::Utf8(Some(RowKind::Insert.to_str()))).alias(COLUMN_NAME_OP));
-    let plan = LogicalPlanBuilder::scan(
-        reference_name,
-        provider_as_source(listing_table as Arc<dyn TableProvider>),
-        None,
-    )?
-    .project(projection)?
-    .build()?;
+    let plan = LogicalPlanBuilder::scan(reference_name, provider_as_source(provider), None)?
+        .project(projection)?
+        .build()?;
 
     Ok(Arc::new(ViewTable::new(plan, None)))
 }
@@ -278,6 +325,29 @@ pub struct FileWatermark {
 
 fn watermark_state_key(reference_name: &str) -> StateKey {
     StateKey::from(format!("{reference_name}:watermark"))
+}
+
+/// The candidate objects for one poll.
+///
+/// A non-collection URL names one exact object, which a prefix listing never
+/// returns (object_store matches prefixes on whole path segments), so it is
+/// HEADed instead. A `NotFound` falls back to a prefix listing, mirroring
+/// DataFusion's `ListingTableUrl::list_prefixed_files`: a remote directory URL
+/// without a trailing slash is also non-collection, and schema inference
+/// resolves it through that same fallback, so a source configured that way would
+/// otherwise start and then tear down on its first poll. Other errors ride the
+/// stream, keeping one error path in the caller.
+async fn list_poll_candidates(
+    object_store: &dyn ObjectStore,
+    table_url: &ListingTableUrl,
+) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    if table_url.is_collection() {
+        return object_store.list(Some(table_url.prefix()));
+    }
+    match object_store.head(table_url.prefix()).await {
+        Err(object_store::Error::NotFound { .. }) => object_store.list(Some(table_url.prefix())),
+        result => futures::stream::iter([result]).boxed(),
+    }
 }
 
 /// Whether a listed object should be ingested: it must carry the format's
@@ -792,7 +862,9 @@ impl ExecutionPlan for FileSourceExec {
                 let boundary: HashSet<String> = watermark.boundary_paths.iter().cloned().collect();
                 let mut new_files: Vec<PartitionedFile> = Vec::new();
                 let mut max_seen = watermark.last_modified_ms;
-                let mut listing = object_store.list(Some(table_url.prefix()));
+                // A HEADed single object flows through the same watermark and
+                // extension checks as a listed one, so it is ingested only once.
+                let mut listing = list_poll_candidates(object_store.as_ref(), &table_url).await;
                 while let Some(meta) = listing.next().await {
                     let meta = meta?;
                     let last_modified_ms = meta.last_modified.timestamp_millis();
@@ -851,13 +923,24 @@ impl ExecutionPlan for FileSourceExec {
                     // TableSchema (set at construction), so the builder takes just
                     // (object_store_url, file_source) and no longer accepts the
                     // file schema or partition cols directly.
+                    //
+                    // Spread the poll's files over the session's target partitions so
+                    // they are read concurrently, then merge them back into the single
+                    // stream this loop emits from: the watermark, the checkpoint drain,
+                    // and the record limit all assume one emission point.
+                    let file_groups = FileGroup::new(new_files)
+                        .split_files(context.session_config().target_partitions());
                     let config =
                         FileScanConfigBuilder::new(object_store_url.clone(), file_source.clone())
-                            .with_file_group(FileGroup::new(new_files))
+                            .with_file_groups(file_groups)
                             .build();
 
-                    let mut stream =
-                        DataSourceExec::from_data_source(config).execute(0, context.clone())?;
+                    let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+                    let mut stream = if scan.output_partitioning().partition_count() > 1 {
+                        CoalescePartitionsExec::new(scan).execute(0, context.clone())?
+                    } else {
+                        scan.execute(0, context.clone())?
+                    };
                     while let Some(batch) = stream.next().await {
                         // Drain again before every batch so markers arriving mid-read
                         // ride the next batch (within one batch interval) instead of
@@ -1257,6 +1340,245 @@ mod tests {
         assert!(
             empty_batches >= 2,
             "idle polls must emit empty heartbeat batches; got {empty_batches}"
+        );
+    }
+
+    /// The bounded source splits its files across the session's target partitions
+    /// but must expose exactly one output partition: `DataSinkExec` reads only
+    /// input partition 0, and streamling's optimizer never inserts a coalesce, so
+    /// a multi-partition source feeding a sink directly would drop rows.
+    #[tokio::test]
+    async fn bounded_source_coalesces_file_groups_into_one_partition() {
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+
+        let dir = std::env::temp_dir().join(format!("streamling_bounded_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..3 {
+            std::fs::write(
+                dir.join(format!("{file}.csv")),
+                format!("id,name\n{file}0,alice\n{file}1,bob\n{file}2,carol"),
+            )
+            .unwrap();
+        }
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let provider = build_bounded_file_source_provider(
+            "bounded_src",
+            &format!("{}/", dir.to_str().unwrap()),
+            FileSourceFormat::Csv,
+            &session_manager,
+        )
+        .await
+        .unwrap();
+
+        let state = session_manager.session_state();
+        let plan = provider.scan(&state, None, &[], None).await.unwrap();
+        assert_eq!(
+            plan.output_partitioning().partition_count(),
+            1,
+            "the bounded source must expose a single output partition"
+        );
+
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch.unwrap().num_rows();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(rows, 9, "every file group's rows must reach partition 0");
+    }
+
+    /// A poll's files are split across the session's target partitions and read
+    /// concurrently, but the source still emits from one stream: every row must
+    /// arrive exactly once (the watermark's boundary set covers the files sharing
+    /// the poll's newest timestamp), and idle polls must still heartbeat.
+    #[tokio::test]
+    async fn continuous_source_reads_split_file_groups_exactly_once() {
+        use datafusion::arrow::array::Array;
+        use std::time::Duration;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+        use tokio::time::timeout;
+
+        let dir = std::env::temp_dir().join(format!("streamling_split_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Non-numeric ids keep the inferred column Utf8, so the assertion below can
+        // name the exact rows rather than just count them.
+        for file in ["a", "b", "c"] {
+            std::fs::write(
+                dir.join(format!("{file}.csv")),
+                format!("id,name\n{file}0,alice\n{file}1,bob\n{file}2,carol"),
+            )
+            .unwrap();
+        }
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<FileWatermark>("split_test");
+
+        let provider = FileSourceTableProvider::try_new(
+            "split_src",
+            &format!("{}/", dir.to_str().unwrap()),
+            FileSourceFormat::Csv,
+            Duration::from_millis(100),
+            &session_manager,
+            state_backend,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.output_partitioning().partition_count(),
+            1,
+            "concurrent file groups must still surface as one output partition"
+        );
+
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        let mut empty_batches = 0usize;
+        for _ in 0..8 {
+            let batch = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream should yield within timeout")
+                .expect("stream should not end")
+                .unwrap();
+            if batch.num_rows() == 0 {
+                empty_batches += 1;
+                continue;
+            }
+            let column = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            ids.extend((0..column.len()).map(|row| column.value(row).to_string()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a0", "a1", "a2", "b0", "b1", "b2", "c0", "c1", "c2"],
+            "every row from every file group must arrive exactly once"
+        );
+        assert!(
+            empty_batches >= 2,
+            "polls after ingest must emit empty heartbeat batches; got {empty_batches}"
+        );
+    }
+
+    /// A remote directory URL without a trailing slash is not a collection, so
+    /// the poll HEADs it and gets NotFound. Schema inference resolves such a URL
+    /// by falling back to a prefix listing, so the poll loop must agree —
+    /// otherwise the source starts and dies on its first poll.
+    #[tokio::test]
+    async fn poll_candidates_fall_back_to_listing_when_head_misses() {
+        use futures::TryStreamExt;
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+
+        let store = InMemory::new();
+        store
+            .put(&Path::from("data/1.csv"), "id\n1".into())
+            .await
+            .unwrap();
+
+        let table_url = ListingTableUrl::parse("memory:///data").unwrap();
+        assert!(!table_url.is_collection(), "no trailing slash");
+
+        let found: Vec<ObjectMeta> = list_poll_candidates(&store, &table_url)
+            .await
+            .try_collect()
+            .await
+            .unwrap();
+        let locations: Vec<&str> = found.iter().map(|meta| meta.location.as_ref()).collect();
+        assert_eq!(locations, vec!["data/1.csv"]);
+    }
+
+    /// A path naming one exact object (no trailing slash) must be ingested by
+    /// the continuous source. The poll loop's prefix listing never returns a
+    /// key equal to the prefix (object_store prefixes match whole path
+    /// segments), so this exercises the HEAD branch — without it the source
+    /// heartbeats forever with zero rows.
+    #[tokio::test]
+    async fn continuous_source_ingests_single_file_path() {
+        use std::time::Duration;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+        use tokio::time::timeout;
+
+        let dir =
+            std::env::temp_dir().join(format!("streamling_single_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("1.csv");
+        std::fs::write(&file, "id,name\n1,alice\n2,bob\n3,carol").unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<FileWatermark>("single_file_test");
+
+        let provider = FileSourceTableProvider::try_new(
+            "single_file_src",
+            file.to_str().unwrap(),
+            FileSourceFormat::Csv,
+            Duration::from_millis(100),
+            &session_manager,
+            state_backend,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
+            .await
+            .unwrap();
+        let mut stream = plan
+            .execute(0, session_manager.session_context().task_ctx())
+            .unwrap();
+
+        // First poll HEADs and reads the file (3 rows); the watermark then
+        // filters the unchanged object, so later polls are idle heartbeats.
+        let mut data_rows = 0usize;
+        let mut empty_batches = 0usize;
+        for _ in 0..5 {
+            let batch = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream should yield within timeout")
+                .expect("stream should not end")
+                .unwrap();
+            if batch.num_rows() == 0 {
+                empty_batches += 1;
+            } else {
+                data_rows += batch.num_rows();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(data_rows, 3, "the object's 3 rows are read exactly once");
+        assert!(
+            empty_batches >= 2,
+            "polls after ingest must emit empty heartbeat batches; got {empty_batches}"
         );
     }
 

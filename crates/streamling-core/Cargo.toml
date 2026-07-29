@@ -1,6 +1,6 @@
 [package]
 name = "streamling-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Core streaming execution engine for Streamling, built on Apache DataFusion."
@@ -94,4 +94,5 @@ rand.workspace = true
 # does not affect the production build, which never compiles dev-dependencies.
 opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_custom_reader",
+    "testing",
 ] }

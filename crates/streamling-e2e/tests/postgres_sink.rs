@@ -4,6 +4,7 @@
 //! Ported from crates/streamling/tests/pipeline_postgres_sink.rs
 
 use serde::Serialize;
+use std::time::Duration;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext};
 
 // ============================================================================
@@ -1410,4 +1411,193 @@ sinks:
         .await
         .expect("Failed to query count");
     assert_eq!(count, 50, "All 50 records should be written");
+}
+
+// ============================================================================
+// Scenario 13: Read-only failover recovery (SQLSTATE 25006)
+// ============================================================================
+
+/// Simulate a primary→replica failover by flipping the test database to
+/// `default_transaction_read_only = on` while the sink is mid-flight, then
+/// flipping it back. The sink's existing connections are terminated each time
+/// so their next reconnect inherits the new GUC. Verifies that
+///   1) writes are provably blocked during the read-only window (the pool's
+///      `before_acquire` gate evicts read-only connections instead of reusing
+///      them forever),
+///   2) the retry loop survives the window without exiting, and
+///   3) all records land once writes are accepted again — without a restart.
+///
+/// Records are produced in two waves: wave 2 arrives only after the database
+/// is read-only, so the pipeline cannot finish before the failover is
+/// exercised — the test cannot pass vacuously.
+///
+/// Scope is per-database via `ALTER DATABASE "<test_db>" SET ...`, so parallel
+/// tests against other isolated databases are unaffected.
+#[tokio::test]
+async fn test_postgres_sink_read_only_failover() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let make_records = |range: std::ops::RangeInclusive<i64>| -> Vec<TestRecord> {
+        range
+            .map(|i| TestRecord {
+                id: i,
+                value: format!("ro_value_{}", i),
+                timestamp: 1000 + i,
+            })
+            .collect()
+    };
+
+    // Wave 1: enough records to get the sink writing, but not enough to let
+    // the pipeline (record_limit = 50) finish before the failover is injected.
+    ctx.kafka
+        .produce_avro_records(&make_records(1..=25))
+        .await
+        .expect("Failed to produce wave 1");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: test_read_only_failover
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 5
+    batch_flush_interval: 200ms
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    // Run the pipeline in the background so the test can flip the read-only
+    // GUC while the sink is mid-flight.
+    let pipeline_path = ctx.temp_dir.path().join("pipeline.yaml");
+    std::fs::write(&pipeline_path, &pipeline).expect("Failed to write pipeline file");
+    let mut env_vars = ctx.build_env_vars();
+    env_vars.push((
+        "STREAMLING__NUM_RECORDS_BEFORE_STOP".to_string(),
+        "50".to_string(),
+    ));
+    let binary_path = ctx.config.streamling_bin.clone();
+
+    let pipeline_task = tokio::spawn(async move {
+        streamling_e2e::streamling::run_streamling(
+            &pipeline_path,
+            binary_path.as_deref(),
+            &env_vars,
+        )
+        .await
+    });
+
+    // Wait until the sink has written at least one row, confirming the happy
+    // path is live before we break it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let n = ctx
+            .postgres
+            .count("SELECT COUNT(*) FROM public.test_read_only_failover")
+            .await
+            .unwrap_or(0);
+        if n > 0 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("sink did not write any rows within 30s");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let db = ctx.pg_database.clone();
+    let quoted_db = db.replace('"', "\"\"");
+    let escaped_db = db.replace('\'', "''");
+
+    // Flip read-only on and force existing sink sessions to reconnect into the
+    // new default, so the next INSERT raises SQLSTATE 25006.
+    ctx.postgres
+        .admin_execute(&format!(
+            "ALTER DATABASE \"{}\" SET default_transaction_read_only = on",
+            quoted_db
+        ))
+        .await
+        .expect("ALTER DATABASE on failed");
+    ctx.postgres
+        .admin_execute(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{}' AND pid <> pg_backend_pid()",
+            escaped_db
+        ))
+        .await
+        .expect("pg_terminate_backend (on) failed");
+
+    // Wave 2: produced only after the database is read-only, so these rows
+    // cannot land until the failover resolves.
+    ctx.kafka
+        .produce_avro_records(&make_records(26..=50))
+        .await
+        .expect("Failed to produce wave 2");
+
+    // Hold the read-only window long enough for the sink to hit 25006 and
+    // exercise the connection-eviction path.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Writes must be blocked while the database is read-only; if all 50 rows
+    // are present the failover was never actually exercised.
+    let mid_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.test_read_only_failover")
+        .await
+        .expect("Failed to query count during read-only window");
+    assert!(
+        mid_count < 50,
+        "read-only window did not block writes (count = {})",
+        mid_count
+    );
+
+    // Resolve the failover. Deliberately do NOT terminate backends here: the
+    // sink's pooled sessions still carry `default_transaction_read_only = on`
+    // from when they connected, so recovery depends entirely on the pool's
+    // `before_acquire` gate evicting them — exactly what this test defends.
+    ctx.postgres
+        .admin_execute(&format!(
+            "ALTER DATABASE \"{}\" SET default_transaction_read_only = off",
+            quoted_db
+        ))
+        .await
+        .expect("ALTER DATABASE off failed");
+
+    let status = tokio::time::timeout(Duration::from_secs(90), pipeline_task)
+        .await
+        .expect("pipeline did not finish within 90s after recovery")
+        .expect("pipeline task panicked")
+        .expect("pipeline returned error");
+    assert!(
+        status.success(),
+        "Streamling should exit successfully after recovery"
+    );
+
+    let count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.test_read_only_failover")
+        .await
+        .expect("Failed to query count after recovery");
+    assert_eq!(count, 50, "All 50 records should be written after recovery");
 }

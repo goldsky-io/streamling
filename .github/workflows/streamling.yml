@@ -455,3 +455,45 @@ jobs:
           echo "Created multi-arch manifests:"
           echo "  - $TAG_SHA"
           echo "  - $TAG_LATEST"
+
+  # ==========================================================================
+  # Manually triggered immutable nightly prerelease from main.
+  # Linux binaries only; versioned releases remain the 'latest' release.
+  # ==========================================================================
+  publish-prerelease:
+    needs: [validate-and-test, e2e-tests, build-release-main]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-binary-*-*
+          path: release-artifacts/
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          found=0
+          for dir in release-artifacts/release-binary-*; do
+            [ -d "$dir" ] || continue
+            found=1
+            base=$(basename "$dir")
+            os_arch=${base#release-binary-}
+            chmod +x "$dir/streamling"
+            tar -czf "release-assets/streamling-${os_arch}.tar.gz" -C "$dir" streamling
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No release artifact directories found" >&2
+            exit 1
+          fi
+      - name: Publish nightly prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "$tag" --notes "Nightly prerelease from main @ $GITHUB_SHA. Linux binaries only; use the versioned releases for macOS/Windows." release-assets/*

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apache_avro::Schema as AvroSchema;
-use apache_avro::types::Value;
 use dashmap::DashMap;
 use futures::future::try_join_all;
 use schema_registry_converter::async_impl::schema_registry::{
@@ -10,7 +8,7 @@ use schema_registry_converter::async_impl::schema_registry::{
 };
 use schema_registry_converter::error::SRCError;
 use schema_registry_converter::schema_registry_common::SrCall;
-use streamling_core::error::{ResultExt, StreamlingError};
+use streamling_core::error::StreamlingError;
 use streamling_core::retry::retry_if_retriable;
 use streamling_core::streamling_err;
 use tokio::sync::OnceCell;
@@ -119,7 +117,10 @@ impl SubjectVersionsClient {
 /// `SRCError`'s own `retriable` flag (which the crate already sets for HTTP-layer failures and
 /// clears for non-retryable cases like parse errors). The retry helper applies exponential
 /// backoff with jitter and stops as soon as a non-retriable error surfaces.
-async fn retry_registry_call<F, Fut, T>(op_name: String, op: F) -> streamling_core::error::Result<T>
+pub(crate) async fn retry_registry_call<F, Fut, T>(
+    op_name: String,
+    op: F,
+) -> streamling_core::error::Result<T>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, SRCError>>,
@@ -137,42 +138,6 @@ where
         &op_name,
     )
     .await
-}
-
-/// Resolves a decoded Avro value to match the reader schema.
-///
-/// Schema-evolution policy:
-/// - Identical writer/reader schema IDs → no-op.
-/// - When `validate_writer_schema_ordering` is true and the writer is newer than the reader for
-///   the subject, return an error so the pipeline can fail-fast and refetch the latest schema.
-/// - Otherwise, apply Avro schema resolution against the reader's schema.
-pub async fn resolve_schema(
-    value: Value,
-    subject: &str,
-    versions_client: &SubjectVersionsClient,
-    writer_schema_id: u32,
-    reader_schema_id: u32,
-    reader_schema: &AvroSchema,
-    validate_writer_schema_ordering: bool,
-) -> streamling_core::error::Result<Value> {
-    if writer_schema_id == reader_schema_id {
-        return Ok(value);
-    }
-    if validate_writer_schema_ordering
-        && is_writer_schema_ahead(versions_client, subject, writer_schema_id, reader_schema_id)
-            .await?
-    {
-        return Err(streamling_err!(
-            "writer_schema_id={} is newer than reader_schema_id={}. Restart to fetch the newest schema",
-            writer_schema_id,
-            reader_schema_id
-        ));
-    }
-    value.resolve(reader_schema).streamling_with_context(|| {
-        format!(
-            "schema resolution failed (writer_id={writer_schema_id}, reader_id={reader_schema_id})"
-        )
-    })
 }
 
 /// Returns true when the writer schema is registered after the reader schema for the same subject.
@@ -268,6 +233,7 @@ pub fn patch_schema_id_with_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apache_avro::types::Value;
     use mockito::Server;
 
     fn mk_settings(server: &Server) -> SrSettings {
@@ -522,271 +488,6 @@ mod tests {
                 .unwrap(),
             5
         );
-    }
-
-    /// Subject and a pre-seeded versions client used by every resolve_schema test below.
-    /// Maps each schema id used in these tests (1, 2, 99, 100) to a version equal to the id,
-    /// so writer < reader id implies writer < reader version (no fail-fast restart path).
-    fn resolve_schema_test_setup() -> (&'static str, SubjectVersionsClient) {
-        let mut id_to_version = HashMap::new();
-        for id in [1u32, 2, 99, 100] {
-            id_to_version.insert(id, id);
-        }
-        (
-            "test-value",
-            SubjectVersionsClient::with_seeded("test-value", id_to_version),
-        )
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_same_schema_id_skips_resolution() {
-        let schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "id", "type": "int"},
-                    {"name": "name", "type": "string"}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![
-            ("id".to_string(), Value::Int(42)),
-            ("name".to_string(), Value::String("test".to_string())),
-        ]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value.clone(), subject, &client, 100, 100, &schema, true)
-            .await
-            .unwrap();
-
-        assert_eq!(result, value);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_different_schema_id_applies_resolution() {
-        let reader_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "id", "type": "int"},
-                    {"name": "version", "type": "int", "default": 1}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![("id".to_string(), Value::Int(42))]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value, subject, &client, 99, 100, &reader_schema, true)
-            .await
-            .unwrap();
-
-        if let Value::Record(fields) = result {
-            assert_eq!(fields.len(), 2);
-            assert_eq!(fields[0], ("id".to_string(), Value::Int(42)));
-            assert_eq!(fields[1], ("version".to_string(), Value::Int(1)));
-        } else {
-            panic!("Expected Record value");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_type_promotion() {
-        let reader_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "count", "type": "long"}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![("count".to_string(), Value::Int(100))]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value, subject, &client, 1, 2, &reader_schema, true)
-            .await
-            .unwrap();
-
-        if let Value::Record(fields) = result {
-            assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0], ("count".to_string(), Value::Long(100)));
-        } else {
-            panic!("Expected Record value");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_nullable_field_with_default() {
-        let reader_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "id", "type": "int"},
-                    {"name": "optional", "type": ["null", "string"], "default": null}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![("id".to_string(), Value::Int(1))]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value, subject, &client, 1, 2, &reader_schema, true)
-            .await
-            .unwrap();
-
-        if let Value::Record(fields) = result {
-            assert_eq!(fields.len(), 2);
-            assert_eq!(fields[0], ("id".to_string(), Value::Int(1)));
-            assert_eq!(
-                fields[1],
-                (
-                    "optional".to_string(),
-                    Value::Union(0, Box::new(Value::Null))
-                )
-            );
-        } else {
-            panic!("Expected Record value");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_extra_field_ignored() {
-        let reader_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "id", "type": "int"}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![
-            ("id".to_string(), Value::Int(42)),
-            ("extra".to_string(), Value::String("ignored".to_string())),
-        ]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value, subject, &client, 1, 2, &reader_schema, true)
-            .await
-            .unwrap();
-
-        if let Value::Record(fields) = result {
-            assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0], ("id".to_string(), Value::Int(42)));
-        } else {
-            panic!("Expected Record value");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_missing_required_field_fails() {
-        let reader_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "id", "type": "int"},
-                    {"name": "required_field", "type": "string"}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![("id".to_string(), Value::Int(42))]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value, subject, &client, 1, 2, &reader_schema, true).await;
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("schema resolution failed"),
-            "Error should mention schema resolution: {}",
-            err_msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_schema_nested_record_with_default() {
-        let reader_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "outer",
-                "fields": [
-                    {"name": "id", "type": "int"},
-                    {
-                        "name": "inner",
-                        "type": {
-                            "type": "record",
-                            "name": "inner_record",
-                            "fields": [
-                                {"name": "value", "type": "string"},
-                                {"name": "count", "type": "int", "default": 0}
-                            ]
-                        }
-                    }
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let value = Value::Record(vec![
-            ("id".to_string(), Value::Int(1)),
-            (
-                "inner".to_string(),
-                Value::Record(vec![(
-                    "value".to_string(),
-                    Value::String("nested".to_string()),
-                )]),
-            ),
-        ]);
-
-        let (subject, client) = resolve_schema_test_setup();
-        let result = resolve_schema(value, subject, &client, 1, 2, &reader_schema, true)
-            .await
-            .unwrap();
-
-        if let Value::Record(outer_fields) = result {
-            assert_eq!(outer_fields.len(), 2);
-            if let Value::Record(inner_fields) = &outer_fields[1].1 {
-                assert_eq!(inner_fields.len(), 2);
-                assert_eq!(
-                    inner_fields[0],
-                    ("value".to_string(), Value::String("nested".to_string()))
-                );
-                assert_eq!(inner_fields[1], ("count".to_string(), Value::Int(0)));
-            } else {
-                panic!("Expected nested Record");
-            }
-        } else {
-            panic!("Expected Record value");
-        }
     }
 
     fn make_payload(schema_id: u32) -> Vec<u8> {

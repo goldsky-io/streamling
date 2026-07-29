@@ -964,6 +964,60 @@ transforms:
     backend_entity_name: persistent_data
 ```
 
+Enable the in-memory cache in the application config (or with
+`STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_ENABLED=true`):
+
+```yaml
+dynamic_table_backend:
+  postgres:
+    cache_enabled: true
+```
+
+Then set `time_column` on each backing table whose timestamp advances on every append:
+
+```yaml
+transforms:
+  persistent_table:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: persistent_data
+    time_column: updated_at
+```
+
+The cache is off by default and is used only when both settings are present. The initial lookup
+loads the full table through bounded PostgreSQL cursor pages. Each later `dynamic_table_check`
+batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
+column so these checks and range reads stay cheap.
+
+PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
+existing membership, including removals, is not supported in this mode. Keeping `time_column` current
+is a user requirement and part of the cache's correctness contract. Every process that appends table
+membership must use the same serialized-writer protocol:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('public.persistent_data', 0));
+INSERT INTO public.persistent_data (value, updated_at)
+VALUES ('new-value', clock_timestamp())
+ON CONFLICT (value) DO NOTHING;
+COMMIT;
+```
+
+Use the schema-qualified table name as the lock key, exactly as shown. Transaction-scoped advisory
+locks coordinate only writers that follow this protocol. Each successful append must atomically make
+`MAX(time_column)` different by assigning a non-null timestamp strictly newer than the previous
+maximum. `NOW()` and `CURRENT_TIMESTAMP` are unsafe here because PostgreSQL fixes them at transaction
+start, which can precede waiting for the writer lock; use `clock_timestamp()` after the lock instead.
+
+Streamling takes this lock automatically for its own cached appends and creates new backing tables
+with `updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()`. It does not alter existing tables.
+Tables created by older Streamling versions with nullable `TIMESTAMPTZ DEFAULT NOW()` need no schema
+or data migration: cached Streamling appends explicitly write `clock_timestamp()` after taking the
+lock. Future appends from other writers must still follow the protocol above. Cache initialization
+checks that the configured column exists and supports `MAX`, but it cannot verify that other writers
+obey the protocol. If that cannot be guaranteed, leave caching disabled; uncached tables continue to
+use batched PostgreSQL lookups.
+
 ### Usage with SQL Transforms
 
 Dynamic tables are accessed within SQL transforms using the `dynamic_table_check` UDF (User Defined Function). This function checks if a value exists in the specified dynamic table.
@@ -1018,8 +1072,18 @@ The `dynamic_table_check` function has the following signature:
 
 - **Parameters**:
   - `table_name` (string): Name of the dynamic table to query
-  - `value` (string): Value to check for existence
+  - `value` (string **or** `text[]`): Value(s) to check for existence
 - **Returns**: `boolean` - `true` if the value exists in the table, `false` otherwise
+
+`value` accepts two forms:
+
+- **Scalar `text`** — returns `true` iff the single value is present in the table.
+- **Array `text[]`** (`List` or `LargeList` of `text`) — **any-match**: returns `true` iff **any** element of the array is present in the table. Null handling is explicit: a **null array yields null**, an **empty array yields `false`**, and **null elements are skipped**. Distinct values are deduplicated per batch before the lookup. Nested arrays (`text[][]`) are not supported — dynamic tables are a flat set of strings.
+
+```sql
+-- any element of the array present in the table?
+SELECT * FROM src WHERE dynamic_table_check('tracked_wallets', accounts)
+```
 
 ### Source Validation
 

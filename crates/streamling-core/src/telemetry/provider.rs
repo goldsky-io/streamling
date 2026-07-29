@@ -193,6 +193,25 @@ pub fn init_telemetry_provider(
     }
 }
 
+/// Flush and shut down the delta meter provider. Must be called on process
+/// exit: the delta provider is not the global provider, so it is not covered
+/// by the cumulative provider's shutdown — without this, jobs that finish
+/// before the PeriodicReader's first tick lose their output_rows_delta
+/// (billing) counts entirely.
+pub fn shutdown_delta_meter_provider() {
+    if let Some(provider) = DELTA_METER_PROVIDER.get() {
+        info!("Shutting down delta telemetry meter provider");
+        if let Err(e) = provider.force_flush() {
+            error!(
+                "Failed to flush delta meter provider; billing counts since the last export tick may be lost: {e}"
+            );
+        }
+        if let Err(e) = provider.shutdown() {
+            error!("Failed to shut down delta meter provider: {e}");
+        }
+    }
+}
+
 pub fn shutdown_test_meter_providers() {
     info!("Shutting down telemetry meter providers");
     if let Some(provider) = SHARED_TEST_METER.get() {
@@ -422,6 +441,7 @@ pub fn get_delta_meter() -> opentelemetry::metrics::Meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporterBuilder;
 
     /// Must recover the plain node name for every key shape, including hybrid
     /// phase keys. Taking only the last `::` segment would yield `unbounded` or
@@ -499,5 +519,36 @@ mod tests {
             "app::bounded::42"
         );
         assert_eq!(get_reference_name_from_metric_key("app::bounded::42"), "42");
+    }
+
+    /// Regression test for short-lived jobs losing billing counts: delta
+    /// measurements recorded after the last PeriodicReader tick must still be
+    /// exported when shutdown_delta_meter_provider() runs on process exit.
+    #[test]
+    fn shutdown_delta_meter_provider_flushes_pending_counts() {
+        let exporter = InMemoryMetricExporterBuilder::new()
+            .with_temporality(Temporality::Delta)
+            .build();
+        // Interval far longer than the test: nothing exports unless shutdown flushes.
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        DELTA_METER_PROVIDER
+            .set(provider)
+            .expect("DELTA_METER_PROVIDER already set; no other test may initialize it");
+
+        get_delta_meter()
+            .u64_counter("streamling_output_rows_delta")
+            .build()
+            .add(42, &[]);
+
+        shutdown_delta_meter_provider();
+
+        let exported = exporter.get_finished_metrics().unwrap();
+        assert!(
+            !exported.is_empty(),
+            "delta counts recorded before exit were not exported on shutdown"
+        );
     }
 }
