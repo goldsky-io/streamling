@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
 use crate::checkpoints::checkpoint_management::{
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
 };
+use crate::operators::wrapping::WrappingExec;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::StreamExt;
@@ -125,6 +126,28 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
                 None
             },
         )
+    }
+}
+
+/// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
+/// into `out`, stopping at any nested [`WrappingExec`].
+///
+/// A nested `WrappingExec` is a *separate* topology node that records its own
+/// `elapsed_compute`; descending into it would fold another node's compute into
+/// this transform's aggregate, double-counting it. Everything strictly between
+/// this `CheckpointableExec` and the next topology boundary is this transform's
+/// own compute and belongs in its aggregate.
+fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) {
+    if let Some(set) = plan.metrics() {
+        for metric in set.iter() {
+            out.push(Arc::clone(metric));
+        }
+    }
+    for child in plan.children() {
+        if child.downcast_ref::<WrappingExec>().is_some() {
+            continue;
+        }
+        collect_subtree_metrics(child, out);
     }
 }
 
@@ -291,7 +314,21 @@ impl ExecutionPlan for CheckpointableExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        self.input.metrics()
+        // Aggregate DataFusion metrics across this transform's ENTIRE physical
+        // subtree, not just the root operator.
+        //
+        // The topology for a SQL transform is
+        // `WrappingExec -> CheckpointableExec -> <SQL plan>`, and `WrappingExec`
+        // folds these DataFusion metrics into the node's `elapsed_compute` (via
+        // `record_execution_plan_metrics`). Forwarding only `self.input.metrics()`
+        // (the SQL plan's ROOT operator) drops the `elapsed_compute` recorded by
+        // deeper operators — e.g. a `FilterExec` beneath a `ProjectionExec` does
+        // the real work but sits below the root. With that deep compute missing,
+        // the transform's reported `elapsed_compute` (query latency) collapsed to
+        // near zero and a compute-bound transform looked idle.
+        let mut aggregated = MetricsSet::new();
+        collect_subtree_metrics(&self.input, &mut aggregated);
+        Some(aggregated)
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -307,10 +344,14 @@ mod tests {
     use arrow::array::{BooleanArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use datafusion::datasource::MemTable;
+    use datafusion::datasource::TableProvider;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_expr::Partitioning as PhysicalPartitioning;
+    use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::*;
     use futures::StreamExt;
+    use std::time::Duration;
 
     fn create_test_schema_with_metadata(metadata: HashMap<String, String>) -> SchemaRef {
         Arc::new(Schema::new_with_metadata(
@@ -691,6 +732,219 @@ mod tests {
             output_metadata.get("another_key"),
             Some(&"another_value".to_string()),
             "Custom metadata 'another_key' should be preserved"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // elapsed_compute (query latency) subtree aggregation regression.
+    //
+    // A SQL transform under-reported its `elapsed_compute` because
+    // `CheckpointableExec::metrics` forwarded only the SQL plan's ROOT
+    // operator, dropping compute recorded by deeper operators.
+    // ------------------------------------------------------------------
+
+    /// A test operator that records a fixed `elapsed_compute` per input batch
+    /// via DataFusion's `BaselineMetrics`, modeling a compute-bound SQL operator
+    /// (e.g. `FilterExec`). Used to prove `CheckpointableExec::metrics` gathers
+    /// compute from operators *below* the SQL plan root, and stops at nested
+    /// `WrappingExec` topology boundaries.
+    #[derive(Debug)]
+    struct ComputeExec {
+        input: Arc<dyn ExecutionPlan>,
+        per_batch_compute: Duration,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl ComputeExec {
+        fn new(input: Arc<dyn ExecutionPlan>, per_batch_compute: Duration) -> Self {
+            Self {
+                input,
+                per_batch_compute,
+                metrics: ExecutionPlanMetricsSet::new(),
+            }
+        }
+    }
+
+    impl DisplayAs for ComputeExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "ComputeExec")
+        }
+    }
+
+    impl ExecutionPlan for ComputeExec {
+        fn name(&self) -> &'static str {
+            "ComputeExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ComputeExec::new(
+                children.swap_remove(0),
+                self.per_batch_compute,
+            )))
+        }
+        fn metrics(&self) -> Option<MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let baseline = BaselineMetrics::new(&self.metrics, partition);
+            let mut input = self.input.execute(partition, context)?;
+            let compute = self.per_batch_compute;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                while let Some(item) = input.next().await {
+                    match item {
+                        Ok(batch) => {
+                            // The timer measures wall-clock exactly as a real
+                            // operator's `elapsed_compute` does; the sleep
+                            // simulates the transform's own compute.
+                            let timer = baseline.elapsed_compute().timer();
+                            if !compute.is_zero() {
+                                tokio::time::sleep(compute).await;
+                            }
+                            timer.done();
+                            yield Ok(batch);
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            break;
+                        }
+                    }
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    fn multi_batch_source(num_batches: usize) -> Arc<dyn ExecutionPlan> {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let schema = batch.schema();
+        let batches = std::iter::repeat_n(batch, num_batches).collect();
+        let mem_table = MemTable::try_new(schema, vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        futures::executor::block_on(mem_table.scan(&ctx.state(), None, &[], None)).unwrap()
+    }
+
+    async fn drain(mut stream: SendableRecordBatchStream) {
+        while let Some(b) = stream.next().await {
+            b.unwrap();
+        }
+    }
+
+    /// Regression: `CheckpointableExec::metrics` must aggregate `elapsed_compute`
+    /// from operators *below* the SQL plan root. Previously it forwarded only
+    /// `self.input.metrics()` (the root operator), so compute recorded by deeper
+    /// operators was dropped and never reached the node's `elapsed_compute` —
+    /// the reason a compute-bound SQL transform under-reported query latency.
+    #[tokio::test]
+    async fn checkpointable_metrics_aggregate_subtree_compute() {
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // Root is a zero-compute passthrough; the real work happens one level
+        // deeper (mirroring a `FilterExec` beneath a `ProjectionExec`). Root-only
+        // forwarding would therefore report ~0 compute.
+        let deep_compute = Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let root: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(deep_compute, Duration::ZERO));
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
+
+        let ctx = SessionContext::new();
+        drain(checkpointable.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let aggregated = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .expect("CheckpointableExec must expose aggregated elapsed_compute");
+
+        // ~NUM_BATCHES * 15ms of deep compute; assert well below the nominal
+        // total so scheduling jitter can't flake it, but far above the ~0 a
+        // root-only forward would report.
+        let aggregated_ms = aggregated as u64 / 1_000_000;
+        assert!(
+            aggregated_ms >= 25,
+            "expected aggregated subtree elapsed_compute >= 25ms (got {aggregated_ms}ms); \
+             deep-operator compute was dropped"
+        );
+    }
+
+    /// `CheckpointableExec::metrics` must stop at a nested `WrappingExec`: that is
+    /// a separate topology node recording its own `elapsed_compute`, so folding
+    /// its subtree in here would double-count another node's compute against this
+    /// transform's query latency.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_nested_wrapping_exec() {
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // Populate real `elapsed_compute` on a compute operator, then place it
+        // *below* a nested `WrappingExec` — a separate topology node. Executing
+        // the compute operator directly records its metrics without executing the
+        // `WrappingExec` (whose `execute()` initializes the process-global
+        // `LiveDataInspect` singleton and would make this test order-dependent).
+        let nested_compute: Arc<dyn ExecutionPlan> =
+            Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+
+        let ctx = SessionContext::new();
+        drain(nested_compute.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        // Sanity: the operator below the boundary really recorded its own
+        // `elapsed_compute`, so the exclusion assertion is meaningful rather than
+        // vacuously passing on an empty set.
+        let below_ms = nested_compute
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert!(
+            below_ms >= 25,
+            "test setup: compute below the boundary must have recorded \
+             elapsed_compute, got {below_ms}ms"
+        );
+
+        let nested_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            nested_compute,
+            "nested_upstream".to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+        // A zero-compute root above the boundary, so this transform's own
+        // compute is ~0.
+        let root: Arc<dyn ExecutionPlan> =
+            Arc::new(ComputeExec::new(nested_wrapping, Duration::ZERO));
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
+
+        let aggregated_ms = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+
+        // The 3×15ms below the nested WrappingExec must be excluded; only the
+        // zero-compute root remains, so this stays near zero. If the boundary
+        // logic regressed and descended into the WrappingExec, the assertion
+        // above proves it would pick up >=25ms here.
+        assert!(
+            aggregated_ms < 10,
+            "compute below a nested WrappingExec must be excluded, got {aggregated_ms}ms"
         );
     }
 }

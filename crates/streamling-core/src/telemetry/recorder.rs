@@ -2,7 +2,9 @@ use crate::telemetry::types::{
     MetricData, RowCountMeasurementType, create_count_with_value, create_gauge_with_value,
     create_time_from_duration,
 };
-use crate::telemetry::{PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags};
+use crate::telemetry::{
+    MillisAccumulator, PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags,
+};
 use datafusion::physical_plan::metrics::{Count, MetricValue, MetricsSet};
 use once_cell::sync::Lazy;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
@@ -92,6 +94,12 @@ pub struct MetricsRecorder {
     count_registry: Mutex<HashMap<String, Counter<u64>>>,
     gauge_registry: Mutex<HashMap<String, Gauge<u64>>>,
     histogram_registry: Mutex<HashMap<String, Histogram<u64>>>,
+    /// Per-node running state for turning DataFusion's *cumulative*
+    /// `elapsed_compute` into a per-batch delta. Keyed by `metadata_id`, the
+    /// value tracks the last-seen cumulative nanos plus a remainder-carrying
+    /// accumulator so sub-millisecond per-batch compute isn't truncated to zero
+    /// at high throughput. See `record_execution_plan_metrics`.
+    sql_compute_accrual: Mutex<HashMap<String, (u64, MillisAccumulator)>>,
 }
 
 impl MetricsRecorder {
@@ -426,9 +434,49 @@ impl MetricsRecorder {
         if let Some(metric_set) = execution_plan_metrics
             && metric_metadata.node_context.operator_type == "sql"
         {
+            // `elapsed_compute` for a SQL transform is the cumulative compute of
+            // its whole physical subtree (aggregated by
+            // `CheckpointableExec::metrics`). DataFusion counters are cumulative,
+            // and this method runs once per batch, so recording the raw value
+            // would re-record an ever-growing snapshot every batch and inflate
+            // the reported query latency super-linearly. Record only the
+            // per-batch DELTA, carrying the sub-millisecond remainder forward so
+            // high-throughput sub-ms compute isn't truncated to zero.
+            if let Some(cumulative_nanos) = metric_set.elapsed_compute() {
+                let whole_ms = {
+                    let mut accruals = self.sql_compute_accrual.lock().unwrap();
+                    let (last, accumulator) = accruals.entry(metadata_id.to_string()).or_default();
+                    let cumulative = cumulative_nanos as u64;
+                    // A re-executed stream resets DataFusion's cumulative counter;
+                    // when the value drops below the last seen total, treat the
+                    // current value as the delta rather than stalling at zero
+                    // until it climbs back past the previous run.
+                    let delta = if cumulative >= *last {
+                        cumulative - *last
+                    } else {
+                        cumulative
+                    };
+                    *last = cumulative;
+                    accumulator.add(Duration::from_nanos(delta));
+                    accumulator.take_whole_millis()
+                };
+                if whole_ms > 0 {
+                    all_metric_data.push(MetricData::new_with_owned_tags(
+                        vec![MetricValue::ElapsedCompute(create_time_from_duration(
+                            Duration::from_millis(whole_ms),
+                        ))],
+                        metric_metadata_tags.clone(),
+                    ));
+                }
+            }
+            // Forward any other DataFusion metrics as-is. OutputRows is already
+            // counted via TelemetryStream, and ElapsedCompute is handled as a
+            // delta above.
             for metric in metric_set.iter() {
-                // Skip OutputRows metrics as it is already counted in TelemetryStream
-                if !matches!(metric.value(), MetricValue::OutputRows(_)) {
+                if !matches!(
+                    metric.value(),
+                    MetricValue::OutputRows(_) | MetricValue::ElapsedCompute(_)
+                ) {
                     all_metric_data.push(MetricData::new_with_owned_tags(
                         vec![metric.value().clone()],
                         metric_metadata_tags.clone(),
@@ -819,6 +867,7 @@ pub fn initialize_metrics_recorder(
             gauge_registry: Mutex::new(gauge_registry),
             histogram_registry: Mutex::new(histogram_registry),
             metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
+            sql_compute_accrual: Mutex::new(HashMap::new()),
         }));
     } else {
         debug!("MetricsRecorder already initialized; merging metric metadata registry.");
@@ -998,6 +1047,7 @@ pub fn get_metrics_recorder() -> Arc<MetricsRecorder> {
             gauge_registry: Mutex::new(HashMap::new()),
             count_registry: Mutex::new(HashMap::new()),
             metric_metadata_tags_registry: Mutex::new(HashMap::new()),
+            sql_compute_accrual: Mutex::new(HashMap::new()),
         });
         *instance = Some(recorder.clone());
         recorder
