@@ -4,12 +4,13 @@
 //! with very large arrays, particularly when dealing with arrow-select's take kernel.
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    PrimitiveArray, RecordBatch, StructArray, UInt32Array, new_null_array,
+    Array, ArrayRef, AsArray, LargeBinaryArray, LargeListArray, LargeStringArray, PrimitiveArray,
+    RecordBatch, StructArray, UInt32Array, new_null_array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::kernels;
 use arrow::datatypes::{DataType, Field, Fields, Int64Type, Schema, SchemaRef};
+use arrow::error::ArrowError;
 use datafusion::common::{Result, exec_datafusion_err};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -113,28 +114,6 @@ fn create_null_buffer(nulls: &[bool]) -> Option<NullBuffer> {
     }
 }
 
-/// Rebuild a ListArray from taken values and new offsets
-fn rebuild_list_array(
-    field: &Field,
-    new_offsets: Vec<i32>,
-    taken_values: ArrayRef,
-    nulls: &[bool],
-) -> ArrayRef {
-    let null_buffer = create_null_buffer(nulls);
-    let offsets_buffer = OffsetBuffer::new(ScalarBuffer::from(new_offsets));
-
-    Arc::new(ListArray::new(
-        Arc::new(Field::new(
-            field.name(),
-            taken_values.data_type().clone(),
-            field.is_nullable(),
-        )),
-        offsets_buffer,
-        taken_values,
-        null_buffer,
-    )) as ArrayRef
-}
-
 /// Rebuild a LargeListArray from taken values and new offsets
 fn rebuild_large_list_array(
     field: &Field,
@@ -162,24 +141,34 @@ enum IsolatedTakeResult {
     /// Native take succeeded
     Success(ArrayRef),
     /// Native take returned an Arrow error
-    ArrowError(String),
-    /// Native take panicked (overflow) - caught before panic hook fires
+    ArrowError(ArrowError),
+    /// Native take panicked while handling an expected overflow
     Panicked,
 }
 
-/// Safe wrapper around arrow's take kernel that catches overflow panics.
+fn fallback_on_offset_overflow<T>(
+    error: ArrowError,
+    fallback: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match error {
+        ArrowError::OffsetOverflowError(_) => fallback(),
+        error => Err(error.into()),
+    }
+}
+
+/// Safe wrapper around Arrow's take kernel that handles offset overflow.
 ///
-/// Arrow-select's `take` kernel can panic with "overflow" when processing very large
-/// String/Binary arrays (> 2GB of string data). This wrapper:
+/// Arrow-select's `take` kernel returns [`ArrowError::OffsetOverflowError`] for
+/// large byte arrays and can still panic for some offset-backed arrays. This wrapper:
 ///
 /// 1. Tries the fast native `take` kernel in a separate thread
-/// 2. Catches the panic INSIDE the thread (before panic hook fires)
-/// 3. Falls back to manual rebuild, promoting to LargeUtf8/LargeBinary as needed
+/// 2. Handles typed offset-overflow errors and isolates legacy overflow panics
+/// 3. Falls back to a manual rebuild using large-offset arrays
 ///
 /// # Panic Isolation
 ///
-/// By using `catch_unwind` inside the spawned thread:
-/// - The panic is caught before the global panic hook fires
+/// By using `catch_unwind` and [`SuppressPanicLoggingGuard`] inside the spawned thread:
+/// - The project panic hook is suppressed for the controlled panic
 /// - No alarming error logs are produced
 /// - No plugins are terminated
 /// - We get a clean fallback to manual implementation
@@ -192,7 +181,7 @@ enum IsolatedTakeResult {
 /// # Returns
 ///
 /// A new array with values taken from `arr` according to `indices`.
-/// Note: String types may be promoted to LargeUtf8 if overflow would occur.
+/// Variable-width types may be promoted to their large-offset variants on overflow.
 pub fn safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Result<ArrayRef> {
     // Clone refs for the spawned thread
     let arr_clone = Arc::clone(arr);
@@ -210,24 +199,26 @@ pub fn safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Result<
             kernels::take::take(&arr_clone, &indices_clone, None)
         })) {
             Ok(Ok(result)) => IsolatedTakeResult::Success(result),
-            Ok(Err(arrow_err)) => IsolatedTakeResult::ArrowError(arrow_err.to_string()),
+            Ok(Err(arrow_err)) => IsolatedTakeResult::ArrowError(arrow_err),
             Err(_) => IsolatedTakeResult::Panicked,
         }
     });
 
+    let overflow_fallback = || {
+        tracing::warn!(
+            "Arrow take overflow detected, using manual safe path for array type {:?}. This means minimally slower performance but could also signal a batch size that is too large if seen multiple times a second.",
+            arr.data_type()
+        );
+        manual_safe_take(arr, indices)
+    };
+
     match handle.join() {
         Ok(IsolatedTakeResult::Success(result)) => Ok(result),
-        Ok(IsolatedTakeResult::ArrowError(err)) => {
-            Err(exec_datafusion_err!("Arrow take error: {}", err))
+        Ok(IsolatedTakeResult::ArrowError(error)) => {
+            fallback_on_offset_overflow(error, overflow_fallback)
         }
-        Ok(IsolatedTakeResult::Panicked) => {
-            // Panic was caught inside the thread - no panic hook fired
-            tracing::warn!(
-                "Arrow take overflow detected, using manual safe path for array type {:?}. This means minimally slower performance but could also signal a batch size that is too large if seen multiple times a second.",
-                arr.data_type()
-            );
-            manual_safe_take(arr, indices)
-        }
+        // Panic was caught inside the thread - no panic hook fired
+        Ok(IsolatedTakeResult::Panicked) => overflow_fallback(),
         Err(_join_err) => {
             // Thread itself failed to join (very rare, usually means thread was killed)
             tracing::warn!(
@@ -239,25 +230,18 @@ pub fn safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Result<
     }
 }
 
-/// Safe wrapper around arrow's `take_record_batch` that recovers from the
-/// same `take_bytes` overflow panic [`safe_take`] handles, applied per
-/// column.
+/// Safe wrapper around Arrow's `take_record_batch` that recovers from the
+/// same offset overflows [`safe_take`] handles, applied per column.
 ///
 /// The native `arrow::compute::take_record_batch` iterates columns and
-/// calls the unsafe-on-overflow take kernel on each. For deeply nested
-/// schemas with large cumulative byte payloads (e.g. Ethereum logs nested
-/// inside receipts inside blocks), the kernel panics with
-/// `Option::expect("overflow")` deep inside `take_bytes`. Without a
-/// `catch_unwind` somewhere in the chain, the panic propagates past the
-/// `extern "C"` plugin boundary and the process dies with exit
-/// 132 (SIGILL on x86_64) or 133 (SIGTRAP on ARM64) with no panic banner.
+/// calls the take kernel on each. For deeply nested schemas with large
+/// cumulative payloads, Arrow may return an offset-overflow error or panic
+/// while constructing an offset buffer.
 ///
-/// This helper tries the fast native path inside `catch_unwind`. On
-/// panic, it rebuilds the batch column-by-column using [`safe_take`],
-/// which promotes overflowing `Utf8`/`Binary` columns to their
-/// `Large…` variants. The resulting `RecordBatch` may have a wider
-/// schema than the input — see [`build_schema_from_columns`] for the
-/// schema reconciliation helper.
+/// This helper tries the fast native path inside `catch_unwind`. On typed
+/// offset overflow or panic, it rebuilds the batch column-by-column using
+/// [`safe_take`]. The resulting `RecordBatch` may have a wider schema than
+/// the input — see [`build_schema_from_columns`] for reconciliation.
 pub fn safe_take_record_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
     // Try the native fast path under catch_unwind. We use the
     // `SuppressPanicLoggingGuard` so the host's global panic hook stays
@@ -270,49 +254,50 @@ pub fn safe_take_record_batch(batch: &RecordBatch, indices: &UInt32Array) -> Res
             arrow::compute::take_record_batch(batch, indices)
         }))
     };
+    let overflow_fallback = || {
+        tracing::warn!(
+            "Arrow take_record_batch overflow detected on {} columns, falling back to per-column safe_take. This means minimally slower performance but could also signal a batch size that is too large if seen multiple times a second.",
+            batch.num_columns()
+        );
+        // Convert UInt32 -> Int64 once; safe_take's signature is Int64.
+        // Use `from_iter` (yielding `Option<i64>`) rather than
+        // `from_iter_values` so null bits propagate explicitly to the
+        // resulting array. `safe_take`'s `manual_safe_take` checks
+        // `indices.is_null(i)` first; if we used a non-null array with
+        // a sentinel value we'd be depending on the sentinel landing
+        // outside `input.len()` after a signed-to-unsigned cast, which
+        // is fragile (and arch-dependent for very large sentinels).
+        let int64_indices = PrimitiveArray::<Int64Type>::from_iter((0..indices.len()).map(|i| {
+            if indices.is_null(i) {
+                None
+            } else {
+                Some(indices.value(i) as i64)
+            }
+        }));
+        let new_columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|col| safe_take(col, &int64_indices))
+            .collect::<Result<Vec<_>>>()?;
+        let new_schema = build_schema_from_columns(
+            batch.schema_ref(),
+            &new_columns,
+            batch.schema().metadata().clone(),
+        );
+        RecordBatch::try_new(new_schema, new_columns).map_err(|e| {
+            exec_datafusion_err!("Failed to rebuild RecordBatch after safe_take fallback: {e}")
+        })
+    };
+
     match result {
         Ok(Ok(rb)) => Ok(rb),
-        Ok(Err(e)) => Err(exec_datafusion_err!("Arrow take_record_batch error: {e}")),
-        Err(_panic) => {
-            tracing::warn!(
-                "Arrow take_record_batch overflow detected on {} columns, falling back to per-column safe_take. This means minimally slower performance but could also signal a batch size that is too large if seen multiple times a second.",
-                batch.num_columns()
-            );
-            // Convert UInt32 -> Int64 once; safe_take's signature is Int64.
-            // Use `from_iter` (yielding `Option<i64>`) rather than
-            // `from_iter_values` so null bits propagate explicitly to the
-            // resulting array. `safe_take`'s `manual_safe_take` checks
-            // `indices.is_null(i)` first; if we used a non-null array with
-            // a sentinel value we'd be depending on the sentinel landing
-            // outside `input.len()` after a signed-to-unsigned cast, which
-            // is fragile (and arch-dependent for very large sentinels).
-            let int64_indices =
-                PrimitiveArray::<Int64Type>::from_iter((0..indices.len()).map(|i| {
-                    if indices.is_null(i) {
-                        None
-                    } else {
-                        Some(indices.value(i) as i64)
-                    }
-                }));
-            let new_columns: Vec<ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(|col| safe_take(col, &int64_indices))
-                .collect::<Result<Vec<_>>>()?;
-            let new_schema = build_schema_from_columns(
-                batch.schema_ref(),
-                &new_columns,
-                batch.schema().metadata().clone(),
-            );
-            RecordBatch::try_new(new_schema, new_columns).map_err(|e| {
-                exec_datafusion_err!("Failed to rebuild RecordBatch after safe_take fallback: {e}")
-            })
-        }
+        Ok(Err(error)) => fallback_on_offset_overflow(error, overflow_fallback),
+        Err(_panic) => overflow_fallback(),
     }
 }
 
 /// Manual implementation of take that handles overflow by using larger types.
-/// This is called when the native Arrow take kernel panics.
+/// This is called when the native Arrow take kernel signals overflow by error or panic.
 fn manual_safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Result<ArrayRef> {
     let output_len = indices.len();
 
@@ -401,8 +386,8 @@ fn manual_safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Resu
             let values = list_arr.values();
 
             let mut nested_indices = Vec::new();
-            let mut new_offsets = vec![0i32];
-            let mut current_offset = 0i32;
+            let mut new_offsets = vec![0i64];
+            let mut current_offset = 0i64;
             let mut nulls = Vec::new();
 
             for i in 0..indices.len() {
@@ -420,7 +405,7 @@ fn manual_safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Resu
                         for nested_idx in start..end {
                             nested_indices.push(nested_idx as i64);
                         }
-                        current_offset += (end - start) as i32;
+                        current_offset += (end - start) as i64;
                         new_offsets.push(current_offset);
                     } else {
                         nulls.push(true);
@@ -436,7 +421,12 @@ fn manual_safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Resu
                 new_null_array(field.data_type(), 0)
             };
 
-            Ok(rebuild_list_array(field, new_offsets, taken_values, &nulls))
+            Ok(rebuild_large_list_array(
+                field,
+                new_offsets,
+                taken_values,
+                &nulls,
+            ))
         }
         DataType::LargeList(field) => {
             let list_arr = arr.as_list::<i64>();
@@ -524,8 +514,7 @@ fn manual_safe_take(arr: &ArrayRef, indices: &PrimitiveArray<Int64Type>) -> Resu
             )) as ArrayRef)
         }
 
-        // For other types that panicked, we can't easily rebuild them
-        // This shouldn't happen in practice since overflow only affects String/Binary
+        // Other types do not have a widening fallback here.
         _ => Err(exec_datafusion_err!(
             "Cannot manually rebuild array type {:?} after take overflow. \
              This is unexpected - please report this as a bug.",
@@ -541,6 +530,36 @@ mod tests {
         ArrayRef, Int32Array, Int64Array, ListBuilder, StringArray, StringBuilder, UInt32Array,
     };
     use arrow::datatypes::{Field, Fields};
+    use datafusion::common::DataFusionError;
+
+    #[test]
+    fn test_offset_overflow_uses_fallback() {
+        let mut fallback_called = false;
+        let result = fallback_on_offset_overflow(ArrowError::OffsetOverflowError(42), || {
+            fallback_called = true;
+            Ok(7)
+        })
+        .expect("offset overflow should use the fallback");
+
+        assert_eq!(result, 7);
+        assert!(fallback_called);
+    }
+
+    #[test]
+    fn test_non_overflow_arrow_error_is_preserved() {
+        let result = fallback_on_offset_overflow(
+            ArrowError::ComputeError("synthetic take failure".to_owned()),
+            || Ok(()),
+        );
+
+        match result.expect_err("non-overflow errors must not use the fallback") {
+            DataFusionError::ArrowError(error, _) => assert!(matches!(
+                error.as_ref(),
+                ArrowError::ComputeError(message) if message == "synthetic take failure"
+            )),
+            error => panic!("expected typed Arrow error, got {error:?}"),
+        }
+    }
 
     #[test]
     fn test_safe_take_record_batch_happy_path() {
@@ -782,6 +801,35 @@ mod tests {
         assert_eq!(result_arr.value(0), "hello");
         assert_eq!(result_arr.value(1), "world");
         assert_eq!(result_arr.value(2), "hello");
+    }
+
+    #[test]
+    fn test_manual_safe_take_list_produces_large_list() {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value("a");
+        builder.values().append_value("b");
+        builder.append(true);
+        builder.append(false);
+        builder.values().append_value("c");
+        builder.append(true);
+
+        let arr: ArrayRef = Arc::new(builder.finish());
+        let indices = PrimitiveArray::<Int64Type>::from(vec![Some(2i64), Some(0), None, Some(1)]);
+        let result = manual_safe_take(&arr, &indices).expect("manual list take should succeed");
+
+        assert!(matches!(result.data_type(), DataType::LargeList(_)));
+        let result_list = result.as_list::<i64>();
+        assert_eq!(result_list.value_offsets(), &[0, 1, 3, 3, 3]);
+        assert!(!result_list.is_null(0));
+        assert!(!result_list.is_null(1));
+        assert!(result_list.is_null(2));
+        assert!(result_list.is_null(3));
+
+        let values = result_list.values().as_string::<i32>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), "c");
+        assert_eq!(values.value(1), "a");
+        assert_eq!(values.value(2), "b");
     }
 
     #[test]
