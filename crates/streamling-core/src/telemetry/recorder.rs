@@ -1326,6 +1326,39 @@ pub(crate) mod test_support {
         }
         total
     }
+
+    /// Sum the `streamling_elapsed_compute` histogram's recorded values (in ms)
+    /// for the given node `id`. Used to assert the `busy = elapsed_compute -
+    /// starved` invariant: the input-wait span folded into `elapsed_compute`
+    /// must use the same remainder-carrying quantization as `starved`, so the
+    /// two never drift and `busy` can't go negative.
+    pub(crate) fn elapsed_compute_ms(id: &str) -> u64 {
+        let mut rm = ResourceMetrics::default();
+        harness()
+            .reader
+            .collect(&mut rm)
+            .expect("collect metrics from manual reader");
+        let mut total = 0u64;
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "streamling_elapsed_compute" {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Histogram(hist)) = metric.data() else {
+                    continue;
+                };
+                for dp in hist.data_points() {
+                    let id_ok = dp
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == "id" && &*kv.value.as_str() == id);
+                    if id_ok {
+                        total += dp.sum();
+                    }
+                }
+            }
+        }
+        total
+    }
 }
 
 #[cfg(test)]

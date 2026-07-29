@@ -796,7 +796,21 @@ impl ExecutionPlan for WrappingExec {
                         // unchanged. Pure compute is `elapsed_compute -
                         // node_wait{state="starved"}`; remove once consumers
                         // migrate to the `starved` state.
-                        metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+                        //
+                        // Fold the SAME remainder-carrying whole-ms value drained
+                        // for `starved` (not the raw `batch_elapsed`) so both
+                        // series quantize the span identically. Flooring each
+                        // batch here instead would drop the sub-ms remainder that
+                        // `starved` carries, making the folded input-wait fall
+                        // below `starved` and `busy = elapsed_compute - starved`
+                        // drift negative at high throughput — the exact failure
+                        // the `MillisAccumulator` exists to prevent.
+                        if starved_ms > 0 {
+                            metrics_recorder.record_elapsed_compute(
+                                Duration::from_millis(starved_ms),
+                                &metric_metadata_id,
+                            );
+                        }
 
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
@@ -1975,6 +1989,92 @@ mod tests {
         assert!(
             starved >= 10,
             "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
+        );
+    }
+
+    /// Regression: the input-wait span dual-emitted into `elapsed_compute` and
+    /// `node_wait{state="starved"}` must use identical quantization, otherwise
+    /// the advertised `busy = elapsed_compute - starved` accounting drifts.
+    ///
+    /// `starved` carries the sub-ms remainder (via `MillisAccumulator`), so if
+    /// `elapsed_compute` instead floors each batch independently it drops that
+    /// remainder and its input-wait portion falls *below* `starved` — exactly
+    /// the case the accumulator was meant to fix. `elapsed_compute` also carries
+    /// a deterministic 1ms-per-Ok-batch seed (`record_execution_plan_metrics`
+    /// keeps the histogram series alive), so the invariant is:
+    ///
+    /// ```text
+    /// elapsed_compute == starved (folded input-wait) + 1ms * num_ok_batches (seed)
+    /// ```
+    ///
+    /// Both series derive from the same integer whole-ms drains, so this holds
+    /// exactly regardless of scheduling jitter. Pre-fix, the floored input-wait
+    /// is strictly less than `starved` whenever any sub-ms remainder accrues, so
+    /// the equality fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn elapsed_compute_input_wait_fold_matches_starved_quantization() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_quantization_source";
+        test_support::init_recorder_with_node(node_id);
+
+        // Each Ok batch seeds exactly 1ms into elapsed_compute (see
+        // `record_execution_plan_metrics`), independent of the folded input-wait.
+        const NUM_BATCHES: u64 = 30;
+        const SEED_MS_PER_BATCH: u64 = 1;
+
+        let schema = test_schema();
+        // Each batch carries a fractional-ms input wait (~1.5ms). Per-batch
+        // flooring would drop ~0.5ms every batch, so across many batches the
+        // dropped remainder accrues to several whole milliseconds — enough to
+        // pull a floored `elapsed_compute` below the remainder-carrying `starved`.
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch)
+            .take(NUM_BATCHES as usize)
+            .collect();
+        let mem_table = MemTable::try_new(schema.clone(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_micros(1_500),
+        });
+
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+        }
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+
+        // Real starvation must have been recorded, otherwise the comparison is
+        // vacuous (a stuck source would report 0 for both).
+        assert!(
+            starved >= 10,
+            "expected real starvation to be recorded, got starved={starved}ms"
+        );
+        // Folded input-wait must equal `starved` exactly (identical
+        // quantization), so `elapsed_compute` is just that plus the per-batch
+        // seed. This keeps `busy = elapsed_compute - starved` == pure compute
+        // (here only the seed), never corrupted by dropped sub-ms remainders.
+        let expected = starved + NUM_BATCHES * SEED_MS_PER_BATCH;
+        assert_eq!(
+            elapsed_compute,
+            expected,
+            "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms) + seed \
+             ({}ms); a mismatch means the input-wait fold used a different quantization than starved",
+            NUM_BATCHES * SEED_MS_PER_BATCH
         );
     }
 
