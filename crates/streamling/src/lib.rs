@@ -1307,8 +1307,10 @@ impl Streamling {
                     // from the `DataFusionError::External` wrapper and stays user-facing.
                     // Otherwise `--validate` would misreport it as an internal failure.
                     .map_err(|e| {
-                        streamling_core::error::StreamlingError::from(e)
-                            .context(format!("{}: failed to build script transform", ctx.format()))
+                        streamling_core::error::StreamlingError::from(e).context(format!(
+                            "{}: failed to build script transform",
+                            ctx.format()
+                        ))
                     })?;
 
                     let logical_plan = LogicalPlan::Extension(Extension {
@@ -2074,12 +2076,18 @@ impl Streamling {
                     provider_as_source(entry.provider.clone()),
                     InsertOp::Append,
                 )
-                .streamling_with_context(|| {
-                    format!("failed to build insert plan for sink [{}]", entry.name)
+                .map_err(|e| {
+                    streamling_core::error::StreamlingError::from(e).context(format!(
+                        "failed to build insert plan for sink [{}]",
+                        entry.name
+                    ))
                 })?
                 .build()
-                .streamling_with_context(|| {
-                    format!("failed to build insert plan for sink [{}]", entry.name)
+                .map_err(|e| {
+                    streamling_core::error::StreamlingError::from(e).context(format!(
+                        "failed to build insert plan for sink [{}]",
+                        entry.name
+                    ))
                 })?
             };
 
