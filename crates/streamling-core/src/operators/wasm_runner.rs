@@ -98,6 +98,7 @@ impl WasmRunnerNode {
             DEFAULT_POOL_SIZE,
             DEFAULT_BATCH_SIZE,
         )
+        .expect("WasmRunnerNode::new called with an invalid schema map")
     }
 
     /// Create a new WasmRunnerNode with configurable pool size.
@@ -130,6 +131,7 @@ impl WasmRunnerNode {
             parallelism,
             DEFAULT_BATCH_SIZE,
         )
+        .expect("WasmRunnerNode::with_parallelism called with an invalid schema map")
     }
 
     /// Create a new WasmRunnerNode with full configuration options.
@@ -153,12 +155,17 @@ impl WasmRunnerNode {
         schema_map: Option<BTreeMap<String, String>>,
         parallelism: usize,
         batch_size: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         // Build DF schema directly here. If a target schema is provided, use it;
         // otherwise default to the input plan's schema.
         let schema = if let Some(ref schema_map) = schema_map {
-            let arrow_schema = Self::create_arrow_schema_from_map(schema_map).unwrap();
-            let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone()).unwrap();
+            let arrow_schema = Self::create_arrow_schema_from_map(schema_map)?;
+            let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone()).map_err(|e| {
+                DataFusionError::from(crate::streamling_user_err!(
+                    "invalid script transform schema: {}",
+                    e
+                ))
+            })?;
             Some(Arc::new(df_schema))
         } else {
             Some(Arc::new(input.schema().as_ref().clone()))
@@ -167,7 +174,7 @@ impl WasmRunnerNode {
         // Ensure parallelism is at least 1
         let parallelism = parallelism.max(1);
 
-        Self {
+        Ok(Self {
             input,
             language,
             script,
@@ -177,7 +184,7 @@ impl WasmRunnerNode {
             schema,
             parallelism,
             batch_size,
-        }
+        })
     }
 
     pub fn get_output_schema(&self) -> Result<SchemaRef> {
