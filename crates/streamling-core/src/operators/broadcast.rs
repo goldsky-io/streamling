@@ -497,7 +497,8 @@ impl ExecutionPlan for MultiSinkExec {
                             .unwrap_or(usize::MAX),
                         rebatch_config.batch_flush_interval,
                     )
-                    .with_name(sink_name.clone());
+                    .with_name(sink_name.clone())
+                    .with_flush_stagger(i, total_sinks);
                     let rebatched = accumulator.process_stream(broadcast_consumer);
                     Box::pin(RecordBatchStreamAdapter::new(
                         broadcast_schema.clone(),

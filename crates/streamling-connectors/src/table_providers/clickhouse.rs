@@ -908,6 +908,71 @@ impl TableProvider for ClickHouseTableProvider {
     }
 }
 
+/// Splits a batch's rows by `_gs_op` into the rows to INSERT (`None` when the
+/// batch has none) and the row indices to DELETE.
+///
+/// When nothing is deleted the batch passes through untouched: the insert
+/// indices are then exactly `0..num_rows`, so taking them would copy every
+/// column just to reproduce the input. Append-only sources hit that case on
+/// every batch, and at sink batch sizes the copy is hundreds of MB.
+fn split_rows_by_operation(batch: &RecordBatch) -> Result<(Option<RecordBatch>, Vec<u32>)> {
+    use datafusion::arrow::array::StringArray;
+    use std::str::FromStr;
+
+    let op_column = batch.column_by_name(COLUMN_NAME_OP).ok_or_else(|| {
+        DataFusionError::from(streamling_core::streamling_err!(
+            "missing required column '{}' in ClickHouse sink batch",
+            COLUMN_NAME_OP
+        ))
+    })?;
+    let op_array = op_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            DataFusionError::from(streamling_core::streamling_err!(
+                "column '{}' must be StringArray, got {:?}",
+                COLUMN_NAME_OP,
+                op_column.data_type()
+            ))
+        })?;
+
+    let mut insert_indices = Vec::new();
+    let mut delete_indices = Vec::new();
+
+    for (idx, op) in op_array.iter().enumerate() {
+        if let Some(op_str) = op {
+            let row_kind = RowKind::from_str(op_str).unwrap_or(RowKind::Insert);
+            match row_kind {
+                RowKind::Delete => delete_indices.push(idx as u32),
+                RowKind::Insert | RowKind::Update => insert_indices.push(idx as u32),
+            }
+        } else {
+            insert_indices.push(idx as u32);
+        }
+    }
+
+    let insert_rows = if insert_indices.is_empty() {
+        None
+    } else if delete_indices.is_empty() {
+        Some(batch.clone())
+    } else {
+        let indices_array = arrow::array::UInt32Array::from(insert_indices);
+        // Use streamling_core::utils::arrow::safe_take_record_batch to
+        // recover from the documented arrow take_bytes overflow panic on
+        // deeply nested schemas. Native take_record_batch panics with
+        // Option::expect("overflow") inside take_bytes for batches whose
+        // Utf8/Binary columns' cumulative byte offsets exceed i32::MAX;
+        // the panic crosses the extern "C" plugin boundary and crashes
+        // the process with exit 132/133 if not caught here.
+        Some(streamling_core::utils::arrow::safe_take_record_batch(
+            batch,
+            &indices_array,
+        )?)
+    };
+
+    Ok((insert_rows, delete_indices))
+}
+
 #[derive(Debug)]
 pub struct ClickHouseSinkExec {
     client: ClickHouseClient,
@@ -1117,59 +1182,11 @@ impl DataSink for ClickHouseSinkExec {
                 .await;
             } else {
                 // append_only_mode=false: split rows by _gs_op into inserts vs deletes
-                use datafusion::arrow::array::StringArray;
-                use std::str::FromStr;
-
-                let op_column =
-                    normalized_batch
-                        .column_by_name(COLUMN_NAME_OP)
-                        .ok_or_else(|| {
-                            DataFusionError::from(streamling_core::streamling_err!(
-                                "missing required column '{}' in ClickHouse sink batch",
-                                COLUMN_NAME_OP
-                            ))
-                        })?;
-                let op_array = op_column
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::from(streamling_core::streamling_err!(
-                            "column '{}' must be StringArray, got {:?}",
-                            COLUMN_NAME_OP,
-                            op_column.data_type()
-                        ))
-                    })?;
-
-                let mut insert_indices = Vec::new();
-                let mut delete_indices = Vec::new();
-
-                for (idx, op) in op_array.iter().enumerate() {
-                    if let Some(op_str) = op {
-                        let row_kind = RowKind::from_str(op_str).unwrap_or(RowKind::Insert);
-                        match row_kind {
-                            RowKind::Delete => delete_indices.push(idx as u32),
-                            RowKind::Insert | RowKind::Update => insert_indices.push(idx as u32),
-                        }
-                    } else {
-                        insert_indices.push(idx as u32);
-                    }
-                }
+                let (insert_rows, delete_indices) = split_rows_by_operation(&normalized_batch)?;
 
                 // Process inserts/updates: strip _gs_op, then send via Arrow IPC
-                if !insert_indices.is_empty() {
-                    let indices_array = arrow::array::UInt32Array::from(insert_indices);
-                    // Use streamling_core::utils::arrow::safe_take_record_batch to
-                    // recover from the documented arrow take_bytes overflow panic on
-                    // deeply nested schemas. Native take_record_batch panics with
-                    // Option::expect("overflow") inside take_bytes for batches whose
-                    // Utf8/Binary columns' cumulative byte offsets exceed i32::MAX;
-                    // the panic crosses the extern "C" plugin boundary and crashes
-                    // the process with exit 132/133 if not caught here.
-                    let insert_batch = streamling_core::utils::arrow::safe_take_record_batch(
-                        &normalized_batch,
-                        &indices_array,
-                    )?;
-                    let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_batch)?;
+                if let Some(insert_rows) = insert_rows {
+                    let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
                     // Build schema without _gs_op for INSERTs
                     let insert_schema =
                         Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
@@ -1216,7 +1233,7 @@ impl DataSink for ClickHouseSinkExec {
                 }
                 if !delete_indices.is_empty() && !primary_keys.is_empty() {
                     let indices_array = arrow::array::UInt32Array::from(delete_indices);
-                    // See safe_take_record_batch comment on the insert path above.
+                    // See the safe_take_record_batch comment in `split_rows_by_operation`.
                     let delete_batch = streamling_core::utils::arrow::safe_take_record_batch(
                         &normalized_batch,
                         &indices_array,
@@ -3243,6 +3260,77 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
+
+    fn batch_with_operations(ops: Vec<&str>) -> RecordBatch {
+        use arrow::array::{Int32Array, StringArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+        ]));
+        let ids: Vec<i32> = (0..ops.len() as i32).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(ops)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn ids_of(batch: &RecordBatch) -> Vec<i32> {
+        use arrow::array::Int32Array;
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    /// An all-inserts batch must pass through without a `take`: its insert
+    /// indices are exactly `0..num_rows`, so copying would only reproduce it.
+    #[test]
+    fn split_rows_by_operation_passes_through_when_nothing_is_deleted() {
+        let batch = batch_with_operations(vec!["i", "u", "i"]);
+
+        let (insert_rows, delete_indices) = split_rows_by_operation(&batch).unwrap();
+
+        assert!(delete_indices.is_empty());
+        let insert_rows = insert_rows.expect("inserts must be returned");
+        assert_eq!(ids_of(&insert_rows), vec![0, 1, 2]);
+        for column in 0..batch.num_columns() {
+            assert!(
+                Arc::ptr_eq(batch.column(column), insert_rows.column(column)),
+                "column {column} was copied despite there being no deletes"
+            );
+        }
+    }
+
+    #[test]
+    fn split_rows_by_operation_separates_inserts_from_deletes() {
+        let batch = batch_with_operations(vec!["i", "d", "u", "d"]);
+
+        let (insert_rows, delete_indices) = split_rows_by_operation(&batch).unwrap();
+
+        assert_eq!(delete_indices, vec![1, 3]);
+        assert_eq!(
+            ids_of(&insert_rows.expect("inserts must be returned")),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn split_rows_by_operation_reports_no_inserts_for_an_all_delete_batch() {
+        let batch = batch_with_operations(vec!["d", "d"]);
+
+        let (insert_rows, delete_indices) = split_rows_by_operation(&batch).unwrap();
+
+        assert!(insert_rows.is_none());
+        assert_eq!(delete_indices, vec![0, 1]);
+    }
 
     #[test]
     fn split_range_start_reads_first_sorting_key() {
