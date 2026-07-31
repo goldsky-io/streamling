@@ -72,6 +72,7 @@ const LONG_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdValLong {
+    #[allow(dead_code)]
     id: i64,
     val: i64,
 }
@@ -145,6 +146,7 @@ const INT_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdValInt {
+    #[allow(dead_code)]
     id: i64,
     val: i32,
 }
@@ -216,6 +218,7 @@ const DOUBLE_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdValDouble {
+    #[allow(dead_code)]
     id: i64,
     val: f64,
 }
@@ -309,7 +312,7 @@ async fn double_many_decimals_roundtrip() {
         DoubleRec { id: 3, val: weird },
         DoubleRec {
             id: 4,
-            val: 123456789.123456789,
+            val: 123_456_789.123_456_79,
         },
     ];
 
@@ -336,7 +339,7 @@ async fn double_many_decimals_roundtrip() {
     assert_eq!(rows[0].val, pi, "pi must round-trip bit-exact");
     assert_eq!(rows[1].val, e, "e must round-trip bit-exact");
     assert_eq!(rows[2].val, weird, "0.1+0.2 must round-trip bit-exact");
-    assert_eq!(rows[3].val, 123456789.123456789);
+    assert_eq!(rows[3].val, 123_456_789.123_456_79);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +363,7 @@ const BOOL_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdFlag {
+    #[allow(dead_code)]
     id: i64,
     flag: bool,
 }
@@ -423,6 +427,7 @@ const STR_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdStr {
+    #[allow(dead_code)]
     id: i64,
     s: String,
 }
@@ -501,6 +506,7 @@ const OPT_STR_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdOptStr {
+    #[allow(dead_code)]
     id: i64,
     s: Option<String>,
 }
@@ -620,7 +626,7 @@ async fn string_sql_injection_shaped() {
         .expect("create table");
 
     // Values that would break naive string-concatenated SQL.
-    let cases = vec![
+    let cases = [
         "Robert'); DROP TABLE str_inject;--".to_string(),
         "O'Brien said \"hello\"".to_string(),
         r"back\slash and ; semicolon".to_string(),
@@ -685,7 +691,7 @@ async fn string_control_chars_and_escapes() {
         .await
         .expect("create table");
 
-    let cases = vec![
+    let cases = [
         "line1\nline2\nline3".to_string(),
         "col1\tcol2\tcol3".to_string(),
         // Literal backslash-zero TEXT (not an actual NUL byte; PG TEXT rejects \0).
@@ -935,6 +941,7 @@ const OPT_MIX_SCHEMA: &str = r#"{
 
 #[derive(Debug, FromRow, Deserialize)]
 struct OptMixRow {
+    #[allow(dead_code)]
     id: i64,
     n: Option<i64>,
     s: Option<String>,
