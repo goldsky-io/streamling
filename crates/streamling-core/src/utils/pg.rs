@@ -1,6 +1,10 @@
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
-use crate::types::{i256::I256Type, u256::U256Type};
+use crate::types::decimal_arb::DecimalArbType;
+// Feature 002 (Retire U256/I256): U256/I256 imports removed; wide-int
+// values flow through decimal_arb. Postgres NUMERIC(78, 0) source columns
+// are auto-promoted to decimal_arb(78, 0) + native_int_kind=u256 in
+// `postgres_type_to_arrow_field` above.
 use crate::utils::parse_primary_key_columns;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use sqlx::Executor;
@@ -169,14 +173,14 @@ pub struct PostgresTypeInfo {
 /// Get PostgreSQL type information for an Arrow field
 /// This is the single source of truth for Arrow → PostgreSQL type mapping
 pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
-    // Check for U256/I256 types that become NUMERIC(78,0)
-    if matches!(field.data_type(), DataType::FixedSizeBinary(32))
-        && (U256Type::is_u256_metadata(field.metadata())
-            || I256Type::is_i256_metadata(field.metadata()))
-    {
+    // Feature 002 (Retire U256/I256): decimal_arb fields with the
+    // `streamling.decimal_arb` extension metadata route to
+    // `NUMERIC(p, s)`. Pre-checked before the LargeBinary catch-all so
+    // wide-integer columns don't fall through to BYTEA.
+    if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) {
         return PostgresTypeInfo {
-            column_type: "NUMERIC(78,0)".to_string(),
-            string_cast_sql: Some("numeric(78,0)".to_string()),
+            column_type: format!("NUMERIC({}, {})", precision, scale),
+            string_cast_sql: Some(format!("numeric({},{})", precision, scale)),
         };
     }
 
@@ -296,8 +300,52 @@ pub fn arrow_field_to_postgres_type(field: &Field) -> String {
     get_postgres_type_info(field).column_type
 }
 
-/// Convert PostgreSQL type string to Arrow DataType
-/// This is the inverse of `get_postgres_type_info` for type override scenarios
+/// Parse the precision and scale out of a parameterised PostgreSQL `NUMERIC(p, s)`
+/// or `DECIMAL(p, s)` type string. Returns `(precision, scale)` where `precision`
+/// is `u32` to accommodate the full `decimal_arb` range.
+fn parse_numeric_params(pg_type_lower: &str, pg_type: &str) -> Result<(u32, i32)> {
+    let params_start = pg_type_lower.find('(').ok_or_else(|| {
+        StreamlingError::user(format!(
+            "invalid PostgreSQL type '{}': missing opening parenthesis",
+            pg_type
+        ))
+    })?;
+    let params_end = pg_type_lower.rfind(')').ok_or_else(|| {
+        StreamlingError::user(format!(
+            "invalid PostgreSQL type '{}': missing closing parenthesis",
+            pg_type
+        ))
+    })?;
+    let params_str = &pg_type_lower[params_start + 1..params_end];
+    let parts: Vec<&str> = params_str.split(',').collect();
+
+    let precision = parts[0].trim().parse::<u32>().map_err(|_| {
+        StreamlingError::user(format!(
+            "invalid precision in PostgreSQL type '{}'",
+            pg_type
+        ))
+    })?;
+    let scale = if parts.len() > 1 {
+        parts[1].trim().parse::<i32>().map_err(|_| {
+            StreamlingError::user(format!("invalid scale in PostgreSQL type '{}'", pg_type))
+        })?
+    } else {
+        0
+    };
+    Ok((precision, scale))
+}
+
+/// Convert PostgreSQL type string to Arrow `DataType`.
+///
+/// Routing for `NUMERIC(p, s)` / `DECIMAL(p, s)` (FR-018):
+/// - `p ≤ 38`            → `Decimal128(p, s)`
+/// - `38 < p ≤ 76`       → `Decimal256(p, s)`
+/// - `p > 76`            → `LargeBinary` (the storage type for `streamling.decimal_arb`)
+///
+/// The `LargeBinary` variant carries no per-`Field` extension metadata; if you
+/// need a complete `Field` with `decimal_arb` metadata attached, call
+/// [`postgres_type_to_arrow_field`] instead. Without that metadata downstream
+/// consumers will see the column as plain bytes, not a numeric value.
 pub fn postgres_type_to_arrow_type(pg_type: &str) -> Result<DataType> {
     let pg_type_lower = pg_type.to_lowercase();
     let base_type = pg_type_lower
@@ -323,35 +371,17 @@ pub fn postgres_type_to_arrow_type(pg_type: &str) -> Result<DataType> {
         "jsonb" | "json" => Ok(DataType::Utf8),
         "numeric" | "decimal" => {
             if pg_type_lower.contains('(') {
-                let params_start = pg_type_lower.find('(').unwrap();
-                let params_end = pg_type_lower.rfind(')').ok_or_else(|| {
-                    StreamlingError::user(format!(
-                        "invalid PostgreSQL type '{}': missing closing parenthesis",
-                        pg_type
-                    ))
-                })?;
-                let params_str = &pg_type_lower[params_start + 1..params_end];
-                let parts: Vec<&str> = params_str.split(',').collect();
-
-                let precision = parts[0].trim().parse::<u8>().map_err(|_| {
-                    StreamlingError::user(format!(
-                        "invalid precision in PostgreSQL type '{}'",
-                        pg_type
-                    ))
-                })?;
-
-                let scale = if parts.len() > 1 {
-                    parts[1].trim().parse::<i8>().map_err(|_| {
-                        StreamlingError::user(format!(
-                            "invalid scale in PostgreSQL type '{}'",
-                            pg_type
-                        ))
-                    })?
+                let (precision, scale) = parse_numeric_params(&pg_type_lower, pg_type)?;
+                if precision <= 38 {
+                    Ok(DataType::Decimal128(precision as u8, scale as i8))
+                } else if precision <= 76 {
+                    Ok(DataType::Decimal256(precision as u8, scale as i8))
                 } else {
-                    0
-                };
-
-                Ok(DataType::Decimal128(precision, scale))
+                    // Storage type only — caller must attach extension metadata
+                    // via `postgres_type_to_arrow_field` to make this a full
+                    // `decimal_arb` field.
+                    Ok(DecimalArbType::new())
+                }
             } else {
                 // Default precision and scale for NUMERIC without parameters
                 Ok(DataType::Decimal128(38, 9))
@@ -362,6 +392,50 @@ pub fn postgres_type_to_arrow_type(pg_type: &str) -> Result<DataType> {
             pg_type
         ))),
     }
+}
+
+/// Like [`postgres_type_to_arrow_type`] but returns a complete `Field` with
+/// the appropriate metadata attached. For `NUMERIC(p, s)` with `p > 76` this
+/// is the only path that produces a usable `decimal_arb` column — callers
+/// that just need a `DataType` will see `LargeBinary` without metadata,
+/// which is not a `decimal_arb` field per [`DecimalArbType::is_decimal_arb_field`].
+pub fn postgres_type_to_arrow_field(pg_type: &str, name: &str, nullable: bool) -> Result<Field> {
+    let pg_type_lower = pg_type.to_lowercase();
+    let base_type = pg_type_lower
+        .split('(')
+        .next()
+        .unwrap_or(&pg_type_lower)
+        .trim();
+
+    if (base_type == "numeric" || base_type == "decimal") && pg_type_lower.contains('(') {
+        let (precision, scale) = parse_numeric_params(&pg_type_lower, pg_type)?;
+        if precision > 76 {
+            if scale < 0 {
+                return Err(StreamlingError::user(format!(
+                    "decimal_arb does not support negative scale (PostgreSQL type '{}', scale {})",
+                    pg_type, scale,
+                )));
+            }
+            let field = DecimalArbType::field(name, precision, scale as u32, nullable)?;
+            // Feature 002: NUMERIC(78, 0) is the conventional unsigned
+            // 256-bit storage shape (Ethereum uint256 in blockchain data).
+            // Stamp the u256 hint so ClickHouse sinks downstream can emit
+            // UInt256 natively (preserving storage compactness on existing
+            // wide-int tables). Postgres NUMERIC has no native unsigned
+            // distinction, so no equivalent i256 path on this side — see
+            // contracts/postgres-wide-int.md §"Why no i256 hint".
+            if precision == 78 && scale == 0 {
+                return DecimalArbType::with_native_int_kind(
+                    field,
+                    crate::types::decimal_arb::NativeIntKind::U256,
+                );
+            }
+            return Ok(field);
+        }
+    }
+
+    let data_type = postgres_type_to_arrow_type(pg_type)?;
+    Ok(Field::new(name, data_type, nullable))
 }
 
 /// Create schema and table if they don't exist
@@ -511,15 +585,14 @@ pub async fn truncate_finalized_checkpoint_data(
     }
 }
 
-/// Override schema for PostgreSQL inserts: convert U256/I256 and nested types to Utf8
+/// Override schema for PostgreSQL inserts: convert nested types to Utf8
+/// (decimal_arb columns are handled separately via `build_projection_for_postgres`).
 pub fn override_schema_for_postgres_insert(source_schema: &SchemaRef) -> Schema {
     let fields: Vec<Field> = source_schema
         .fields()
         .iter()
         .map(|f| {
-            if U256Type::is_u256_field(f) || I256Type::is_i256_field(f) {
-                Field::new(f.name(), DataType::Utf8, f.is_nullable())
-            } else if matches!(
+            if matches!(
                 f.data_type(),
                 DataType::Struct(_)
                     | DataType::List(_)
@@ -696,16 +769,14 @@ mod tests {
         );
     }
 
+    // Feature 002: tests for U256/I256 → NUMERIC(78, 0) deleted along
+    // with the retired types. Wide-integer fields now arrive as decimal_arb
+    // and route through the decimal_arb branch in get_postgres_type_info.
     #[test]
-    fn test_u256_type() {
-        let field = Field::new("u256", U256Type::new(), false).with_metadata(U256Type::metadata());
-        assert_eq!(arrow_field_to_postgres_type(&field), "NUMERIC(78,0)");
-    }
-
-    #[test]
-    fn test_i256_type() {
-        let field = Field::new("i256", I256Type::new(), false).with_metadata(I256Type::metadata());
-        assert_eq!(arrow_field_to_postgres_type(&field), "NUMERIC(78,0)");
+    fn test_decimal_arb_78_0_maps_to_numeric_78_0() {
+        let field =
+            crate::types::decimal_arb::DecimalArbType::field("amount", 78, 0, false).unwrap();
+        assert_eq!(arrow_field_to_postgres_type(&field), "NUMERIC(78, 0)");
     }
 
     #[test]
@@ -855,5 +926,78 @@ mod tests {
                 "each attempt must open a fresh physical connection (permit released by detach)"
             );
         }
+    }
+
+    // ------- T015: postgres_type_to_arrow_type / _to_arrow_field routing -------
+    //
+    // Regression guard for FR-018: prior to this fix, `NUMERIC(p, s)` with
+    // `p > 38` would return `Decimal128(p, s)` which violates Arrow's max
+    // Decimal128 precision (38). The fix routes by precision band:
+    //   p ≤ 38 → Decimal128, 38 < p ≤ 76 → Decimal256, p > 76 → decimal_arb.
+
+    #[test]
+    fn numeric_within_decimal128_precision_routes_to_decimal128() {
+        let dt = postgres_type_to_arrow_type("NUMERIC(20, 5)").unwrap();
+        assert_eq!(dt, DataType::Decimal128(20, 5));
+    }
+
+    #[test]
+    fn numeric_above_decimal128_routes_to_decimal256_when_within_76() {
+        // FR-018: `NUMERIC(50, 10)` previously produced an invalid
+        // Decimal128(50, 10); now it routes to Decimal256.
+        let dt = postgres_type_to_arrow_type("NUMERIC(50, 10)").unwrap();
+        assert_eq!(dt, DataType::Decimal256(50, 10));
+    }
+
+    #[test]
+    fn numeric_at_decimal256_boundary_routes_to_decimal256() {
+        let dt = postgres_type_to_arrow_type("NUMERIC(76, 38)").unwrap();
+        assert_eq!(dt, DataType::Decimal256(76, 38));
+    }
+
+    #[test]
+    fn numeric_exceeding_decimal256_routes_to_decimal_arb_storage() {
+        // FR-018: `NUMERIC(100, 18)` previously produced an invalid
+        // Decimal128(100, 18); now it routes to the decimal_arb storage type.
+        let dt = postgres_type_to_arrow_type("NUMERIC(100, 18)").unwrap();
+        assert_eq!(dt, DataType::LargeBinary);
+    }
+
+    #[test]
+    fn arrow_field_for_wide_numeric_carries_decimal_arb_metadata() {
+        let field = postgres_type_to_arrow_field("NUMERIC(100, 18)", "amount", true).unwrap();
+        assert!(
+            DecimalArbType::is_decimal_arb_field(&field),
+            "wide-precision NUMERIC must produce a decimal_arb field"
+        );
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&field),
+            Some((100, 18))
+        );
+        assert!(field.is_nullable());
+    }
+
+    #[test]
+    fn arrow_field_for_narrow_numeric_omits_decimal_arb_metadata() {
+        let field = postgres_type_to_arrow_field("NUMERIC(20, 5)", "amount", false).unwrap();
+        assert!(!DecimalArbType::is_decimal_arb_field(&field));
+        assert_eq!(field.data_type(), &DataType::Decimal128(20, 5));
+    }
+
+    #[test]
+    fn arrow_field_for_wide_numeric_rejects_negative_scale() {
+        // decimal_arb invariant: scale >= 0; reject negative-scale Postgres types
+        // rather than silently dropping the constraint.
+        let result = postgres_type_to_arrow_field("NUMERIC(100, -2)", "x", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn numeric_without_params_keeps_default_routing() {
+        // Bare `NUMERIC` defaults to Decimal128(38, 9) per the existing
+        // contract; this test pins the behavior so the wide-precision fix
+        // doesn't accidentally change it.
+        let dt = postgres_type_to_arrow_type("NUMERIC").unwrap();
+        assert_eq!(dt, DataType::Decimal128(38, 9));
     }
 }

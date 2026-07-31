@@ -4,11 +4,14 @@ use datafusion::common::{Result, ToDFSchema};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use std::sync::Arc;
+use streamling_core::functions::decimal_arb_ops::DecimalArbToStringFunc;
 use streamling_core::functions::json_string::JsonStringFunc;
-use streamling_core::functions::{i256_ops::I256ToStringFunc, u256_ops::U256ToStringFunc};
-use streamling_core::types::{i256::I256Type, u256::U256Type};
+use streamling_core::types::decimal_arb::DecimalArbType;
+// Feature 002 (Retire U256/I256): U256/I256 imports removed; only
+// decimal_arb and nested types need projection to Utf8 for PG insert.
 
-/// Build projection expressions to convert U256/I256 and nested types to Utf8 for PostgreSQL insertion
+/// Build projection expressions to convert decimal_arb and nested types to
+/// Utf8 for PostgreSQL insertion. (U256/I256 paths retired in feature 002.)
 pub fn build_projection_for_postgres(
     state: &dyn Session,
     input: Arc<dyn ExecutionPlan>,
@@ -20,14 +23,7 @@ pub fn build_projection_for_postgres(
     let mut needs_projection = false;
 
     for f in input_schema.fields() {
-        let is_u256 = matches!(
-            f.data_type(),
-            datafusion::arrow::datatypes::DataType::FixedSizeBinary(32)
-        ) && U256Type::is_u256_metadata(f.metadata());
-        let is_i256 = matches!(
-            f.data_type(),
-            datafusion::arrow::datatypes::DataType::FixedSizeBinary(32)
-        ) && I256Type::is_i256_metadata(f.metadata());
+        let is_decimal_arb = DecimalArbType::is_decimal_arb_field(f);
         let is_nested_json = matches!(
             f.data_type(),
             datafusion::arrow::datatypes::DataType::Struct(_)
@@ -37,25 +33,12 @@ pub fn build_projection_for_postgres(
                 | datafusion::arrow::datatypes::DataType::Map(_, _)
         );
 
-        let logical_expr: datafusion::logical_expr::Expr = if is_u256 {
+        let logical_expr: datafusion::logical_expr::Expr = if is_decimal_arb {
             needs_projection = true;
             datafusion::logical_expr::Expr::ScalarFunction(
                 datafusion::logical_expr::expr::ScalarFunction {
                     func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
-                        U256ToStringFunc::new(),
-                    )),
-                    args: vec![datafusion::logical_expr::Expr::Column(
-                        datafusion::common::Column::from_name(f.name()),
-                    )],
-                },
-            )
-            .alias(f.name())
-        } else if is_i256 {
-            needs_projection = true;
-            datafusion::logical_expr::Expr::ScalarFunction(
-                datafusion::logical_expr::expr::ScalarFunction {
-                    func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
-                        I256ToStringFunc::new(),
+                        DecimalArbToStringFunc::new(),
                     )),
                     args: vec![datafusion::logical_expr::Expr::Column(
                         datafusion::common::Column::from_name(f.name()),

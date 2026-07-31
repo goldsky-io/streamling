@@ -9,12 +9,18 @@ use datafusion::catalog::{SchemaProvider, Session, TableProvider};
 use datafusion::common::{config::ConfigExtension, extensions_options};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::execution::{FunctionRegistry, SessionState, SessionStateBuilder};
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
+use streamling_common::functions::decimal_arb_aggregates::{
+    DecimalArbAvgUdaf, DecimalArbExtremeUdaf, DecimalArbSumUdaf,
+};
+use streamling_common::functions::decimal_arb_coercion::DecimalArbExprPlanner;
+use streamling_common::functions::decimal_arb_predicate_optimizer::DecimalArbExprRewrite;
+use streamling_common::functions::decimal_arb_sort_optimizer::DecimalArbSortRewriteRule;
 use streamling_flink_compat::{register_json_functions, register_string_aliases};
 
 pub static DEFAULT_CATALOG_NAME: &str = "default";
@@ -139,9 +145,14 @@ impl SessionManager {
             .with_runtime_env(runtime)
             .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
             .with_physical_optimizer_rules(StreamlingPhysicalOptimizerRules::rules())
+            // T046: rewrite ORDER BY decimal_arb_col -> ORDER BY
+            // decimal_arb_to_sort_key(...) so DataFusion's bytewise
+            // sort over the canonical encoding produces correct
+            // numeric ordering across signs (FR-005).
+            .with_optimizer_rule(Arc::new(DecimalArbSortRewriteRule::new()))
             .build();
 
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
 
         register_json_functions(&ctx)?;
         register_string_aliases(&ctx)?;
@@ -150,6 +161,25 @@ impl SessionManager {
             // This can override a built-in function with the same name
             ctx.register_udf(udf);
         }
+
+        // T047: register decimal_arb aggregate UDAFs (override built-in
+        // sum/min/max/avg for decimal_arb input columns) and the
+        // ExprPlanner (auto-bind native +/-/*/`/`%/=/!=/</<=/>/`>=` to
+        // decimal_arb_<op> ScalarUDFs when both operands are decimal_arb).
+        // The T007 spike confirmed register_udaf overrides the built-in
+        // for that name; the T005 spike confirmed register_expr_planner
+        // wires the planner into SQL frontend planning.
+        ctx.register_udaf(DecimalArbSumUdaf::into_udaf());
+        ctx.register_udaf(DecimalArbExtremeUdaf::min_udaf());
+        ctx.register_udaf(DecimalArbExtremeUdaf::max_udaf());
+        ctx.register_udaf(DecimalArbAvgUdaf::into_udaf());
+        ctx.register_expr_planner(Arc::new(DecimalArbExprPlanner::new()))?;
+        // Rewrite `BETWEEN` / `IN` over decimal_arb into the decimal_arb
+        // comparison UDFs (F1b). Registered as a FunctionRewrite so it runs in
+        // the analyzer *before* TypeCoercion — which would otherwise fail to
+        // reconcile LargeBinary against the Int64 bounds before any optimizer
+        // rule could rewrite the Between/InList node.
+        ctx.register_function_rewrite(Arc::new(DecimalArbExprRewrite::new()))?;
 
         crate::plugin::udf::register_plugin_udfs(&ctx);
 
@@ -436,98 +466,242 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
 
-    // Test infrastructure for end-to-end CASE-over-u256 behavior. Exercises the
-    // full session (preprocessor + registered UDFs), so it catches both the
-    // type-coercion failure and the field-metadata loss that a bare
-    // SessionContext (used in the preprocessor's string-only tests) cannot.
-    use crate::types::u256::{U256, U256Type, u256_to_bytes};
-    use datafusion::arrow::array::{
-        Array, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
-    };
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::MemTable;
+    /// Build a `t(id, amt decimal_arb(100,0), alt decimal_arb(100,0), flag)`
+    /// MemTable: amt = [111, 222], alt = [999, 888], flag = [1, 0].
+    fn register_decimal_arb_case_table(sm: &SessionManager) {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+        use arrow::array::StringArray;
+        use datafusion::datasource::MemTable;
+        use std::str::FromStr;
 
-    fn u256_col(vals: &[Option<u64>]) -> FixedSizeBinaryArray {
-        let iter = vals
-            .iter()
-            .map(|v| v.map(|x| u256_to_bytes(&U256::from(x)).to_vec()));
-        FixedSizeBinaryArray::try_from_sparse_iter_with_size(iter, 32).unwrap()
-    }
+        let col = |vals: [&str; 2], name: &str| {
+            let mut b = DecimalArbArrayBuilder::with_capacity(2, name, 100, 0).unwrap();
+            for v in vals {
+                b.append_value(&DecimalArbValue::from_str(v).unwrap())
+                    .unwrap();
+            }
+            b.finish().into_inner().0
+        };
 
-    /// A `txs` table with two u256 columns (`gas_price`, nullable
-    /// `effective_gas_price`) and a non-u256 `flag` for CASE conditions.
-    fn u256_session() -> SessionManager {
-        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
-            Field::new("gas_price", U256Type::new(), false).with_metadata(U256Type::metadata()),
-            Field::new("effective_gas_price", U256Type::new(), true)
-                .with_metadata(U256Type::metadata()),
+            DecimalArbType::field("amt", 100, 0, true).unwrap(),
+            DecimalArbType::field("alt", 100, 0, true).unwrap(),
             Field::new("flag", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(u256_col(&[Some(10), Some(20)])),
-                Arc::new(u256_col(&[None, Some(99)])),
+                Arc::new(col(["111", "222"], "amt")),
+                Arc::new(col(["999", "888"], "alt")),
                 Arc::new(Int64Array::from(vec![1, 0])),
             ],
         )
         .unwrap();
         let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-        sm.register_table("txs", Arc::new(table)).unwrap();
-        sm
+        sm.register_table("t", Arc::new(table)).unwrap();
     }
 
-    async fn collect_sql(sm: &SessionManager, sql: &str) -> Result<Vec<RecordBatch>> {
-        let plan = sm.create_logical_plan(sql.to_string()).await?;
-        sm.new_df(plan).collect().await
-    }
-
+    /// `CASE` over `decimal_arb` branches plans, executes, and selects the right
+    /// values through the full session — the decimal_arb `ExprPlanner` only
+    /// rewrites binary ops, so this confirms CASE rides DataFusion's native
+    /// coercion of the underlying `LargeBinary` without erroring. (Mirrors the
+    /// "does not kill the stream" u256 CASE test retired in feature 002.)
     #[tokio::test]
-    async fn test_case_with_u256_and_literal_branch_does_not_kill_stream() {
-        // A literal branch (`ELSE 0`) alongside a u256 branch must not fail
-        // type-coercion (FixedSizeBinary(32) vs Int64). Before the fix this
-        // errored with "Failed to coerce then/else ... in CASE WHEN expression",
-        // which terminates the stream.
-        let sm = u256_session();
-        let sql = "SELECT id, u256_to_string(CASE WHEN flag = 1 THEN gas_price ELSE 0 END) AS chosen FROM txs";
-        let batches = collect_sql(&sm, sql)
+    async fn case_over_decimal_arb_plans_and_selects_correct_values() {
+        use crate::types::decimal_arb::DecimalArbValue;
+        use arrow::array::{Array, LargeBinaryArray};
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_case_table(&sm);
+
+        let sql = "SELECT id, CASE WHEN flag = 1 THEN amt ELSE alt END AS chosen FROM t";
+        let plan = sm
+            .create_logical_plan(sql.to_string())
             .await
-            .expect("CASE with literal branch over u256 should plan and execute");
-        let batch = &batches[0];
-        let chosen = batch
-            .column(batch.schema().index_of("chosen").unwrap())
+            .expect("CASE over decimal_arb should plan");
+        let batches = sm
+            .new_df(plan)
+            .collect()
+            .await
+            .expect("CASE over decimal_arb should execute");
+
+        // row 0: flag=1 -> amt=111 ; row 1: flag=0 -> alt=888
+        let col = batches[0]
+            .column_by_name("chosen")
+            .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("chosen should be a string");
-        // row 0: flag=1 -> gas_price=10 ; row 1: flag=0 -> 0
-        assert_eq!(chosen.value(0), "10");
-        assert_eq!(chosen.value(1), "0");
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("decimal_arb storage is LargeBinary");
+        let v0 = DecimalArbValue::from_canonical_bytes_at_scale(col.value(0), 0).unwrap();
+        let v1 = DecimalArbValue::from_canonical_bytes_at_scale(col.value(1), 0).unwrap();
+        assert_eq!(v0.to_canonical_string(), "111");
+        assert_eq!(v1.to_canonical_string(), "888");
     }
 
+    /// F2 FIXED: `CASE` over `decimal_arb` used to come back as a bare
+    /// `LargeBinary` (extension metadata dropped), so a Postgres/ClickHouse sink
+    /// treated it as raw BYTEA instead of `NUMERIC(p, s)`. The
+    /// `DecimalArbExprRewrite` FunctionRewrite now re-stamps the metadata, so the
+    /// `chosen` output is a proper decimal_arb field again.
     #[tokio::test]
-    async fn test_case_over_u256_preserves_metadata_for_numeric_sink() {
-        // A CASE whose branches are u256 must yield an output field that still
-        // carries the streamling.u256 extension metadata, otherwise the Postgres
-        // sink falls back to BYTEA instead of numeric(78,0).
-        let sm = u256_session();
-        let sql = "SELECT id, CASE WHEN flag = 1 THEN gas_price ELSE effective_gas_price END AS chosen FROM txs";
-        let batches = collect_sql(&sm, sql)
-            .await
-            .expect("CASE over u256 should execute");
+    async fn case_over_decimal_arb_should_preserve_metadata() {
+        use crate::types::decimal_arb::DecimalArbType;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_case_table(&sm);
+
+        let sql = "SELECT id, CASE WHEN flag = 1 THEN amt ELSE alt END AS chosen FROM t";
+        let plan = sm.create_logical_plan(sql.to_string()).await.unwrap();
+        let batches = sm.new_df(plan).collect().await.unwrap();
+
         let field = batches[0]
             .schema()
             .field_with_name("chosen")
             .unwrap()
             .clone();
-        assert_eq!(field.data_type(), &DataType::FixedSizeBinary(32));
         assert!(
-            U256Type::is_u256_metadata(field.metadata()),
-            "CASE output lost u256 metadata: {:?}",
-            field.metadata()
+            DecimalArbType::is_decimal_arb_field(&field),
+            "CASE output lost decimal_arb metadata: {field:?}"
+        );
+    }
+
+    /// Register a single-column `t(amt decimal_arb(100,0))` MemTable from a list
+    /// of textual decimal values (each canonicalized via `DecimalArbValue`).
+    fn register_decimal_arb_values(sm: &SessionManager, table: &str, values: &[&str]) {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+        use datafusion::datasource::MemTable;
+        use std::str::FromStr;
+
+        let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "amt", 100, 0).unwrap();
+        for v in values {
+            b.append_value(&DecimalArbValue::from_str(v).unwrap())
+                .unwrap();
+        }
+        let amt = b.finish().into_inner().0;
+        let schema = Arc::new(Schema::new(vec![
+            DecimalArbType::field("amt", 100, 0, true).unwrap(),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(amt)]).unwrap();
+        let table_provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        sm.register_table(table, Arc::new(table_provider)).unwrap();
+    }
+
+    /// `GROUP BY` over `decimal_arb` groups by the canonical bytes. This verifies
+    /// the equality assumption end-to-end: numerically-equal values written in
+    /// different textual forms (`5` / `5.0` / `05`) collapse into ONE group, and
+    /// `+0` / `-0` are the same group — i.e. grouping is numerically correct, not
+    /// a silent byte-representation split.
+    #[tokio::test]
+    async fn group_by_decimal_arb_groups_numerically_equal_values() {
+        use crate::types::decimal_arb::DecimalArbValue;
+        use arrow::array::{Array, LargeBinaryArray};
+        use std::collections::HashMap;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_values(&sm, "t", &["5", "5.0", "05", "-3", "-3", "0", "-0"]);
+
+        let sql = "SELECT amt, COUNT(*) AS n FROM t GROUP BY amt";
+        let plan = sm
+            .create_logical_plan(sql.to_string())
+            .await
+            .expect("GROUP BY decimal_arb should plan");
+        let batches = sm
+            .new_df(plan)
+            .collect()
+            .await
+            .expect("GROUP BY decimal_arb should execute");
+
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for batch in &batches {
+            let amt = batch
+                .column_by_name("amt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            let n = batch
+                .column_by_name("n")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let key = DecimalArbValue::from_canonical_bytes_at_scale(amt.value(i), 0)
+                    .unwrap()
+                    .to_canonical_string();
+                *counts.entry(key).or_default() += n.value(i);
+            }
+        }
+
+        assert_eq!(
+            counts.len(),
+            3,
+            "exactly three distinct numeric groups expected: {counts:?}"
+        );
+        assert_eq!(
+            counts.get("5"),
+            Some(&3),
+            "5 / 5.0 / 05 must collapse to one group of 3: {counts:?}"
+        );
+        assert_eq!(counts.get("-3"), Some(&2), "{counts:?}");
+        assert_eq!(
+            counts.get("0"),
+            Some(&2),
+            "+0 and -0 must be the same group: {counts:?}"
+        );
+    }
+
+    /// `SELECT DISTINCT` over `decimal_arb` dedupes by numeric value, not textual
+    /// form — the same byte-equality guarantee as GROUP BY.
+    #[tokio::test]
+    async fn distinct_decimal_arb_dedupes_numerically_equal_values() {
+        use crate::types::decimal_arb::DecimalArbValue;
+        use arrow::array::{Array, LargeBinaryArray};
+        use std::collections::BTreeSet;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        register_decimal_arb_values(&sm, "t", &["5", "5.0", "-3", "-3", "0", "-0", "7"]);
+
+        let sql = "SELECT DISTINCT amt FROM t";
+        let plan = sm
+            .create_logical_plan(sql.to_string())
+            .await
+            .expect("DISTINCT decimal_arb should plan");
+        let batches = sm
+            .new_df(plan)
+            .collect()
+            .await
+            .expect("DISTINCT decimal_arb should execute");
+
+        let mut distinct: BTreeSet<String> = BTreeSet::new();
+        for batch in &batches {
+            let amt = batch
+                .column_by_name("amt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                distinct.insert(
+                    DecimalArbValue::from_canonical_bytes_at_scale(amt.value(i), 0)
+                        .unwrap()
+                        .to_canonical_string(),
+                );
+            }
+        }
+
+        let expected: BTreeSet<String> = ["5", "-3", "0", "7"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            distinct, expected,
+            "DISTINCT must dedupe numerically-equal decimal_arb values"
         );
     }
 
@@ -541,5 +715,69 @@ mod tests {
             SessionManager::extract_schema_and_table_names("table_c"),
             (DEFAULT_SCHEMA_NAME, "table_c")
         );
+    }
+
+    /// Regression test (code-reviewer-pro: SUM/MIN/MAX/AVG UDAFs are
+    /// registered under built-in names, so a pipeline calling SUM on a
+    /// plain Int64/Float64 column must still resolve via the built-in
+    /// aggregate — not error with a coerce-to-LargeBinary type mismatch.
+    #[tokio::test]
+    async fn builtin_aggregates_still_work_for_non_decimal_arb_columns() {
+        let registry = DynamicTableRegistry::new();
+        let sm = SessionManager::new(1024, 64, registry).unwrap();
+        let ctx = sm.session_context();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+                Arc::new(Float64Array::from(vec![1.5_f64, 2.5, 3.5, 4.5, 5.5])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("t", batch).unwrap();
+
+        for (sql, expected_col, expected_val) in [
+            ("SELECT SUM(i) AS s FROM t", "s", "15"),
+            ("SELECT MIN(i) AS m FROM t", "m", "1"),
+            ("SELECT MAX(i) AS m FROM t", "m", "5"),
+            ("SELECT AVG(f) AS a FROM t", "a", "3.5"),
+            // The `mean` alias for AVG is registered by DataFusion's built-in
+            // and must be preserved through the wrapper's `aliases` delegation.
+            ("SELECT MEAN(f) AS a FROM t", "a", "3.5"),
+        ] {
+            let df = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("plan failed for `{sql}`: {e}"));
+            let batches = df
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("collect failed for `{sql}`: {e}"));
+            assert_eq!(
+                batches.len(),
+                1,
+                "expected one output batch for `{sql}`, got {}",
+                batches.len()
+            );
+            assert_eq!(batches[0].num_rows(), 1, "expected one row for `{sql}`");
+            let col = batches[0]
+                .column_by_name(expected_col)
+                .unwrap_or_else(|| panic!("missing output column `{expected_col}` for `{sql}`"));
+            let formatter = arrow::util::display::ArrayFormatter::try_new(
+                col,
+                &arrow::util::display::FormatOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                formatter.value(0).to_string(),
+                expected_val,
+                "wrong result for `{sql}`"
+            );
+        }
     }
 }

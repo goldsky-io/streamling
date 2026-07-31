@@ -145,22 +145,19 @@ pub fn bind_arrow_value_to_query<'q>(
             q.bind(timestamp)
         }
         DataType::Decimal128(_precision, scale) => {
-            // Decimal128 binds as string (determined by type mapping)
+            // Decimal128 binds as string (determined by type mapping). The array
+            // value is the UNSCALED integer; place the point `scale` from the right.
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let value = arr.value(index);
-            // Convert decimal to properly formatted string with scale
-            let scaled = value.to_string();
-            // Format with proper decimal places
-            let formatted = format_decimal_string(&scaled, *scale as usize);
+            let unscaled = arr.value(index).to_string();
+            let formatted = unscaled_to_numeric_string(&unscaled, *scale as usize);
             q.bind(formatted)
         }
         DataType::Decimal256(_precision, scale) => {
-            // Decimal256 binds as string (determined by type mapping)
+            // Decimal256 binds as string (determined by type mapping). The array
+            // value is the UNSCALED integer; place the point `scale` from the right.
             let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            let value = arr.value(index);
-            // Convert decimal256 to string with proper scale
-            let scaled = value.to_string();
-            let formatted = format_decimal_string(&scaled, *scale as usize);
+            let unscaled = arr.value(index).to_string();
+            let formatted = unscaled_to_numeric_string(&unscaled, *scale as usize);
             q.bind(formatted)
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
@@ -227,34 +224,36 @@ pub fn bind_arrow_value_to_query<'q>(
     Ok(q)
 }
 
-/// Format a decimal string with the specified scale (number of decimal places)
-fn format_decimal_string(value: &str, scale: usize) -> String {
+/// Render a base-10 **unscaled integer** — the raw value of an Arrow
+/// `Decimal128`/`Decimal256` (e.g. `"12345"` for `123.45` at scale 2) — as the
+/// decimal string Postgres `NUMERIC` expects, with the point placed `scale`
+/// digits from the right.
+///
+/// The previous implementation *appended* `scale` trailing zeros (treating the
+/// unscaled integer as if it were already the integer part), which inflated the
+/// magnitude by 10^scale: it both wrote wrong values and overflowed otherwise
+/// wide-enough NUMERIC columns for high-scale / all-fractional decimals (F3).
+fn unscaled_to_numeric_string(unscaled: &str, scale: usize) -> String {
     if scale == 0 {
-        return value.to_string();
+        return unscaled.to_string();
     }
-
-    // If value already has decimal point, ensure it has the right number of decimal places
-    if let Some(dot_pos) = value.find('.') {
-        let integer_part = &value[..dot_pos];
-        let decimal_part = &value[dot_pos + 1..];
-
-        if decimal_part.len() == scale {
-            value.to_string()
-        } else if decimal_part.len() < scale {
-            // Pad with zeros
-            format!(
-                "{}.{}{}",
-                integer_part,
-                decimal_part,
-                "0".repeat(scale - decimal_part.len())
-            )
-        } else {
-            // Truncate (shouldn't happen, but handle it)
-            format!("{}.{}", integer_part, &decimal_part[..scale])
-        }
+    let (sign, digits) = match unscaled.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", unscaled),
+    };
+    let body = if digits.len() > scale {
+        // Has integer digits: split `scale` from the right.
+        let (int_part, frac_part) = digits.split_at(digits.len() - scale);
+        format!("{int_part}.{frac_part}")
     } else {
-        // No decimal point, add it with zeros
-        format!("{}.{}", value, "0".repeat(scale))
+        // Magnitude < 1: pad with leading zeros after "0.".
+        format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+    };
+    // Never emit "-0.000…" for a zero magnitude.
+    if sign == "-" && digits.bytes().all(|b| b == b'0') {
+        body
+    } else {
+        format!("{sign}{body}")
     }
 }
 
@@ -342,22 +341,38 @@ mod tests {
     }
 
     #[test]
-    fn test_format_decimal_string() {
-        use super::format_decimal_string;
+    fn test_unscaled_to_numeric_string() {
+        use super::unscaled_to_numeric_string;
 
-        // Test with scale 0
-        assert_eq!(format_decimal_string("123", 0), "123");
+        // scale 0: unchanged
+        assert_eq!(unscaled_to_numeric_string("123", 0), "123");
+        // point placed `scale` from the right
+        assert_eq!(unscaled_to_numeric_string("12345", 2), "123.45");
+        // exactly `scale` digits -> "0.<digits>"
+        assert_eq!(unscaled_to_numeric_string("45", 2), "0.45");
+        // all-fractional (scale == precision), the F3 dec128(10,10) shape
+        assert_eq!(unscaled_to_numeric_string("1234567890", 10), "0.1234567890");
+        // magnitude < 10^scale needs leading zero padding
+        assert_eq!(unscaled_to_numeric_string("5", 3), "0.005");
+        // zero
+        assert_eq!(unscaled_to_numeric_string("0", 2), "0.00");
+        assert_eq!(unscaled_to_numeric_string("0", 0), "0");
 
-        // Test adding decimal point
-        assert_eq!(format_decimal_string("123", 2), "123.00");
+        // negatives
+        assert_eq!(unscaled_to_numeric_string("-12345", 2), "-123.45");
+        assert_eq!(
+            unscaled_to_numeric_string("-1234567890", 10),
+            "-0.1234567890"
+        );
+        assert_eq!(unscaled_to_numeric_string("-5", 3), "-0.005");
 
-        // Test padding decimals
-        assert_eq!(format_decimal_string("123.4", 3), "123.400");
-
-        // Test truncation (shouldn't happen but handled)
-        assert_eq!(format_decimal_string("123.456", 2), "123.45");
-
-        // Test already correct scale
-        assert_eq!(format_decimal_string("123.45", 2), "123.45");
+        // F3 dec256(60,30) high-scale shape: 60-digit unscaled -> 30 integer +
+        // 30 fractional digits (fits NUMERIC(80,30); the old code produced 60
+        // integer digits and overflowed).
+        let big = "1".repeat(60);
+        assert_eq!(
+            unscaled_to_numeric_string(&big, 30),
+            format!("{}.{}", "1".repeat(30), "1".repeat(30))
+        );
     }
 }

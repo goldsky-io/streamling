@@ -687,10 +687,10 @@ sinks:
 | `STREAMLING__POSTGRES_SINK__DB` | `postgres` | Database name |
 | `STREAMLING__POSTGRES_SINK__SSLMODE` | `disable` | SSL mode (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`) |
 
-Behavior for 256-bit integers (U256/I256):
+Behavior for wide / arbitrary-precision decimals (`decimal_arb`):
 
-- Columns annotated as U256/I256 in the Arrow schema (FixedSizeBinary(32) with Streamling metadata) are created in Postgres as `NUMERIC(78,0)`.
-- During writes, these columns are stringified in-flight (`u256_to_string` / `i256_to_string`) so the sink sends textual decimal values that Postgres parses into `NUMERIC(78,0)`.
+- Wide integers and high-precision decimals are represented by the `decimal_arb` extension type (a `LargeBinary` Arrow column carrying canonical `(precision, scale)` metadata; it superseded the dedicated `u256`/`i256` types). A `decimal_arb(p, s)` column is created in Postgres as `NUMERIC(p, s)` (e.g. wide blockchain integers land as `NUMERIC(78, 0)`).
+- During writes the sink serializes each value to its canonical decimal string so Postgres parses it into the `NUMERIC` column losslessly. Within SQL, `decimal_arb_to_string(col)` produces that same textual form.
 - If an existing destination table has incompatible types (e.g., insufficient precision or non-numeric), the sink errors instead of coercing or dropping data.
 
 #### Postgres Aggregation Sink

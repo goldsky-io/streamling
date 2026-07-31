@@ -1,17 +1,12 @@
 use crate::formats::{FromArrowConverter, ToArrowConverter};
-use crate::types::i256::{I256Type, i256_to_bytes, string_to_i256};
-use crate::types::u256::{U256Type, bytes_to_u256, string_to_u256, u256_to_bytes, u256_to_string};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, StringArray,
-};
+use crate::streamling_err;
+use arrow_schema::{Field, Schema, SchemaRef};
+use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::ipc::{reader::FileReader, writer::FileWriter};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use std::io::Cursor;
 use std::sync::Arc;
-
-use crate::streamling_err;
 
 pub struct FromArrowToIpcConverter {}
 
@@ -21,101 +16,11 @@ impl FromArrowToIpcConverter {
     }
 
     fn to_ipc(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
-        // If the schema contains U256/I256 extension fields, convert those columns to Utf8 (decimal strings)
-        // This matches the JSON converter behavior
-        let has_u256_or_i256 = batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| U256Type::is_u256_field(f) || I256Type::is_i256_field(f));
-
-        let transformed_batch = if has_u256_or_i256 {
-            let mut new_fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
-            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-
-            for (idx, field) in batch.schema().fields().iter().enumerate() {
-                if U256Type::is_u256_field(field) {
-                    // Convert FixedSizeBinary(32) -> Utf8 with decimal string
-                    let col = batch.column(idx);
-                    let fsb = col
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .ok_or_else(|| {
-                            DataFusionError::from(streamling_err!(
-                                "expected FixedSizeBinaryArray for U256 field '{}', got {:?}",
-                                field.name(),
-                                col.data_type()
-                            ))
-                        })?;
-
-                    let mut string_values: Vec<Option<String>> = Vec::with_capacity(fsb.len());
-                    for row_idx in 0..fsb.len() {
-                        if fsb.is_null(row_idx) {
-                            string_values.push(None);
-                        } else {
-                            let bytes = fsb.value(row_idx);
-                            debug_assert_eq!(bytes.len(), 32);
-                            let mut fixed: [u8; 32] = [0u8; 32];
-                            fixed.copy_from_slice(bytes);
-                            let val = bytes_to_u256(&fixed);
-                            string_values.push(Some(u256_to_string(&val)));
-                        }
-                    }
-
-                    let string_array = StringArray::from(string_values);
-                    new_columns.push(Arc::new(string_array) as ArrayRef);
-                    new_fields.push(Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    ));
-                } else if I256Type::is_i256_field(field) {
-                    // Convert FixedSizeBinary(32) -> Utf8 with decimal string
-                    let col = batch.column(idx);
-                    let fsb = col
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .ok_or_else(|| {
-                            DataFusionError::from(streamling_err!(
-                                "expected FixedSizeBinaryArray for I256 field '{}', got {:?}",
-                                field.name(),
-                                col.data_type()
-                            ))
-                        })?;
-
-                    let mut string_values: Vec<Option<String>> = Vec::with_capacity(fsb.len());
-                    for row_idx in 0..fsb.len() {
-                        if fsb.is_null(row_idx) {
-                            string_values.push(None);
-                        } else {
-                            let bytes = fsb.value(row_idx);
-                            debug_assert_eq!(bytes.len(), 32);
-                            let mut fixed: [u8; 32] = [0u8; 32];
-                            fixed.copy_from_slice(bytes);
-                            let i256_val = crate::types::i256::bytes_to_i256(&fixed);
-                            let string_val = crate::types::i256::i256_to_string(&i256_val);
-                            string_values.push(Some(string_val));
-                        }
-                    }
-
-                    let string_array = StringArray::from(string_values);
-                    new_columns.push(Arc::new(string_array) as ArrayRef);
-                    new_fields.push(Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    ));
-                } else {
-                    new_columns.push(batch.column(idx).clone());
-                    new_fields.push(field.as_ref().clone());
-                }
-            }
-
-            let new_schema = Arc::new(Schema::new(new_fields));
-            RecordBatch::try_new(new_schema, new_columns)?
-        } else {
-            batch.clone()
-        };
+        // Feature 002 (Retire U256/I256): the previous U256/I256 → Utf8
+        // string-conversion at IPC write time is no longer needed — wide
+        // integers flow through decimal_arb (LargeBinary) which Arrow IPC
+        // serializes natively, preserving the field's extension metadata.
+        let transformed_batch = batch.clone();
 
         // Serialize to Arrow IPC file format
         let mut buf = Vec::new();
@@ -210,13 +115,10 @@ impl FromIpcToArrowConverter {
     }
 
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // Check if we need any conversions (type mismatches or U256/I256)
-        let needs_conversion = batch.schema() != self.schema
-            || self
-                .schema
-                .fields()
-                .iter()
-                .any(|f| U256Type::is_u256_field(f) || I256Type::is_i256_field(f));
+        // Feature 002: U256/I256 conversion no longer needed (those types
+        // are retired in favor of decimal_arb, which Arrow IPC carries
+        // natively).
+        let needs_conversion = batch.schema() != self.schema;
 
         if !needs_conversion {
             return Ok(batch);
@@ -248,77 +150,7 @@ impl FromIpcToArrowConverter {
                     }
                 };
 
-            if U256Type::is_u256_field(target_field) {
-                // Convert Utf8 -> FixedSizeBinary(32) for U256
-                let col = source_col_opt.ok_or_else(|| {
-                    DataFusionError::from(streamling_err!(
-                        "missing column for U256 field '{}'",
-                        target_field.name()
-                    ))
-                })?;
-                let string_array = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::from(streamling_err!(
-                        "expected StringArray for U256 field '{}', got {:?}",
-                        target_field.name(),
-                        col.data_type()
-                    ))
-                })?;
-
-                let mut builder = FixedSizeBinaryBuilder::with_capacity(string_array.len(), 32);
-                for row_idx in 0..string_array.len() {
-                    if string_array.is_null(row_idx) {
-                        builder.append_null();
-                    } else {
-                        let str_val = string_array.value(row_idx);
-                        let u256_val = string_to_u256(str_val)?;
-                        let bytes = u256_to_bytes(&u256_val);
-                        builder.append_value(bytes).map_err(|e| {
-                            DataFusionError::from(streamling_err!(
-                                "failed to append U256 value for field '{}': {}",
-                                target_field.name(),
-                                e
-                            ))
-                        })?;
-                    }
-                }
-                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
-                new_fields.push(target_field.as_ref().clone());
-            } else if I256Type::is_i256_field(target_field) {
-                // Convert Utf8 -> FixedSizeBinary(32) for I256
-                let col = source_col_opt.ok_or_else(|| {
-                    DataFusionError::from(streamling_err!(
-                        "missing column for I256 field '{}'",
-                        target_field.name()
-                    ))
-                })?;
-                let string_array = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::from(streamling_err!(
-                        "expected StringArray for I256 field '{}', got {:?}",
-                        target_field.name(),
-                        col.data_type()
-                    ))
-                })?;
-
-                let mut builder = FixedSizeBinaryBuilder::with_capacity(string_array.len(), 32);
-                for row_idx in 0..string_array.len() {
-                    if string_array.is_null(row_idx) {
-                        builder.append_null();
-                    } else {
-                        let str_val = string_array.value(row_idx);
-                        let i256_val = string_to_i256(str_val)?;
-                        let bytes = i256_to_bytes(&i256_val);
-                        builder.append_value(bytes).map_err(|e| {
-                            DataFusionError::from(streamling_err!(
-                                "failed to append I256 value for field '{}': {}",
-                                target_field.name(),
-                                e
-                            ))
-                        })?;
-                    }
-                }
-                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
-                new_fields.push(target_field.as_ref().clone());
-            } else if let Some(source_col) = source_col_opt {
+            if let Some(source_col) = source_col_opt {
                 // Convert column type if needed to match target schema
                 let source_field = source_field_opt.cloned().unwrap_or_else(|| {
                     Field::new(target_field.name(), source_col.data_type().clone(), true)
@@ -448,208 +280,8 @@ impl ToArrowConverter<Vec<u8>> for FromIpcToArrowConverter {
 mod tests {
     use super::*;
     use crate::formats::FromArrowConverter;
-    use crate::types::u256::{U256, U256Type, u256_to_bytes};
-    use datafusion::arrow::array::FixedSizeBinaryBuilder;
-
-    #[test]
-    fn test_arrow_ipc_arrow_roundtrip_with_u256() {
-        // Build a schema with a U256 field
-        let u256_field =
-            Field::new("u256", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let schema = Arc::new(Schema::new(vec![u256_field]));
-
-        // Create original batch with U256 values
-        let value1 = U256::from(12345u64);
-        let value2 = U256::from(67890u64);
-        let bytes1 = u256_to_bytes(&value1);
-        let bytes2 = u256_to_bytes(&value2);
-
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(2, 32);
-        builder.append_value(bytes1).unwrap();
-        builder.append_value(bytes2).unwrap();
-        let array = Arc::new(builder.finish()) as ArrayRef;
-
-        let original_batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-
-        // Convert Arrow -> IPC
-        let to_ipc_converter = FromArrowToIpcConverter::new();
-        let ipc_bytes_vec = to_ipc_converter
-            .convert_from_batch(&original_batch)
-            .unwrap();
-        assert_eq!(ipc_bytes_vec.len(), 1);
-
-        // Convert IPC -> Arrow
-        let mut from_ipc_converter = FromIpcToArrowConverter::new(schema.clone());
-        from_ipc_converter.buffer(ipc_bytes_vec.into_iter().next().unwrap());
-        let restored_batch = from_ipc_converter.convert_to_batch().unwrap();
-
-        // Verify round-trip
-        assert_eq!(restored_batch.num_rows(), 2);
-        assert_eq!(restored_batch.num_columns(), 1);
-
-        // Check that the schema has the U256 metadata preserved
-        let restored_schema = restored_batch.schema();
-        let restored_field = restored_schema.field(0);
-        assert!(U256Type::is_u256_field(restored_field));
-
-        // Check the values
-        let restored_col = restored_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("Expected FixedSizeBinaryArray");
-
-        let mut fixed0 = [0u8; 32];
-        fixed0.copy_from_slice(restored_col.value(0));
-        let val0 = crate::types::u256::bytes_to_u256(&fixed0);
-        assert_eq!(val0, value1);
-
-        let mut fixed1 = [0u8; 32];
-        fixed1.copy_from_slice(restored_col.value(1));
-        let val1 = crate::types::u256::bytes_to_u256(&fixed1);
-        assert_eq!(val1, value2);
-    }
-
-    #[test]
-    fn test_arrow_ipc_arrow_roundtrip_with_u256_and_other_fields() {
-        // Build a schema with U256 and other fields
-        let u256_field =
-            Field::new("amount", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let int_field = Field::new("id", DataType::Int32, false);
-        let string_field = Field::new("name", DataType::Utf8, true);
-        let schema = Arc::new(Schema::new(vec![int_field, u256_field, string_field]));
-
-        // Create Int32 column
-        use datafusion::arrow::array::{Int32Array, StringBuilder};
-        let int_array = Int32Array::from(vec![1, 2]);
-
-        // Create U256 column
-        let value1 = U256::from(999999999999u64);
-        let value2 = U256::from(123456789012345u64);
-        let bytes1 = u256_to_bytes(&value1);
-        let bytes2 = u256_to_bytes(&value2);
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(2, 32);
-        builder.append_value(bytes1).unwrap();
-        builder.append_value(bytes2).unwrap();
-        let u256_array = Arc::new(builder.finish()) as ArrayRef;
-
-        // Create String column
-        let mut string_builder = StringBuilder::new();
-        string_builder.append_value("alice");
-        string_builder.append_value("bob");
-        let string_array = Arc::new(string_builder.finish()) as ArrayRef;
-
-        let original_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(int_array) as ArrayRef, u256_array, string_array],
-        )
-        .unwrap();
-
-        // Convert Arrow -> IPC -> Arrow
-        let to_ipc_converter = FromArrowToIpcConverter::new();
-        let ipc_bytes_vec = to_ipc_converter
-            .convert_from_batch(&original_batch)
-            .unwrap();
-
-        let mut from_ipc_converter = FromIpcToArrowConverter::new(schema.clone());
-        from_ipc_converter.buffer(ipc_bytes_vec.into_iter().next().unwrap());
-        let restored_batch = from_ipc_converter.convert_to_batch().unwrap();
-
-        // Verify round-trip
-        assert_eq!(restored_batch.num_rows(), 2);
-        assert_eq!(restored_batch.num_columns(), 3);
-
-        // Check Int32 column
-        let id_col = restored_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("Expected Int32Array");
-        assert_eq!(id_col.value(0), 1);
-        assert_eq!(id_col.value(1), 2);
-
-        // Check U256 column
-        let restored_u256_col = restored_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("Expected FixedSizeBinaryArray");
-
-        let mut fixed0 = [0u8; 32];
-        fixed0.copy_from_slice(restored_u256_col.value(0));
-        let val0 = crate::types::u256::bytes_to_u256(&fixed0);
-        assert_eq!(val0, value1);
-
-        let mut fixed1 = [0u8; 32];
-        fixed1.copy_from_slice(restored_u256_col.value(1));
-        let val1 = crate::types::u256::bytes_to_u256(&fixed1);
-        assert_eq!(val1, value2);
-
-        // Check String column
-        let name_col = restored_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray");
-        assert_eq!(name_col.value(0), "alice");
-        assert_eq!(name_col.value(1), "bob");
-    }
-
-    #[test]
-    fn test_arrow_ipc_arrow_roundtrip_with_large_u256_values() {
-        // Test with values that span the full 256-bit range
-        let u256_field =
-            Field::new("big_num", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let schema = Arc::new(Schema::new(vec![u256_field]));
-
-        // Create values that use more than 64 bits
-        let value1 = U256::max_value(); // Maximum U256 value
-        let value2 = U256::max_value() / U256::from(2u64); // Half of max
-        let value3 = U256::from(0u64); // Zero
-        let bytes1 = u256_to_bytes(&value1);
-        let bytes2 = u256_to_bytes(&value2);
-        let bytes3 = u256_to_bytes(&value3);
-
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 32);
-        builder.append_value(bytes1).unwrap();
-        builder.append_value(bytes2).unwrap();
-        builder.append_value(bytes3).unwrap();
-        let array = Arc::new(builder.finish()) as ArrayRef;
-
-        let original_batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-
-        // Convert Arrow -> IPC -> Arrow
-        let to_ipc_converter = FromArrowToIpcConverter::new();
-        let ipc_bytes_vec = to_ipc_converter
-            .convert_from_batch(&original_batch)
-            .unwrap();
-
-        let mut from_ipc_converter = FromIpcToArrowConverter::new(schema.clone());
-        from_ipc_converter.buffer(ipc_bytes_vec.into_iter().next().unwrap());
-        let restored_batch = from_ipc_converter.convert_to_batch().unwrap();
-
-        // Verify round-trip
-        let restored_col = restored_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("Expected FixedSizeBinaryArray");
-
-        let mut fixed0 = [0u8; 32];
-        fixed0.copy_from_slice(restored_col.value(0));
-        let val0 = crate::types::u256::bytes_to_u256(&fixed0);
-        assert_eq!(val0, value1);
-
-        let mut fixed1 = [0u8; 32];
-        fixed1.copy_from_slice(restored_col.value(1));
-        let val1 = crate::types::u256::bytes_to_u256(&fixed1);
-        assert_eq!(val1, value2);
-
-        let mut fixed2 = [0u8; 32];
-        fixed2.copy_from_slice(restored_col.value(2));
-        let val2 = crate::types::u256::bytes_to_u256(&fixed2);
-        assert_eq!(val2, value3);
-    }
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::datatypes::DataType;
 
     #[test]
     fn test_ipc_converter_handles_empty_buffer() {
@@ -737,5 +369,76 @@ mod tests {
         // Should get empty batch with target schema
         assert_eq!(restored_batch.num_rows(), 0);
         assert_eq!(restored_batch.schema(), target_schema);
+    }
+
+    // ------- T031: decimal_arb survives Arrow IPC round-trip -------
+    //
+    // The IPC writer leaves non-u256/i256 fields untouched and Arrow IPC
+    // preserves field metadata natively, so decimal_arb columns flow through
+    // without conversion. The reader's `convert_batch_to_original_schema`
+    // sees matching schemas (LargeBinary + same extension metadata) and
+    // early-returns the batch as-is. This test pins that behavior.
+
+    #[test]
+    fn test_arrow_ipc_arrow_roundtrip_with_decimal_arb() {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+        use std::str::FromStr;
+
+        let field = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        // Build a batch with three values including a 100-digit one,
+        // a NULL, and a negative.
+        let mut s = String::with_capacity(101);
+        s.push('1');
+        for _ in 0..81 {
+            s.push('0');
+        }
+        s.push_str(".000000000000000001");
+
+        let mut b = DecimalArbArrayBuilder::with_capacity(3, "amount", 100, 18).unwrap();
+        b.append_str(&s).unwrap();
+        b.append_null();
+        b.append_str("-99.5").unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let original_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(raw) as ArrayRef]).unwrap();
+
+        // Round-trip: Arrow -> IPC -> Arrow.
+        let to_ipc = FromArrowToIpcConverter::new();
+        let ipc_bytes_vec = to_ipc.convert_from_batch(&original_batch).unwrap();
+        assert_eq!(ipc_bytes_vec.len(), 1);
+
+        let mut from_ipc = FromIpcToArrowConverter::new(schema.clone());
+        from_ipc.buffer(ipc_bytes_vec.into_iter().next().unwrap());
+        let restored_batch = from_ipc.convert_to_batch().unwrap();
+
+        assert_eq!(restored_batch.num_rows(), 3);
+        assert_eq!(restored_batch.num_columns(), 1);
+
+        // Field metadata must round-trip — that's what makes the column a
+        // decimal_arb column rather than plain LargeBinary downstream.
+        let restored_field = restored_batch.schema().field(0).clone();
+        assert!(
+            DecimalArbType::is_decimal_arb_field(&restored_field),
+            "decimal_arb extension metadata must survive Arrow IPC round-trip"
+        );
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&restored_field),
+            Some((100, 18)),
+        );
+
+        // Values must round-trip byte-for-byte (canonical encoding is stable).
+        let restored = restored_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::LargeBinaryArray>()
+            .expect("decimal_arb storage type is LargeBinary");
+
+        let v0 = DecimalArbValue::from_canonical_bytes_at_scale(restored.value(0), 18).unwrap();
+        assert_eq!(v0, DecimalArbValue::from_str(&s).unwrap());
+        assert!(restored.is_null(1));
+        let v2 = DecimalArbValue::from_canonical_bytes_at_scale(restored.value(2), 18).unwrap();
+        assert_eq!(v2, DecimalArbValue::from_str("-99.5").unwrap());
     }
 }
