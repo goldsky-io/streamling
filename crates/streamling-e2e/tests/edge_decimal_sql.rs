@@ -354,7 +354,10 @@ async fn sql_case_passthrough_metadata_tripwire() {
         .run_pipeline_with_opts(&yaml, base_opts().record_limit(2))
         .await
         .expect("pipeline run");
-    assert!(status.success(), "CASE over decimal_arb should succeed (F2 fixed)");
+    assert!(
+        status.success(),
+        "CASE over decimal_arb should succeed (F2 fixed)"
+    );
 
     let rows: Vec<IdText> = ctx
         .postgres
@@ -401,7 +404,10 @@ async fn sql_nested_case() {
         .run_pipeline_with_opts(&yaml, base_opts().record_limit(3))
         .await
         .expect("pipeline run");
-    assert!(status.success(), "nested CASE over decimal_arb should succeed (F2 fixed)");
+    assert!(
+        status.success(),
+        "nested CASE over decimal_arb should succeed (F2 fixed)"
+    );
 
     let rows: Vec<IdText> = ctx
         .postgres

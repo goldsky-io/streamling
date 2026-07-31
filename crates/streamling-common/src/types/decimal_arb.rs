@@ -16,8 +16,8 @@ use arrow::array::{
 };
 use arrow::datatypes::i256 as ArrowI256;
 use arrow::datatypes::{DataType, Field};
-use arrow_schema::extension::ExtensionType;
 use arrow_schema::ArrowError;
+use arrow_schema::extension::ExtensionType;
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 use num_traits::Zero;
@@ -244,7 +244,9 @@ impl ExtensionType for DecimalArbExtension {
         ))
     }
 
-    fn deserialize_metadata(metadata: Option<&str>) -> std::result::Result<Self::Metadata, ArrowError> {
+    fn deserialize_metadata(
+        metadata: Option<&str>,
+    ) -> std::result::Result<Self::Metadata, ArrowError> {
         let raw = metadata.ok_or_else(|| {
             ArrowError::InvalidArgumentError("decimal_arb extension metadata missing".to_string())
         })?;
@@ -1174,7 +1176,10 @@ mod tests {
         assert!(f.has_valid_extension_type::<DecimalArbExtension>());
         let ext = f.try_extension_type::<DecimalArbExtension>().unwrap();
         assert_eq!((ext.precision(), ext.scale()), (100, 18));
-        assert_eq!(f.extension_type_name(), Some(DecimalArbType::EXTENSION_NAME));
+        assert_eq!(
+            f.extension_type_name(),
+            Some(DecimalArbType::EXTENSION_NAME)
+        );
     }
 
     #[test]

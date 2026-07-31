@@ -3429,16 +3429,17 @@ mod tests {
 /// Real-payload regression check for the arrow-avro decode path (`ConfluentAvroDecoder` +
 /// recursive `coerce_batch_to_target`): decoding the real blockchain `traces` schema + payload
 /// must produce a `RecordBatch` whose schema matches streamling's `convert_avro_schema_to_arrow`
-/// mapping (top-level u256 + nested `List<Struct{…Decimal128(100,0)}>`) and whose u256 column
-/// round-trips. Lives inline per repo convention (no standalone test files in library crates).
+/// mapping (top-level wide decimal → `decimal_arb` + nested `List<Struct{…decimal_arb}>`) and
+/// whose `decimal_arb` column round-trips. Lives inline per repo convention (no standalone test
+/// files in library crates).
 #[cfg(test)]
 mod arrow_avro_real_payload_tests {
     use apache_avro::Schema as AvroSchema;
-    use arrow::array::{Array, FixedSizeBinaryArray};
+    use arrow::array::{Array, LargeBinaryArray};
     use arrow_schema::DataType;
     use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
     use streamling_core::formats::avro::convert_avro_schema_to_arrow;
-    use streamling_core::types::u256::U256Type;
+    use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
 
     fn manifest_path(rel: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
@@ -3505,7 +3506,7 @@ mod arrow_avro_real_payload_tests {
             let schema = batch.schema();
 
             // The decoded batch must carry exactly streamling's target Arrow schema, recursively
-            // (field types, nullability, and u256/i256 extension metadata).
+            // (field types, nullability, and decimal_arb extension metadata).
             assert_eq!(
                 schema.fields(),
                 target.fields(),
@@ -3513,26 +3514,31 @@ mod arrow_avro_real_payload_tests {
             );
             assert_eq!(batch.num_rows(), 1, "expected one decoded row");
 
-            // Top-level `value` (avro decimal precision 100, scale 0) → u256 FixedSizeBinary(32).
+            // Top-level `value` (avro decimal precision 100, scale 0) → streamling.decimal_arb.
             let value_idx = target.index_of("value").unwrap();
             let value_field = schema.field(value_idx).clone();
             assert!(
-                U256Type::is_u256_field(&value_field),
-                "`value` field is not tagged u256: {value_field:?}"
+                DecimalArbType::is_decimal_arb_field(&value_field),
+                "`value` field is not tagged decimal_arb: {value_field:?}"
             );
+            let (_p, scale) = DecimalArbType::precision_scale_from_field(&value_field)
+                .expect("decimal_arb metadata");
             let value_col = batch
                 .column(value_idx)
                 .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .expect("u256 column is FixedSizeBinary(32)");
+                .downcast_ref::<LargeBinaryArray>()
+                .expect("decimal_arb column is LargeBinary");
             assert!(
                 !value_col.is_null(0),
                 "`value` should be non-null in this row"
             );
-            assert_eq!(value_col.value(0).len(), 32, "u256 is 32 bytes");
+            // The canonical payload decodes to a valid decimal_arb value at the declared scale.
+            DecimalArbValue::from_canonical_bytes_at_scale(value_col.value(0), scale)
+                .expect("`value` decodes as decimal_arb");
 
-            // Nested high-precision decimals inside the array-of-records become Decimal128(100,0)
-            // (matching streamling's top-level-only u256 fixup — nested decimals fall through).
+            // Nested high-precision decimals inside the array-of-records route to
+            // streamling.decimal_arb (precision 100 > 76), lossless — they no longer fall
+            // through to the truncating Decimal128(100,0) path.
             let xfers_idx = target.index_of("after_evm_transfers").unwrap();
             let DataType::List(elem) = schema.field(xfers_idx).data_type() else {
                 panic!("after_evm_transfers is not a List");
@@ -3541,14 +3547,14 @@ mod arrow_avro_real_payload_tests {
                 panic!("after_evm_transfers element is not a Struct");
             };
             let nested_value = fields.iter().find(|f| f.name() == "value").unwrap();
-            assert_eq!(
-                nested_value.data_type(),
-                &DataType::Decimal128(100, 0),
-                "nested transfer `value` should be Decimal128(100,0)"
+            assert!(
+                DecimalArbType::is_decimal_arb_field(nested_value),
+                "nested transfer `value` should be decimal_arb, got {:?}",
+                nested_value.data_type()
             );
 
             println!(
-                "  OK: {} cols, schema + u256 + nested types verified",
+                "  OK: {} cols, schema + decimal_arb + nested types verified",
                 batch.num_columns()
             );
         }

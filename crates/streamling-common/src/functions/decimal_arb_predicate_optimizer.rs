@@ -37,9 +37,9 @@ use arrow_schema::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, Result as DFResult};
-use datafusion::logical_expr::expr::{Between, Case, InList, ScalarFunction};
+use datafusion::logical_expr::expr::{Between, InList, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
-use datafusion::logical_expr::{lit, BinaryExpr, Expr, ExprSchemable, Operator, ScalarUDF};
+use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator, ScalarUDF, lit};
 use std::sync::Arc;
 
 /// Precision used when coercing a 64-bit integer to decimal_arb at scale 0
@@ -88,7 +88,11 @@ impl DecimalArbExprRewrite {
     /// enclosing CASE/COALESCE. Returns `None` (leave untouched) if any non-null
     /// branch is not decimal_arb, or the decimal_arb branches disagree on scale
     /// (stamping a single scale would misread the other branch's bytes).
-    fn decimal_arb_branches_meta(&self, branches: &[&Expr], schema: &DFSchema) -> Option<(u32, u32)> {
+    fn decimal_arb_branches_meta(
+        &self,
+        branches: &[&Expr],
+        schema: &DFSchema,
+    ) -> Option<(u32, u32)> {
         let mut p_max = 0u32;
         let mut scale: Option<u32> = None;
         let mut any = false;
@@ -135,8 +139,12 @@ impl DecimalArbExprRewrite {
         match dtype {
             // Already decimal_arb (LargeBinary storage): pass through.
             DataType::LargeBinary if self.is_decimal_arb(&operand, schema) => Some(operand),
-            DataType::Decimal128(_, _) => Some(call(self.cast_from_decimal128.clone(), vec![operand])),
-            DataType::Decimal256(_, _) => Some(call(self.cast_from_decimal256.clone(), vec![operand])),
+            DataType::Decimal128(_, _) => {
+                Some(call(self.cast_from_decimal128.clone(), vec![operand]))
+            }
+            DataType::Decimal256(_, _) => {
+                Some(call(self.cast_from_decimal256.clone(), vec![operand]))
+            }
             DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -177,9 +185,10 @@ impl DecimalArbExprRewrite {
                         high,
                     })));
                 }
-                let (Some(low_c), Some(high_c)) =
-                    (self.coerce(*low.clone(), schema), self.coerce(*high.clone(), schema))
-                else {
+                let (Some(low_c), Some(high_c)) = (
+                    self.coerce(*low.clone(), schema),
+                    self.coerce(*high.clone(), schema),
+                ) else {
                     // A bound we can't coerce (e.g. a float) — leave the node
                     // so DataFusion surfaces its usual error.
                     return Ok(Transformed::no(Expr::Between(Between {
@@ -253,8 +262,11 @@ impl DecimalArbExprRewrite {
             // metadata on its output field. Re-stamp it (when all branches share
             // a scale) so downstream sinks treat it as NUMERIC(p, s), not BYTEA.
             Expr::Case(case) => {
-                let mut branches: Vec<&Expr> =
-                    case.when_then_expr.iter().map(|(_, t)| t.as_ref()).collect();
+                let mut branches: Vec<&Expr> = case
+                    .when_then_expr
+                    .iter()
+                    .map(|(_, t)| t.as_ref())
+                    .collect();
                 if let Some(e) = &case.else_expr {
                     branches.push(e.as_ref());
                 }
@@ -267,9 +279,11 @@ impl DecimalArbExprRewrite {
             Expr::ScalarFunction(sf) if sf.func.name() == "coalesce" => {
                 let branches: Vec<&Expr> = sf.args.iter().collect();
                 match self.decimal_arb_branches_meta(&branches, schema) {
-                    Some((p, s)) => {
-                        Ok(Transformed::yes(self.stamp_meta(Expr::ScalarFunction(sf), p, s)))
-                    }
+                    Some((p, s)) => Ok(Transformed::yes(self.stamp_meta(
+                        Expr::ScalarFunction(sf),
+                        p,
+                        s,
+                    ))),
                     None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
                 }
             }
@@ -446,7 +460,11 @@ mod tests {
             .collect()
             .await
             .unwrap();
-        let field = batches[0].schema().field_with_name("chosen").unwrap().clone();
+        let field = batches[0]
+            .schema()
+            .field_with_name("chosen")
+            .unwrap()
+            .clone();
         assert!(
             DecimalArbType::is_decimal_arb_field(&field),
             "CASE over decimal_arb must retain (precision, scale) metadata (F2); got {field:?}"

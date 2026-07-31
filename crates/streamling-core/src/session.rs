@@ -579,7 +579,8 @@ mod tests {
 
         let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "amt", 100, 0).unwrap();
         for v in values {
-            b.append_value(&DecimalArbValue::from_str(v).unwrap()).unwrap();
+            b.append_value(&DecimalArbValue::from_str(v).unwrap())
+                .unwrap();
         }
         let amt = b.finish().into_inner().0;
         let schema = Arc::new(Schema::new(vec![
