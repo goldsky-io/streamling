@@ -139,10 +139,18 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                         DecimalArbType::field(field.name(), p as u32, s as u32, field.is_nullable())
                             .map(Arc::new)
                             .unwrap_or_else(|_| {
-                                Arc::new(utf8_avro_decimal_field(field.name(), s, field.is_nullable()))
+                                Arc::new(utf8_avro_decimal_field(
+                                    field.name(),
+                                    s,
+                                    field.is_nullable(),
+                                ))
                             })
                     }
-                    (_, s) => Arc::new(utf8_avro_decimal_field(field.name(), s, field.is_nullable())),
+                    (_, s) => Arc::new(utf8_avro_decimal_field(
+                        field.name(),
+                        s,
+                        field.is_nullable(),
+                    )),
                 };
             }
             field.clone()

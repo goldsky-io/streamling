@@ -12,6 +12,7 @@ use streamling_e2e::{init_tracing, PipelineOpts, TestContext};
 
 #[derive(Debug, FromRow, Deserialize)]
 struct IdText {
+    #[allow(dead_code)]
     id: i64,
     t: String,
 }
@@ -186,10 +187,7 @@ async fn dec256_negative_high_scale() {
     // digits, fits NUMERIC(80,30) (the old code produced 60 integer digits).
     let neg = format!("-{}", "1".repeat(60));
     let rows = ingest_to_pg(&ctx, 60, 30, "NUMERIC(80,30)", &[(1, neg.as_str())]).await;
-    assert_eq!(
-        rows[0].t,
-        format!("-{}.{}", "1".repeat(30), "1".repeat(30))
-    );
+    assert_eq!(rows[0].t, format!("-{}.{}", "1".repeat(30), "1".repeat(30)));
 }
 
 // ---------------------------------------------------------------------------
