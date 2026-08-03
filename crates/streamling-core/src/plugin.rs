@@ -580,18 +580,21 @@ pub fn create_preprocessor_plugin(
     // Preprocessors are short-lived helpers: they are not registered in
     // PLUGIN_INSTANCE_REGISTRY and do not start the process-wide shutdown watcher
     // (unlike source/transform/sink). FFI create failures are internal/platform.
+    // Construct the struct directly (no InitializedPlugin::new): preprocessors have
+    // no output schema, so the op-column check in `new` does not apply and init
+    // remains infallible after a successful FFI create.
     let result = create_result
         .into_rust()
         .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
     let mapped_future = result
         .execution_future
         .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-    InitializedPlugin::new(
-        plugin_type.to_string(),
-        Box::pin(mapped_future),
-        plugin_channels,
-        None,
-    )
+    Ok(InitializedPlugin {
+        plugin_id: plugin_type.to_string(),
+        execution_future: Box::pin(mapped_future),
+        channels: plugin_channels,
+        output_schema: None,
+    })
 }
 
 pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
