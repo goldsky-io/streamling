@@ -604,3 +604,91 @@ pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::Schema;
+    use crate::error::StreamlingError;
+
+    /// Unused name that will not be present in the empty default plugin registry.
+    const UNKNOWN_PLUGIN: &str = "definitely_not_a_real_plugin";
+
+    fn assert_unknown_plugin_user_error(err: StreamlingError) {
+        assert!(
+            !err.is_internal(),
+            "missing plugin must be a user-facing error"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(UNKNOWN_PLUGIN),
+            "error should name the plugin: {msg}"
+        );
+        assert!(
+            msg.contains("is not available"),
+            "error should say plugin is not available: {msg}"
+        );
+    }
+
+    /// Regression: unknown plugins used to `panic!("Plugin {} not found!")`.
+    /// They must now return a structured user error (never a panic).
+    #[test]
+    fn create_source_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        match create_source_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    #[test]
+    fn create_transform_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        let empty_schema = Arc::new(Schema::empty());
+        match create_transform_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+            empty_schema,
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    #[test]
+    fn create_sink_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        let empty_schema = Arc::new(Schema::empty());
+        match create_sink_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+            empty_schema,
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    #[test]
+    fn create_preprocessor_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        match create_preprocessor_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+}
