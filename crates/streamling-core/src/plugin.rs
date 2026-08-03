@@ -413,8 +413,8 @@ pub fn create_source_plugin(
     // Validate schema before registering so a missing/invalid output schema does
     // not leave a half-initialized entry in the plugin instance registry.
     let output_schema = result.output_schema.into_option().ok_or_else(|| {
-        streamling_user_err!(
-            "source plugin '{}' did not provide an output schema",
+        streamling_err!(
+            "source plugin '{}' must provide an output schema (plugin invariant)",
             plugin_type
         )
     })?;
@@ -472,8 +472,8 @@ pub fn create_transform_plugin(
     // Validate schema before registering so a missing/invalid output schema does
     // not leave a half-initialized entry in the plugin instance registry.
     let output_schema = result.output_schema.into_option().ok_or_else(|| {
-        streamling_user_err!(
-            "transform plugin '{}' did not provide an output schema",
+        streamling_err!(
+            "transform plugin '{}' must provide an output schema (plugin invariant)",
             plugin_type
         )
     })?;
