@@ -577,20 +577,21 @@ pub fn create_preprocessor_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    // Preprocessors are short-lived helpers: they are not registered in
+    // PLUGIN_INSTANCE_REGISTRY and do not start the process-wide shutdown watcher
+    // (unlike source/transform/sink). FFI create failures are internal/platform.
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin {
-                plugin_id: plugin_type.to_string(),
-                execution_future: Box::pin(mapped_future),
-                channels: plugin_channels,
-                output_schema: None,
-            }
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels,
+        None,
+    )
 }
 
 pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
