@@ -528,21 +528,25 @@ pub fn create_sink_plugin(
     let result = create_result
         .into_rust()
         .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
-    start_shutdown_watcher_once();
-    register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-    merge_metadata_tags(
-        &metric_key(&app_config.application_id, &reference_name),
-        collect_labels(result.labels),
-    );
+    // Match source/transform: only register after InitializedPlugin::new succeeds
+    // so a future sink-schema invariant cannot leave a half-initialized registry entry.
+    let labels = collect_labels(result.labels);
     let mapped_future = result
         .execution_future
         .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-    InitializedPlugin::new(
+    let initialized = InitializedPlugin::new(
         plugin_type.to_string(),
         Box::pin(mapped_future),
-        plugin_channels,
+        plugin_channels.clone(),
         None,
-    )
+    )?;
+    start_shutdown_watcher_once();
+    register_plugin_instance(reference_name.as_str(), plugin_channels);
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        labels,
+    );
+    Ok(initialized)
 }
 
 pub fn create_preprocessor_plugin(
