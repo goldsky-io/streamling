@@ -3010,6 +3010,71 @@ mod tests {
         assert_eq!(fields, vec!["a"], "scan must project to the pushed columns");
     }
 
+    /// Unknown JSON schema types must stay user-facing after the same wrapping
+    /// `streamling` applies when creating a Kafka source. The source returns a
+    /// `DataFusionError::External` around a user-facing `StreamlingError`;
+    /// wrapping via `streamling_with_context` would default to `internal=true`
+    /// and make `--validate` report `success: false`. Recover with
+    /// `StreamlingError::from` instead (same pattern as script-transform).
+    #[test]
+    fn unknown_json_schema_type_stays_user_facing_after_source_context() {
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+
+        let session_manager = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<TopicPartitionOffset>("test-kafka-bad-schema");
+
+        let mut json_schema = BTreeMap::new();
+        json_schema.insert("id".to_string(), "uint64".to_string());
+        json_schema.insert("blob".to_string(), "not_a_type".to_string());
+
+        let df_err = KafkaSourceTableProvider::new(
+            "s".to_string(),
+            "s-metrics".to_string(),
+            test_kafka_config(),
+            "qa-validate-unused".to_string(),
+            Some("earliest".to_string()),
+            None,
+            1000,
+            10,
+            10,
+            false,
+            state_backend,
+            session_manager,
+            None,
+            false,
+            vec![],
+            false,
+            vec![],
+            KafkaFormat::Json,
+            Some(json_schema),
+        )
+        .expect_err("unknown schema type must fail source creation");
+
+        // Mirror the fixed call site in `streamling::lib`: recover via
+        // `StreamlingError::from` so the user-facing flag survives the External wrap.
+        let wrapped = StreamlingError::from(df_err)
+            .context("kafka source 's': failed to create Kafka source");
+
+        assert!(
+            !wrapped.is_internal(),
+            "unsupported JSON schema type must stay user-facing after Kafka source context, got: {wrapped}"
+        );
+        assert!(
+            wrapped.to_string().contains("not_a_type"),
+            "error should mention the bad type, got: {wrapped}"
+        );
+        assert!(
+            wrapped
+                .to_string()
+                .contains("failed to create Kafka source"),
+            "error should keep the Kafka source context, got: {wrapped}"
+        );
+    }
+
     #[test]
     fn json_payload_to_string_rejects_empty_payload() {
         let err = json_payload_to_string(b"", "orders", 3, 42).unwrap_err();

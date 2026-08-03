@@ -626,8 +626,13 @@ impl Streamling {
                             data_format,
                             kafka.schema.clone(),
                         )
-                        .streamling_with_context(|| {
-                            format!("{}: failed to create Kafka source", ctx.format())
+                        // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                        // so a user-facing schema error (e.g. unsupported JSON dtype) is
+                        // recovered from the `DataFusionError::External` wrapper and stays
+                        // user-facing. Otherwise `--validate` would misreport it as internal.
+                        .map_err(|e| {
+                            streamling_core::error::StreamlingError::from(e)
+                                .context(format!("{}: failed to create Kafka source", ctx.format()))
                         })?,
                     );
                     let extracted_pk = kafka_source_provider.get_extracted_primary_key();
