@@ -410,27 +410,31 @@ pub fn create_source_plugin(
     let result = create_result
         .into_rust()
         .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
-    start_shutdown_watcher_once();
-    register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-    merge_metadata_tags(
-        &metric_key(&app_config.application_id, &reference_name),
-        collect_labels(result.labels),
-    );
-    let mapped_future = result
-        .execution_future
-        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    // Validate schema before registering so a missing/invalid output schema does
+    // not leave a half-initialized entry in the plugin instance registry.
     let output_schema = result.output_schema.into_option().ok_or_else(|| {
         streamling_user_err!(
             "source plugin '{}' did not provide an output schema",
             plugin_type
         )
     })?;
-    InitializedPlugin::new(
+    let labels = collect_labels(result.labels);
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let initialized = InitializedPlugin::new(
         plugin_type.to_string(),
         Box::pin(mapped_future),
-        plugin_channels,
+        plugin_channels.clone(),
         Some(output_schema.into()),
-    )
+    )?;
+    start_shutdown_watcher_once();
+    register_plugin_instance(reference_name.as_str(), plugin_channels);
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        labels,
+    );
+    Ok(initialized)
 }
 
 pub fn create_transform_plugin(
@@ -465,27 +469,31 @@ pub fn create_transform_plugin(
     let result = create_result
         .into_rust()
         .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
-    start_shutdown_watcher_once();
-    register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-    merge_metadata_tags(
-        &metric_key(&app_config.application_id, &reference_name),
-        collect_labels(result.labels),
-    );
-    let mapped_future = result
-        .execution_future
-        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    // Validate schema before registering so a missing/invalid output schema does
+    // not leave a half-initialized entry in the plugin instance registry.
     let output_schema = result.output_schema.into_option().ok_or_else(|| {
         streamling_user_err!(
             "transform plugin '{}' did not provide an output schema",
             plugin_type
         )
     })?;
-    InitializedPlugin::new(
+    let labels = collect_labels(result.labels);
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let initialized = InitializedPlugin::new(
         plugin_type.to_string(),
         Box::pin(mapped_future),
-        plugin_channels,
+        plugin_channels.clone(),
         Some(output_schema.into()),
-    )
+    )?;
+    start_shutdown_watcher_once();
+    register_plugin_instance(reference_name.as_str(), plugin_channels);
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        labels,
+    );
+    Ok(initialized)
 }
 
 pub fn create_sink_plugin(

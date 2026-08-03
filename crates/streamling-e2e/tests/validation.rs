@@ -616,23 +616,13 @@ async fn test_validate_unknown_plugin_is_error_not_panic() {
         .await
         .expect("Failed to create test context");
 
+    // Schema registration is still needed so the Kafka source can resolve its
+    // Avro schema during topology build; no records are produced because
+    // `--validate` does not consume data.
     ctx.kafka
         .register_schema(TEST_SCHEMA)
         .await
         .expect("Failed to register schema");
-
-    let records: Vec<TestRecord> = (0..3)
-        .map(|i| TestRecord {
-            block: i,
-            id: format!("id_{}", i),
-            data: format!("data{}", i),
-        })
-        .collect();
-
-    ctx.kafka
-        .produce_avro_records(&records)
-        .await
-        .expect("Failed to produce records");
 
     // `definitely_not_a_real_plugin` is not a built-in sink type, so it binds to the
     // plugin sink variant and is resolved against the (empty) plugin registry.
@@ -657,10 +647,7 @@ sinks:
     );
 
     let output = ctx
-        .run_pipeline_raw(
-            &pipeline,
-            PipelineOpts::new().record_limit(3).arg("--validate"),
-        )
+        .run_pipeline_raw(&pipeline, PipelineOpts::new().arg("--validate"))
         .await
         .expect("Failed to run pipeline");
 
