@@ -608,8 +608,8 @@ pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::Schema;
     use crate::error::StreamlingError;
+    use arrow_schema::Schema;
 
     /// Unused name that will not be present in the empty default plugin registry.
     const UNKNOWN_PLUGIN: &str = "definitely_not_a_real_plugin";
