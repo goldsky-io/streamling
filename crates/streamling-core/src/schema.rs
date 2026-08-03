@@ -35,10 +35,17 @@ fn parse_data_type(type_str: &str) -> Result<DataType> {
         return Ok(decimal);
     }
 
-    let normalized = if type_str.eq_ignore_ascii_case("string") {
-        "Utf8".to_string()
-    } else {
-        type_str.to_upper_camel_case()
+    // `DataType::from_str` expects Arrow's exact spelling (e.g. `UInt64`, `Binary`),
+    // but `to_upper_camel_case` produces `Uint64`/`Bytes`, so common aliases that are
+    // advertised as supported would otherwise fail. Map those aliases explicitly first.
+    let normalized = match type_str.trim().to_ascii_lowercase().as_str() {
+        "string" | "utf8" => "Utf8".to_string(),
+        "bytes" | "binary" => "Binary".to_string(),
+        "uint8" => "UInt8".to_string(),
+        "uint16" => "UInt16".to_string(),
+        "uint32" => "UInt32".to_string(),
+        "uint64" => "UInt64".to_string(),
+        _ => type_str.to_upper_camel_case(),
     };
     DataType::from_str(&normalized).map_err(|_| {
         streamling_user_err!(
@@ -168,6 +175,50 @@ mod tests {
         assert_eq!(schema.field(1).data_type(), &DataType::Decimal256(50, 8));
         // A precision without a scale defaults the scale to 0.
         assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(10, 0));
+    }
+
+    /// Regression: `uint*` and `bytes` are advertised as supported types, but
+    /// `to_upper_camel_case` produced `Uint64`/`Bytes` which Arrow's
+    /// `DataType::from_str` rejects, so the validator used to `.unwrap()`-panic on
+    /// them. They must now resolve to the correct Arrow types.
+    #[test]
+    fn parses_unsigned_and_bytes_aliases() {
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert("a".to_string(), "uint8".to_string());
+        schema_map.insert("b".to_string(), "uint16".to_string());
+        schema_map.insert("c".to_string(), "uint32".to_string());
+        schema_map.insert("d".to_string(), "uint64".to_string());
+        schema_map.insert("e".to_string(), "bytes".to_string());
+        schema_map.insert("f".to_string(), "binary".to_string());
+        schema_map.insert("g".to_string(), "UInt64".to_string());
+
+        let schema = arrow_schema_from_type_map(&schema_map).expect("aliases must be supported");
+
+        assert_eq!(schema.field(0).data_type(), &DataType::UInt8);
+        assert_eq!(schema.field(1).data_type(), &DataType::UInt16);
+        assert_eq!(schema.field(2).data_type(), &DataType::UInt32);
+        assert_eq!(schema.field(3).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(5).data_type(), &DataType::Binary);
+        // Arrow's own spelling still works.
+        assert_eq!(schema.field(6).data_type(), &DataType::UInt64);
+    }
+
+    /// A genuinely unknown type still yields a structured user error (never a panic).
+    #[test]
+    fn unknown_type_is_user_error_not_panic() {
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert("x".to_string(), "not_a_type".to_string());
+
+        let err = arrow_schema_from_type_map(&schema_map).unwrap_err();
+        assert!(
+            !err.is_internal(),
+            "unsupported type must be a user-facing error"
+        );
+        assert!(
+            err.to_string()
+                .contains("unsupported data type 'not_a_type'")
+        );
     }
 
     /// Confirms a decimal declared in the schema actually decodes from a JSON payload.
