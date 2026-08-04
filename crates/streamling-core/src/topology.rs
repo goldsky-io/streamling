@@ -634,6 +634,9 @@ pub struct PostgresSink {
     /// Number of parallel tasks for writing to PostgreSQL. Each task processes
     /// a slice of the accumulated batch concurrently. Defaults to 1.
     pub parallelism: Option<usize>,
+    /// When true (default), each batch is collapsed to the latest row per
+    /// `primary_key` before it is written.
+    pub deduplicate: Option<bool>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -682,6 +685,9 @@ pub struct PostgresAggregateSink {
     pub batch_flush_interval: Option<String>,
     pub batch_size: Option<u32>,
     pub primary_key: Option<String>,
+    /// When true (default), each batch is collapsed to the latest row per
+    /// `primary_key` before it is written.
+    pub deduplicate: Option<bool>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -707,6 +713,9 @@ pub struct KafkaSink {
     /// Set `gzip` or `none` for brokers that reject lz4.
     #[serde(default)]
     pub compression: KafkaCompression,
+    /// When true (default), each batch is collapsed to the latest row per
+    /// `primary_key` before it is written.
+    pub deduplicate: Option<bool>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -725,6 +734,9 @@ pub struct ClickhouseSink {
     /// When false, uses plain ReplacingMergeTree() with INSERT for upserts and
     /// ALTER TABLE DELETE for deletes.
     pub append_only_mode: Option<bool>,
+    /// When true (default), each batch is collapsed to the latest row per
+    /// `primary_key` before it is written.
+    pub deduplicate: Option<bool>,
     /// Optional schema overrides for type conversions
     /// Maps column name -> ClickHouse type (e.g., "timestamp" -> "DateTime64(3)")
     #[serde(default)]
