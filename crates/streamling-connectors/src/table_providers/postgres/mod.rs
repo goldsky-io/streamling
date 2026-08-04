@@ -61,6 +61,28 @@ pub struct PostgresSinkTableProvider {
     write_batch_size: u32,
 }
 
+/// The key each batch is collapsed on before it reaches the sink, or `None`
+/// when deduplication is off.
+///
+/// This must match the destination's own key. In append-only mode the landing
+/// table's primary key — and this sink's `ON CONFLICT` target — is
+/// `(primary_key…, _gs_op)`, so an insert and a delete of the same row are two
+/// distinct rows there. Collapsing on the narrower `primary_key` alone would
+/// drop one of them, and the aggregation trigger accumulates deltas
+/// (`total = total + EXCLUDED`), so a dropped row corrupts the aggregate.
+fn dedup_key(
+    primary_key: Option<&str>,
+    append_only_mode: bool,
+    deduplicate: bool,
+) -> Option<String> {
+    let primary_key = primary_key.filter(|_| deduplicate)?;
+    Some(if append_only_mode {
+        format!("{primary_key},{COLUMN_NAME_OP}")
+    } else {
+        primary_key.to_string()
+    })
+}
+
 impl PostgresSinkTableProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -159,7 +181,11 @@ impl TableProvider for PostgresSinkTableProvider {
         let wrapper_sink = Arc::new(WrappingDataSink::new(
             postgres_sink,
             self.metric_metadata_id.clone(),
-            self.primary_key.clone().filter(|_| self.deduplicate),
+            dedup_key(
+                self.primary_key.as_deref(),
+                self.append_only_mode,
+                self.deduplicate,
+            ),
             self.telemetry.as_ref(),
         ));
 
@@ -354,5 +380,40 @@ impl DataSink for PostgresSinkExec {
 impl DisplayAs for PostgresSinkExec {
     fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "PostgresSink")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_key_matches_the_destination_key() {
+        // Plain sink: the table's PK is the configured key, so is the dedup key.
+        assert_eq!(dedup_key(Some("id"), false, true), Some("id".to_string()));
+        assert_eq!(
+            dedup_key(Some("account,day"), false, true),
+            Some("account,day".to_string())
+        );
+
+        // Append-only (aggregation landing table): the table's PK is
+        // (primary_key…, _gs_op), so an insert and a delete of the same row
+        // must both survive into the trigger's delta.
+        assert_eq!(
+            dedup_key(Some("id"), true, true),
+            Some("id,_gs_op".to_string())
+        );
+        assert_eq!(
+            dedup_key(Some("account,day"), true, true),
+            Some("account,day,_gs_op".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_key_is_none_when_disabled_or_keyless() {
+        assert_eq!(dedup_key(Some("id"), false, false), None);
+        assert_eq!(dedup_key(Some("id"), true, false), None);
+        assert_eq!(dedup_key(None, false, true), None);
+        assert_eq!(dedup_key(None, true, true), None);
     }
 }
