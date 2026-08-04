@@ -665,6 +665,9 @@ sinks:
 
 The PostgreSQL sink allows writing data to PostgreSQL tables. It create sink table automically.
 
+When a `primary_key` is set, each batch is collapsed to the latest row per key before writing; set `deduplicate: false`
+to disable that (see `Batch Deduplication` below).
+
 Sample configuration:
 
 ```yaml
@@ -698,6 +701,8 @@ Behavior for 256-bit integers (U256/I256):
 The PostgreSQL aggregation sink enables real-time aggregations directly in PostgreSQL using database triggers. Data flows into a landing table, and a trigger function automatically maintains aggregated values in a separate aggregation table.
 
 - **Landing Table**: Stores raw records in append-only mode with a composite primary key (`primary_key` + `_gs_op`).
+- **Deduplication**: each batch is collapsed to the latest row per `primary_key` before it reaches the landing table;
+  set `deduplicate: false` to disable that (see `Batch Deduplication` below).
 - **Aggregation Table**: Stores aggregated results, updated incrementally by the trigger.
 - **Operation Handling**: For `sum`, `count`, and `avg`, delete operations negate values. `count` also correctly handles updates (contributes 0 to the count). `min` and `max` do not support deletes or updates (use only for insert-only streams).
 
@@ -833,6 +838,8 @@ implemented as a custom DataFusion Table Provider (`TableProvider`) with the fol
   - Converts Arrow `RecordBatch`es to Avro-encoded messages.
   - Adds operation type column (`_gs_op`) to track INSERT/UPDATE/DELETE operations (see `Upsert Semantics` section
     below) as a message header with the `dbz.op` key.
+- **Deduplication**: when a `primary_key` is set, each batch is collapsed to the latest row per key before it is
+  produced; set `deduplicate: false` to disable that (see `Batch Deduplication` below). Message keying is unaffected.
 
 Kafka Sink uses
 high-level [FutureProducer](https://docs.rs/rdkafka/latest/rdkafka/producer/future_producer/struct.FutureProducer.html)
@@ -870,6 +877,7 @@ The ClickHouse sink writes records to a ClickHouse table over the HTTP interface
 
 - **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
 - **Compression**: INSERT request bodies can be gzip-compressed. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
+- **Deduplication**: each batch is collapsed to the latest row per `primary_key` before writing. Set `deduplicate: false` for append-only tables whose rows are deltas rather than states (e.g. `SummingMergeTree`) — see `Batch Deduplication` below.
 
 Sample configuration:
 
@@ -1430,6 +1438,32 @@ This replaces the previous nested `"Execution error: Execution error:"` pattern 
 By default, DataFusion passes data in a columnar format using `RecordBatch` without any additional metadata.
 So, in order to support upsert semantics, an additional `_gs_op` column is added to the schema. Unfortunately, this
 comes with some challenges mentioned in https://github.com/goldsky-io/streamling/pull/2.
+
+### Batch Deduplication
+
+Every sink configured with a `primary_key` — Postgres, Kafka and ClickHouse — collapses each
+batch to the **latest row per key** before writing it. Only the newest state of a row matters to an upsert, so this
+saves redundant writes. Sinks with no primary key never deduplicate.
+
+That assumption breaks when rows are **deltas rather than states**. Delta rows are meant to accumulate, so several
+of them legitimately share a key and every one has to be written — a retraction and its addition, or two different
+entities rolling up to the same aggregate key. Collapsing them silently drops rows and the destination drifts. Set
+`deduplicate: false` on those sinks:
+
+```yaml
+sinks:
+  revenue_rollup:
+    type: clickhouse
+    from: revenue_deltas
+    table: product_revenue_daily
+    primary_key: revenue_date,product_id,currency
+    append_only_mode: false
+    deduplicate: false
+```
+
+The primary key still drives everything else it is used for — `ALTER TABLE ... DELETE` keying and `CREATE TABLE`
+ordering in ClickHouse, `ON CONFLICT` targeting in Postgres, message keying in Kafka. `deduplicate: false` turns off
+the batch collapse and nothing else.
 
 ## Plugin System
 

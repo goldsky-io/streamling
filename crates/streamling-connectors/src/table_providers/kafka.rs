@@ -2848,6 +2848,7 @@ pub struct KafkaSinkTableProvider {
     parallelism: Option<usize>,
     /// Producer compression codec (maps to librdkafka's compression.type)
     compression: KafkaCompression,
+    deduplicate: bool,
     telemetry: Option<Telemetry>,
 }
 
@@ -2868,6 +2869,7 @@ impl KafkaSinkTableProvider {
         message_max_bytes: Option<u32>,
         parallelism: Option<usize>,
         compression: KafkaCompression,
+        deduplicate: Option<bool>,
         telemetry: Option<Telemetry>,
     ) -> Self {
         Self {
@@ -2885,6 +2887,7 @@ impl KafkaSinkTableProvider {
             message_max_bytes,
             parallelism,
             compression,
+            deduplicate: deduplicate.unwrap_or(true),
             telemetry,
         }
     }
@@ -2936,7 +2939,7 @@ impl TableProvider for KafkaSinkTableProvider {
         let wrapper_data_sink = Arc::new(WrappingDataSink::new(
             kafka_sink,
             metric_metadata_id.clone(),
-            self.primary_key.clone(),
+            self.primary_key.clone().filter(|_| self.deduplicate),
             self.telemetry.as_ref(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, wrapper_data_sink, None)))

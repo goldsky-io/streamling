@@ -55,6 +55,7 @@ pub struct PostgresSinkTableProvider {
     update_where: Option<BTreeMap<String, String>>,
     append_only_mode: bool,
     checkpoint_truncation: bool,
+    deduplicate: bool,
     parallelism: usize,
     telemetry: Option<Telemetry>,
     write_batch_size: u32,
@@ -76,6 +77,7 @@ impl PostgresSinkTableProvider {
         update_where: Option<BTreeMap<String, String>>,
         append_only_mode: bool,
         checkpoint_truncation: bool,
+        deduplicate: Option<bool>,
         reference_name: String,
         parallelism: Option<usize>,
         telemetry: Option<Telemetry>,
@@ -98,6 +100,7 @@ impl PostgresSinkTableProvider {
             update_where,
             append_only_mode,
             checkpoint_truncation,
+            deduplicate: deduplicate.unwrap_or(true),
             parallelism,
             telemetry,
             write_batch_size,
@@ -156,7 +159,7 @@ impl TableProvider for PostgresSinkTableProvider {
         let wrapper_sink = Arc::new(WrappingDataSink::new(
             postgres_sink,
             self.metric_metadata_id.clone(),
-            self.primary_key.clone(),
+            self.primary_key.clone().filter(|_| self.deduplicate),
             self.telemetry.as_ref(),
         ));
 
