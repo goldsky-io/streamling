@@ -1776,6 +1776,22 @@ plugin:
       key: value
 ```
 
+`preprocessor_ids` is an **ordered allowlist**: the chain runs sequentially, so
+specialized preprocessors must be listed before generic ones that would
+otherwise claim the same nodes.
+
+An id that no loaded plugin registered is **skipped with a warning**, not a
+failure — the id list and the plugin bundle are versioned independently, so a
+bundle that predates a newly added id must not take the pipeline down at
+startup. Under `--validate` the warning is reported in the `warnings` array of
+the JSON output.
+
+Skipping stays honest: if a skipped preprocessor was the one meant to expand a
+placeholder `type: dataset` source, the pipeline still fails — but with an error
+naming both the leftover source(s) and the skipped preprocessor id(s), instead of
+the misleading `plugin 'dataset' is not available` produced by the unknown-source
+fallthrough.
+
 #### Side Output Trait
 
 Side outputs observe data from sources without modifying the pipeline. Unlike other plugin types, side outputs use direct FFI invocation (no channels). One instance is created per source.

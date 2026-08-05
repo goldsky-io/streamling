@@ -288,6 +288,21 @@ fn find_plugin(plugin_id: &PluginId) -> Option<Arc<PluginModuleRef>> {
     module_registry.get(plugin_id).cloned()
 }
 
+/// Plugin ids registered by all currently loaded plugin modules, sorted for
+/// stable output.
+///
+/// Used to check whether an *optional* plugin is available before instantiating
+/// it (see `build_plugin_preprocessors`) and to name what is actually available
+/// in diagnostics when a configured id cannot be resolved.
+pub fn registered_plugin_ids() -> Vec<String> {
+    let module_registry = PLUGIN_MODULE_REGISTRY
+        .read()
+        .expect("plugin module registry lock poisoned");
+    let mut ids: Vec<String> = module_registry.keys().map(|id| id.to_string()).collect();
+    ids.sort();
+    ids
+}
+
 fn create_plugin_async_runtime(handle: Handle) -> PluginAsyncRuntimeObj {
     // `TD_Opaque` chooses `RBox<()>` for the erased-pointer parameter
     PluginAsyncRuntime_TO::from_value(PluginTokioWrapper { inner: handle }, TD_Opaque)

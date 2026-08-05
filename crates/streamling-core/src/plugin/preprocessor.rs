@@ -4,8 +4,9 @@ use abi_stable::traits::IntoReprC;
 use streamling_config::preprocessors::{Preprocessor, PreprocessorError};
 pub use streamling_plugin::PluginMsg;
 use streamling_plugin::{PluginChannel, PluginChannels};
+use tracing::warn;
 
-use super::create_preprocessor_plugin;
+use super::{create_preprocessor_plugin, registered_plugin_ids};
 
 pub struct PluginPreprocessorAdapter {
     app_config: AppConfig,
@@ -110,16 +111,122 @@ impl Preprocessor for PluginPreprocessorAdapter {
     }
 }
 
-pub fn build_plugin_preprocessors(app_config: &AppConfig) -> Vec<Box<dyn Preprocessor>> {
-    app_config
-        .plugin
-        .preprocessor_ids
-        .iter()
+/// Instantiate the configured topology preprocessors, in configured order.
+///
+/// The configured id list is an *ordered allowlist*: the chain runs
+/// sequentially and specialized expanders must run before generic ones. A
+/// configured id that no loaded plugin registered is **skipped with a warning**
+/// instead of failing the pipeline, because the id list and the plugin bundle
+/// are versioned independently — a bundle that predates a newly added id must
+/// not take the whole pipeline down at startup. `--validate` harvests WARN logs
+/// into its JSON output, so a skip stays visible to callers.
+///
+/// Returns the preprocessors together with the ids that were skipped, so the
+/// caller can name them if preprocessing left unexpanded sources behind (see
+/// `topology_validation::validate_no_unexpanded_dataset_sources`).
+pub fn build_plugin_preprocessors(
+    app_config: &AppConfig,
+) -> (Vec<Box<dyn Preprocessor>>, Vec<String>) {
+    let registered = registered_plugin_ids();
+    let (available, skipped) =
+        split_available_preprocessor_ids(&app_config.plugin.preprocessor_ids, &registered);
+
+    for id in &skipped {
+        warn!(
+            preprocessor_id = %id,
+            "Preprocessor '{}' is not registered by any loaded plugin; skipping it. Registered plugin ids: [{}]",
+            id,
+            registered.join(", ")
+        );
+    }
+
+    let preprocessors = available
+        .into_iter()
         .map(|id| {
-            Box::new(PluginPreprocessorAdapter::new(
-                app_config.clone(),
-                id.clone(),
-            )) as Box<dyn Preprocessor>
+            Box::new(PluginPreprocessorAdapter::new(app_config.clone(), id))
+                as Box<dyn Preprocessor>
         })
-        .collect()
+        .collect();
+
+    (preprocessors, skipped)
+}
+
+/// Split configured preprocessor ids into those a loaded plugin can serve and
+/// those it cannot, preserving configured order in both halves. Relative order
+/// of the resolved ids is load-bearing: the chain runs sequentially.
+fn split_available_preprocessor_ids(
+    configured: &[String],
+    registered: &[String],
+) -> (Vec<String>, Vec<String>) {
+    configured
+        .iter()
+        .cloned()
+        .partition(|id| registered.contains(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn unregistered_ids_are_skipped_and_registered_order_is_preserved() {
+        let (available, skipped) = split_available_preprocessor_ids(
+            &ids(&[
+                "solana_dataset_preprocessor",
+                "hypercore_dataset_preprocessor",
+                "dataset_preprocessor",
+                "kafka_schema_compat_preprocessor",
+            ]),
+            // A plugin bundle predating `hypercore_dataset_preprocessor`.
+            &ids(&[
+                "dataset_preprocessor",
+                "kafka_schema_compat_preprocessor",
+                "solana_dataset_preprocessor",
+            ]),
+        );
+
+        assert_eq!(
+            available,
+            ids(&[
+                "solana_dataset_preprocessor",
+                "dataset_preprocessor",
+                "kafka_schema_compat_preprocessor",
+            ]),
+            "resolved ids must keep their configured relative order"
+        );
+        assert_eq!(skipped, ids(&["hypercore_dataset_preprocessor"]));
+    }
+
+    #[test]
+    fn duplicate_configured_id_is_reported_once_per_occurrence() {
+        let (available, skipped) =
+            split_available_preprocessor_ids(&ids(&["missing", "missing"]), &[]);
+        assert!(available.is_empty());
+        assert_eq!(skipped, ids(&["missing", "missing"]));
+    }
+
+    #[test]
+    fn empty_config_builds_nothing() {
+        let (available, skipped) =
+            split_available_preprocessor_ids(&[], &ids(&["dataset_preprocessor"]));
+        assert!(available.is_empty());
+        assert!(skipped.is_empty());
+    }
+
+    /// Regression: an id no loaded plugin provides used to be instantiated
+    /// anyway and then fail the whole pipeline at startup.
+    #[test]
+    fn build_with_no_plugins_loaded_skips_every_configured_id() {
+        let mut app_config = AppConfig::load().expect("embedded config must load");
+        app_config.plugin.preprocessor_ids = ids(&["bogus_preprocessor"]);
+
+        let (preprocessors, skipped) = build_plugin_preprocessors(&app_config);
+
+        assert!(preprocessors.is_empty());
+        assert_eq!(skipped, ids(&["bogus_preprocessor"]));
+    }
 }
