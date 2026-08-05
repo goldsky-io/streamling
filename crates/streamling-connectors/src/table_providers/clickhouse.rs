@@ -350,6 +350,7 @@ struct SinkParams {
     primary_keys: Vec<String>,
     parallelism: usize,
     append_only_mode: bool,
+    deduplicate: bool,
     version_column_name: Option<String>,
     schema_override: Option<std::collections::HashMap<String, String>>,
     telemetry: Option<Telemetry>,
@@ -658,6 +659,7 @@ impl ClickHouseTableProvider {
         source_name: String,
         parallelism: Option<usize>,
         append_only_mode: Option<bool>,
+        deduplicate: Option<bool>,
         version_column_name: Option<String>,
         schema_override: Option<std::collections::HashMap<String, String>>,
         compression_override: Option<ClickHouseCompression>,
@@ -693,6 +695,7 @@ impl ClickHouseTableProvider {
             primary_keys,
             parallelism,
             append_only_mode: append_only_mode.unwrap_or(true),
+            deduplicate: deduplicate.unwrap_or(true),
             version_column_name,
             schema_override,
             telemetry,
@@ -895,7 +898,9 @@ impl TableProvider for ClickHouseTableProvider {
         let wrapper_sink = Arc::new(WrappingDataSink::new(
             clickhouse_sink,
             self.metric_metadata_id.clone(),
-            Some(sink_params.primary_keys.join(",")),
+            sink_params
+                .deduplicate
+                .then(|| sink_params.primary_keys.join(",")),
             sink_params.telemetry.as_ref(),
         ));
         Ok(Arc::new(DataSinkExec::new(

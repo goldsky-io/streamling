@@ -626,8 +626,13 @@ impl Streamling {
                             data_format,
                             kafka.schema.clone(),
                         )
-                        .streamling_with_context(|| {
-                            format!("{}: failed to create Kafka source", ctx.format())
+                        // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                        // so a user-facing schema error (e.g. unsupported JSON dtype) is
+                        // recovered from the `DataFusionError::External` wrapper and stays
+                        // user-facing. Otherwise `--validate` would misreport it as internal.
+                        .map_err(|e| {
+                            streamling_core::error::StreamlingError::from(e)
+                                .context(format!("{}: failed to create Kafka source", ctx.format()))
                         })?,
                     );
                     let extracted_pk = kafka_source_provider.get_extracted_primary_key();
@@ -1633,6 +1638,7 @@ impl Streamling {
                         update_where.clone(),
                         false, // append_only_mode (normal Postgres sink)
                         false, // checkpoint_truncation (disabled for normal sink)
+                        postgres.deduplicate,
                         reference_name.clone(),
                         postgres.parallelism,
                         sink_telemetry.clone(),
@@ -1751,6 +1757,7 @@ impl Streamling {
                         None, // update_where (not applicable for aggregation sink)
                         true, // append_only_mode (aggregation sink)
                         true, // checkpoint_truncation (enabled for aggregation sink)
+                        postgres.deduplicate,
                         reference_name.clone(),
                         None, // parallelism (default for aggregation sink)
                         sink_telemetry.clone(),
@@ -1881,6 +1888,7 @@ impl Streamling {
                         kafka_sink.message_max_bytes,
                         kafka_sink.parallelism,
                         kafka_sink.compression,
+                        kafka_sink.deduplicate,
                         sink_telemetry.clone(),
                     ));
                     session_manager
@@ -1941,6 +1949,7 @@ impl Streamling {
                         from.clone(),
                         parallelism,
                         clickhouse_sink.append_only_mode,
+                        clickhouse_sink.deduplicate,
                         clickhouse_sink.version_column_name.clone(),
                         clickhouse_sink.schema_override.clone(),
                         clickhouse_sink.compression,
