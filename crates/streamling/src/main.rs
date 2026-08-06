@@ -127,7 +127,7 @@ async fn run_pipeline(
 
     let pipeline_definition_location =
         pipeline_file.unwrap_or_else(|| app_config.pipeline_definition_location.clone());
-    let (plugin_preprocessors, skipped_preprocessor_ids) = build_plugin_preprocessors(&app_config);
+    let plugin_preprocessors = build_plugin_preprocessors(&app_config);
     let preprocessor = TopologyPreprocessor::new(plugin_preprocessors);
     let config_string = read_to_string(&pipeline_definition_location)
         .streamling_context("failed to read pipeline definition")?;
@@ -136,10 +136,6 @@ async fn run_pipeline(
         .preprocess_topology(config_string)
         .await
         .streamling_context("failed to preprocess pipeline topology")?;
-    streamling_core::topology_validation::validate_no_unexpanded_dataset_sources(
-        &pipeline_topology,
-        &skipped_preprocessor_ids,
-    )?;
     let pipeline_topology = PipelineTopology::load_from_string(&pipeline_topology)?;
     streamling_core::topology_validation::validate_job_mode(
         app_config.job_mode,

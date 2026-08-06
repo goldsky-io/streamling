@@ -1,8 +1,7 @@
 //! Validation for pipeline topology.
 //!
 //! Pre-deserialization: catches orphan sources/transforms (nodes with no downstream
-//! consumers) which would cause scan-sharing to wait forever and deadlock the pipeline,
-//! and (post-preprocessing) catches placeholder sources no preprocessor expanded.
+//! consumers) which would cause scan-sharing to wait forever and deadlock the pipeline.
 //!
 //! Post-deserialization: validates configuration constraints (e.g. job_mode requires
 //! hybrid sources).
@@ -18,92 +17,6 @@ fn strip_sql_quotes(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-/// Source `type` of a Goldsky dataset placeholder, before a preprocessor plugin
-/// rewrites it into a concrete source. [`Source`] has no `dataset` variant; an
-/// unknown `type` falls through to `Source::plugin`, so nothing downstream can
-/// consume one.
-const DATASET_SOURCE_TYPE: &str = "dataset";
-
-/// Pipeline configs come in two shapes: bare (`sources:` at the root) and
-/// wrapped (`definition:` holding the topology). Returns whichever holds the
-/// topology.
-fn topology_root(value: &serde_yaml::Value) -> &serde_yaml::Value {
-    match value.get("definition") {
-        Some(def) if def.is_mapping() => def,
-        _ => value,
-    }
-}
-
-/// Validates that preprocessing left no `type: dataset` sources behind.
-/// Runs on the config after preprocessing, before deserialization.
-///
-/// A `dataset` source is a placeholder that a preprocessor plugin must rewrite.
-/// If one survives, `Source`'s unknown-type fallthrough treats it as a plugin
-/// source and the pipeline dies with `plugin 'dataset' is not available`, which
-/// says nothing about the real cause — usually a preprocessor that was
-/// configured but absent from the loaded plugin bundle, which
-/// `plugin::build_plugin_preprocessors` warns about and skips. Naming both the
-/// leftover sources and `skipped_preprocessor_ids` makes that mismatch
-/// self-diagnosing.
-///
-/// A config that does not parse as YAML is left to the topology loader, which
-/// reports the syntax error authoritatively.
-pub fn validate_no_unexpanded_dataset_sources(
-    config: &str,
-    skipped_preprocessor_ids: &[String],
-) -> crate::error::Result<()> {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(config) else {
-        return Ok(());
-    };
-
-    let mut unexpanded: Vec<&str> = topology_root(&value)
-        .get("sources")
-        .and_then(|v| v.as_mapping())
-        .map(|sources| {
-            sources
-                .iter()
-                .filter(|(_, source)| {
-                    source.get("type").and_then(|t| t.as_str()) == Some(DATASET_SOURCE_TYPE)
-                })
-                .filter_map(|(name, _)| name.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if unexpanded.is_empty() {
-        return Ok(());
-    }
-    unexpanded.sort_unstable();
-
-    let quoted = |names: &[&str]| {
-        names
-            .iter()
-            .map(|name| format!("'{name}'"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    let cause = if skipped_preprocessor_ids.is_empty() {
-        "No configured preprocessor expanded them; check `plugin.preprocessor_ids`.".to_string()
-    } else {
-        let skipped: Vec<&str> = skipped_preprocessor_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        format!(
-            "Preprocessor(s) {} were configured but not registered by any loaded plugin, so they were skipped; \
-             the loaded plugin bundle is likely older than `plugin.preprocessor_ids`.",
-            quoted(&skipped)
-        )
-    };
-
-    Err(streamling_user_err!(
-        "Source(s) {} still have `type: dataset` after preprocessing. {}",
-        quoted(&unexpanded),
-        cause
-    ))
-}
-
 /// Validates that all sources and transforms have at least one consumer.
 /// Runs on the raw config before preprocessing.
 ///
@@ -112,7 +25,11 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
     let value: serde_yaml::Value =
         serde_yaml::from_str(config).map_err(|e| streamling_user_err!("invalid YAML: {}", e))?;
 
-    let root = topology_root(&value);
+    let root = if let Some(def) = value.get("definition") {
+        if def.is_mapping() { def } else { &value }
+    } else {
+        &value
+    };
 
     let sources: Vec<String> = root
         .get("sources")
@@ -268,110 +185,6 @@ pub fn validate_job_mode(job_mode: bool, topology: &PipelineTopology) -> crate::
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Regression: a `type: dataset` source that survived preprocessing used to
-    /// fall through to `Source::plugin` and fail with the misleading
-    /// `plugin 'dataset' is not available`.
-    #[test]
-    fn unexpanded_dataset_source_names_source_and_skipped_preprocessor() {
-        let config = r#"
-sources:
-  trades:
-    type: dataset
-    dataset_name: hypercore.trades
-transforms: {}
-sinks:
-  out:
-    type: print
-    from: trades
-"#;
-        let err = validate_no_unexpanded_dataset_sources(
-            config,
-            &["hypercore_dataset_preprocessor".to_string()],
-        )
-        .expect_err("leftover dataset source must fail validation");
-        let message = err.to_string();
-        assert!(message.contains("'trades'"), "message: {message}");
-        assert!(
-            message.contains("hypercore_dataset_preprocessor"),
-            "message: {message}"
-        );
-        assert!(!err.is_internal(), "config mismatch is a user error");
-    }
-
-    #[test]
-    fn unexpanded_dataset_source_without_skips_points_at_config() {
-        let config = r#"
-sources:
-  trades:
-    type: dataset
-    dataset_name: hypercore.trades
-transforms: {}
-sinks:
-  out:
-    type: print
-    from: trades
-"#;
-        let message = validate_no_unexpanded_dataset_sources(config, &[])
-            .expect_err("leftover dataset source must fail validation")
-            .to_string();
-        assert!(message.contains("'trades'"), "message: {message}");
-        assert!(
-            message.contains("plugin.preprocessor_ids"),
-            "message: {message}"
-        );
-    }
-
-    #[test]
-    fn expanded_sources_pass_even_with_skipped_preprocessors() {
-        let config = r#"
-definition:
-  sources:
-    trades:
-      type: kafka
-      topic: hypercore.trades
-      primary_key: id
-  transforms: {}
-  sinks:
-    out:
-      type: print
-      from: trades
-"#;
-        assert!(
-            validate_no_unexpanded_dataset_sources(config, &["some_preprocessor".to_string()])
-                .is_ok(),
-            "a skipped preprocessor is only fatal when it left a dataset source behind"
-        );
-    }
-
-    #[test]
-    fn all_unexpanded_sources_are_listed_sorted() {
-        let config = r#"
-sources:
-  zeta:
-    type: dataset
-    dataset_name: hypercore.zeta
-  alpha:
-    type: dataset
-    dataset_name: hypercore.alpha
-  passthrough:
-    type: kafka
-    topic: t
-    primary_key: id
-transforms: {}
-sinks: {}
-"#;
-        let message = validate_no_unexpanded_dataset_sources(config, &[])
-            .expect_err("leftover dataset sources must fail validation")
-            .to_string();
-        assert!(message.contains("'alpha', 'zeta'"), "message: {message}");
-        assert!(!message.contains("passthrough"), "message: {message}");
-    }
-
-    #[test]
-    fn unparseable_config_is_left_to_the_topology_loader() {
-        assert!(validate_no_unexpanded_dataset_sources("sources: [unclosed", &[]).is_ok());
-    }
 
     #[test]
     fn unused_source_returns_error() {

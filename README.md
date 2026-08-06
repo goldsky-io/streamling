@@ -1776,21 +1776,20 @@ plugin:
       key: value
 ```
 
-`preprocessor_ids` is an **ordered allowlist**: the chain runs sequentially, so
-specialized preprocessors must be listed before generic ones that would
-otherwise claim the same nodes.
+`preprocessor_ids` is an ordered allowlist. The chain runs in the order given, so
+list specialized preprocessors before generic ones that would claim the same nodes.
 
-An id that no loaded plugin registered is **skipped with a warning**, not a
-failure — the id list and the plugin bundle are versioned independently, so a
-bundle that predates a newly added id must not take the pipeline down at
-startup. Under `--validate` the warning is reported in the `warnings` array of
-the JSON output.
+An id that no loaded plugin registered is skipped with a warning rather than
+treated as a failure. The id list and the plugin bundle are deployed separately,
+so a bundle that predates a newly added id must not take the pipeline down at
+startup. Under `--validate` the warning appears in the `warnings` array of the
+JSON output.
 
-Skipping stays honest: if a skipped preprocessor was the one meant to expand a
-placeholder `type: dataset` source, the pipeline still fails — but with an error
-naming both the leftover source(s) and the skipped preprocessor id(s), instead of
-the misleading `plugin 'dataset' is not available` produced by the unknown-source
-fallthrough.
+Skipping does not hide the consequences. A preprocessor that rewrites a
+placeholder source into a concrete one still leaves that placeholder behind when
+it is skipped, and the pipeline fails on the unresolvable source type. That error
+lists the plugin ids actually registered, so an empty or stale bundle is visible
+in the message.
 
 #### Side Output Trait
 

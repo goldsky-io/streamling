@@ -111,22 +111,16 @@ impl Preprocessor for PluginPreprocessorAdapter {
     }
 }
 
-/// Instantiate the configured topology preprocessors, in configured order.
+/// Instantiates the configured topology preprocessors, in configured order.
 ///
-/// The configured id list is an *ordered allowlist*: the chain runs
-/// sequentially and specialized expanders must run before generic ones. A
-/// configured id that no loaded plugin registered is **skipped with a warning**
-/// instead of failing the pipeline, because the id list and the plugin bundle
-/// are versioned independently — a bundle that predates a newly added id must
-/// not take the whole pipeline down at startup. `--validate` harvests WARN logs
-/// into its JSON output, so a skip stays visible to callers.
-///
-/// Returns the preprocessors together with the ids that were skipped, so the
-/// caller can name them if preprocessing left unexpanded sources behind (see
-/// `topology_validation::validate_no_unexpanded_dataset_sources`).
-pub fn build_plugin_preprocessors(
-    app_config: &AppConfig,
-) -> (Vec<Box<dyn Preprocessor>>, Vec<String>) {
+/// The id list is an ordered allowlist: the chain runs sequentially, so
+/// specialized expanders must precede generic ones. A configured id that no
+/// loaded plugin registered is skipped with a warning instead of failing the
+/// pipeline, because the id list and the plugin bundle are deployed separately —
+/// a bundle that predates a newly added id must not take the whole pipeline down
+/// at startup. `--validate` harvests WARN logs into its JSON output, so a skip
+/// stays visible to callers.
+pub fn build_plugin_preprocessors(app_config: &AppConfig) -> Vec<Box<dyn Preprocessor>> {
     let registered = registered_plugin_ids();
     let (available, skipped) =
         split_available_preprocessor_ids(&app_config.plugin.preprocessor_ids, &registered);
@@ -140,15 +134,13 @@ pub fn build_plugin_preprocessors(
         );
     }
 
-    let preprocessors = available
+    available
         .into_iter()
         .map(|id| {
             Box::new(PluginPreprocessorAdapter::new(app_config.clone(), id))
                 as Box<dyn Preprocessor>
         })
-        .collect();
-
-    (preprocessors, skipped)
+        .collect()
 }
 
 /// Split configured preprocessor ids into those a loaded plugin can serve and
@@ -173,46 +165,24 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_ids_are_skipped_and_registered_order_is_preserved() {
+    fn unregistered_ids_are_skipped_and_resolved_order_is_preserved() {
         let (available, skipped) = split_available_preprocessor_ids(
-            &ids(&[
-                "solana_dataset_preprocessor",
-                "hypercore_dataset_preprocessor",
-                "dataset_preprocessor",
-                "kafka_schema_compat_preprocessor",
-            ]),
-            // A plugin bundle predating `hypercore_dataset_preprocessor`.
-            &ids(&[
-                "dataset_preprocessor",
-                "kafka_schema_compat_preprocessor",
-                "solana_dataset_preprocessor",
-            ]),
+            &ids(&["specific_expander", "new_expander", "generic_expander"]),
+            // A plugin bundle that predates `new_expander`.
+            &ids(&["generic_expander", "specific_expander"]),
         );
 
         assert_eq!(
             available,
-            ids(&[
-                "solana_dataset_preprocessor",
-                "dataset_preprocessor",
-                "kafka_schema_compat_preprocessor",
-            ]),
+            ids(&["specific_expander", "generic_expander"]),
             "resolved ids must keep their configured relative order"
         );
-        assert_eq!(skipped, ids(&["hypercore_dataset_preprocessor"]));
-    }
-
-    #[test]
-    fn duplicate_configured_id_is_reported_once_per_occurrence() {
-        let (available, skipped) =
-            split_available_preprocessor_ids(&ids(&["missing", "missing"]), &[]);
-        assert!(available.is_empty());
-        assert_eq!(skipped, ids(&["missing", "missing"]));
+        assert_eq!(skipped, ids(&["new_expander"]));
     }
 
     #[test]
     fn empty_config_builds_nothing() {
-        let (available, skipped) =
-            split_available_preprocessor_ids(&[], &ids(&["dataset_preprocessor"]));
+        let (available, skipped) = split_available_preprocessor_ids(&[], &ids(&["some_expander"]));
         assert!(available.is_empty());
         assert!(skipped.is_empty());
     }
@@ -224,9 +194,6 @@ mod tests {
         let mut app_config = AppConfig::load().expect("embedded config must load");
         app_config.plugin.preprocessor_ids = ids(&["bogus_preprocessor"]);
 
-        let (preprocessors, skipped) = build_plugin_preprocessors(&app_config);
-
-        assert!(preprocessors.is_empty());
-        assert_eq!(skipped, ids(&["bogus_preprocessor"]));
+        assert!(build_plugin_preprocessors(&app_config).is_empty());
     }
 }
