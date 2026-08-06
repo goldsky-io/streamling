@@ -622,6 +622,13 @@ impl MetricsRecorder {
 pub fn initialize_metrics_recorder(
     metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
 ) {
+    // Nothing to record without metadata (e.g. `--validate`/dry-run of a minimal topology).
+    // Returning early avoids panicking on an empty registry during first initialization.
+    if metric_metadata_registry.is_empty() {
+        debug!("Skipping metrics recorder initialization: no metric metadata available");
+        return;
+    }
+
     let mut instance = METRICS_RECORDER_INSTANCE.lock().unwrap();
     if instance.is_none() {
         let meter = get_meter();
@@ -1233,6 +1240,21 @@ mod tests {
             seed_metadata("app::other");
             merge_metadata_tags("app::missing", vec![("chain".into(), "eth".into())]);
             assert!(additional_tags("app::other").is_empty());
+        }
+
+        /// Regression: `--validate`/dry-run of a minimal topology produced an empty
+        /// metric metadata registry, and the first initialization used to
+        /// `.expect()`-panic on `values().next()`. It must now be a no-op instead.
+        #[test]
+        fn empty_registry_does_not_panic() {
+            let _guard = TEST_LOCK.lock().unwrap();
+            reset_instance();
+            initialize_metrics_recorder(HashMap::new());
+            let instance = METRICS_RECORDER_INSTANCE.lock().unwrap();
+            assert!(
+                instance.is_none(),
+                "empty registry must not initialize the recorder"
+            );
         }
 
         #[test]

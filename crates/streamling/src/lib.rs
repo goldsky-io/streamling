@@ -626,8 +626,13 @@ impl Streamling {
                             data_format,
                             kafka.schema.clone(),
                         )
-                        .streamling_with_context(|| {
-                            format!("{}: failed to create Kafka source", ctx.format())
+                        // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                        // so a user-facing schema error (e.g. unsupported JSON dtype) is
+                        // recovered from the `DataFusionError::External` wrapper and stays
+                        // user-facing. Otherwise `--validate` would misreport it as internal.
+                        .map_err(|e| {
+                            streamling_core::error::StreamlingError::from(e)
+                                .context(format!("{}: failed to create Kafka source", ctx.format()))
                         })?,
                     );
                     let extracted_pk = kafka_source_provider.get_extracted_primary_key();
@@ -1301,7 +1306,17 @@ impl Streamling {
                         schema.clone(),
                         parallelism,
                         batch_size,
-                    );
+                    )
+                    // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                    // so a user-facing schema error (e.g. unsupported dtype) is recovered
+                    // from the `DataFusionError::External` wrapper and stays user-facing.
+                    // Otherwise `--validate` would misreport it as an internal failure.
+                    .map_err(|e| {
+                        streamling_core::error::StreamlingError::from(e).context(format!(
+                            "{}: failed to build script transform",
+                            ctx.format()
+                        ))
+                    })?;
 
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(wasm_node),
@@ -1623,6 +1638,7 @@ impl Streamling {
                         update_where.clone(),
                         false, // append_only_mode (normal Postgres sink)
                         false, // checkpoint_truncation (disabled for normal sink)
+                        postgres.deduplicate,
                         reference_name.clone(),
                         postgres.parallelism,
                         sink_telemetry.clone(),
@@ -1741,6 +1757,7 @@ impl Streamling {
                         None, // update_where (not applicable for aggregation sink)
                         true, // append_only_mode (aggregation sink)
                         true, // checkpoint_truncation (enabled for aggregation sink)
+                        postgres.deduplicate,
                         reference_name.clone(),
                         None, // parallelism (default for aggregation sink)
                         sink_telemetry.clone(),
@@ -1871,6 +1888,7 @@ impl Streamling {
                         kafka_sink.message_max_bytes,
                         kafka_sink.parallelism,
                         kafka_sink.compression,
+                        kafka_sink.deduplicate,
                         sink_telemetry.clone(),
                     ));
                     session_manager
@@ -1931,6 +1949,7 @@ impl Streamling {
                         from.clone(),
                         parallelism,
                         clickhouse_sink.append_only_mode,
+                        clickhouse_sink.deduplicate,
                         clickhouse_sink.version_column_name.clone(),
                         clickhouse_sink.schema_override.clone(),
                         clickhouse_sink.compression,
@@ -2029,67 +2048,75 @@ impl Streamling {
 
         let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 
-        sources_to_sinks
-            .into_iter()
-            .for_each(|(_, (source_plan, mut sinks))| {
-                let future_name = sinks
-                    .iter()
-                    .map(|e| e.name.as_str())
-                    .collect::<Vec<&str>>()
-                    .join(", ");
-                let sink_plan = if sinks.len() > 1 {
-                    // Fan-out: each sink gets its own RebatchExec injected by
-                    // the MultiSinkExtensionPlanner, so the raw source_plan
-                    // flows into MultiSinkLogicalNode without any upstream
-                    // wrapping. Per-sink configs live on MultiSinkEntry.
-                    let entries: Vec<MultiSinkEntry> = sinks
-                        .into_iter()
-                        .map(|e| MultiSinkEntry {
-                            name: e.name,
-                            rebatch_config: e.rebatch_config,
-                        })
-                        .collect();
-                    LogicalPlan::Extension(Extension {
-                        node: Arc::new(MultiSinkLogicalNode::new(source_plan, entries)),
+        for (_, (source_plan, mut sinks)) in sources_to_sinks.into_iter() {
+            let future_name = sinks
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ");
+            let sink_plan = if sinks.len() > 1 {
+                // Fan-out: each sink gets its own RebatchExec injected by
+                // the MultiSinkExtensionPlanner, so the raw source_plan
+                // flows into MultiSinkLogicalNode without any upstream
+                // wrapping. Per-sink configs live on MultiSinkEntry.
+                let entries: Vec<MultiSinkEntry> = sinks
+                    .into_iter()
+                    .map(|e| MultiSinkEntry {
+                        name: e.name,
+                        rebatch_config: e.rebatch_config,
                     })
-                } else {
-                    // Single sink: wrap once at the logical level with this
-                    // sink's config, then insert_into.
-                    let entry = sinks.remove(0);
-                    let rebatched_plan = wrap_with_rebatch(
-                        source_plan,
-                        entry.rebatch_config.batch_size.map(|s| s as usize),
-                        entry.rebatch_config.batch_flush_interval,
-                        entry.name.clone(),
-                    );
-                    LogicalPlanBuilder::insert_into(
-                        rebatched_plan,
-                        entry.name.as_str(),
-                        provider_as_source(entry.provider.clone()),
-                        InsertOp::Append,
-                    )
-                    .unwrap()
-                    .build()
-                    .unwrap()
-                };
+                    .collect();
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(MultiSinkLogicalNode::new(source_plan, entries)),
+                })
+            } else {
+                // Single sink: wrap once at the logical level with this
+                // sink's config, then insert_into.
+                let entry = sinks.remove(0);
+                let rebatched_plan = wrap_with_rebatch(
+                    source_plan,
+                    entry.rebatch_config.batch_size.map(|s| s as usize),
+                    entry.rebatch_config.batch_flush_interval,
+                    entry.name.clone(),
+                );
+                LogicalPlanBuilder::insert_into(
+                    rebatched_plan,
+                    entry.name.as_str(),
+                    provider_as_source(entry.provider.clone()),
+                    InsertOp::Append,
+                )
+                .map_err(|e| {
+                    streamling_core::error::StreamlingError::from(e).context(format!(
+                        "failed to build insert plan for sink [{}]",
+                        entry.name
+                    ))
+                })?
+                .build()
+                .map_err(|e| {
+                    streamling_core::error::StreamlingError::from(e).context(format!(
+                        "failed to build insert plan for sink [{}]",
+                        entry.name
+                    ))
+                })?
+            };
 
-                if !dry_run {
-                    let session_manager = session_manager.clone();
-                    let sink_future = async move {
-                        let result = session_manager.new_df(sink_plan).collect().await;
-                        if let Err(err) = &result {
-                            error!(
-                                "Sink future [{}] completed with error: {}",
-                                future_name, err
-                            );
-                        }
-                        result
-                    };
-                    sink_futures.push(sink_future);
-                } else {
-                    dry_run_plans.push((future_name, sink_plan));
-                }
-            });
+            if !dry_run {
+                let session_manager = session_manager.clone();
+                let sink_future = async move {
+                    let result = session_manager.new_df(sink_plan).collect().await;
+                    if let Err(err) = &result {
+                        error!(
+                            "Sink future [{}] completed with error: {}",
+                            future_name, err
+                        );
+                    }
+                    result
+                };
+                sink_futures.push(sink_future);
+            } else {
+                dry_run_plans.push((future_name, sink_plan));
+            }
+        }
 
         // During dry_run, create physical plans to catch type coercion
         // and other SQL errors that only manifest at physical planning time.

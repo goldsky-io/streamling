@@ -1536,4 +1536,104 @@ mod tests {
         emit_event_time_metrics(&inst, &batch, "test_source", recorder.as_ref());
         assert!(inst.read_error_logged.load(Ordering::Relaxed));
     }
+
+    /// Records every row the inner sink actually receives.
+    #[derive(Debug)]
+    struct RecordingSink {
+        schema: SchemaRef,
+        ids_written: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    impl DisplayAs for RecordingSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "RecordingSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for RecordingSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            mut data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut rows = 0u64;
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column");
+                let mut written = self.ids_written.lock().unwrap();
+                for i in 0..batch.num_rows() {
+                    written.push(ids.value(i));
+                }
+                rows += batch.num_rows() as u64;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// Pushes one batch holding two rows that share primary key `1` through a
+    /// `WrappingDataSink` built with `primary_key`, and returns the ids that
+    /// reached the inner sink.
+    async fn ids_reaching_sink(primary_key: Option<String>) -> Vec<i64> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ]));
+        // Two deltas for one key: a retraction and the addition replacing it.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1])),
+                Arc::new(Int64Array::from(vec![-150i64, 120])),
+            ],
+        )
+        .unwrap();
+
+        let ids_written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = WrappingDataSink::new(
+            Arc::new(RecordingSink {
+                schema: schema.clone(),
+                ids_written: ids_written.clone(),
+            }),
+            "test_sink".to_string(),
+            primary_key,
+            None,
+        );
+
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        sink.write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+
+        let ids = ids_written.lock().unwrap();
+        ids.clone()
+    }
+
+    #[tokio::test]
+    async fn a_primary_key_collapses_rows_sharing_it() {
+        // Upsert semantics: only the latest state of key 1 is written.
+        assert_eq!(ids_reaching_sink(Some("id".to_string())).await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn no_primary_key_passes_every_row_through() {
+        // What `deduplicate: false` buys the ClickHouse/Postgres/Kafka sinks:
+        // both delta rows land instead of one silently disappearing.
+        assert_eq!(ids_reaching_sink(None).await, vec![1, 1]);
+    }
 }
