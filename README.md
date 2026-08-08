@@ -1776,20 +1776,14 @@ plugin:
       key: value
 ```
 
-`preprocessor_ids` is an ordered allowlist. The chain runs in the order given, so
-list specialized preprocessors before generic ones that would claim the same nodes.
+Preprocessors run in the configured order. An id that is not registered by the
+loaded plugin bundle is skipped with a warning. This allows shared configuration
+to add preprocessors without breaking older images that do not include them.
+Under `--validate`, the warning appears in the JSON `warnings` array.
 
-An id that no loaded plugin registered is skipped with a warning rather than
-treated as a failure. The id list and the plugin bundle are deployed separately,
-so a bundle that predates a newly added id must not take the pipeline down at
-startup. Under `--validate` the warning appears in the `warnings` array of the
-JSON output.
-
-Skipping does not hide the consequences. A preprocessor that rewrites a
-placeholder source into a concrete one still leaves that placeholder behind when
-it is skipped, and the pipeline fails on the unresolvable source type. That error
-lists the plugin ids actually registered, so an empty or stale bundle is visible
-in the message.
+A pipeline that depends on a skipped preprocessor may still fail later when its
+topology is validated. Missing-plugin errors list the ids available in the loaded
+bundle to make version mismatches easier to diagnose.
 
 #### Side Output Trait
 

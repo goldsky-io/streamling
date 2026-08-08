@@ -111,15 +111,10 @@ impl Preprocessor for PluginPreprocessorAdapter {
     }
 }
 
-/// Instantiates the configured topology preprocessors, in configured order.
+/// Builds registered preprocessors in configured order.
 ///
-/// The id list is an ordered allowlist: the chain runs sequentially, so
-/// specialized expanders must precede generic ones. A configured id that no
-/// loaded plugin registered is skipped with a warning instead of failing the
-/// pipeline, because the id list and the plugin bundle are deployed separately —
-/// a bundle that predates a newly added id must not take the whole pipeline down
-/// at startup. `--validate` harvests WARN logs into its JSON output, so a skip
-/// stays visible to callers.
+/// Unknown ids are skipped so shared configuration remains compatible with
+/// older plugin bundles. The warning keeps the mismatch visible to callers.
 pub fn build_plugin_preprocessors(app_config: &AppConfig) -> Vec<Box<dyn Preprocessor>> {
     let registered = registered_plugin_ids();
     let (available, skipped) =
@@ -143,9 +138,7 @@ pub fn build_plugin_preprocessors(app_config: &AppConfig) -> Vec<Box<dyn Preproc
         .collect()
 }
 
-/// Split configured preprocessor ids into those a loaded plugin can serve and
-/// those it cannot, preserving configured order in both halves. Relative order
-/// of the resolved ids is load-bearing: the chain runs sequentially.
+/// Partitions ids without changing their configured order.
 fn split_available_preprocessor_ids(
     configured: &[String],
     registered: &[String],
@@ -167,17 +160,20 @@ mod tests {
     #[test]
     fn unregistered_ids_are_skipped_and_resolved_order_is_preserved() {
         let (available, skipped) = split_available_preprocessor_ids(
-            &ids(&["specific_expander", "new_expander", "generic_expander"]),
-            // A plugin bundle that predates `new_expander`.
-            &ids(&["generic_expander", "specific_expander"]),
+            &ids(&[
+                "first_preprocessor",
+                "new_optional_preprocessor",
+                "last_preprocessor",
+            ]),
+            &ids(&["last_preprocessor", "first_preprocessor"]),
         );
 
         assert_eq!(
             available,
-            ids(&["specific_expander", "generic_expander"]),
+            ids(&["first_preprocessor", "last_preprocessor"]),
             "resolved ids must keep their configured relative order"
         );
-        assert_eq!(skipped, ids(&["new_expander"]));
+        assert_eq!(skipped, ids(&["new_optional_preprocessor"]));
     }
 
     #[test]
@@ -192,7 +188,7 @@ mod tests {
     #[test]
     fn build_with_no_plugins_loaded_skips_every_configured_id() {
         let mut app_config = AppConfig::load().expect("embedded config must load");
-        app_config.plugin.preprocessor_ids = ids(&["bogus_preprocessor"]);
+        app_config.plugin.preprocessor_ids = ids(&["new_optional_preprocessor"]);
 
         assert!(build_plugin_preprocessors(&app_config).is_empty());
     }
