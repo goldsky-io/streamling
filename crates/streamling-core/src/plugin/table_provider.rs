@@ -113,11 +113,19 @@ impl ExecutionPlan for PluginSourceExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // A disconnected input channel means the plugin already exited (e.g.
+        // it died during startup): surface an execution error instead of
+        // panicking the executor thread.
         self.plugin_channels
             .input
             .sender
             .send(NonExhaustive::new(PluginMsg::Init))
-            .unwrap();
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "plugin input channel closed before Init could be sent \
+                     (plugin exited early?): {e}"
+                ))
+            })?;
 
         let (checkpoint_receiver, checkpoint_subscriber_id) =
             subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);

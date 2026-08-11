@@ -1562,6 +1562,14 @@ async fn emit_terminal_checkpoint(
             finalize_timeout,
             control.pending_terminal_ack_sinks()
         );
+        // Counter alongside the warn: a skipped terminal Finalizer means the
+        // tail silently replays on the next restart — operators need a metric
+        // to alert on, not just a log line. Grouped under the coordinator's
+        // component id with the other checkpoint_* counters.
+        streamling_core::telemetry::recorder::get_control_plane_metrics_recorder(
+            "checkpoint_coordinator",
+        )
+        .record_count("checkpoint_terminal_finalizer_skipped", 1);
         return;
     }
 
