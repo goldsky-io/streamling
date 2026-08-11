@@ -165,6 +165,33 @@ impl KafkaResource {
         records: &[T],
         op: &str,
     ) -> Result<()> {
+        self.produce_avro_records_keyed_with_op(records, op, |_| String::new())
+            .await
+    }
+
+    /// Produce Avro records with a per-record message key.
+    ///
+    /// The unkeyed variants send an *empty* key, which librdkafka partitions
+    /// randomly — so two records sharing a primary key can land on different
+    /// Kafka partitions. Streamling preserves per-key ordering from the source
+    /// onward, but it cannot restore an order the source never had, so any test
+    /// asserting "the later version wins" has to key production by that same
+    /// primary key.
+    pub async fn produce_avro_records_keyed<T: Serialize>(
+        &self,
+        records: &[T],
+        key_of: impl Fn(&T) -> String,
+    ) -> Result<()> {
+        self.produce_avro_records_keyed_with_op(records, "c", key_of)
+            .await
+    }
+
+    pub async fn produce_avro_records_keyed_with_op<T: Serialize>(
+        &self,
+        records: &[T],
+        op: &str,
+        key_of: impl Fn(&T) -> String,
+    ) -> Result<()> {
         let encoder = AvroEncoder::new(self.sr_settings.clone());
         let subject_strategy = SubjectNameStrategy::TopicNameStrategy(self.topic.clone(), false);
 
@@ -179,9 +206,10 @@ impl KafkaResource {
                 value: Some(op),
             });
 
+            let key = key_of(record);
             let kafka_record = FutureRecord::to(&self.topic)
                 .payload(&payload)
-                .key("")
+                .key(&key)
                 .headers(headers);
 
             self.producer
