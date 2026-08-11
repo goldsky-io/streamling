@@ -288,6 +288,27 @@ fn find_plugin(plugin_id: &PluginId) -> Option<Arc<PluginModuleRef>> {
     module_registry.get(plugin_id).cloned()
 }
 
+/// Returns all loaded plugin ids in a stable order.
+fn registered_plugin_ids() -> Vec<String> {
+    let module_registry = PLUGIN_MODULE_REGISTRY
+        .read()
+        .expect("plugin module registry lock poisoned");
+    let mut ids: Vec<String> = module_registry.keys().map(|id| id.to_string()).collect();
+    ids.sort();
+    ids
+}
+
+/// Resolves a plugin module and includes the loaded ids in any error.
+fn require_plugin(plugin_id: &PluginId) -> Result<Arc<PluginModuleRef>> {
+    find_plugin(plugin_id).ok_or_else(|| {
+        streamling_user_err!(
+            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed. Registered plugin ids: [{}]",
+            plugin_id,
+            registered_plugin_ids().join(", ")
+        )
+    })
+}
+
 fn create_plugin_async_runtime(handle: Handle) -> PluginAsyncRuntimeObj {
     // `TD_Opaque` chooses `RBox<()>` for the erased-pointer parameter
     PluginAsyncRuntime_TO::from_value(PluginTokioWrapper { inner: handle }, TD_Opaque)
@@ -386,12 +407,7 @@ pub fn create_source_plugin(
     options: HashMap<String, String>,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
-        streamling_user_err!(
-            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
-            plugin_type
-        )
-    })?;
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -445,12 +461,7 @@ pub fn create_transform_plugin(
     input_schema: SchemaRef,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
-        streamling_user_err!(
-            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
-            plugin_type
-        )
-    })?;
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -504,12 +515,7 @@ pub fn create_sink_plugin(
     input_schema: SchemaRef,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
-        streamling_user_err!(
-            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
-            plugin_type
-        )
-    })?;
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -556,12 +562,7 @@ pub fn create_preprocessor_plugin(
     options: HashMap<String, String>,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module = find_plugin(&plugin_type).ok_or_else(|| {
-        streamling_user_err!(
-            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed",
-            plugin_type
-        )
-    })?;
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -635,6 +636,13 @@ mod tests {
         assert!(
             msg.contains("is not available"),
             "error should say plugin is not available: {msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "Registered plugin ids: [{}]",
+                registered_plugin_ids().join(", ")
+            )),
+            "error should name what is actually loaded: {msg}"
         );
     }
 
