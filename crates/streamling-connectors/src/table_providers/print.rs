@@ -247,6 +247,10 @@ impl TableProvider for PrintTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(ParallelSinkExec::new(input, with_telemetry)))
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            with_telemetry,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+        )))
     }
 }

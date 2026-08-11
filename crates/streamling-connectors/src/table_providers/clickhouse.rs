@@ -19,8 +19,6 @@ use streamling_core::types::{i256::I256Type, u256::U256Type};
 use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
 use streamling_core::utils::parse_primary_key_columns;
 
-use crate::util::parallel::parallel_execute;
-
 use async_stream;
 use datafusion::arrow::ipc::reader::FileReader;
 use datafusion::arrow::ipc::writer::FileWriter;
@@ -346,10 +344,8 @@ struct SinkParams {
     table_name: String,
     source_name: String,
     reference_name: String,
-    write_batch_size: u32,
     num_records_before_stop: Option<u64>,
     primary_keys: Vec<String>,
-    parallelism: usize,
     append_only_mode: bool,
     version_column_name: Option<String>,
     schema_override: Option<std::collections::HashMap<String, String>>,
@@ -653,11 +649,9 @@ impl ClickHouseTableProvider {
         metric_metadata_id: String,
         table_name: &str,
         config: ClickHouseSinkConfig,
-        batch_size: u32,
         num_records_before_stop: Option<u64>,
         primary_key: String,
         source_name: String,
-        parallelism: Option<usize>,
         append_only_mode: Option<bool>,
         version_column_name: Option<String>,
         schema_override: Option<std::collections::HashMap<String, String>>,
@@ -682,17 +676,12 @@ impl ClickHouseTableProvider {
 
         let empty_schema = Arc::new(arrow::datatypes::Schema::empty());
 
-        let parallelism = parallelism.unwrap_or(1).max(1);
-        let write_batch_size = batch_size.div_ceil(parallelism as u32).max(1);
-
         let sink_params = SinkParams {
             table_name: table_name.to_string(),
             source_name,
             reference_name: reference_name.clone(),
-            write_batch_size,
             num_records_before_stop,
             primary_keys,
-            parallelism,
             append_only_mode: append_only_mode.unwrap_or(true),
             version_column_name,
             schema_override,
@@ -881,14 +870,12 @@ impl TableProvider for ClickHouseTableProvider {
         let clickhouse_sink = Arc::new(ClickHouseSinkExec {
             client: self.client.clone(),
             table_name: sink_params.table_name.clone(),
-            write_batch_size: sink_params.write_batch_size,
             num_records_before_stop: sink_params.num_records_before_stop,
             source_name: sink_params.source_name.clone(),
             reference_name: sink_params.reference_name.clone(),
             schema,
             primary_keys: Arc::new(sink_params.primary_keys.clone()),
             metric_metadata_id: self.metric_metadata_id.clone(),
-            parallelism: sink_params.parallelism,
             append_only_mode: sink_params.append_only_mode,
             version_column_name: sink_params.version_column_name.clone(),
             schema_override: sink_params.schema_override.clone(),
@@ -904,6 +891,7 @@ impl TableProvider for ClickHouseTableProvider {
         Ok(Arc::new(ParallelSinkExec::new(
             projection_exec,
             wrapper_sink,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
         )))
     }
 }
@@ -977,14 +965,12 @@ fn split_rows_by_operation(batch: &RecordBatch) -> Result<(Option<RecordBatch>, 
 pub struct ClickHouseSinkExec {
     client: ClickHouseClient,
     table_name: String,
-    write_batch_size: u32,
     num_records_before_stop: Option<u64>,
     source_name: String,
     reference_name: String,
     schema: SchemaRef,
     primary_keys: Arc<Vec<String>>,
     metric_metadata_id: String,
-    parallelism: usize,
     append_only_mode: bool,
     version_column_name: Option<String>,
     schema_override: Option<std::collections::HashMap<String, String>>,
@@ -1093,8 +1079,6 @@ impl DataSink for ClickHouseSinkExec {
             }
         };
         let primary_keys = self.primary_keys.clone();
-        let parallelism = self.parallelism.max(1);
-        let write_batch_size = self.write_batch_size;
         let append_only_mode = self.append_only_mode;
         let source_name = self.source_name.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
@@ -1153,32 +1137,16 @@ impl DataSink for ClickHouseSinkExec {
 
             if append_only_mode {
                 // append_only_mode=true: INSERT all rows directly
-                parallel_execute(&normalized_batch, parallelism, write_batch_size as usize, {
-                    let client_closure = client.clone();
-                    let table_closure = table_name.clone();
-                    let schema_closure = normalized_schema.clone();
-                    let node_label_closure = node_label.clone();
-                    move |slice: RecordBatch| {
-                        let client = client_closure.clone();
-                        let table_name = table_closure.clone();
-                        let schema = schema_closure.clone();
-                        let node_label = node_label_closure.clone();
-                        async move {
-                            let operation_name =
-                                format!("{}: INSERT into '{}'", node_label, table_name);
-                            retry_forever_with_backoff_async(
-                                || async {
-                                    client
-                                        .send_arrow_batch(&table_name, &slice, &schema)
-                                        .await
-                                        .streamling_context("failed to send Arrow batch")
-                                },
-                                &operation_name,
-                            )
-                            .await;
-                        }
-                    }
-                })
+                let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
+                retry_forever_with_backoff_async(
+                    || async {
+                        client
+                            .send_arrow_batch(&table_name, &normalized_batch, &normalized_schema)
+                            .await
+                            .streamling_context("failed to send Arrow batch")
+                    },
+                    &operation_name,
+                )
                 .await;
             } else {
                 // append_only_mode=false: split rows by _gs_op into inserts vs deletes
@@ -1193,32 +1161,16 @@ impl DataSink for ClickHouseSinkExec {
                             insert_batch.schema().as_ref(),
                         ));
 
-                    parallel_execute(&insert_batch, parallelism, write_batch_size as usize, {
-                        let client_closure = client.clone();
-                        let table_closure = table_name.clone();
-                        let schema_closure = insert_schema;
-                        let node_label_closure = node_label.clone();
-                        move |slice: RecordBatch| {
-                            let client = client_closure.clone();
-                            let table_name = table_closure.clone();
-                            let schema = schema_closure.clone();
-                            let node_label = node_label_closure.clone();
-                            async move {
-                                let operation_name =
-                                    format!("{}: INSERT into '{}'", node_label, table_name);
-                                retry_forever_with_backoff_async(
-                                    || async {
-                                        client
-                                            .send_arrow_batch(&table_name, &slice, &schema)
-                                            .await
-                                            .streamling_context("failed to send Arrow batch")
-                                    },
-                                    &operation_name,
-                                )
-                                .await;
-                            }
-                        }
-                    })
+                    let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
+                    retry_forever_with_backoff_async(
+                        || async {
+                            client
+                                .send_arrow_batch(&table_name, &insert_batch, &insert_schema)
+                                .await
+                                .streamling_context("failed to send Arrow batch")
+                        },
+                        &operation_name,
+                    )
                     .await;
                 }
 
@@ -1328,7 +1280,11 @@ pub struct ClickHouseSourceExec {
 
 impl DisplayAs for ClickHouseSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "ClickHouseSourceExec")
+        write!(
+            f,
+            "ClickHouseSourceExec: partitions={}",
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 

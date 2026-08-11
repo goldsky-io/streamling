@@ -434,11 +434,22 @@ impl TestContext {
 
     /// Create an additional Kafka topic for use in tests (e.g., for sink output)
     pub async fn create_kafka_topic(&self, topic_suffix: &str) -> Result<KafkaResource> {
+        self.create_kafka_topic_with_partitions(topic_suffix, 1)
+            .await
+    }
+
+    /// Create an additional Kafka topic with `partitions` partitions.
+    pub async fn create_kafka_topic_with_partitions(
+        &self,
+        topic_suffix: &str,
+        partitions: i32,
+    ) -> Result<KafkaResource> {
         let topic = format!("test_{}_{}", &self.test_id[..8], topic_suffix);
-        KafkaResource::new(
+        KafkaResource::new_with_partitions(
             &self.config.kafka_broker,
             &self.config.schema_registry_url,
             &topic,
+            partitions,
         )
         .await
     }

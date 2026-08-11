@@ -27,10 +27,14 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::unnest::UnnestExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_input_stream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    execute_input_stream,
     execution_plan::{Boundedness, EmissionType},
 };
 
+use crate::checkpoints::checkpoint_management::{
+    register_sink_streams, send_checkpoint_ack, sink_stream_done,
+};
 use crate::operators::parallel_sink::ParallelSinkExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use std::fmt;
@@ -76,7 +80,11 @@ impl Debug for StreamSourcePlan {
 
 impl DisplayAs for StreamSourcePlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "StreamSourcePlan")
+        write!(
+            f,
+            "StreamSourcePlan: partitions={}",
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -401,7 +409,12 @@ impl DisplayAs for MultiSinkExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "MultiSinkExec: sinks=[{}]", self.format_sinks())
+                write!(
+                    f,
+                    "MultiSinkExec: partitions={}, sinks=[{}]",
+                    self.input.output_partitioning().partition_count(),
+                    self.format_sinks()
+                )
             }
         }
     }
@@ -417,7 +430,11 @@ impl ExecutionPlan for MultiSinkExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        // Partition-transparent: every input partition gets its own broadcast
+        // and its own write stream per sink. Requiring `SinglePartition` here
+        // would make the optimizer coalesce a parallel source back to one stream
+        // before it ever reached the fan-out.
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -443,115 +460,149 @@ impl ExecutionPlan for MultiSinkExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // same as DataSinkExec
+        // Like `ParallelSinkExec`, this node reports a single output partition
+        // and fans over its input partitions internally: it is always the plan
+        // root, so its own width buys nothing, while the fan-out below it is
+        // where the parallelism has to live.
         if partition != 0 {
             return internal_err!("MultiSinkExec can only be called on partition 0!");
         }
 
-        let data = execute_input_stream(
-            Arc::clone(&self.input),
-            Arc::clone(&self.schema()),
-            0,
-            Arc::clone(&context),
-        )?;
-
-        let broadcast_stream = Arc::new(BroadcastStream::new(
-            self.schema(),
-            self.internal_buffer_size,
-        ));
-
+        let input_partitions = self.input.output_partitioning().partition_count();
         let total_sinks = self.sinks.len();
-        let completed_sinks = Arc::new(Mutex::new(0));
-
-        for (i, sink) in self.sinks.iter().enumerate() {
-            let sink = sink.clone();
-            let has_transforms = self.sink_has_transforms[i];
-            let sink_name = self.sink_names.get(i).cloned().unwrap_or_default();
-            let rebatch_config = self.sink_rebatch_configs[i].clone();
-            let broadcast_consumer: SendableRecordBatchStream =
-                Box::pin(broadcast_stream.add_consumer());
-            let task_context = context.clone();
-            let broadcast_schema = self.schema();
-
-            let broadcast_stream = broadcast_stream.clone();
-            let completed_sinks = completed_sinks.clone();
-
-            tokio::spawn(async move {
-                let data_sink_exec = sink
-                    .downcast_ref::<ParallelSinkExec>()
-                    .expect("MultiSinkExec: sink must be a ParallelSinkExec");
-                let data_sink = data_sink_exec.sink();
-
-                // Per-sink rebatching: run the broadcast consumer through an
-                // `AsyncBatchAccumulator` before it reaches the sink. Placing
-                // this upstream of the sink's own transformation chain
-                // mirrors the single-sink case where `RebatchExec` sits above
-                // any projection the sink provider attaches.
-                let sink_input_stream: SendableRecordBatchStream = if rebatch_config.is_noop() {
-                    broadcast_consumer
-                } else {
-                    let accumulator = AsyncBatchAccumulator::new(
-                        rebatch_config
-                            .batch_size
-                            .map(|s| s as usize)
-                            .unwrap_or(usize::MAX),
-                        rebatch_config.batch_flush_interval,
-                    )
-                    .with_name(sink_name.clone())
-                    .with_flush_stagger(i, total_sinks);
-                    let rebatched = accumulator.process_stream(broadcast_consumer);
-                    Box::pin(RecordBatchStreamAdapter::new(
-                        broadcast_schema.clone(),
-                        rebatched,
-                    ))
-                };
-
-                let input_stream = if !has_transforms {
-                    sink_input_stream
-                } else {
-                    // Pipe broadcast data through the sink's transformation plan
-                    // (e.g. a ProjectionExec for column mapping).
-                    let sink_input = data_sink_exec.input();
-                    let stream_source =
-                        Arc::new(StreamSourcePlan::new(broadcast_schema, sink_input_stream));
-                    let modified_input = Arc::clone(sink_input)
-                        .with_new_children(vec![stream_source])
-                        .expect("Failed to replace sink input children with broadcast stream");
-                    modified_input
-                        .execute(0, Arc::clone(&task_context))
-                        .expect("Failed to execute sink input plan over broadcast data")
-                };
-
-                match data_sink.write_all(input_stream, &task_context).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            "MultiSinkExec [{}]: Sink write_all failed: {}",
-                            sink_name,
-                            e
-                        );
-                        panic!(
-                            "MultiSinkExec [{}]: Sink write_all failed: {}",
-                            sink_name, e
-                        );
-                    }
-                }
-
-                debug!("MultiSinkExec [{}]: Sink completed", sink_name);
-                let mut count = completed_sinks.lock().await;
-                *count += 1;
-                if *count >= total_sinks {
-                    broadcast_stream.stop();
-                }
-            });
+        // Each sink is written by one stream per input partition. `MultiSinkExec`
+        // calls `write_all` directly rather than going through
+        // `ParallelSinkExec`, so the ack gate has to be registered here or a
+        // sink would ack an epoch on the first partition that flushed it.
+        for sink_name in &self.sink_names {
+            register_sink_streams(sink_name, input_partitions);
         }
 
-        let output_consumer = broadcast_stream.add_consumer();
+        let mut output_consumers = Vec::with_capacity(input_partitions);
+        for input_partition in 0..input_partitions {
+            let data = execute_input_stream(
+                Arc::clone(&self.input),
+                Arc::clone(&self.schema()),
+                input_partition,
+                Arc::clone(&context),
+            )?;
 
-        // Start broadcasting after all consumers (sinks + output) are registered
-        broadcast_stream.start(data);
+            let broadcast_stream = Arc::new(BroadcastStream::new(
+                self.schema(),
+                self.internal_buffer_size,
+            ));
 
-        Ok(Box::pin(output_consumer))
+            // Scoped to this partition: its broadcast stops once every sink has
+            // finished *this* partition's stream, independent of the others.
+            let completed_sinks = Arc::new(Mutex::new(0));
+
+            for (i, sink) in self.sinks.iter().enumerate() {
+                let sink = sink.clone();
+                let has_transforms = self.sink_has_transforms[i];
+                let sink_name = self.sink_names.get(i).cloned().unwrap_or_default();
+                let rebatch_config = self.sink_rebatch_configs[i].clone();
+                let broadcast_consumer: SendableRecordBatchStream =
+                    Box::pin(broadcast_stream.add_consumer());
+                let task_context = context.clone();
+                let broadcast_schema = self.schema();
+
+                let broadcast_stream = broadcast_stream.clone();
+                let completed_sinks = completed_sinks.clone();
+                // Stagger flushes across every (sink, partition) stream, not just
+                // across sinks, so N×M writers don't all fire at the same instant.
+                let stagger_index = input_partition * total_sinks + i;
+                let stagger_total = total_sinks * input_partitions;
+
+                tokio::spawn(async move {
+                    let data_sink_exec = sink
+                        .downcast_ref::<ParallelSinkExec>()
+                        .expect("MultiSinkExec: sink must be a ParallelSinkExec");
+                    let data_sink = data_sink_exec.sink();
+
+                    // Per-sink rebatching: run the broadcast consumer through an
+                    // `AsyncBatchAccumulator` before it reaches the sink. Placing
+                    // this upstream of the sink's own transformation chain
+                    // mirrors the single-sink case where `RebatchExec` sits above
+                    // any projection the sink provider attaches.
+                    let sink_input_stream: SendableRecordBatchStream = if rebatch_config.is_noop() {
+                        broadcast_consumer
+                    } else {
+                        let accumulator = AsyncBatchAccumulator::new(
+                            rebatch_config
+                                .batch_size
+                                .map(|s| s as usize)
+                                .unwrap_or(usize::MAX),
+                            rebatch_config.batch_flush_interval,
+                        )
+                        .with_name(sink_name.clone())
+                        .with_flush_stagger(stagger_index, stagger_total);
+                        let rebatched = accumulator.process_stream(broadcast_consumer);
+                        Box::pin(RecordBatchStreamAdapter::new(
+                            broadcast_schema.clone(),
+                            rebatched,
+                        ))
+                    };
+
+                    let input_stream = if !has_transforms {
+                        sink_input_stream
+                    } else {
+                        // Pipe broadcast data through the sink's transformation plan
+                        // (e.g. a ProjectionExec for column mapping). The stream
+                        // source is single-partition — this chain handles one
+                        // broadcast partition — so it is executed at partition 0.
+                        let sink_input = data_sink_exec.input();
+                        let stream_source =
+                            Arc::new(StreamSourcePlan::new(broadcast_schema, sink_input_stream));
+                        let modified_input = Arc::clone(sink_input)
+                            .with_new_children(vec![stream_source])
+                            .expect("Failed to replace sink input children with broadcast stream");
+                        modified_input
+                            .execute(0, Arc::clone(&task_context))
+                            .expect("Failed to execute sink input plan over broadcast data")
+                    };
+
+                    match data_sink.write_all(input_stream, &task_context).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "MultiSinkExec [{}]: Sink write_all failed: {}",
+                                sink_name,
+                                e
+                            );
+                            panic!(
+                                "MultiSinkExec [{}]: Sink write_all failed: {}",
+                                sink_name, e
+                            );
+                        }
+                    }
+
+                    debug!(
+                        "MultiSinkExec [{}]: Sink completed partition {}",
+                        sink_name, input_partition
+                    );
+                    // This stream will never report another epoch; release its
+                    // share so a late epoch is not stuck waiting on it.
+                    for epoch in sink_stream_done(&sink_name) {
+                        send_checkpoint_ack(epoch, &sink_name);
+                    }
+                    let mut count = completed_sinks.lock().await;
+                    *count += 1;
+                    if *count >= total_sinks {
+                        broadcast_stream.stop();
+                    }
+                });
+            }
+
+            output_consumers.push(broadcast_stream.add_consumer());
+
+            // Start broadcasting after all consumers (sinks + output) are registered
+            broadcast_stream.start(data);
+        }
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            futures::stream::select_all(output_consumers),
+        )))
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -586,6 +637,206 @@ mod tests {
     fn identity_projection(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let col: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(Column::new("id", 0));
         Arc::new(ProjectionExec::try_new(vec![(col, "id".to_string())], input).unwrap())
+    }
+
+    /// Collects every row it is handed, across all the concurrent `write_all`
+    /// calls `MultiSinkExec` makes (one per input partition).
+    #[derive(Debug)]
+    struct CollectingSink {
+        schema: SchemaRef,
+        ids: std::sync::Mutex<Vec<i64>>,
+        finished_streams: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CollectingSink {
+        fn new(schema: SchemaRef) -> Self {
+            Self {
+                schema,
+                ids: std::sync::Mutex::new(Vec::new()),
+                finished_streams: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn sorted_ids(&self) -> Vec<i64> {
+            let mut ids = self.ids.lock().unwrap().clone();
+            ids.sort();
+            ids
+        }
+    }
+
+    #[async_trait]
+    impl datafusion::datasource::sink::DataSink for CollectingSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        async fn write_all(
+            &self,
+            mut data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut count = 0;
+            while let Some(batch) = futures::StreamExt::next(&mut data).await.transpose()? {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let mut ids = self.ids.lock().unwrap();
+                for i in 0..batch.num_rows() {
+                    ids.push(column.value(i));
+                    count += 1;
+                }
+            }
+            self.finished_streams
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(count)
+        }
+    }
+
+    impl DisplayAs for CollectingSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "CollectingSink")
+        }
+    }
+
+    fn two_partition_input() -> (Arc<dyn ExecutionPlan>, SchemaRef) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch_for = |ids: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+        };
+        let input = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch_for(vec![1, 2, 3])], vec![batch_for(vec![4, 5])]],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        (input, schema)
+    }
+
+    fn multi_sink_over(
+        input: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+        names: &[&str],
+    ) -> (MultiSinkExec, Vec<Arc<CollectingSink>>) {
+        let collectors: Vec<Arc<CollectingSink>> = names
+            .iter()
+            .map(|_| Arc::new(CollectingSink::new(schema.clone())))
+            .collect();
+        let sinks: Vec<Arc<dyn ExecutionPlan>> = collectors
+            .iter()
+            .zip(names)
+            .map(|(collector, name)| {
+                Arc::new(ParallelSinkExec::new(
+                    Arc::clone(&input),
+                    collector.clone(),
+                    name.to_string(),
+                )) as Arc<dyn ExecutionPlan>
+            })
+            .collect();
+        let exec = MultiSinkExec::new(
+            input,
+            sinks,
+            names.iter().map(|_| false).collect(),
+            names.iter().map(|n| n.to_string()).collect(),
+            names.iter().map(|_| RebatchConfig::default()).collect(),
+            10,
+        );
+        (exec, collectors)
+    }
+
+    /// `MultiSinkExec` used to demand `SinglePartition`, so the optimizer
+    /// coalesced a parallel source before it ever reached the fan-out. It must
+    /// now take the input at its own width.
+    #[test]
+    fn multi_partition_input_is_not_coalesced_before_the_fan_out() {
+        use crate::operators::coalesce::StreamingCoalesceExec;
+        use crate::optimizer::EnforceSinglePartitionPhysicalOptimizerRule;
+        use datafusion::config::ConfigOptions;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+
+        let (input, schema) = two_partition_input();
+        let (exec, _) = multi_sink_over(input, schema, &["sink_a", "sink_b"]);
+
+        let optimized = EnforceSinglePartitionPhysicalOptimizerRule::new()
+            .optimize(Arc::new(exec), &ConfigOptions::default())
+            .unwrap();
+
+        assert!(
+            optimized.children()[0]
+                .downcast_ref::<StreamingCoalesceExec>()
+                .is_none(),
+            "the fan-out input must keep its partitions, got {}",
+            optimized.children()[0].name()
+        );
+        assert_eq!(
+            optimized.children()[0]
+                .output_partitioning()
+                .partition_count(),
+            2
+        );
+    }
+
+    /// The property the whole fan-out rests on: every sink sees every row of
+    /// every input partition. A partition dropped here is silent data loss.
+    #[tokio::test]
+    async fn every_sink_receives_every_input_partition() {
+        let (input, schema) = two_partition_input();
+        let (exec, collectors) =
+            multi_sink_over(input, schema, &["fanout_sink_a", "fanout_sink_b"]);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
+        while (futures::StreamExt::next(&mut stream).await).is_some() {}
+
+        // The output stream ends when the broadcasts drain, which can happen a
+        // beat before the sink tasks record their last rows.
+        for collector in &collectors {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while collector
+                .finished_streams
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < 2
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "sink did not finish both partition streams"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        for (index, collector) in collectors.iter().enumerate() {
+            assert_eq!(
+                collector.sorted_ids(),
+                vec![1, 2, 3, 4, 5],
+                "sink {index} must receive both input partitions"
+            );
+        }
+    }
+
+    /// `MultiSinkExec` calls `write_all` directly instead of going through
+    /// `ParallelSinkExec`, so it owns the ack-gate registration: without it a
+    /// sink would ack an epoch on the first partition that flushed it, while the
+    /// other partition still had pre-marker rows in flight.
+    #[tokio::test]
+    async fn fan_out_registers_an_ack_gate_per_sink() {
+        use crate::checkpoints::checkpoint_management::{CheckpointEpoch, report_marker_at_sink};
+
+        let (input, schema) = two_partition_input();
+        let (exec, _) = multi_sink_over(input, schema, &["gated_fanout_sink"]);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let _stream = exec.execute(0, ctx.task_ctx()).unwrap();
+
+        assert!(
+            !report_marker_at_sink("gated_fanout_sink", CheckpointEpoch(1)),
+            "the first of two partition streams must not ack"
+        );
+        assert!(
+            report_marker_at_sink("gated_fanout_sink", CheckpointEpoch(1)),
+            "the second releases the ack"
+        );
     }
 
     /// A `ProjectionExec` added by a sink's `insert_into` must be rewritten to

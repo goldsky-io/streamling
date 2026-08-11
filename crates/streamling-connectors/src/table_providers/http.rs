@@ -324,6 +324,10 @@ impl TableProvider for HttpTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(ParallelSinkExec::new(input, telemetry_data_sink)))
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            telemetry_data_sink,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+        )))
     }
 }

@@ -9,6 +9,7 @@ pub mod pg_aggregation;
 pub mod planner;
 pub mod projection;
 pub mod rebatch;
+pub mod repartition;
 pub mod scan_sharing;
 pub mod unnest;
 pub mod wasm_runner;

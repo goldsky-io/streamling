@@ -175,7 +175,12 @@ impl DisplayAs for ExternalHandlerExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "ExternalHandlerExec: url={}", self.config.url)
+                write!(
+                    f,
+                    "ExternalHandlerExec: url={}, partitions={}",
+                    self.config.url,
+                    self.properties().output_partitioning().partition_count()
+                )
             }
         }
     }

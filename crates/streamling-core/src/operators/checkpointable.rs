@@ -9,7 +9,7 @@ use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext
 use datafusion::logical_expr::{
     Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
-use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::Distribution;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -147,12 +147,20 @@ impl CheckpointableExec {
 
     fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(input.schema()),
+            // The wrapper is schema-identical to its input, so the input's
+            // equivalence properties (orderings, constants, equivalence groups)
+            // carry over verbatim. Rebuilding them from the schema alone would
+            // hide a `Partitioning::Hash`'s key equivalences from
+            // `Partitioning::satisfy`, forcing a redundant exchange above every
+            // SQL transform.
+            input.equivalence_properties().clone(),
             // Partition-transparent: each input partition is forwarded as its own
             // output partition, so a multi-partition source stays parallel through
             // the transform all the way to the sink (`ParallelSinkExec` writes every
-            // partition concurrently).
-            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
+            // partition concurrently). The partitioning is propagated as-is rather
+            // than flattened to `UnknownPartitioning`, so a hash exchange below the
+            // transform stays visible to distribution checks above it.
+            input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -173,7 +181,12 @@ impl DisplayAs for CheckpointableExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "CheckpointableExec (for {})", self.input.name())
+                write!(
+                    f,
+                    "CheckpointableExec (for {}), partitions={}",
+                    self.input.name(),
+                    self.cache.output_partitioning().partition_count()
+                )
             }
         }
     }
@@ -261,7 +274,7 @@ mod tests {
     use arrow_schema::{Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::physical_expr::Partitioning as PhysicalPartitioning;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning as PhysicalPartitioning};
     use datafusion::prelude::*;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -312,10 +325,18 @@ mod tests {
 
     impl TestSourceExec {
         fn new(partitions: Vec<RecordBatch>) -> Self {
+            let count = partitions.len();
+            Self::with_partitioning(partitions, PhysicalPartitioning::UnknownPartitioning(count))
+        }
+
+        fn with_partitioning(
+            partitions: Vec<RecordBatch>,
+            partitioning: PhysicalPartitioning,
+        ) -> Self {
             let schema = partitions[0].schema();
             let cache = PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
-                PhysicalPartitioning::UnknownPartitioning(partitions.len()),
+                partitioning,
                 datafusion::physical_plan::execution_plan::EmissionType::Incremental,
                 datafusion::physical_plan::execution_plan::Boundedness::Bounded,
             );
@@ -698,5 +719,60 @@ mod tests {
         }
         assert_eq!(with_marker_rows, 5, "partition 0 forwards its own rows");
         assert_eq!(plain_rows, 5, "partition 1 forwards its own rows");
+    }
+
+    /// The wrapper is partition-transparent, so its displayed width is the one
+    /// flowing through it — that is the whole point of showing it in a plan dump.
+    #[test]
+    fn display_reports_the_width_passing_through() {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let source = Arc::new(TestSourceExec::new(vec![batch.clone(), batch]));
+        let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
+
+        let rendered = datafusion::physical_plan::displayable(&checkpointable)
+            .indent(true)
+            .to_string();
+        assert!(
+            rendered.contains("CheckpointableExec (for TestSourceExec), partitions=2"),
+            "unexpected plan display:\n{rendered}"
+        );
+    }
+
+    /// A hash exchange below a SQL transform must stay visible to distribution
+    /// checks above it, otherwise every keyed sink re-exchanges its input.
+    #[tokio::test]
+    async fn test_checkpointable_exec_propagates_hash_partitioning() {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let hash_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = vec![Arc::new(
+            datafusion::physical_expr::expressions::Column::new("id", 0),
+        )];
+        let source = Arc::new(TestSourceExec::with_partitioning(
+            vec![batch.clone(), batch],
+            PhysicalPartitioning::Hash(hash_exprs.clone(), 2),
+        ));
+        let checkpointable = CheckpointableExec::new(source.clone(), 10, "test".to_string());
+
+        assert!(
+            matches!(
+                checkpointable.properties().output_partitioning(),
+                PhysicalPartitioning::Hash(_, 2)
+            ),
+            "hash partitioning must survive the wrapper, not flatten to UnknownPartitioning"
+        );
+        assert!(
+            crate::operators::repartition::satisfies_hash_distribution(
+                checkpointable.properties(),
+                &hash_exprs,
+            ),
+            "a keyed distribution requirement must be satisfied through the wrapper"
+        );
+        assert_eq!(
+            checkpointable
+                .properties()
+                .equivalence_properties()
+                .schema(),
+            source.properties().equivalence_properties().schema(),
+            "equivalence properties are propagated, not rebuilt"
+        );
     }
 }

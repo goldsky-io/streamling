@@ -242,7 +242,11 @@ impl DisplayAs for PluginExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "PluginExec")
+                write!(
+                    f,
+                    "PluginExec: partitions={}",
+                    self.properties().output_partitioning().partition_count()
+                )
             }
         }
     }

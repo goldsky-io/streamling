@@ -421,7 +421,12 @@ impl DisplayAs for WasmRunnerExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "WasmRunnerExec (lang: {})", self.language)
+                write!(
+                    f,
+                    "WasmRunnerExec (lang: {}), partitions={}",
+                    self.language,
+                    self.properties().output_partitioning().partition_count()
+                )
             }
         }
     }

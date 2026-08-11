@@ -34,6 +34,7 @@ use streamling_core::error::ResultExt;
 use streamling_core::node_context::get_node_context;
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
+use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
 use streamling_core::utils::parse_primary_key_columns;
@@ -58,7 +59,6 @@ pub struct PostgresSinkTableProvider {
     checkpoint_truncation: bool,
     parallelism: usize,
     telemetry: Option<Telemetry>,
-    write_batch_size: u32,
 }
 
 impl PostgresSinkTableProvider {
@@ -81,9 +81,12 @@ impl PostgresSinkTableProvider {
         parallelism: Option<usize>,
         telemetry: Option<Telemetry>,
     ) -> Self {
-        let batch_size = batch_size.unwrap_or(config.batch_size);
+        // `parallelism` counts concurrent partition write streams (produced by
+        // the sink-edge hash exchange), not slices of one batch, so each stream
+        // writes the batch it receives whole. `batch_size` shapes the upstream
+        // rebatcher, which is where the sink's batch size is decided now.
+        let _ = batch_size;
         let parallelism = parallelism.unwrap_or(1).max(1);
-        let write_batch_size = batch_size.div_ceil(parallelism as u32).max(1);
 
         Self {
             metric_metadata_id,
@@ -101,7 +104,6 @@ impl PostgresSinkTableProvider {
             checkpoint_truncation,
             parallelism,
             telemetry,
-            write_batch_size,
         }
     }
 }
@@ -151,7 +153,6 @@ impl TableProvider for PostgresSinkTableProvider {
             self.checkpoint_truncation,
             self.reference_name.clone(),
             self.parallelism,
-            self.write_batch_size,
         ));
 
         let wrapper_sink = Arc::new(WrappingDataSink::new(
@@ -164,6 +165,7 @@ impl TableProvider for PostgresSinkTableProvider {
         Ok(Arc::new(ParallelSinkExec::new(
             adjusted_input,
             wrapper_sink,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
         )))
     }
 }
@@ -186,7 +188,6 @@ pub struct PostgresSinkExec {
     append_only_mode: bool,
     checkpoint_truncation: bool,
     parallelism: usize,
-    write_batch_size: u32,
     /// Pool + DDL shared across `ParallelSinkExec`'s concurrent per-partition
     /// `write_all` calls.
     connection: tokio::sync::OnceCell<PostgresConnection>,
@@ -209,7 +210,6 @@ impl PostgresSinkExec {
         checkpoint_truncation: bool,
         reference_name: String,
         parallelism: usize,
-        write_batch_size: u32,
     ) -> Self {
         Self {
             config,
@@ -227,7 +227,6 @@ impl PostgresSinkExec {
             append_only_mode,
             checkpoint_truncation,
             parallelism,
-            write_batch_size,
             connection: tokio::sync::OnceCell::new(),
         }
     }
@@ -340,8 +339,6 @@ impl DataSink for PostgresSinkExec {
             append_only_mode: self.append_only_mode,
             checkpoint_truncation: self.checkpoint_truncation,
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
-            parallelism: self.parallelism,
-            write_batch_size: self.write_batch_size,
             client_statement_timeout: self.config.client_statement_timeout(),
         };
 

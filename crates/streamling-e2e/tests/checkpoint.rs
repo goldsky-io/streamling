@@ -445,3 +445,149 @@ sinks:
         );
     }
 }
+
+/// Checkpoint restart-resume with a multi-instance Kafka source.
+///
+/// This is the case the sink ack gate and marker alignment exist for. With
+/// `parallelism: 2` the source emits a marker copy per instance, and each copy
+/// reaches its own sink write stream. Acking on the first copy would commit
+/// offsets for both instances while the slower one still had pre-marker rows in
+/// flight, so a restart would resume past data that was never written.
+///
+/// Run 1 stops at a record limit; run 2 resumes from the committed offsets. The
+/// assertion is at-least-once end to end: no produced key may be missing after
+/// the two runs.
+#[tokio::test]
+async fn test_kafka_parallelism_checkpoint_resume() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new())
+        .await
+        .expect("Failed to create test context");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("parallel_ckpt", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(MARKER_TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let total_records = 400i64;
+    let records: Vec<MarkerTestRecord> = (1..=total_records)
+        .map(|i| MarkerTestRecord {
+            id: i,
+            value: format!("value_{i}"),
+        })
+        .collect();
+    topic
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let state_table = format!("parallel_ckpt_state_{}", ctx.test_id.replace("-", "_"));
+    let application_id = format!("parallel_ckpt_{}", ctx.test_id);
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 2
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: parallel_ckpt_output
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 10
+    batch_flush_interval: 100ms
+"#,
+        topic = topic.topic,
+    );
+
+    let state_env = |opts: PipelineOpts| -> PipelineOpts {
+        opts.env("STREAMLING__APPLICATION_ID", &application_id)
+            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+                &ctx.postgres.host,
+            )
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+                ctx.postgres.port.to_string(),
+            )
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+                &state_table,
+            )
+            .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+            .env("STREAMLING__RECORD_BATCH_SIZE", "10")
+            .timeout(std::time::Duration::from_secs(120))
+    };
+
+    let status_1 = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            state_env(PipelineOpts::new().record_limit(total_records as u64 / 2)),
+        )
+        .await
+        .expect("Pipeline 1 execution failed");
+    assert!(status_1.success(), "Pipeline 1 should exit successfully");
+
+    let count_1 = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.parallel_ckpt_output")
+        .await
+        .expect("Failed to query count");
+    assert!(
+        count_1 > 0,
+        "Pipeline 1 should have written rows before stopping"
+    );
+    assert!(
+        count_1 < total_records,
+        "Pipeline 1 should have stopped short of the full topic, got {count_1}"
+    );
+
+    // Resume: both instances rejoin the same group and seek to the committed
+    // offsets of whichever partitions they are now assigned.
+    let status_2 = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            state_env(PipelineOpts::new().record_limit(total_records as u64)),
+        )
+        .await
+        .expect("Pipeline 2 execution failed");
+    assert!(status_2.success(), "Pipeline 2 should exit successfully");
+
+    // At-least-once: every produced key must be present. Duplicates are allowed
+    // and collapse via the upsert primary key, but a gap means the first run
+    // committed offsets past data it never wrote.
+    let missing: Vec<(i64,)> = ctx
+        .postgres
+        .query(
+            "SELECT s.id FROM generate_series(1, 400) AS s(id) \
+             LEFT JOIN public.parallel_ckpt_output o ON o.id = s.id \
+             WHERE o.id IS NULL ORDER BY s.id",
+        )
+        .await
+        .expect("Failed to query missing ids");
+    assert!(
+        missing.is_empty(),
+        "checkpoint resume lost rows: {:?}",
+        missing.iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+}

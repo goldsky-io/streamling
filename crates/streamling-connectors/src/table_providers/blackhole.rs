@@ -21,6 +21,7 @@ use streamling_core::checkpoints::checkpoint_management::{
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
@@ -30,6 +31,11 @@ use streamling_core::topology::Telemetry;
 struct BlackholeSink {
     schema: SchemaRef,
     num_records_before_stop: Option<u64>, // for integration tests only!
+    /// Global `num_records_before_stop` progress across the concurrent
+    /// per-partition `write_all` streams (`ParallelSinkExec`). Counting in a
+    /// `write_all`-local would make the threshold per-stream, so a sink with
+    /// `parallelism: N` would need N times the rows before stopping.
+    rows_received: AtomicU64,
     source_name: String,
     metric_metadata_id: String,
 }
@@ -44,6 +50,7 @@ impl BlackholeSink {
         Self {
             schema,
             num_records_before_stop,
+            rows_received: AtomicU64::new(0),
             source_name,
             metric_metadata_id,
         }
@@ -73,6 +80,10 @@ impl DataSink for BlackholeSink {
             let start_at = Instant::now();
             let num_rows_in_batch = batch.num_rows();
             row_count += num_rows_in_batch;
+            let total_received = self
+                .rows_received
+                .fetch_add(num_rows_in_batch as u64, Ordering::SeqCst)
+                + num_rows_in_batch as u64;
             metrics_recorder.record_output_rows_count(
                 num_rows_in_batch as u64,
                 self.metric_metadata_id.as_str(),
@@ -91,9 +102,11 @@ impl DataSink for BlackholeSink {
                 &sink_id,
             );
 
+            // Compare against the global received count so the stop threshold
+            // stays global across the concurrent per-partition streams.
             if let Some(num_records_before_stop) = self.num_records_before_stop
-                && row_count >= num_records_before_stop as usize
-                && !(num_records_before_stop == 0 && row_count == 0)
+                && total_received >= num_records_before_stop
+                && !(num_records_before_stop == 0 && total_received == 0)
             {
                 // Notify the coordinator (and sources) that the sink has received the expected rows
                 let _ = send(
@@ -191,6 +204,55 @@ impl TableProvider for BlackholeTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(ParallelSinkExec::new(input, telemetry_data_sink)))
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            telemetry_data_sink,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
+
+    /// `num_records_before_stop` has to be global across the concurrent
+    /// per-partition `write_all` calls `ParallelSinkExec` makes. Counted in a
+    /// `write_all`-local, a sink with `parallelism: N` would need N times the
+    /// rows before signalling completion — so a pipeline with a record limit
+    /// would simply never stop.
+    #[tokio::test]
+    async fn stop_threshold_is_shared_across_concurrent_write_streams() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let sink = Arc::new(BlackholeSink::new(
+            schema.clone(),
+            Some(4),
+            "src".to_string(),
+            "app::sink".to_string(),
+        ));
+
+        // Two streams of two rows each: neither reaches 4 on its own.
+        let context = SessionContext::new().task_ctx();
+        for _ in 0..2 {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                    .unwrap();
+            let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(vec![Ok(batch)]),
+            ));
+            sink.write_all(stream, &context).await.unwrap();
+        }
+
+        assert_eq!(
+            sink.rows_received.load(Ordering::SeqCst),
+            4,
+            "both write streams must count toward the same threshold"
+        );
     }
 }

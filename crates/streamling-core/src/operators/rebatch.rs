@@ -143,7 +143,11 @@ impl DisplayAs for RebatchExec {
                 if let Some(interval) = self.batch_flush_interval {
                     write!(f, ", interval={:?}", interval)?;
                 }
-                write!(f, ")")
+                write!(
+                    f,
+                    ", partitions={})",
+                    self.properties().output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "RebatchExec")

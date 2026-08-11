@@ -153,6 +153,11 @@ impl HybridOffsetTable {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct KafkaSource {
     pub topic: String,
+    /// Number of concurrent consumer instances. All instances share one consumer
+    /// group, so the broker assigns each a disjoint slice of the topic's
+    /// partitions. Defaults to 1. Values above the topic's partition count leave
+    /// the surplus instances idle.
+    pub parallelism: Option<usize>,
     pub starting_offsets: Option<String>,
     pub include_metadata: Option<bool>,
     pub filter: Option<String>,
@@ -244,6 +249,11 @@ pub struct FileSource {
     pub format: FileSourceFormat,
     #[serde(default)]
     pub mode: FileSourceMode,
+    /// Number of concurrent scan partitions the discovered files are split
+    /// across. Bounded mode only; defaults to the session's target partitions.
+    /// A continuous file source is single-stream (one watermark cursor) and
+    /// rejects any value above 1.
+    pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
 }
@@ -477,6 +487,17 @@ impl Source {
             Source::plugin(s) => s.telemetry.as_ref(),
         }
     }
+
+    /// Requested number of concurrent instances for this source, if the source
+    /// type supports more than one. Sources not listed here are structurally
+    /// single-stream and have no field to set.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Source::kafka(s) => s.parallelism,
+            Source::file(s) => s.parallelism,
+            Source::clickhouse(_) | Source::hybrid(_) | Source::plugin(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -496,6 +517,10 @@ pub struct DynamicTableTransform {
 pub struct SqlTransform {
     pub primary_key: String,
     pub sql: String,
+    /// Width of this transform's output: the rows are hash-partitioned by
+    /// `primary_key` into this many streams, letting a narrow source feed wider
+    /// downstream compute. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -568,6 +593,21 @@ impl Transform {
             Transform::plugin(t) => t.telemetry.as_ref(),
         }
     }
+
+    /// Requested output width for this transform.
+    ///
+    /// `script` is deliberately absent: its `parallelism` sizes the WASM instance
+    /// pool inside a single stream, which is a different thing from plan width.
+    /// `handler`, `plugin` and `dynamic_table` are `SinglePartition` operators.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Transform::sql(t) => t.parallelism,
+            Transform::dynamic_table(_)
+            | Transform::handler(_)
+            | Transform::script(_)
+            | Transform::plugin(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -590,6 +630,11 @@ pub struct WebhookSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PrintSink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink neither dedupes nor depends on ordering,
+    /// so it needs no primary key to parallelize. Output from the streams
+    /// interleaves.
+    pub parallelism: Option<usize>,
     pub sample_every: Option<u32>,
     pub num_records_before_stop: Option<u64>,
     pub primary_key: Option<String>,
@@ -602,6 +647,10 @@ pub struct PrintSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct BlackholeSink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink discards everything, so it needs no
+    /// primary key to parallelize.
+    pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
@@ -612,6 +661,11 @@ pub struct BlackholeSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MemorySink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink appends into a shared store and neither
+    /// dedupes nor depends on ordering, so it needs no primary key to
+    /// parallelize. Batch order in the store becomes nondeterministic.
+    pub parallelism: Option<usize>,
     pub exclude_gs_op: Option<bool>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
@@ -673,6 +727,13 @@ pub struct AggregateColumn {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PostgresAggregateSink {
     pub from: String,
+    /// Number of concurrent write streams into the landing table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    ///
+    /// Note this parallelizes the *insert*, not the aggregation: the aggregate
+    /// table is maintained by a Postgres trigger, and concurrent inserts whose
+    /// rows fall in the same `group_by` bucket contend on that row.
+    pub parallelism: Option<usize>,
     pub schema: String,
     pub landing_table: String,
     pub agg_table: String,
@@ -785,6 +846,22 @@ impl Sink {
             Sink::kafka(s) => s.telemetry.as_ref(),
             Sink::clickhouse(s) => s.telemetry.as_ref(),
             Sink::plugin(s) => s.telemetry.as_ref(),
+        }
+    }
+
+    /// Requested number of concurrent write streams for this sink. The rows are
+    /// hash-partitioned by the sink's primary key into that many streams, so a
+    /// key is never written by two streams at once.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Sink::postgres(s) => s.parallelism,
+            Sink::kafka(s) => s.parallelism,
+            Sink::clickhouse(s) => s.parallelism,
+            Sink::postgres_aggregate(s) => s.parallelism,
+            Sink::print(s) => s.parallelism,
+            Sink::blackhole(s) => s.parallelism,
+            Sink::memory(s) => s.parallelism,
+            Sink::webhook(_) | Sink::plugin(_) => None,
         }
     }
 }

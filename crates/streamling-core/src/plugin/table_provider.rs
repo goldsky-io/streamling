@@ -15,14 +15,20 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+};
 use futures::StreamExt;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
-use crate::checkpoints::channels::{send, subscribe};
+use crate::checkpoints::channels::subscribe;
+use crate::checkpoints::checkpoint_management::send_checkpoint_ack;
+use crate::operators::coalesce::StreamingCoalesceExec;
 use crate::operators::wrapping::WrappingDataSink;
 use crate::plugin::telemetry::process_plugin_metrics;
+use crate::session::get_streamling_config_from_session;
+use crate::telemetry::provider::get_reference_name_from_metric_key;
 use crate::telemetry::recorder::get_metrics_recorder;
 use crate::topology::Telemetry;
 use crate::utils::metrics::metric_metadata_id_to_reference_name;
@@ -84,7 +90,11 @@ impl PluginSourceExec {
 
 impl DisplayAs for PluginSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-        write!(f, "PluginSourceExec")
+        write!(
+            f,
+            "PluginSourceExec: partitions={}",
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -490,14 +500,7 @@ impl DataSink for PluginSink {
                         let sink_id =
                             metric_metadata_id_to_reference_name(&self.metric_metadata_id)
                                 .unwrap_or_else(|| self.metric_metadata_id.clone());
-                        send(
-                            CHECKPOINT_COORDINATOR_CHANNEL,
-                            CheckpointMessage::Ack {
-                                epoch: CheckpointEpoch(epoch.0),
-                                sink_id,
-                            },
-                        )
-                        .unwrap();
+                        send_checkpoint_ack(CheckpointEpoch(epoch.0), &sink_id);
                     }
                     _ => {
                         warn!("Received unexpected message from plugin channel");
@@ -585,7 +588,7 @@ impl TableProvider for PluginSinkProvider {
 
     async fn insert_into(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -601,6 +604,22 @@ impl TableProvider for PluginSinkProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(ParallelSinkExec::new(input, telemetry_sink)))
+        // A plugin acks epochs from inside the plugin, on a channel poll that is
+        // decoupled from the marker that triggered it, so the per-stream ack gate
+        // cannot see its markers. Merge to one write stream instead — the plugin
+        // ABI has no partition dimension anyway.
+        let input = if input.output_partitioning().partition_count() > 1 {
+            Arc::new(StreamingCoalesceExec::new(
+                input,
+                get_streamling_config_from_session(state)?.internal_buffer_size,
+            )) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            telemetry_sink,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+        )))
     }
 }

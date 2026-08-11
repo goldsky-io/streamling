@@ -6,16 +6,23 @@
 //!
 //! Concurrent writes mean there is no cross-partition ordering: rows carrying
 //! the same primary key on different partitions reach the sink in
-//! nondeterministic order. Today the only multi-partition input is the bounded
-//! file source (append-only inserts, no checkpoint markers), where ordering is
-//! immaterial; order-sensitive streams (CDC upserts/deletes, checkpoint
-//! markers) all flow through single-partition sources, and `UNION ALL` fan-ins
-//! are merged back to one partition by the `EnforceSinglePartition` optimizer
-//! rule. `write_all` implementations must tolerate concurrent invocation:
-//! one-time setup (DDL, plugin init) belongs behind a `OnceCell`, and
+//! nondeterministic order. Order-sensitive streams (CDC upserts/deletes,
+//! keep-last dedup) are kept correct by hash-partitioning on the primary key
+//! upstream, so all rows of a key share one partition; `UNION ALL` fan-ins are
+//! merged back to one partition by the `EnforceSinglePartition` optimizer rule.
+//! `write_all` implementations must tolerate concurrent invocation: one-time
+//! setup (DDL, plugin init) belongs behind a `OnceCell`, and
 //! `num_records_before_stop` counting must use state shared on the sink
 //! instance, not `write_all`-locals.
+//!
+//! Checkpoint markers fan out with the partitions, so each write stream sees its
+//! own copy of an epoch. The sink must not ack until every stream has flushed
+//! it, or the source commits offsets for data still in flight — hence the
+//! per-sink ack gate registered here (see `MarkerAligner`).
 
+use crate::checkpoints::checkpoint_management::{
+    register_sink_streams, send_checkpoint_ack, sink_stream_done,
+};
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -42,17 +49,23 @@ use tokio::task::JoinSet;
 pub struct ParallelSinkExec {
     input: Arc<dyn ExecutionPlan>,
     sink: Arc<dyn DataSink>,
+    /// The sink's reference name. Must match the `sink_id` the sink itself acks
+    /// with (`get_reference_name_from_metric_key(metric_metadata_id)`), or the
+    /// ack gate registered here will not be found and the sink acks on the first
+    /// stream to see the epoch.
+    sink_id: String,
     count_schema: SchemaRef,
     cache: Arc<PlanProperties>,
 }
 
 impl ParallelSinkExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, sink: Arc<dyn DataSink>) -> Self {
+    pub fn new(input: Arc<dyn ExecutionPlan>, sink: Arc<dyn DataSink>, sink_id: String) -> Self {
         let count_schema = make_count_schema();
         let cache = Self::compute_properties(&input, count_schema.clone());
         Self {
             input,
             sink,
+            sink_id,
             count_schema,
             cache: Arc::new(cache),
         }
@@ -96,7 +109,14 @@ impl DisplayAs for ParallelSinkExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ParallelSinkExec: sink=")?;
+                // The input's width is the number of concurrent `write_all`
+                // calls, which is the one thing about this node a plan dump
+                // cannot show anywhere else: its own output is always 1.
+                write!(
+                    f,
+                    "ParallelSinkExec: partitions={}, sink=",
+                    self.input.output_partitioning().partition_count()
+                )?;
                 self.sink.fmt_as(t, f)
             }
             DisplayFormatType::TreeRender => self.sink.fmt_as(t, f),
@@ -130,6 +150,7 @@ impl ExecutionPlan for ParallelSinkExec {
         Ok(Arc::new(ParallelSinkExec::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.sink),
+            self.sink_id.clone(),
         )))
     }
 
@@ -158,6 +179,8 @@ impl ExecutionPlan for ParallelSinkExec {
 
         let sink = Arc::clone(&self.sink);
         let count_schema = Arc::clone(&self.count_schema);
+        let sink_id = self.sink_id.clone();
+        register_sink_streams(&sink_id, input_partitions);
 
         let stream = futures::stream::once(async move {
             // One spawned task per partition so each partition's pipeline
@@ -172,6 +195,11 @@ impl ExecutionPlan for ParallelSinkExec {
             }
             let mut total_count: u64 = 0;
             while let Some(write_result) = writes.join_next().await {
+                // A finished stream will never report another epoch; releasing
+                // its share here keeps a late epoch from waiting forever on it.
+                for epoch in sink_stream_done(&sink_id) {
+                    send_checkpoint_ack(epoch, &sink_id);
+                }
                 total_count += write_result
                     .map_err(|e| internal_datafusion_err!("sink write task failed: {e}"))??;
             }
@@ -244,6 +272,37 @@ mod tests {
         }
     }
 
+    /// The node's own output is always a single partition, so the write
+    /// concurrency is invisible in a plan dump unless it says so itself.
+    #[test]
+    fn display_reports_the_number_of_write_streams() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let input: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone()], vec![batch]],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        let exec = ParallelSinkExec::new(
+            input,
+            Arc::new(CountingSink {
+                schema,
+                rows_written: AtomicU64::new(0),
+            }),
+            "test_sink".to_string(),
+        );
+
+        let rendered = datafusion::physical_plan::displayable(&exec)
+            .indent(true)
+            .to_string();
+        assert!(
+            rendered.contains("ParallelSinkExec: partitions=2, sink=CountingSink"),
+            "unexpected plan display:\n{rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn writes_every_input_partition() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -266,7 +325,7 @@ mod tests {
             schema: schema.clone(),
             rows_written: AtomicU64::new(0),
         });
-        let exec = ParallelSinkExec::new(input, sink.clone());
+        let exec = ParallelSinkExec::new(input, sink.clone(), "test_sink".to_string());
 
         let task_context = SessionContext::new().task_ctx();
         let mut stream = exec.execute(0, task_context).unwrap();

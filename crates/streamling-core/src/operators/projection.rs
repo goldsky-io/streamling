@@ -87,7 +87,12 @@ impl DisplayAs for StreamingProjectionExec {
                     })
                     .collect();
 
-                write!(f, "ProjectionExec: expr=[{}]", expr.join(", "))
+                write!(
+                    f,
+                    "ProjectionExec: expr=[{}], partitions={}",
+                    expr.join(", "),
+                    self.properties().output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 for (i, (e, alias)) in self.expr().iter().enumerate() {

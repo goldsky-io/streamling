@@ -169,6 +169,7 @@ pub async fn build_bounded_file_source_provider(
     path: &str,
     format: FileSourceFormat,
     session_manager: &SessionManager,
+    parallelism: Option<usize>,
 ) -> Result<Arc<dyn TableProvider>> {
     let table_url = ListingTableUrl::parse(path)?;
     register_object_store_for_url(&table_url, path, session_manager)?;
@@ -194,7 +195,11 @@ pub async fn build_bounded_file_source_provider(
     // turn on `collect_stat` (a footer fetch per file at startup).
     let listing_options = ListingOptions::new(file_format)
         .with_table_partition_cols(partition_cols)
-        .with_target_partitions(state.config().target_partitions());
+        .with_target_partitions(
+            parallelism
+                .unwrap_or_else(|| state.config().target_partitions())
+                .max(1),
+        );
     // Partition columns are detected ourselves above (`infer_partition_columns`),
     // not via DataFusion's `infer_partitions_from_path` (which treats every parent
     // directory as a partition level and errors on plain nested subfolders).
@@ -718,7 +723,11 @@ impl Debug for FileSourceExec {
 
 impl DisplayAs for FileSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-        write!(f, "FileSourceExec")
+        write!(
+            f,
+            "FileSourceExec: partitions={}",
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -1254,7 +1263,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("1.csv"), "id,name\n1,alice\n2,bob\n3,carol").unwrap();
 
-        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
         let state_backend = InMemoryStateOperatorBackendFactory::new()
             .unwrap()
             .create::<FileWatermark>("heartbeat_test");
@@ -1326,12 +1335,13 @@ mod tests {
             .unwrap();
         }
 
-        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
         let provider = build_bounded_file_source_provider(
             "bounded_src",
             &format!("{}/", dir.to_str().unwrap()),
             FileSourceFormat::Csv,
             &session_manager,
+            None,
         )
         .await
         .unwrap();
@@ -1388,7 +1398,7 @@ mod tests {
             .unwrap();
         }
 
-        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
         let state_backend = InMemoryStateOperatorBackendFactory::new()
             .unwrap()
             .create::<FileWatermark>("split_test");
@@ -1501,7 +1511,7 @@ mod tests {
         let file = dir.join("1.csv");
         std::fs::write(&file, "id,name\n1,alice\n2,bob\n3,carol").unwrap();
 
-        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new()).unwrap();
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
         let state_backend = InMemoryStateOperatorBackendFactory::new()
             .unwrap()
             .create::<FileWatermark>("single_file_test");
