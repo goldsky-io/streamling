@@ -1241,15 +1241,17 @@ async fn test_deduplication_with_sink_parallelism() {
         .await
         .expect("Failed to register schema");
 
-    // Every id appears twice; the second occurrence must win.
-    let mut records: Vec<TestRecord> = (1..=20)
+    // Every id appears twice; the second occurrence must win. Ten keys is
+    // enough that both write streams get work with near-certainty.
+    const KEYS: i64 = 10;
+    let mut records: Vec<TestRecord> = (1..=KEYS)
         .map(|i| TestRecord {
             id: i,
             value: format!("first_{i}"),
             timestamp: i,
         })
         .collect();
-    records.extend((1..=20).map(|i| TestRecord {
+    records.extend((1..=KEYS).map(|i| TestRecord {
         id: i,
         value: format!("updated_{i}"),
         timestamp: 1000 + i,
@@ -1278,11 +1280,22 @@ sinks:
     table: parallel_dedup_output
     primary_key: id
     parallelism: 2
+    batch_size: 1
 "#,
         topic = ctx.kafka_topic,
     );
 
-    let mut opts = PipelineOpts::new().record_limit(records.len() as u64);
+    // The record limit counts WRITTEN rows, and rows are deduplicated by primary
+    // key *within a batch* before they reach the sink's counter — so with both
+    // versions of a key in one batch, only one is ever counted and a limit of
+    // `records.len()` is unreachable. Force one record per batch (sink
+    // `batch_size: 1` + record batch size 1, per the repo test guidance) so
+    // every produced record is written and counted, and the pipeline stops on
+    // its own instead of running to the harness timeout.
+    let mut opts = PipelineOpts::new()
+        .record_limit(records.len() as u64)
+        .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+        .timeout(std::time::Duration::from_secs(120));
     for (k, v) in clickhouse_env(&ctx) {
         opts = opts.env(&k, &v);
     }
@@ -1297,7 +1310,7 @@ sinks:
         .count("SELECT COUNT(*) FROM parallel_dedup_output FINAL")
         .await
         .expect("Failed to query count");
-    assert_eq!(count, 20, "one row per key after deduplication");
+    assert_eq!(count, KEYS as u64, "one row per key after deduplication");
 
     #[derive(Row, Deserialize)]
     struct ResultRow {
@@ -1309,6 +1322,9 @@ sinks:
         .query("SELECT id, value FROM parallel_dedup_output FINAL ORDER BY id")
         .await
         .expect("Failed to query rows");
+
+    // Without this the loop below would pass vacuously on an empty result.
+    assert_eq!(rows.len(), KEYS as usize, "every key must be present");
 
     for row in &rows {
         assert_eq!(
