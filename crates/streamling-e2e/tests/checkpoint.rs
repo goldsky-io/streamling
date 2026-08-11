@@ -454,9 +454,10 @@ sinks:
 /// offsets for both instances while the slower one still had pre-marker rows in
 /// flight, so a restart would resume past data that was never written.
 ///
-/// Run 1 stops at a record limit; run 2 resumes from the committed offsets. The
-/// assertion is at-least-once end to end: no produced key may be missing after
-/// the two runs.
+/// Records are produced in two waves with a pipeline run after each. The second
+/// run can only reach the second wave by resuming from the committed offsets —
+/// a run that restarted from `earliest` would re-read the first wave, hit its
+/// record limit on those replays, and write no second-wave row at all.
 #[tokio::test]
 async fn test_kafka_parallelism_checkpoint_resume() {
     init_tracing();
@@ -474,17 +475,23 @@ async fn test_kafka_parallelism_checkpoint_resume() {
         .await
         .expect("Failed to register schema");
 
-    let total_records = 400i64;
-    let records: Vec<MarkerTestRecord> = (1..=total_records)
-        .map(|i| MarkerTestRecord {
-            id: i,
-            value: format!("value_{i}"),
-        })
-        .collect();
+    // Two waves of the same size. `num_records_before_stop` is a *graceful*
+    // stop — it halts the source but still writes everything already in flight —
+    // so a single wave with a half-sized limit would simply drain the whole
+    // topic in run 1 and leave run 2 nothing to resume onto.
+    const WAVE: i64 = 200;
+    let wave = |from: i64| -> Vec<MarkerTestRecord> {
+        (from..from + WAVE)
+            .map(|i| MarkerTestRecord {
+                id: i,
+                value: format!("value_{i}"),
+            })
+            .collect()
+    };
     topic
-        .produce_avro_records(&records)
+        .produce_avro_records(&wave(1))
         .await
-        .expect("Failed to produce records");
+        .expect("Failed to produce first wave");
 
     let state_table = format!("parallel_ckpt_state_{}", ctx.test_id.replace("-", "_"));
     let application_id = format!("parallel_ckpt_{}", ctx.test_id);
@@ -542,7 +549,7 @@ sinks:
     let status_1 = ctx
         .run_pipeline_with_opts(
             &pipeline,
-            state_env(PipelineOpts::new().record_limit(total_records as u64 / 2)),
+            state_env(PipelineOpts::new().record_limit(WAVE as u64)),
         )
         .await
         .expect("Pipeline 1 execution failed");
@@ -553,41 +560,66 @@ sinks:
         .count("SELECT COUNT(*) FROM public.parallel_ckpt_output")
         .await
         .expect("Failed to query count");
-    assert!(
-        count_1 > 0,
-        "Pipeline 1 should have written rows before stopping"
-    );
-    assert!(
-        count_1 < total_records,
-        "Pipeline 1 should have stopped short of the full topic, got {count_1}"
+    assert_eq!(
+        count_1, WAVE,
+        "Pipeline 1 should have written the whole first wave"
     );
 
-    // Resume: both instances rejoin the same group and seek to the committed
-    // offsets of whichever partitions they are now assigned.
+    // Now produce records the first run never saw. Both instances rejoin the
+    // same consumer group and seek to the committed offsets of whichever
+    // partitions they are assigned.
+    topic
+        .produce_avro_records(&wave(WAVE + 1))
+        .await
+        .expect("Failed to produce second wave");
+
     let status_2 = ctx
         .run_pipeline_with_opts(
             &pipeline,
-            state_env(PipelineOpts::new().record_limit(total_records as u64)),
+            state_env(PipelineOpts::new().record_limit(WAVE as u64)),
         )
         .await
         .expect("Pipeline 2 execution failed");
     assert!(status_2.success(), "Pipeline 2 should exit successfully");
 
-    // At-least-once: every produced key must be present. Duplicates are allowed
-    // and collapse via the upsert primary key, but a gap means the first run
-    // committed offsets past data it never wrote.
+    // Nothing from the first wave may go missing across the restart — a gap
+    // there means a run committed offsets past data it never wrote.
     let missing: Vec<(i64,)> = ctx
         .postgres
-        .query(
-            "SELECT s.id FROM generate_series(1, 400) AS s(id) \
+        .query(&format!(
+            // `generate_series(int, int)` yields INT4; the ids are BIGINT, so
+            // cast or the row decode into `i64` fails.
+            "SELECT s.id::bigint FROM generate_series(1, {WAVE}) AS s(id) \
              LEFT JOIN public.parallel_ckpt_output o ON o.id = s.id \
-             WHERE o.id IS NULL ORDER BY s.id",
-        )
+             WHERE o.id IS NULL ORDER BY s.id"
+        ))
         .await
         .expect("Failed to query missing ids");
     assert!(
         missing.is_empty(),
-        "checkpoint resume lost rows: {:?}",
+        "checkpoint resume lost rows from the first wave: {:?}",
         missing.iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+
+    // And the second run must have got *past* the first wave. This is the
+    // resume signal: a run that ignored the checkpoint and restarted from
+    // `earliest` would re-read the first wave, spend its whole record budget on
+    // those replays, and write no second-wave id at all.
+    //
+    // Completeness of the second wave is deliberately not asserted. At-least-once
+    // means run 2 replays whatever the first run had not yet committed, and those
+    // replays count against its record limit — so how far into the second wave it
+    // gets is not deterministic.
+    let resumed: i64 = ctx
+        .postgres
+        .count(&format!(
+            "SELECT COUNT(*) FROM public.parallel_ckpt_output WHERE id > {WAVE}"
+        ))
+        .await
+        .expect("Failed to count second-wave rows");
+    assert!(
+        resumed > 0,
+        "pipeline 2 wrote no second-wave row, so it restarted from the beginning \
+         instead of resuming from the committed offsets"
     );
 }

@@ -1192,12 +1192,21 @@ sinks:
     primary_key: id
     on_conflict: update
     parallelism: 3
-    batch_size: 5
+    batch_size: 1
     batch_flush_interval: 100ms
 "#,
         topic = ctx.kafka_topic,
     );
 
+    // `batch_size: 1` (was 5) so no two rows share a batch. `parallelism` now
+    // hash-partitions on the primary key, which puts both copies of an id on one
+    // write stream — with a larger batch they would land in the same batch and be
+    // collapsed by in-batch dedup, so fewer than 10 rows would ever be written and
+    // the record limit would be unreachable.
+    //
+    // One row per batch also makes this a sharper test of the exchange: with no
+    // in-batch dedup to mask it, a key whose two rows reached different streams
+    // would race and could leave `original_i` as the final value.
     let status = ctx
         .run_pipeline_with_opts(
             &pipeline,
@@ -1300,12 +1309,18 @@ sinks:
     primary_key: id
     on_conflict: update
     parallelism: 3
-    batch_size: 5
+    batch_size: 1
     batch_flush_interval: 100ms
 "#,
         topic = ctx.kafka_topic,
     );
 
+    // `batch_size: 1` (was 5) so an id's insert and its delete never share a
+    // batch: `parallelism` hash-partitions on the primary key, so both land on
+    // one write stream and in-batch dedup would collapse them, making the record
+    // limit below unreachable. Keeping them as separate writes also means the
+    // delete has to actually follow the insert on that stream — which is the
+    // ordering guarantee the exchange exists to provide.
     // 10 inserts + 5 deletes = 15 total records
     let status = ctx
         .run_pipeline_with_opts(

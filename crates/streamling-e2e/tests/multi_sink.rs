@@ -618,7 +618,8 @@ sinks:
     let missing: Vec<(i64,)> = ctx
         .postgres
         .query(
-            "SELECT s.id FROM generate_series(1, 100) AS s(id) \
+            // `generate_series(int, int)` yields INT4; the ids are BIGINT.
+            "SELECT s.id::bigint FROM generate_series(1, 100) AS s(id) \
              LEFT JOIN public.parallel_fanout_pg o ON o.id = s.id \
              WHERE o.id IS NULL ORDER BY s.id",
         )

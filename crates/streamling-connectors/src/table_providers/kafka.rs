@@ -87,6 +87,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
@@ -2284,6 +2285,11 @@ pub struct KafkaSink {
     format: KafkaFormat,
     subject_name_strategy: SubjectNameStrategy,
     num_records_before_stop: Option<u64>, // for integration tests only!
+    /// Global `num_records_before_stop` progress across the concurrent
+    /// per-partition `write_all` streams (`ParallelSinkExec`). Counting in a
+    /// `write_all`-local would make the threshold per-stream, so a sink with
+    /// `parallelism: N` would need N times the rows before stopping.
+    rows_received: AtomicU64,
     source_name: String,
     metric_metadata_id: String,
     producer: OnceCell<KafkaThreadedProducer>,
@@ -2326,6 +2332,7 @@ impl KafkaSink {
             format,
             subject_name_strategy,
             num_records_before_stop,
+            rows_received: AtomicU64::new(0),
             source_name,
             metric_metadata_id: reference_name,
             producer: OnceCell::new(),
@@ -2810,6 +2817,10 @@ impl DataSink for KafkaSink {
             }
 
             row_count += batch.num_rows();
+            let total_received = self
+                .rows_received
+                .fetch_add(batch.num_rows() as u64, Ordering::SeqCst)
+                + batch.num_rows() as u64;
 
             let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
             trace!(
@@ -2859,8 +2870,10 @@ impl DataSink for KafkaSink {
                 }
             }
 
+            // Compare against the global received count so the stop threshold
+            // stays global across the concurrent per-partition streams.
             if let Some(num_records_before_stop) = self.num_records_before_stop
-                && row_count >= num_records_before_stop as usize
+                && total_received >= num_records_before_stop
             {
                 let _ = send(
                     CHECKPOINT_COORDINATOR_CHANNEL,

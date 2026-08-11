@@ -188,6 +188,12 @@ pub struct PostgresSinkExec {
     append_only_mode: bool,
     checkpoint_truncation: bool,
     parallelism: usize,
+    /// Global `num_records_before_stop` progress, shared across
+    /// `ParallelSinkExec`'s concurrent per-partition `write_all` calls. Built
+    /// per call it would be per-stream, so a sink with `parallelism: N` would
+    /// need N times the rows before signalling completion — and a pipeline with
+    /// a record limit would never stop.
+    records_processed: Arc<Mutex<u64>>,
     /// Pool + DDL shared across `ParallelSinkExec`'s concurrent per-partition
     /// `write_all` calls.
     connection: tokio::sync::OnceCell<PostgresConnection>,
@@ -227,6 +233,7 @@ impl PostgresSinkExec {
             append_only_mode,
             checkpoint_truncation,
             parallelism,
+            records_processed: Arc::new(Mutex::new(0u64)),
             connection: tokio::sync::OnceCell::new(),
         }
     }
@@ -329,7 +336,7 @@ impl DataSink for PostgresSinkExec {
             column_indices: column_info.indices.clone(),
             source_name: self.source_name.clone(),
             node_label: node_label.clone(),
-            records_processed: Arc::new(Mutex::new(0u64)),
+            records_processed: Arc::clone(&self.records_processed),
             num_records_before_stop: self.num_records_before_stop,
             metrics_recorder: get_metrics_recorder().clone(),
             metric_metadata_id: self.metric_metadata_id.clone(),
