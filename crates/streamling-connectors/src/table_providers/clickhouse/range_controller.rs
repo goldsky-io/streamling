@@ -1,3 +1,4 @@
+use once_cell::sync::OnceCell;
 use std::time::Duration;
 
 /// Adaptive sort-key-range pagination with an owned cursor.
@@ -16,8 +17,9 @@ use std::time::Duration;
 /// Three signals drive width:
 /// - **rows** — the tripwire. A page is read with `LIMIT page_size + 1`; `page_size + 1`
 ///   rows means the range overflowed (`on_overflow`), else it was fully consumed.
-/// - **elapsed** — the time guard. A page slower than `soft_time_budget` shrinks the
-///   width even if the row count looked fine, catching the scan-bound case.
+/// - **elapsed** — the time guard. Scales width toward `soft_time_budget` on every
+///   completed page, not only slow ones: a page that used most of its budget can't
+///   be multiplied back into a timeout by row headroom alone.
 /// - **bytes** — the array guard. A page over `max_page_bytes` (`on_byte_overflow`)
 ///   would build a single Arrow column past the ~2 GiB `i32` offset limit, so it is
 ///   re-read smaller. `on_complete` also clamps growth by observed byte density, or a
@@ -41,8 +43,21 @@ pub struct RangeController {
 
 impl RangeController {
     /// Largest per-step growth multiplier. Bounds how fast width expands so a
-    /// near-empty page can't explode the range in one step.
-    const GROW_CEILING: f64 = 4.0;
+    /// near-empty page can't explode the range in one step. Lower it when a table
+    /// keeps oscillating between a completed page and a timeout. Override with
+    /// `STREAMLING__CLICKHOUSE_SOURCE__GROW_CEILING`.
+    const DEFAULT_GROW_CEILING: f64 = 4.0;
+
+    fn grow_ceiling() -> f64 {
+        static GROW_CEILING: OnceCell<f64> = OnceCell::new();
+        *GROW_CEILING.get_or_init(|| {
+            std::env::var("STREAMLING__CLICKHOUSE_SOURCE__GROW_CEILING")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v >= 1.0 && v.is_finite())
+                .unwrap_or(Self::DEFAULT_GROW_CEILING)
+        })
+    }
 
     /// Fraction of `max_page_bytes` that byte sizing targets. A re-read covers a
     /// different (shrunk) sub-range whose byte density differs from the page that
@@ -133,13 +148,15 @@ impl RangeController {
         // GROW_CEILING. A completed page has rows <= page_size, so this is >= 1.0
         // (never shrinks on rows alone — that's the tripwire's and time guard's job).
         let rows = rows.max(1) as f64;
-        let row_mult = (self.page_size as f64 / rows).min(Self::GROW_CEILING);
+        let row_mult = (self.page_size as f64 / rows).min(Self::grow_ceiling());
         let mut candidate = self.width as f64 * row_mult;
 
-        // Time guard: a page slower than the soft budget is transfer- or scan-bound,
-        // so shrink proportionally regardless of row headroom. This stops an
-        // empty-but-slow (sparse, no projection) page from growing into a timeout.
-        if elapsed > self.soft_time_budget {
+        // Time guard: cap growth by how close the page ran to the soft budget, in both
+        // directions. Over budget it shrinks (transfer- or scan-bound); under budget it
+        // still bounds growth to budget/elapsed, so a page that already used most of its
+        // time cannot be multiplied back into a timeout by row headroom alone. A fast
+        // page leaves a multiplier well above the grow ceiling, so it is unaffected.
+        if !elapsed.is_zero() {
             let time_mult = self.soft_time_budget.as_secs_f64() / elapsed.as_secs_f64();
             candidate = candidate.min(self.width as f64 * time_mult);
         }
@@ -334,6 +351,16 @@ mod tests {
         let mut c = controller();
         c.on_complete(500, Duration::from_secs(60), 0);
         assert_eq!(c.width(), 500, "the time guard wins over row-based growth");
+    }
+
+    #[test]
+    fn near_budget_page_growth_is_damped_by_time() {
+        let mut c = controller();
+        // 100 rows against page_size 1000 wants 4x growth, but the page burned 20s of a
+        // 30s budget: growth is capped at 30/20 = 1.5x, not 4x, so the next page cannot
+        // be multiplied straight back into a timeout.
+        c.on_complete(100, Duration::from_secs(20), 0);
+        assert_eq!(c.width(), 1500);
     }
 
     #[test]

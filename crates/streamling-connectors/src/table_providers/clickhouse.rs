@@ -46,6 +46,7 @@ use datafusion::physical_expr::expressions::{CaseExpr, binary, col, lit};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::projection::ProjectionExec;
 use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use regex::Regex;
 use reqwest::{Error, Response};
 use serde::{Deserialize, Serialize};
@@ -359,7 +360,22 @@ impl ClickHouseTableProvider {
     const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
     const DEFAULT_PAGE_SIZE: usize = 10_000_000;
     const MIN_SORT_KEY_RANGE: i64 = 100;
-    const SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
+    /// Hard per-page timeout for a source range query. A page that exceeds this is
+    /// cancelled and the range re-read at half the width. The soft shrink budget is
+    /// half of this, so lowering it also makes completed-but-slow pages shrink sooner.
+    /// Override with `STREAMLING__CLICKHOUSE_SOURCE__QUERY_TIMEOUT_SEC`.
+    const DEFAULT_SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
+
+    fn source_query_timeout_secs() -> u64 {
+        static TIMEOUT_SECS: OnceCell<u64> = OnceCell::new();
+        *TIMEOUT_SECS.get_or_init(|| {
+            std::env::var("STREAMLING__CLICKHOUSE_SOURCE__QUERY_TIMEOUT_SEC")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(Self::DEFAULT_SOURCE_QUERY_TIMEOUT_SECS)
+        })
+    }
 
     pub fn new_source(
         reference_name: String,
@@ -1474,7 +1490,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let max_width = (max_key - range_start).max(default_sort_key_range);
 
             let source_query_timeout =
-                Duration::from_secs(ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS);
+                Duration::from_secs(ClickHouseTableProvider::source_query_timeout_secs());
             // Shrink proactively at half the hard timeout, before the query is killed.
             let soft_time_budget = source_query_timeout / 2;
 
@@ -1612,7 +1628,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     Err(_elapsed) => {
                         Err(DataFusionError::from(streamling_core::streamling_err!(
                             "ClickHouse query timed out after {}s",
-                            ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS
+                            ClickHouseTableProvider::source_query_timeout_secs()
                         )))
                     }
                 };
