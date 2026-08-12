@@ -176,6 +176,113 @@ pub async fn run_streamling(
     Ok(status)
 }
 
+/// Run streamling, send SIGTERM after `signal_after`, and require the process
+/// to exit within `exit_deadline` of the signal (the graceful-shutdown
+/// contract: drain and exit well inside the k8s grace period).
+///
+/// The child is placed in its own process group and the signal is sent to the
+/// whole group, so the streamling binary receives it even when launched via
+/// `cargo run` (where the direct child is cargo, which does not forward
+/// signals). Returns the exit status; errors if the process misses the
+/// deadline (after SIGKILLing the group so no orphans leak into later tests).
+#[cfg(unix)]
+pub async fn run_streamling_with_sigterm(
+    pipeline_path: &Path,
+    binary_path: Option<&Path>,
+    env_vars: &[(String, String)],
+    signal_after: std::time::Duration,
+    exit_deadline: std::time::Duration,
+) -> Result<ExitStatus> {
+    let streamling_dir = find_streamling_dir();
+    let (program, args) = construct_program_with_args(binary_path);
+
+    let mut cmd = Command::new(&program);
+    for arg in &args {
+        cmd.arg(arg);
+    }
+    if let Some(ref dir) = streamling_dir {
+        cmd.current_dir(dir);
+        info!("Running streamling from directory: {}", dir.display());
+    }
+    cmd.env(
+        "STREAMLING__PIPELINE_DEFINITION_LOCATION",
+        pipeline_path.to_string_lossy().to_string(),
+    );
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    // New process group (pgid == child pid) so `kill -- -PGID` reaches the
+    // streamling binary through the `cargo run` wrapper.
+    cmd.process_group(0);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    info!(
+        "Running streamling with pipeline: {} (SIGTERM after {:?}, exit deadline {:?})",
+        pipeline_path.display(),
+        signal_after,
+        exit_deadline
+    );
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id().ok_or_else(|| {
+        E2eError::StreamlingFailed("child exited before a pid could be observed".to_string())
+    })?;
+
+    // Stream output so the drain behaviour is debuggable in test logs.
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(target: "streamling", "{}", line);
+            }
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "streamling", "{}", line);
+            }
+        })
+    });
+
+    let send_group_signal = |sig: &str| {
+        let _ = std::process::Command::new("kill")
+            .args([sig, "--", &format!("-{}", pid)])
+            .status();
+    };
+
+    tokio::time::sleep(signal_after).await;
+    info!("Sending SIGTERM to streamling process group {}", pid);
+    send_group_signal("-TERM");
+
+    let waited = tokio::time::timeout(exit_deadline, child.wait()).await;
+
+    if let Some(handle) = stdout_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = stderr_handle {
+        let _ = handle.await;
+    }
+
+    match waited {
+        Ok(status) => Ok(status?),
+        Err(_) => {
+            // Missed the deadline: this is exactly the hang-until-SIGKILL bug.
+            // Kill the group so the test suite doesn't leak the process.
+            send_group_signal("-KILL");
+            let _ = child.wait().await;
+            Err(E2eError::StreamlingFailed(format!(
+                "streamling did not exit within {:?} of SIGTERM (graceful-shutdown hang)",
+                exit_deadline
+            )))
+        }
+    }
+}
+
 /// Run streamling and wait for it to process a specific number of records
 /// This is useful for tests that need streamling to run until a condition is met
 pub async fn run_streamling_with_limit(

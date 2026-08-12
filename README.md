@@ -1776,6 +1776,15 @@ plugin:
       key: value
 ```
 
+Preprocessors run in the configured order. An id that is not registered by the
+loaded plugin bundle is skipped with a warning. This allows shared configuration
+to add preprocessors without breaking older images that do not include them.
+Under `--validate`, the warning appears in the JSON `warnings` array.
+
+A pipeline that depends on a skipped preprocessor may still fail later when its
+topology is validated. Missing-plugin errors list the ids available in the loaded
+bundle to make version mismatches easier to diagnose.
+
 #### Side Output Trait
 
 Side outputs observe data from sources without modifying the pipeline. Unlike other plugin types, side outputs use direct FFI invocation (no channels). One instance is created per source.

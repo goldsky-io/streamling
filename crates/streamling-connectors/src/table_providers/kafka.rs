@@ -3,7 +3,7 @@ mod metadata;
 mod schema_registry;
 
 use streamling_config::{KafkaCompression, KafkaConfig};
-use streamling_core::checkpoints::channels::{send, subscribe};
+use streamling_core::checkpoints::channels::{send, subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
@@ -985,7 +985,7 @@ async fn calculate_lag_task(
     reference_name: String,
     metric_metadata_id: String,
     kafka_topic_partition_list: KafkaTopicPartitionList,
-    consumer: StreamConsumer,
+    consumer: SafeKafkaConsumer,
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     metrics_recorder: Arc<MetricsRecorder>,
     lag_report_interval_ms: Option<u64>,
@@ -996,11 +996,27 @@ async fn calculate_lag_task(
         lag_report_interval_ms.unwrap_or(DEFAULT_LAG_REPORT_INTERVAL_MS),
     ));
 
+    // Also observe the process-wide shutdown signal: outside job mode nothing
+    // flips the provider-level channel, and a lag task that outlives the
+    // pipeline gets cancelled at runtime teardown — where its consumer's
+    // rd_kafka_destroy can no longer be deferred to a blocking thread.
+    let mut global_shutdown_rx = streamling_core::shutdown::subscribe();
+
     loop {
+        if *global_shutdown_rx.borrow() {
+            info!("Lag task observed process shutdown for {}", reference_name);
+            break;
+        }
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     info!("Lag task received shutdown signal for {}", reference_name);
+                    break;
+                }
+            },
+            _ = global_shutdown_rx.changed() => {
+                if *global_shutdown_rx.borrow() {
+                    info!("Lag task observed process shutdown for {}", reference_name);
                     break;
                 }
             },
@@ -1208,7 +1224,13 @@ impl ExecutionPlan for KafkaSourceExec {
         let batch_size_limit = self.record_batch_size as u64;
 
         let reference_name = self.reference_name.clone();
-        let receiver = subscribe(CHECKPOINT_COORDINATOR_CHANNEL);
+        // Keep the subscriber id so the consume task can unsubscribe on exit:
+        // dropping the receiver while the sender stays in the global channel
+        // map makes every later broadcast return SendError — which used to
+        // panic sinks/coordinator mid-drain the moment this source exited on
+        // shutdown.
+        let (receiver, checkpoint_subscriber_id) =
+            subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
 
         let mut metadata = if self.include_metadata {
             Some(KafkaMetadata::default())
@@ -1233,12 +1255,15 @@ impl ExecutionPlan for KafkaSourceExec {
         let metric_metadata_id = self.metric_metadata_id.clone();
         let kafka_lag_reporter_interval = self.kafka_config.lag_report_interval_ms;
         let metrics_recorder = get_metrics_recorder().clone();
-        let lag_consumer = Self::create_consumer(
+        // Wrap the lag consumer so its rd_kafka_destroy is deferred to a
+        // blocking thread on drop, instead of running inline on a tokio worker
+        // (the documented deadlock the main consumer is already protected from).
+        let lag_consumer = SafeKafkaConsumer::new(Self::create_consumer(
             &self.kafka_config,
             &self.start_at,
             &self.reference_name,
             true,
-        );
+        ));
         let topic = self.topic.clone();
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
@@ -1379,30 +1404,60 @@ impl ExecutionPlan for KafkaSourceExec {
             let mut source_complete_interval = num_records_before_stop
                 .map(|_| tokio::time::interval(Duration::from_millis(5)));
 
+            // Process-wide shutdown signal (one top-level SIGTERM/SIGINT
+            // handler flips it). This replaces the per-iteration
+            // `signal(SignalKind::terminate())` listener this loop used to
+            // re-create on every outer iteration — a signal landing in the
+            // drop/recreate window was lost entirely, leaving the source
+            // running until the watchdog force-exited the process.
+            let mut global_shutdown_rx = streamling_core::shutdown::subscribe();
+            // When a shutdown signal arrives we break the INNER loop only, so
+            // the batch already buffered in the converter is still converted
+            // and sent (drain, don't drop), then exit the outer loop.
+            let mut drain_and_stop = false;
+
             'outer: loop {
+                // A shutdown requested before this iteration started (e.g.
+                // before the first poll, or while sending the previous batch)
+                // would not wake `changed()` below — the subscription has
+                // already observed the value. Check it explicitly. No DATA is
+                // buffered at the top of an iteration, but
+                // `checkpoint_messages_buffer` may hold Markers/Finalizers
+                // that arrived after the last batch was built (they ride the
+                // NEXT batch, which never comes) — the post-loop flush below
+                // delivers them on a synthetic batch.
+                if drain_and_stop || *global_shutdown_rx.borrow() {
+                    info!("Kafka source '{}': shutdown requested; stopping", reference_name);
+                    break 'outer;
+                }
+
                 watchdog.refresh_lag();
                 watchdog.check_and_alert(&topic);
 
                 let outer_loop_start_at = Instant::now();
                 let deadline = Instant::now() + batch_interval;
-                // SIGTERM on Unix; Windows has no SIGTERM, so the shutdown branch
-                // below falls back to Ctrl-C there.
-                #[cfg(unix)]
-                let mut sigterm = {
-                    use tokio::signal::unix::{SignalKind, signal};
-                    signal(SignalKind::terminate())?
-                };
 
                 let mut row_kinds = Vec::new();
                 let mut batch_row_count = 0u64;
 
                 loop {
                     tokio::select! {
-                        // Check for shutdown signal
+                        // Provider-level shutdown (hybrid job-mode termination)
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() {
                                 info!("Kafka consumer received shutdown signal");
-                                break 'outer;
+                                drain_and_stop = true;
+                                break;
+                            }
+                        },
+                        // Process-wide shutdown (SIGTERM/SIGINT via the
+                        // top-level handler): finish the in-flight batch and
+                        // send it before exiting.
+                        _ = global_shutdown_rx.changed() => {
+                            if *global_shutdown_rx.borrow() {
+                                info!("Kafka source '{}': received shutdown signal, draining in-flight batch", reference_name);
+                                drain_and_stop = true;
+                                break;
                             }
                         },
                         // Check for SourceComplete messages (only in test mode with num_records_before_stop).
@@ -1475,17 +1530,6 @@ impl ExecutionPlan for KafkaSourceExec {
                         _ = sleep_until(deadline) => {
                             break;
                         },
-                        // shutdown hook: SIGTERM on Unix, Ctrl-C on Windows
-                        _ = async {
-                            #[cfg(unix)]
-                            { let _ = sigterm.recv().await; }
-                            #[cfg(not(unix))]
-                            { let _ = tokio::signal::ctrl_c().await; }
-                        } => {
-                            // TODO: flush, cleanup, etc.
-                            info!("Received shutdown signal, shutting down");
-                            break 'outer; // exit the outer loop, which terminates the task
-                        }
                     }
                 }
 
@@ -1630,7 +1674,15 @@ impl ExecutionPlan for KafkaSourceExec {
 
                                 consumer_offsets.remove(&epoch);
                             } else {
-                                error!("No position found for epoch: {:?}", epoch);
+                                // Expected for epochs whose Marker never reached this
+                                // source — notably the terminal epoch, whose Marker
+                                // travels inline to the sinks only. Commits are
+                                // cumulative, so a missed epoch never loses data; the
+                                // uncommitted tail replays on restart (at-least-once).
+                                debug!(
+                                    "No recorded position for finalized epoch {:?}; skipping commit (cumulative commits make this safe)",
+                                    epoch
+                                );
                             }
                         }
                         CheckpointMessage::SourceComplete(name) => {
@@ -1657,7 +1709,31 @@ impl ExecutionPlan for KafkaSourceExec {
                 metrics_recorder.record_elapsed_compute(outer_loop_start_at.elapsed(), metric_metadata_id.as_str());
             }
 
+            // Flush any checkpoint messages buffered to ride the next batch —
+            // no exit path from the loop above produces one. Without this, a
+            // Marker/Finalizer that arrived after the last batch was built is
+            // silently dropped: the sinks never see it, the epoch cannot
+            // collect this branch's acks, and its offsets are never committed
+            // before teardown (replayed on restart, but the clean drain is
+            // lost). Mirrors the end-of-stream flush in the ClickHouse and
+            // hybrid sources.
+            {
+                let flush_batch = crate::table_providers::clickhouse::build_checkpoint_flush_batch(
+                    &mut checkpoint_messages_buffer,
+                    full_schema.clone(),
+                );
+                if let Some(batch) = flush_batch
+                    && tx.send(Ok(batch)).await.is_err()
+                {
+                    warn!(
+                        "Kafka source '{}': receiver dropped before final checkpoint flush",
+                        reference_name
+                    );
+                }
+            }
+
             info!("Shutting down Kafka consumer: unsubscribing and unassigning");
+            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
             consumer.unsubscribe();
             consumer.unassign().expect("Failed to unassign consumer");
             // Always forget after explicit cleanup to avoid redundant drop overhead.
@@ -2768,11 +2844,12 @@ impl DataSink for KafkaSink {
                     }
 
                     let sink_id = get_reference_name_from_metric_key(&self.metric_metadata_id);
-                    send(
+                    // Best-effort: see the postgres sink — a receiver dropped
+                    // during shutdown must not panic the sink mid-drain.
+                    let _ = send(
                         CHECKPOINT_COORDINATOR_CHANNEL,
                         CheckpointMessage::Ack { epoch, sink_id },
-                    )
-                    .unwrap();
+                    );
                     metrics_recorder.record_time(
                         "checkpoint_sink_flush",
                         ack_start.elapsed(),

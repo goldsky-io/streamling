@@ -46,6 +46,7 @@ use datafusion::physical_expr::expressions::{CaseExpr, binary, col, lit};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::projection::ProjectionExec;
 use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use regex::Regex;
 use reqwest::{Error, Response};
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ pub use streamling_config::{
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::node_context::get_node_context;
 use streamling_core::operators::wrapping::WrappingDataSink;
-use streamling_core::retry::retry_forever_with_backoff_async;
+use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
@@ -142,8 +143,9 @@ const MAX_PAGE_BYTES: u64 = (i32::MAX as u64) / 2;
 ///
 /// Extracted as a free function so the drain logic is unit-testable without a
 /// ClickHouse connection or a multi-minute scan. Returns `None` when the buffer
-/// is empty (nothing to flush).
-fn build_checkpoint_flush_batch(
+/// is empty (nothing to flush). Shared with the Kafka source, whose exit paths
+/// have the same buffered-message shape.
+pub(crate) fn build_checkpoint_flush_batch(
     buffer: &mut Vec<CheckpointMessage>,
     schema: SchemaRef,
 ) -> Option<RecordBatch> {
@@ -360,7 +362,22 @@ impl ClickHouseTableProvider {
     const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
     const DEFAULT_PAGE_SIZE: usize = 10_000_000;
     const MIN_SORT_KEY_RANGE: i64 = 100;
-    const SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
+    /// Hard per-page timeout for a source range query. A page that exceeds this is
+    /// cancelled and the range re-read at half the width. The soft shrink budget is
+    /// half of this, so lowering it also makes completed-but-slow pages shrink sooner.
+    /// Override with `STREAMLING__CLICKHOUSE_SOURCE__QUERY_TIMEOUT_SEC`.
+    const DEFAULT_SOURCE_QUERY_TIMEOUT_SECS: u64 = 60;
+
+    fn source_query_timeout_secs() -> u64 {
+        static TIMEOUT_SECS: OnceCell<u64> = OnceCell::new();
+        *TIMEOUT_SECS.get_or_init(|| {
+            std::env::var("STREAMLING__CLICKHOUSE_SOURCE__QUERY_TIMEOUT_SEC")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(Self::DEFAULT_SOURCE_QUERY_TIMEOUT_SECS)
+        })
+    }
 
     pub fn new_source(
         reference_name: String,
@@ -1094,7 +1111,8 @@ impl DataSink for ClickHouseSinkExec {
                         async move {
                             let operation_name =
                                 format!("{}: INSERT into '{}'", node_label, table_name);
-                            retry_forever_with_backoff_async(
+                            let mut shutdown = streamling_core::shutdown::subscribe();
+                            match retry_forever_with_backoff_until_cancelled(
                                 || async {
                                     client
                                         .send_arrow_batch(&table_name, &slice, &schema)
@@ -1102,12 +1120,20 @@ impl DataSink for ClickHouseSinkExec {
                                         .streamling_context("failed to send Arrow batch")
                                 },
                                 &operation_name,
+                                &mut shutdown,
                             )
-                            .await;
+                            .await
+                            {
+                                RetryOutcome::Completed => Ok(()),
+                                RetryOutcome::Cancelled => Err(streamling_core::streamling_err!(
+                                    "{} aborted: shutdown requested before the write succeeded",
+                                    operation_name
+                                )),
+                            }
                         }
                     }
                 })
-                .await;
+                .await?;
             } else {
                 // append_only_mode=false: split rows by _gs_op into inserts vs deletes
                 use datafusion::arrow::array::StringArray;
@@ -1182,7 +1208,8 @@ impl DataSink for ClickHouseSinkExec {
                             async move {
                                 let operation_name =
                                     format!("{}: INSERT into '{}'", node_label, table_name);
-                                retry_forever_with_backoff_async(
+                                let mut shutdown = streamling_core::shutdown::subscribe();
+                                match retry_forever_with_backoff_until_cancelled(
                                     || async {
                                         client
                                             .send_arrow_batch(&table_name, &slice, &schema)
@@ -1190,12 +1217,22 @@ impl DataSink for ClickHouseSinkExec {
                                             .streamling_context("failed to send Arrow batch")
                                     },
                                     &operation_name,
+                                    &mut shutdown,
                                 )
-                                .await;
+                                .await
+                                {
+                                    RetryOutcome::Completed => Ok(()),
+                                    RetryOutcome::Cancelled => {
+                                        Err(streamling_core::streamling_err!(
+                                            "{} aborted: shutdown requested before the write succeeded",
+                                            operation_name
+                                        ))
+                                    }
+                                }
                             }
                         }
                     })
-                    .await;
+                    .await?;
                 }
 
                 // Process deletes: extract PK columns and issue ALTER TABLE DELETE
@@ -1219,7 +1256,8 @@ impl DataSink for ClickHouseSinkExec {
                     let client_for_delete = client.clone();
                     let table_for_delete = table_name.clone();
                     let pks = primary_keys.clone();
-                    retry_forever_with_backoff_async(
+                    let mut shutdown = streamling_core::shutdown::subscribe();
+                    match retry_forever_with_backoff_until_cancelled(
                         || {
                             let client = client_for_delete.clone();
                             let table = table_for_delete.clone();
@@ -1228,8 +1266,18 @@ impl DataSink for ClickHouseSinkExec {
                             async move { client.delete_by_primary_keys(&table, &pks, &batch).await }
                         },
                         &operation_name,
+                        &mut shutdown,
                     )
-                    .await;
+                    .await
+                    {
+                        RetryOutcome::Completed => {}
+                        RetryOutcome::Cancelled => {
+                            return Err(DataFusionError::from(streamling_core::streamling_err!(
+                                "{} aborted: shutdown requested before the delete succeeded",
+                                operation_name
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -1479,7 +1527,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let max_width = (max_key - range_start).max(default_sort_key_range);
 
             let source_query_timeout =
-                Duration::from_secs(ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS);
+                Duration::from_secs(ClickHouseTableProvider::source_query_timeout_secs());
             // Shrink proactively at half the hard timeout, before the query is killed.
             let soft_time_budget = source_query_timeout / 2;
 
@@ -1530,6 +1578,16 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let mut query_retry_attempts: u32 = 0;
             let mut query_retry_backoff_ms: u64 = 100;
 
+            // Observe the process-wide shutdown signal between pages so a
+            // SIGTERM during a long bounded scan ends the stream at a page
+            // boundary instead of running the table to completion (and
+            // blowing the shutdown budget). Nothing past the last emitted
+            // page is checkpoint-covered, so a restart resumes from the last
+            // finalized cursor. The retry/timeout backoff sleeps below select
+            // on the same signal — an uncancellable 30s backoff would outlive
+            // the shutdown budget all by itself.
+            let mut shutdown = streamling_core::shutdown::subscribe();
+
             // Attach any buffered checkpoint messages to a batch about to be emitted.
             // Clears the buffer after attaching, so messages ride exactly one batch.
             let attach_checkpoints = {
@@ -1550,6 +1608,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
             };
 
             while !controller.is_done() {
+                if *shutdown.borrow() {
+                    info!(
+                        "[{}] shutdown requested; ending bounded scan early after {} page(s)",
+                        reference_name, page_count
+                    );
+                    break;
+                }
                 page_count += 1;
                 // Count-first sizing: probe the exact row count for the range the
                 // cursor covers and shrink the width to fit BEFORE the data read.
@@ -1617,7 +1682,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     Err(_elapsed) => {
                         Err(DataFusionError::from(streamling_core::streamling_err!(
                             "ClickHouse query timed out after {}s",
-                            ClickHouseTableProvider::SOURCE_QUERY_TIMEOUT_SECS
+                            ClickHouseTableProvider::source_query_timeout_secs()
                         )))
                     }
                 };
@@ -1855,7 +1920,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 reference_name, page_count, old_width, controller.width()
                             );
                             page_count -= 1;
-                            tokio::time::sleep(Duration::from_millis(1_000)).await;
+                            // Shutdown-aware backoff: fall through to the
+                            // loop-top check as soon as the signal flips.
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(1_000)) => {}
+                                _ = shutdown.changed() => {}
+                            }
                             continue;
                         }
 
@@ -1874,7 +1944,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         page_count -= 1;
                         let jitter = (query_retry_attempts as u64 % 100) * 7;
                         let sleep_ms = std::cmp::min(30_000u64, query_retry_backoff_ms + jitter);
-                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        // Shutdown-aware backoff: a full 30s uncancellable
+                        // sleep would outlive the shutdown budget on its own;
+                        // fall through to the loop-top check on signal.
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+                            _ = shutdown.changed() => {}
+                        }
                         query_retry_backoff_ms = std::cmp::min(query_retry_backoff_ms.saturating_mul(2), 30_000);
                         continue;
                     }
