@@ -1333,9 +1333,6 @@ impl Streamling {
                     )
                     .await?;
 
-                    // `CheckpointableNode` is schema-identical to its input, so
-                    // the primary key resolves the same either way; it is tracked
-                    // here because the exchange below needs the key columns.
                     let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
                         &Some(sql_transform.primary_key),
                         source_name.clone(),

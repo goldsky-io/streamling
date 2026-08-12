@@ -49,7 +49,8 @@ use tracing::debug;
 use crate::checkpoints::checkpoint_management::{
     MarkerAligner, extract_checkpoint_messages, strip_checkpoint_messages,
 };
-use crate::operators::coalesce::{StreamingCoalesceExec, marker_only_batch, schema_with_messages};
+use crate::operators::coalesce::StreamingCoalesceExec;
+use crate::operators::{marker_only_batch, schema_with_messages};
 use crate::session::get_streamling_config;
 use crate::streamling_user_err;
 

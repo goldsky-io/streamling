@@ -15,7 +15,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 
-use crate::operators::coalesce::spawn_marker_preserving_forwarder;
+use crate::operators::spawn_marker_preserving_forwarder;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
