@@ -545,6 +545,15 @@ impl Streamling {
         let mut plugins: BTreeMap<String, InitializedPlugin> = BTreeMap::new();
 
         let mut checkpoint_coordinator = CheckpointCoordinator::new();
+        // Control handle shared with bounded sources (to begin the terminal
+        // checkpoint) and sink futures (to signal completion). Valid before the
+        // coordinator is started since it shares the coordinator's state.
+        let checkpoint_control = checkpoint_coordinator.control();
+        // Process-wide shutdown signal (streamling_core::shutdown). A single
+        // SIGTERM/SIGINT handler flips it (installed below); every source
+        // observes it and drains front-to-back, and deep call sites (sink
+        // retry loops) subscribe to it directly.
+        let shutdown_rx = streamling_core::shutdown::subscribe();
         let mut checkpoint_sink_names: Vec<String> = Vec::new();
 
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
@@ -772,20 +781,29 @@ impl Streamling {
                     let offset_table = &hybrid.offset_table;
                     let primary_key_opt = &hybrid.primary_key;
 
-                    let hybrid_source_provider = Arc::new(HybridTableProvider::new_from_topology(
-                        reference_name.clone(),
-                        bounded_sources.clone(),
-                        unbounded_source.clone(),
-                        offset_table.clone(),
-                        &app_config,
-                        &state_backend_factory,
-                        session_manager.clone(),
-                        // Per-phase event-time config flows directly to the
-                        // inner WrappingSourceTableProviders (one per bounded
-                        // phase + one for unbounded), each carrying its own
-                        // `metric_key_hybrid_src_*` suffix. R9 falls out.
-                        hybrid.telemetry.as_ref(),
-                    )?);
+                    let hybrid_source_provider = Arc::new(
+                        HybridTableProvider::new_from_topology(
+                            reference_name.clone(),
+                            bounded_sources.clone(),
+                            unbounded_source.clone(),
+                            offset_table.clone(),
+                            &app_config,
+                            &state_backend_factory,
+                            session_manager.clone(),
+                            // Per-phase event-time config flows directly to the
+                            // inner WrappingSourceTableProviders (one per bounded
+                            // phase + one for unbounded), each carrying its own
+                            // `metric_key_hybrid_src_*` suffix. R9 falls out.
+                            hybrid.telemetry.as_ref(),
+                        )?
+                        // In job mode this source emits the terminal checkpoint
+                        // when its bounded phases complete; in streaming mode it
+                        // does so on shutdown. Give it the control handle (to gate
+                        // teardown on that epoch finalizing) and the shutdown
+                        // signal (to drain rather than drop on SIGTERM).
+                        .with_checkpoint_control(checkpoint_control.clone())
+                        .with_shutdown(shutdown_rx.clone()),
+                    );
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         hybrid_source_provider.clone(),
@@ -2054,6 +2072,9 @@ impl Streamling {
                 .map(|e| e.name.as_str())
                 .collect::<Vec<&str>>()
                 .join(", ");
+            // Captured for the sink-completion signal below: one entry per
+            // sink driven by this future (a fan-out future drives several).
+            let sink_names: Vec<String> = sinks.iter().map(|e| e.name.clone()).collect();
             let sink_plan = if sinks.len() > 1 {
                 // Fan-out: each sink gets its own RebatchExec injected by
                 // the MultiSinkExtensionPlanner, so the raw source_plan
@@ -2102,13 +2123,35 @@ impl Streamling {
 
             if !dry_run {
                 let session_manager = session_manager.clone();
+                let checkpoint_control = checkpoint_control.clone();
                 let sink_future = async move {
                     let result = session_manager.new_df(sink_plan).collect().await;
-                    if let Err(err) = &result {
-                        error!(
-                            "Sink future [{}] completed with error: {}",
-                            future_name, err
-                        );
+                    match &result {
+                        Ok(_) => {
+                            // The sink has SUCCESSFULLY drained its input and
+                            // will not ack any further checkpoint epochs. Tell
+                            // the coordinator so it drops these sinks from the
+                            // expected-ack set and can finalize in-flight
+                            // epochs the remaining live sinks already acked,
+                            // instead of blocking on a sink that is gone (the
+                            // multi-source completion case).
+                            for sink_name in &sink_names {
+                                checkpoint_control.sink_completed(sink_name);
+                            }
+                        }
+                        Err(err) => {
+                            // A FAILED sink must NOT be deregistered: its
+                            // missing acks are the coordinator's only signal
+                            // that the epochs it touched are not durable.
+                            // Removing it would let those epochs (including
+                            // the terminal one) finalize as if the data had
+                            // been written. The pipeline is failing anyway —
+                            // let the epochs stall and the error propagate.
+                            error!(
+                                "Sink future [{}] completed with error: {}",
+                                future_name, err
+                            );
+                        }
                     }
                     result
                 };
@@ -2144,49 +2187,128 @@ impl Streamling {
             );
         }
 
-        let app_result = if !plugins.is_empty() {
-            let plugin_futures: Vec<ExecutionFuture> = plugins
-                .into_values()
-                .map(|plugin| plugin.execution_future)
-                .collect();
+        // One top-level shutdown trigger. On SIGTERM/SIGINT it flips the shared
+        // signal (sources drain front-to-back) and arms the watchdog. This
+        // replaces the per-component signal handlers (notably the plugin
+        // watcher that used to kill plugins first, inverting the drain order).
+        if !dry_run {
+            tokio::spawn(async move {
+                Self::wait_for_shutdown_signal().await;
+                info!("Shutdown signal received; draining pipeline front-to-back");
+                streamling_core::shutdown::request_shutdown();
+                Self::arm_shutdown_watchdog(Self::shutdown_budget());
+            });
+        }
 
-            // We terminate the application in two cases:
-            // 1. If ANY plugin future completes (assuming an error)
-            // 2. If ANY sink future fails
-            let result: Result<()> = tokio::select! {
-                plugin_outcome = futures::future::select_all(plugin_futures) => {
-                    let (res, _idx, _rest) = plugin_outcome;
-                    match res {
-                        Ok(()) => {
-                            debug!("Terminating because a plugin future completed gracefully");
-                            Ok(())
-                        }
-                        Err(msg) => {
-                            debug!("Terminating because a plugin future completed with error: {}", msg);
-                            Err(streamling_err!("Plugin error: {}", msg))
-                        }
+        // Plugin dispatchers run as detached tasks; their execution futures are
+        // join wrappers. We keep them in a set so that AFTER the sinks drain we
+        // can send Terminate and AWAIT the dispatchers finishing their flush,
+        // rather than dropping them and letting the runtime cancel them
+        // mid-flush at process exit (the job-mode tail-loss bug).
+        let mut plugin_set: futures::stream::FuturesUnordered<ExecutionFuture> =
+            plugins.into_values().map(|p| p.execution_future).collect();
+
+        // Drive to completion. The terminal condition is "all sinks drained"
+        // (every source ended its stream, via bounded completion or shutdown).
+        // A plugin dispatcher exiting on its own is NOT terminal unless it
+        // errored — otherwise we would drop in-flight sink work and lose the
+        // tail, exactly the previous behaviour.
+        // The sinks are driven individually (not try_join_all): a failing sink
+        // must not CANCEL its siblings mid-flush — dropping their futures would
+        // abort in-flight writes and re-widen the very tail-loss window this
+        // change closes. Instead, the first failure triggers the same graceful
+        // drain as SIGTERM (sources stop, streams end, the remaining sinks
+        // finish flushing — all bounded by the watchdog), and the error is
+        // propagated once every sink has wound down. No epoch a failed sink
+        // touched is ever acked, so at-least-once is preserved either way.
+        let app_result: Result<()> = {
+            use futures::StreamExt as _;
+            let mut sink_set: futures::stream::FuturesUnordered<_> =
+                sink_futures.into_iter().collect();
+            let mut first_error: Option<streamling_core::error::StreamlingError> = None;
+            let fail_drain = |err: streamling_core::error::StreamlingError,
+                              first_error: &mut Option<
+                streamling_core::error::StreamlingError,
+            >| {
+                if first_error.is_none() {
+                    if !dry_run {
+                        warn!(
+                            "Pipeline component failed; draining remaining sinks before exit: {}",
+                            err
+                        );
+                        streamling_core::shutdown::request_shutdown();
+                        Self::arm_shutdown_watchdog(Self::shutdown_budget());
                     }
-                },
-                result = futures::future::try_join_all(sink_futures) => {
-                    result
-                        .map(|_| ())
-                        .map_err(|e| {
-                            debug!("Terminating because a sink future completed with error");
-                            e.into()
-                        })
+                    *first_error = Some(err);
                 }
             };
-
-            result
-        } else {
-            futures::future::try_join_all(sink_futures)
-                .await
-                .map(|_| ())
-                .map_err(Into::into)
+            while !sink_set.is_empty() {
+                tokio::select! {
+                    Some(sink_res) = sink_set.next() => {
+                        if let Err(e) = sink_res {
+                            debug!("A sink future completed with error");
+                            fail_drain(e.into(), &mut first_error);
+                        }
+                    }
+                    Some(plugin_res) = plugin_set.next() => {
+                        match plugin_res {
+                            Ok(()) => {
+                                debug!("A plugin future completed; continuing to drain sinks");
+                            }
+                            Err(msg) => {
+                                fail_drain(
+                                    streamling_err!("Plugin error: {}", msg),
+                                    &mut first_error,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            match first_error {
+                None => Ok(()),
+                Some(e) => Err(e),
+            }
         };
 
-        // Issue SourceComplete message to plugins. This is needed to fully clean up checkpoint channels when plugins
-        // terminate.
+        // Teardown. Everything below is bounded by a single deadline shared
+        // with the watchdog: arming is idempotent and returns the deadline of
+        // the FIRST arming (SIGTERM time, if one arrived), so after a long
+        // drain the bounded waits below correctly see less time remaining
+        // instead of overrunning into the hard exit. A 2s margin keeps these
+        // waits expiring before the watchdog fires. Dry runs never arm the
+        // watchdog (there is nothing to drain).
+        let deadline = if dry_run {
+            std::time::Instant::now() + Self::shutdown_budget()
+        } else {
+            let watchdog_deadline = Self::arm_shutdown_watchdog(Self::shutdown_budget());
+            watchdog_deadline
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or(watchdog_deadline)
+        };
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        if !dry_run {
+            // The sinks drained. Before tearing anything down, wait (bounded)
+            // for the terminal checkpoint to finalize so the tail is durably
+            // checkpointed and its Finalizer reaches components that commit on
+            // it. No-op in the streaming case where no terminal checkpoint was
+            // begun, and skipped on error (none will arrive).
+            if app_result.is_ok()
+                && timeout(remaining(), checkpoint_control.await_terminal_finalized())
+                    .await
+                    .is_err()
+            {
+                warn!(
+                    "Terminal checkpoint did not finalize within budget; proceeding with shutdown"
+                );
+            }
+            // Ensure sources observe shutdown even on a clean job-mode completion
+            // (so any lingering helper tasks — lag reporters — wind down).
+            streamling_core::shutdown::request_shutdown();
+        }
+
+        // Issue SourceComplete to plugin sources so the checkpoint channels are
+        // fully cleaned up when the plugins terminate.
         {
             use streamling_core::checkpoints::channels::send as checkpoint_send;
             use streamling_core::checkpoints::checkpoint_management::CheckpointMessage;
@@ -2202,23 +2324,136 @@ impl Streamling {
         }
 
         shutdown_plugin_side_outputs();
+
+        // Terminate plugins, then AWAIT their dispatchers finishing their drain
+        // (bounded) so the last buffered batches are flushed durably before the
+        // runtime is dropped. This is the fix for the plugin/pubsub tail loss.
         terminate_all_plugins()?;
-        // Stop checkpoint coordinator only if it was started (not in dry_run mode)
-        // Stop it before checking app_result to ensure cleanup happens even if there's an error
+        if !plugin_set.is_empty() {
+            use futures::StreamExt as _;
+            let drain = async {
+                while let Some(res) = plugin_set.next().await {
+                    if let Err(msg) = res {
+                        warn!("Plugin exited with error during drain: {}", msg);
+                    }
+                }
+            };
+            match timeout(remaining(), drain).await {
+                Ok(()) => info!("All plugin dispatchers drained cleanly"),
+                Err(_) => warn!(
+                    "Plugin drain exceeded the shutdown budget; {} dispatcher(s) may not have flushed",
+                    plugin_set.len()
+                ),
+            }
+        }
+
+        // Stop the checkpoint coordinator only if it was started (not dry_run).
         if !dry_run {
-            // Use timeout to prevent hanging if checkpoint coordinator tasks are stuck
-            match timeout(Duration::from_secs(30), checkpoint_coordinator.stop()).await {
+            match timeout(remaining(), checkpoint_coordinator.stop()).await {
                 Ok(_) => {}
                 Err(_) => {
-                    warn!(
-                        "Checkpoint coordinator stop timed out after 5 seconds, continuing anyway"
-                    );
+                    warn!("Checkpoint coordinator stop timed out; continuing anyway");
                 }
             }
         }
 
         app_result?;
         Ok(())
+    }
+
+    /// The total time budget for graceful shutdown. Delegates to the shared
+    /// definition in `streamling_core::shutdown` so every consumer (this run
+    /// loop's watchdog, the hybrid source's terminal-finalize wait) reads the
+    /// same value and they can never drift.
+    fn shutdown_budget() -> Duration {
+        streamling_core::shutdown::shutdown_budget()
+    }
+
+    /// Arm a last-resort watchdog: a plain OS thread that hard-exits the process
+    /// after `budget`, so a wedged FFI/rdkafka teardown or a plugin that never
+    /// finishes its drain can never hold the process past the k8s grace period.
+    ///
+    /// Idempotent — the first arming wins and later calls are no-ops. Always
+    /// returns the deadline of the FIRST arming so callers slice their bounded
+    /// waits against the watchdog's real deadline (e.g. teardown after a long
+    /// SIGTERM-triggered drain must not assume a fresh budget).
+    ///
+    /// The forced exit is non-zero: this path only fires when teardown failed
+    /// to complete in time, and it must surface to k8s/alerting as an abnormal
+    /// exit, not a clean completion.
+    fn arm_shutdown_watchdog(budget: Duration) -> std::time::Instant {
+        use std::sync::OnceLock;
+        static WATCHDOG_DEADLINE: OnceLock<std::time::Instant> = OnceLock::new();
+        *WATCHDOG_DEADLINE.get_or_init(|| {
+            let deadline = std::time::Instant::now() + budget;
+            let spawn_result = std::thread::Builder::new()
+                .name("shutdown-watchdog".to_string())
+                .spawn(move || {
+                    std::thread::sleep(budget);
+                    // A plain OS thread's exit cannot be blocked by a wedged
+                    // tokio worker or a hung FFI call, so this always fires.
+                    eprintln!(
+                        "[streamling] shutdown budget of {:?} exceeded; forcing process exit",
+                        budget
+                    );
+                    std::process::exit(1);
+                });
+            if let Err(e) = spawn_result {
+                // Without the watchdog nothing guarantees the process exits
+                // before the grace period; make that loudly visible instead of
+                // failing silently (behaviour then degrades to pre-watchdog).
+                eprintln!(
+                    "[streamling] FAILED to spawn shutdown watchdog thread: {}; \
+                     a wedged teardown can no longer be force-exited",
+                    e
+                );
+            }
+            deadline
+        })
+    }
+
+    /// Await SIGTERM / SIGINT / Ctrl-C — the single shutdown trigger for the
+    /// whole process, replacing the per-component signal handlers.
+    async fn wait_for_shutdown_signal() {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let handlers = (|| {
+                Ok::<_, std::io::Error>((
+                    signal(SignalKind::terminate())?,
+                    signal(SignalKind::interrupt())?,
+                ))
+            })();
+            let (mut sigterm, mut sigint) = match handlers {
+                Ok(h) => h,
+                Err(e) => {
+                    // Installation failed: the caller treats this function
+                    // returning as "signal received" and starts a drain, so
+                    // returning here would trigger a SPURIOUS shutdown at
+                    // startup. Pend forever instead — the process keeps
+                    // running and degrades to the OS default SIGTERM
+                    // disposition (immediate kill, no graceful drain), which
+                    // is the pre-existing behaviour without a handler.
+                    error!(
+                        "Failed to install SIGTERM/SIGINT handlers ({}); \
+                         graceful shutdown on signal is DISABLED for this run",
+                        e
+                    );
+                    futures::future::pending::<()>().await;
+                    unreachable!("pending() never resolves");
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => info!("Received SIGTERM"),
+                _ = sigint.recv() => info!("Received SIGINT"),
+                _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Received Ctrl-C");
+        }
     }
 
     fn find_plan_and_schema(

@@ -120,11 +120,13 @@ async fn process_checkpoint_messages_with_truncation(
                 );
 
                 let sink_id = get_reference_name_from_metric_key(&context.metric_metadata_id);
-                send(
+                // Best-effort: during shutdown a source may have dropped its
+                // channel receiver already; a failed ack broadcast must not
+                // panic the sink mid-drain (the epoch simply never finalizes).
+                let _ = send(
                     CHECKPOINT_COORDINATOR_CHANNEL,
                     CheckpointMessage::Ack { epoch, sink_id },
-                )
-                .unwrap();
+                );
 
                 // Record sink flush time (time from batch arrival to ack sent)
                 context.metrics_recorder.record_time(
@@ -151,9 +153,9 @@ async fn execute_insert_slice(
     context: &BatchProcessorContext,
     slice: &RecordBatch,
     epoch_for_rows: Option<u64>,
-) {
+) -> streamling_core::error::Result<()> {
     if slice.num_rows() == 0 {
-        return;
+        return Ok(());
     }
 
     let query = PostgresQueryBuilder::build_complete_upsert_query(
@@ -189,13 +191,16 @@ async fn execute_insert_slice(
         epoch_for_rows,
         context.client_statement_timeout,
     )
-    .await;
+    .await
 }
 
 /// Execute a DELETE for a single slice of a RecordBatch
-async fn execute_delete_slice(context: &BatchProcessorContext, slice: &RecordBatch) {
+async fn execute_delete_slice(
+    context: &BatchProcessorContext,
+    slice: &RecordBatch,
+) -> streamling_core::error::Result<()> {
     if slice.num_rows() == 0 {
-        return;
+        return Ok(());
     }
 
     let query = PostgresQueryBuilder::build_delete_query(
@@ -224,7 +229,7 @@ async fn execute_delete_slice(context: &BatchProcessorContext, slice: &RecordBat
         &sink_ctx,
         context.client_statement_timeout,
     )
-    .await;
+    .await
 }
 
 /// Process a single batch and return whether to continue processing.
@@ -283,13 +288,11 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
                 let ctx = context.clone();
                 move |slice| {
                     let ctx = ctx.clone();
-                    async move {
-                        execute_insert_slice(&ctx, &slice, epoch_for_rows).await;
-                    }
+                    async move { execute_insert_slice(&ctx, &slice, epoch_for_rows).await }
                 }
             },
         )
-        .await;
+        .await?;
     } else {
         // Normal mode: Split by _gs_op and process inserts/updates vs deletes separately
         // Get _gs_op column to identify delete operations
@@ -330,13 +333,11 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
                     let ctx = context.clone();
                     move |slice| {
                         let ctx = ctx.clone();
-                        async move {
-                            execute_insert_slice(&ctx, &slice, epoch_for_rows).await;
-                        }
+                        async move { execute_insert_slice(&ctx, &slice, epoch_for_rows).await }
                     }
                 },
             )
-            .await;
+            .await?;
         }
 
         // Process deletes
@@ -351,13 +352,11 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
                     let ctx = context.clone();
                     move |slice| {
                         let ctx = ctx.clone();
-                        async move {
-                            execute_delete_slice(&ctx, &slice).await;
-                        }
+                        async move { execute_delete_slice(&ctx, &slice).await }
                     }
                 },
             )
-            .await;
+            .await?;
         }
     }
 

@@ -73,7 +73,16 @@ pub fn unsubscribe(id: &str, subscriber_id: SubscriberId) {
 }
 
 /// Send a checkpoint message to all subscribers of the checkpoint channel using the reference name of the operator.
-/// Returns the number of successful sends. Receivers are only removed if a SourceComplete message is received.
+/// Returns the number of successful sends.
+///
+/// The broadcast always attempts EVERY subscriber: a dead one (receiver
+/// dropped without `unsubscribe`) is pruned and the remaining live subscribers
+/// still receive the message. This used to early-return on the first dead
+/// subscriber for non-completed sources, which silently starved every
+/// subscriber later in the (arbitrary) iteration order of Markers/Acks/
+/// Finalizers the moment any component exited uncleanly during shutdown.
+/// Dead subscribers on a source not marked complete are logged, since they
+/// indicate a component that dropped its receiver without unsubscribing.
 pub fn send(
     id: &str,
     message: CheckpointMessage,
@@ -94,19 +103,21 @@ pub fn send(
         for (subscriber_id, sender) in senders.iter() {
             match sender.send(message.clone()) {
                 Ok(()) => successful_sends += 1,
-                Err(e) => {
-                    // Only remove receivers if this source has been marked as completed
-                    if is_completed {
-                        disconnected_ids.push(*subscriber_id);
-                    } else {
-                        // For sources not yet completed, raise the error
-                        return Err(e);
-                    }
-                }
+                Err(_) => disconnected_ids.push(*subscriber_id),
             }
         }
 
-        // Remove disconnected senders
+        // Prune disconnected senders: a dropped crossbeam receiver never comes
+        // back, so keeping the sender only makes every future broadcast fail
+        // against it.
+        if !disconnected_ids.is_empty() && !is_completed {
+            tracing::warn!(
+                "checkpoint channel '{}': pruned {} disconnected subscriber(s) mid-broadcast \
+                 (a component dropped its receiver without unsubscribing)",
+                id,
+                disconnected_ids.len()
+            );
+        }
         for subscriber_id in disconnected_ids {
             senders.remove(&subscriber_id);
         }
@@ -119,4 +130,47 @@ pub fn send(
     }
 
     Ok(successful_sends)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoints::checkpoint_management::{CheckpointEpoch, CheckpointMessage};
+
+    #[test]
+    fn send_delivers_to_all_live_subscribers_despite_a_dead_one() {
+        // Three subscribers; the middle one drops its receiver WITHOUT
+        // unsubscribing (an unclean component exit). The broadcast must still
+        // deliver to both live subscribers — the old behaviour early-returned
+        // on the first dead sender it happened to iterate, silently starving
+        // whoever came after it.
+        let channel_id = "channels_test_partial_delivery";
+        let (rx_a, _id_a) = subscribe_with_id(channel_id);
+        let (rx_dead, _id_dead) = subscribe_with_id(channel_id);
+        let (rx_b, _id_b) = subscribe_with_id(channel_id);
+        drop(rx_dead);
+
+        let sent = send(
+            channel_id,
+            CheckpointMessage::Finalizer(CheckpointEpoch(99)),
+        )
+        .expect("broadcast must not fail because one subscriber died");
+        assert_eq!(sent, 2, "both live subscribers must receive the message");
+        assert!(matches!(
+            rx_a.try_recv(),
+            Ok(CheckpointMessage::Finalizer(CheckpointEpoch(99)))
+        ));
+        assert!(matches!(
+            rx_b.try_recv(),
+            Ok(CheckpointMessage::Finalizer(CheckpointEpoch(99)))
+        ));
+
+        // The dead subscriber was pruned: a second send reaches the same two.
+        let sent = send(
+            channel_id,
+            CheckpointMessage::Finalizer(CheckpointEpoch(100)),
+        )
+        .expect("broadcast must not fail after pruning");
+        assert_eq!(sent, 2);
+    }
 }

@@ -215,6 +215,12 @@ pub trait SourcePlugin: SupportsGracefulShutdown + Send + Sync {
     /// Returning a successful result indicates that the checkpoint marker was processed
     /// successfully, and the mark should be propagated downstream.
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError>;
+    /// Called when `epoch` finalized end-to-end (every live sink acked it).
+    /// Contract: MUST be idempotent, MUST NOT block, and MUST NEVER wait for
+    /// one specific epoch's Finalizer — at shutdown the host drops in-flight
+    /// timer epochs without ever sending their Finalizers, and only a later
+    /// terminal epoch (covering their work) finalizes. An implementation that
+    /// gates on an exact epoch will stall the shutdown drain.
     async fn process_checkpoint_finalizer(&self, epoch: CheckpointEpoch)
     -> Result<(), PluginError>;
 }
@@ -233,6 +239,8 @@ pub trait TransformPlugin: SupportsGracefulShutdown + Send + Sync {
     /// Returning a successful result indicates that the checkpoint marker was processed
     /// successfully, and the mark should be propagated downstream.
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError>;
+    /// See `SourcePlugin::process_checkpoint_finalizer` for the consumer
+    /// contract (idempotent, non-blocking, never wait for a specific epoch).
     async fn process_checkpoint_finalizer(&self, epoch: CheckpointEpoch)
     -> Result<(), PluginError>;
 }
@@ -248,7 +256,12 @@ pub trait SinkPlugin: SupportsGracefulShutdown + Send + Sync {
     async fn process_batch(&self, data: RecordBatch) -> Result<(), PluginError>;
     /// Returning a successful result indicates that the checkpoint marker was processed
     /// successfully, and an acknowledgment should be sent back to the source.
+    /// For a sink, "processed successfully" means DURABLY flushed: the ack
+    /// tells the source everything up to this marker survives a crash, so
+    /// buffered-but-unpublished data must be flushed before returning `Ok`.
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError>;
+    /// See `SourcePlugin::process_checkpoint_finalizer` for the consumer
+    /// contract (idempotent, non-blocking, never wait for a specific epoch).
     async fn process_checkpoint_finalizer(&self, epoch: CheckpointEpoch)
     -> Result<(), PluginError>;
 }

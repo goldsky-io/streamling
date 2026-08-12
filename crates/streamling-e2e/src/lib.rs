@@ -508,6 +508,42 @@ impl TestContext {
         })?
     }
 
+    /// Run streamling with pipeline YAML, send SIGTERM after `signal_after`,
+    /// and require the process to exit within `exit_deadline` of the signal.
+    ///
+    /// This is the graceful-shutdown chaos harness: it asserts the process
+    /// observes SIGTERM, drains, and exits well inside the k8s grace period
+    /// instead of hanging until SIGKILL.
+    #[cfg(unix)]
+    pub async fn run_pipeline_with_sigterm(
+        &self,
+        pipeline_yaml: &str,
+        opts: PipelineOpts,
+        signal_after: std::time::Duration,
+        exit_deadline: std::time::Duration,
+    ) -> Result<ExitStatus> {
+        let pipeline_path = self.temp_dir.path().join("pipeline.yaml");
+        std::fs::write(&pipeline_path, pipeline_yaml)?;
+
+        let mut env_vars = self.build_env_vars();
+        if let Some(limit) = opts.record_limit {
+            env_vars.push((
+                "STREAMLING__NUM_RECORDS_BEFORE_STOP".to_string(),
+                limit.to_string(),
+            ));
+        }
+        env_vars.extend(opts.extra_env);
+
+        streamling::run_streamling_with_sigterm(
+            &pipeline_path,
+            self.config.streamling_bin.as_deref(),
+            &env_vars,
+            signal_after,
+            exit_deadline,
+        )
+        .await
+    }
+
     /// Run streamling with pipeline YAML and capture stdout/stderr for inspection
     ///
     /// This is useful for tests that need to inspect the print sink output.

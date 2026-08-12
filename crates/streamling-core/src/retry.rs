@@ -55,6 +55,100 @@ where
     }
 }
 
+/// Outcome of a cancellable retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOutcome {
+    /// The operation eventually succeeded.
+    Completed,
+    /// The shutdown signal fired before the operation succeeded; the loop gave
+    /// up between attempts.
+    Cancelled,
+}
+
+/// Like [`retry_forever_with_backoff_async`], but the loop gives up (returns
+/// [`RetryOutcome::Cancelled`]) when the shutdown watch flips to `true`.
+///
+/// The FIRST attempt always runs, even when shutdown has already been
+/// requested: graceful drain means in-flight work still gets written — a sink
+/// flushing its final batches during shutdown must attempt the write, not
+/// abandon it (abandoning it is exactly the tail loss the drain exists to
+/// prevent). Cancellation is only checked during the backoff sleeps between
+/// attempts, so what shutdown cuts short is the infinite RE-try loop against a
+/// sick backend. A single in-flight attempt is allowed to finish (or hit its
+/// own I/O timeout); callers relying on prompt cancellation must give each
+/// attempt a bounded timeout of its own.
+pub async fn retry_forever_with_backoff_until_cancelled<Op, Fut>(
+    mut operation: Op,
+    operation_name: &str,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> RetryOutcome
+where
+    Op: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<()>>,
+{
+    let mut attempt: u32 = 0;
+    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        match operation().await {
+            Ok(()) => {
+                if attempt > 1 {
+                    warn!("{} recovered after {} attempts", operation_name, attempt);
+                }
+                return RetryOutcome::Completed;
+            }
+            Err(err) => {
+                if attempt > 5 {
+                    error!(
+                        error.internal = err.is_internal(),
+                        error.retriable = err.is_retriable(),
+                        "{} failed (attempt {}):\n{:?}\nRetrying...",
+                        operation_name,
+                        attempt,
+                        err
+                    );
+                } else {
+                    warn!(
+                        error.internal = err.is_internal(),
+                        error.retriable = err.is_retriable(),
+                        "{} failed (attempt {}):\n{:?}\nRetrying...",
+                        operation_name,
+                        attempt,
+                        err
+                    );
+                }
+            }
+        }
+
+        // Between attempts: give up if shutdown has been requested. The
+        // borrow check covers a watch that flipped before we got here (its
+        // `changed()` would never fire again).
+        if *shutdown.borrow() {
+            warn!(
+                "{} cancelled by shutdown after {} attempt(s)",
+                operation_name, attempt
+            );
+            return RetryOutcome::Cancelled;
+        }
+        let jitter = (attempt as u64 % 100) * 7; // small deterministic jitter
+        let sleep_ms = std::cmp::min(MAX_BACKOFF_MS, backoff_ms + jitter);
+        tokio::select! {
+            _ = sleep(Duration::from_millis(sleep_ms)) => {}
+            res = shutdown.changed() => {
+                if res.is_ok() && *shutdown.borrow() {
+                    warn!(
+                        "{} cancelled by shutdown after {} attempt(s)",
+                        operation_name, attempt
+                    );
+                    return RetryOutcome::Cancelled;
+                }
+            }
+        }
+        backoff_ms = std::cmp::min(backoff_ms.saturating_mul(2), MAX_BACKOFF_MS);
+    }
+}
+
 /// Retry the provided operation indefinitely with exponential backoff and small jitter.
 /// Returns the successful value once the operation succeeds.
 /// The operation should return `Ok(T)` on success and `Err` with a StreamlingError on failure.
@@ -287,6 +381,104 @@ mod tests {
 
         assert_eq!(result, "success".to_string());
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_until_cancelled_completes_on_success() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let operation = || {
+            let count = cc.clone();
+            async move {
+                let c = count.fetch_add(1, Ordering::SeqCst) + 1;
+                if c < 3 {
+                    Err(streamling_err!("attempt {} failed", c))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let outcome =
+            retry_forever_with_backoff_until_cancelled(operation, "test_cancel", &mut rx).await;
+        assert_eq!(outcome, RetryOutcome::Completed);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_until_cancelled_stops_on_shutdown() {
+        // Operation always fails; flipping the shutdown watch must break the
+        // otherwise-infinite retry loop promptly (between attempts).
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let operation = move || {
+            let count = cc.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(streamling_err!("always fails"))
+            }
+        };
+
+        // Fire shutdown shortly after the loop starts.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_forever_with_backoff_until_cancelled(operation, "test_cancel", &mut rx),
+        )
+        .await
+        .expect("cancellable retry must return, not hang");
+        assert_eq!(outcome, RetryOutcome::Cancelled);
+        assert!(call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_until_cancelled_first_attempt_runs_even_when_already_shutdown() {
+        // Graceful drain: work already in flight when shutdown is requested
+        // still gets its first attempt (a sink flushing final batches must
+        // write them, not abandon them). A successful first attempt completes.
+        let (_tx, mut rx) = tokio::sync::watch::channel(true);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let operation = move || {
+            let count = cc.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let outcome =
+            retry_forever_with_backoff_until_cancelled(operation, "test_cancel", &mut rx).await;
+        assert_eq!(outcome, RetryOutcome::Completed);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_until_cancelled_no_retries_when_already_shutdown() {
+        // A FAILING first attempt is not retried once shutdown is requested:
+        // cancellation cuts the re-try loop, not the initial attempt.
+        let (_tx, mut rx) = tokio::sync::watch::channel(true);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let operation = move || {
+            let count = cc.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(streamling_err!("always fails"))
+            }
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_forever_with_backoff_until_cancelled(operation, "test_cancel", &mut rx),
+        )
+        .await
+        .expect("must return promptly, not keep retrying");
+        assert_eq!(outcome, RetryOutcome::Cancelled);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
