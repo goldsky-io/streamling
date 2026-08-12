@@ -631,3 +631,128 @@ sinks:
         missing.iter().map(|r| r.0).collect::<Vec<_>>()
     );
 }
+
+/// `MultiSinkExec` never executes a sink's physical plan — it calls `write_all`
+/// once per (input partition, sink). A sink that cannot be parallelized therefore
+/// cannot guard itself from inside `insert_into`; the whole group has to be
+/// narrowed at planning time, which is what `Placement::Single` does.
+///
+/// A webhook beside a postgres sink over a parallel source is the case that used
+/// to slip through: both sinks still get every row, and the webhook still writes
+/// from one stream.
+#[tokio::test]
+async fn test_multi_sink_with_a_webhook_runs_on_one_stream() {
+    init_tracing();
+
+    use streamling_e2e::resources::WebhookResource;
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("fanout_single_stream", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let webhook = WebhookResource::new()
+        .await
+        .expect("Failed to start webhook server");
+
+    let records_to_produce: i64 = 60;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    topic
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 2
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: fanout_single_stream_pg
+    schema: public
+    primary_key: id
+    on_conflict: update
+
+  webhook_sink:
+    type: webhook
+    from: kafka_source
+    url: {webhook_url}
+    one_row_per_request: true
+    payload_version: 0
+"#,
+        topic = topic.topic,
+        webhook_url = webhook.webhook_url(),
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .env("RUST_LOG", "info")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(
+        output.status.success(),
+        "Pipeline should exit successfully; stderr:\n{}",
+        output.stderr
+    );
+    // `MultiSinkExec` never executes a sink's physical plan, so `ParallelSinkExec`
+    // never appears here — the fan-out's own width *is* the sink's write-stream
+    // count, one `write_all` per input partition per sink.
+    assert!(
+        output.stderr.contains("MultiSinkExec: partitions=1"),
+        "the fan-out must reach both sinks on one stream; stderr:\n{}",
+        output.stderr
+    );
+
+    let received_all = webhook
+        .wait_for_requests(
+            records_to_produce as usize,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+    assert!(
+        received_all,
+        "Expected {} webhook requests, got {}",
+        records_to_produce,
+        webhook.request_count()
+    );
+
+    let pg_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.fanout_single_stream_pg")
+        .await
+        .expect("Failed to query PostgreSQL count");
+    assert_eq!(
+        pg_count, records_to_produce,
+        "every row must reach the PostgreSQL sink too"
+    );
+}

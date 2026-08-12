@@ -518,6 +518,9 @@ pub enum Placement {
     ByKey(Vec<String>),
     /// Any stream will do. Only for sinks with no ordering or dedup requirement.
     RoundRobin,
+    /// The sink cannot write from more than one stream. Always lowers to a
+    /// coalesce, ignoring any declared parallelism.
+    Single,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Hash, Clone)]
@@ -573,6 +576,7 @@ impl UserDefinedLogicalNodeCore for RepartitionNode {
         match &self.placement {
             Placement::ByKey(columns) => write!(f, "Repartition keys=[{}]", columns.join(", "))?,
             Placement::RoundRobin => write!(f, "Repartition round_robin")?,
+            Placement::Single => write!(f, "Repartition single")?,
         }
         if let Some(target) = self.target_parallelism {
             write!(f, " parallelism={target}")?;
@@ -638,7 +642,10 @@ fn plan_repartition(
     buffer_size: usize,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let input_partitions = input.output_partitioning().partition_count();
-    let target = target_parallelism.unwrap_or(input_partitions).max(1);
+    let target = match placement {
+        Placement::Single => 1,
+        _ => target_parallelism.unwrap_or(input_partitions).max(1),
+    };
 
     // A single output stream needs no exchange at all: one stream trivially
     // holds every key, in order. Reuse the coalesce, which also works keyless.
@@ -651,6 +658,9 @@ fn plan_repartition(
     }
 
     let exchange = match placement {
+        Placement::Single => {
+            return internal_err!("'{name}': a single-stream placement cannot reach an exchange");
+        }
         Placement::RoundRobin => {
             // Any placement satisfies a sink with no ordering requirement, so an
             // input that is already the right width needs no exchange.
@@ -794,6 +804,36 @@ mod tests {
             Arc::ptr_eq(&planned, &source),
             "a single-partition input already satisfies any key placement"
         );
+    }
+
+    /// A sink that cannot write from more than one stream (webhook, plugin)
+    /// collapses whatever width its input has, and is left alone when its input
+    /// is already single-stream.
+    #[test]
+    fn single_coalesces_a_multi_partition_input() {
+        let wide = Arc::new(MarkerSourceExec::new(vec![vec![], vec![]]));
+        let planned = plan_repartition(wide, &Placement::Single, None, "sink", 10).unwrap();
+        assert_eq!(planned.output_partitioning().partition_count(), 1);
+        assert!(planned.downcast_ref::<StreamingCoalesceExec>().is_some());
+
+        let narrow: Arc<dyn ExecutionPlan> = Arc::new(MarkerSourceExec::new(vec![vec![]]));
+        let planned =
+            plan_repartition(Arc::clone(&narrow), &Placement::Single, None, "sink", 10).unwrap();
+        assert!(
+            Arc::ptr_eq(&planned, &narrow),
+            "there is nothing to coalesce when the input is already one stream"
+        );
+    }
+
+    /// `Single` is the sink saying it *cannot* be parallelized, so it outranks a
+    /// requested width rather than negotiating with it.
+    #[test]
+    fn single_ignores_a_declared_parallelism() {
+        let source = Arc::new(MarkerSourceExec::new(vec![vec![], vec![]]));
+        let planned = plan_repartition(source, &Placement::Single, Some(4), "sink", 10).unwrap();
+
+        assert_eq!(planned.output_partitioning().partition_count(), 1);
+        assert!(planned.downcast_ref::<StreamingCoalesceExec>().is_some());
     }
 
     /// Round-robin is for sinks that neither dedupe nor depend on ordering

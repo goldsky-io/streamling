@@ -448,7 +448,8 @@ struct SinkEntry {
     rebatch_config: RebatchConfig,
     /// How this sink's rows must be spread across its write streams. Keyed for
     /// order-sensitive sinks (upsert/delete, keep-last dedup), round-robin for
-    /// sinks that neither dedupe nor depend on ordering.
+    /// sinks that neither dedupe nor depend on ordering, single for sinks that
+    /// cannot write from more than one stream at all.
     placement: Placement,
     /// Number of concurrent write streams requested by the sink's `parallelism`.
     parallelism: Option<usize>,
@@ -527,11 +528,30 @@ fn validate_parallelism(topology: &PipelineTopology) -> Result<usize> {
 ///   exchange if one of them asked to be wider than its input;
 /// - the sinks disagree → no single placement is correct for all of them, so the
 ///   group runs on one stream, which is what it did before it could be parallel.
+///
+/// A sink that cannot be parallelized at all short-circuits this: `MultiSinkExec`
+/// spawns one `write_all` per input partition per sink, so the only way to hold
+/// that sink to one write stream is to narrow the whole group.
 fn wrap_multi_sink_with_repartition(
     plan: LogicalPlan,
     sinks: &[SinkEntry],
     group_name: &str,
 ) -> LogicalPlan {
+    let single_stream_sinks: Vec<&str> = sinks
+        .iter()
+        .filter(|entry| matches!(entry.placement, Placement::Single))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if !single_stream_sinks.is_empty() {
+        warn!(
+            "sinks [{}] share one input, but [{}] cannot write from more than one stream; \
+             running the whole group on a single stream, since they all read one exchange",
+            group_name,
+            single_stream_sinks.join(", ")
+        );
+        return wrap_with_repartition(plan, &Placement::Single, None, group_name.to_string());
+    }
+
     let mut key_sets: Vec<&Vec<String>> = sinks
         .iter()
         .filter_map(|entry| match &entry.placement {
@@ -638,8 +658,15 @@ fn wrap_with_repartition(
     name: String,
 ) -> LogicalPlan {
     // Nothing to place and no width to hit: the sink just inherits its input.
-    let has_keys = matches!(placement, Placement::ByKey(columns) if !columns.is_empty());
-    if !has_keys && parallelism.is_none() {
+    let needs_node = match placement {
+        Placement::ByKey(columns) => !columns.is_empty(),
+        // The node *is* the coalesce for a single-stream sink, so it always has
+        // to be emitted — inheriting the input's width is exactly what it exists
+        // to prevent.
+        Placement::Single => true,
+        Placement::RoundRobin => false,
+    };
+    if !needs_node && parallelism.is_none() {
         return plan;
     }
     LogicalPlan::Extension(Extension {
@@ -1688,7 +1715,7 @@ impl Streamling {
                         webhook.headers.clone()
                     };
 
-                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
+                    pk_registry.track_primary_key_for_transform_or_sink(
                         primary_key_opt,
                         from.clone(),
                         reference_name.clone(),
@@ -1720,7 +1747,9 @@ impl Streamling {
                             reference_name.clone(),
                             http_sink_provider,
                             RebatchConfig::new(webhook.batch_size, batch_flush_interval),
-                            Placement::ByKey(pk_columns(&pk_metadata_opt)),
+                            // Concurrent `write_all` is untested for this sink, and
+                            // N streams would also multiply the in-flight requests.
+                            Placement::Single,
                             None,
                         ),
                     );
@@ -2251,7 +2280,11 @@ impl Streamling {
                             reference_name.clone(),
                             plugin_sink_provider,
                             RebatchConfig::new(plugin_sink.batch_size, batch_flush_interval),
-                            Placement::RoundRobin,
+                            // A plugin acks epochs from inside the plugin, on a
+                            // channel poll decoupled from the marker that triggered
+                            // it, so the per-stream ack gate cannot see its markers.
+                            // The plugin ABI has no partition dimension either.
+                            Placement::Single,
                             None,
                         ),
                     );
@@ -2994,6 +3027,37 @@ mod tests {
             repartition_node(&plan).is_none(),
             "a keyless fan-out needs no exchange"
         );
+    }
+
+    /// A sink that cannot be parallelized has to get its node even with nothing
+    /// to key by and no width to hit — the node *is* what narrows its input.
+    #[test]
+    fn single_sink_gets_a_coalescing_node() {
+        let plan = wrap_with_repartition(
+            empty_plan(),
+            &Placement::Single,
+            None,
+            "webhook_sink".to_string(),
+        );
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::Single);
+    }
+
+    /// `MultiSinkExec` fans one `write_all` per input partition per sink, so a
+    /// sink that cannot be parallelized narrows the whole group — there is no
+    /// way to keep the others wide.
+    #[test]
+    fn a_single_sink_forces_the_whole_group_to_one_stream() {
+        let sinks = vec![
+            sink_entry("warehouse", by_key(&["id"]), None),
+            sink_entry("webhook", Placement::Single, None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "warehouse, webhook");
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::Single);
     }
 
     /// The sinks share one input, so one exchange has to serve all of them. When

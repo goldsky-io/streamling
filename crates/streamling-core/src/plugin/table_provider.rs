@@ -15,19 +15,15 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
 use crate::checkpoints::channels::subscribe;
 use crate::checkpoints::checkpoint_management::send_checkpoint_ack;
-use crate::operators::coalesce::StreamingCoalesceExec;
 use crate::operators::wrapping::WrappingDataSink;
 use crate::plugin::telemetry::process_plugin_metrics;
-use crate::session::get_streamling_config_from_session;
 use crate::telemetry::provider::get_reference_name_from_metric_key;
 use crate::telemetry::recorder::get_metrics_recorder;
 use crate::topology::Telemetry;
@@ -588,7 +584,7 @@ impl TableProvider for PluginSinkProvider {
 
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -604,18 +600,9 @@ impl TableProvider for PluginSinkProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        // A plugin acks epochs from inside the plugin, on a channel poll that is
-        // decoupled from the marker that triggered it, so the per-stream ack gate
-        // cannot see its markers. Merge to one write stream instead — the plugin
-        // ABI has no partition dimension anyway (for now)
-        let input = if input.output_partitioning().partition_count() > 1 {
-            Arc::new(StreamingCoalesceExec::new(
-                input,
-                get_streamling_config_from_session(state)?.internal_buffer_size,
-            )) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
+        // Always one write stream: planning marks plugin sinks `Placement::Single`,
+        // so the input is coalesced above this point on both the single-sink and
+        // the fan-out path.
         Ok(Arc::new(ParallelSinkExec::new(
             input,
             telemetry_sink,
