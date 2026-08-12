@@ -425,6 +425,33 @@ fn finalize_ready_epochs(
     newly_finalized
 }
 
+/// Collect the epochs a timeout sweep should remove: `Started`/`InProgress`
+/// epochs older than `timeout`, excluding the terminal epoch (its lifecycle
+/// is owned by the shutdown path's bounded wait, which must be able to
+/// observe it until that wait expires).
+///
+/// Extracted as a free function so the removal decision is unit-testable
+/// without driving the timeout task's sleep loop. The caller removes the
+/// returned epochs from the map under the same lock it used to build the
+/// snapshot.
+fn timed_out_epochs_to_remove(
+    epochs: &BTreeMap<CheckpointEpoch, EpochState>,
+    timeout: Duration,
+    terminal: Option<&CheckpointEpoch>,
+) -> Vec<CheckpointEpoch> {
+    epochs
+        .iter()
+        .filter_map(|(epoch, state)| match state {
+            EpochState::Started { created_at } | EpochState::InProgress { created_at, .. }
+                if created_at.elapsed() > timeout && Some(epoch) != terminal =>
+            {
+                Some(epoch.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Record the current number of non-finalized epochs as a gauge metric.
 /// Acquires the epochs lock internally, so callers must NOT hold it.
 fn record_in_flight_gauge(
@@ -835,14 +862,34 @@ impl CheckpointCoordinator {
         });
         self.handles.push(producer_handle);
 
-        // Timeout checker task - periodically checks for stalled epochs
+        // Timeout checker task — periodically REMOVES stalled epochs so the
+        // timer producer (which waits for the newest epoch to finalize before
+        // minting the next one) can never wedge permanently on an epoch whose
+        // Marker was lost. A Marker is lost when the broadcast reaches no
+        // source subscriber — e.g. the producer's first interval fires while a
+        // large plan (many sources, plugin UDF compilation) is still being
+        // built, so no source `execute()` has subscribed yet. No batch ever
+        // carries that epoch's Marker, no sink can ack it, and without removal
+        // the producer waits on it forever while data continues to flow
+        // uncheckpointed. Removing the epoch restores liveness: the next
+        // minted epoch's Marker reaches the (by then live) subscribers and
+        // finalizes normally. Removal is safe under the Finalizer consumer
+        // contract at the top of this file: Finalizers can be skipped, and
+        // commit/cleanup semantics are cumulative, so the offsets a removed
+        // epoch covered stay uncommitted until the next finalized epoch covers
+        // them (at-least-once preserved). The terminal epoch is exempt — its
+        // lifecycle is owned by the shutdown path's bounded wait.
         let epochs = Arc::clone(&self.epochs);
         let running = Arc::clone(&self.running);
+        let terminal_epoch_for_timeout = Arc::clone(&self.terminal_epoch);
         let timeout_duration = Duration::from_secs(self.timeout_sec);
+        // Sweep at half the timeout, clamped to [1s, 30s] — 30s for the
+        // production default, sub-second-free short cadences for tests that
+        // construct the coordinator with a small timeout.
+        let check_interval = Duration::from_secs((self.timeout_sec / 2).clamp(1, 30));
 
         let timeout_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
-            let check_interval = Duration::from_secs(30); // Check every 30 seconds
             let poll_interval = Duration::from_millis(500); // Poll for shutdown frequently
 
             while running.load(Ordering::SeqCst) {
@@ -857,47 +904,45 @@ impl CheckpointCoordinator {
                     break;
                 }
 
-                // Collect and count in-flight under a single lock to avoid a race
-                // where the ack handler finalizes an epoch between these phases.
-                let timed_out_count = {
-                    let epochs_guard = epochs.lock();
-                    let timed_out: Vec<CheckpointEpoch> = epochs_guard
-                        .iter()
-                        .filter_map(|(epoch, state)| match state {
-                            EpochState::Started { created_at }
-                            | EpochState::InProgress { created_at, .. } => {
-                                if created_at.elapsed() > timeout_duration {
-                                    Some(epoch.clone())
-                                } else {
-                                    None
-                                }
-                            }
-                            EpochState::Finalized => None,
-                        })
-                        .collect();
+                // Lock discipline: take `terminal_epoch` alone and drop it
+                // before touching `epochs` (see the CheckpointControl lock
+                // notes — only `begin_terminal_checkpoint` may hold both).
+                let terminal: Option<CheckpointEpoch> =
+                    { terminal_epoch_for_timeout.lock().clone() };
 
+                // Collect, remove, and count in-flight under a single lock to
+                // avoid a race where the ack handler finalizes an epoch
+                // between these phases.
+                let (removed, in_flight) = {
+                    let mut epochs_guard = epochs.lock();
+                    let timed_out = timed_out_epochs_to_remove(
+                        &epochs_guard,
+                        timeout_duration,
+                        terminal.as_ref(),
+                    );
                     for epoch in &timed_out {
-                        warn!(
-                            "Checkpoint epoch {} timed out after {:?}",
-                            epoch.0, timeout_duration
-                        );
+                        epochs_guard.remove(epoch);
                     }
-
-                    let count = timed_out.len();
-
-                    // Compute in-flight while we still hold the lock
                     let in_flight = epochs_guard
                         .values()
                         .filter(|s| !matches!(s, EpochState::Finalized))
                         .count();
-                    metrics_recorder.record_gauge("checkpoint_epochs_in_flight", in_flight as u64);
-
-                    count
+                    (timed_out, in_flight)
                 };
+                metrics_recorder.record_gauge("checkpoint_epochs_in_flight", in_flight as u64);
 
-                if timed_out_count > 0 {
-                    metrics_recorder
-                        .record_count("checkpoint_epochs_failed", timed_out_count as u64);
+                for epoch in &removed {
+                    warn!(
+                        "Checkpoint epoch {} timed out after {:?}; removed so a fresh epoch can be \
+                         minted (its Marker may never have reached a live source — late acks for it \
+                         will be ignored, and its offsets stay uncommitted until the next finalized \
+                         epoch covers them)",
+                        epoch.0, timeout_duration
+                    );
+                }
+
+                if !removed.is_empty() {
+                    metrics_recorder.record_count("checkpoint_epochs_failed", removed.len() as u64);
                 }
             }
         });
@@ -1319,5 +1364,154 @@ mod tests {
             1,
             "only the single terminal epoch should exist"
         );
+    }
+
+    #[test]
+    fn test_timed_out_epochs_to_remove_selects_only_stale_non_terminal() {
+        let timeout = Duration::from_secs(60);
+        let stale = Instant::now() - Duration::from_secs(120);
+        let fresh = Instant::now();
+
+        let mut epochs: BTreeMap<CheckpointEpoch, EpochState> = BTreeMap::new();
+        epochs.insert(
+            CheckpointEpoch(1),
+            EpochState::Started { created_at: stale },
+        );
+        epochs.insert(
+            CheckpointEpoch(2),
+            EpochState::InProgress {
+                acked_sinks: HashSet::from(["a".to_string()]),
+                created_at: stale,
+            },
+        );
+        epochs.insert(
+            CheckpointEpoch(3),
+            EpochState::Started { created_at: fresh },
+        );
+        epochs.insert(CheckpointEpoch(4), EpochState::Finalized);
+        // Epoch 5 is stale but terminal — exempt: the shutdown path owns its
+        // (bounded) wait and must be able to observe it until that expires.
+        epochs.insert(
+            CheckpointEpoch(5),
+            EpochState::Started { created_at: stale },
+        );
+
+        let terminal = CheckpointEpoch(5);
+        let removed = timed_out_epochs_to_remove(&epochs, timeout, Some(&terminal));
+        assert_eq!(
+            removed,
+            vec![CheckpointEpoch(1), CheckpointEpoch(2)],
+            "stale Started and InProgress epochs are removed; fresh, finalized, \
+             and terminal epochs are kept"
+        );
+
+        let removed_no_terminal = timed_out_epochs_to_remove(&epochs, timeout, None);
+        assert_eq!(
+            removed_no_terminal,
+            vec![CheckpointEpoch(1), CheckpointEpoch(2), CheckpointEpoch(5)],
+            "without a terminal epoch, every stale epoch is removed"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_timeout_sweep_removes_stale_epoch_and_unwedges() {
+        // An epoch whose Marker never reached any source (broadcast before the
+        // sources subscribed) can never be acked. The timeout sweep must remove
+        // it so the producer's finalization wait unblocks, and a later epoch
+        // must still finalize normally through the regular ack path.
+        let mut coordinator = CheckpointCoordinator::with_timeout(1);
+        let stale_epoch = CheckpointEpoch(7);
+        {
+            let mut epochs = coordinator.epochs.lock();
+            epochs.insert(
+                stale_epoch.clone(),
+                EpochState::Started {
+                    created_at: Instant::now() - Duration::from_secs(5),
+                },
+            );
+        }
+
+        // Long producer interval: only the timeout sweep and the subscriber run.
+        coordinator.start(3600, vec!["expected_sink".to_string()]);
+
+        // Sweep cadence for timeout_sec=1 is 1s; give it two cycles.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let epochs = coordinator.epochs.lock();
+                if !epochs.contains_key(&stale_epoch) {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stale epoch was not removed by the timeout sweep"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        // The pipeline is un-wedged: a later epoch finalizes via a normal ack.
+        let next_epoch = CheckpointEpoch(8);
+        {
+            let mut epochs = coordinator.epochs.lock();
+            epochs.insert(
+                next_epoch.clone(),
+                EpochState::Started {
+                    created_at: Instant::now(),
+                },
+            );
+        }
+        send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Ack {
+                epoch: next_epoch.clone(),
+                sink_id: "expected_sink".to_string(),
+            },
+        )
+        .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                matches!(epochs.get(&next_epoch), Some(EpochState::Finalized)),
+                "the epoch after a removed one must finalize normally"
+            );
+        }
+
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_timeout_sweep_never_removes_terminal_epoch() {
+        // The terminal epoch is exempt from timeout removal — the shutdown
+        // path's bounded wait owns its lifecycle.
+        let mut coordinator = CheckpointCoordinator::with_timeout(1);
+        let control = coordinator.control();
+        let terminal = control.begin_terminal_checkpoint();
+        {
+            // Age the terminal epoch far past the timeout.
+            let mut epochs = coordinator.epochs.lock();
+            epochs.insert(
+                terminal.clone(),
+                EpochState::Started {
+                    created_at: Instant::now() - Duration::from_secs(60),
+                },
+            );
+        }
+
+        coordinator.start(3600, vec!["expected_sink".to_string()]);
+        sleep(Duration::from_millis(2600)).await;
+
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                epochs.contains_key(&terminal),
+                "terminal epoch must survive timeout sweeps"
+            );
+        }
+
+        coordinator.stop().await;
     }
 }
