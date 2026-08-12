@@ -128,8 +128,7 @@ struct MarkerState {
 /// is still in flight on the slower streams.
 ///
 /// Alignment only ever *delays* a marker; data is never blocked, so at-least-once
-/// delivery is preserved. An input that ends counts as having delivered every
-/// epoch, so a bounded branch cannot stall the pipeline forever.
+/// delivery is preserved.
 #[derive(Debug)]
 pub struct MarkerAligner {
     live_inputs: usize,

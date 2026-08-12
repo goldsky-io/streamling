@@ -849,9 +849,7 @@ impl Sink {
         }
     }
 
-    /// Requested number of concurrent write streams for this sink. The rows are
-    /// hash-partitioned by the sink's primary key into that many streams, so a
-    /// key is never written by two streams at once.
+    /// Requested number of concurrent write streams for this sink.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Sink::postgres(s) => s.parallelism,

@@ -607,7 +607,7 @@ impl TableProvider for PluginSinkProvider {
         // A plugin acks epochs from inside the plugin, on a channel poll that is
         // decoupled from the marker that triggered it, so the per-stream ack gate
         // cannot see its markers. Merge to one write stream instead — the plugin
-        // ABI has no partition dimension anyway.
+        // ABI has no partition dimension anyway (for now)
         let input = if input.output_partitioning().partition_count() > 1 {
             Arc::new(StreamingCoalesceExec::new(
                 input,

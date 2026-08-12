@@ -32,9 +32,7 @@ struct BlackholeSink {
     schema: SchemaRef,
     num_records_before_stop: Option<u64>, // for integration tests only!
     /// Global `num_records_before_stop` progress across the concurrent
-    /// per-partition `write_all` streams (`ParallelSinkExec`). Counting in a
-    /// `write_all`-local would make the threshold per-stream, so a sink with
-    /// `parallelism: N` would need N times the rows before stopping.
+    /// per-partition `write_all` streams (`ParallelSinkExec`).
     rows_received: AtomicU64,
     source_name: String,
     metric_metadata_id: String,
