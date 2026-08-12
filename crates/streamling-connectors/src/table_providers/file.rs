@@ -187,12 +187,7 @@ pub async fn build_bounded_file_source_provider(
     // `ListingOptions::new` defaults to one target partition, which reads every
     // file serially on a single core. Split the files across the session's target
     // partitions instead; the scan keeps them as separate output partitions, which
-    // stay parallel end-to-end: transforms are partition-preserving and
-    // `ParallelSinkExec` writes every partition concurrently. The remaining
-    // partition-0-only consumers are guarded elsewhere (`MultiSinkExec` by the
-    // `EnforceSinglePartition` optimizer rule, scan sharing by `SharedSourceHandle`).
-    // Set explicitly rather than via `with_session_config_options`, which would also
-    // turn on `collect_stat` (a footer fetch per file at startup).
+    // stay parallel end-to-end.
     let listing_options = ListingOptions::new(file_format)
         .with_table_partition_cols(partition_cols)
         .with_target_partitions(
@@ -1317,9 +1312,6 @@ mod tests {
     /// The bounded source splits its files across the session's target partitions
     /// and keeps them as separate output partitions, which stay parallel through
     /// transforms and into `ParallelSinkExec`'s concurrent per-partition writes.
-    /// The remaining partition-0-only consumers are guarded elsewhere
-    /// (`MultiSinkExec` by the `EnforceSinglePartition` optimizer rule, scan
-    /// sharing by `SharedSourceHandle`).
     #[tokio::test]
     async fn bounded_source_splits_files_across_partitions() {
         use streamling_core::dynamic_table::DynamicTableRegistry;

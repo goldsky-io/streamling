@@ -1715,6 +1715,8 @@ impl ExecutionPlan for KafkaSourceExec {
             }
 
             info!("Shutting down Kafka consumer: unsubscribing and unassigning");
+            // Drop this instance's subscription before its receiver, or the
+            // coordinator's next broadcast fails for every instance still running.
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
             consumer.unsubscribe();
             consumer.unassign().expect("Failed to unassign consumer");
@@ -1950,7 +1952,7 @@ impl KafkaSourceTableProvider {
             .ok()
             .and_then(|client| {
                 client
-                    .fetch_metadata(Some(topic), Duration::from_secs(10))
+                    .fetch_metadata(Some(topic), Duration::from_secs(60))
                     .ok()
             })
             .and_then(|metadata| metadata.topics().first().map(|t| t.partitions().len()));
@@ -2286,9 +2288,7 @@ pub struct KafkaSink {
     subject_name_strategy: SubjectNameStrategy,
     num_records_before_stop: Option<u64>, // for integration tests only!
     /// Global `num_records_before_stop` progress across the concurrent
-    /// per-partition `write_all` streams (`ParallelSinkExec`). Counting in a
-    /// `write_all`-local would make the threshold per-stream, so a sink with
-    /// `parallelism: N` would need N times the rows before stopping.
+    /// per-partition `write_all` streams (`ParallelSinkExec`).
     rows_received: AtomicU64,
     source_name: String,
     metric_metadata_id: String,

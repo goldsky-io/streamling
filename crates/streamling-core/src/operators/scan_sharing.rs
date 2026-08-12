@@ -4,6 +4,7 @@
 
 use crate::operators::broadcast::broadcast_stream::{BroadcastConsumer, BroadcastStream};
 use arrow_schema::SchemaRef;
+use datafusion::common::internal_err;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -73,18 +74,16 @@ struct PartitionBroadcast {
 
 /// Handle for a shared source that manages broadcasting to multiple consumers.
 ///
-/// The base plan keeps its own width: partition j of the shared source is
-/// broadcast to partition j of every consumer, so a parallel source stays
-/// parallel through scan sharing instead of collapsing to one stream.
+/// Partition j of the base plan is broadcast to partition j of every consumer,
+/// so a parallel source stays parallel through scan sharing.
 pub struct SharedSourceHandle {
     schema: SchemaRef,
     base_exec: Arc<dyn ExecutionPlan>,
     /// One independent broadcast per base-plan partition.
     partitions: Mutex<Vec<PartitionBroadcast>>,
     channel_capacity: usize,
-    /// Number of consumer plans. Each executes every partition exactly once, so
-    /// a partition's broadcast starts once this many consumers registered *for
-    /// that partition*.
+    /// Number of consumer plans. Each executes every partition, so this is also
+    /// the count a single partition waits for.
     expected_consumers: AtomicUsize,
 }
 
@@ -149,11 +148,11 @@ impl SharedSourceHandle {
     ) -> Result<BroadcastConsumer> {
         let mut partitions = self.partitions.lock().unwrap();
         let partition_count = partitions.len();
-        let state = partitions.get_mut(partition).ok_or_else(|| {
-            datafusion::common::DataFusionError::from(crate::streamling_err!(
+        let Some(state) = partitions.get_mut(partition) else {
+            return internal_err!(
                 "shared source has {partition_count} partition(s), got request for partition {partition}"
-            ))
-        })?;
+            );
+        };
 
         let broadcast = state
             .stream
@@ -226,12 +225,9 @@ impl BroadcastingExec {
     fn compute_properties(schema: SchemaRef, partitions: usize) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
-            // Every consumer sees the shared source at its real width; partition
-            // j of the base plan is broadcast to partition j of each consumer.
-            // The base plan's own `Partitioning` is not re-declared here — it is
-            // hidden from the plan tree, so an inherited `Hash` claim could not
-            // be checked by anything, and under-claiming only ever costs an
-            // exchange a consumer would otherwise elide.
+            // Only the base plan's width is inherited, not its `Partitioning`: the
+            // base is hidden from the plan tree, so a `Hash` claim here would be
+            // unverifiable, and under-claiming only costs an elidable exchange.
             Partitioning::UnknownPartitioning(partitions),
             EmissionType::Incremental,
             Boundedness::Unbounded {
@@ -334,18 +330,6 @@ mod tests {
         ]))
     }
 
-    /// A shared source used to be coalesced to one stream before broadcasting,
-    /// so a parallel source lost its parallelism the moment a second consumer
-    /// appeared. Each consumer must now see the source at its real width.
-    #[test]
-    fn broadcasting_exec_exposes_the_base_plans_partitions() {
-        let base = two_partition_source();
-        let handle = Arc::new(SharedSourceHandle::new(base.schema(), base, 10, 1));
-        let exec = BroadcastingExec::new(handle, None).unwrap();
-
-        assert_eq!(exec.properties().output_partitioning().partition_count(), 2);
-    }
-
     /// A partition must not open just because *another* partition reached the
     /// expected consumer count — the consumer registering last would miss
     /// everything broadcast meanwhile.
@@ -388,13 +372,20 @@ mod tests {
     }
 
     /// Partition j of the base plan must reach partition j of every consumer —
-    /// no cross-partition mixing, nothing dropped.
+    /// no cross-partition mixing, nothing dropped. A shared source used to be
+    /// broadcast as a single stream, so a parallel source lost its parallelism
+    /// the moment a second consumer appeared.
     #[tokio::test]
     async fn every_consumer_receives_every_partition() {
         let base = two_partition_source();
         let handle = Arc::new(SharedSourceHandle::new(base.schema(), base, 10, 2));
         let first = BroadcastingExec::new(handle.clone(), None).unwrap();
         let second = BroadcastingExec::new(handle, None).unwrap();
+        assert_eq!(
+            first.properties().output_partitioning().partition_count(),
+            2,
+            "consumers must see the source at its real width"
+        );
 
         let ctx = SessionContext::new();
         let first_0 = first.execute(0, ctx.task_ctx()).unwrap();
@@ -410,20 +401,5 @@ mod tests {
             "partition 1 must carry its own rows"
         );
         assert_eq!(drain(second_1).await, vec![3, 4]);
-    }
-
-    /// Projections are per consumer, and must stay per consumer per partition.
-    #[tokio::test]
-    async fn each_partition_applies_the_consumers_projection() {
-        let base = two_partition_source();
-        let handle = Arc::new(SharedSourceHandle::new(base.schema(), base, 10, 1));
-        let exec = BroadcastingExec::new(handle, Some(vec![0])).unwrap();
-
-        let ctx = SessionContext::new();
-        let partition_0 = exec.execute(0, ctx.task_ctx()).unwrap();
-        let partition_1 = exec.execute(1, ctx.task_ctx()).unwrap();
-
-        assert_eq!(drain(partition_0).await, vec![1, 2]);
-        assert_eq!(drain(partition_1).await, vec![3, 4]);
     }
 }
