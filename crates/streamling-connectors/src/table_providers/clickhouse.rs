@@ -360,7 +360,9 @@ struct SinkParams {
 
 impl ClickHouseTableProvider {
     const DEFAULT_SORT_KEY_RANGE: i64 = 1_000_000;
-    const DEFAULT_PAGE_SIZE: usize = 10_000_000;
+    /// Fallback when `clickhouse_source.page_size` is absent. Kept in sync with
+    /// the shipped default in `streamling-config/default_config.yaml`.
+    const DEFAULT_PAGE_SIZE: usize = 5_000_000;
     const MIN_SORT_KEY_RANGE: i64 = 100;
     /// Hard per-page timeout for a source range query. A page that exceeds this is
     /// cancelled and the range re-read at half the width. The soft shrink budget is

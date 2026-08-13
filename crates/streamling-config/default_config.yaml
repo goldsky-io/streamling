@@ -81,7 +81,7 @@ clickhouse_source:
   user: default
   password: ""
   database: default
-  page_size: "10000000"
+  page_size: "5000000"
 clickhouse_sink:
   url: "http://localhost:8123"
   user: default

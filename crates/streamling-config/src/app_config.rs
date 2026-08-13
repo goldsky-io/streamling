@@ -1026,6 +1026,21 @@ password: ""
         assert_eq!(cfg.compression, ClickHouseCompression::Zstd);
     }
 
+    /// Pins the shipped ClickHouse source page size. Halved from 10M to 5M so
+    /// the source starts with smaller pages while the database is responding
+    /// slowly; a silent bump back would undo that tuning. Reads the
+    /// embedded defaults only — no env layer — so the test is deterministic.
+    #[test]
+    fn embedded_default_clickhouse_source_page_size_is_halved() {
+        let config: AppConfig = Config::builder()
+            .add_source(File::from_str(EMBEDDED_DEFAULT_CONFIG, FileFormat::Yaml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.clickhouse_source.page_size, Some(5_000_000));
+    }
+
     #[test]
     fn clickhouse_compression_rejects_unknown_method() {
         let err =

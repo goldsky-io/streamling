@@ -434,7 +434,7 @@ sources:
 | `STREAMLING__CLICKHOUSE_SOURCE__USER` | `default` | Username |
 | `STREAMLING__CLICKHOUSE_SOURCE__PASSWORD` | _(empty)_ | Password |
 | `STREAMLING__CLICKHOUSE_SOURCE__DATABASE` | `default` | Database name |
-| `STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE` | `10000000` | Rows fetched per pagination chunk |
+| `STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE` | `5000000` | Rows fetched per pagination chunk |
 
 #### File Source
 
