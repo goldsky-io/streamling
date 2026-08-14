@@ -299,3 +299,148 @@ sinks:
 
     assert!(status.success(), "Streamling should exit successfully");
 }
+
+// ============================================================================
+// Scenario 5: keyless sink parallelism (round-robin)
+// ============================================================================
+
+/// Print and blackhole neither dedupe nor depend on per-key ordering, so
+/// `parallelism` widens them round-robin — no primary key required, unlike the
+/// keyed sinks whose exchange hashes on one.
+///
+/// The property under test is that dealing batches out across N write streams
+/// loses nothing: every produced row must still reach the sink exactly once.
+#[tokio::test]
+async fn test_print_sink_parallelism_delivers_every_row() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce: i64 = 60;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    // No `primary_key` on the sink: a keyed sink would fail to plan here, which
+    // is exactly the difference round-robin placement buys.
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: kafka_source
+    parallelism: 3
+    sample_every: 1
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    let mut ids: Vec<i64> = output
+        .column_values("id")
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        (1..=records_to_produce).collect::<Vec<i64>>(),
+        "every row must be printed exactly once across the three write streams"
+    );
+}
+
+/// A blackhole sink discards everything, so `parallelism` is purely about how
+/// many concurrent writers the pipeline drives — useful for throughput testing.
+/// It must plan and run without a primary key on the sink.
+#[tokio::test]
+async fn test_blackhole_sink_parallelism() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce: i64 = 500;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: kafka_source
+    parallelism: 4
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+}

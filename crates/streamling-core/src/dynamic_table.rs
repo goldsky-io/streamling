@@ -507,7 +507,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_session_manager() -> SessionManager {
-        SessionManager::new(1000, 10, DynamicTableRegistry::new())
+        SessionManager::new(1000, 10, DynamicTableRegistry::new(), 1)
             .expect("test session manager initialisation failed")
     }
 
@@ -517,6 +517,7 @@ mod tests {
             "test_source".to_string(),
             crate::topology::Source::kafka(crate::topology::KafkaSource {
                 topic: "test_topic".to_string(),
+                parallelism: None,
                 starting_offsets: None,
                 include_metadata: None,
                 filter: None,

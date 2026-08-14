@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use streamling_core::checkpoints::channels::send;
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
+    report_marker_at_sink, send_checkpoint_ack,
 };
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::streamling_err;
@@ -20,7 +21,6 @@ use crate::table_providers::postgres::execution::{
     SinkContext, execute_batch_delete, execute_batch_insert,
 };
 use crate::table_providers::postgres::query_builder::PostgresQueryBuilder;
-use crate::table_providers::util::parallel::parallel_execute;
 use streamling_core::utils::pg::truncate_finalized_checkpoint_data;
 
 /// Filter a RecordBatch to only include rows at the specified indices
@@ -69,8 +69,6 @@ pub struct BatchProcessorContext {
     pub append_only_mode: bool,
     pub checkpoint_truncation: bool,
     pub current_checkpoint_epoch: Arc<Mutex<u64>>,
-    pub parallelism: usize,
-    pub write_batch_size: u32,
     /// Client-side bound for a single statement execution; see
     /// `PostgresSinkConfig::client_statement_timeout`.
     pub client_statement_timeout: Option<Duration>,
@@ -121,12 +119,12 @@ async fn process_checkpoint_messages_with_truncation(
 
                 let sink_id = get_reference_name_from_metric_key(&context.metric_metadata_id);
                 // Best-effort: during shutdown a source may have dropped its
-                // channel receiver already; a failed ack broadcast must not
-                // panic the sink mid-drain (the epoch simply never finalizes).
-                let _ = send(
-                    CHECKPOINT_COORDINATOR_CHANNEL,
-                    CheckpointMessage::Ack { epoch, sink_id },
-                );
+                // channel receiver already; `send_checkpoint_ack` logs instead
+                // of panicking so a failed broadcast can't kill the sink
+                // mid-drain (the epoch simply never finalizes).
+                if report_marker_at_sink(&sink_id, epoch.clone()) {
+                    send_checkpoint_ack(epoch, &sink_id);
+                }
 
                 // Record sink flush time (time from batch arrival to ack sent)
                 context.metrics_recorder.record_time(
@@ -280,19 +278,7 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
     if context.append_only_mode {
         // Append-only mode: INSERT everything (including deletes with _gs_op='d')
         // Don't split by operation type, no DELETE statements
-        parallel_execute(
-            &batch,
-            context.parallelism,
-            context.write_batch_size as usize,
-            {
-                let ctx = context.clone();
-                move |slice| {
-                    let ctx = ctx.clone();
-                    async move { execute_insert_slice(&ctx, &slice, epoch_for_rows).await }
-                }
-            },
-        )
-        .await?;
+        execute_insert_slice(context, &batch, epoch_for_rows).await?;
     } else {
         // Normal mode: Split by _gs_op and process inserts/updates vs deletes separately
         // Get _gs_op column to identify delete operations
@@ -325,38 +311,14 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
         if !insert_indices.is_empty() {
             let filtered_batch = filter_batch_by_indices(&batch, &insert_indices)?;
 
-            parallel_execute(
-                &filtered_batch,
-                context.parallelism,
-                context.write_batch_size as usize,
-                {
-                    let ctx = context.clone();
-                    move |slice| {
-                        let ctx = ctx.clone();
-                        async move { execute_insert_slice(&ctx, &slice, epoch_for_rows).await }
-                    }
-                },
-            )
-            .await?;
+            execute_insert_slice(context, &filtered_batch, epoch_for_rows).await?;
         }
 
         // Process deletes
         if !delete_indices.is_empty() && !context.primary_key_columns.is_empty() {
             let delete_batch = filter_batch_by_indices(&batch, &delete_indices)?;
 
-            parallel_execute(
-                &delete_batch,
-                context.parallelism,
-                context.write_batch_size as usize,
-                {
-                    let ctx = context.clone();
-                    move |slice| {
-                        let ctx = ctx.clone();
-                        async move { execute_delete_slice(&ctx, &slice).await }
-                    }
-                },
-            )
-            .await?;
+            execute_delete_slice(context, &delete_batch).await?;
         }
     }
 
@@ -453,8 +415,6 @@ mod tests {
             append_only_mode: false,
             checkpoint_truncation: false,
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
-            parallelism: 1,
-            write_batch_size: 1000,
             client_statement_timeout: Some(Duration::from_secs(120)),
         };
 
@@ -497,8 +457,6 @@ mod tests {
             append_only_mode: false,
             checkpoint_truncation: false,
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
-            parallelism: 1,
-            write_batch_size: 1000,
             client_statement_timeout: Some(Duration::from_secs(120)),
         };
 

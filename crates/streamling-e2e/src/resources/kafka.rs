@@ -36,8 +36,22 @@ pub struct KafkaResource {
 }
 
 impl KafkaResource {
-    /// Create a new Kafka resource with an isolated topic
+    /// Create a new Kafka resource with an isolated single-partition topic
     pub async fn new(broker: &str, schema_registry_url: &str, topic: &str) -> Result<Self> {
+        Self::new_with_partitions(broker, schema_registry_url, topic, 1).await
+    }
+
+    /// Create a new Kafka resource whose topic has `partitions` partitions.
+    ///
+    /// Needed to exercise a source's `parallelism`: N consumer instances share
+    /// one group, so the broker can only spread them out if the topic actually
+    /// has partitions to hand around.
+    pub async fn new_with_partitions(
+        broker: &str,
+        schema_registry_url: &str,
+        topic: &str,
+        partitions: i32,
+    ) -> Result<Self> {
         // Create admin client
         let admin_client: AdminClient<DefaultClientContext> = ClientConfig::new()
             .set("bootstrap.servers", broker)
@@ -46,7 +60,7 @@ impl KafkaResource {
             .map_err(|e| E2eError::Kafka(e.to_string()))?;
 
         // Create the topic
-        let new_topic = NewTopic::new(topic, 1, TopicReplication::Fixed(1));
+        let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
         let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
 
         admin_client
@@ -104,10 +118,25 @@ impl KafkaResource {
 
     /// Produce JSON records to the topic (without schema registry)
     pub async fn produce_json_records<T: Serialize>(&self, records: &[T]) -> Result<()> {
+        self.produce_json_records_keyed(records, |_| String::new())
+            .await
+    }
+
+    /// Produce JSON records with a per-record message key.
+    ///
+    /// [`Self::produce_json_records`] keys every message with `""`, which lands
+    /// them all on one Kafka partition. Tests that need records spread across a
+    /// multi-partition topic must supply a real key.
+    pub async fn produce_json_records_keyed<T: Serialize>(
+        &self,
+        records: &[T],
+        key_of: impl Fn(&T) -> String,
+    ) -> Result<()> {
         for record in records {
             let payload = serde_json::to_vec(record).map_err(|e| E2eError::Kafka(e.to_string()))?;
+            let key = key_of(record);
 
-            let kafka_record = FutureRecord::to(&self.topic).payload(&payload).key("");
+            let kafka_record = FutureRecord::to(&self.topic).payload(&payload).key(&key);
 
             self.producer
                 .send(kafka_record, Timeout::After(Duration::from_secs(15)))
@@ -136,6 +165,33 @@ impl KafkaResource {
         records: &[T],
         op: &str,
     ) -> Result<()> {
+        self.produce_avro_records_keyed_with_op(records, op, |_| String::new())
+            .await
+    }
+
+    /// Produce Avro records with a per-record message key.
+    ///
+    /// The unkeyed variants send an *empty* key, which librdkafka partitions
+    /// randomly — so two records sharing a primary key can land on different
+    /// Kafka partitions. Streamling preserves per-key ordering from the source
+    /// onward, but it cannot restore an order the source never had, so any test
+    /// asserting "the later version wins" has to key production by that same
+    /// primary key.
+    pub async fn produce_avro_records_keyed<T: Serialize>(
+        &self,
+        records: &[T],
+        key_of: impl Fn(&T) -> String,
+    ) -> Result<()> {
+        self.produce_avro_records_keyed_with_op(records, "c", key_of)
+            .await
+    }
+
+    pub async fn produce_avro_records_keyed_with_op<T: Serialize>(
+        &self,
+        records: &[T],
+        op: &str,
+        key_of: impl Fn(&T) -> String,
+    ) -> Result<()> {
         let encoder = AvroEncoder::new(self.sr_settings.clone());
         let subject_strategy = SubjectNameStrategy::TopicNameStrategy(self.topic.clone(), false);
 
@@ -150,9 +206,10 @@ impl KafkaResource {
                 value: Some(op),
             });
 
+            let key = key_of(record);
             let kafka_record = FutureRecord::to(&self.topic)
                 .payload(&payload)
-                .key("")
+                .key(&key)
                 .headers(headers);
 
             self.producer

@@ -17,7 +17,7 @@ use batch_processor::{BatchProcessorContext, process_batch};
 use columns::ColumnInfo;
 use datafusion::catalog::Session;
 use datafusion::common::{Result, not_impl_err};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -32,7 +32,9 @@ use streamling_config::PostgresSinkConfig;
 use streamling_core::data::COLUMN_NAME_OP;
 use streamling_core::error::ResultExt;
 use streamling_core::node_context::get_node_context;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
+use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
 use streamling_core::utils::parse_primary_key_columns;
@@ -58,7 +60,6 @@ pub struct PostgresSinkTableProvider {
     deduplicate: bool,
     parallelism: usize,
     telemetry: Option<Telemetry>,
-    write_batch_size: u32,
 }
 
 /// The key each batch is collapsed on before it reaches the sink, or `None`
@@ -104,9 +105,12 @@ impl PostgresSinkTableProvider {
         parallelism: Option<usize>,
         telemetry: Option<Telemetry>,
     ) -> Self {
-        let batch_size = batch_size.unwrap_or(config.batch_size);
+        // `parallelism` counts concurrent partition write streams (produced by
+        // the sink-edge hash exchange), not slices of one batch, so each stream
+        // writes the batch it receives whole. `batch_size` shapes the upstream
+        // rebatcher, which is where the sink's batch size is decided now.
+        let _ = batch_size;
         let parallelism = parallelism.unwrap_or(1).max(1);
-        let write_batch_size = batch_size.div_ceil(parallelism as u32).max(1);
 
         Self {
             metric_metadata_id,
@@ -125,7 +129,6 @@ impl PostgresSinkTableProvider {
             deduplicate: deduplicate.unwrap_or(true),
             parallelism,
             telemetry,
-            write_batch_size,
         }
     }
 }
@@ -175,7 +178,6 @@ impl TableProvider for PostgresSinkTableProvider {
             self.checkpoint_truncation,
             self.reference_name.clone(),
             self.parallelism,
-            self.write_batch_size,
         ));
 
         let wrapper_sink = Arc::new(WrappingDataSink::new(
@@ -189,10 +191,10 @@ impl TableProvider for PostgresSinkTableProvider {
             self.telemetry.as_ref(),
         ));
 
-        Ok(Arc::new(DataSinkExec::new(
+        Ok(Arc::new(ParallelSinkExec::new(
             adjusted_input,
             wrapper_sink,
-            None,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
         )))
     }
 }
@@ -215,7 +217,15 @@ pub struct PostgresSinkExec {
     append_only_mode: bool,
     checkpoint_truncation: bool,
     parallelism: usize,
-    write_batch_size: u32,
+    /// Global `num_records_before_stop` progress, shared across
+    /// `ParallelSinkExec`'s concurrent per-partition `write_all` calls. Built
+    /// per call it would be per-stream, so a sink with `parallelism: N` would
+    /// need N times the rows before signalling completion — and a pipeline with
+    /// a record limit would never stop.
+    records_processed: Arc<Mutex<u64>>,
+    /// Pool + DDL shared across `ParallelSinkExec`'s concurrent per-partition
+    /// `write_all` calls.
+    connection: tokio::sync::OnceCell<PostgresConnection>,
 }
 
 impl PostgresSinkExec {
@@ -235,7 +245,6 @@ impl PostgresSinkExec {
         checkpoint_truncation: bool,
         reference_name: String,
         parallelism: usize,
-        write_batch_size: u32,
     ) -> Self {
         Self {
             config,
@@ -253,7 +262,8 @@ impl PostgresSinkExec {
             append_only_mode,
             checkpoint_truncation,
             parallelism,
-            write_batch_size,
+            records_processed: Arc::new(Mutex::new(0u64)),
+            connection: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -282,28 +292,43 @@ impl DataSink for PostgresSinkExec {
             node_label, self.schema_name, self.table, self.parallelism
         );
 
-        // Create connection pool with enough connections for parallel tasks
-        let connection = PostgresConnection::new_with_parallelism(&self.config, self.parallelism)
-            .await
-            .streamling_with_context(|| format!("{}: failed to create connection", node_label))?;
+        // One shared pool and one DDL pass regardless of how many partition
+        // streams `ParallelSinkExec` writes concurrently: Postgres `IF NOT EXISTS`
+        // DDL is racy across sessions (the loser fails with a duplicate-key
+        // error), and a pool per stream would multiply connections by the
+        // partition count.
+        let connection = self
+            .connection
+            .get_or_try_init(|| async {
+                // Create connection pool with enough connections for parallel tasks
+                let connection =
+                    PostgresConnection::new_with_parallelism(&self.config, self.parallelism)
+                        .await
+                        .streamling_with_context(|| {
+                            format!("{}: failed to create connection", node_label)
+                        })?;
 
-        // Create schema and table if needed (use original schema for correct column types)
-        create_schema_and_table_if_needed(
-            connection.pool(),
-            &self.schema_name,
-            &self.table,
-            &self.original_schema,
-            self.primary_key.as_ref(),
-            self.append_only_mode,
-            self.checkpoint_truncation,
-        )
-        .await
-        .streamling_with_context(|| {
-            format!(
-                "{}: failed to create schema/table '{}.{}'",
-                node_label, self.schema_name, self.table
-            )
-        })?;
+                // Create schema and table if needed (use original schema for correct column types)
+                create_schema_and_table_if_needed(
+                    connection.pool(),
+                    &self.schema_name,
+                    &self.table,
+                    &self.original_schema,
+                    self.primary_key.as_ref(),
+                    self.append_only_mode,
+                    self.checkpoint_truncation,
+                )
+                .await
+                .streamling_with_context(|| {
+                    format!(
+                        "{}: failed to create schema/table '{}.{}'",
+                        node_label, self.schema_name, self.table
+                    )
+                })?;
+
+                Ok::<_, datafusion::common::DataFusionError>(connection)
+            })
+            .await?;
 
         // Get primary key columns
         let mut primary_key_columns: Vec<String> = if let Some(pk_str) = &self.primary_key {
@@ -340,7 +365,7 @@ impl DataSink for PostgresSinkExec {
             column_indices: column_info.indices.clone(),
             source_name: self.source_name.clone(),
             node_label: node_label.clone(),
-            records_processed: Arc::new(Mutex::new(0u64)),
+            records_processed: Arc::clone(&self.records_processed),
             num_records_before_stop: self.num_records_before_stop,
             metrics_recorder: get_metrics_recorder().clone(),
             metric_metadata_id: self.metric_metadata_id.clone(),
@@ -350,8 +375,6 @@ impl DataSink for PostgresSinkExec {
             append_only_mode: self.append_only_mode,
             checkpoint_truncation: self.checkpoint_truncation,
             current_checkpoint_epoch: Arc::new(Mutex::new(0)),
-            parallelism: self.parallelism,
-            write_batch_size: self.write_batch_size,
             client_statement_timeout: self.config.client_statement_timeout(),
         };
 

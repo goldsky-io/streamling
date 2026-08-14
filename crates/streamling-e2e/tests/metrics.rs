@@ -106,17 +106,25 @@ sinks:
     // Give metrics time to be flushed to Prometheus
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    // Verify output rows metric
-    let output_query =
-        streamling_e2e::resources::PrometheusResource::output_rows_query("kafka_source", None);
+    // Scope both queries to this run's `instance` label. Every test that names
+    // its source `kafka_source` produces a series with that `id`, and the query
+    // helper reads the *first* series Prometheus returns — so an unscoped query
+    // silently reads some other test's numbers once more than one run's series
+    // are retained.
+    let output_query = streamling_e2e::resources::PrometheusResource::output_rows_query(
+        "kafka_source",
+        Some(&ctx.test_id),
+    );
     let output_rows = prometheus
         .query_count(&output_query)
         .await
         .expect("Failed to query output rows");
 
     // Verify input rows metric for the sink
-    let input_query =
-        streamling_e2e::resources::PrometheusResource::input_rows_query("postgres_sink", None);
+    let input_query = streamling_e2e::resources::PrometheusResource::input_rows_query(
+        "postgres_sink",
+        Some(&ctx.test_id),
+    );
     let input_rows = prometheus
         .query_count(&input_query)
         .await

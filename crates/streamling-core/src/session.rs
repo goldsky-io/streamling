@@ -80,8 +80,20 @@ impl SessionManager {
         batch_size: u64,
         internal_buffer_size: u32,
         dynamic_table_registry: DynamicTableRegistry,
+        max_declared_parallelism: usize,
     ) -> Result<Self> {
+        // DataFusion defaults `target_partitions` to the CPU count. A pipeline
+        // that declares more parallelism than that must still get the streams it
+        // asked for, or the same YAML would behave differently per machine, so
+        // the ceiling is raised to whatever the topology declares.
+        let target_partitions = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(max_declared_parallelism)
+            .max(1);
+
         let config = SessionConfig::new()
+            .with_target_partitions(target_partitions)
             .set_bool("datafusion.catalog.information_schema", true)
             .set_bool("datafusion.catalog.create_default_catalog_and_schema", true)
             // this increases e2e latency and can keep intermediate results in memory indefinitely, so we disable it
@@ -458,7 +470,7 @@ mod tests {
     /// A `txs` table with two u256 columns (`gas_price`, nullable
     /// `effective_gas_price`) and a non-u256 `flag` for CASE conditions.
     fn u256_session() -> SessionManager {
-        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("gas_price", U256Type::new(), false).with_metadata(U256Type::metadata()),
