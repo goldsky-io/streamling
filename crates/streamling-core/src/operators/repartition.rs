@@ -224,6 +224,7 @@ async fn route_input_partition(
 ) {
     let output_partitions = txs.len();
     let mut hashes: Vec<u64> = Vec::new();
+    let mut indices: Vec<Vec<u32>> = Vec::new();
     let mut next_output = 0;
 
     while let Some(batch) = stream.next().await {
@@ -257,7 +258,13 @@ async fn route_input_partition(
         // because each output feeds a write stream that has to see the epoch.
         let split = match &exchange {
             Exchange::Hash(exprs) => {
-                match split_batch_by_hash(&batch, exprs, output_partitions, &mut hashes) {
+                match split_batch_by_hash(
+                    &batch,
+                    exprs,
+                    output_partitions,
+                    &mut hashes,
+                    &mut indices,
+                ) {
                     Ok(split) => split,
                     Err(e) => {
                         broadcast_error(&txs, e).await;
@@ -308,11 +315,15 @@ async fn broadcast_error(txs: &[mpsc::Sender<BatchResult>], error: DataFusionErr
 
 /// Splits `batch` into one sub-batch per output partition, `None` where an output
 /// received no rows.
+///
+/// `hashes` and `indices` are scratch buffers owned by the caller, reused across
+/// batches so a per-batch shuffle costs no allocations of its own.
 fn split_batch_by_hash(
     batch: &RecordBatch,
     hash_exprs: &[PhysicalExprRef],
     output_partitions: usize,
     hashes: &mut Vec<u64>,
+    indices: &mut Vec<Vec<u32>>,
 ) -> Result<Vec<Option<RecordBatch>>> {
     let arrays = hash_exprs
         .iter()
@@ -326,21 +337,36 @@ fn split_batch_by_hash(
     // an exchange whose placement does not actually match.
     create_hashes(&arrays, REPARTITION_RANDOM_STATE.random_state(), hashes)?;
 
-    let mut indices: Vec<Vec<u32>> = vec![Vec::new(); output_partitions];
+    indices.resize_with(output_partitions, Vec::new);
+    for rows in indices.iter_mut() {
+        rows.clear();
+    }
     for (row, hash) in hashes.iter().enumerate() {
         indices[(*hash % output_partitions as u64) as usize].push(row as u32);
     }
 
-    indices
-        .into_iter()
+    // One gather for the whole batch rather than one per output: the rows are
+    // permuted so each output's share is contiguous, and the outputs then take
+    // zero-copy slices of it. Per-output takes move the same bytes but pay a
+    // kernel dispatch, an allocation and an overflow guard per column *per
+    // output*, which dominates at the small batch sizes this operator sees (it
+    // sits below the rebatcher).
+    //
+    // The permutation is a bijection of `0..num_rows`, so the gathered batch
+    // holds exactly the input's column payloads: it cannot overflow i32 offsets
+    // unless the input already had.
+    let permutation = UInt32Array::from_iter_values(indices.iter().flatten().copied());
+    let grouped = safe_take_record_batch(batch, &permutation)?;
+
+    let mut offset = 0;
+    Ok(indices
+        .iter()
         .map(|rows| {
-            if rows.is_empty() {
-                Ok(None)
-            } else {
-                safe_take_record_batch(batch, &UInt32Array::from(rows)).map(Some)
-            }
+            let slice = (!rows.is_empty()).then(|| grouped.slice(offset, rows.len()));
+            offset += rows.len();
+            slice
         })
-        .collect()
+        .collect())
 }
 
 impl DisplayAs for StreamingRepartitionExec {
@@ -968,6 +994,32 @@ mod tests {
             let holders = outputs.iter().filter(|(ids, _)| ids.contains(&key)).count();
             assert_eq!(holders, 1, "key {key} must live on exactly one output");
         }
+    }
+
+    /// Rows reach an output as a slice of one permuted batch, so a mistake in
+    /// the permutation's offsets would reorder them. Per-key ordering is what
+    /// `WrappingDataSink`'s keep-last dedup and CDC upserts rest on.
+    #[tokio::test]
+    async fn hash_keeps_rows_in_input_order_within_an_output() {
+        let source = Arc::new(MarkerSourceExec::new(vec![vec![MarkerSourceExec::batch(
+            (1..=64).collect(),
+            &[],
+        )]]));
+        let exec = StreamingRepartitionExec::new(source, id_hash(), 4, 10);
+
+        let outputs = drain_all(&exec, 4).await;
+
+        for (index, (ids, _)) in outputs.iter().enumerate() {
+            assert!(
+                ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "output {index} reordered its rows: {ids:?}"
+            );
+        }
+        assert_eq!(
+            outputs.iter().map(|(ids, _)| ids.len()).sum::<usize>(),
+            64,
+            "every row must still be accounted for"
+        );
     }
 
     /// N inputs × M outputs: each output is a merge point, so each must emit the

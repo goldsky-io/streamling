@@ -32,7 +32,9 @@ use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{
+    RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     execute_input_stream,
@@ -42,6 +44,42 @@ use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::task::JoinSet;
+
+/// How many batches each write stream may run ahead of its `write_all`.
+///
+/// A sink stops polling its input for the whole duration of a write (an HTTP
+/// INSERT, an `ALTER TABLE` mutation). With nothing draining behind it, that
+/// stall backs up into the shared exchange upstream, whose router blocks on the
+/// first full output and so stalls every *other* write stream too — the sink's
+/// parallelism collapses to the pace of its slowest writer.
+///
+/// One batch is enough because it is denominated in the same unit as the stall
+/// it covers: the rebatcher keeps accumulating behind the buffered batch, and
+/// both the write and the accumulation scale with the sink's `batch_size`, so
+/// "one batch ahead" stays "one write's worth of slack" at any tuning.
+const WRITE_STREAM_PREFETCH: usize = 1;
+
+/// Runs `input` on its own task, letting it produce up to `capacity` batches
+/// ahead of the consumer.
+///
+/// Batch-level schema metadata (the checkpoint markers) is forwarded untouched:
+/// `RecordBatchReceiverStream` yields exactly what it was sent, unlike
+/// `CoalescePartitionsExec`, which rebuilds batches on the operator schema and
+/// would drop them.
+fn prefetch(mut input: SendableRecordBatchStream, capacity: usize) -> SendableRecordBatchStream {
+    let mut builder = RecordBatchReceiverStreamBuilder::new(input.schema(), capacity);
+    let tx = builder.tx();
+    builder.spawn(async move {
+        while let Some(batch) = input.next().await {
+            if tx.send(batch).await.is_err() {
+                // The consumer is gone; nothing left to feed.
+                return Ok(());
+            }
+        }
+        Ok(())
+    });
+    builder.build()
+}
 
 /// Executes all input partitions and writes each through `sink.write_all`
 /// concurrently, returning a single-row batch with the total written count
@@ -168,12 +206,13 @@ impl ExecutionPlan for ParallelSinkExec {
         let input_partitions = self.input.output_partitioning().partition_count();
         let streams: Vec<SendableRecordBatchStream> = (0..input_partitions)
             .map(|input_partition| {
-                execute_input_stream(
+                let data = execute_input_stream(
                     Arc::clone(&self.input),
                     Arc::clone(self.sink.schema()),
                     input_partition,
                     Arc::clone(&context),
-                )
+                )?;
+                Ok(prefetch(data, WRITE_STREAM_PREFETCH))
             })
             .collect::<Result<_>>()?;
 
@@ -233,6 +272,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::prelude::SessionContext;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Counts every row it receives across concurrent `write_all` calls.
@@ -300,6 +340,59 @@ mod tests {
         assert!(
             rendered.contains("ParallelSinkExec: partitions=2, sink=CountingSink"),
             "unexpected plan display:\n{rendered}"
+        );
+    }
+
+    /// The whole point of the prefetch: the input keeps running while the
+    /// consumer sits idle, which is what a sink does for the length of a write.
+    /// If the input were only driven on demand, a stalled writer would back up
+    /// into the shared exchange and stall its sibling writers too.
+    ///
+    /// Checkpoint markers ride on batch schema metadata, so the buffer must
+    /// forward batches untouched — losing them stalls checkpoint finalization.
+    #[tokio::test]
+    async fn prefetch_drives_the_input_while_the_consumer_is_idle() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let marked_schema = Arc::new(Schema::new_with_metadata(
+            schema.fields().clone(),
+            HashMap::from([("marker".to_string(), "epoch-1".to_string())]),
+        ));
+        let produced = Arc::new(AtomicU64::new(0));
+
+        let counter = Arc::clone(&produced);
+        let batch_schema = Arc::clone(&marked_schema);
+        let input = futures::stream::iter(0..8).map(move |id| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(RecordBatch::try_new(
+                Arc::clone(&batch_schema),
+                vec![Arc::new(Int32Array::from(vec![id]))],
+            )
+            .unwrap())
+        });
+        let mut stream = prefetch(
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input)),
+            WRITE_STREAM_PREFETCH,
+        );
+
+        let first = stream.next().await.expect("a batch").unwrap();
+        assert_eq!(
+            first.schema().metadata().get("marker").map(String::as_str),
+            Some("epoch-1"),
+            "batch schema metadata must survive the buffer"
+        );
+
+        // The consumer takes nothing further; only the prefetch task can advance
+        // the input from here.
+        for _ in 0..100 {
+            if produced.load(Ordering::SeqCst) > 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            produced.load(Ordering::SeqCst) > 1,
+            "the input must run ahead of an idle consumer, produced only {}",
+            produced.load(Ordering::SeqCst)
         );
     }
 
