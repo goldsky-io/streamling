@@ -2,8 +2,6 @@
 //! It propagates the input data as is, preserving checkpoint messages in batch metadata.
 //! This is useful for adding checkpointing support to SQL transformations.
 
-use arrow::record_batch::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::{DFSchemaRef, Statistics};
 use datafusion::error::Result;
@@ -11,25 +9,19 @@ use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext
 use datafusion::logical_expr::{
     Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
-use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::Distribution;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    execute_input_stream,
 };
 
-use crate::checkpoints::checkpoint_management::{
-    enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
-};
+use crate::operators::spawn_marker_preserving_forwarder;
 use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use futures::StreamExt;
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
-use tracing::debug;
 
 #[derive(PartialEq, Eq, PartialOrd, Hash)]
 pub struct CheckpointableNode {
@@ -112,9 +104,12 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
                     .create_physical_plan(&checkpointable_node.input, session_state)
                     .await?;
 
-                // Multi-partition inputs (e.g. from `UNION ALL`) are coalesced inside
-                // `CheckpointableExec::execute`, which preserves checkpoint-marker metadata.
-                // We deliberately avoid a stock `RepartitionExec` here, which would drop it.
+                // `CheckpointableExec` is partition-transparent (N in, N out); it no
+                // longer merges multi-partition inputs. `UNION ALL` outputs are
+                // coalesced by the `EnforceSinglePartition` optimizer rule, and other
+                // partition-0-only consumers guard themselves (`SharedSourceHandle`).
+                // We deliberately avoid a stock `RepartitionExec` here, which would
+                // drop checkpoint-marker metadata.
                 let exec = Arc::new(CheckpointableExec::new(
                     input_physical,
                     checkpointable_node.internal_buffer_size,
@@ -141,7 +136,7 @@ impl CheckpointableExec {
         internal_buffer_size: u32,
         reference_name: String,
     ) -> Self {
-        let cache = Self::compute_properties(input.schema());
+        let cache = Self::compute_properties(&input);
         Self {
             input,
             internal_buffer_size,
@@ -150,10 +145,22 @@ impl CheckpointableExec {
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            // The wrapper is schema-identical to its input, so the input's
+            // equivalence properties (orderings, constants, equivalence groups)
+            // carry over verbatim. Rebuilding them from the schema alone would
+            // hide a `Partitioning::Hash`'s key equivalences from
+            // `Partitioning::satisfy`, forcing a redundant exchange above every
+            // SQL transform.
+            input.equivalence_properties().clone(),
+            // Partition-transparent: each input partition is forwarded as its own
+            // output partition, so a multi-partition source stays parallel through
+            // the transform all the way to the sink (`ParallelSinkExec` writes every
+            // partition concurrently). The partitioning is propagated as-is rather
+            // than flattened to `UnknownPartitioning`, so a hash exchange below the
+            // transform stays visible to distribution checks above it.
+            input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -174,7 +181,12 @@ impl DisplayAs for CheckpointableExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "CheckpointableExec (for {})", self.input.name())
+                write!(
+                    f,
+                    "CheckpointableExec (for {}), partitions={}",
+                    self.input.name(),
+                    self.cache.output_partitioning().partition_count()
+                )
             }
         }
     }
@@ -190,8 +202,8 @@ impl ExecutionPlan for CheckpointableExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        // We coalesce the input partitions ourselves in `execute` (preserving checkpoint
-        // markers). Requiring `SinglePartition` here would make DataFusion insert a stock
+        // Partition-transparent, no distribution requirement. Requiring
+        // `SinglePartition` here would make DataFusion insert a stock
         // `CoalescePartitionsExec`/`RepartitionExec`, which rebuild batches with a
         // metadata-less schema and silently drop the checkpoint markers.
         vec![Distribution::UnspecifiedDistribution]
@@ -214,79 +226,28 @@ impl ExecutionPlan for CheckpointableExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Forward this partition's batches with their checkpoint-marker metadata
+        // intact, through a channel task so the transform keeps computing while
+        // downstream (e.g. a sink write) is busy. Checkpoint markers ride per
+        // partition: a marker is forwarded on the partition stream it arrived on
+        // (no cross-partition barrier alignment — today's only multi-partition
+        // source, the bounded file source, emits no markers).
         let output_schema = self.schema();
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             output_schema.clone(),
             self.internal_buffer_size as usize,
         );
-
-        // Coalesce all input partitions into this single output partition, forwarding
-        // each batch with its checkpoint-marker metadata intact. We merge here rather
-        // than via a stock DataFusion `RepartitionExec`/`CoalescePartitionsExec`, which
-        // rebuild batches with a metadata-less schema and would drop checkpoint markers,
-        // stalling checkpoint finalization (e.g. for `UNION ALL`, which is multi-partition).
-        let input_partitions = self.input.output_partitioning().partition_count();
-        for input_partition in 0..input_partitions {
-            let data = execute_input_stream(
-                Arc::clone(&self.input),
-                Arc::clone(&output_schema),
-                input_partition,
-                Arc::clone(&context),
-            )?;
-            let tx = builder.tx();
-            let output_schema = output_schema.clone();
-            let reference_name = self.reference_name.clone();
-
-            builder.spawn(async move {
-                let mut stream = data;
-
-                while let Some(batch) = stream.next().await {
-                    match batch {
-                        Ok(batch) => {
-                            // Extract checkpoint messages from input batch metadata
-                            let checkpoint_messages =
-                                extract_checkpoint_messages(batch.schema().metadata());
-
-                            // Create output batch with checkpoint messages preserved in schema metadata
-                            // Preserve existing metadata from output_schema and merge with checkpoint messages
-                            let output_batch = if !checkpoint_messages.is_empty() {
-                                let mut metadata: HashMap<String, String> =
-                                    output_schema.metadata().clone();
-                                enrich_batch_metadata_with_checkpoints(
-                                    &mut metadata,
-                                    &checkpoint_messages,
-                                );
-                                let enriched_schema = Arc::new(Schema::new_with_metadata(
-                                    output_schema.fields().clone(),
-                                    metadata,
-                                ));
-                                RecordBatch::try_new(enriched_schema, batch.columns().to_vec())
-                                    .unwrap_or(batch)
-                            } else {
-                                batch
-                            };
-
-                            // Forward the batch to the output stream
-                            if tx.send(Ok(output_batch)).await.is_err() {
-                                // The receiver was dropped, stop processing
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("CheckpointableExec [{}]: Error from inner SQL plan, stream will terminate: {}", reference_name, e);
-                            let _ = tx.send(Err(e)).await;
-                            break;
-                        }
-                    }
-                }
-
-                Ok(())
-            });
-        }
-
+        spawn_marker_preserving_forwarder(
+            &mut builder,
+            &self.input,
+            partition,
+            &output_schema,
+            &context,
+            format!("CheckpointableExec [{}]", self.reference_name),
+        )?;
         Ok(builder.build())
     }
 
@@ -302,15 +263,21 @@ impl ExecutionPlan for CheckpointableExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoints::checkpoint_management::{CheckpointEpoch, CheckpointMessage};
+    use crate::checkpoints::checkpoint_management::{
+        CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+        extract_checkpoint_messages,
+    };
     use crate::optimizer::StreamlingPhysicalOptimizerRules;
     use arrow::array::{BooleanArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::physical_expr::Partitioning as PhysicalPartitioning;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning as PhysicalPartitioning};
     use datafusion::prelude::*;
     use futures::StreamExt;
+    use std::collections::HashMap;
 
     fn create_test_schema_with_metadata(metadata: HashMap<String, String>) -> SchemaRef {
         Arc::new(Schema::new_with_metadata(
@@ -349,24 +316,32 @@ mod tests {
         .unwrap()
     }
 
-    /// A simple test source that emits a single batch with checkpoint metadata
+    /// A simple test source that emits one batch per partition
     struct TestSourceExec {
-        batch: RecordBatch,
+        partitions: Vec<RecordBatch>,
         schema: SchemaRef,
         cache: Arc<PlanProperties>,
     }
 
     impl TestSourceExec {
-        fn new(batch: RecordBatch) -> Self {
-            let schema = batch.schema();
+        fn new(partitions: Vec<RecordBatch>) -> Self {
+            let count = partitions.len();
+            Self::with_partitioning(partitions, PhysicalPartitioning::UnknownPartitioning(count))
+        }
+
+        fn with_partitioning(
+            partitions: Vec<RecordBatch>,
+            partitioning: PhysicalPartitioning,
+        ) -> Self {
+            let schema = partitions[0].schema();
             let cache = PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
-                PhysicalPartitioning::UnknownPartitioning(1),
+                partitioning,
                 datafusion::physical_plan::execution_plan::EmissionType::Incremental,
                 datafusion::physical_plan::execution_plan::Boundedness::Bounded,
             );
             Self {
-                batch,
+                partitions,
                 schema,
                 cache: Arc::new(cache),
             }
@@ -407,10 +382,10 @@ mod tests {
 
         fn execute(
             &self,
-            _partition: usize,
+            partition: usize,
             _context: Arc<TaskContext>,
         ) -> Result<SendableRecordBatchStream> {
-            let batch = self.batch.clone();
+            let batch = self.partitions[partition].clone();
             let schema = self.schema.clone();
             let stream = futures::stream::once(async move { Ok(batch) });
             Ok(Box::pin(
@@ -438,7 +413,7 @@ mod tests {
         let batch = create_test_batch_with_checkpoint(&checkpoint_messages);
 
         // Create test source with checkpoint metadata
-        let source = Arc::new(TestSourceExec::new(batch));
+        let source = Arc::new(TestSourceExec::new(vec![batch]));
 
         // Wrap with CheckpointableExec
         let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
@@ -652,7 +627,7 @@ mod tests {
         assert_eq!(input_checkpoint.len(), 1);
 
         // Create test source and wrap with CheckpointableExec
-        let source = Arc::new(TestSourceExec::new(batch));
+        let source = Arc::new(TestSourceExec::new(vec![batch]));
         let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
 
         // Execute and collect output
@@ -691,6 +666,113 @@ mod tests {
             output_metadata.get("another_key"),
             Some(&"another_value".to_string()),
             "Custom metadata 'another_key' should be preserved"
+        );
+    }
+
+    /// Pins the partition-transparent contract: N input partitions surface as N
+    /// output partitions, `execute(i)` forwards exactly input partition i, and
+    /// checkpoint markers stay on the partition stream they arrived on.
+    #[tokio::test]
+    async fn test_checkpointable_exec_forwards_partitions_independently() {
+        let marker = vec![CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(7),
+            created_at_ms: 0,
+        }];
+        let batch_with_marker = create_test_batch_with_checkpoint(&marker);
+        let plain_batch = create_test_batch_with_checkpoint(&[]);
+
+        let source = Arc::new(TestSourceExec::new(vec![
+            batch_with_marker,
+            plain_batch.clone(),
+        ]));
+        let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
+
+        assert_eq!(
+            checkpointable
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            2,
+            "input partitions must surface as output partitions"
+        );
+
+        let ctx = SessionContext::new();
+        let mut with_marker_rows = 0;
+        let mut plain_rows = 0;
+        for partition in 0..2 {
+            let mut stream = checkpointable.execute(partition, ctx.task_ctx()).unwrap();
+            let mut markers_seen = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                markers_seen += extract_checkpoint_messages(batch.schema().metadata()).len();
+                if partition == 0 {
+                    with_marker_rows += batch.num_rows();
+                } else {
+                    plain_rows += batch.num_rows();
+                }
+            }
+            assert_eq!(
+                markers_seen,
+                if partition == 0 { 1 } else { 0 },
+                "markers must stay on the partition stream they arrived on"
+            );
+        }
+        assert_eq!(with_marker_rows, 5, "partition 0 forwards its own rows");
+        assert_eq!(plain_rows, 5, "partition 1 forwards its own rows");
+    }
+
+    /// The wrapper is partition-transparent, so its displayed width is the one
+    /// flowing through it — that is the whole point of showing it in a plan dump.
+    #[test]
+    fn display_reports_the_width_passing_through() {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let source = Arc::new(TestSourceExec::new(vec![batch.clone(), batch]));
+        let checkpointable = CheckpointableExec::new(source, 10, "test".to_string());
+
+        let rendered = datafusion::physical_plan::displayable(&checkpointable)
+            .indent(true)
+            .to_string();
+        assert!(
+            rendered.contains("CheckpointableExec (for TestSourceExec), partitions=2"),
+            "unexpected plan display:\n{rendered}"
+        );
+    }
+
+    /// A hash exchange below a SQL transform must stay visible to distribution
+    /// checks above it, otherwise every keyed sink re-exchanges its input.
+    #[tokio::test]
+    async fn test_checkpointable_exec_propagates_hash_partitioning() {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let hash_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = vec![Arc::new(
+            datafusion::physical_expr::expressions::Column::new("id", 0),
+        )];
+        let source = Arc::new(TestSourceExec::with_partitioning(
+            vec![batch.clone(), batch],
+            PhysicalPartitioning::Hash(hash_exprs.clone(), 2),
+        ));
+        let checkpointable = CheckpointableExec::new(source.clone(), 10, "test".to_string());
+
+        assert!(
+            matches!(
+                checkpointable.properties().output_partitioning(),
+                PhysicalPartitioning::Hash(_, 2)
+            ),
+            "hash partitioning must survive the wrapper, not flatten to UnknownPartitioning"
+        );
+        assert!(
+            crate::operators::repartition::satisfies_hash_distribution(
+                checkpointable.properties(),
+                &hash_exprs,
+            ),
+            "a keyed distribution requirement must be satisfied through the wrapper"
+        );
+        assert_eq!(
+            checkpointable
+                .properties()
+                .equivalence_properties()
+                .schema(),
+            source.properties().equivalence_properties().schema(),
+            "equivalence properties are propagated, not rebuilt"
         );
     }
 }

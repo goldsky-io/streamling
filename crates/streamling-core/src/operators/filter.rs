@@ -327,7 +327,13 @@ impl DisplayAs for StreamingFilterExec {
                 } else {
                     "".to_string()
                 };
-                write!(f, "FilterExec: {}{}", self.predicate, display_projections)
+                write!(
+                    f,
+                    "FilterExec: {}{}, partitions={}",
+                    self.predicate,
+                    display_projections,
+                    self.cache.output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "predicate={}", fmt_sql(self.predicate.as_ref()))

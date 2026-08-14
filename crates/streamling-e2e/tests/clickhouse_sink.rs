@@ -1210,3 +1210,128 @@ sinks:
         .expect("Failed to query count");
     assert_eq!(count, 4, "all rows written");
 }
+
+// =============================================================================
+// Sink parallelism
+// =============================================================================
+
+/// `parallelism: N` on a ClickHouse sink now means N concurrent partition write
+/// streams fed by a hash exchange on the sink's primary key — it used to mean
+/// slicing one accumulated batch N ways inside a single stream.
+///
+/// The correctness property is unchanged and is what this test pins: keep-last
+/// deduplication is only correct when every row of a key reaches one stream, in
+/// order. If the exchange were missing (or hashed inconsistently), the two
+/// streams would race on id=1 and `updated_1` could lose to `first_1`.
+#[tokio::test]
+async fn test_deduplication_with_sink_parallelism() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx
+        .clickhouse
+        .as_ref()
+        .expect("ClickHouse should be enabled");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Every id appears twice; the second occurrence must win. Ten keys is
+    // enough that both write streams get work with near-certainty.
+    const KEYS: i64 = 10;
+    let mut records: Vec<TestRecord> = (1..=KEYS)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("first_{i}"),
+            timestamp: i,
+        })
+        .collect();
+    records.extend((1..=KEYS).map(|i| TestRecord {
+        id: i,
+        value: format!("updated_{i}"),
+        timestamp: 1000 + i,
+    }));
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  ch_sink:
+    type: clickhouse
+    from: kafka_source
+    table: parallel_dedup_output
+    primary_key: id
+    parallelism: 2
+    batch_size: 1
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    // The record limit counts WRITTEN rows, and rows are deduplicated by primary
+    // key *within a batch* before they reach the sink's counter — so with both
+    // versions of a key in one batch, only one is ever counted and a limit of
+    // `records.len()` is unreachable. Force one record per batch (sink
+    // `batch_size: 1` + record batch size 1, per the repo test guidance) so
+    // every produced record is written and counted, and the pipeline stops on
+    // its own instead of running to the harness timeout.
+    let mut opts = PipelineOpts::new()
+        .record_limit(records.len() as u64)
+        .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+        .timeout(std::time::Duration::from_secs(120));
+    for (k, v) in clickhouse_env(&ctx) {
+        opts = opts.env(&k, &v);
+    }
+
+    let status = ctx
+        .run_pipeline_with_opts(&pipeline, opts)
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let count = clickhouse
+        .count("SELECT COUNT(*) FROM parallel_dedup_output FINAL")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(count, KEYS as u64, "one row per key after deduplication");
+
+    #[derive(Row, Deserialize)]
+    struct ResultRow {
+        id: i64,
+        value: String,
+    }
+
+    let rows: Vec<ResultRow> = clickhouse
+        .query("SELECT id, value FROM parallel_dedup_output FINAL ORDER BY id")
+        .await
+        .expect("Failed to query rows");
+
+    // Without this the loop below would pass vacuously on an empty result.
+    assert_eq!(rows.len(), KEYS as usize, "every key must be present");
+
+    for row in &rows {
+        assert_eq!(
+            row.value,
+            format!("updated_{}", row.id),
+            "the later update for id={} must win on its own write stream",
+            row.id
+        );
+    }
+}

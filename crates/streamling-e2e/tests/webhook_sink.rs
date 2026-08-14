@@ -297,3 +297,118 @@ sinks:
         webhook.request_count()
     );
 }
+
+// ============================================================================
+// Scenario 4: One write stream regardless of upstream width
+// ============================================================================
+
+/// A webhook sink is never parallelized: planning marks it `Placement::Single`,
+/// so the sink edge coalesces whatever width its input has. Running the *same*
+/// pipeline at two source widths pins that the invariant belongs to the sink,
+/// not to the source.
+#[tokio::test]
+async fn webhook_sink_always_writes_from_one_stream() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("webhook_single_stream", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce = 60;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    topic
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    for source_parallelism in [3, 1] {
+        let webhook = WebhookResource::new()
+            .await
+            .expect("Failed to start webhook server");
+
+        let pipeline = format!(
+            r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: {source_parallelism}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  webhook_sink:
+    type: webhook
+    from: kafka_source
+    url: {webhook_url}
+    one_row_per_request: true
+    payload_version: 0
+"#,
+            topic = topic.topic,
+            webhook_url = webhook.webhook_url(),
+        );
+
+        let output = ctx
+            .run_pipeline_raw(
+                &pipeline,
+                PipelineOpts::new()
+                    .record_limit(records_to_produce as u64)
+                    .env("RUST_LOG", "info")
+                    .timeout(std::time::Duration::from_secs(120)),
+            )
+            .await
+            .expect("Streamling execution failed");
+
+        assert!(
+            output.status.success(),
+            "Pipeline should exit successfully at source parallelism {source_parallelism}; \
+             stderr:\n{}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("ParallelSinkExec: partitions=1"),
+            "the webhook sink must write from one stream at source parallelism \
+             {source_parallelism}; stderr:\n{}",
+            output.stderr
+        );
+        // Only when there is something to coalesce: at parallelism 1 the sink
+        // edge is already one stream and the planner elides the node entirely.
+        if source_parallelism > 1 {
+            assert!(
+                output.stderr.contains("StreamingCoalesceExec"),
+                "a parallel source must be coalesced before the webhook sink; stderr:\n{}",
+                output.stderr
+            );
+        }
+
+        let received_all = webhook
+            .wait_for_requests(
+                records_to_produce as usize,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        assert!(
+            received_all,
+            "Expected {} webhook requests at source parallelism {source_parallelism}, got {}",
+            records_to_produce,
+            webhook.request_count()
+        );
+    }
+}

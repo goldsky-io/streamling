@@ -277,6 +277,7 @@ mod tests {
         topology::Transform::sql(topology::SqlTransform {
             primary_key: "id".to_string(),
             sql: sql.to_string(),
+            parallelism: None,
             telemetry: None,
         })
     }
@@ -644,6 +645,7 @@ mod tests {
         let sql_with_dynamic_deps = topology::Transform::sql(topology::SqlTransform {
             primary_key: "id".to_string(),
             sql: "SELECT * FROM some_source WHERE dynamic_table_check('dynamic_table1', id) AND dynamic_table_check('dynamic_table2', name)".to_string(),
+            parallelism: None,
             telemetry: None,
         });
         transforms.insert("sql_with_dynamic_deps".to_string(), sql_with_dynamic_deps);
@@ -720,6 +722,7 @@ mod tests {
         let updated_transactions = topology::Transform::sql(topology::SqlTransform {
             primary_key: "id".to_string(),
             sql: "SELECT id, vid, _gs_op FROM preprocessed_transactions WHERE dynamic_table_check('filtered_market', id)".to_string(),
+            parallelism: None,
             telemetry: None,
         });
         transforms.insert("updated_transactions".to_string(), updated_transactions);
@@ -777,6 +780,7 @@ mod tests {
       where
         program_id = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'"
                 .to_string(),
+            parallelism: None,
             telemetry: None,
         });
         transforms.insert("cash".to_string(), sql_transform);
