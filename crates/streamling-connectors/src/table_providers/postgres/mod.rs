@@ -92,7 +92,6 @@ impl PostgresSinkTableProvider {
         config: PostgresSinkConfig,
         table: String,
         schema_name: String,
-        batch_size: Option<u32>,
         num_records_before_stop: Option<u64>,
         source_name: String,
         primary_key: Option<String>,
@@ -107,9 +106,8 @@ impl PostgresSinkTableProvider {
     ) -> Self {
         // `parallelism` counts concurrent partition write streams (produced by
         // the sink-edge hash exchange), not slices of one batch, so each stream
-        // writes the batch it receives whole. `batch_size` shapes the upstream
-        // rebatcher, which is where the sink's batch size is decided now.
-        let _ = batch_size;
+        // writes the batch it receives whole. Batch size is decided upstream by
+        // the per-partition rebatcher.
         let parallelism = parallelism.unwrap_or(1).max(1);
 
         Self {
