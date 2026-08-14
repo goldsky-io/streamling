@@ -155,6 +155,10 @@ static DEFAULT_CONSUMER_FETCH_TIMEOUT_SEC: u64 = 60;
 static DEFAULT_STALL_WATCHDOG_TIMEOUT_SEC: u64 = 60;
 static DEFAULT_LAG_REPORT_INTERVAL_MS: u64 = 30_000;
 static WATCHDOG_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Kept short because the lookup runs inside the synchronous provider
+/// constructor, which planning calls from an async context — it blocks a Tokio
+/// worker thread for its duration.
+static PARTITION_COUNT_FETCH_TIMEOUT_SEC: u64 = 10;
 
 static DEFAULT_NUM_PARTITIONS: i32 = 4;
 
@@ -2021,22 +2025,35 @@ impl KafkaSourceTableProvider {
         }
         let partitions = KafkaCommon::build_client(config)
             .create::<rdkafka::consumer::BaseConsumer>()
-            .ok()
             .and_then(|client| {
-                client
-                    .fetch_metadata(Some(topic), Duration::from_secs(60))
-                    .ok()
+                client.fetch_metadata(
+                    Some(topic),
+                    Duration::from_secs(PARTITION_COUNT_FETCH_TIMEOUT_SEC),
+                )
             })
-            .and_then(|metadata| metadata.topics().first().map(|t| t.partitions().len()));
+            .map(|metadata| {
+                metadata
+                    .topics()
+                    .first()
+                    .map_or(0, |t| t.partitions().len())
+            });
 
         match partitions {
-            Some(partitions) if partitions > 0 && partitions < requested => {
+            Ok(partitions) if partitions > 0 && partitions < requested => {
                 warn!(
                     "source parallelism {} exceeds the {} partition(s) of topic '{}'; \
                      running {} consumer instance(s) instead",
                     requested, partitions, topic, partitions
                 );
                 partitions
+            }
+            Err(e) => {
+                warn!(
+                    "could not read the partition count of topic '{}' ({}); running the \
+                     requested {} consumer instance(s) unclamped",
+                    topic, e, requested
+                );
+                requested
             }
             _ => requested,
         }
