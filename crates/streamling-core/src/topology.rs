@@ -680,13 +680,16 @@ pub struct PostgresSink {
     pub table: String,
     pub schema: String,
     pub batch_flush_interval: Option<String>,
+    /// Rows accumulated per write stream before a write is issued, so a sink
+    /// with `parallelism: N` buffers up to `N * batch_size` rows.
     pub batch_size: Option<u32>,
     pub primary_key: Option<String>,
     #[serde(default = "default_on_conflict")]
     pub on_conflict: String,
     pub update_where: Option<std::collections::BTreeMap<String, String>>,
-    /// Number of parallel tasks for writing to PostgreSQL. Each task processes
-    /// a slice of the accumulated batch concurrently. Defaults to 1.
+    /// Number of concurrent write streams into the table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    /// Also sizes the connection pool. Defaults to 1.
     pub parallelism: Option<usize>,
     /// When true (default), each batch is collapsed to the latest row per
     /// `primary_key` before it is written.
@@ -786,9 +789,14 @@ pub struct ClickhouseSink {
     pub from: String,
     pub table: String,
     pub batch_flush_interval: Option<String>,
+    /// Rows accumulated per write stream before an INSERT is issued, so a sink
+    /// with `parallelism: N` buffers up to `N * batch_size` rows.
     pub batch_size: Option<u32>,
     pub primary_key: String,
     pub version_column_name: Option<String>,
+    /// Number of concurrent write streams into the table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    /// Defaults to 1.
     pub parallelism: Option<usize>,
     /// When true (default), uses ReplacingMergeTree(insert_time, is_deleted) with
     /// automatic is_deleted/insert_time columns derived from _gs_op.
