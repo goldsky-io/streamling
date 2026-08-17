@@ -136,17 +136,15 @@ struct NodeMetricAccrual {
 }
 
 /// Accrual state for one cumulative time metric. Whole milliseconds are
-/// emitted as `accrued_nanos / 1ms - emitted_ms`, so the sub-millisecond
-/// remainder is carried implicitly and high-throughput sub-ms compute isn't
-/// truncated to zero.
+/// emitted as the growth of `accrued / 1ms` across a call, so the
+/// sub-millisecond remainder is carried implicitly and high-throughput sub-ms
+/// compute isn't truncated to zero.
 #[derive(Default)]
 struct TimeAccrual {
     /// Last-seen cumulative nanos (for reset detection).
     last: u64,
     /// Total accrued nanos across stream resets.
     accrued: u64,
-    /// Whole milliseconds already emitted.
-    emitted_ms: u64,
 }
 
 /// Delta since the last-seen cumulative value. A re-executed stream resets
@@ -181,12 +179,11 @@ fn time_delta_millis(
     cumulative_nanos: u64,
 ) -> u64 {
     let acc = entry_no_alloc(times, name);
+    let emitted_before = acc.accrued / 1_000_000;
     acc.accrued = acc
         .accrued
         .saturating_add(cumulative_delta(&mut acc.last, cumulative_nanos));
-    let whole = acc.accrued / 1_000_000 - acc.emitted_ms;
-    acc.emitted_ms += whole;
-    whole
+    acc.accrued / 1_000_000 - emitted_before
 }
 
 impl MetricsRecorder {
@@ -253,21 +250,6 @@ impl MetricsRecorder {
     }
 
     pub fn record_elapsed_compute(&self, duration: Duration, metadata_id: &str) {
-        // SQL transforms get accurate per-batch compute from the DataFusion
-        // subtree delta in `record_execution_plan_metrics`. The wall-clock
-        // span passed here is measured around `data.next().await`, so it is
-        // dominated by time blocked on upstream; recording it for sql nodes
-        // would pollute the same `elapsed_compute` histogram series with
-        // idle-wait samples and bury the real compute signal.
-        let is_sql = self
-            .metric_metadata_registry
-            .lock()
-            .unwrap()
-            .get(metadata_id)
-            .is_some_and(|m| m.node_context.operator_type == "sql");
-        if is_sql {
-            return;
-        }
         let tags_opt = self
             .metric_metadata_tags_registry
             .lock()
@@ -279,6 +261,17 @@ impl MetricsRecorder {
             let data = MetricData::new_with_owned_tags(vec![metric_value], metric_metadata_tags);
             self.record_metric_data(data)
         }
+    }
+
+    /// Whether `metadata_id` is a SQL transform node. Static per node, so
+    /// callers on per-batch paths should resolve it once per stream (see
+    /// `WrappingExec::execute`) rather than per batch.
+    pub fn is_sql_node(&self, metadata_id: &str) -> bool {
+        self.metric_metadata_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(metadata_id)
+            .is_some_and(|m| m.node_context.operator_type == "sql")
     }
     pub fn record_count_w_tags(
         &self,
@@ -626,6 +619,15 @@ impl MetricsRecorder {
                 }
                 MetricValue::Count { name, count } => {
                     *count_totals.entry(name.as_ref()).or_default() += count.value() as u64;
+                }
+                // A Time literally named "elapsed_compute" is the same
+                // quantity as the typed variant; folding it in keeps one
+                // accrual slot and one emitted series (a separate Time entry
+                // would clobber the typed variant's last-seen state and trip
+                // the reset heuristic every batch).
+                MetricValue::Time { name, time } if name == "elapsed_compute" => {
+                    elapsed_compute_nanos =
+                        elapsed_compute_nanos.saturating_add(time.value() as u64);
                 }
                 MetricValue::Time { name, time } => {
                     *time_totals.entry(name.as_ref()).or_default() += time.value() as u64;
@@ -2076,6 +2078,34 @@ mod tests {
             let d2 = recorder.subtree_delta_metric_values(id, &set2);
             assert_eq!(find_count(&d2, "spill_metric"), None);
             assert_eq!(find_time_ms(&d2, "spill_metric"), None);
+        }
+
+        /// A `Time` literally named "elapsed_compute" folds into the typed
+        /// `ElapsedCompute` series (one accrual slot, one emission); a
+        /// separate slot would clobber the typed variant's last-seen state
+        /// and trip the reset heuristic every batch.
+        #[test]
+        fn time_named_elapsed_compute_merges_with_typed_variant() {
+            let recorder = test_recorder();
+            let id = "app::sql";
+
+            let mut set1 = MetricsSet::new();
+            set1.push(elapsed_compute_metric(10_000_000)); // 10ms typed
+            set1.push(time_metric("elapsed_compute", 2_000_000)); // 2ms named
+            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            assert_eq!(
+                find_time_ms(&d1, "elapsed_compute"),
+                Some(12),
+                "typed and same-named Time merge into one 12ms delta"
+            );
+
+            // Unchanged cumulatives: nothing re-emits. A clobbered shared slot
+            // would alternate phantom deltas here forever.
+            let mut set2 = MetricsSet::new();
+            set2.push(elapsed_compute_metric(10_000_000));
+            set2.push(time_metric("elapsed_compute", 2_000_000));
+            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            assert_eq!(find_time_ms(&d2, "elapsed_compute"), None);
         }
 
         /// The 1ms elapsed_compute series seed must fire exactly once per

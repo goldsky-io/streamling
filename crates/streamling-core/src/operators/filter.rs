@@ -431,7 +431,13 @@ impl ExecutionPlan for StreamingFilterExec {
                     let selectivity = self.default_selectivity();
                     e.with_default_selectivity(selectivity)
                 })
-                .map(|e| Some(Arc::new(e) as _));
+                .map(|mut e| {
+                    // Optimizer rewrites must not erase the topology-boundary
+                    // mark, or a source-owned filter's compute gets folded
+                    // into the consuming transform's metrics.
+                    e.source_owned = self.source_owned;
+                    Some(Arc::new(e) as _)
+                });
             }
         }
         try_embed_projection(projection, self)
@@ -485,9 +491,15 @@ impl ExecutionPlan for StreamingFilterExec {
                             )
                         })
                         .collect::<Vec<_>>();
-                    Some(Arc::new(StreamingProjectionExec::from_original(
+                    let mut replacement = StreamingProjectionExec::from_original(
                         ProjectionExec::try_new(proj_exprs, filter_input)?,
-                    )?) as Arc<dyn ExecutionPlan>)
+                    )?;
+                    // The projection replaces a source-owned filter, so it
+                    // inherits the topology-boundary mark.
+                    if self.source_owned {
+                        replacement.mark_source_owned();
+                    }
+                    Some(Arc::new(replacement) as Arc<dyn ExecutionPlan>)
                 }
                 None => {
                     // No projection needed, just return the input

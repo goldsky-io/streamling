@@ -186,6 +186,15 @@ impl ExecutionPlan for StreamingProjectionExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Never unify across a topology boundary: merging a source-owned
+        // projection with a downstream transform's projection would blend the
+        // source's expression cost into the transform's metrics (and drop the
+        // boundary mark). Keep the two projections stacked instead.
+        if self.source_owned {
+            return Ok(Some(Arc::new(StreamingProjectionExec::from_original(
+                projection.clone(),
+            )?)));
+        }
         let streaming_projection = StreamingProjectionExec::from_original(projection.clone())?;
         let maybe_unified = try_unifying_projections(&streaming_projection, self)?;
         if let Some(new_plan) = maybe_unified {

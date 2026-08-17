@@ -148,6 +148,12 @@ fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if plan.downcast_ref::<WrappingExec>().is_some() {
         return true;
     }
+    // A nested CheckpointableExec is another transform's aggregation point:
+    // its `metrics()` already covers its own subtree, so descending past it
+    // would double-count everything below (and misattribute it to this node).
+    if plan.downcast_ref::<CheckpointableExec>().is_some() {
+        return true;
+    }
     if let Some(filter) = plan.downcast_ref::<StreamingFilterExec>() {
         return filter.is_source_owned();
     }
@@ -171,6 +177,20 @@ fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// children-only guard would collect its delegated metrics and descend into the
 /// nested topology anyway.
 fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) {
+    let mut visited = std::collections::HashSet::new();
+    collect_subtree_metrics_inner(plan, out, &mut visited);
+}
+
+fn collect_subtree_metrics_inner(
+    plan: &Arc<dyn ExecutionPlan>,
+    out: &mut MetricsSet,
+    visited: &mut std::collections::HashSet<usize>,
+) {
+    // A physical plan can be a DAG: one Arc-shared subplan reachable from two
+    // parents (e.g. a UNION ALL over a common input) must be counted once.
+    if !visited.insert(Arc::as_ptr(plan) as *const () as usize) {
+        return;
+    }
     if is_topology_boundary(plan) {
         return;
     }
@@ -180,7 +200,7 @@ fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) 
         }
     }
     for child in plan.children() {
-        collect_subtree_metrics(child, out);
+        collect_subtree_metrics_inner(child, out, visited);
     }
 }
 
@@ -1123,6 +1143,87 @@ mod tests {
         assert!(
             own_ms >= 25,
             "a transform-owned filter must not bound the walk, got {own_ms}ms"
+        );
+    }
+
+    /// The source-owned mark must survive DataFusion's ProjectionPushdown
+    /// rewrite (`try_swapping_with_projection` rebuilds the filter); losing it
+    /// would silently re-enable the misattribution the mark exists to prevent.
+    #[tokio::test]
+    async fn source_owned_flag_survives_projection_swap() {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        use datafusion::physical_plan::PhysicalExpr;
+        use datafusion::physical_plan::expressions::lit;
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let input = multi_batch_source(1).await;
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let mut filter = StreamingFilterExec::from_original(original).unwrap();
+        filter.mark_source_owned();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(filter);
+
+        // A narrowing projection directly above the filter, as ProjectionPushdown
+        // would present it.
+        let projection = ProjectionExec::try_new(
+            vec![(
+                Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                "id".to_string(),
+            )],
+            Arc::clone(&filter),
+        )
+        .unwrap();
+
+        let swapped = filter
+            .try_swapping_with_projection(&projection)
+            .unwrap()
+            .expect("swap should apply: predicate has no column refs");
+        let swapped_filter = swapped
+            .downcast_ref::<StreamingFilterExec>()
+            .expect("swap keeps the filter on top");
+        assert!(
+            swapped_filter.is_source_owned(),
+            "projection swap must preserve the source-owned boundary mark"
+        );
+    }
+
+    /// One Arc-shared subplan reachable from two parents (a DAG, e.g. UNION
+    /// ALL over a common input) must have its metrics counted once, not once
+    /// per path.
+    #[tokio::test]
+    async fn checkpointable_metrics_count_shared_subplan_once() {
+        use datafusion::physical_plan::union::UnionExec;
+
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        let shared: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
+        let ctx = SessionContext::new();
+        drain(shared.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let single_ms = shared
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert!(single_ms >= 25, "setup: expected recorded compute");
+
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![Arc::clone(&shared), Arc::clone(&shared)]).unwrap();
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(union, 1, "t".to_string()));
+
+        let aggregated_ms = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert_eq!(
+            aggregated_ms, single_ms,
+            "shared subplan must be counted once, not per parent"
         );
     }
 }

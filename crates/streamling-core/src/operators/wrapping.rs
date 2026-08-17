@@ -598,6 +598,13 @@ impl ExecutionPlan for WrappingExec {
         // this single read stays live as batches flow.
         let metrics = self.metrics();
 
+        // Static per node: resolve once per stream, not per batch. SQL
+        // transforms get accurate per-batch compute from the DataFusion
+        // subtree delta; the wall-clock span below is measured around
+        // `data.next().await` (dominated by upstream idle-wait) and would
+        // pollute the same `elapsed_compute` series for them.
+        let record_wall_clock_compute = !metrics_recorder.is_sql_node(&metric_metadata_id);
+
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
 
@@ -616,8 +623,11 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        // Record per-batch compute time
-                        metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+                        // Record per-batch compute time (non-sql nodes only;
+                        // see `record_wall_clock_compute` above)
+                        if record_wall_clock_compute {
+                            metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+                        }
 
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
