@@ -236,11 +236,16 @@ impl ExecutionPlan for ParallelSinkExec {
             while let Some(write_result) = writes.join_next().await {
                 // A finished stream will never report another epoch; releasing
                 // its share here keeps a late epoch from waiting forever on it.
-                for epoch in sink_stream_done(&sink_id) {
+                // The epochs freed by a FAILED write are deliberately not acked —
+                // acking them would let the source commit offsets for rows that
+                // never landed, hence the `?`s before the ack loop.
+                let freed_epochs = sink_stream_done(&sink_id);
+                let written = write_result
+                    .map_err(|e| internal_datafusion_err!("sink write task failed: {e}"))??;
+                for epoch in freed_epochs {
                     send_checkpoint_ack(epoch, &sink_id);
                 }
-                total_count += write_result
-                    .map_err(|e| internal_datafusion_err!("sink write task failed: {e}"))??;
+                total_count += written;
             }
             RecordBatch::try_new(
                 make_count_schema(),
@@ -268,12 +273,16 @@ impl ExecutionPlan for ParallelSinkExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoints::channels::{subscribe_with_id, unsubscribe};
+    use crate::checkpoints::checkpoint_management::{
+        CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage, report_marker_at_sink,
+    };
     use arrow::array::Int32Array;
     use async_trait::async_trait;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::prelude::SessionContext;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// Counts every row it receives across concurrent `write_all` calls.
     #[derive(Debug)]
@@ -434,6 +443,92 @@ mod tests {
             sink.rows_written.load(Ordering::SeqCst),
             6,
             "every partition's rows must reach the sink"
+        );
+    }
+
+    const FREED_EPOCH: CheckpointEpoch = CheckpointEpoch(7);
+
+    /// One stream flushes an epoch and stays open, the other fails: finishing the
+    /// failed stream frees that epoch from the ack gate, and acking it there
+    /// would let the source commit offsets for the rows the failed write lost.
+    #[derive(Debug)]
+    struct OneStreamFailsSink {
+        schema: SchemaRef,
+        sink_id: String,
+        writes_started: AtomicU64,
+        epoch_reported: AtomicBool,
+    }
+
+    #[async_trait]
+    impl DataSink for OneStreamFailsSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            _data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            if self.writes_started.fetch_add(1, Ordering::SeqCst) == 0 {
+                report_marker_at_sink(&self.sink_id, FREED_EPOCH);
+                self.epoch_reported.store(true, Ordering::SeqCst);
+                // Never finish, so the failure below is the first join result.
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            while !self.epoch_reported.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            internal_err!("write failed")
+        }
+    }
+
+    impl DisplayAs for OneStreamFailsSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "OneStreamFailsSink")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_does_not_ack_the_epochs_it_frees() {
+        let sink_id = "parallel_sink_failed_write";
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let input: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone()], vec![batch]],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        let exec = ParallelSinkExec::new(
+            input,
+            Arc::new(OneStreamFailsSink {
+                schema,
+                sink_id: sink_id.to_string(),
+                writes_started: AtomicU64::new(0),
+                epoch_reported: AtomicBool::new(false),
+            }),
+            sink_id.to_string(),
+        );
+
+        let (acks, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+        let mut stream = exec.execute(0, SessionContext::new().task_ctx()).unwrap();
+        let result = stream.next().await.expect("a result");
+        unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, subscriber_id);
+
+        assert!(result.is_err(), "the failed write must fail the plan");
+        assert!(
+            !acks.try_iter().any(|message| matches!(
+                message,
+                CheckpointMessage::Ack { sink_id: acked, .. } if acked == sink_id
+            )),
+            "a failed write must not ack the epochs its exit frees"
         );
     }
 }
