@@ -2,15 +2,13 @@ use crate::telemetry::types::{
     MetricData, RowCountMeasurementType, create_count_with_value, create_gauge_with_value,
     create_time_from_duration,
 };
-use crate::telemetry::{
-    MillisAccumulator, PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags,
-};
+use crate::telemetry::{PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags};
 use datafusion::physical_plan::metrics::{Count, MetricValue, MetricsSet};
 use once_cell::sync::Lazy;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
@@ -58,6 +56,26 @@ fn is_metric_denied(metric_name: &str) -> bool {
     })
 }
 
+/// Millisecond bucket layout shared by every duration histogram (the
+/// hand-registered `elapsed_compute` and any auto-created `Time` metric), so
+/// all duration series bucket identically up to one hour.
+const DURATION_MS_BOUNDARIES: [f64; 14] = [
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    30_000.0,
+    60_000.0,
+    120_000.0,
+    300_000.0,
+    600_000.0,
+    1_800_000.0,
+    3_600_000.0,
+];
+
 /// Gauges represent absolute state (e.g. "lag = 0"), so zero is meaningful
 /// and must be recorded. Additive metrics (counters) adding zero are no-ops.
 fn should_skip_zero_value_metric(metric_value: &MetricValue) -> bool {
@@ -95,26 +113,104 @@ pub struct MetricsRecorder {
     gauge_registry: Mutex<HashMap<String, Gauge<u64>>>,
     histogram_registry: Mutex<HashMap<String, Histogram<u64>>>,
     /// Per-node running state for turning DataFusion's *cumulative* metrics into
-    /// per-batch deltas. Keyed by `metadata_id`, then by metric name (a SQL
-    /// transform's subtree exposes many cumulative metrics — `elapsed_compute`,
-    /// a join's `build_time` / `join_time`, operator-defined counters — and each
-    /// must be deltaed independently). Each entry tracks the last-seen cumulative
-    /// value plus a remainder-carrying accumulator so sub-millisecond per-batch
-    /// time isn't truncated to zero at high throughput. See
-    /// `record_execution_plan_metrics`.
-    sql_metric_accrual: Mutex<HashMap<String, HashMap<String, CumulativeAccrual>>>,
+    /// per-batch deltas, plus the one-time `elapsed_compute` series seed flag.
+    /// Keyed by `metadata_id`, then by metric name (a SQL transform's subtree
+    /// exposes many cumulative metrics — `elapsed_compute`, a join's
+    /// `build_time` / `join_time`, operator-defined counters — and each must be
+    /// deltaed independently). See `record_execution_plan_metrics`.
+    metric_accrual: Mutex<HashMap<String, NodeMetricAccrual>>,
 }
 
-/// Running state for converting one cumulative DataFusion metric into per-batch
-/// deltas. `last` is the previous cumulative snapshot; `millis` carries the
-/// sub-millisecond remainder for time-valued metrics (unused for counters).
+/// Per-node running state for converting cumulative DataFusion metrics into
+/// per-batch deltas. Counters and time metrics live in separate maps so a
+/// `Count` and a `Time` sharing a name can never clobber each other's
+/// last-seen state (which would trip the reset heuristic every batch).
 #[derive(Default)]
-struct CumulativeAccrual {
+struct NodeMetricAccrual {
+    /// metric name -> last-seen cumulative counter value.
+    counts: HashMap<String, u64>,
+    /// metric name -> cumulative time accrual state.
+    times: HashMap<String, TimeAccrual>,
+    /// Whether the one-time 1ms `elapsed_compute` series seed was emitted.
+    seeded: bool,
+}
+
+/// Accrual state for one cumulative time metric. Whole milliseconds are
+/// emitted as `accrued_nanos / 1ms - emitted_ms`, so the sub-millisecond
+/// remainder is carried implicitly and high-throughput sub-ms compute isn't
+/// truncated to zero.
+#[derive(Default)]
+struct TimeAccrual {
+    /// Last-seen cumulative nanos (for reset detection).
     last: u64,
-    millis: MillisAccumulator,
+    /// Total accrued nanos across stream resets.
+    accrued: u64,
+    /// Whole milliseconds already emitted.
+    emitted_ms: u64,
+}
+
+/// Delta since the last-seen cumulative value. A re-executed stream resets
+/// DataFusion's cumulative counters; a value below the last-seen total is
+/// treated as a fresh delta rather than stalling at zero until it climbs back
+/// past the previous run.
+fn cumulative_delta(last: &mut u64, cumulative: u64) -> u64 {
+    let delta = if cumulative >= *last {
+        cumulative - *last
+    } else {
+        cumulative
+    };
+    *last = cumulative;
+    delta
+}
+
+/// Look up `name` in `map`, inserting a default entry on first sight without
+/// allocating a key `String` on the steady-state hit path.
+fn entry_no_alloc<'m, V: Default>(map: &'m mut HashMap<String, V>, name: &str) -> &'m mut V {
+    if !map.contains_key(name) {
+        map.insert(name.to_string(), V::default());
+    }
+    map.get_mut(name).expect("entry inserted above")
+}
+
+/// Per-batch delta (in whole milliseconds) for one cumulative time metric.
+/// Emitting `accrued / 1ms - emitted_ms` carries the sub-millisecond remainder
+/// implicitly, and [`cumulative_delta`] supplies the shared reset handling.
+fn time_delta_millis(
+    times: &mut HashMap<String, TimeAccrual>,
+    name: &str,
+    cumulative_nanos: u64,
+) -> u64 {
+    let acc = entry_no_alloc(times, name);
+    acc.accrued = acc
+        .accrued
+        .saturating_add(cumulative_delta(&mut acc.last, cumulative_nanos));
+    let whole = acc.accrued / 1_000_000 - acc.emitted_ms;
+    acc.emitted_ms += whole;
+    whole
 }
 
 impl MetricsRecorder {
+    /// Single construction point so every site (initialization, no-op
+    /// fallback, tests) gets identical defaults for internal state.
+    fn new(
+        service_instance_id: String,
+        metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
+        metric_metadata_tags_registry: HashMap<String, HashMap<String, String>>,
+        count_registry: HashMap<String, Counter<u64>>,
+        gauge_registry: HashMap<String, Gauge<u64>>,
+        histogram_registry: HashMap<String, Histogram<u64>>,
+    ) -> Self {
+        Self {
+            service_instance_id,
+            metric_metadata_registry: Mutex::new(metric_metadata_registry),
+            metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
+            count_registry: Mutex::new(count_registry),
+            gauge_registry: Mutex::new(gauge_registry),
+            histogram_registry: Mutex::new(histogram_registry),
+            metric_accrual: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn record_count(&self, name: &str, value: u64, metadata_id: &str) {
         self.record_count_w_tags(name, value, vec![], metadata_id);
     }
@@ -157,6 +253,21 @@ impl MetricsRecorder {
     }
 
     pub fn record_elapsed_compute(&self, duration: Duration, metadata_id: &str) {
+        // SQL transforms get accurate per-batch compute from the DataFusion
+        // subtree delta in `record_execution_plan_metrics`. The wall-clock
+        // span passed here is measured around `data.next().await`, so it is
+        // dominated by time blocked on upstream; recording it for sql nodes
+        // would pollute the same `elapsed_compute` histogram series with
+        // idle-wait samples and bury the real compute signal.
+        let is_sql = self
+            .metric_metadata_registry
+            .lock()
+            .unwrap()
+            .get(metadata_id)
+            .is_some_and(|m| m.node_context.operator_type == "sql");
+        if is_sql {
+            return;
+        }
         let tags_opt = self
             .metric_metadata_tags_registry
             .lock()
@@ -333,7 +444,7 @@ impl MetricsRecorder {
         metadata_id: &str,
         batch_count: usize,
         measurement_type: RowCountMeasurementType,
-        execution_plan_metrics: Option<MetricsSet>,
+        execution_plan_metrics: Option<&MetricsSet>,
     ) {
         let metric_metadata = self
             .metric_metadata_registry
@@ -380,15 +491,19 @@ impl MetricsRecorder {
                     metric_metadata_tags.clone(),
                 ));
 
-                // Seed a minimal elapsed_compute sample to ensure histogram series exists
-                // even if the underlying plan does not expose metrics yet.
-                let seed_elapsed = MetricValue::ElapsedCompute(create_time_from_duration(
-                    Duration::from_millis(1),
-                ));
-                all_metric_data.push(MetricData::new_with_owned_tags(
-                    vec![seed_elapsed],
-                    metric_metadata_tags.clone(),
-                ));
+                // Seed a minimal elapsed_compute sample ONCE per node so the
+                // histogram series exists even if the underlying plan never
+                // records compute. Seeding every batch polluted the series'
+                // lower percentiles with a constant 1ms sample.
+                if self.should_seed_elapsed_compute(metadata_id) {
+                    let seed_elapsed = MetricValue::ElapsedCompute(create_time_from_duration(
+                        Duration::from_millis(1),
+                    ));
+                    all_metric_data.push(MetricData::new_with_owned_tags(
+                        vec![seed_elapsed],
+                        metric_metadata_tags.clone(),
+                    ));
+                }
                 for child_metric_metadata_id in &metric_metadata.children_metadata_ids {
                     let child_metric_metadata = self
                         .metric_metadata_registry
@@ -454,10 +569,13 @@ impl MetricsRecorder {
             // super-linearly — the bug that originally only affected
             // `elapsed_compute` and then resurfaced for deeper operators'
             // metrics (e.g. a join's `build_time` / `join_time`) once the
-            // subtree was folded in. Convert each to its per-batch DELTA.
-            for metric_value in self.subtree_delta_metric_values(metadata_id, &metric_set) {
+            // subtree was folded in. Convert each to its per-batch DELTA,
+            // batched into ONE MetricData so the tag set is cloned and the
+            // attribute vector built once per batch, not once per metric.
+            let delta_values = self.subtree_delta_metric_values(metadata_id, metric_set);
+            if !delta_values.is_empty() {
                 all_metric_data.push(MetricData::new_with_owned_tags(
-                    vec![metric_value],
+                    delta_values,
                     metric_metadata_tags.clone(),
                 ));
             }
@@ -491,28 +609,26 @@ impl MetricsRecorder {
         // `OutputBatches` alongside an operator-defined
         // `Count { name: "output_batches" }`), which real plans do.
         let mut elapsed_compute_nanos: u64 = 0;
-        let mut count_totals: BTreeMap<String, u64> = BTreeMap::new();
-        let mut time_totals: BTreeMap<String, u64> = BTreeMap::new();
+        let mut count_totals: HashMap<&str, u64> = HashMap::new();
+        let mut time_totals: HashMap<&str, u64> = HashMap::new();
         let mut deltas = Vec::new();
         for metric in metric_set.iter() {
             match metric.value() {
                 // Counted separately via TelemetryStream.
                 MetricValue::OutputRows(_) => {}
+                // Cumulative batch counter; not exported as telemetry
+                // (matches pre-subtree-aggregation behavior, where it fell
+                // into `record_metric_data`'s dropped-variants arm).
+                MetricValue::OutputBatches(_) => {}
                 MetricValue::ElapsedCompute(time) => {
-                    elapsed_compute_nanos += time.value() as u64;
-                }
-                // Typed batch counter; fold into the same series as generic
-                // counters sharing its name — both are cumulative counts.
-                MetricValue::OutputBatches(count) => {
-                    *count_totals
-                        .entry("output_batches".to_string())
-                        .or_default() += count.value() as u64;
+                    elapsed_compute_nanos =
+                        elapsed_compute_nanos.saturating_add(time.value() as u64);
                 }
                 MetricValue::Count { name, count } => {
-                    *count_totals.entry(name.to_string()).or_default() += count.value() as u64;
+                    *count_totals.entry(name.as_ref()).or_default() += count.value() as u64;
                 }
                 MetricValue::Time { name, time } => {
-                    *time_totals.entry(name.to_string()).or_default() += time.value() as u64;
+                    *time_totals.entry(name.as_ref()).or_default() += time.value() as u64;
                 }
                 // Gauges are absolute state, not cumulative totals; the latest
                 // snapshot is already correct. Remaining variants (spill
@@ -522,30 +638,34 @@ impl MetricsRecorder {
             }
         }
 
-        let whole_ms = self.cumulative_time_delta_millis(
-            metadata_id,
-            "elapsed_compute",
-            elapsed_compute_nanos,
-        );
+        // One lock and one node lookup per batch; the per-name delta math runs
+        // under this single guard.
+        let mut accruals = self
+            .metric_accrual
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let node = entry_no_alloc(&mut accruals, metadata_id);
+
+        let whole_ms = time_delta_millis(&mut node.times, "elapsed_compute", elapsed_compute_nanos);
         if whole_ms > 0 {
             deltas.push(MetricValue::ElapsedCompute(create_time_from_duration(
                 Duration::from_millis(whole_ms),
             )));
         }
         for (name, cumulative) in count_totals {
-            let delta = self.cumulative_count_delta(metadata_id, &name, cumulative);
+            let delta = cumulative_delta(entry_no_alloc(&mut node.counts, name), cumulative);
             if delta > 0 {
                 deltas.push(MetricValue::Count {
-                    name: name.into(),
+                    name: name.to_string().into(),
                     count: create_count_with_value(delta as usize),
                 });
             }
         }
         for (name, cumulative_nanos) in time_totals {
-            let whole_ms = self.cumulative_time_delta_millis(metadata_id, &name, cumulative_nanos);
+            let whole_ms = time_delta_millis(&mut node.times, name, cumulative_nanos);
             if whole_ms > 0 {
                 deltas.push(MetricValue::Time {
-                    name: name.into(),
+                    name: name.to_string().into(),
                     time: create_time_from_duration(Duration::from_millis(whole_ms)),
                 });
             }
@@ -553,51 +673,22 @@ impl MetricsRecorder {
         deltas
     }
 
-    /// Per-batch delta for a cumulative *counter* keyed by `(metadata_id,
-    /// metric_name)`. A re-executed stream resets DataFusion's cumulative
-    /// counters; a value below the last-seen total is treated as a fresh delta
-    /// rather than stalling at zero until it climbs back past the previous run.
-    fn cumulative_count_delta(&self, metadata_id: &str, metric_name: &str, cumulative: u64) -> u64 {
-        let mut accruals = self.sql_metric_accrual.lock().unwrap();
-        let accrual = accruals
-            .entry(metadata_id.to_string())
-            .or_default()
-            .entry(metric_name.to_string())
-            .or_default();
-        let delta = if cumulative >= accrual.last {
-            cumulative - accrual.last
+    /// Returns true exactly once per `metadata_id`: whether the one-time 1ms
+    /// `elapsed_compute` seed should be emitted for this node. Seeding once
+    /// keeps the histogram series discoverable without polluting every batch's
+    /// distribution with a constant 1ms sample.
+    fn should_seed_elapsed_compute(&self, metadata_id: &str) -> bool {
+        let mut accruals = self
+            .metric_accrual
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let node = entry_no_alloc(&mut accruals, metadata_id);
+        if node.seeded {
+            false
         } else {
-            cumulative
-        };
-        accrual.last = cumulative;
-        delta
-    }
-
-    /// Per-batch delta (in whole milliseconds) for a cumulative *time* metric
-    /// keyed by `(metadata_id, metric_name)`. Carries the sub-millisecond
-    /// remainder forward so high-throughput sub-ms compute isn't truncated to
-    /// zero, and applies the same counter-reset handling as
-    /// [`Self::cumulative_count_delta`].
-    fn cumulative_time_delta_millis(
-        &self,
-        metadata_id: &str,
-        metric_name: &str,
-        cumulative_nanos: u64,
-    ) -> u64 {
-        let mut accruals = self.sql_metric_accrual.lock().unwrap();
-        let accrual = accruals
-            .entry(metadata_id.to_string())
-            .or_default()
-            .entry(metric_name.to_string())
-            .or_default();
-        let delta = if cumulative_nanos >= accrual.last {
-            cumulative_nanos - accrual.last
-        } else {
-            cumulative_nanos
-        };
-        accrual.last = cumulative_nanos;
-        accrual.millis.add(Duration::from_nanos(delta));
-        accrual.millis.take_whole_millis()
+            node.seeded = true;
+            true
+        }
     }
 
     fn record_metric_data_batch(&self, all_metric_data: Vec<MetricData>) {
@@ -725,7 +816,18 @@ impl MetricsRecorder {
                         .lock()
                         .unwrap()
                         .entry(name.to_string())
-                        .or_insert(meter.u64_histogram(prefixed_name).build());
+                        // Time metrics are recorded in whole milliseconds, so
+                        // auto-created histograms need the same unit and
+                        // bucket layout as the hand-registered duration
+                        // histograms — the OTel defaults top out at ~10s and
+                        // would collapse long spans into +Inf.
+                        .or_insert_with(|| {
+                            meter
+                                .u64_histogram(prefixed_name)
+                                .with_unit("ms")
+                                .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
+                                .build()
+                        });
                 }
                 _ => {}
             }
@@ -784,22 +886,7 @@ pub fn initialize_metrics_recorder(
                     "Total time taken to execute the query execution plan on the data",
                 )
                 .with_unit("ms")
-                .with_boundaries(vec![
-                    100.0,
-                    250.0,
-                    500.0,
-                    1_000.0,
-                    2_500.0,
-                    5_000.0,
-                    10_000.0,
-                    30_000.0,
-                    60_000.0,
-                    120_000.0,
-                    300_000.0,
-                    600_000.0,
-                    1_800_000.0,
-                    3_600_000.0,
-                ])
+                .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
                 .build(),
         );
 
@@ -975,20 +1062,20 @@ pub fn initialize_metrics_recorder(
         for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
             metric_metadata_tags_registry.insert(metric_metadata_id, metric_metadata.to_tags());
         }
-        *instance = Some(Arc::new(MetricsRecorder {
-            service_instance_id: metric_metadata_registry
-                .values()
-                .next()
-                .expect("expect at least one metric metadata to be available")
-                .service_instance_id
-                .clone(),
-            metric_metadata_registry: Mutex::new(metric_metadata_registry),
-            count_registry: Mutex::new(count_registry),
-            gauge_registry: Mutex::new(gauge_registry),
-            histogram_registry: Mutex::new(histogram_registry),
-            metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
-            sql_metric_accrual: Mutex::new(HashMap::new()),
-        }));
+        let service_instance_id = metric_metadata_registry
+            .values()
+            .next()
+            .expect("expect at least one metric metadata to be available")
+            .service_instance_id
+            .clone();
+        *instance = Some(Arc::new(MetricsRecorder::new(
+            service_instance_id,
+            metric_metadata_registry,
+            metric_metadata_tags_registry,
+            count_registry,
+            gauge_registry,
+            histogram_registry,
+        )));
     } else {
         debug!("MetricsRecorder already initialized; merging metric metadata registry.");
         // Merge new metadata into existing recorder so subsequent pipelines are tracked
@@ -1160,15 +1247,14 @@ pub fn get_metrics_recorder() -> Arc<MetricsRecorder> {
         warn!(
             "get_metrics_recorder called before initialize_metrics_recorder; falling back to no-op implementation; no metrics will be recorded"
         );
-        let recorder = Arc::new(MetricsRecorder {
-            service_instance_id: "default-service-instance-id".to_string(),
-            metric_metadata_registry: Mutex::new(HashMap::new()),
-            histogram_registry: Mutex::new(HashMap::new()),
-            gauge_registry: Mutex::new(HashMap::new()),
-            count_registry: Mutex::new(HashMap::new()),
-            metric_metadata_tags_registry: Mutex::new(HashMap::new()),
-            sql_metric_accrual: Mutex::new(HashMap::new()),
-        });
+        let recorder = Arc::new(MetricsRecorder::new(
+            "default-service-instance-id".to_string(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
         *instance = Some(recorder.clone());
         recorder
     }
@@ -1730,15 +1816,14 @@ mod tests {
         use datafusion::physical_plan::metrics::{Metric, Time};
 
         fn test_recorder() -> MetricsRecorder {
-            MetricsRecorder {
-                service_instance_id: "test-instance".to_string(),
-                metric_metadata_registry: Mutex::new(HashMap::new()),
-                metric_metadata_tags_registry: Mutex::new(HashMap::new()),
-                count_registry: Mutex::new(HashMap::new()),
-                gauge_registry: Mutex::new(HashMap::new()),
-                histogram_registry: Mutex::new(HashMap::new()),
-                sql_metric_accrual: Mutex::new(HashMap::new()),
-            }
+            MetricsRecorder::new(
+                "test-instance".to_string(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
         }
 
         fn time_metric(name: &'static str, nanos: u64) -> Arc<Metric> {
@@ -1943,8 +2028,9 @@ mod tests {
         /// Regression: a typed `OutputBatches` and a generic
         /// `Count { name: "output_batches" }` in the same subtree made
         /// `MetricsSet::aggregate_by_name` panic ("Mismatched metric types"),
-        /// crashing the pipeline. The manual aggregation must merge them into
-        /// one deltaed series instead.
+        /// crashing the pipeline. The manual aggregation must handle the mix:
+        /// typed `OutputBatches` stays unexported (pre-subtree behavior) and
+        /// the generic counter deltas normally.
         #[test]
         fn mixed_variant_same_name_metrics_do_not_panic() {
             let recorder = test_recorder();
@@ -1961,9 +2047,46 @@ mod tests {
             let d1 = recorder.subtree_delta_metric_values(id, &set1);
             assert_eq!(
                 find_count(&d1, "output_batches"),
-                Some(3),
-                "typed OutputBatches(2) and Count(1) merge into one series"
+                Some(1),
+                "typed OutputBatches stays unexported; the generic Count still deltas"
             );
+        }
+
+        /// A `Count` and a `Time` sharing one name must keep independent
+        /// accrual state: a shared last-seen slot would trip the reset
+        /// heuristic every batch and re-emit full cumulative values.
+        #[test]
+        fn same_name_count_and_time_do_not_clobber_state() {
+            let recorder = test_recorder();
+            let id = "app::sql";
+
+            let mut set1 = MetricsSet::new();
+            set1.push(count_metric("spill_metric", 5));
+            set1.push(time_metric("spill_metric", 200_000_000)); // 200ms
+            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            assert_eq!(find_count(&d1, "spill_metric"), Some(5));
+            assert_eq!(find_time_ms(&d1, "spill_metric"), Some(200));
+
+            // Unchanged cumulative values: both series must emit nothing. With
+            // a shared slot the count (5 < 200ms-in-nanos) would re-emit 5 and
+            // the time would re-emit 200ms, every batch, forever.
+            let mut set2 = MetricsSet::new();
+            set2.push(count_metric("spill_metric", 5));
+            set2.push(time_metric("spill_metric", 200_000_000));
+            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            assert_eq!(find_count(&d2, "spill_metric"), None);
+            assert_eq!(find_time_ms(&d2, "spill_metric"), None);
+        }
+
+        /// The 1ms elapsed_compute series seed must fire exactly once per
+        /// node, not once per batch (per-batch seeding polluted percentiles).
+        #[test]
+        fn elapsed_compute_seed_fires_once_per_node() {
+            let recorder = test_recorder();
+            assert!(recorder.should_seed_elapsed_compute("app::a"));
+            assert!(!recorder.should_seed_elapsed_compute("app::a"));
+            assert!(recorder.should_seed_elapsed_compute("app::b"));
+            assert!(!recorder.should_seed_elapsed_compute("app::b"));
         }
 
         /// Gauges report absolute state, not a cumulative total, so the latest

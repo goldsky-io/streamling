@@ -78,6 +78,12 @@ pub struct StreamingFilterExec {
     projection: Option<Vec<usize>>,
     /// Copy of the original FilterExec for method delegation
     original_filter: FilterExec,
+    /// True when this filter belongs to an upstream source node and was
+    /// re-applied above the source's `WrappingExec` (see
+    /// `wrap_with_side_outputs_before_filter`). Marks a topology boundary for
+    /// downstream metric aggregation so this operator's compute is not
+    /// attributed to the consuming transform.
+    source_owned: bool,
 }
 
 impl StreamingFilterExec {
@@ -100,6 +106,7 @@ impl StreamingFilterExec {
                     cache: Arc::new(cache),
                     projection: None,
                     original_filter,
+                    source_owned: false,
                 })
             }
             other => {
@@ -117,7 +124,19 @@ impl StreamingFilterExec {
             cache: original_filter.properties().clone(),
             projection: original_filter.projection().as_ref().map(|p| p.to_vec()),
             original_filter,
+            source_owned: false,
         })
+    }
+
+    /// Whether this filter is owned by an upstream source node (re-applied
+    /// above the source's `WrappingExec`); see the `source_owned` field.
+    pub fn is_source_owned(&self) -> bool {
+        self.source_owned
+    }
+
+    /// Mark this filter as owned by an upstream source node.
+    pub fn mark_source_owned(&mut self) {
+        self.source_owned = true;
     }
 
     pub fn with_default_selectivity(
@@ -160,6 +179,7 @@ impl StreamingFilterExec {
             cache: Arc::new(cache),
             projection,
             original_filter: self.original_filter.clone(),
+            source_owned: self.source_owned,
         })
     }
 
@@ -386,7 +406,10 @@ impl ExecutionPlan for StreamingFilterExec {
             e.with_default_selectivity(selectivity)
         })
         .and_then(|e| e.with_projection(self.projection().cloned()))
-        .map(|e| Arc::new(e) as _)
+        .map(|mut e| {
+            e.source_owned = self.source_owned;
+            Arc::new(e) as _
+        })
     }
 
     /// Tries to swap `projection` with its input (`filter`). If possible, performs
@@ -489,6 +512,7 @@ impl ExecutionPlan for StreamingFilterExec {
                 )?),
                 projection: None,
                 original_filter: self.original_filter.clone(),
+                source_owned: self.source_owned,
             };
             Some(Arc::new(new) as _)
         };

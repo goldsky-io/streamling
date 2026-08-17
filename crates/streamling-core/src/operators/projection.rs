@@ -41,6 +41,11 @@ pub struct StreamingProjectionExec {
     cache: Arc<PlanProperties>,
     /// Copy of the original DataFusion ProjectionExec for method delegation
     original_projection: ProjectionExec,
+    /// True when this projection belongs to an upstream source node and was
+    /// re-applied above the source's `WrappingExec` (see
+    /// `wrap_with_side_outputs_before_filter`). Marks a topology boundary for
+    /// downstream metric aggregation.
+    source_owned: bool,
 }
 
 impl StreamingProjectionExec {
@@ -56,7 +61,20 @@ impl StreamingProjectionExec {
             metrics: ExecutionPlanMetricsSet::new(),
             cache: original_projection.properties().clone(),
             original_projection,
+            source_owned: false,
         })
+    }
+
+    /// Whether this projection is owned by an upstream source node
+    /// (re-applied above the source's `WrappingExec`); see the
+    /// `source_owned` field.
+    pub fn is_source_owned(&self) -> bool {
+        self.source_owned
+    }
+
+    /// Mark this projection as owned by an upstream source node.
+    pub fn mark_source_owned(&mut self) {
+        self.source_owned = true;
     }
 
     /// The projection expressions
@@ -135,7 +153,10 @@ impl ExecutionPlan for StreamingProjectionExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let new_projection = ProjectionExec::try_new(self.expr.clone(), children.swap_remove(0))?;
 
-        StreamingProjectionExec::from_original(new_projection).map(|e| Arc::new(e) as _)
+        StreamingProjectionExec::from_original(new_projection).map(|mut e| {
+            e.source_owned = self.source_owned;
+            Arc::new(e) as _
+        })
     }
 
     fn execute(

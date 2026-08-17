@@ -22,6 +22,8 @@ use datafusion::physical_plan::{
 use crate::checkpoints::checkpoint_management::{
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
 };
+use crate::operators::filter::StreamingFilterExec;
+use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::wrapping::WrappingExec;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -129,14 +131,37 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
     }
 }
 
-/// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
-/// into `out`, stopping at any [`WrappingExec`].
+/// Whether `plan` marks the edge of this transform's own physical subtree for
+/// metric attribution.
 ///
-/// A `WrappingExec` is a *separate* topology node that records its own
-/// `elapsed_compute`; descending into it would fold another node's compute into
-/// this transform's aggregate, double-counting it. Everything strictly between
-/// this `CheckpointableExec` and the next topology boundary is this transform's
-/// own compute and belongs in its aggregate.
+/// Two kinds of boundary exist:
+/// - A [`WrappingExec`]: a *separate* topology node that records its own
+///   `elapsed_compute`; descending into it would fold another node's compute
+///   into this transform's aggregate, double-counting it.
+/// - A source-owned [`StreamingFilterExec`] / [`StreamingProjectionExec`]:
+///   `wrap_with_side_outputs_before_filter` re-applies a source's filter and
+///   projection ABOVE the source's `WrappingExec` (so side outputs observe
+///   pre-filter rows), which places those source-owned operators inside the
+///   consuming transform's subtree. Without stopping at them, an expensive
+///   source-level filter would be misattributed to the transform's compute.
+fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.downcast_ref::<WrappingExec>().is_some() {
+        return true;
+    }
+    if let Some(filter) = plan.downcast_ref::<StreamingFilterExec>() {
+        return filter.is_source_owned();
+    }
+    if let Some(projection) = plan.downcast_ref::<StreamingProjectionExec>() {
+        return projection.is_source_owned();
+    }
+    false
+}
+
+/// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
+/// into `out`, stopping at any topology boundary (see [`is_topology_boundary`]).
+///
+/// Everything strictly between this `CheckpointableExec` and the next topology
+/// boundary is this transform's own compute and belongs in its aggregate.
 ///
 /// The boundary check is applied to `plan` itself, not just its children:
 /// `WrappingExec` delegates both `metrics()` and `children()` to its inner
@@ -146,7 +171,7 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 /// children-only guard would collect its delegated metrics and descend into the
 /// nested topology anyway.
 fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) {
-    if plan.downcast_ref::<WrappingExec>().is_some() {
+    if is_topology_boundary(plan) {
         return;
     }
     if let Some(set) = plan.metrics() {
@@ -332,11 +357,18 @@ impl ExecutionPlan for CheckpointableExec {
         // (the SQL plan's ROOT operator) drops the `elapsed_compute` recorded by
         // deeper operators — e.g. a `FilterExec` beneath a `ProjectionExec` does
         // the real work but sits below the root. With that deep compute missing,
-        // the transform's reported `elapsed_compute` (query latency) collapsed to
-        // near zero and a compute-bound transform looked idle.
+        // the transform's reported `elapsed_compute` collapsed to near zero and
+        // a compute-bound transform looked idle.
+        //
+        // Return `None` (not `Some(empty)`) when the subtree exposes nothing,
+        // so per-batch consumers keep their metric-less short-circuit.
         let mut aggregated = MetricsSet::new();
         collect_subtree_metrics(&self.input, &mut aggregated);
-        Some(aggregated)
+        if aggregated.iter().next().is_none() {
+            None
+        } else {
+            Some(aggregated)
+        }
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -838,13 +870,15 @@ mod tests {
         }
     }
 
-    fn multi_batch_source(num_batches: usize) -> Arc<dyn ExecutionPlan> {
+    async fn multi_batch_source(num_batches: usize) -> Arc<dyn ExecutionPlan> {
         let batch = create_test_batch_with_checkpoint(&[]);
         let schema = batch.schema();
         let batches = std::iter::repeat_n(batch, num_batches).collect();
         let mem_table = MemTable::try_new(schema, vec![batches]).unwrap();
         let ctx = SessionContext::new();
-        futures::executor::block_on(mem_table.scan(&ctx.state(), None, &[], None)).unwrap()
+        // Awaited directly: `block_on` inside a tokio worker panics the
+        // moment the scanned future yields.
+        mem_table.scan(&ctx.state(), None, &[], None).await.unwrap()
     }
 
     async fn drain(mut stream: SendableRecordBatchStream) {
@@ -866,7 +900,10 @@ mod tests {
         // Root is a zero-compute passthrough; the real work happens one level
         // deeper (mirroring a `FilterExec` beneath a `ProjectionExec`). Root-only
         // forwarding would therefore report ~0 compute.
-        let deep_compute = Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let deep_compute = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
         let root: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(deep_compute, Duration::ZERO));
 
         let checkpointable: Arc<dyn ExecutionPlan> =
@@ -905,8 +942,10 @@ mod tests {
         // the compute operator directly records its metrics without executing the
         // `WrappingExec` (whose `execute()` initializes the process-global
         // `LiveDataInspect` singleton and would make this test order-dependent).
-        let nested_compute: Arc<dyn ExecutionPlan> =
-            Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let nested_compute: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
 
         let ctx = SessionContext::new();
         drain(nested_compute.execute(0, ctx.task_ctx()).unwrap()).await;
@@ -971,8 +1010,10 @@ mod tests {
         // Record real `elapsed_compute` on the operator that lives below the
         // nested `WrappingExec`, without executing the `WrappingExec` itself
         // (see sibling test for why direct execution is used).
-        let nested_compute: Arc<dyn ExecutionPlan> =
-            Arc::new(ComputeExec::new(multi_batch_source(NUM_BATCHES), per_batch));
+        let nested_compute: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
 
         let ctx = SessionContext::new();
         drain(nested_compute.execute(0, ctx.task_ctx()).unwrap()).await;
@@ -1013,6 +1054,75 @@ mod tests {
         assert!(
             aggregated_ms < 10,
             "compute at/below a root WrappingExec must be excluded, got {aggregated_ms}ms"
+        );
+    }
+
+    /// A *source-owned* `StreamingFilterExec` (a source's filter re-applied
+    /// above the source's `WrappingExec` by
+    /// `wrap_with_side_outputs_before_filter`) must also act as a topology
+    /// boundary: its compute belongs to the source, not to the consuming
+    /// transform. A transform-owned filter (not marked) is still descended
+    /// into.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_source_owned_filter() {
+        use datafusion::physical_plan::expressions::lit;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // Record real compute on the operator beneath the source-owned filter.
+        let source_compute: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
+        let ctx = SessionContext::new();
+        drain(source_compute.execute(0, ctx.task_ctx()).unwrap()).await;
+
+        let below_ms = source_compute
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert!(
+            below_ms >= 25,
+            "test setup: compute below the boundary must have recorded \
+             elapsed_compute, got {below_ms}ms"
+        );
+
+        let original = FilterExec::try_new(lit(true), Arc::clone(&source_compute)).unwrap();
+        let mut source_filter = StreamingFilterExec::from_original(original).unwrap();
+        source_filter.mark_source_owned();
+        let source_filter: Arc<dyn ExecutionPlan> = Arc::new(source_filter);
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(source_filter, 1, "t".to_string()));
+
+        let aggregated_ms = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert!(
+            aggregated_ms < 10,
+            "compute at/below a source-owned filter must be excluded, got {aggregated_ms}ms"
+        );
+
+        // Control: the SAME shape without the source-owned mark is the
+        // transform's own filter, so the compute below it IS collected.
+        let original = FilterExec::try_new(lit(true), Arc::clone(&source_compute)).unwrap();
+        let own_filter: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingFilterExec::from_original(original).unwrap());
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(own_filter, 1, "t".to_string()));
+        let own_ms = checkpointable
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000;
+        assert!(
+            own_ms >= 25,
+            "a transform-owned filter must not bound the walk, got {own_ms}ms"
         );
     }
 }

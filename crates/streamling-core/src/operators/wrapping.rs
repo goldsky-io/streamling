@@ -254,10 +254,18 @@ impl WrappingSourceTableProvider {
                 Vec::new(),
                 event_time_instrumentation.clone(),
             ));
-            let rebuilt = Arc::new(filter_exec.clone())
+            // Mark the re-applied filter/projection as source-owned: they sit
+            // ABOVE this source's `WrappingExec`, i.e. inside the downstream
+            // consumer's plan subtree, and must act as a topology boundary so
+            // their compute is not attributed to the consuming transform.
+            let mut marked_filter = filter_exec.clone();
+            marked_filter.mark_source_owned();
+            let mut marked_projection = projection_exec.clone();
+            marked_projection.mark_source_owned();
+            let rebuilt = Arc::new(marked_filter)
                 .with_new_children(vec![wrapped_source])
                 .and_then(|new_filter| {
-                    Arc::new(projection_exec.clone()).with_new_children(vec![new_filter])
+                    Arc::new(marked_projection).with_new_children(vec![new_filter])
                 });
             match rebuilt {
                 Ok(plan) => return plan,
@@ -281,7 +289,12 @@ impl WrappingSourceTableProvider {
                 Vec::new(),
                 event_time_instrumentation.clone(),
             ));
-            match Arc::new(filter_exec.clone()).with_new_children(vec![wrapped_source]) {
+            // Source-owned for the same reason as the projection+filter
+            // branch above: this filter is re-applied above the source's
+            // `WrappingExec` and must bound downstream metric aggregation.
+            let mut marked_filter = filter_exec.clone();
+            marked_filter.mark_source_owned();
+            match Arc::new(marked_filter).with_new_children(vec![wrapped_source]) {
                 Ok(plan) => plan,
                 Err(e) => {
                     warn!(
@@ -581,8 +594,8 @@ impl ExecutionPlan for WrappingExec {
         // (`elapsed_compute`, ...) when its `execute` is called. Snapshotting
         // before that returned an empty set whose live Arc-backed counters were
         // never captured, so a SQL transform's compute never reached
-        // `elapsed_compute` (query latency). The `MetricsSet` holds Arc-shared
-        // counters, so this single read stays live as batches flow.
+        // `elapsed_compute`. The `MetricsSet` holds Arc-shared counters, so
+        // this single read stays live as batches flow.
         let metrics = self.metrics();
 
         let side_outputs = self.side_outputs.clone();
@@ -611,7 +624,7 @@ impl ExecutionPlan for WrappingExec {
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
                             RowCountMeasurementType::OutputRowCount,
-                            metrics.clone(),
+                            metrics.as_ref(),
                         );
 
                         // Record checkpoint marker arrival time for transforms
@@ -754,7 +767,7 @@ impl DataSink for WrappingDataSink {
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
                             RowCountMeasurementType::InputRowCount,
-                            metrics.clone(),
+                            metrics.as_ref(),
                         );
 
                         // End-to-end freshness at sink ingress. Same code
