@@ -10,7 +10,7 @@ use once_cell::sync::Lazy;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
@@ -484,49 +484,70 @@ impl MetricsRecorder {
         metadata_id: &str,
         metric_set: &MetricsSet,
     ) -> Vec<MetricValue> {
-        let aggregated = metric_set.aggregate_by_name();
+        // Aggregate by name manually instead of via
+        // `MetricsSet::aggregate_by_name`: that panics when two operators in
+        // the subtree expose the same metric name under different
+        // `MetricValue` variants (e.g. `BaselineMetrics`' typed
+        // `OutputBatches` alongside an operator-defined
+        // `Count { name: "output_batches" }`), which real plans do.
+        let mut elapsed_compute_nanos: u64 = 0;
+        let mut count_totals: BTreeMap<String, u64> = BTreeMap::new();
+        let mut time_totals: BTreeMap<String, u64> = BTreeMap::new();
         let mut deltas = Vec::new();
-        for metric in aggregated.iter() {
+        for metric in metric_set.iter() {
             match metric.value() {
                 // Counted separately via TelemetryStream.
                 MetricValue::OutputRows(_) => {}
                 MetricValue::ElapsedCompute(time) => {
-                    let whole_ms = self.cumulative_time_delta_millis(
-                        metadata_id,
-                        "elapsed_compute",
-                        time.value() as u64,
-                    );
-                    if whole_ms > 0 {
-                        deltas.push(MetricValue::ElapsedCompute(create_time_from_duration(
-                            Duration::from_millis(whole_ms),
-                        )));
-                    }
+                    elapsed_compute_nanos += time.value() as u64;
+                }
+                // Typed batch counter; fold into the same series as generic
+                // counters sharing its name — both are cumulative counts.
+                MetricValue::OutputBatches(count) => {
+                    *count_totals
+                        .entry("output_batches".to_string())
+                        .or_default() += count.value() as u64;
                 }
                 MetricValue::Count { name, count } => {
-                    let delta =
-                        self.cumulative_count_delta(metadata_id, name, count.value() as u64);
-                    if delta > 0 {
-                        deltas.push(MetricValue::Count {
-                            name: name.clone(),
-                            count: create_count_with_value(delta as usize),
-                        });
-                    }
+                    *count_totals.entry(name.to_string()).or_default() += count.value() as u64;
                 }
                 MetricValue::Time { name, time } => {
-                    let whole_ms =
-                        self.cumulative_time_delta_millis(metadata_id, name, time.value() as u64);
-                    if whole_ms > 0 {
-                        deltas.push(MetricValue::Time {
-                            name: name.clone(),
-                            time: create_time_from_duration(Duration::from_millis(whole_ms)),
-                        });
-                    }
+                    *time_totals.entry(name.to_string()).or_default() += time.value() as u64;
                 }
                 // Gauges are absolute state, not cumulative totals; the latest
                 // snapshot is already correct. Remaining variants (spill
                 // counts, timestamps, custom) are not exported downstream, so
                 // forwarding them raw is harmless.
                 other => deltas.push(other.clone()),
+            }
+        }
+
+        let whole_ms = self.cumulative_time_delta_millis(
+            metadata_id,
+            "elapsed_compute",
+            elapsed_compute_nanos,
+        );
+        if whole_ms > 0 {
+            deltas.push(MetricValue::ElapsedCompute(create_time_from_duration(
+                Duration::from_millis(whole_ms),
+            )));
+        }
+        for (name, cumulative) in count_totals {
+            let delta = self.cumulative_count_delta(metadata_id, &name, cumulative);
+            if delta > 0 {
+                deltas.push(MetricValue::Count {
+                    name: name.into(),
+                    count: create_count_with_value(delta as usize),
+                });
+            }
+        }
+        for (name, cumulative_nanos) in time_totals {
+            let whole_ms = self.cumulative_time_delta_millis(metadata_id, &name, cumulative_nanos);
+            if whole_ms > 0 {
+                deltas.push(MetricValue::Time {
+                    name: name.into(),
+                    time: create_time_from_duration(Duration::from_millis(whole_ms)),
+                });
             }
         }
         deltas
@@ -1917,6 +1938,32 @@ mod tests {
             set2.push(time_metric("build_time", 1_200_000));
             let d2 = recorder.subtree_delta_metric_values(id, &set2);
             assert_eq!(find_time_ms(&d2, "build_time"), Some(1));
+        }
+
+        /// Regression: a typed `OutputBatches` and a generic
+        /// `Count { name: "output_batches" }` in the same subtree made
+        /// `MetricsSet::aggregate_by_name` panic ("Mismatched metric types"),
+        /// crashing the pipeline. The manual aggregation must merge them into
+        /// one deltaed series instead.
+        #[test]
+        fn mixed_variant_same_name_metrics_do_not_panic() {
+            let recorder = test_recorder();
+            let id = "app::sql";
+
+            let output_batches = Count::new();
+            output_batches.add(2);
+            let mut set1 = MetricsSet::new();
+            set1.push(Arc::new(Metric::new(
+                MetricValue::OutputBatches(output_batches),
+                None,
+            )));
+            set1.push(count_metric("output_batches", 1));
+            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            assert_eq!(
+                find_count(&d1, "output_batches"),
+                Some(3),
+                "typed OutputBatches(2) and Count(1) merge into one series"
+            );
         }
 
         /// Gauges report absolute state, not a cumulative total, so the latest
