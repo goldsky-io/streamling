@@ -1146,11 +1146,13 @@ mod tests {
         );
     }
 
-    /// The source-owned mark must survive DataFusion's ProjectionPushdown
-    /// rewrite (`try_swapping_with_projection` rebuilds the filter); losing it
-    /// would silently re-enable the misattribution the mark exists to prevent.
+    /// A source-owned filter must refuse DataFusion's ProjectionPushdown
+    /// swap outright: pushing the transform's projection below the boundary
+    /// would exclude the transform's own projection compute from its metrics,
+    /// and rebuilding the filter risks dropping the boundary mark. An
+    /// unmarked (transform-owned) filter must still allow the swap.
     #[tokio::test]
-    async fn source_owned_flag_survives_projection_swap() {
+    async fn source_owned_filter_refuses_projection_swap() {
         use datafusion::physical_expr::expressions::Column as PhysicalColumn;
         use datafusion::physical_plan::PhysicalExpr;
         use datafusion::physical_plan::expressions::lit;
@@ -1165,25 +1167,35 @@ mod tests {
 
         // A narrowing projection directly above the filter, as ProjectionPushdown
         // would present it.
-        let projection = ProjectionExec::try_new(
-            vec![(
-                Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
-                "id".to_string(),
-            )],
-            Arc::clone(&filter),
-        )
-        .unwrap();
+        let narrowing_projection = |child: &Arc<dyn ExecutionPlan>| {
+            ProjectionExec::try_new(
+                vec![(
+                    Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                    "id".to_string(),
+                )],
+                Arc::clone(child),
+            )
+            .unwrap()
+        };
 
         let swapped = filter
-            .try_swapping_with_projection(&projection)
-            .unwrap()
-            .expect("swap should apply: predicate has no column refs");
-        let swapped_filter = swapped
-            .downcast_ref::<StreamingFilterExec>()
-            .expect("swap keeps the filter on top");
+            .try_swapping_with_projection(&narrowing_projection(&filter))
+            .unwrap();
         assert!(
-            swapped_filter.is_source_owned(),
-            "projection swap must preserve the source-owned boundary mark"
+            swapped.is_none(),
+            "a source-owned filter must refuse the projection swap"
+        );
+
+        // Control: the same shape without the mark swaps as usual.
+        let original = FilterExec::try_new(lit(true), multi_batch_source(1).await).unwrap();
+        let own_filter: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingFilterExec::from_original(original).unwrap());
+        let swapped = own_filter
+            .try_swapping_with_projection(&narrowing_projection(&own_filter))
+            .unwrap();
+        assert!(
+            swapped.is_some(),
+            "a transform-owned filter must still allow the swap"
         );
     }
 

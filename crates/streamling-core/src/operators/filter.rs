@@ -418,6 +418,14 @@ impl ExecutionPlan for StreamingFilterExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Never push a projection below a topology boundary: the swap would
+        // place the downstream transform's own projection UNDER this
+        // source-owned filter, excluding the transform's projection compute
+        // from its metrics (and embedding would hide it inside the boundary
+        // node). Mirrors the unification guard on StreamingProjectionExec.
+        if self.source_owned {
+            return Ok(None);
+        }
         // If the projection does not narrow the schema, we should not try to push it down:
         if projection.expr().len() < projection.input().schema().fields().len() {
             // Each column in the predicate expression must exist after the projection.
@@ -431,13 +439,7 @@ impl ExecutionPlan for StreamingFilterExec {
                     let selectivity = self.default_selectivity();
                     e.with_default_selectivity(selectivity)
                 })
-                .map(|mut e| {
-                    // Optimizer rewrites must not erase the topology-boundary
-                    // mark, or a source-owned filter's compute gets folded
-                    // into the consuming transform's metrics.
-                    e.source_owned = self.source_owned;
-                    Some(Arc::new(e) as _)
-                });
+                .map(|e| Some(Arc::new(e) as _));
             }
         }
         try_embed_projection(projection, self)

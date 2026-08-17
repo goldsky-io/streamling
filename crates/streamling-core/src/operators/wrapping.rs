@@ -602,8 +602,13 @@ impl ExecutionPlan for WrappingExec {
         // transforms get accurate per-batch compute from the DataFusion
         // subtree delta; the wall-clock span below is measured around
         // `data.next().await` (dominated by upstream idle-wait) and would
-        // pollute the same `elapsed_compute` series for them.
-        let record_wall_clock_compute = !metrics_recorder.is_sql_node(&metric_metadata_id);
+        // pollute the same `elapsed_compute` series for them. When the
+        // subtree exposes NO metrics at all (e.g. a passthrough transform
+        // whose input is directly the upstream topology boundary), the delta
+        // path can never emit, so wall-clock stays on as the only available
+        // signal rather than leaving the series dead.
+        let record_wall_clock_compute =
+            metrics.is_none() || !metrics_recorder.is_sql_node(&metric_metadata_id);
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
