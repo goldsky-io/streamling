@@ -684,21 +684,6 @@ pub struct WasmScriptConfig {
     /// compiled into the binary is used.
     #[serde(default)]
     pub runtime_wasm_file_path: Option<String>,
-    /// Number of WASM plugin instances in the pool for concurrent processing.
-    /// Higher values allow more concurrent batch processing but use more memory.
-    /// Default is 4.
-    #[serde(default = "default_wasm_parallelism")]
-    pub parallelism: usize,
-    /// Minimum number of rows to accumulate before processing.
-    /// Smaller batches are combined until this threshold is reached.
-    /// Set to 0 to disable accumulation and process each batch immediately.
-    /// Default is 0 (disabled).
-    #[serde(default)]
-    pub batch_size: usize,
-}
-
-fn default_wasm_parallelism() -> usize {
-    4
 }
 
 #[derive(Debug, Deserialize, Clone)]

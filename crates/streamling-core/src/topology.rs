@@ -553,11 +553,13 @@ pub struct ScriptTransform {
     pub language: String,
     pub script: String,
     pub schema: Option<BTreeMap<String, String>>,
-    /// Number of WASM plugin instances for parallel processing.
-    /// Overrides the global wasm_script.parallelism if specified.
+    /// Number of concurrent WASM execution streams, hash-partitioned by
+    /// `primary_key`. Each stream owns one WASM instance. Defaults to the input
+    /// width.
     pub parallelism: Option<usize>,
-    /// Minimum rows to accumulate before processing.
-    /// Overrides the global wasm_script.batch_size if specified.
+    /// Rows accumulated per execution stream before invoking WASM, so a script
+    /// with `parallelism: N` buffers up to `N * batch_size` rows. If omitted,
+    /// input batches are passed through unchanged.
     pub batch_size: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
@@ -601,14 +603,13 @@ impl Transform {
 
     /// Requested output width for this transform.
     ///
-    /// `script` is deliberately absent: its `parallelism` sizes the WASM instance
-    /// pool inside a single stream, which is a different thing from plan width.
     /// `plugin` and `dynamic_table` are `SinglePartition` operators.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Transform::sql(t) => t.parallelism,
             Transform::handler(t) => t.parallelism,
-            Transform::dynamic_table(_) | Transform::script(_) | Transform::plugin(_) => None,
+            Transform::script(t) => t.parallelism,
+            Transform::dynamic_table(_) | Transform::plugin(_) => None,
         }
     }
 }

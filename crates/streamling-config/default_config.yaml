@@ -40,19 +40,7 @@ external_http_handler:
   operator_timeout_sec: "300"
   # the number of in-flight record batches executed concurrently by the external HTTP handler
   buffer_size: "25"
-wasm_script:
-  # The WASM runtime is embedded in the binary; uncomment runtime_wasm_file_path
-  # only to override it with an external .wasm file.
-  # runtime_wasm_file_path: "/path/to/runtime.wasm"
-  # Number of WASM plugin instances in the pool for concurrent processing.
-  # Higher values allow more concurrent batch processing but use more memory.
-  # Default is 4.
-  parallelism: 4
-  # Minimum number of rows to accumulate before processing.
-  # Smaller batches are combined until this threshold is reached.
-  # Set to 0 to disable accumulation and process each batch immediately.
-  # Default is 0 (disabled).
-  batch_size: 0
+wasm_script: {}
 plugin: {}
 kafka_source:
   brokers: "localhost:9092"

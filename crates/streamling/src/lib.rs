@@ -1559,28 +1559,42 @@ impl Streamling {
                     let language = &script_transform.language;
                     let script = &script_transform.script;
                     let schema = &script_transform.schema;
-                    // Use topology-level parallelism/batch_size if specified, otherwise fall back to app_config
-                    let parallelism = script_transform
-                        .parallelism
-                        .unwrap_or(app_config.wasm_script.parallelism);
-                    let batch_size = script_transform
-                        .batch_size
-                        .unwrap_or(app_config.wasm_script.batch_size);
+                    let parallelism = script_transform.parallelism;
+                    let batch_size = script_transform.batch_size;
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
                             streamling_user_err!("{}: source '{}' not found", ctx.format(), from)
                         })?
                         .clone();
+
+                    let input_primary_key = PrimaryKeyMetadata::from_str(
+                        &script_transform.primary_key,
+                        PrimaryKeySource::TopologyDefined,
+                        reference_name.clone(),
+                    );
+                    if parallelism.is_some_and(|parallelism| parallelism > 1) {
+                        input_primary_key.validate_against_schema(source_plan.schema().inner())?;
+                    }
+
+                    let script_input = wrap_with_rebatch(
+                        wrap_with_repartition(
+                            source_plan,
+                            &Placement::ByKey(input_primary_key.columns),
+                            parallelism,
+                            reference_name.clone(),
+                        ),
+                        batch_size,
+                        None,
+                        reference_name.clone(),
+                    );
                     let wasm_node = WasmRunnerNode::with_options(
-                        source_plan,
+                        script_input,
                         language.clone(),
                         script.clone(),
                         app_config.wasm_script.runtime_wasm_file_path.clone(),
                         app_config.internal_buffer_size,
                         schema.clone(),
-                        parallelism,
-                        batch_size,
                     )
                     // Convert via `StreamlingError::from` (not `streamling_with_context`)
                     // so a user-facing schema error (e.g. unsupported dtype) is recovered
@@ -3341,6 +3355,115 @@ mod tests {
                 "expected {expected:?} in plan:\n{rendered}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn script_parallelism_and_batch_size_shape_the_wasm_streams() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan.clone(),
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            Some(2),
+            None,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        for expected in [
+            "WasmRunnerExec (lang: javascript), partitions=4",
+            "RebatchExec(batch_size=2, partitions=4)",
+            "StreamingRepartitionExec: partitions=4, keys=[id@0]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in plan:\n{rendered}"
+            );
+        }
+
+        let inherited_input =
+            wrap_with_repartition(source_plan, &by_key(&["id"]), None, "normalize".to_string());
+        let inherited_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    inherited_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        let inherited_physical_plan = session_manager
+            .new_df(inherited_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let inherited_rendered = displayable(inherited_physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        for expected in [
+            "WasmRunnerExec (lang: javascript), partitions=3",
+            "StreamingRepartitionExec: partitions=3, keys=[id@0]",
+        ] {
+            assert!(
+                inherited_rendered.contains(expected),
+                "expected {expected:?} in plan:\n{inherited_rendered}"
+            );
+        }
+        assert!(
+            !inherited_rendered.contains("RebatchExec"),
+            "unexpected RebatchExec in plan:\n{inherited_rendered}"
+        );
     }
 
     fn empty_plan() -> LogicalPlan {
