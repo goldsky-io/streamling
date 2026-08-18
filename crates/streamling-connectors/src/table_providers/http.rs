@@ -324,9 +324,6 @@ impl TableProvider for HttpTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        // Always one write stream: planning marks webhook sinks `Placement::Single`,
-        // so the input is coalesced above this point on both the single-sink and
-        // the fan-out path.
         Ok(Arc::new(ParallelSinkExec::new(
             input,
             telemetry_data_sink,

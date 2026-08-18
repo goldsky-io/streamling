@@ -299,15 +299,18 @@ sinks:
 }
 
 // ============================================================================
-// Scenario 4: One write stream regardless of upstream width
+// Scenario 4: Concurrent write streams
 // ============================================================================
 
-/// A webhook sink is never parallelized: planning marks it `Placement::Single`,
-/// so the sink edge coalesces whatever width its input has. Running the *same*
-/// pipeline at two source widths pins that the invariant belongs to the sink,
-/// not to the source.
+/// `parallelism` on a webhook sink turns into concurrent `write_all` calls, fed
+/// by a hash exchange on the sink's primary key so a key is never delivered by
+/// two streams at once.
+///
+/// Run at a width above and below the source's, so the width is pinned to the
+/// sink's own declaration rather than to whatever it inherited. Every row must
+/// still arrive exactly once through either exchange direction.
 #[tokio::test]
-async fn webhook_sink_always_writes_from_one_stream() {
+async fn webhook_sink_parallelism_widens_the_write_streams() {
     init_tracing();
 
     let ctx = TestContext::new()
@@ -315,7 +318,7 @@ async fn webhook_sink_always_writes_from_one_stream() {
         .expect("Failed to create test context");
 
     let topic = ctx
-        .create_kafka_topic_with_partitions("webhook_single_stream", 4)
+        .create_kafka_topic_with_partitions("webhook_parallel", 4)
         .await
         .expect("Failed to create multi-partition topic");
     topic
@@ -336,7 +339,8 @@ async fn webhook_sink_always_writes_from_one_stream() {
         .await
         .expect("Failed to produce records");
 
-    for source_parallelism in [3, 1] {
+    // 2 -> 3 widens the sink beyond its source, 2 -> 1 narrows it to a coalesce.
+    for sink_parallelism in [3, 1] {
         let webhook = WebhookResource::new()
             .await
             .expect("Failed to start webhook server");
@@ -347,7 +351,7 @@ sources:
   kafka_source:
     type: kafka
     topic: {topic}
-    parallelism: {source_parallelism}
+    parallelism: 2
     starting_offsets: earliest
     primary_key: id
 
@@ -358,6 +362,8 @@ sinks:
     type: webhook
     from: kafka_source
     url: {webhook_url}
+    primary_key: id
+    parallelism: {sink_parallelism}
     one_row_per_request: true
     payload_version: 0
 "#,
@@ -378,25 +384,29 @@ sinks:
 
         assert!(
             output.status.success(),
-            "Pipeline should exit successfully at source parallelism {source_parallelism}; \
+            "Pipeline should exit successfully at sink parallelism {sink_parallelism}; \
              stderr:\n{}",
             output.stderr
         );
         assert!(
-            output.stderr.contains("ParallelSinkExec: partitions=1"),
-            "the webhook sink must write from one stream at source parallelism \
-             {source_parallelism}; stderr:\n{}",
+            output
+                .stderr
+                .contains(&format!("ParallelSinkExec: partitions={sink_parallelism}")),
+            "the webhook sink must write from {sink_parallelism} stream(s); stderr:\n{}",
             output.stderr
         );
-        // Only when there is something to coalesce: at parallelism 1 the sink
-        // edge is already one stream and the planner elides the node entirely.
-        if source_parallelism > 1 {
-            assert!(
-                output.stderr.contains("StreamingCoalesceExec"),
-                "a parallel source must be coalesced before the webhook sink; stderr:\n{}",
-                output.stderr
-            );
-        }
+        // Widening goes through the keyed exchange; narrowing to one stream is a
+        // coalesce instead, since one stream trivially holds every key.
+        let expected_node = if sink_parallelism > 1 {
+            format!("StreamingRepartitionExec: partitions={sink_parallelism}, keys=[id@")
+        } else {
+            "StreamingCoalesceExec".to_string()
+        };
+        assert!(
+            output.stderr.contains(&expected_node),
+            "expected {expected_node:?} at sink parallelism {sink_parallelism}; stderr:\n{}",
+            output.stderr
+        );
 
         let received_all = webhook
             .wait_for_requests(
@@ -406,9 +416,23 @@ sinks:
             .await;
         assert!(
             received_all,
-            "Expected {} webhook requests at source parallelism {source_parallelism}, got {}",
+            "Expected {} webhook requests at sink parallelism {sink_parallelism}, got {}",
             records_to_produce,
             webhook.request_count()
+        );
+
+        // A count alone cannot separate loss from duplication; the exact id set
+        // can. Arrival order across concurrent streams is meaningless, so sort.
+        let mut delivered_ids: Vec<i64> = webhook
+            .get_request_bodies_as_json()
+            .iter()
+            .filter_map(|body| body.get("id").and_then(|id| id.as_i64()))
+            .collect();
+        delivered_ids.sort();
+        assert_eq!(
+            delivered_ids,
+            (1..=records_to_produce).collect::<Vec<i64>>(),
+            "every row must be delivered exactly once at sink parallelism {sink_parallelism}"
         );
     }
 }

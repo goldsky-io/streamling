@@ -292,6 +292,7 @@ mod tests {
             one_row_per_request: Some(true),
             payload_version: Some(0),
             schema_override: None,
+            parallelism: None,
             telemetry: None,
             batch_size: None,
             batch_flush_interval: None,
