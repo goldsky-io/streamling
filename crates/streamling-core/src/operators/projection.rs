@@ -189,14 +189,14 @@ impl ExecutionPlan for StreamingProjectionExec {
         // Never unify across a topology boundary: merging a source-owned
         // projection with a downstream transform's projection would blend the
         // source's expression cost into the transform's metrics (and drop the
-        // boundary mark). Keep the two projections stacked instead.
-        if self.source_owned {
-            return Ok(Some(Arc::new(StreamingProjectionExec::from_original(
-                projection.clone(),
-            )?)));
-        }
-        let streaming_projection = StreamingProjectionExec::from_original(projection.clone())?;
-        let maybe_unified = try_unifying_projections(&streaming_projection, self)?;
+        // boundary mark). Keep the two projections stacked instead (the shared
+        // fallback arm below).
+        let maybe_unified = if self.source_owned {
+            None
+        } else {
+            let streaming_projection = StreamingProjectionExec::from_original(projection.clone())?;
+            try_unifying_projections(&streaming_projection, self)?
+        };
         if let Some(new_plan) = maybe_unified {
             // To unify 3 or more sequential projections:
             remove_unnecessary_projections(new_plan).data().map(Some)

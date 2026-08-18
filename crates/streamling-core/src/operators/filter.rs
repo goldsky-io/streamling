@@ -454,6 +454,12 @@ impl ExecutionPlan for StreamingFilterExec {
         if !matches!(phase, FilterPushdownPhase::Pre) {
             return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
         }
+        // Never absorb a downstream transform's predicates into a topology
+        // boundary: the transform's filter compute would be excluded from its
+        // own metrics. Mirrors the projection-swap guard above.
+        if self.source_owned {
+            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+        }
         // We absorb any parent filters that were not handled by our children
         let unsupported_parent_filters = child_pushdown_result
             .parent_filters

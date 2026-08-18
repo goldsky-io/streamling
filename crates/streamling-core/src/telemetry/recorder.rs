@@ -56,6 +56,11 @@ fn is_metric_denied(metric_name: &str) -> bool {
     })
 }
 
+/// The operator_type value identifying SQL transform nodes. Gates BOTH the
+/// wall-clock suppression (via `is_sql_node`) and the subtree-delta export in
+/// `record_execution_plan_metrics`; the two must never drift apart.
+const SQL_OPERATOR_TYPE: &str = "sql";
+
 /// Streamling's own semantic row-count series. A subtree operator exposing a
 /// generic DataFusion counter under one of these names (e.g.
 /// `StreamingUnnestExec` registers `Count { name: "input_rows" }`) must NOT be
@@ -273,7 +278,7 @@ impl MetricsRecorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(metadata_id)
-            .is_some_and(|m| m.node_context.operator_type == "sql")
+            .is_some_and(|m| m.node_context.operator_type == SQL_OPERATOR_TYPE)
     }
     pub fn record_count_w_tags(
         &self,
@@ -541,7 +546,7 @@ impl MetricsRecorder {
         //     * ClickHouse source (DF-based scan)
         //     * Hybrid source per-phase child plans (bounded/unbounded)
         if let Some(metric_set) = execution_plan_metrics
-            && metric_metadata.node_context.operator_type == "sql"
+            && metric_metadata.node_context.operator_type == SQL_OPERATOR_TYPE
         {
             // Every DataFusion metric here is the CUMULATIVE total of the
             // transform's whole physical subtree (aggregated by
@@ -663,6 +668,9 @@ impl MetricsRecorder {
             }
         }
         for (name, cumulative_nanos) in time_totals {
+            if cumulative_nanos == 0 {
+                continue;
+            }
             let whole_ms = time_delta_millis(&mut node.times, name, cumulative_nanos);
             if whole_ms > 0 {
                 deltas.push(MetricValue::Time {
@@ -1065,10 +1073,21 @@ pub fn initialize_metrics_recorder(
         if let Some(existing) = instance.as_ref() {
             let mut seed_ids = Vec::new();
             {
-                let mut reg_lock = existing.metric_metadata_registry.lock().unwrap();
-                let mut tags_lock = existing.metric_metadata_tags_registry.lock().unwrap();
+                let mut reg_lock = existing
+                    .metric_metadata_registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut tags_lock = existing
+                    .metric_metadata_tags_registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for (id, meta) in metric_metadata_registry.into_iter() {
-                    if meta.node_context.node_type != TopologyNodeType::Sink {
+                    // Seed only genuinely new nodes: re-registering the same
+                    // pipeline must not accumulate phantom 1ms samples per
+                    // redeploy.
+                    if meta.node_context.node_type != TopologyNodeType::Sink
+                        && !reg_lock.contains_key(&id)
+                    {
                         seed_ids.push(id.clone());
                     }
                     reg_lock.insert(id.clone(), meta.clone());
@@ -1082,7 +1101,7 @@ pub fn initialize_metrics_recorder(
             let has_histogram = existing
                 .histogram_registry
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key("elapsed_compute");
             if has_histogram {
                 for id in &seed_ids {
