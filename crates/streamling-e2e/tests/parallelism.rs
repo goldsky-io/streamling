@@ -114,8 +114,10 @@ transforms:
     batch_size: 2
     script: |
       function(input) {{
-        input.value = input.value.toUpperCase();
-        return input;
+        return {{
+          id: input.id,
+          value: input.value.toUpperCase(),
+        }};
       }}
 
 sinks:
