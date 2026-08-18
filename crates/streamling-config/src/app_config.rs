@@ -162,6 +162,9 @@ pub struct PostgresDynamicTableBackendConfig {
     pub sslmode: String,
     pub max_connections: Option<u32>,
     pub dt_schema_name: Option<String>,
+    /// Enables incremental in-memory caching for dynamic tables that explicitly set `time_column`.
+    #[serde(default)]
+    pub cache_enabled: bool,
 }
 
 impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
@@ -180,6 +183,7 @@ impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
             .field("sslmode", &self.sslmode)
             .field("max_connections", &self.max_connections)
             .field("dt_schema_name", &self.dt_schema_name)
+            .field("cache_enabled", &self.cache_enabled)
             .finish()
     }
 }
@@ -543,6 +547,26 @@ impl PostgresSinkConfig {
             ("batch_size".to_string(), self.batch_size.to_string()),
             ("sslmode".to_string(), self.sslmode.to_string()),
         ])
+    }
+
+    /// Client-side bound for a single statement execution.
+    ///
+    /// `statement_timeout_secs` is enforced by the server and cannot fire when
+    /// the connection is dead (e.g. a middlebox silently dropped the flow), so
+    /// sinks additionally bound the await client-side. Derived as 2x the
+    /// server-side timeout so the server-side timeout fires first whenever the
+    /// server is reachable (the 2x headroom also covers wire upload time,
+    /// which the server-side timeout does not measure).
+    ///
+    /// `statement_timeout_secs = 0` means "no timeout" and is honored here
+    /// too (`None`): a statement legitimately slower than any fixed bound
+    /// would otherwise be killed and retried forever. Users who disable the
+    /// server timeout opt out of the client bound as well.
+    pub fn client_statement_timeout(&self) -> Option<std::time::Duration> {
+        match self.statement_timeout_secs {
+            0 => None,
+            s => Some(std::time::Duration::from_secs(s.saturating_mul(2))),
+        }
     }
 }
 
@@ -1168,5 +1192,38 @@ password: ""
 
         let config = result.expect("test body panicked");
         assert_eq!(config.application_id, "from_env");
+    }
+
+    #[test]
+    fn test_client_statement_timeout_is_double_the_server_timeout() {
+        let config = PostgresSinkConfig {
+            statement_timeout_secs: 60,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.client_statement_timeout(),
+            Some(std::time::Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn test_client_statement_timeout_disabled_when_server_timeout_disabled() {
+        let config = PostgresSinkConfig {
+            statement_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.client_statement_timeout(), None);
+    }
+
+    #[test]
+    fn test_client_statement_timeout_saturates_on_huge_values() {
+        let config = PostgresSinkConfig {
+            statement_timeout_secs: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.client_statement_timeout(),
+            Some(std::time::Duration::from_secs(u64::MAX))
+        );
     }
 }

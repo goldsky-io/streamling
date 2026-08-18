@@ -655,6 +655,9 @@ sinks:
 
 The PostgreSQL sink allows writing data to PostgreSQL tables. It create sink table automically.
 
+When a `primary_key` is set, each batch is collapsed to the latest row per key before writing; set `deduplicate: false`
+to disable that (see `Batch Deduplication` below).
+
 Sample configuration:
 
 ```yaml
@@ -688,6 +691,8 @@ Behavior for 256-bit integers (U256/I256):
 The PostgreSQL aggregation sink enables real-time aggregations directly in PostgreSQL using database triggers. Data flows into a landing table, and a trigger function automatically maintains aggregated values in a separate aggregation table.
 
 - **Landing Table**: Stores raw records in append-only mode with a composite primary key (`primary_key` + `_gs_op`).
+- **Deduplication**: each batch is collapsed to the latest row per `primary_key` before it reaches the landing table;
+  set `deduplicate: false` to disable that (see `Batch Deduplication` below).
 - **Aggregation Table**: Stores aggregated results, updated incrementally by the trigger.
 - **Operation Handling**: For `sum`, `count`, and `avg`, delete operations negate values. `count` also correctly handles updates (contributes 0 to the count). `min` and `max` do not support deletes or updates (use only for insert-only streams).
 
@@ -823,6 +828,8 @@ implemented as a custom DataFusion Table Provider (`TableProvider`) with the fol
   - Converts Arrow `RecordBatch`es to Avro-encoded messages.
   - Adds operation type column (`_gs_op`) to track INSERT/UPDATE/DELETE operations (see `Upsert Semantics` section
     below) as a message header with the `dbz.op` key.
+- **Deduplication**: when a `primary_key` is set, each batch is collapsed to the latest row per key before it is
+  produced; set `deduplicate: false` to disable that (see `Batch Deduplication` below). Message keying is unaffected.
 
 Kafka Sink uses
 high-level [FutureProducer](https://docs.rs/rdkafka/latest/rdkafka/producer/future_producer/struct.FutureProducer.html)
@@ -860,6 +867,7 @@ The ClickHouse sink writes records to a ClickHouse table over the HTTP interface
 
 - **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
 - **Compression**: INSERT request bodies are compressed with zstd by default. gzip and lz4 are also available. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
+- **Deduplication**: each batch is collapsed to the latest row per `primary_key` before writing. Set `deduplicate: false` for append-only tables whose rows are deltas rather than states (e.g. `SummingMergeTree`) — see `Batch Deduplication` below.
 
 Sample configuration:
 
@@ -954,6 +962,60 @@ transforms:
     backend_entity_name: persistent_data
 ```
 
+Enable the in-memory cache in the application config (or with
+`STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_ENABLED=true`):
+
+```yaml
+dynamic_table_backend:
+  postgres:
+    cache_enabled: true
+```
+
+Then set `time_column` on each backing table whose timestamp advances on every append:
+
+```yaml
+transforms:
+  persistent_table:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: persistent_data
+    time_column: updated_at
+```
+
+The cache is off by default and is used only when both settings are present. The initial lookup
+loads the full table through bounded PostgreSQL cursor pages. Each later `dynamic_table_check`
+batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
+column so these checks and range reads stay cheap.
+
+PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
+existing membership, including removals, is not supported in this mode. Keeping `time_column` current
+is a user requirement and part of the cache's correctness contract. Every process that appends table
+membership must use the same serialized-writer protocol:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('public.persistent_data', 0));
+INSERT INTO public.persistent_data (value, updated_at)
+VALUES ('new-value', clock_timestamp())
+ON CONFLICT (value) DO NOTHING;
+COMMIT;
+```
+
+Use the schema-qualified table name as the lock key, exactly as shown. Transaction-scoped advisory
+locks coordinate only writers that follow this protocol. Each successful append must atomically make
+`MAX(time_column)` different by assigning a non-null timestamp strictly newer than the previous
+maximum. `NOW()` and `CURRENT_TIMESTAMP` are unsafe here because PostgreSQL fixes them at transaction
+start, which can precede waiting for the writer lock; use `clock_timestamp()` after the lock instead.
+
+Streamling takes this lock automatically for its own cached appends and creates new backing tables
+with `updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()`. It does not alter existing tables.
+Tables created by older Streamling versions with nullable `TIMESTAMPTZ DEFAULT NOW()` need no schema
+or data migration: cached Streamling appends explicitly write `clock_timestamp()` after taking the
+lock. Future appends from other writers must still follow the protocol above. Cache initialization
+checks that the configured column exists and supports `MAX`, but it cannot verify that other writers
+obey the protocol. If that cannot be guaranteed, leave caching disabled; uncached tables continue to
+use batched PostgreSQL lookups.
+
 ### Usage with SQL Transforms
 
 Dynamic tables are accessed within SQL transforms using the `dynamic_table_check` UDF (User Defined Function). This function checks if a value exists in the specified dynamic table.
@@ -1008,8 +1070,18 @@ The `dynamic_table_check` function has the following signature:
 
 - **Parameters**:
   - `table_name` (string): Name of the dynamic table to query
-  - `value` (string): Value to check for existence
+  - `value` (string **or** `text[]`): Value(s) to check for existence
 - **Returns**: `boolean` - `true` if the value exists in the table, `false` otherwise
+
+`value` accepts two forms:
+
+- **Scalar `text`** — returns `true` iff the single value is present in the table.
+- **Array `text[]`** (`List` or `LargeList` of `text`) — **any-match**: returns `true` iff **any** element of the array is present in the table. Null handling is explicit: a **null array yields null**, an **empty array yields `false`**, and **null elements are skipped**. Distinct values are deduplicated per batch before the lookup. Nested arrays (`text[][]`) are not supported — dynamic tables are a flat set of strings.
+
+```sql
+-- any element of the array present in the table?
+SELECT * FROM src WHERE dynamic_table_check('tracked_wallets', accounts)
+```
 
 ### Source Validation
 
@@ -1357,6 +1429,32 @@ By default, DataFusion passes data in a columnar format using `RecordBatch` with
 So, in order to support upsert semantics, an additional `_gs_op` column is added to the schema. Unfortunately, this
 comes with some challenges mentioned in https://github.com/goldsky-io/streamling/pull/2.
 
+### Batch Deduplication
+
+Every sink configured with a `primary_key` — Postgres, Kafka and ClickHouse — collapses each
+batch to the **latest row per key** before writing it. Only the newest state of a row matters to an upsert, so this
+saves redundant writes. Sinks with no primary key never deduplicate.
+
+That assumption breaks when rows are **deltas rather than states**. Delta rows are meant to accumulate, so several
+of them legitimately share a key and every one has to be written — a retraction and its addition, or two different
+entities rolling up to the same aggregate key. Collapsing them silently drops rows and the destination drifts. Set
+`deduplicate: false` on those sinks:
+
+```yaml
+sinks:
+  revenue_rollup:
+    type: clickhouse
+    from: revenue_deltas
+    table: product_revenue_daily
+    primary_key: revenue_date,product_id,currency
+    append_only_mode: false
+    deduplicate: false
+```
+
+The primary key still drives everything else it is used for — `ALTER TABLE ... DELETE` keying and `CREATE TABLE`
+ordering in ClickHouse, `ON CONFLICT` targeting in Postgres, message keying in Kafka. `deduplicate: false` turns off
+the batch collapse and nothing else.
+
 ## Plugin System
 
 ### Overview
@@ -1667,6 +1765,15 @@ plugin:
     my_preprocessor:
       key: value
 ```
+
+Preprocessors run in the configured order. An id that is not registered by the
+loaded plugin bundle is skipped with a warning. This allows shared configuration
+to add preprocessors without breaking older images that do not include them.
+Under `--validate`, the warning appears in the JSON `warnings` array.
+
+A pipeline that depends on a skipped preprocessor may still fail later when its
+topology is validated. Missing-plugin errors list the ids available in the loaded
+bundle to make version mismatches easier to diagnose.
 
 #### Side Output Trait
 

@@ -1,6 +1,6 @@
 [package]
 name = "streamling-core"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Core streaming execution engine for Streamling, built on Apache DataFusion."
@@ -88,3 +88,5 @@ paste.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+serial_test.workspace = true

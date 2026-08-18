@@ -5,11 +5,15 @@
 pub(crate) mod broadcast_stream;
 
 use crate::operators::broadcast::broadcast_stream::BroadcastStream;
+use crate::operators::filter::StreamingFilterExec;
+use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::rebatch::RebatchConfig;
+use crate::operators::unnest::StreamingUnnestExec;
 use crate::session::{DEFAULT_CATALOG_NAME, SessionManager, get_streamling_config};
 use crate::utils::batch_accumulator::AsyncBatchAccumulator;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, Statistics, internal_err};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -18,7 +22,10 @@ use datafusion::logical_expr::{
     Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::unnest::UnnestExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_input_stream,
     execution_plan::{Boundedness, EmissionType},
@@ -190,6 +197,49 @@ impl UserDefinedLogicalNodeCore for MultiSinkLogicalNode {
     }
 }
 
+/// Rewrite stock DataFusion operators in a sink's transform chain (the nodes
+/// `insert_into` adds between the shared broadcast input and the `DataSink`,
+/// e.g. a ClickHouse sink's `ProjectionExec`) into their metadata-preserving
+/// `Streaming*` counterparts.
+///
+/// The main plan tree gets this rewrite from the
+/// `Streaming*RewritePhysicalOptimizerRule`s, but the per-sink plans built
+/// here are stored in `MultiSinkExec::sinks`, which is not exposed through
+/// `children()`, so the physical optimizer never traverses them. Left as-is,
+/// a stock `ProjectionExec` rebuilds every batch with its plan-time schema,
+/// dropping the checkpoint-marker metadata — the sink then keeps writing but
+/// never acks an epoch, and checkpointing stalls forever on "missing sinks".
+///
+/// Traversal stops at `shared_input`: that subtree belongs to the main plan
+/// tree (optimized separately) and is replaced by the broadcast stream at
+/// execute time anyway. Not descending into it also keeps the
+/// `Arc::ptr_eq(dse.input(), &input_physical)` transform detection intact for
+/// sinks whose `insert_into` adds no nodes.
+fn rewrite_sink_transform_chain(
+    plan: Arc<dyn ExecutionPlan>,
+    shared_input: &Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_down(|node| {
+        if Arc::ptr_eq(&node, shared_input) {
+            return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
+        }
+        if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+            let streaming = StreamingProjectionExec::from_original(projection.clone())?;
+            return Ok(Transformed::yes(Arc::new(streaming)));
+        }
+        if let Some(filter) = node.downcast_ref::<FilterExec>() {
+            let streaming = StreamingFilterExec::from_original(filter.clone())?;
+            return Ok(Transformed::yes(Arc::new(streaming)));
+        }
+        if let Some(unnest) = node.downcast_ref::<UnnestExec>() {
+            let streaming = StreamingUnnestExec::from_original(unnest.clone())?;
+            return Ok(Transformed::yes(Arc::new(streaming)));
+        }
+        Ok(Transformed::no(node))
+    })
+    .data()
+}
+
 pub struct MultiSinkExtensionPlanner {}
 
 #[async_trait]
@@ -227,6 +277,9 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
                     let sink_plan = table
                         .insert_into(session_state, input_physical.clone(), InsertOp::Append)
                         .await?;
+                    // Checkpoint markers must survive the sink's transform
+                    // chain; the physical optimizer can't reach it here.
+                    let sink_plan = rewrite_sink_transform_chain(sink_plan, &input_physical)?;
 
                     let has_transforms = sink_plan
                         .downcast_ref::<DataSinkExec>()
@@ -409,6 +462,15 @@ impl ExecutionPlan for MultiSinkExec {
 
         let total_sinks = self.sinks.len();
         let completed_sinks = Arc::new(Mutex::new(0));
+        // Handles for the per-sink writer tasks. The output stream below only
+        // ends after every one of these is joined: the tasks keep flushing
+        // their rebatched tails after the broadcast input ends, and completing
+        // the plan while they are still writing lets the pipeline start
+        // teardown (or exit) mid-flush — dropping the tail of every sink that
+        // didn't win the race (observed as ClickHouse receiving 0 rows in the
+        // multi-sink e2e test once shutdown began cancelling in-flight writes).
+        let mut sink_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+            Vec::with_capacity(total_sinks);
 
         for (i, sink) in self.sinks.iter().enumerate() {
             let sink = sink.clone();
@@ -423,7 +485,7 @@ impl ExecutionPlan for MultiSinkExec {
             let broadcast_stream = broadcast_stream.clone();
             let completed_sinks = completed_sinks.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let data_sink_exec = sink
                     .downcast_ref::<DataSinkExec>()
                     .expect("MultiSinkExec: sink must be a DataSinkExec");
@@ -468,28 +530,43 @@ impl ExecutionPlan for MultiSinkExec {
                         .expect("Failed to execute sink input plan over broadcast data")
                 };
 
-                match data_sink.write_all(input_stream, &task_context).await {
-                    Ok(_) => {}
+                let write_result = data_sink.write_all(input_stream, &task_context).await;
+
+                // Count this sink as done on BOTH paths (success and failure)
+                // so the broadcast's all-sinks-completed stop can never stall
+                // on a failed sink.
+                {
+                    let mut count = completed_sinks.lock().await;
+                    *count += 1;
+                    if *count >= total_sinks {
+                        broadcast_stream.stop();
+                    }
+                }
+
+                match write_result {
+                    Ok(_) => {
+                        debug!("MultiSinkExec [{}]: Sink completed", sink_name);
+                        Ok(())
+                    }
                     Err(e) => {
+                        // Surface the failure as a plan error via the joined
+                        // handle below — previously this panicked inside a
+                        // detached task whose JoinHandle nobody awaited, so a
+                        // failed sink silently dropped out of the fan-out while
+                        // the pipeline kept running.
                         tracing::warn!(
                             "MultiSinkExec [{}]: Sink write_all failed: {}",
                             sink_name,
                             e
                         );
-                        panic!(
+                        Err(datafusion::error::DataFusionError::Execution(format!(
                             "MultiSinkExec [{}]: Sink write_all failed: {}",
                             sink_name, e
-                        );
+                        )))
                     }
                 }
-
-                debug!("MultiSinkExec [{}]: Sink completed", sink_name);
-                let mut count = completed_sinks.lock().await;
-                *count += 1;
-                if *count >= total_sinks {
-                    broadcast_stream.stop();
-                }
             });
+            sink_handles.push(handle);
         }
 
         let output_consumer = broadcast_stream.add_consumer();
@@ -497,10 +574,149 @@ impl ExecutionPlan for MultiSinkExec {
         // Start broadcasting after all consumers (sinks + output) are registered
         broadcast_stream.start(data);
 
-        Ok(Box::pin(output_consumer))
+        // Gate the plan's completion on every sink writer finishing: forward
+        // the output consumer, then join the writer tasks and surface any
+        // failure as a stream error. `collect()` on this plan therefore
+        // resolves only once all sinks have durably drained — which is what
+        // the run loop's teardown ordering (and the shutdown drain guarantee)
+        // relies on. Note this means the plan's wall-clock now includes sink
+        // write latency (and any residual retry backoff), by design.
+        // ASSUMPTION: downstream drains this stream to completion before
+        // dropping it (DataFusion's collect() does). Dropping it early skips
+        // the handle-join below and aborts in-flight sink writers mid-flush.
+        let schema = self.schema();
+        let output = async_stream::stream! {
+            let mut out = output_consumer;
+            while let Some(item) = futures::StreamExt::next(&mut out).await {
+                yield item;
+            }
+            // Join ALL writers before yielding any failure: consumers like
+            // `collect()` stop pulling on the first error and drop this
+            // stream, and dropping it before the remaining handles are joined
+            // would abort the sibling writers mid-flush — the exact tail loss
+            // this gating exists to prevent. So: drain everyone first, then
+            // report the first failure.
+            let mut first_error: Option<datafusion::error::DataFusionError> = None;
+            for handle in sink_handles {
+                let failure = match handle.await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(join_err) => Some(datafusion::error::DataFusionError::Execution(
+                        format!("MultiSinkExec: sink writer task panicked: {}", join_err),
+                    )),
+                };
+                if let Some(e) = failure {
+                    tracing::warn!("MultiSinkExec: sink writer failed: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+            if let Some(e) = first_error {
+                yield Err(e);
+            }
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output)))
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::prelude::SessionContext;
+
+    fn scan_plan() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        futures::executor::block_on(mem_table.scan(&state, None, &[], None)).unwrap()
+    }
+
+    fn identity_projection(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let col: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(Column::new("id", 0));
+        Arc::new(ProjectionExec::try_new(vec![(col, "id".to_string())], input).unwrap())
+    }
+
+    /// A `ProjectionExec` added by a sink's `insert_into` must be rewritten to
+    /// the metadata-preserving `StreamingProjectionExec`, while the shared
+    /// broadcast input below it stays untouched (same `Arc`).
+    #[test]
+    fn rewrite_replaces_sink_projection_and_keeps_shared_input() {
+        let shared = scan_plan();
+        let plan = identity_projection(shared.clone());
+
+        let rewritten = rewrite_sink_transform_chain(plan, &shared).unwrap();
+
+        assert!(
+            rewritten
+                .downcast_ref::<StreamingProjectionExec>()
+                .is_some(),
+            "expected StreamingProjectionExec at the root, got {}",
+            rewritten.name()
+        );
+        let children = rewritten.children();
+        assert_eq!(children.len(), 1);
+        assert!(
+            Arc::ptr_eq(children[0], &shared),
+            "shared input must be forwarded untouched"
+        );
+    }
+
+    /// A sink plan that adds no nodes (e.g. a webhook sink) must come back as
+    /// the very same plan, preserving the `Arc::ptr_eq` transform detection.
+    #[test]
+    fn rewrite_is_identity_when_sink_adds_no_nodes() {
+        let shared = scan_plan();
+
+        let rewritten = rewrite_sink_transform_chain(shared.clone(), &shared).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&rewritten, &shared),
+            "plan without sink-side transforms must be returned as-is"
+        );
+    }
+
+    /// Operators inside the shared input subtree belong to the main plan tree
+    /// (the physical optimizer handles them there); the rewrite must not
+    /// descend into it.
+    #[test]
+    fn rewrite_does_not_descend_into_shared_input() {
+        let shared = identity_projection(scan_plan());
+        let plan = identity_projection(shared.clone());
+
+        let rewritten = rewrite_sink_transform_chain(plan, &shared).unwrap();
+
+        assert!(
+            rewritten
+                .downcast_ref::<StreamingProjectionExec>()
+                .is_some(),
+            "sink-side projection must still be rewritten"
+        );
+        let children = rewritten.children();
+        assert!(
+            Arc::ptr_eq(children[0], &shared),
+            "shared input subtree must not be rebuilt"
+        );
+        assert!(
+            children[0].downcast_ref::<ProjectionExec>().is_some(),
+            "nodes inside the shared input must keep their original type"
+        );
     }
 }

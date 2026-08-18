@@ -10,18 +10,23 @@ use std::sync::Arc;
 /// - `execute_fn`: Async function called once per slice
 ///
 /// Slices are formed as equally as possible using ceil(max_total_rows / parallelism).
+///
+/// All slices run to completion; if any slice fails, the first error is
+/// returned so the caller can propagate it (e.g. a write cancelled by
+/// shutdown must fail the sink instead of silently acking a checkpoint).
 pub async fn parallel_execute<F, Fut>(
     batch: &RecordBatch,
     parallelism: usize,
     min_batch_e: usize,
     execute_fn: F,
-) where
+) -> streamling_core::error::Result<()>
+where
     F: Fn(RecordBatch) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
+    Fut: std::future::Future<Output = streamling_core::error::Result<()>> + Send + 'static,
 {
     let total_rows = batch.num_rows();
     if total_rows == 0 {
-        return;
+        return Ok(());
     }
 
     let max_workers = parallelism.max(1);
@@ -45,10 +50,25 @@ pub async fn parallel_execute<F, Fut>(
         (func)(slice)
     });
 
-    let _ = tasks
+    let results = tasks
         .buffer_unordered(effective_workers)
         .collect::<Vec<_>>()
         .await;
+    let mut first_error = None;
+    for result in results {
+        if let Err(e) = result {
+            // Log every slice failure (not just the one we return) so a
+            // backend rejecting several slices in one batch stays diagnosable.
+            tracing::warn!("parallel_execute: slice failed: {}", e);
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
+        }
+    }
+    match first_error {
+        None => Ok(()),
+        Some(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -77,13 +97,22 @@ mod tests {
         .unwrap()
     }
 
-    async fn inc_seen_assert(seen: Arc<AtomicUsize>, slice: RecordBatch, shard_cap: usize) {
+    async fn inc_seen_assert(
+        seen: Arc<AtomicUsize>,
+        slice: RecordBatch,
+        shard_cap: usize,
+    ) -> streamling_core::error::Result<()> {
         assert!(slice.num_rows() <= shard_cap);
         seen.fetch_add(slice.num_rows(), std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
-    async fn inc_seen(seen: Arc<AtomicUsize>, slice: RecordBatch) {
+    async fn inc_seen(
+        seen: Arc<AtomicUsize>,
+        slice: RecordBatch,
+    ) -> streamling_core::error::Result<()> {
         seen.fetch_add(slice.num_rows(), std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     #[tokio::test]
@@ -97,7 +126,8 @@ mod tests {
             let seen = seen.clone();
             move |slice| inc_seen_assert(seen.clone(), slice, shard_cap)
         })
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(seen.load(Ordering::SeqCst), 1000);
     }
@@ -113,7 +143,8 @@ mod tests {
             let seen = seen.clone();
             move |slice| inc_seen_assert(seen.clone(), slice, shard_cap)
         })
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(seen.load(Ordering::SeqCst), 1025);
     }
@@ -128,7 +159,8 @@ mod tests {
             let seen = seen.clone();
             move |slice| inc_seen(seen.clone(), slice)
         })
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(seen.load(Ordering::SeqCst), 10);
     }
@@ -149,10 +181,12 @@ mod tests {
                 async move {
                     seen.fetch_add(slice.num_rows(), Ordering::SeqCst);
                     count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 }
             }
         })
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(seen.load(Ordering::SeqCst), 10);
         assert_eq!(count.load(Ordering::SeqCst), 1);
