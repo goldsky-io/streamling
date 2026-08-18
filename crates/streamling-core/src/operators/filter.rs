@@ -115,6 +115,10 @@ impl StreamingFilterExec {
         }
     }
 
+    /// NOTE: always resets `source_owned` to `false`. A rebuild path that
+    /// routes a source-owned filter through here silently drops the topology
+    /// boundary mark — callers must re-apply it via [`Self::with_source_owned`]
+    /// (see `wrap_with_side_outputs_before_filter`).
     pub fn from_original(original_filter: FilterExec) -> Result<Self> {
         Ok(Self {
             predicate: original_filter.predicate().clone(),
@@ -134,9 +138,11 @@ impl StreamingFilterExec {
         self.source_owned
     }
 
-    /// Mark this filter as owned by an upstream source node.
-    pub fn mark_source_owned(&mut self) {
+    /// Consume `self`, returning it marked as owned by an upstream source
+    /// node (see the `source_owned` field).
+    pub fn with_source_owned(mut self) -> Self {
         self.source_owned = true;
+        self
     }
 
     pub fn with_default_selectivity(
@@ -423,6 +429,12 @@ impl ExecutionPlan for StreamingFilterExec {
         // source-owned filter, excluding the transform's projection compute
         // from its metrics (and embedding would hide it inside the boundary
         // node). Mirrors the unification guard on StreamingProjectionExec.
+        //
+        // NOTE: the production session replaces DataFusion's physical
+        // optimizer rules with `StreamlingPhysicalOptimizerRules` (see
+        // session.rs), so ProjectionPushdown/FilterPushdown never run there.
+        // This guard (and its sibling in `handle_child_pushdown_result`) is
+        // defense-in-depth for embedders and future rule-set changes.
         if self.source_owned {
             return Ok(None);
         }
@@ -499,14 +511,12 @@ impl ExecutionPlan for StreamingFilterExec {
                             )
                         })
                         .collect::<Vec<_>>();
-                    let mut replacement = StreamingProjectionExec::from_original(
+                    // `self.source_owned` is always false here (source-owned
+                    // filters early-return above), so there is no boundary
+                    // mark to propagate onto the replacement.
+                    let replacement = StreamingProjectionExec::from_original(
                         ProjectionExec::try_new(proj_exprs, filter_input)?,
                     )?;
-                    // The projection replaces a source-owned filter, so it
-                    // inherits the topology-boundary mark.
-                    if self.source_owned {
-                        replacement.mark_source_owned();
-                    }
                     Some(Arc::new(replacement) as Arc<dyn ExecutionPlan>)
                 }
                 None => {

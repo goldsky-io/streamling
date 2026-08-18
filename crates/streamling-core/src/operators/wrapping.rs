@@ -258,14 +258,11 @@ impl WrappingSourceTableProvider {
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
             // consumer's plan subtree, and must act as a topology boundary so
             // their compute is not attributed to the consuming transform.
-            let mut marked_filter = filter_exec.clone();
-            marked_filter.mark_source_owned();
-            let mut marked_projection = projection_exec.clone();
-            marked_projection.mark_source_owned();
-            let rebuilt = Arc::new(marked_filter)
+            let rebuilt = Arc::new(filter_exec.clone().with_source_owned())
                 .with_new_children(vec![wrapped_source])
                 .and_then(|new_filter| {
-                    Arc::new(marked_projection).with_new_children(vec![new_filter])
+                    Arc::new(projection_exec.clone().with_source_owned())
+                        .with_new_children(vec![new_filter])
                 });
             match rebuilt {
                 Ok(plan) => return plan,
@@ -292,9 +289,9 @@ impl WrappingSourceTableProvider {
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
             // `WrappingExec` and must bound downstream metric aggregation.
-            let mut marked_filter = filter_exec.clone();
-            marked_filter.mark_source_owned();
-            match Arc::new(marked_filter).with_new_children(vec![wrapped_source]) {
+            match Arc::new(filter_exec.clone().with_source_owned())
+                .with_new_children(vec![wrapped_source])
+            {
                 Ok(plan) => plan,
                 Err(e) => {
                     warn!(

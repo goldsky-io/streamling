@@ -49,6 +49,10 @@ pub struct StreamingProjectionExec {
 }
 
 impl StreamingProjectionExec {
+    /// NOTE: always resets `source_owned` to `false`. A rebuild path that
+    /// routes a source-owned projection through here silently drops the
+    /// topology boundary mark — callers must re-apply it via
+    /// [`Self::with_source_owned`] (see `wrap_with_side_outputs_before_filter`).
     pub fn from_original(original_projection: ProjectionExec) -> Result<Self> {
         Ok(Self {
             expr: original_projection
@@ -72,9 +76,11 @@ impl StreamingProjectionExec {
         self.source_owned
     }
 
-    /// Mark this projection as owned by an upstream source node.
-    pub fn mark_source_owned(&mut self) {
+    /// Consume `self`, returning it marked as owned by an upstream source
+    /// node (see the `source_owned` field).
+    pub fn with_source_owned(mut self) -> Self {
         self.source_owned = true;
+        self
     }
 
     /// The projection expressions
@@ -191,6 +197,11 @@ impl ExecutionPlan for StreamingProjectionExec {
         // source's expression cost into the transform's metrics (and drop the
         // boundary mark). Keep the two projections stacked instead (the shared
         // fallback arm below).
+        //
+        // NOTE: the production session replaces DataFusion's physical
+        // optimizer rules with `StreamlingPhysicalOptimizerRules` (see
+        // session.rs), so ProjectionPushdown never runs there. This guard is
+        // defense-in-depth for embedders and future rule-set changes.
         let maybe_unified = if self.source_owned {
             None
         } else {

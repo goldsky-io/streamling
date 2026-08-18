@@ -25,7 +25,7 @@ use crate::checkpoints::checkpoint_management::{
 use crate::operators::filter::StreamingFilterExec;
 use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::wrapping::WrappingExec;
-use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -196,7 +196,18 @@ fn collect_subtree_metrics_inner(
     }
     if let Some(set) = plan.metrics() {
         for metric in set.iter() {
-            out.push(Arc::clone(metric));
+            // Capture only the variants the per-batch delta path exports
+            // (`subtree_delta_metric_values`); dropping the rest here —
+            // timestamps, output_rows/bytes/batches per operator per
+            // partition — keeps the per-batch loop from re-walking dead
+            // entries on every batch.
+            match metric.value() {
+                MetricValue::ElapsedCompute(_)
+                | MetricValue::Count { .. }
+                | MetricValue::Time { .. }
+                | MetricValue::Gauge { .. } => out.push(Arc::clone(metric)),
+                _ => {}
+            }
         }
     }
     for child in plan.children() {
@@ -901,10 +912,52 @@ mod tests {
         mem_table.scan(&ctx.state(), None, &[], None).await.unwrap()
     }
 
-    async fn drain(mut stream: SendableRecordBatchStream) {
-        while let Some(b) = stream.next().await {
-            b.unwrap();
-        }
+    /// Execute partition 0 of `plan` to completion, discarding the batches.
+    async fn drain(plan: &Arc<dyn ExecutionPlan>) {
+        let stream = plan.execute(0, SessionContext::new().task_ctx()).unwrap();
+        datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+    }
+
+    /// Aggregated `elapsed_compute` of `plan`, in whole milliseconds.
+    fn elapsed_ms(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+        plan.metrics().and_then(|m| m.elapsed_compute()).unwrap_or(0) as u64 / 1_000_000
+    }
+
+    /// Shared body for the boundary-exclusion tests: record ~45ms of real
+    /// compute on an operator (executed directly, so a boundary node's own
+    /// `execute()` side effects — e.g. `WrappingExec` initializing the
+    /// process-global `LiveDataInspect` singleton — never run), place it
+    /// below the boundary built by `make_boundary`, and assert
+    /// `CheckpointableExec::metrics` excludes it. Thresholds: >=25ms proves
+    /// the setup recorded compute (tolerating timer jitter); <10ms proves the
+    /// boundary excluded it.
+    async fn assert_boundary_excludes(
+        make_boundary: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
+    ) {
+        let below: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(3).await,
+            Duration::from_millis(15),
+        ));
+        drain(&below).await;
+        let below_ms = elapsed_ms(&below);
+        assert!(
+            below_ms >= 25,
+            "test setup: compute below the boundary must have recorded \
+             elapsed_compute, got {below_ms}ms"
+        );
+
+        let checkpointable: Arc<dyn ExecutionPlan> = Arc::new(CheckpointableExec::new(
+            make_boundary(below),
+            1,
+            "t".to_string(),
+        ));
+        let aggregated_ms = elapsed_ms(&checkpointable);
+        assert!(
+            aggregated_ms < 10,
+            "compute at/below a topology boundary must be excluded, got {aggregated_ms}ms"
+        );
     }
 
     /// Regression: `CheckpointableExec::metrics` must aggregate `elapsed_compute`
@@ -929,18 +982,12 @@ mod tests {
         let checkpointable: Arc<dyn ExecutionPlan> =
             Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
 
-        let ctx = SessionContext::new();
-        drain(checkpointable.execute(0, ctx.task_ctx()).unwrap()).await;
-
-        let aggregated = checkpointable
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .expect("CheckpointableExec must expose aggregated elapsed_compute");
+        drain(&checkpointable).await;
 
         // ~NUM_BATCHES * 15ms of deep compute; assert well below the nominal
         // total so scheduling jitter can't flake it, but far above the ~0 a
         // root-only forward would report.
-        let aggregated_ms = aggregated as u64 / 1_000_000;
+        let aggregated_ms = elapsed_ms(&checkpointable);
         assert!(
             aggregated_ms >= 25,
             "expected aggregated subtree elapsed_compute >= 25ms (got {aggregated_ms}ms); \
@@ -954,65 +1001,19 @@ mod tests {
     /// transform's query latency.
     #[tokio::test]
     async fn checkpointable_metrics_stop_at_nested_wrapping_exec() {
-        const NUM_BATCHES: usize = 3;
-        let per_batch = Duration::from_millis(15);
-
-        // Populate real `elapsed_compute` on a compute operator, then place it
-        // *below* a nested `WrappingExec` — a separate topology node. Executing
-        // the compute operator directly records its metrics without executing the
-        // `WrappingExec` (whose `execute()` initializes the process-global
-        // `LiveDataInspect` singleton and would make this test order-dependent).
-        let nested_compute: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
-            multi_batch_source(NUM_BATCHES).await,
-            per_batch,
-        ));
-
-        let ctx = SessionContext::new();
-        drain(nested_compute.execute(0, ctx.task_ctx()).unwrap()).await;
-
-        // Sanity: the operator below the boundary really recorded its own
-        // `elapsed_compute`, so the exclusion assertion is meaningful rather than
-        // vacuously passing on an empty set.
-        let below_ms = nested_compute
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
-        assert!(
-            below_ms >= 25,
-            "test setup: compute below the boundary must have recorded \
-             elapsed_compute, got {below_ms}ms"
-        );
-
-        let nested_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-            nested_compute,
-            "nested_upstream".to_string(),
-            vec![],
-            vec![],
-            None,
-        ));
-        // A zero-compute root above the boundary, so this transform's own
-        // compute is ~0.
-        let root: Arc<dyn ExecutionPlan> =
-            Arc::new(ComputeExec::new(nested_wrapping, Duration::ZERO));
-
-        let checkpointable: Arc<dyn ExecutionPlan> =
-            Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
-
-        let aggregated_ms = checkpointable
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
-
-        // The 3×15ms below the nested WrappingExec must be excluded; only the
-        // zero-compute root remains, so this stays near zero. If the boundary
-        // logic regressed and descended into the WrappingExec, the assertion
-        // above proves it would pick up >=25ms here.
-        assert!(
-            aggregated_ms < 10,
-            "compute below a nested WrappingExec must be excluded, got {aggregated_ms}ms"
-        );
+        assert_boundary_excludes(|below| {
+            let nested_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+                below,
+                "nested_upstream".to_string(),
+                vec![],
+                vec![],
+                None,
+            ));
+            // A zero-compute root above the boundary, so this transform's own
+            // compute is ~0.
+            Arc::new(ComputeExec::new(nested_wrapping, Duration::ZERO))
+        })
+        .await;
     }
 
     /// `CheckpointableExec::metrics` must also stop when the *root* of its input
@@ -1024,57 +1025,19 @@ mod tests {
     /// descend into the nested topology — folding another node's compute in.
     #[tokio::test]
     async fn checkpointable_metrics_stop_at_root_wrapping_exec() {
-        const NUM_BATCHES: usize = 3;
-        let per_batch = Duration::from_millis(15);
-
-        // Record real `elapsed_compute` on the operator that lives below the
-        // nested `WrappingExec`, without executing the `WrappingExec` itself
-        // (see sibling test for why direct execution is used).
-        let nested_compute: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
-            multi_batch_source(NUM_BATCHES).await,
-            per_batch,
-        ));
-
-        let ctx = SessionContext::new();
-        drain(nested_compute.execute(0, ctx.task_ctx()).unwrap()).await;
-
-        let below_ms = nested_compute
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
-        assert!(
-            below_ms >= 25,
-            "test setup: compute below the boundary must have recorded \
-             elapsed_compute, got {below_ms}ms"
-        );
-
-        // The `WrappingExec` is the input's ROOT this time — no intervening
-        // operator between it and the `CheckpointableExec`.
-        let root_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-            nested_compute,
-            "nested_upstream".to_string(),
-            vec![],
-            vec![],
-            None,
-        ));
-
-        let checkpointable: Arc<dyn ExecutionPlan> =
-            Arc::new(CheckpointableExec::new(root_wrapping, 1, "t".to_string()));
-
-        let aggregated_ms = checkpointable
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
-
-        // The entire subtree lives beyond the `WrappingExec` boundary, so none
-        // of the 3×15ms belongs to this transform. If the boundary check only
-        // guarded children (not the root), this would pick up >=25ms.
-        assert!(
-            aggregated_ms < 10,
-            "compute at/below a root WrappingExec must be excluded, got {aggregated_ms}ms"
-        );
+        // The `WrappingExec` is the input's ROOT — no intervening operator
+        // between it and the `CheckpointableExec`. If the boundary check only
+        // guarded children (not the root), this would collect the compute.
+        assert_boundary_excludes(|below| {
+            Arc::new(WrappingExec::new(
+                below,
+                "nested_upstream".to_string(),
+                vec![],
+                vec![],
+                None,
+            ))
+        })
+        .await;
     }
 
     /// A *source-owned* `StreamingFilterExec` (a source's filter re-applied
@@ -1088,58 +1051,29 @@ mod tests {
         use datafusion::physical_plan::expressions::lit;
         use datafusion::physical_plan::filter::FilterExec;
 
-        const NUM_BATCHES: usize = 3;
-        let per_batch = Duration::from_millis(15);
-
-        // Record real compute on the operator beneath the source-owned filter.
-        let source_compute: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
-            multi_batch_source(NUM_BATCHES).await,
-            per_batch,
-        ));
-        let ctx = SessionContext::new();
-        drain(source_compute.execute(0, ctx.task_ctx()).unwrap()).await;
-
-        let below_ms = source_compute
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
-        assert!(
-            below_ms >= 25,
-            "test setup: compute below the boundary must have recorded \
-             elapsed_compute, got {below_ms}ms"
-        );
-
-        let original = FilterExec::try_new(lit(true), Arc::clone(&source_compute)).unwrap();
-        let mut source_filter = StreamingFilterExec::from_original(original).unwrap();
-        source_filter.mark_source_owned();
-        let source_filter: Arc<dyn ExecutionPlan> = Arc::new(source_filter);
-
-        let checkpointable: Arc<dyn ExecutionPlan> =
-            Arc::new(CheckpointableExec::new(source_filter, 1, "t".to_string()));
-
-        let aggregated_ms = checkpointable
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
-        assert!(
-            aggregated_ms < 10,
-            "compute at/below a source-owned filter must be excluded, got {aggregated_ms}ms"
-        );
+        assert_boundary_excludes(|below| {
+            let original = FilterExec::try_new(lit(true), below).unwrap();
+            Arc::new(
+                StreamingFilterExec::from_original(original)
+                    .unwrap()
+                    .with_source_owned(),
+            )
+        })
+        .await;
 
         // Control: the SAME shape without the source-owned mark is the
         // transform's own filter, so the compute below it IS collected.
-        let original = FilterExec::try_new(lit(true), Arc::clone(&source_compute)).unwrap();
+        let below: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(3).await,
+            Duration::from_millis(15),
+        ));
+        drain(&below).await;
+        let original = FilterExec::try_new(lit(true), Arc::clone(&below)).unwrap();
         let own_filter: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingFilterExec::from_original(original).unwrap());
         let checkpointable: Arc<dyn ExecutionPlan> =
             Arc::new(CheckpointableExec::new(own_filter, 1, "t".to_string()));
-        let own_ms = checkpointable
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
+        let own_ms = elapsed_ms(&checkpointable);
         assert!(
             own_ms >= 25,
             "a transform-owned filter must not bound the walk, got {own_ms}ms"
@@ -1151,6 +1085,11 @@ mod tests {
     /// would exclude the transform's own projection compute from its metrics,
     /// and rebuilding the filter risks dropping the boundary mark. An
     /// unmarked (transform-owned) filter must still allow the swap.
+    ///
+    /// NOTE: the production session never runs ProjectionPushdown (the
+    /// physical rule set is replaced by `StreamlingPhysicalOptimizerRules`,
+    /// see session.rs); this covers the defense-in-depth guard for embedders
+    /// and future rule-set changes.
     #[tokio::test]
     async fn source_owned_filter_refuses_projection_swap() {
         use datafusion::physical_expr::expressions::Column as PhysicalColumn;
@@ -1161,9 +1100,11 @@ mod tests {
 
         let input = multi_batch_source(1).await;
         let original = FilterExec::try_new(lit(true), input).unwrap();
-        let mut filter = StreamingFilterExec::from_original(original).unwrap();
-        filter.mark_source_owned();
-        let filter: Arc<dyn ExecutionPlan> = Arc::new(filter);
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
 
         // A narrowing projection directly above the filter, as ProjectionPushdown
         // would present it.
@@ -1213,14 +1154,9 @@ mod tests {
             multi_batch_source(NUM_BATCHES).await,
             per_batch,
         ));
-        let ctx = SessionContext::new();
-        drain(shared.execute(0, ctx.task_ctx()).unwrap()).await;
+        drain(&shared).await;
 
-        let single_ms = shared
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
+        let single_ms = elapsed_ms(&shared);
         assert!(single_ms >= 25, "setup: expected recorded compute");
 
         let union: Arc<dyn ExecutionPlan> =
@@ -1228,11 +1164,7 @@ mod tests {
         let checkpointable: Arc<dyn ExecutionPlan> =
             Arc::new(CheckpointableExec::new(union, 1, "t".to_string()));
 
-        let aggregated_ms = checkpointable
-            .metrics()
-            .and_then(|m| m.elapsed_compute())
-            .unwrap_or(0) as u64
-            / 1_000_000;
+        let aggregated_ms = elapsed_ms(&checkpointable);
         assert_eq!(
             aggregated_ms, single_ms,
             "shared subplan must be counted once, not per parent"
