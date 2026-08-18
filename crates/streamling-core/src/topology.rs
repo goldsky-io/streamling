@@ -557,9 +557,7 @@ pub struct ScriptTransform {
     /// `primary_key`. Each stream owns one WASM instance. Defaults to the input
     /// width.
     pub parallelism: Option<usize>,
-    /// Rows accumulated per execution stream before invoking WASM, so a script
-    /// with `parallelism: N` buffers up to `N * batch_size` rows. If omitted,
-    /// input batches are passed through unchanged.
+    /// Rows accumulated per execution stream before invoking WASM.
     pub batch_size: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }

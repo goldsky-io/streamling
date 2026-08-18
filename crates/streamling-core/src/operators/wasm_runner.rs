@@ -2069,45 +2069,64 @@ mod tests {
                 panic!("Error executing logical plan: {:?}", e);
             }
         };
-        let batches = match df.collect().await {
-            Ok(batches) => batches,
+        let partitioned_batches = match df.collect_partitioned().await {
+            Ok(partitioned_batches) => partitioned_batches,
             Err(e) => {
-                eprintln!("Error collecting batches: {:?}", e);
-                panic!("Error collecting batches: {:?}", e);
+                eprintln!("Error collecting partitioned batches: {:?}", e);
+                panic!("Error collecting partitioned batches: {:?}", e);
             }
         };
 
         assert_eq!(
-            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            partitioned_batches.len(),
+            2,
+            "WASM must preserve input width"
+        );
+        assert_eq!(
+            partitioned_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
             num_rows,
             "every input partition must be processed"
         );
 
-        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
-        let id_col = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let doubled_col = batch
-            .column_by_name("doubled")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let rows_per_partition = num_rows / partitioned_batches.len();
+        for (partition, batches) in partitioned_batches.iter().enumerate() {
+            let schema = batches
+                .first()
+                .expect("each input partition must produce a batch")
+                .schema();
+            let batch = concat_batches(&schema, batches).unwrap();
+            assert_eq!(batch.num_rows(), rows_per_partition);
 
-        for idx in 0..num_rows {
-            let id = id_col.value(idx);
-            let doubled = doubled_col.value(idx);
-            assert_eq!(
-                doubled,
-                id * 2,
-                "Row {} should have doubled={}, but got doubled={}",
-                idx,
-                id * 2,
-                doubled
-            );
+            let id_column = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let doubled_column = batch
+                .column_by_name("doubled")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            for row in 0..rows_per_partition {
+                let expected_id = (partition * rows_per_partition + row) as i64;
+                assert_eq!(
+                    id_column.value(row),
+                    expected_id,
+                    "partition {partition} must preserve row order"
+                );
+                assert_eq!(
+                    doubled_column.value(row),
+                    expected_id * 2,
+                    "partition {partition}, row {row} must preserve transformed values"
+                );
+            }
         }
     }
 }

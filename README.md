@@ -562,18 +562,14 @@ input stream. It's implemented as a custom DataFusion operator (`WasmRunnerExec`
 - **Runtime Environment**: Uses Extism's [js-pdk](https://github.com/extism/js-pdk) to execute JavaScript code in a
   sandboxed WebAssembly environment.
 - **Record Processing**:
-  - Sends Arrow `RecordBatch`es into WASM as Arrow IPC.
-  - Decodes each record into a JavaScript object and invokes the provided function.
+  - Converts Arrow `RecordBatch`es to JSON strings.
+  - Executes the provided JavaScript code for each record.
   - Uses JavaScript's `eval` function within the WebAssembly sandbox.
-  - Encodes the results as Arrow IPC and converts them back to `RecordBatch`es.
+  - Converts the results back to Arrow `RecordBatch`es.
 - **Batching**:
   - Processes multiple records in a batch for better performance.
+  - Uses newline character as a separator between records.
   - Maintains checkpointing for reliable processing.
-- **Parallel execution**:
-  - `parallelism` controls the number of physical execution streams.
-  - Input rows are hash-partitioned by `primary_key`, and each stream owns one
-    isolated WASM instance.
-  - `batch_size` applies independently to each stream.
 - **Language Support**:
   - Supports any valid **browser** JavaScript and TypeScript (no Node APIs).
   - TypeScript is transpiled to JavaScript in runtime using [swc](https://swc.rs/).
@@ -597,8 +593,6 @@ transforms:
         return input;
       }
     primary_key: id
-    parallelism: 4
-    batch_size: 1000
 ```
 
 Note: `script` field accepts any valid **browser** JavaScript or TypeScript snippet inside a `process` function with a
