@@ -1429,7 +1429,7 @@ impl Streamling {
                             output_schema,
                             Arc::new(initialized_plugin.channels.clone()),
                             app_config.internal_buffer_size,
-                            reference_name.clone(),
+                            metric_key(&application_id, reference_name.as_str()),
                         )),
                     });
 
@@ -3228,6 +3228,30 @@ sinks: {}
         assert_eq!(
             meta.additional_tags.get("topic"),
             Some(&"v2.evm.blocks".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plugin_transform_metric_metadata_keyed_by_composite_key() {
+        let yaml = r#"
+sources:
+  blocks:
+    type: kafka
+    topic: v2.evm.blocks
+transforms:
+  token_metadata:
+    type: test_transform_plugin
+    from: blocks
+sinks: {}
+"#;
+        let map = build_metadata_from_yaml(yaml);
+        assert!(
+            map.contains_key(&metric_key("test_app", "token_metadata")),
+            "plugin transform metadata must be keyed by metric_key(app_id, reference_name)"
+        );
+        assert!(
+            !map.contains_key("token_metadata"),
+            "bare reference name is not a registry key; consumers must look up by the composite key"
         );
     }
 
