@@ -18,5 +18,6 @@ pub mod wrapping;
 /// downcasts a closed set; each type opts in here so "always bound" vs
 /// source-owned lives on the operator, not as ad-hoc checks in the walk.
 pub(crate) trait TopologyBoundary {
+    /// `true` always bounds the walk; filter/projection return `source_owned`.
     fn bounds_metric_aggregation(&self) -> bool;
 }
