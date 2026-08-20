@@ -214,6 +214,10 @@ impl MetricsRecorder {
     /// merged at that point (`merge_metadata_tags`), and seeding earlier
     /// would emit the sample on a pre-merge tag set — an orphan series that
     /// dashboards filtering on those labels would never match.
+    ///
+    /// Consumers must treat `elapsed_compute <= 1ms` as "no real compute
+    /// recorded": the seed is indistinguishable from a node that truly did
+    /// about 1ms of work (or stalled after seeding).
     pub fn seed_elapsed_compute_series(&self) {
         // The no-op fallback recorder has an empty histogram registry and the
         // ElapsedCompute record arm would panic on the missing instrument.
