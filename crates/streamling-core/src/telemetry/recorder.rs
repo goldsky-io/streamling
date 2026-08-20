@@ -300,9 +300,13 @@ impl MetricsRecorder {
         }
     }
 
-    /// Whether `metadata_id` is a SQL transform node. Static per node, so
-    /// callers on per-batch paths should resolve it once per stream (see
-    /// `WrappingExec::execute`) rather than per batch.
+    /// Whether `metadata_id` is registered as a SQL transform (`operator_type == "sql"`).
+    ///
+    /// Takes the metadata-registry lock. The result is static for a node's
+    /// lifetime, so per-batch paths must resolve it **once per stream** (see
+    /// `WrappingExec::execute`) rather than on every batch. Used to suppress
+    /// wall-clock `elapsed_compute` when the DataFusion subtree already
+    /// supplies per-batch deltas.
     pub fn is_sql_node(&self, metadata_id: &str) -> bool {
         self.metric_metadata_registry
             .lock()
