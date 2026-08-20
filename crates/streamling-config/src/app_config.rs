@@ -752,23 +752,23 @@ impl KafkaSinkConnection {
         if let Some(security_protocol) = &self.security_protocol {
             config.security_protocol = security_protocol.clone();
         }
-        if self.sasl_mechanism.is_some() {
-            config.sasl_mechanism = self.sasl_mechanism.clone();
+        if let Some(sasl_mechanism) = &self.sasl_mechanism {
+            config.sasl_mechanism = Some(sasl_mechanism.clone());
         }
-        if self.sasl_username.is_some() {
-            config.sasl_username = self.sasl_username.clone();
+        if let Some(sasl_username) = &self.sasl_username {
+            config.sasl_username = Some(sasl_username.clone());
         }
-        if self.sasl_password.is_some() {
-            config.sasl_password = self.sasl_password.clone();
+        if let Some(sasl_password) = &self.sasl_password {
+            config.sasl_password = Some(sasl_password.clone());
         }
-        if self.schema_registry_url.is_some() {
-            config.schema_registry_url = self.schema_registry_url.clone();
+        if let Some(schema_registry_url) = &self.schema_registry_url {
+            config.schema_registry_url = Some(schema_registry_url.clone());
         }
-        if self.schema_registry_username.is_some() {
-            config.schema_registry_username = self.schema_registry_username.clone();
+        if let Some(schema_registry_username) = &self.schema_registry_username {
+            config.schema_registry_username = Some(schema_registry_username.clone());
         }
-        if self.schema_registry_password.is_some() {
-            config.schema_registry_password = self.schema_registry_password.clone();
+        if let Some(schema_registry_password) = &self.schema_registry_password {
+            config.schema_registry_password = Some(schema_registry_password.clone());
         }
     }
 }

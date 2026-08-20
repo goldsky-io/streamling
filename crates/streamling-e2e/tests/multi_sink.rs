@@ -506,3 +506,156 @@ sinks:
         webhook.request_count()
     );
 }
+
+// ============================================================================
+// Scenario 5: Two postgres sinks, two databases (STRM-6516)
+// ============================================================================
+
+/// Regression: two `postgres` sinks in one pipeline must write to the two
+/// databases they were each given, not both to whichever connection the
+/// deployer published last.
+///
+/// A streamling process has one global `postgres_sink` block, and
+/// streamling-agent used to flatten every sink's resolved secret into it, so the
+/// second secret it processed overwrote the first: both sinks connected to the
+/// same database and the other database received nothing (LiFi `solana-mainnet`,
+/// two sinks writing the same table name into a prod and a dev database).
+///
+/// The sinks here are the same shape — identical table, two databases — and only
+/// `pg_second` gets per-sink keys, in the exact
+/// `STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__<FIELD>` form the agent
+/// writes. `pg_primary` stays on the global block and `pg_second` omits
+/// `SSLMODE`, so the run also covers the fallback path per sink and per field.
+/// Pre-fix, `multi_db_rows` never existed in the second database.
+#[tokio::test]
+async fn test_multi_sink_two_postgres_databases() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let second = ctx
+        .create_postgres_database("second")
+        .await
+        .expect("Failed to create second PostgreSQL database");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce: i64 = 10;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_primary:
+    type: postgres
+    from: kafka_source
+    table: multi_db_rows
+    schema: public
+    primary_key: id
+    on_conflict: update
+
+  pg_second:
+    type: postgres
+    from: kafka_source
+    table: multi_db_rows
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(std::time::Duration::from_secs(60))
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__HOST",
+                    second.host.clone(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__PORT",
+                    second.port.to_string(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__USER",
+                    second.user.clone(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__PASS",
+                    second.password.clone(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__DB",
+                    second.database.clone(),
+                ),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let primary_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.multi_db_rows")
+        .await
+        .expect("Failed to query the primary database");
+    assert_eq!(
+        primary_count, records_to_produce,
+        "sink on the global connection should have written {} records to database '{}'",
+        records_to_produce, ctx.pg_database
+    );
+
+    // The regression: without per-sink resolution this table does not exist here
+    // at all, because pg_second connected to the primary database instead.
+    let second_count = second
+        .count("SELECT COUNT(*) FROM public.multi_db_rows")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "sink with per-sink connection keys did not write to database '{}': {}",
+                second.database, e
+            )
+        });
+    assert_eq!(
+        second_count, records_to_produce,
+        "sink with per-sink connection keys should have written {} records to database '{}'",
+        records_to_produce, second.database
+    );
+
+    let second_ids: Vec<(i64,)> = second
+        .query("SELECT id FROM public.multi_db_rows ORDER BY id")
+        .await
+        .expect("Failed to query ids from the second database");
+    assert_eq!(
+        second_ids.iter().map(|row| row.0).collect::<Vec<_>>(),
+        (1..=records_to_produce).collect::<Vec<_>>(),
+        "the second database should hold every record, not a subset"
+    );
+}
