@@ -1235,7 +1235,12 @@ mod tests {
         // The top-level plan should be a StreamingFilterExec (filter is on top)
         let rebuilt_filter = result
             .downcast_ref::<StreamingFilterExec>()
-            .unwrap_or_else(|| panic!("Expected top-level plan to be StreamingFilterExec, got: {}", result.name()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected top-level plan to be StreamingFilterExec, got: {}",
+                    result.name()
+                )
+            });
         assert!(
             rebuilt_filter.is_source_owned(),
             "wrap reconstruction must keep the source-owned topology boundary"
