@@ -70,6 +70,11 @@ const SQL_OPERATOR_TYPE: &str = "sql";
 /// `TelemetryStream` / the recorder itself.
 const SUBTREE_METRIC_PREFIX: &str = "df_";
 
+/// Phantom `elapsed_compute` sample used by
+/// [`MetricsRecorder::seed_elapsed_compute_series`]. Consumers must treat
+/// values at or below this as "no real compute recorded".
+const ELAPSED_COMPUTE_SEED_MS: u64 = 1;
+
 /// Millisecond bucket layout shared by every duration histogram (the
 /// hand-registered `elapsed_compute` and any auto-created `Time` metric), so
 /// all duration series bucket identically up to one hour.
@@ -223,9 +228,9 @@ impl MetricsRecorder {
     /// would emit the sample on a pre-merge tag set — an orphan series that
     /// dashboards filtering on those labels would never match.
     ///
-    /// Consumers must treat `elapsed_compute <= 1ms` as "no real compute
-    /// recorded": the seed is indistinguishable from a node that truly did
-    /// about 1ms of work (or stalled after seeding).
+    /// Consumers must treat `elapsed_compute <= ELAPSED_COMPUTE_SEED_MS` as
+    /// "no real compute recorded": the seed is indistinguishable from a node
+    /// that truly did about that much work (or stalled after seeding).
     pub fn seed_elapsed_compute_series(&self) {
         // The no-op fallback recorder has an empty histogram registry and the
         // ElapsedCompute record arm would panic on the missing instrument.
@@ -256,7 +261,7 @@ impl MetricsRecorder {
                 .collect()
         };
         for id in ids {
-            self.record_elapsed_compute(Duration::from_millis(1), &id);
+            self.record_elapsed_compute(Duration::from_millis(ELAPSED_COMPUTE_SEED_MS), &id);
             self.seeded_elapsed_compute
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
