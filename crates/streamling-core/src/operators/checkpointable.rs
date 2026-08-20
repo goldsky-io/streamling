@@ -945,7 +945,7 @@ mod tests {
     /// below the boundary built by `make_boundary`, and assert
     /// `CheckpointableExec::metrics` excludes it. Thresholds: >=25ms proves
     /// the setup recorded compute (tolerating timer jitter); <10ms proves the
-    /// boundary excluded it.
+    /// boundary excluded it. Slack is for CI timer jitter — do not env-var-skip.
     async fn assert_boundary_excludes(
         make_boundary: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
     ) {
@@ -999,7 +999,8 @@ mod tests {
 
         // ~NUM_BATCHES * 15ms of deep compute; assert well below the nominal
         // total so scheduling jitter can't flake it, but far above the ~0 a
-        // root-only forward would report.
+        // root-only forward would report. Slack is for CI timer jitter — do
+        // not env-var-skip.
         let aggregated_ms = elapsed_ms(&checkpointable);
         assert!(
             aggregated_ms >= 25,
