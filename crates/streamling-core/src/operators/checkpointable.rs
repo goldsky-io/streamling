@@ -163,6 +163,12 @@ fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
     false
 }
 
+/// DataFusion's [`MetricsSet`] has no `is_empty()`; this is the emptiness check
+/// `CheckpointableExec::metrics` uses to restore the metric-less short-circuit.
+fn metrics_set_is_empty(set: &MetricsSet) -> bool {
+    set.iter().next().is_none()
+}
+
 /// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
 /// into `out`, stopping at any topology boundary (see [`is_topology_boundary`]).
 ///
@@ -395,7 +401,7 @@ impl ExecutionPlan for CheckpointableExec {
         // so per-batch consumers keep their metric-less short-circuit.
         let mut aggregated = MetricsSet::new();
         collect_subtree_metrics(&self.input, &mut aggregated);
-        if aggregated.iter().next().is_none() {
+        if metrics_set_is_empty(&aggregated) {
             None
         } else {
             Some(aggregated)
