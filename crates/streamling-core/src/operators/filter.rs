@@ -511,9 +511,6 @@ impl ExecutionPlan for StreamingFilterExec {
                             )
                         })
                         .collect::<Vec<_>>();
-                    // `self.source_owned` is always false here (source-owned
-                    // filters early-return above), so there is no boundary
-                    // mark to propagate onto the replacement.
                     let replacement = StreamingProjectionExec::from_original(
                         ProjectionExec::try_new(proj_exprs, filter_input)?,
                     )?;
@@ -542,7 +539,9 @@ impl ExecutionPlan for StreamingFilterExec {
                 )?),
                 projection: None,
                 original_filter: self.original_filter.clone(),
-                source_owned: self.source_owned,
+                // Source-owned filters already returned above; this rewrite
+                // is only for transform-owned filters.
+                source_owned: false,
             };
             Some(Arc::new(new) as _)
         };
@@ -780,6 +779,45 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn source_owned_filter_pushdown_does_not_rewrite_the_node() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = FilterExec::try_new(lit(true), Arc::clone(&input)).unwrap();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+
+        // One child, no remaining predicates. Without the source-owned
+        // early-return this would strip the filter (`updated_node = Some(input)`).
+        let child_result = ChildPushdownResult {
+            parent_filters: vec![],
+            self_filters: vec![vec![]],
+        };
+        let out = filter
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Pre,
+                child_result,
+                &ConfigOptions::new(),
+            )
+            .expect("pushdown handler");
+        assert!(
+            out.updated_node.is_none(),
+            "a source-owned filter must not be rewritten or stripped by filter pushdown"
+        );
+        assert!(
+            filter
+                .downcast_ref::<StreamingFilterExec>()
+                .expect("still a StreamingFilterExec")
+                .is_source_owned()
+        );
     }
 
     #[test]
