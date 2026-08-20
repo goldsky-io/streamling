@@ -470,6 +470,78 @@ sinks:
     );
 }
 
+/// SQL transform `elapsed_compute` must reach Prometheus above the 1ms series
+/// seed, proving WrappingExec → CheckpointableExec → record_execution_plan_metrics
+/// emits query latency for operator_type=sql.
+#[tokio::test]
+async fn test_sql_transform_elapsed_compute_emitted() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus should be available");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Enough rows of a CPU-ish projection that DataFusion's elapsed_compute
+    // on the SQL subtree exceeds the 1ms per-node series seed.
+    let records = create_test_records(50);
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    primary_key: id
+
+transforms:
+  sql_transform:
+    type: sql
+    sql: "SELECT id, md5(repeat(data, 8000)) AS h, _gs_op FROM kafka_source"
+    primary_key: id
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: sql_transform
+"#,
+        topic = ctx.kafka_topic
+    );
+
+    let _status = ctx
+        .run_pipeline_with_opts(&pipeline, PipelineOpts::new().record_limit(50))
+        .await
+        .expect("Pipeline should complete successfully");
+
+    use streamling_e2e::resources::PrometheusResource;
+    let elapsed_query =
+        PrometheusResource::elapsed_compute_query("sql_transform", Some(&ctx.test_id));
+
+    // Seed records 1ms; require a strictly larger sum so this fails if we
+    // only ever emit the seed and never SQL subtree compute.
+    let elapsed = prometheus
+        .wait_for_metric_at_least(&elapsed_query, 2, 15, 500)
+        .await;
+    assert!(
+        elapsed.is_ok(),
+        "sql_transform elapsed_compute must exceed the 1ms series seed: {:?}",
+        elapsed
+    );
+}
+
 // ============================================================================
 // Scenario 5: Chained SQL transforms with comments containing apostrophes
 // ============================================================================
