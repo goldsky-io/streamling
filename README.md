@@ -692,10 +692,6 @@ STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_BLOCKS__HOST=blocks.example.com
 STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_BLOCKS__DB=blocks
 ```
 
-The same shape exists for the Kafka and ClickHouse sinks
-(`STREAMLING__KAFKA_SINK_CONNECTIONS__<SINK_NAME>__*`,
-`STREAMLING__CLICKHOUSE_SINK_CONNECTIONS__<SINK_NAME>__*`).
-
 Behavior for 256-bit integers (U256/I256):
 
 - Columns annotated as U256/I256 in the Arrow schema (FixedSizeBinary(32) with Streamling metadata) are created in Postgres as `NUMERIC(78,0)`.

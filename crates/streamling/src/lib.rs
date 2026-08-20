@@ -1903,17 +1903,10 @@ impl Streamling {
                         &source_schema,
                     )?;
 
-                    // Per-sink connection (STRM-6516); global kafka_sink otherwise.
-                    let kafka_config = app_config.kafka_sink_for(&reference_name);
-                    info!(
-                        "kafka sink '{}' resolved connection {:?}",
-                        reference_name, kafka_config
-                    );
-
                     let kafka_sink_provider = Arc::new(KafkaSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema,
-                        kafka_config,
+                        app_config.kafka_sink.clone(),
                         topic.clone(),
                         topic_partitions,
                         data_format.parse()?,
@@ -1976,16 +1969,10 @@ impl Streamling {
                         Some(raw_batch_flush_interval.unwrap_or_else(|| {
                             Duration::from_millis(app_config.record_batch_interval_ms)
                         }));
-                    // Per-sink connection (STRM-6516); global clickhouse_sink otherwise.
-                    let clickhouse_config = app_config.clickhouse_sink_for(&reference_name);
-                    info!(
-                        "clickhouse sink '{}' resolved connection {:?}",
-                        reference_name, clickhouse_config
-                    );
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),
                         table.as_str(),
-                        clickhouse_config,
+                        app_config.clickhouse_sink.clone(),
                         effective_batch_size,
                         app_config.num_records_before_stop,
                         pk_metadata_opt.map(|pk| pk.to_str()).unwrap_or_default(),

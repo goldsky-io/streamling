@@ -671,108 +671,6 @@ impl PostgresSinkConnection {
     }
 }
 
-/// Connection overrides for one `clickhouse` sink node. See
-/// [`PostgresSinkConnection`] for why these exist.
-#[derive(Deserialize, Clone, Default)]
-pub struct ClickHouseSinkConnection {
-    pub url: Option<String>,
-    pub user: Option<String>,
-    pub password: Option<String>,
-    pub database: Option<String>,
-}
-
-impl std::fmt::Debug for ClickHouseSinkConnection {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClickHouseSinkConnection")
-            .field("url", &self.url)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "*****"))
-            .field("database", &self.database)
-            .finish()
-    }
-}
-
-impl ClickHouseSinkConnection {
-    fn apply_to(&self, config: &mut ClickHouseSinkConfig) {
-        if let Some(url) = &self.url {
-            config.url = url.clone();
-        }
-        if let Some(user) = &self.user {
-            config.user = user.clone();
-        }
-        if let Some(password) = &self.password {
-            config.password = password.clone();
-        }
-        if let Some(database) = &self.database {
-            config.database = database.clone();
-        }
-    }
-}
-
-/// Connection overrides for one `kafka` sink node. See
-/// [`PostgresSinkConnection`] for why these exist.
-#[derive(Deserialize, Clone, Default)]
-pub struct KafkaSinkConnection {
-    pub brokers: Option<String>,
-    pub security_protocol: Option<String>,
-    pub sasl_mechanism: Option<String>,
-    pub sasl_username: Option<String>,
-    pub sasl_password: Option<String>,
-    pub schema_registry_url: Option<String>,
-    pub schema_registry_username: Option<String>,
-    pub schema_registry_password: Option<String>,
-}
-
-impl std::fmt::Debug for KafkaSinkConnection {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KafkaSinkConnection")
-            .field("brokers", &self.brokers)
-            .field("security_protocol", &self.security_protocol)
-            .field("sasl_mechanism", &self.sasl_mechanism)
-            .field("sasl_username", &self.sasl_username)
-            .field(
-                "sasl_password",
-                &self.sasl_password.as_ref().map(|_| "*****"),
-            )
-            .field("schema_registry_url", &self.schema_registry_url)
-            .field("schema_registry_username", &self.schema_registry_username)
-            .field(
-                "schema_registry_password",
-                &self.schema_registry_password.as_ref().map(|_| "*****"),
-            )
-            .finish()
-    }
-}
-
-impl KafkaSinkConnection {
-    fn apply_to(&self, config: &mut KafkaConfig) {
-        if let Some(brokers) = &self.brokers {
-            config.brokers = brokers.clone();
-        }
-        if let Some(security_protocol) = &self.security_protocol {
-            config.security_protocol = security_protocol.clone();
-        }
-        if let Some(sasl_mechanism) = &self.sasl_mechanism {
-            config.sasl_mechanism = Some(sasl_mechanism.clone());
-        }
-        if let Some(sasl_username) = &self.sasl_username {
-            config.sasl_username = Some(sasl_username.clone());
-        }
-        if let Some(sasl_password) = &self.sasl_password {
-            config.sasl_password = Some(sasl_password.clone());
-        }
-        if let Some(schema_registry_url) = &self.schema_registry_url {
-            config.schema_registry_url = Some(schema_registry_url.clone());
-        }
-        if let Some(schema_registry_username) = &self.schema_registry_username {
-            config.schema_registry_username = Some(schema_registry_username.clone());
-        }
-        if let Some(schema_registry_password) = &self.schema_registry_password {
-            config.schema_registry_password = Some(schema_registry_password.clone());
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExternalHttpHandlerConfig {
     pub trigger_max_count: u32,
@@ -928,12 +826,6 @@ pub struct AppConfig {
     /// via [`AppConfig::postgres_sink_for`].
     #[serde(default)]
     pub postgres_sink_connections: HashMap<String, PostgresSinkConnection>,
-    /// Per-sink ClickHouse connections. See [`AppConfig::clickhouse_sink_for`].
-    #[serde(default)]
-    pub clickhouse_sink_connections: HashMap<String, ClickHouseSinkConnection>,
-    /// Per-sink Kafka connections. See [`AppConfig::kafka_sink_for`].
-    #[serde(default)]
-    pub kafka_sink_connections: HashMap<String, KafkaSinkConnection>,
     #[serde(default)]
     pub test_settings: TestSettings,
     /// When true, hybrid sources terminate after all bounded phases complete
@@ -960,32 +852,6 @@ impl AppConfig {
         let mut config = self.postgres_sink.clone();
         if let Some(connection) = self
             .postgres_sink_connections
-            .get(&normalize_sink_key(sink_name))
-        {
-            connection.apply_to(&mut config);
-        }
-        config
-    }
-
-    /// Connection for the `clickhouse` sink node named `sink_name`.
-    /// See [`AppConfig::postgres_sink_for`].
-    pub fn clickhouse_sink_for(&self, sink_name: &str) -> ClickHouseSinkConfig {
-        let mut config = self.clickhouse_sink.clone();
-        if let Some(connection) = self
-            .clickhouse_sink_connections
-            .get(&normalize_sink_key(sink_name))
-        {
-            connection.apply_to(&mut config);
-        }
-        config
-    }
-
-    /// Connection for the `kafka` sink node named `sink_name`.
-    /// See [`AppConfig::postgres_sink_for`].
-    pub fn kafka_sink_for(&self, sink_name: &str) -> KafkaConfig {
-        let mut config = self.kafka_sink.clone();
-        if let Some(connection) = self
-            .kafka_sink_connections
             .get(&normalize_sink_key(sink_name))
         {
             connection.apply_to(&mut config);
@@ -1204,43 +1070,6 @@ mod tests {
         let resolved = config.postgres_sink_for("some_sink");
         assert_eq!(resolved.host, config.postgres_sink.host);
         assert_eq!(resolved.db, config.postgres_sink.db);
-
-        let clickhouse = config.clickhouse_sink_for("some_sink");
-        assert_eq!(clickhouse.url, config.clickhouse_sink.url);
-
-        let kafka = config.kafka_sink_for("some_sink");
-        assert_eq!(kafka.brokers, config.kafka_sink.brokers);
-    }
-
-    #[test]
-    fn clickhouse_and_kafka_connections_resolve_per_sink() {
-        let mut config = base_app_config();
-        config.clickhouse_sink_connections.insert(
-            "ch_two".to_string(),
-            ClickHouseSinkConnection {
-                url: Some("https://two.clickhouse.cloud:8443".to_string()),
-                database: Some("two".to_string()),
-                ..Default::default()
-            },
-        );
-        config.kafka_sink_connections.insert(
-            "kafka_two".to_string(),
-            KafkaSinkConnection {
-                brokers: Some("two.broker:9092".to_string()),
-                sasl_username: Some("two".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let ch = config.clickhouse_sink_for("ch_two");
-        assert_eq!(ch.url, "https://two.clickhouse.cloud:8443");
-        assert_eq!(ch.database, "two");
-        assert_eq!(ch.user, config.clickhouse_sink.user);
-
-        let kafka = config.kafka_sink_for("kafka_two");
-        assert_eq!(kafka.brokers, "two.broker:9092");
-        assert_eq!(kafka.sasl_username, Some("two".to_string()));
-        assert_eq!(kafka.security_protocol, config.kafka_sink.security_protocol);
     }
 
     /// End-to-end env path: the agent writes
