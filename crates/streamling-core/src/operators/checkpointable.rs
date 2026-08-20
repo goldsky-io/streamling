@@ -922,7 +922,10 @@ mod tests {
 
     /// Aggregated `elapsed_compute` of `plan`, in whole milliseconds.
     fn elapsed_ms(plan: &Arc<dyn ExecutionPlan>) -> u64 {
-        plan.metrics().and_then(|m| m.elapsed_compute()).unwrap_or(0) as u64 / 1_000_000
+        plan.metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000
     }
 
     /// Shared body for the boundary-exclusion tests: record ~45ms of real

@@ -708,8 +708,10 @@ impl MetricsRecorder {
                 if !node.counts.contains_key(name) {
                     node.counts.insert(name.to_string(), 0);
                 }
-                let delta =
-                    cumulative_delta(node.counts.get_mut(name).expect("just inserted"), cumulative);
+                let delta = cumulative_delta(
+                    node.counts.get_mut(name).expect("just inserted"),
+                    cumulative,
+                );
                 if delta > 0 {
                     count_deltas.push((name, delta));
                 }
@@ -1877,9 +1879,7 @@ mod tests {
 
         fn elapsed_compute_metric(nanos: u64) -> Arc<Metric> {
             Arc::new(Metric::new(
-                MetricValue::ElapsedCompute(create_time_from_duration(Duration::from_nanos(
-                    nanos,
-                ))),
+                MetricValue::ElapsedCompute(create_time_from_duration(Duration::from_nanos(nanos))),
                 None,
             ))
         }
