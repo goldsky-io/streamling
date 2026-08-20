@@ -783,6 +783,34 @@ mod tests {
     }
 
     #[test]
+    fn with_new_children_preserves_source_owned() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let marked = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+        assert!(marked.is_source_owned());
+
+        let new_child: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let rebuilt = Arc::clone(&marked)
+            .with_new_children(vec![new_child])
+            .expect("with_new_children");
+        let rebuilt = rebuilt
+            .downcast_ref::<StreamingFilterExec>()
+            .expect("must remain a StreamingFilterExec");
+        assert!(
+            rebuilt.is_source_owned(),
+            "with_new_children must not drop the topology-boundary mark"
+        );
+    }
+
+    #[test]
     fn test_batch_filter_preserves_checkpoint_metadata() {
         // Create metadata with checkpoint marker (as used in production)
         let checkpoint_messages = vec![CheckpointMessage::Marker {

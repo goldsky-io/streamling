@@ -1167,20 +1167,33 @@ mod tests {
         );
 
         // Order must be projection -> filter -> wrapper -> source, so side
-        // outputs / event-time observe every pre-filter row (R7).
+        // outputs / event-time observe every pre-filter row (R7). Both
+        // rebuilt nodes must keep the source-owned topology-boundary mark.
+        let rebuilt_proj = result
+            .downcast_ref::<StreamingProjectionExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected top-level plan to be StreamingProjectionExec, got: {}",
+                    result.name()
+                )
+            });
         assert!(
-            result.downcast_ref::<StreamingProjectionExec>().is_some(),
-            "Expected top-level plan to be StreamingProjectionExec, got: {}",
-            result.name()
+            rebuilt_proj.is_source_owned(),
+            "rebuilt source projection must stay a topology boundary"
         );
         let proj_children = result.children();
         assert_eq!(proj_children.len(), 1);
+        let rebuilt_filter = proj_children[0]
+            .downcast_ref::<StreamingFilterExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected projection's child to be StreamingFilterExec, got: {}",
+                    proj_children[0].name()
+                )
+            });
         assert!(
-            proj_children[0]
-                .downcast_ref::<StreamingFilterExec>()
-                .is_some(),
-            "Expected projection's child to be StreamingFilterExec, got: {}",
-            proj_children[0].name()
+            rebuilt_filter.is_source_owned(),
+            "rebuilt source filter must stay a topology boundary after with_new_children"
         );
         let filter_children = proj_children[0].children();
         assert_eq!(filter_children.len(), 1);
@@ -1220,10 +1233,12 @@ mod tests {
         );
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
+        let rebuilt_filter = result
+            .downcast_ref::<StreamingFilterExec>()
+            .unwrap_or_else(|| panic!("Expected top-level plan to be StreamingFilterExec, got: {}", result.name()));
         assert!(
-            result.downcast_ref::<StreamingFilterExec>().is_some(),
-            "Expected top-level plan to be StreamingFilterExec, got: {}",
-            result.name()
+            rebuilt_filter.is_source_owned(),
+            "wrap reconstruction must keep the source-owned topology boundary"
         );
 
         // Its child should be WrappingExec (side outputs run before the filter)
