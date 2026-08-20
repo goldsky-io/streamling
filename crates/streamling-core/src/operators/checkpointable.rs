@@ -134,10 +134,16 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 /// Whether `plan` marks the edge of this transform's own physical subtree for
 /// metric attribution.
 ///
-/// Two kinds of boundary exist:
+/// Types opt in via [`crate::operators::TopologyBoundary`]. This walk still
+/// downcasts the closed set because DataFusion's `ExecutionPlan` has no local
+/// hook; adding a boundary type means `impl TopologyBoundary` plus one arm.
+///
+/// Three kinds of boundary exist:
 /// - A [`WrappingExec`]: a *separate* topology node that records its own
 ///   `elapsed_compute`; descending into it would fold another node's compute
 ///   into this transform's aggregate, double-counting it.
+/// - A nested [`CheckpointableExec`]: another transform's aggregation point
+///   (its `metrics()` already covers its subtree).
 /// - A source-owned [`StreamingFilterExec`] / [`StreamingProjectionExec`]:
 ///   `wrap_with_side_outputs_before_filter` re-applies a source's filter and
 ///   projection ABOVE the source's `WrappingExec` (so side outputs observe
@@ -145,22 +151,18 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 ///   consuming transform's subtree. Without stopping at them, an expensive
 ///   source-level filter would be misattributed to the transform's compute.
 fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.downcast_ref::<WrappingExec>().is_some() {
-        return true;
-    }
-    // A nested CheckpointableExec is another transform's aggregation point:
-    // its `metrics()` already covers its own subtree, so descending past it
-    // would double-count everything below (and misattribute it to this node).
-    if plan.downcast_ref::<CheckpointableExec>().is_some() {
-        return true;
-    }
-    if let Some(filter) = plan.downcast_ref::<StreamingFilterExec>() {
-        return filter.is_source_owned();
-    }
-    if let Some(projection) = plan.downcast_ref::<StreamingProjectionExec>() {
-        return projection.is_source_owned();
-    }
-    false
+    topology_boundary_of::<WrappingExec>(plan)
+        .or_else(|| topology_boundary_of::<CheckpointableExec>(plan))
+        .or_else(|| topology_boundary_of::<StreamingFilterExec>(plan))
+        .or_else(|| topology_boundary_of::<StreamingProjectionExec>(plan))
+        .unwrap_or(false)
+}
+
+fn topology_boundary_of<T: crate::operators::TopologyBoundary + ExecutionPlan + 'static>(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<bool> {
+    plan.downcast_ref::<T>()
+        .map(crate::operators::TopologyBoundary::bounds_metric_aggregation)
 }
 
 /// DataFusion's [`MetricsSet`] has no `is_empty()`. This helper is the
@@ -230,6 +232,15 @@ struct CheckpointableExec {
     internal_buffer_size: u32,
     reference_name: String,
     cache: Arc<PlanProperties>,
+}
+
+impl crate::operators::TopologyBoundary for CheckpointableExec {
+    /// Nested CheckpointableExec is another transform's aggregation point:
+    /// its `metrics()` already covers its own subtree, so descending past it
+    /// would double-count everything below (and misattribute it to this node).
+    fn bounds_metric_aggregation(&self) -> bool {
+        true
+    }
 }
 
 impl CheckpointableExec {

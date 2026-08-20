@@ -94,6 +94,12 @@ impl StreamingProjectionExec {
     }
 }
 
+impl crate::operators::TopologyBoundary for StreamingProjectionExec {
+    fn bounds_metric_aggregation(&self) -> bool {
+        self.is_source_owned()
+    }
+}
+
 impl DisplayAs for StreamingProjectionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {

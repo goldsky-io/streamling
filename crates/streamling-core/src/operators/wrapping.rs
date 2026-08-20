@@ -468,6 +468,12 @@ pub struct WrappingExec {
     event_time_instrumentation: Option<EventTimeInstrumentation>,
 }
 
+impl crate::operators::TopologyBoundary for WrappingExec {
+    fn bounds_metric_aggregation(&self) -> bool {
+        true
+    }
+}
+
 impl WrappingExec {
     pub fn new(
         inner: Arc<dyn ExecutionPlan>,
