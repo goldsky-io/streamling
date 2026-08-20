@@ -438,6 +438,10 @@ impl ExecutionPlan for StreamingFilterExec {
         if self.source_owned {
             return Ok(None);
         }
+        // The rebuild below uses `try_new`, which resets `source_owned` to
+        // false. That is only safe because source-owned filters already
+        // returned: allowing the swap would drop the topology-boundary mark
+        // and push the transform's projection under the source filter.
         // If the projection does not narrow the schema, we should not try to push it down:
         if projection.expr().len() < projection.input().schema().fields().len() {
             // Each column in the predicate expression must exist after the projection.
@@ -779,6 +783,47 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn source_owned_filter_refuses_projection_swap_and_keeps_mark() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+
+        // Narrowing projection above the filter, as ProjectionPushdown presents it.
+        let projection = ProjectionExec::try_new(
+            vec![(
+                Arc::new(Column::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                "id".to_string(),
+            )],
+            Arc::clone(&filter),
+        )
+        .unwrap();
+
+        let swapped = filter
+            .try_swapping_with_projection(&projection)
+            .expect("swap handler");
+        assert!(
+            swapped.is_none(),
+            "a source-owned filter must refuse the projection swap"
+        );
+        assert!(
+            filter
+                .downcast_ref::<StreamingFilterExec>()
+                .expect("original filter still in place")
+                .is_source_owned(),
+            "refusing the swap must leave the original boundary mark in place"
+        );
     }
 
     #[test]

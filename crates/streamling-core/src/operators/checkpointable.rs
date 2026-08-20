@@ -1129,6 +1129,13 @@ mod tests {
             swapped.is_none(),
             "a source-owned filter must refuse the projection swap"
         );
+        assert!(
+            filter
+                .downcast_ref::<StreamingFilterExec>()
+                .expect("original filter still in place")
+                .is_source_owned(),
+            "refusing the swap must leave the original boundary mark in place"
+        );
 
         // Control: the same shape without the mark swaps as usual.
         let original = FilterExec::try_new(lit(true), multi_batch_source(1).await).unwrap();
