@@ -861,21 +861,21 @@ impl MetricsRecorder {
                 MetricValue::Count { name, .. } => {
                     self.count_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .entry(name.to_string())
                         .or_insert_with(|| meter.u64_counter(add_service_prefix(name)).build());
                 }
                 MetricValue::Gauge { name, .. } => {
                     self.gauge_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .entry(name.to_string())
                         .or_insert_with(|| meter.u64_gauge(add_service_prefix(name)).build());
                 }
                 MetricValue::Time { name, .. } => {
                     self.histogram_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .entry(name.to_string())
                         // Time metrics are recorded in whole milliseconds, so
                         // auto-created histograms need the same unit and
