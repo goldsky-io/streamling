@@ -419,6 +419,9 @@ impl ExecutionPlan for StreamingFilterExec {
         })
         .and_then(|e| e.with_projection(self.projection().cloned()))
         .map(|mut e| {
+            // `try_new` resets `source_owned` to false; this restores the
+            // caller's mark. `with_projection` only copies the rebuilt
+            // (false) flag, so this assignment is not redundant.
             e.source_owned = self.source_owned;
             Arc::new(e) as _
         })
