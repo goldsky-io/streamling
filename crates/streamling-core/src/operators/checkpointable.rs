@@ -1105,6 +1105,58 @@ mod tests {
         );
     }
 
+    /// Sibling of `checkpointable_metrics_stop_at_source_owned_filter`: a
+    /// source-owned `StreamingProjectionExec` must bound the walk the same
+    /// way. A transform-owned projection (not marked) is still descended into.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_source_owned_projection() {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        use datafusion::physical_plan::PhysicalExpr;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        assert_boundary_excludes(|below| {
+            let original = ProjectionExec::try_new(
+                vec![(
+                    Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                    "id".to_string(),
+                )],
+                below,
+            )
+            .unwrap();
+            Arc::new(
+                StreamingProjectionExec::from_original(original)
+                    .unwrap()
+                    .with_source_owned(),
+            )
+        })
+        .await;
+
+        // Control: the SAME shape without the source-owned mark is the
+        // transform's own projection, so the compute below it IS collected.
+        let below: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(3).await,
+            Duration::from_millis(15),
+        ));
+        drain(&below).await;
+        let original = ProjectionExec::try_new(
+            vec![(
+                Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                "id".to_string(),
+            )],
+            Arc::clone(&below),
+        )
+        .unwrap();
+        let own_proj: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingProjectionExec::from_original(original).unwrap());
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(own_proj, 1, "t".to_string()));
+        let own_ms = elapsed_ms(&checkpointable);
+        assert!(
+            own_ms >= 25,
+            "a transform-owned projection must not bound the walk, got {own_ms}ms"
+        );
+    }
+
     /// A source-owned filter must refuse DataFusion's ProjectionPushdown
     /// swap outright: pushing the transform's projection below the boundary
     /// would exclude the transform's own projection compute from its metrics,
