@@ -132,13 +132,17 @@ pub struct MetricsRecorder {
     /// transform's subtree exposes many cumulative metrics — `elapsed_compute`,
     /// a join's `build_time` / `join_time`, operator-defined counters — and each
     /// must be deltaed independently). See `record_execution_plan_metrics`.
-    // ponytail: entries live for the process lifetime, bounded by node count
-    // across redeploys (matches metric_metadata_registry retention); evict
-    // alongside registry retirement if that ever exists.
+    ///
+    /// Entries are never evicted: they live for the process lifetime, keyed by
+    /// node id, matching `metric_metadata_registry`. Bound is distinct SQL
+    /// node ids ever seen in this process (pipeline lifetime / redeploys),
+    /// not currently-active nodes. Evict only if registry retirement is added.
     metric_accrual: Mutex<HashMap<String, NodeMetricAccrual>>,
     /// Node ids whose `elapsed_compute` series has already been seeded; makes
     /// [`MetricsRecorder::seed_elapsed_compute_series`] idempotent so a
     /// re-registered pipeline doesn't accumulate phantom 1ms samples.
+    /// Same process-lifetime retention as `metric_accrual` (no per-pipeline
+    /// teardown hook exists to prune it).
     seeded_elapsed_compute: Mutex<HashSet<String>>,
 }
 
