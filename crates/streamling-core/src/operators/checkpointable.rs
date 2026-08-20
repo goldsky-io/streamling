@@ -193,7 +193,10 @@ fn collect_subtree_metrics_inner(
     visited: &mut std::collections::HashSet<usize>,
 ) {
     // A physical plan can be a DAG: one Arc-shared subplan reachable from two
-    // parents (e.g. a UNION ALL over a common input) must be counted once.
+    // parents (e.g. UNION ALL over a common input) must be counted once.
+    // The visited-set key is Arc pointer identity, not operator equality —
+    // two separately constructed plans wrapping the same operator would
+    // both be walked (extremely unlikely in a single physical tree).
     if !visited.insert(Arc::as_ptr(plan) as *const () as usize) {
         return;
     }
