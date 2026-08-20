@@ -188,12 +188,7 @@ fn time_delta_millis(
     name: &str,
     cumulative_nanos: u64,
 ) -> u64 {
-    // contains_key-then-get_mut avoids allocating the key on the hit path
-    // (every batch after the first), at the cost of a second cheap hash lookup.
-    if !times.contains_key(name) {
-        times.insert(name.to_string(), TimeAccrual::default());
-    }
-    let acc = times.get_mut(name).expect("just inserted");
+    let acc = times.entry(name.to_string()).or_default();
     let emitted_before = acc.accrued / 1_000_000;
     acc.accrued = acc
         .accrued
@@ -689,12 +684,7 @@ impl MetricsRecorder {
                 .metric_accrual
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // contains_key-then-get_mut avoids allocating the key on the hit
-            // path (every batch after the first).
-            if !accruals.contains_key(metadata_id) {
-                accruals.insert(metadata_id.to_string(), NodeMetricAccrual::default());
-            }
-            let node = accruals.get_mut(metadata_id).expect("just inserted");
+            let node = accruals.entry(metadata_id.to_string()).or_default();
 
             // Only touch the accrual slot when the set actually carried compute:
             // an unconditional call would write `last = 0` for compute-less
@@ -705,13 +695,8 @@ impl MetricsRecorder {
                     time_delta_millis(&mut node.times, "elapsed_compute", elapsed_compute_nanos);
             }
             for (name, cumulative) in count_totals {
-                if !node.counts.contains_key(name) {
-                    node.counts.insert(name.to_string(), 0);
-                }
-                let delta = cumulative_delta(
-                    node.counts.get_mut(name).expect("just inserted"),
-                    cumulative,
-                );
+                let last = node.counts.entry(name.to_string()).or_insert(0);
+                let delta = cumulative_delta(last, cumulative);
                 if delta > 0 {
                     count_deltas.push((name, delta));
                 }
