@@ -173,10 +173,10 @@ struct TimeAccrual {
     accrued: u64,
 }
 
-/// Delta since the last-seen cumulative value. A re-executed stream resets
-/// DataFusion's cumulative counters; a value below the last-seen total is
-/// treated as a fresh delta rather than stalling at zero until it climbs back
-/// past the previous run.
+/// Delta since the last-seen cumulative value. A re-executed stream OR a
+/// mid-update partition snapshot can drop below the last-seen total; either
+/// case is treated as a fresh delta rather than stalling at zero until the
+/// value climbs back past the previous run.
 fn cumulative_delta(last: &mut u64, cumulative: u64) -> u64 {
     let delta = if cumulative >= *last {
         cumulative - *last
