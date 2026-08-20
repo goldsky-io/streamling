@@ -492,7 +492,7 @@ impl MetricsRecorder {
     /// Datafusion's `ExecutionPlanMetricsSet` is also recorded but only for transforms
     /// for transforms, we also emit `batch_count` as children node's `input_row` count
     /// under the assumption that output for a transform node is input for it's downstream nodes
-    pub fn record_execution_plan_metrics(
+    pub(crate) fn record_execution_plan_metrics(
         &self,
         metadata_id: &str,
         batch_count: usize,
