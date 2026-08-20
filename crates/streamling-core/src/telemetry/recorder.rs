@@ -2145,6 +2145,46 @@ mod tests {
             assert_eq!(find_time_ms(&d2, "elapsed_compute"), None);
         }
 
+        /// A `Count` named "elapsed_compute" is not folded into typed
+        /// `ElapsedCompute`: counts go through `count_totals` / `node.counts`
+        /// and export as `df_elapsed_compute`. Typed time uses `node.times`.
+        /// Kind-separated maps keep the two from clobbering each other.
+        #[test]
+        fn count_named_elapsed_compute_does_not_merge_with_typed_variant() {
+            let recorder = test_recorder();
+            let id = "app::sql";
+
+            let mut set1 = MetricsSet::new();
+            set1.push(elapsed_compute_metric(10_000_000)); // 10ms typed
+            set1.push(count_metric("elapsed_compute", 7));
+            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            assert_eq!(
+                find_time_ms(&d1, "elapsed_compute"),
+                Some(10),
+                "typed elapsed_compute is the time delta only"
+            );
+            assert_eq!(
+                find_count(&d1, "df_elapsed_compute"),
+                Some(7),
+                "named Count is namespaced, not folded into the time series"
+            );
+
+            let mut set2 = MetricsSet::new();
+            set2.push(elapsed_compute_metric(10_000_000));
+            set2.push(count_metric("elapsed_compute", 7));
+            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            assert_eq!(
+                find_time_ms(&d2, "elapsed_compute"),
+                None,
+                "unchanged typed cumulative must not re-emit"
+            );
+            assert_eq!(
+                find_count(&d2, "df_elapsed_compute"),
+                None,
+                "unchanged named Count must not re-emit"
+            );
+        }
+
         /// Operator-internal counters named after streamling's own semantic
         /// row-count series (e.g. `StreamingUnnestExec`'s `input_rows`) must
         /// never land on those series — they would double-count rows on
