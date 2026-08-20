@@ -151,6 +151,8 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 ///   consuming transform's subtree. Without stopping at them, an expensive
 ///   source-level filter would be misattributed to the transform's compute.
 fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    // EXTEND: add `or_else(|| topology_boundary_of::<NewType>(plan))` and
+    // `impl TopologyBoundary` — a missing arm silently bleeds metrics.
     topology_boundary_of::<WrappingExec>(plan)
         .or_else(|| topology_boundary_of::<CheckpointableExec>(plan))
         .or_else(|| topology_boundary_of::<StreamingFilterExec>(plan))
