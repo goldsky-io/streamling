@@ -521,12 +521,17 @@ sinks:
 /// same database and the other database received nothing (LiFi `solana-mainnet`,
 /// two sinks writing the same table name into a prod and a dev database).
 ///
-/// The sinks here are the same shape — identical table, two databases — and only
-/// `pg_second` gets per-sink keys, in the exact
+/// Only `pg_second` gets per-sink keys, in the exact
 /// `STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__<FIELD>` form the agent
 /// writes. `pg_primary` stays on the global block and `pg_second` omits
 /// `SSLMODE`, so the run also covers the fallback path per sink and per field.
-/// Pre-fix, `multi_db_rows` never existed in the second database.
+///
+/// The two sinks write *different* table names so the misrouting is what fails,
+/// not a side effect of it: LiFi's sinks shared a table name, and pre-fix that
+/// means both sinks race to `CREATE TABLE` in the one database they both
+/// connected to. With distinct names, pre-fix leaves `multi_db_second` in the
+/// primary database and the second database empty — which is exactly what the
+/// assertions below check, in both directions.
 #[tokio::test]
 async fn test_multi_sink_two_postgres_databases() {
     init_tracing();
@@ -573,7 +578,7 @@ sinks:
   pg_primary:
     type: postgres
     from: kafka_source
-    table: multi_db_rows
+    table: multi_db_primary
     schema: public
     primary_key: id
     on_conflict: update
@@ -581,7 +586,7 @@ sinks:
   pg_second:
     type: postgres
     from: kafka_source
-    table: multi_db_rows
+    table: multi_db_second
     schema: public
     primary_key: id
     on_conflict: update
@@ -623,7 +628,7 @@ sinks:
 
     let primary_count = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.multi_db_rows")
+        .count("SELECT COUNT(*) FROM public.multi_db_primary")
         .await
         .expect("Failed to query the primary database");
     assert_eq!(
@@ -632,10 +637,10 @@ sinks:
         records_to_produce, ctx.pg_database
     );
 
-    // The regression: without per-sink resolution this table does not exist here
-    // at all, because pg_second connected to the primary database instead.
+    // The regression, one direction: pre-fix pg_second connected to the primary
+    // database, so its table does not exist here at all.
     let second_count = second
-        .count("SELECT COUNT(*) FROM public.multi_db_rows")
+        .count("SELECT COUNT(*) FROM public.multi_db_second")
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -650,12 +655,25 @@ sinks:
     );
 
     let second_ids: Vec<(i64,)> = second
-        .query("SELECT id FROM public.multi_db_rows ORDER BY id")
+        .query("SELECT id FROM public.multi_db_second ORDER BY id")
         .await
         .expect("Failed to query ids from the second database");
     assert_eq!(
         second_ids.iter().map(|row| row.0).collect::<Vec<_>>(),
         (1..=records_to_produce).collect::<Vec<_>>(),
         "the second database should hold every record, not a subset"
+    );
+
+    // The other direction: pg_second must not have touched the primary database.
+    let leaked: Vec<(bool,)> = ctx
+        .postgres
+        .query("SELECT to_regclass('public.multi_db_second') IS NOT NULL")
+        .await
+        .expect("Failed to probe the primary database for the second sink's table");
+    assert_eq!(
+        leaked,
+        vec![(false,)],
+        "sink 'pg_second' wrote into the primary database '{}' as well",
+        ctx.pg_database
     );
 }
