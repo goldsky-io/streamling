@@ -799,7 +799,7 @@ impl MetricsRecorder {
                     if in_ms != 0 {
                         self.histogram_registry
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .get(metric_name)
                             .expect("expect elapsed_compute histogram to be available")
                             .record(in_ms, &tags)
@@ -808,7 +808,7 @@ impl MetricsRecorder {
                 MetricValue::OutputRows(count) => {
                     self.count_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(metric_name)
                         .expect("expect output_rows counter to be available")
                         .add(count.value() as u64, &tags);
@@ -816,7 +816,7 @@ impl MetricsRecorder {
                 MetricValue::Count { name, count } => {
                     self.count_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(name.as_ref())
                         .unwrap_or_else(|| panic!("expect counter with name: {}", name))
                         .add(count.value() as u64, &tags);
@@ -824,7 +824,7 @@ impl MetricsRecorder {
                 MetricValue::Gauge { name, gauge } => {
                     self.gauge_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(name.as_ref())
                         .unwrap_or_else(|| panic!("expect gauge with name: {}", name))
                         .record(gauge.value() as u64, &tags);
@@ -833,7 +833,7 @@ impl MetricsRecorder {
                     let in_ms = time.value() as u64 / 1_000_000;
                     self.histogram_registry
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(name.as_ref())
                         .unwrap_or_else(|| panic!("expect histogram with name: {}", name))
                         .record(in_ms, &tags)
