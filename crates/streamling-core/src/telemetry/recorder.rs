@@ -203,6 +203,14 @@ fn time_delta_millis(
     acc.accrued / 1_000_000 - emitted_before
 }
 
+/// Whether a cumulative `elapsed_compute` snapshot should update accrual.
+/// Zero must not write `last = 0`: that arms a full-cumulative re-emit on the
+/// next nonzero snapshot. Counts still update `last` (a zero delta is a
+/// no-op); other Time metrics use the same skip (`cumulative_nanos == 0`).
+fn should_accrue_elapsed_compute(cumulative_nanos: u64) -> bool {
+    cumulative_nanos > 0
+}
+
 impl MetricsRecorder {
     /// Seed each non-sink node's `elapsed_compute` series with a single 1ms
     /// sample so the series exists (and dashboards can find it) even for
@@ -701,11 +709,9 @@ impl MetricsRecorder {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let node = accruals.entry(metadata_id.to_string()).or_default();
 
-            // Only touch the accrual slot when the set actually carried compute:
-            // an unconditional call would write `last = 0` for compute-less
-            // snapshots, arming a full-cumulative re-emit if a compute-bearing
-            // snapshot ever follows under the same id.
-            if elapsed_compute_nanos > 0 {
+            // See [`should_accrue_elapsed_compute`]: a zero snapshot must not
+            // write `last = 0` and arm a later full-cumulative re-emit.
+            if should_accrue_elapsed_compute(elapsed_compute_nanos) {
                 elapsed_ms =
                     time_delta_millis(&mut node.times, "elapsed_compute", elapsed_compute_nanos);
             }
