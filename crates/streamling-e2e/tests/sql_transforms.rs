@@ -470,9 +470,10 @@ sinks:
     );
 }
 
-/// SQL transform `elapsed_compute` must reach Prometheus above the 1ms series
-/// seed, proving WrappingExec → CheckpointableExec → record_execution_plan_metrics
-/// emits query latency for operator_type=sql.
+/// SQL transform `elapsed_compute` is the DataFusion subtree **delta** path
+/// (wall-clock around `next().await` is suppressed when the SQL plan exposes
+/// metrics). Must exceed the 1ms series seed so this fails if only the seed
+/// or wrapping idle-wait were recorded.
 #[tokio::test]
 async fn test_sql_transform_elapsed_compute_emitted() {
     init_tracing();
@@ -530,16 +531,36 @@ sinks:
     let elapsed_query =
         PrometheusResource::elapsed_compute_query("sql_transform", Some(&ctx.test_id));
 
-    // Seed records 1ms; require a strictly larger sum so this fails if we
-    // only ever emit the seed and never SQL subtree compute.
+    // Seed records 1ms; the compute-bound `md5(repeat(...))` projection is
+    // SQL subtree elapsed_compute (WrappingExec suppresses wall-clock idle-wait
+    // when DF metrics exist). Require a strictly larger sum so this fails if
+    // we only ever emit the seed.
     let elapsed = prometheus
         .wait_for_metric_at_least(&elapsed_query, 2, 15, 500)
         .await;
     assert!(
         elapsed.is_ok(),
-        "sql_transform elapsed_compute must exceed the 1ms series seed: {:?}",
+        "sql_transform elapsed_compute must exceed the 1ms series seed via subtree deltas (wall-clock suppressed for SQL): {:?}",
         elapsed
     );
+
+    // Histogram sample count must stay small: seed (1) + per-batch *deltas*,
+    // not seed + wall-clock-per-batch + deltas. 50 rows in default batches
+    // plus seed is well under a wall-clock-per-row inflation.
+    let count_query = format!(
+        "streamling_elapsed_compute_milliseconds_count{{id=\"sql_transform\",instance=\"{}\"}}",
+        ctx.test_id
+    );
+    let sample_count = prometheus
+        .query_count(&count_query)
+        .await
+        .expect("query elapsed_compute count");
+    if let Some(count) = sample_count {
+        assert!(
+            count < 50,
+            "SQL elapsed_compute sample count {count} looks like wall-clock-per-batch; expected seed + subtree deltas only ({count_query})"
+        );
+    }
 }
 
 // ============================================================================

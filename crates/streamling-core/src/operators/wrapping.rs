@@ -513,6 +513,15 @@ impl WrappingExec {
     }
 }
 
+/// Wall-clock around `data.next().await` is idle-wait dominated. SQL nodes
+/// that already expose a DataFusion subtree emit per-batch compute via
+/// `record_execution_plan_metrics`; recording wall-clock too would fold
+/// idle-wait into the same `elapsed_compute` series. A passthrough SQL
+/// node with no subtree metrics keeps wall-clock as the only signal.
+fn should_record_wall_clock_compute(has_subtree_metrics: bool, is_sql_node: bool) -> bool {
+    !has_subtree_metrics || !is_sql_node
+}
+
 /// Used to intercept `execute()` calls and run additional logic like telemetry processing
 impl ExecutionPlan for WrappingExec {
     delegate! {
@@ -604,8 +613,10 @@ impl ExecutionPlan for WrappingExec {
         // whose input is directly the upstream topology boundary), the delta
         // path can never emit, so wall-clock stays on as the only available
         // signal rather than leaving the series dead.
-        let record_wall_clock_compute =
-            metrics.is_none() || !metrics_recorder.is_sql_node(&metric_metadata_id);
+        let record_wall_clock_compute = should_record_wall_clock_compute(
+            metrics.is_some(),
+            metrics_recorder.is_sql_node(&metric_metadata_id),
+        );
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
@@ -1089,6 +1100,22 @@ mod tests {
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::prelude::SessionContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn sql_with_subtree_metrics_suppresses_wall_clock() {
+        assert!(!should_record_wall_clock_compute(true, true));
+    }
+
+    #[test]
+    fn sql_passthrough_without_subtree_metrics_keeps_wall_clock() {
+        assert!(should_record_wall_clock_compute(false, true));
+    }
+
+    #[test]
+    fn non_sql_always_records_wall_clock() {
+        assert!(should_record_wall_clock_compute(true, false));
+        assert!(should_record_wall_clock_compute(false, false));
+    }
 
     #[derive(Debug)]
     struct CountingSideOutput {
