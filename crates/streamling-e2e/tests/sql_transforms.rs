@@ -554,13 +554,12 @@ sinks:
     let sample_count = prometheus
         .query_count(&count_query)
         .await
-        .expect("query elapsed_compute count");
-    if let Some(count) = sample_count {
-        assert!(
-            count < 50,
-            "SQL elapsed_compute sample count {count} looks like wall-clock-per-batch; expected seed + subtree deltas only ({count_query})"
-        );
-    }
+        .expect("query elapsed_compute count")
+        .expect("elapsed_compute _count series must exist after seed + compute");
+    assert!(
+        sample_count < 50,
+        "SQL elapsed_compute sample count {sample_count} looks like wall-clock-per-batch; expected seed + subtree deltas only ({count_query})"
+    );
 }
 
 // ============================================================================
