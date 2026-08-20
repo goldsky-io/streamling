@@ -137,12 +137,15 @@ pub struct MetricsRecorder {
     /// node id, matching `metric_metadata_registry`. Bound is distinct SQL
     /// node ids ever seen in this process (pipeline lifetime / redeploys),
     /// not currently-active nodes. Evict only if registry retirement is added.
+    /// A Prometheus size-gauge on this map is out of scope: the bound is the
+    /// same as the metadata registry, not a distinct leak to instrument.
     metric_accrual: Mutex<HashMap<String, NodeMetricAccrual>>,
     /// Node ids whose `elapsed_compute` series has already been seeded; makes
     /// [`MetricsRecorder::seed_elapsed_compute_series`] idempotent so a
     /// re-registered pipeline doesn't accumulate phantom 1ms samples.
     /// Same process-lifetime retention as `metric_accrual` (no per-pipeline
-    /// teardown hook exists to prune it).
+    /// teardown hook exists to prune it). A size gauge is out of scope for
+    /// the same reason as `metric_accrual`.
     seeded_elapsed_compute: Mutex<HashSet<String>>,
 }
 
