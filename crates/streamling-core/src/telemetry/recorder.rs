@@ -57,8 +57,8 @@ fn is_metric_denied(metric_name: &str) -> bool {
 }
 
 /// The operator_type value identifying SQL transform nodes. Gates BOTH the
-/// wall-clock suppression (via `is_sql_node`) and the subtree-delta export in
-/// `record_execution_plan_metrics`; the two must never drift apart.
+/// wall-clock suppression (via `resolve_is_sql_node`) and the subtree-delta
+/// export in `record_execution_plan_metrics`; the two must never drift apart.
 const SQL_OPERATOR_TYPE: &str = "sql";
 
 /// Prefix for metric names sourced from a SQL transform's DataFusion subtree
@@ -318,7 +318,7 @@ impl MetricsRecorder {
     /// `WrappingExec::execute`) rather than on every batch. Used to suppress
     /// wall-clock `elapsed_compute` when the DataFusion subtree already
     /// supplies per-batch deltas.
-    pub fn is_sql_node(&self, metadata_id: &str) -> bool {
+    pub fn resolve_is_sql_node(&self, metadata_id: &str) -> bool {
         self.metric_metadata_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

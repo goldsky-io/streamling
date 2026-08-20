@@ -615,7 +615,7 @@ impl ExecutionPlan for WrappingExec {
         // signal rather than leaving the series dead.
         let record_wall_clock_compute = should_record_wall_clock_compute(
             metrics.is_some(),
-            metrics_recorder.is_sql_node(&metric_metadata_id),
+            metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
         );
 
         let side_outputs = self.side_outputs.clone();
