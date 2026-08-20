@@ -432,6 +432,14 @@ impl TestContext {
         SqsResource::new(sqs_url, &queue_name).await
     }
 
+    /// Create an additional isolated PostgreSQL database, for tests that need a
+    /// second destination on the same cluster (e.g. two postgres sinks resolving
+    /// their own per-sink connections). Dropped when the returned resource is.
+    pub async fn create_postgres_database(&self, suffix: &str) -> Result<PostgresResource> {
+        let database = format!("test_{}_{}", &self.test_id[..8], suffix);
+        PostgresResource::new(&self.config.postgres_url, &database).await
+    }
+
     /// Create an additional Kafka topic for use in tests (e.g., for sink output)
     pub async fn create_kafka_topic(&self, topic_suffix: &str) -> Result<KafkaResource> {
         let topic = format!("test_{}_{}", &self.test_id[..8], topic_suffix);

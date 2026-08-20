@@ -1685,8 +1685,8 @@ impl Streamling {
                         None => humantime::parse_duration(&postgres_config.batch_flush_interval)
                             .streamling_with_context(|| {
                                 format!(
-                                    "invalid app_config.postgres_sink.batch_flush_interval '{}'",
-                                    postgres_config.batch_flush_interval
+                                    "invalid postgres batch_flush_interval '{}' resolved for sink '{}'",
+                                    postgres_config.batch_flush_interval, reference_name
                                 )
                             })?,
                     });
@@ -1809,8 +1809,8 @@ impl Streamling {
                         None => humantime::parse_duration(&postgres_config.batch_flush_interval)
                             .streamling_with_context(|| {
                                 format!(
-                                    "invalid app_config.postgres_sink.batch_flush_interval '{}'",
-                                    postgres_config.batch_flush_interval
+                                    "invalid postgres batch_flush_interval '{}' resolved for sink '{}'",
+                                    postgres_config.batch_flush_interval, reference_name
                                 )
                             })?,
                     });
