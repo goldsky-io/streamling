@@ -163,8 +163,9 @@ fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
     false
 }
 
-/// DataFusion's [`MetricsSet`] has no `is_empty()`; this is the emptiness check
-/// `CheckpointableExec::metrics` uses to restore the metric-less short-circuit.
+/// DataFusion's [`MetricsSet`] has no `is_empty()`. This helper is the
+/// emptiness check `CheckpointableExec::metrics` uses to restore the
+/// metric-less short-circuit, until DataFusion grows `is_empty()`.
 fn metrics_set_is_empty(set: &MetricsSet) -> bool {
     set.iter().next().is_none()
 }
