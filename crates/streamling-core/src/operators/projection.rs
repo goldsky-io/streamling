@@ -442,3 +442,27 @@ fn try_unifying_projections(
 fn is_expr_trivial(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.downcast_ref::<Column>().is_some() || expr.downcast_ref::<Literal>().is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    #[test]
+    fn from_original_resets_source_owned() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let original = ProjectionExec::try_new(vec![(col, "id".to_string())], input).unwrap();
+        let marked = StreamingProjectionExec::from_original(original.clone())
+            .unwrap()
+            .with_source_owned();
+        assert!(marked.is_source_owned());
+        let reset = StreamingProjectionExec::from_original(original).unwrap();
+        assert!(
+            !reset.is_source_owned(),
+            "from_original always resets the topology-boundary mark"
+        );
+    }
+}

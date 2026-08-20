@@ -786,6 +786,25 @@ mod tests {
     }
 
     #[test]
+    fn from_original_resets_source_owned() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let marked = StreamingFilterExec::from_original(original.clone())
+            .unwrap()
+            .with_source_owned();
+        assert!(marked.is_source_owned());
+        let reset = StreamingFilterExec::from_original(original).unwrap();
+        assert!(
+            !reset.is_source_owned(),
+            "from_original always resets the topology-boundary mark"
+        );
+    }
+
+    #[test]
     fn source_owned_filter_refuses_projection_swap_and_keeps_mark() {
         use datafusion::physical_plan::empty::EmptyExec;
         use datafusion::physical_plan::filter::FilterExec;
