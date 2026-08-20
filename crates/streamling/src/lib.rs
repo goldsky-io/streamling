@@ -1645,7 +1645,7 @@ impl Streamling {
                     // Per-sink connection: two postgres sinks in one pipeline can
                     // target two different databases (STRM-6516). Falls back to the
                     // global postgres_sink block when no per-sink keys are set.
-                    let postgres_config = app_config.postgres_sink_for(&reference_name);
+                    let postgres_config = app_config.postgres_sink.clone();
                     info!(
                         "postgres sink '{}' resolved connection {:?}",
                         reference_name, postgres_config
