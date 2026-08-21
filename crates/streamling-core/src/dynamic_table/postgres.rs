@@ -822,6 +822,28 @@ impl PostgresDynamicTableBackend {
                     match create_result {
                         Ok(_) => {
                             info!("Successfully created table: {}", self.full_table_name);
+                            let bare_table = self
+                                .full_table_name
+                                .rsplit_once('.')
+                                .map(|(_, table)| table)
+                                .unwrap_or(self.full_table_name.as_str());
+                            let index_name =
+                                format!("idx_{}_{}", bare_table, self.time_column_name);
+                            let create_index_sql = format!(
+                                r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
+                                index_name, self.full_table_name, self.time_column_name
+                            );
+                            if let Err(e) = sqlx::query(&create_index_sql)
+                                .execute(pool_arc.as_ref())
+                                .await
+                            {
+                                let err = DynamicTableBackendError::Initialization(format!(
+                                    "Failed to create index {} on table {}: {}",
+                                    index_name, self.full_table_name, e
+                                ));
+                                error!("{}", err);
+                                return Err(err);
+                            }
                         }
                         Err(e) => {
                             let err = DynamicTableBackendError::Initialization(format!(
