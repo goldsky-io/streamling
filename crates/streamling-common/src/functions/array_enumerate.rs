@@ -23,6 +23,7 @@
 //! -- 2               | tx3
 //! ```
 
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{Field as SchemaField, FieldRef};
 use datafusion::arrow::array::{Array, ArrayRef, Int64Builder, ListArray, StructArray};
 use datafusion::arrow::datatypes::{DataType, Field, Fields};
@@ -132,18 +133,19 @@ impl ScalarUDFImpl for ArrayEnumerateFunc {
                 )
             })?;
 
-        // Zero-copy optimization: reuse the flattened values buffer from the input list
-        let values_array = list_array.values();
+        // A sliced ListArray keeps the full child buffer, so its offsets are absolute.
+        // Slice the child to the window this array actually covers and rebase the offsets
+        // onto it — otherwise the (index, value) struct children disagree on length.
+        let offsets = list_array.value_offsets();
+        let start = offsets.first().copied().unwrap_or(0) as usize;
+        let end = offsets.last().copied().unwrap_or(0) as usize;
+        let values_array = list_array.values().slice(start, end - start);
         let total_elements = values_array.len();
 
         // Build index array efficiently using builder
         let mut index_builder = Int64Builder::with_capacity(total_elements);
-        let offsets = list_array.value_offsets();
-
-        // Generate indices for each row based on offsets
-        for window in offsets.windows(2) {
-            let row_len = (window[1] - window[0]) as i64;
-            for i in 0..row_len {
+        for row_len in list_array.offsets().lengths() {
+            for i in 0..row_len as i64 {
                 index_builder.append_value(i);
             }
         }
@@ -162,12 +164,13 @@ impl ScalarUDFImpl for ArrayEnumerateFunc {
             ),
         ]);
 
-        // Reuse offset and null metadata from the original ListArray
+        // Reuse null metadata from the original ListArray; offsets are rebased onto the
+        // sliced child (a no-op walk when the input was never sliced).
         let list_field = Arc::new(Field::new("item", DataType::Struct(struct_fields), false));
 
         let result_list = ListArray::new(
             list_field,
-            list_array.offsets().clone(), // zero-copy reuse of offsets
+            OffsetBuffer::from_lengths(list_array.offsets().lengths()),
             Arc::new(struct_array),
             list_array.nulls().cloned(), // reuse null bitmap
         );
@@ -185,10 +188,76 @@ impl ScalarUDFImpl for ArrayEnumerateFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_buffer::OffsetBuffer;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::logical_expr::ScalarFunctionArgs;
     use std::sync::Arc;
+
+    /// Invoke the UDF on a `List<Utf8>` array and return the resulting list.
+    fn invoke_utf8(list: ListArray) -> ArrayRef {
+        let number_rows = list.len();
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("index", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(list))],
+            arg_fields: vec![Field::new("list", list_type, false).into()],
+            number_rows,
+            return_field: Field::new(
+                "array_enumerate",
+                DataType::List(Arc::new(Field::new("item", struct_type, false))),
+                false,
+            )
+            .into(),
+            config_options: Arc::new(::datafusion::config::ConfigOptions::default()),
+        };
+
+        match ArrayEnumerateFunc::new().invoke_with_args(args).unwrap() {
+            ColumnarValue::Array(array) => array,
+            ColumnarValue::Scalar(_) => panic!("Expected array result"),
+        }
+    }
+
+    /// A sliced `ListArray` keeps the full child buffer and absolute offsets, so the
+    /// enumerated struct's children used to disagree on length and panic.
+    #[test]
+    fn test_array_enumerate_sliced_list() {
+        let full = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            OffsetBuffer::new(vec![0i32, 2, 5].into()),
+            Arc::new(StringArray::from(vec!["a", "b", "x", "y", "z"])),
+            None,
+        );
+
+        // Second row only: ["x", "y", "z"] -> [(0, "x"), (1, "y"), (2, "z")]
+        let result = invoke_utf8(full.slice(1, 1));
+        let result_list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(result_list.len(), 1);
+
+        let row = result_list.value(0);
+        let row = row.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(row.len(), 3);
+
+        let indices = row
+            .column_by_name("index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let values = row
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(indices.values().to_vec(), vec![0i64, 1, 2]);
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![Some("x"), Some("y"), Some("z")]
+        );
+    }
 
     #[test]
     fn test_array_enumerate_string_array() {

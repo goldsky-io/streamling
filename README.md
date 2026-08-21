@@ -11,16 +11,9 @@
 
 ```
 
-Streamling is a columnar streaming runtime for real-time and historical processing, with a highly efficient plugin system. 
+Streamling is a columnar streaming runtime for real-time and historical data processing, extended through dynamically linked plugins.
 
-The runtime provides:
-
-- Performance in high-throughput (millions of rows per second) real-time filtering and enrichment scenarios like trading or gaming
-- Decoupled runtime vs logic. User code can be developed and deployed on a separate lifecycle, making drift easy to manage
-- At-least-once consistency through a checkpointing system 
-- Fast startup and operational ease. Checkpoint state can be kept any postgres database 
-
-Streamling powers [Goldsky Turbo](https://goldsky.com/products/turbo-pipelines), and runs vital production workloads that provide real-time data to banks, hedge funds, prediction markets, and more. 
+It powers [Goldsky Turbo](https://goldsky.com/products/turbo-pipelines), where thousands of user-created pipelines run in production for banks, hedge funds, and prediction markets.
 
 Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
 
@@ -45,13 +38,12 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 
 ## Why Streamling
 
-Streamling enables teams to build and deploy custom sources, transforms, sinks, and UDFs through plugins without sacrificing performance or correctness. It's also meant to be highly efficient. 
+- **Plugin system on a columnar data plane.** Custom sources, transforms, and sinks are separate Rust crates dynamically linked at runtime. No forking or recompiling the engine. Every stage exchanges Arrow RecordBatches and processes millions of rows per second on one node. In [benchmarks against Flink](https://www.streamling.dev/blog/streamling-0-3-0), Streamling delivered roughly 40x the throughput per GB of memory on a Kafka workload.
+- **Transactional correctness.** At-least-once delivery through checkpointing. Checkpoint state lives in any Postgres database.
+- **Declarative pipelines, built-in connectors.** Define topologies in YAML. Kafka, Postgres, ClickHouse, files, and webhooks ship in a single binary with fast startup.
+- **Lean in production.** Allocator and Arrow-native decode work cut one customer workload writing million-row batches into ClickHouse from 31 GB of memory to 4 GB.
 
-Many other streaming frameworks can be extended like libaries (include, extend, compile) for higher performance or through external services and API endpoints. The intent behind Streamling is that to extend, you would write plugins and dynamically link them in instead of compiling, reducing the operational complexity. 
-
-Plugins are created as separate rust crates that are compiled and linked in at runtime. Users reuse them through a declarative YAML format for the precise solution. They have minimal overhead and have similiar efficiency to embedding code into the codebase despite the FFI boundary in real-world scenarios.
-
-A pipeline has three sections: `sources`, `transforms`, and `sinks`. Every node exchanges Arrow RecordBatches. Built-in connectors cover Kafka, Postgres, ClickHouse, webhooks, and WASM scripts; anything else can be a [plugin](#plugin-system).
+A pipeline has three sections: `sources`, `transforms`, and `sinks`.
 
 ```yaml
 sources:
@@ -77,20 +69,18 @@ sinks:
 
 **Streamling is a good fit when you need to:**
 
-- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline. The runtime enforces checkpointing, schema validation, and delivery guarantees around your code
-- **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source that emits data over time
-- **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in a single topology, all exchanging Arrow `RecordBatch`es
-- **Move data with minimal overhead**: Kafka, Postgres, ClickHouse, files, and webhooks. 
-- **Run bounded batch jobs** With the same logic as real-time and handle upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
-
-Use Streamling when you need a streaming engine to process continuously arriving data in order through a defined pipeline, not a distributed shuffle or windowed aggregation engine.
+- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline with runtime-enforced checkpointing and schema validation
+- **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source
+- **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in one topology, all exchanging Arrow `RecordBatch`es
+- **Move data with built-in connectors**: Kafka, Postgres, ClickHouse, files, and webhooks
+- **Run bounded batch jobs** with the same logic as real-time pipelines, including upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
 
 **Streamling is probably not the right fit when you need:**
 
-- **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes aren't supported today, but can be done through custom plugins
-- **A library to embed**: it's a standalone runtime you deploy and configure, not a crate you wire into your codebase
+- **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes (custom plugins can cover some of these)
+- **An embeddable library**: Streamling is a standalone runtime you deploy and configure
 
-Streamling runs as a **single-node engine**. It can scale horizontally via Kafka consumer groups and multiple independent instances. Each instance checkpoints and progresses on its own.
+Streamling is a single-node engine. Scale horizontally with Kafka consumer groups and independent instances, each checkpointing on its own.
 
 ## Quick start
 
@@ -876,7 +866,7 @@ sinks:
 The ClickHouse sink writes records to a ClickHouse table over the HTTP interface. The destination table must already exist; the sink reads its schema and sorting keys at startup rather than creating the table.
 
 - **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
-- **Compression**: INSERT request bodies can be gzip-compressed. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
+- **Compression**: INSERT request bodies are compressed with zstd by default. gzip and lz4 are also available. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
 - **Deduplication**: each batch is collapsed to the latest row per `primary_key` before writing. Set `deduplicate: false` for append-only tables whose rows are deltas rather than states (e.g. `SummingMergeTree`) — see `Batch Deduplication` below.
 
 Sample configuration:
@@ -899,7 +889,7 @@ sinks:
 | `STREAMLING__CLICKHOUSE_SINK__USER` | `default` | Username |
 | `STREAMLING__CLICKHOUSE_SINK__PASSWORD` | _(empty)_ | Password |
 | `STREAMLING__CLICKHOUSE_SINK__DATABASE` | `default` | Database name |
-| `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `none` | Wire compression for INSERTs (`none` or `gzip`); the per-sink `compression` field overrides it |
+| `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `zstd` | Wire compression for INSERTs (`none`, `gzip`, `zstd`, or `lz4`); the per-sink `compression` field overrides it |
 | `STREAMLING__CLICKHOUSE_SINK__COMPRESSION_LEVEL` | `6` | gzip compression level (0–9); ignored unless compression resolves to `gzip` |
 
 ## Dynamic Tables
