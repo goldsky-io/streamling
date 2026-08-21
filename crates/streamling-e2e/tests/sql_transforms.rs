@@ -9,6 +9,7 @@
 //! Ported from crates/streamling/tests/pipeline.rs
 
 use serde::Serialize;
+use std::fs;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
 
 // ============================================================================
@@ -559,6 +560,111 @@ sinks:
     assert!(
         sample_count < 50,
         "SQL elapsed_compute sample count {sample_count} looks like wall-clock-per-batch; expected seed + subtree deltas only ({count_query})"
+    );
+}
+
+/// Join SQL exercises the `df_`-prefixed subtree recording path (HashJoin
+/// `build_time` / `join_time` / `build_input_rows`), which the single-operator
+/// projection e2e above does not hit. Two bounded file sources so the join
+/// completes at EOF instead of waiting on an unbounded Kafka build side.
+#[tokio::test]
+async fn test_sql_join_emits_df_prefixed_subtree_metrics() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus should be available");
+
+    let left_dir = ctx.temp_dir.path().join("join_left");
+    let right_dir = ctx.temp_dir.path().join("join_right");
+    fs::create_dir_all(&left_dir).expect("create left dir");
+    fs::create_dir_all(&right_dir).expect("create right dir");
+    fs::write(
+        left_dir.join("data.csv"),
+        "id,name\n1,alice\n2,bob\n3,carol\n",
+    )
+    .expect("write left csv");
+    fs::write(
+        right_dir.join("data.csv"),
+        "id,extra\n1,alpha\n2,beta\n9,orphan\n",
+    )
+    .expect("write right csv");
+
+    let pipeline = format!(
+        r#"
+sources:
+  left_src:
+    type: file
+    path: {left}/
+    format: csv
+    primary_key: id
+    mode:
+      type: bounded
+  right_src:
+    type: file
+    path: {right}/
+    format: csv
+    primary_key: id
+    mode:
+      type: bounded
+
+transforms:
+  sql_join:
+    type: sql
+    sql: "SELECT l.id, l.name, r.extra FROM left_src l INNER JOIN right_src r ON l.id = r.id"
+    primary_key: id
+
+sinks:
+  print_sink:
+    type: print
+    from: sql_join
+    sample_every: 1
+"#,
+        left = left_dir.display(),
+        right = right_dir.display()
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(&pipeline, PipelineOpts::new())
+        .await
+        .expect("join pipeline should complete");
+
+    assert_eq!(
+        output.len(),
+        2,
+        "INNER JOIN should emit the two matching ids; got {:?}",
+        output.column_values("id")
+    );
+
+    use streamling_e2e::resources::PrometheusResource;
+    let elapsed_query = PrometheusResource::elapsed_compute_query("sql_join", Some(&ctx.test_id));
+    let elapsed = prometheus
+        .wait_for_metric_at_least(&elapsed_query, 2, 15, 500)
+        .await;
+    assert!(
+        elapsed.is_ok(),
+        "sql_join elapsed_compute must exceed the 1ms series seed: {:?}",
+        elapsed
+    );
+
+    // Any df_* series on this node means subtree_delta_metric_values exported
+    // join/operator metrics under SUBTREE_METRIC_PREFIX, not only elapsed_compute.
+    let df_series_query = format!(
+        "count({{__name__=~\"streamling_df_.*\",id=\"sql_join\",instance=\"{}\"}})",
+        ctx.test_id
+    );
+    let df_series = prometheus
+        .wait_for_metric_at_least(&df_series_query, 1, 15, 500)
+        .await;
+    assert!(
+        df_series.is_ok(),
+        "sql_join must export at least one df_-prefixed subtree metric (join build/join time or counts): {:?}",
+        df_series
     );
 }
 
