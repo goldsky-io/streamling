@@ -151,8 +151,9 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 ///   consuming transform's subtree. Without stopping at them, an expensive
 ///   source-level filter would be misattributed to the transform's compute.
 fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    // EXTEND: add `or_else(|| topology_boundary_of::<NewType>(plan))` and
-    // `impl TopologyBoundary` — a missing arm silently bleeds metrics.
+    // Closed set: `topology_boundary_closed_set_matches_operator_execution_plans`
+    // fails if a new operators/ ExecutionPlan is added without classifying it
+    // here (and `impl TopologyBoundary`). A missing arm silently bleeds metrics.
     topology_boundary_of::<WrappingExec>(plan)
         .or_else(|| topology_boundary_of::<CheckpointableExec>(plan))
         .or_else(|| topology_boundary_of::<StreamingFilterExec>(plan))
@@ -951,14 +952,21 @@ mod tests {
             / 1_000_000
     }
 
+    /// Nominal compute in these tests is 3 batches × 15ms sleep = 45ms.
+    /// CI load can compress `Instant` readings well below that; this floor
+    /// only needs to prove the setup recorded *some* compute (a broken timer
+    /// or root-only walk reports ~0). Do not env-var-skip.
+    const RECORDED_COMPUTE_FLOOR_MS: u64 = 5;
+    /// Exclusion must report far less than the compute sitting below the
+    /// boundary. 10ms is well below the 45ms nominal and above timer noise.
+    const BOUNDARY_EXCLUSION_CEILING_MS: u64 = 10;
+
     /// Shared body for the boundary-exclusion tests: record ~45ms of real
     /// compute on an operator (executed directly, so a boundary node's own
     /// `execute()` side effects — e.g. `WrappingExec` initializing the
     /// process-global `LiveDataInspect` singleton — never run), place it
     /// below the boundary built by `make_boundary`, and assert
-    /// `CheckpointableExec::metrics` excludes it. Thresholds: >=25ms proves
-    /// the setup recorded compute (tolerating timer jitter); <10ms proves the
-    /// boundary excluded it. Slack is for CI timer jitter — do not env-var-skip.
+    /// `CheckpointableExec::metrics` excludes it.
     async fn assert_boundary_excludes(
         make_boundary: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
     ) {
@@ -969,7 +977,7 @@ mod tests {
         drain(&below).await;
         let below_ms = elapsed_ms(&below);
         assert!(
-            below_ms >= 25,
+            below_ms >= RECORDED_COMPUTE_FLOOR_MS,
             "test setup: compute below the boundary must have recorded \
              elapsed_compute, got {below_ms}ms"
         );
@@ -981,7 +989,7 @@ mod tests {
         ));
         let aggregated_ms = elapsed_ms(&checkpointable);
         assert!(
-            aggregated_ms < 10,
+            aggregated_ms < BOUNDARY_EXCLUSION_CEILING_MS,
             "compute at/below a topology boundary must be excluded, got {aggregated_ms}ms"
         );
     }
@@ -1011,14 +1019,13 @@ mod tests {
         drain(&checkpointable).await;
 
         // ~NUM_BATCHES * 15ms of deep compute; assert well below the nominal
-        // total so scheduling jitter can't flake it, but far above the ~0 a
-        // root-only forward would report. Slack is for CI timer jitter — do
-        // not env-var-skip.
+        // total so CI load can't flake it, but far above the ~0 a root-only
+        // forward would report. Do not env-var-skip.
         let aggregated_ms = elapsed_ms(&checkpointable);
         assert!(
-            aggregated_ms >= 25,
-            "expected aggregated subtree elapsed_compute >= 25ms (got {aggregated_ms}ms); \
-             deep-operator compute was dropped"
+            aggregated_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "expected aggregated subtree elapsed_compute >= {RECORDED_COMPUTE_FLOOR_MS}ms \
+             (got {aggregated_ms}ms); deep-operator compute was dropped"
         );
     }
 
@@ -1067,6 +1074,16 @@ mod tests {
         .await;
     }
 
+    /// Nested `CheckpointableExec` is another transform's aggregation point;
+    /// descending past it would double-count (and misattribute) its subtree.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_nested_checkpointable_exec() {
+        assert_boundary_excludes(|below| {
+            Arc::new(CheckpointableExec::new(below, 1, "nested".to_string()))
+        })
+        .await;
+    }
+
     /// A *source-owned* `StreamingFilterExec` (a source's filter re-applied
     /// above the source's `WrappingExec` by
     /// `wrap_with_side_outputs_before_filter`) must also act as a topology
@@ -1102,7 +1119,7 @@ mod tests {
             Arc::new(CheckpointableExec::new(own_filter, 1, "t".to_string()));
         let own_ms = elapsed_ms(&checkpointable);
         assert!(
-            own_ms >= 25,
+            own_ms >= RECORDED_COMPUTE_FLOOR_MS,
             "a transform-owned filter must not bound the walk, got {own_ms}ms"
         );
     }
@@ -1154,7 +1171,7 @@ mod tests {
             Arc::new(CheckpointableExec::new(own_proj, 1, "t".to_string()));
         let own_ms = elapsed_ms(&checkpointable);
         assert!(
-            own_ms >= 25,
+            own_ms >= RECORDED_COMPUTE_FLOOR_MS,
             "a transform-owned projection must not bound the walk, got {own_ms}ms"
         );
     }
@@ -1243,7 +1260,10 @@ mod tests {
         drain(&shared).await;
 
         let single_ms = elapsed_ms(&shared);
-        assert!(single_ms >= 25, "setup: expected recorded compute");
+        assert!(
+            single_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "setup: expected recorded compute, got {single_ms}ms"
+        );
 
         let union: Arc<dyn ExecutionPlan> =
             UnionExec::try_new(vec![Arc::clone(&shared), Arc::clone(&shared)]).unwrap();
@@ -1255,5 +1275,139 @@ mod tests {
             aggregated_ms, single_ms,
             "shared subplan must be counted once, not per parent"
         );
+    }
+
+    /// Types in `is_topology_boundary`. Adding a type there without listing
+    /// it here (or vice versa) fails this test.
+    const TOPOLOGY_BOUNDARY_TYPES: &[&str] = &[
+        "WrappingExec",
+        "CheckpointableExec",
+        "StreamingFilterExec",
+        "StreamingProjectionExec",
+    ];
+
+    /// Production `impl ExecutionPlan` types under `operators/` that are *not*
+    /// topology-boundary downcast targets. A new wrapper of foreign topology
+    /// must move to [`TOPOLOGY_BOUNDARY_TYPES`] and gain an `is_topology_boundary`
+    /// arm; any other new operator ExecutionPlan must be listed here so the
+    /// choice is explicit.
+    const NON_BOUNDARY_OPERATOR_EXEC_TYPES: &[&str] = &[
+        "StreamSourcePlan",    // scan-sharing source adapter; sits inside a source node
+        "MultiSinkExec",       // sink fan-out
+        "StreamingUnnestExec", // this transform's own compute
+        "BroadcastingExec",    // scan-sharing fan-out
+        "ExternalHandlerExec", // this node's HTTP transform
+        "RebatchExec",         // this node's rebatch; nested WrappingExec still bounds
+        "WasmRunnerExec",      // this node's wasm transform
+    ];
+
+    /// Sentinel: a new `impl ExecutionPlan for` in `operators/` (top-level,
+    /// not inside `mod tests`) must be classified as either a topology
+    /// boundary or an explicit non-boundary. The previous `// EXTEND:` comment
+    /// was silent; this fails the build instead.
+    #[test]
+    fn topology_boundary_closed_set_matches_operator_execution_plans() {
+        let checkpointable_src = include_str!("checkpointable.rs");
+        for ty in TOPOLOGY_BOUNDARY_TYPES {
+            let needle = format!("topology_boundary_of::<{ty}>");
+            assert!(
+                checkpointable_src.contains(&needle),
+                "is_topology_boundary is missing `{needle}`; a new boundary type \
+                 silently bleeds metrics until this arm is added"
+            );
+        }
+
+        let operators_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/operators");
+        let mut found = production_execution_plan_types(&operators_dir);
+        found.sort();
+        found.dedup();
+
+        let mut expected: Vec<String> = TOPOLOGY_BOUNDARY_TYPES
+            .iter()
+            .chain(NON_BOUNDARY_OPERATOR_EXEC_TYPES.iter())
+            .map(|s| (*s).to_string())
+            .collect();
+        expected.sort();
+        expected.dedup();
+
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|t| !expected.contains(t))
+            .cloned()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "new operators/ ExecutionPlan type(s) {missing:?} are not classified. \
+             If the type wraps foreign topology, add `impl TopologyBoundary`, \
+             a `topology_boundary_of::<T>` arm in `is_topology_boundary`, and \
+             the name to TOPOLOGY_BOUNDARY_TYPES. Otherwise add it to \
+             NON_BOUNDARY_OPERATOR_EXEC_TYPES."
+        );
+
+        let extra: Vec<_> = expected
+            .iter()
+            .filter(|t| !found.contains(t))
+            .cloned()
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "classified ExecutionPlan type(s) {extra:?} were not found as \
+             top-level `impl ExecutionPlan for` in operators/; update the \
+             sentinel lists"
+        );
+
+        // Every closed-set type must opt in via the trait, not only the walk.
+        let mut operators_src = String::new();
+        collect_rust_sources(&operators_dir, &mut operators_src);
+        for ty in TOPOLOGY_BOUNDARY_TYPES {
+            let needle = format!("TopologyBoundary for {ty}");
+            assert!(
+                operators_src.contains(&needle),
+                "{ty} is in is_topology_boundary but has no `impl TopologyBoundary`"
+            );
+        }
+    }
+
+    fn production_execution_plan_types(dir: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        collect_production_execution_plan_types(dir, &mut names);
+        names
+    }
+
+    fn collect_production_execution_plan_types(dir: &std::path::Path, names: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_production_execution_plan_types(&path, names);
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for line in src.lines() {
+                // Test-module impls are indented; production impls are top-level.
+                let Some(rest) = line.strip_prefix("impl ExecutionPlan for ") else {
+                    continue;
+                };
+                let name = rest.trim().trim_end_matches('{').trim();
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut String) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            out.push_str(&std::fs::read_to_string(&path).unwrap());
+            out.push('\n');
+        }
     }
 }
