@@ -1793,6 +1793,100 @@ mod tests {
             assert_eq!(tags.get("chain"), Some(&"polygon".to_string()));
             assert_eq!(tags.get("tier"), Some(&"gold".to_string()));
         }
+
+        /// `ELAPSED_COMPUTE_SEED_MS` is the consumer-facing contract: values at
+        /// or below this are indistinguishable from the once-per-node series
+        /// seed. The SQL e2e waits for `elapsed_compute` sum >= 2, which is
+        /// only valid while the seed stays 1ms.
+        #[test]
+        fn elapsed_compute_seed_ms_is_the_no_real_compute_threshold() {
+            assert_eq!(
+                ELAPSED_COMPUTE_SEED_MS, 1,
+                "consumers treat elapsed_compute <= ELAPSED_COMPUTE_SEED_MS as \
+                 'no real compute'; e2e threshold of 2ms must stay seed+1"
+            );
+            let src = include_str!("recorder.rs");
+            assert!(
+                src.contains("Duration::from_millis(ELAPSED_COMPUTE_SEED_MS)"),
+                "seed_elapsed_compute_series must record ELAPSED_COMPUTE_SEED_MS, \
+                 not a hardcoded millisecond value"
+            );
+        }
+
+        /// Seeding records exactly [`ELAPSED_COMPUTE_SEED_MS`] once per non-sink
+        /// node and is a no-op on sinks and on a second call.
+        #[test]
+        fn seed_elapsed_compute_series_once_per_non_sink_at_seed_ms() {
+            let _guard = TEST_LOCK.lock().unwrap();
+            reset_instance();
+
+            let mut map = HashMap::new();
+            let instance = "test-instance".to_string();
+            map.insert(
+                "src".to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(TopologyNodeType::Source, "kafka", "src"),
+                    service_instance_id: instance.clone(),
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+            map.insert(
+                "sql".to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(TopologyNodeType::Transform, "sql", "sql"),
+                    service_instance_id: instance.clone(),
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+            map.insert(
+                "sink".to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(TopologyNodeType::Sink, "blackhole", "sink"),
+                    service_instance_id: instance,
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+            initialize_metrics_recorder(map);
+
+            let recorder = get_metrics_recorder();
+            assert!(
+                recorder
+                    .histogram_registry
+                    .lock()
+                    .unwrap()
+                    .contains_key("elapsed_compute"),
+                "seed path requires the elapsed_compute histogram"
+            );
+
+            recorder.seed_elapsed_compute_series();
+            {
+                let seeded = recorder.seeded_elapsed_compute.lock().unwrap();
+                assert!(
+                    seeded.contains("src") && seeded.contains("sql"),
+                    "non-sink nodes must be seeded, got {seeded:?}"
+                );
+                assert!(
+                    !seeded.contains("sink"),
+                    "sinks must not receive the elapsed_compute seed, got {seeded:?}"
+                );
+                assert_eq!(
+                    seeded.len(),
+                    2,
+                    "exactly the two non-sink nodes, got {seeded:?}"
+                );
+            }
+
+            recorder.seed_elapsed_compute_series();
+            let seeded = recorder.seeded_elapsed_compute.lock().unwrap();
+            assert_eq!(
+                seeded.len(),
+                2,
+                "second seed must be idempotent, got {seeded:?}"
+            );
+        }
     }
 
     #[test]
