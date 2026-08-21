@@ -5,11 +5,11 @@
 //! - UNION query handling
 //! - Flink-compatible string functions
 //! - SQL filter metrics
+//! - Multi-operator SQL subtree df_-prefixed metrics (unnest)
 //!
 //! Ported from crates/streamling/tests/pipeline.rs
 
 use serde::Serialize;
-use std::fs;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
 
 // ============================================================================
@@ -563,12 +563,13 @@ sinks:
     );
 }
 
-/// Join SQL exercises the `df_`-prefixed subtree recording path (HashJoin
-/// `build_time` / `join_time` / `build_input_rows`), which the single-operator
-/// projection e2e above does not hit. Two bounded file sources so the join
-/// completes at EOF instead of waiting on an unbounded Kafka build side.
+/// Multi-operator SQL subtree (filter + make_array projection + unnest) exercises
+/// the `df_`-prefixed recording path. JOIN SQL is unsupported (`sql_parse` /
+/// bigint preprocessor reject it); `StreamingUnnestExec` already emits named
+/// Count metrics (`input_rows`, `input_batches`) which export as `streamling_df_*`.
+/// Same unnest/`make_array` shape as the checkpoint e2e.
 #[tokio::test]
-async fn test_sql_join_emits_df_prefixed_subtree_metrics() {
+async fn test_sql_unnest_emits_df_prefixed_subtree_metrics() {
     init_tracing();
 
     let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
@@ -580,91 +581,74 @@ async fn test_sql_join_emits_df_prefixed_subtree_metrics() {
         .as_ref()
         .expect("Prometheus should be available");
 
-    let left_dir = ctx.temp_dir.path().join("join_left");
-    let right_dir = ctx.temp_dir.path().join("join_right");
-    fs::create_dir_all(&left_dir).expect("create left dir");
-    fs::create_dir_all(&right_dir).expect("create right dir");
-    fs::write(
-        left_dir.join("data.csv"),
-        "id,name\n1,alice\n2,bob\n3,carol\n",
-    )
-    .expect("write left csv");
-    fs::write(
-        right_dir.join("data.csv"),
-        "id,extra\n1,alpha\n2,beta\n9,orphan\n",
-    )
-    .expect("write right csv");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records = create_test_records(10);
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
 
     let pipeline = format!(
         r#"
 sources:
-  left_src:
-    type: file
-    path: {left}/
-    format: csv
+  kafka_source:
+    type: kafka
+    topic: {topic}
     primary_key: id
-    mode:
-      type: bounded
-  right_src:
-    type: file
-    path: {right}/
-    format: csv
-    primary_key: id
-    mode:
-      type: bounded
 
 transforms:
-  sql_join:
+  sql_unnest:
     type: sql
-    sql: "SELECT l.id, l.name, r.extra FROM left_src l INNER JOIN right_src r ON l.id = r.id"
+    sql: "SELECT id, item, _gs_op FROM (SELECT id, unnest(make_array(data, data)) AS item, _gs_op FROM kafka_source WHERE block > 0) t"
     primary_key: id
 
 sinks:
-  print_sink:
-    type: print
-    from: sql_join
-    sample_every: 1
+  blackhole_sink:
+    type: blackhole
+    from: sql_unnest
 "#,
-        left = left_dir.display(),
-        right = right_dir.display()
+        topic = ctx.kafka_topic
     );
 
-    let output = ctx
-        .run_pipeline_with_capture(&pipeline, PipelineOpts::new())
+    // 10 source rows × 2 unnest elements; RECORD_BATCH_SIZE=1 so UnnestExec
+    // records per-row Count metrics instead of one fat batch.
+    let _status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(20)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+        )
         .await
-        .expect("join pipeline should complete");
-
-    assert_eq!(
-        output.len(),
-        2,
-        "INNER JOIN should emit the two matching ids; got {:?}",
-        output.column_values("id")
-    );
+        .expect("Pipeline should complete successfully");
 
     use streamling_e2e::resources::PrometheusResource;
-    let elapsed_query = PrometheusResource::elapsed_compute_query("sql_join", Some(&ctx.test_id));
+    let elapsed_query = PrometheusResource::elapsed_compute_query("sql_unnest", Some(&ctx.test_id));
     let elapsed = prometheus
         .wait_for_metric_at_least(&elapsed_query, 2, 15, 500)
         .await;
     assert!(
         elapsed.is_ok(),
-        "sql_join elapsed_compute must exceed the 1ms series seed: {:?}",
+        "sql_unnest elapsed_compute must exceed the 1ms series seed: {:?}",
         elapsed
     );
 
-    // Any df_* series on this node means subtree_delta_metric_values exported
-    // join/operator metrics under SUBTREE_METRIC_PREFIX, not only elapsed_compute.
-    let df_series_query = format!(
-        "count({{__name__=~\"streamling_df_.*\",id=\"sql_join\",instance=\"{}\"}})",
+    // StreamingUnnestExec::input_rows is a named Count, exported as df_input_rows.
+    let df_input_rows = format!(
+        "streamling_df_input_rows_total{{id=\"sql_unnest\",instance=\"{}\"}}",
         ctx.test_id
     );
-    let df_series = prometheus
-        .wait_for_metric_at_least(&df_series_query, 1, 15, 500)
+    let rows = prometheus
+        .wait_for_metric_at_least(&df_input_rows, 1, 15, 500)
         .await;
     assert!(
-        df_series.is_ok(),
-        "sql_join must export at least one df_-prefixed subtree metric (join build/join time or counts): {:?}",
-        df_series
+        rows.is_ok(),
+        "sql_unnest must export df_input_rows from the unnest operator (df_-prefixed subtree path): {:?}",
+        rows
     );
 }
 
