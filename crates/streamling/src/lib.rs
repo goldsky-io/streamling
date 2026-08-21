@@ -1642,10 +1642,19 @@ impl Streamling {
                         validate_update_where(uw, &source_schema, &reference_name)?;
                     }
 
+                    // Per-sink connection: two postgres sinks in one pipeline can
+                    // target two different databases (STRM-6516). Falls back to the
+                    // global postgres_sink block when no per-sink keys are set.
+                    let postgres_config = app_config.postgres_sink_for(&reference_name);
+                    info!(
+                        "postgres sink '{}' resolved connection {:?}",
+                        reference_name, postgres_config
+                    );
+
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
-                        app_config.postgres_sink.clone(),
+                        postgres_config.clone(),
                         table.clone(),
                         schema.clone(),
                         batch_size,
@@ -1670,18 +1679,16 @@ impl Streamling {
                     // always has a concrete batch_size/interval regardless of
                     // whether the topology supplied them.
                     let effective_batch_size =
-                        Some(batch_size.unwrap_or(app_config.postgres_sink.batch_size));
+                        Some(batch_size.unwrap_or(postgres_config.batch_size));
                     let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
                         Some(d) => d,
-                        None => humantime::parse_duration(
-                            &app_config.postgres_sink.batch_flush_interval,
-                        )
-                        .streamling_with_context(|| {
-                            format!(
-                                "invalid app_config.postgres_sink.batch_flush_interval '{}'",
-                                app_config.postgres_sink.batch_flush_interval
-                            )
-                        })?,
+                        None => humantime::parse_duration(&postgres_config.batch_flush_interval)
+                            .streamling_with_context(|| {
+                                format!(
+                                    "invalid postgres batch_flush_interval '{}' resolved for sink '{}'",
+                                    postgres_config.batch_flush_interval, reference_name
+                                )
+                            })?,
                     });
                     Self::update_source_to_sink_mapping(
                         &mut sources_to_sinks,
@@ -1747,6 +1754,13 @@ impl Streamling {
                         format!("{}: failed to create PostgresAggregator", ctx.format())
                     })?;
 
+                    // Per-sink connection, as for the plain postgres sink above.
+                    let postgres_config = app_config.postgres_sink_for(&reference_name);
+                    info!(
+                        "postgres_aggregate sink '{}' resolved connection {:?}",
+                        reference_name, postgres_config
+                    );
+
                     if dry_run {
                         // Secrets are not resolved during dry-run (see
                         // secret_name_to_resolve), so there are no DB credentials
@@ -1757,14 +1771,14 @@ impl Streamling {
                         pg_aggregator.generate_trigger_statement_sql()?;
                     } else {
                         pg_aggregator
-                            .create_trigger_and_tables(&app_config.postgres_sink)
+                            .create_trigger_and_tables(&postgres_config)
                             .await?;
                     }
 
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
-                        app_config.postgres_sink.clone(),
+                        postgres_config.clone(),
                         landing_table.clone(),
                         schema.clone(),
                         batch_size,
@@ -1789,18 +1803,16 @@ impl Streamling {
                     // always has a concrete batch_size/interval regardless of
                     // whether the topology supplied them.
                     let effective_batch_size =
-                        Some(batch_size.unwrap_or(app_config.postgres_sink.batch_size));
+                        Some(batch_size.unwrap_or(postgres_config.batch_size));
                     let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
                         Some(d) => d,
-                        None => humantime::parse_duration(
-                            &app_config.postgres_sink.batch_flush_interval,
-                        )
-                        .streamling_with_context(|| {
-                            format!(
-                                "invalid app_config.postgres_sink.batch_flush_interval '{}'",
-                                app_config.postgres_sink.batch_flush_interval
-                            )
-                        })?,
+                        None => humantime::parse_duration(&postgres_config.batch_flush_interval)
+                            .streamling_with_context(|| {
+                                format!(
+                                    "invalid postgres batch_flush_interval '{}' resolved for sink '{}'",
+                                    postgres_config.batch_flush_interval, reference_name
+                                )
+                            })?,
                     });
                     Self::update_source_to_sink_mapping(
                         &mut sources_to_sinks,

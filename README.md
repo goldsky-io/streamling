@@ -680,6 +680,18 @@ sinks:
 | `STREAMLING__POSTGRES_SINK__DB` | `postgres` | Database name |
 | `STREAMLING__POSTGRES_SINK__SSLMODE` | `disable` | SSL mode (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`) |
 
+**Per-sink connections** — two `postgres` sinks in one pipeline can write to two
+different databases. Prefix a sink's connection with
+`STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__`, where `<SINK_NAME>` is
+the sink's key in `sinks:` with non-alphanumeric characters replaced by `_`; any
+field left unset falls back to the table above, and a sink with no entry uses it
+verbatim. For the sample above:
+
+```
+STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_BLOCKS__HOST=blocks.example.com
+STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_BLOCKS__DB=blocks
+```
+
 Behavior for 256-bit integers (U256/I256):
 
 - Columns annotated as U256/I256 in the Arrow schema (FixedSizeBinary(32) with Streamling metadata) are created in Postgres as `NUMERIC(78,0)`.

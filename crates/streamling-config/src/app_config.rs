@@ -589,6 +589,88 @@ impl Default for PostgresSinkConfig {
     }
 }
 
+/// Normalizes a topology node name to the key the config crate produces for a
+/// `STREAMLING__<SINK_TYPE>_SINK_CONNECTIONS__<NODE_NAME>__<FIELD>` env var.
+///
+/// The config crate lowercases env var names and splits them on `__`, so a node
+/// name has to survive both: non-alphanumeric characters become `_` and runs of
+/// `_` collapse into one. `my-sink`, `my_sink` and `my__sink` therefore all
+/// resolve to `my_sink`. streamling-agent applies the same normalization when it
+/// writes the env vars, and rejects a pipeline whose sink names collide once
+/// normalized, so one key never stands for two different destinations.
+pub fn normalize_sink_key(node_name: &str) -> String {
+    let mut key = String::with_capacity(node_name.len());
+    for c in node_name.chars() {
+        if c.is_alphanumeric() {
+            key.push(c.to_ascii_lowercase());
+        } else if !key.is_empty() && !key.ends_with('_') {
+            key.push('_');
+        }
+    }
+    // A leading or trailing `_` would make the config crate split the env name
+    // into an empty segment, so the key could never be looked up.
+    if key.ends_with('_') {
+        key.pop();
+    }
+    key
+}
+
+/// Connection overrides for one `postgres` / `postgres_aggregate` sink node.
+///
+/// A streamling process has a single global `postgres_sink` connection, so two
+/// postgres sinks in one pipeline used to share one destination: whichever
+/// secret the cloud agent flattened into `STREAMLING__POSTGRES_SINK__*` last
+/// won, and the other sink silently wrote to the same database (STRM-6516).
+/// Each sink's own credentials now arrive under
+/// `STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__*`; fields left unset
+/// fall back to the global block, and a sink with no entry at all keeps the
+/// global connection verbatim.
+#[derive(Deserialize, Clone, Default)]
+pub struct PostgresSinkConnection {
+    pub host: Option<String>,
+    pub port: Option<String>,
+    pub user: Option<String>,
+    pub pass: Option<String>,
+    pub db: Option<String>,
+    pub sslmode: Option<String>,
+}
+
+impl std::fmt::Debug for PostgresSinkConnection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSinkConnection")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &self.pass.as_ref().map(|_| "*****"))
+            .field("db", &self.db)
+            .field("sslmode", &self.sslmode)
+            .finish()
+    }
+}
+
+impl PostgresSinkConnection {
+    fn apply_to(&self, config: &mut PostgresSinkConfig) {
+        if let Some(host) = &self.host {
+            config.host = host.clone();
+        }
+        if let Some(port) = &self.port {
+            config.port = port.clone();
+        }
+        if let Some(user) = &self.user {
+            config.user = user.clone();
+        }
+        if let Some(pass) = &self.pass {
+            config.pass = pass.clone();
+        }
+        if let Some(db) = &self.db {
+            config.db = db.clone();
+        }
+        if let Some(sslmode) = &self.sslmode {
+            config.sslmode = sslmode.clone();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExternalHttpHandlerConfig {
     pub trigger_max_count: u32,
@@ -738,6 +820,12 @@ pub struct AppConfig {
     /// Populated from `STREAMLING__HTTP_SECRET_VALUE__<NAME>` environment variables.
     #[serde(default)]
     pub http_secret_value: SecretMap,
+    /// Per-sink Postgres connections, keyed by normalized sink node name
+    /// (see [`normalize_sink_key`]). Populated from
+    /// `STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__*` env vars; read
+    /// via [`AppConfig::postgres_sink_for`].
+    #[serde(default)]
+    pub postgres_sink_connections: HashMap<String, PostgresSinkConnection>,
     #[serde(default)]
     pub test_settings: TestSettings,
     /// When true, hybrid sources terminate after all bounded phases complete
@@ -753,6 +841,22 @@ impl AppConfig {
     /// it would affect existing state.
     pub fn state_backend_namespace(&self) -> &str {
         self.application_id.as_str()
+    }
+
+    /// Connection for the `postgres` / `postgres_aggregate` sink node named
+    /// `sink_name`: the global `postgres_sink` block with that sink's own
+    /// overrides applied. Sinks without an override keep the global connection,
+    /// which is the single-destination behavior every pipeline had before
+    /// STRM-6516.
+    pub fn postgres_sink_for(&self, sink_name: &str) -> PostgresSinkConfig {
+        let mut config = self.postgres_sink.clone();
+        if let Some(connection) = self
+            .postgres_sink_connections
+            .get(&normalize_sink_key(sink_name))
+        {
+            connection.apply_to(&mut config);
+        }
+        config
     }
 }
 
@@ -890,6 +994,154 @@ mod tests {
             test.http_secret_value.get("my_token"),
             Some(&"Bearer abc123".to_string())
         );
+    }
+
+    /// The embedded defaults, with no external file and no env overrides — a
+    /// deterministic starting point for connection-resolution tests.
+    fn base_app_config() -> AppConfig {
+        Config::builder()
+            .add_source(File::from_str(EMBEDDED_DEFAULT_CONFIG, FileFormat::Yaml))
+            .build()
+            .expect("embedded default config must build")
+            .try_deserialize()
+            .expect("embedded default config must deserialize into AppConfig")
+    }
+
+    #[test]
+    fn normalize_sink_key_matches_config_crate_key_shape() {
+        // The config crate lowercases and splits on `__`, so every rendering of
+        // one sink name has to land on the same key.
+        assert_eq!(normalize_sink_key("postgres_prod_txs"), "postgres_prod_txs");
+        assert_eq!(normalize_sink_key("Postgres-Prod-Txs"), "postgres_prod_txs");
+        assert_eq!(
+            normalize_sink_key("postgres__prod__txs"),
+            "postgres_prod_txs"
+        );
+        assert_eq!(normalize_sink_key("pg.prod"), "pg_prod");
+        // No empty leading or trailing segment: the config crate would split the
+        // env name around it and the key would be unreachable.
+        assert_eq!(normalize_sink_key("-pg-prod-"), "pg_prod");
+    }
+
+    /// The whole point of the per-sink maps: two postgres sinks in one pipeline
+    /// resolve to two different databases instead of sharing whichever secret
+    /// the cloud agent flattened last (STRM-6516).
+    #[test]
+    fn postgres_sink_connections_resolve_per_sink() {
+        let mut config = base_app_config();
+        config.postgres_sink_connections.insert(
+            "postgres_prod_txs".to_string(),
+            PostgresSinkConnection {
+                host: Some("prod.example.com".to_string()),
+                db: Some("prod".to_string()),
+                ..Default::default()
+            },
+        );
+        config.postgres_sink_connections.insert(
+            "postgres_dev_txs".to_string(),
+            PostgresSinkConnection {
+                host: Some("dev.example.com".to_string()),
+                db: Some("dev".to_string()),
+                pass: Some("dev-pass".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let prod = config.postgres_sink_for("postgres_prod_txs");
+        let dev = config.postgres_sink_for("postgres_dev_txs");
+
+        assert_eq!(prod.host, "prod.example.com");
+        assert_eq!(prod.db, "prod");
+        assert_eq!(dev.host, "dev.example.com");
+        assert_eq!(dev.db, "dev");
+        // Unset fields fall back to the global block, set ones win.
+        assert_eq!(prod.pass, config.postgres_sink.pass);
+        assert_eq!(dev.pass, "dev-pass");
+        // Non-connection knobs are never per-sink.
+        assert_eq!(dev.batch_size, config.postgres_sink.batch_size);
+    }
+
+    /// A sink with no override keeps the global connection — the behavior of
+    /// every pipeline deployed by an agent that does not publish per-sink keys.
+    #[test]
+    fn sink_without_connection_override_falls_back_to_global() {
+        let config = base_app_config();
+
+        let resolved = config.postgres_sink_for("some_sink");
+        assert_eq!(resolved.host, config.postgres_sink.host);
+        assert_eq!(resolved.db, config.postgres_sink.db);
+    }
+
+    /// End-to-end env path: the agent writes
+    /// `STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK>__<FIELD>`, so the config
+    /// crate must nest a map of structs two levels deep from those env vars.
+    #[test]
+    fn postgres_sink_connections_populated_from_env_vars() {
+        let _guard = env_guard();
+
+        let vars = [
+            (
+                "STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_DEV_TXS__HOST",
+                "dev.example.com",
+            ),
+            (
+                "STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_DEV_TXS__DB",
+                "dev",
+            ),
+            (
+                "STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_PROD_TXS__HOST",
+                "prod.example.com",
+            ),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            #[derive(serde_derive::Deserialize)]
+            struct TestConfig {
+                #[serde(default)]
+                postgres_sink_connections: HashMap<String, PostgresSinkConnection>,
+            }
+            Config::builder()
+                .add_source(Environment::with_prefix("streamling").separator("__"))
+                .build()
+                .unwrap()
+                .try_deserialize::<TestConfig>()
+                .unwrap()
+                .postgres_sink_connections
+        });
+
+        // SAFETY: see above.
+        unsafe {
+            for (name, value) in previous {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let connections = result.expect("test body panicked");
+        let dev = connections
+            .get("postgres_dev_txs")
+            .expect("dev sink connection must be populated from env");
+        assert_eq!(dev.host.as_deref(), Some("dev.example.com"));
+        assert_eq!(dev.db.as_deref(), Some("dev"));
+        assert_eq!(dev.user, None);
+        let prod = connections
+            .get("postgres_prod_txs")
+            .expect("prod sink connection must be populated from env");
+        assert_eq!(prod.host.as_deref(), Some("prod.example.com"));
+        assert_eq!(prod.db, None);
     }
 
     /// Verifies the full path: STREAMLING__HTTP_SECRET_HEADER__* and STREAMLING__HTTP_SECRET_VALUE__* env
