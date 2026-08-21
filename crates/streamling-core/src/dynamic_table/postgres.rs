@@ -804,56 +804,65 @@ impl PostgresDynamicTableBackend {
                         "Creating PostgreSQL dynamic table: {}",
                         self.full_table_name
                     );
-                    let create_result = sqlx::query(
-                        format!(
-                            r#"
+                    let create_table_sql = format!(
+                        r#"
                             CREATE TABLE IF NOT EXISTS {} (
                                 "{}" TEXT PRIMARY KEY,
                                 "{}" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CLOCK_TIMESTAMP()
                             );
                         "#,
-                            self.full_table_name, self.column_name, self.time_column_name
-                        )
-                        .as_str(),
-                    )
-                    .execute(pool_arc.as_ref())
-                    .await;
+                        self.full_table_name, self.column_name, self.time_column_name
+                    );
+                    let bare_table = self
+                        .full_table_name
+                        .rsplit_once('.')
+                        .map(|(_, table)| table)
+                        .unwrap_or(self.full_table_name.as_str());
+                    let index_name = format!("idx_{}_{}", bare_table, self.time_column_name);
+                    let create_index_sql = format!(
+                        r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
+                        index_name, self.full_table_name, self.time_column_name
+                    );
 
-                    match create_result {
-                        Ok(_) => {
-                            info!("Successfully created table: {}", self.full_table_name);
-                            let bare_table = self
-                                .full_table_name
-                                .rsplit_once('.')
-                                .map(|(_, table)| table)
-                                .unwrap_or(self.full_table_name.as_str());
-                            let index_name =
-                                format!("idx_{}_{}", bare_table, self.time_column_name);
-                            let create_index_sql = format!(
-                                r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
-                                index_name, self.full_table_name, self.time_column_name
-                            );
-                            if let Err(e) = sqlx::query(&create_index_sql)
-                                .execute(pool_arc.as_ref())
-                                .await
-                            {
-                                let err = DynamicTableBackendError::Initialization(format!(
-                                    "Failed to create index {} on table {}: {}",
-                                    index_name, self.full_table_name, e
-                                ));
-                                error!("{}", err);
-                                return Err(err);
-                            }
-                        }
-                        Err(e) => {
+                    let mut transaction = pool_arc.begin().await.map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to begin transaction for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+                    sqlx::query(&create_table_sql)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| {
                             let err = DynamicTableBackendError::Initialization(format!(
                                 "Failed to create table {}: {}",
                                 self.full_table_name, e
                             ));
                             error!("{}", err);
-                            return Err(err);
-                        }
-                    }
+                            err
+                        })?;
+                    sqlx::query(&create_index_sql)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| {
+                            let err = DynamicTableBackendError::Initialization(format!(
+                                "Failed to create index {} on table {}: {}",
+                                index_name, self.full_table_name, e
+                            ));
+                            error!("{}", err);
+                            err
+                        })?;
+                    transaction.commit().await.map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to commit transaction for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+                    info!("Successfully created table: {}", self.full_table_name);
                 } else {
                     debug!(
                         "Table {} already exists, skipping creation",
