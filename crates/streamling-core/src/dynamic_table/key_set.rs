@@ -1,8 +1,4 @@
-use arrow::array::{Array, BooleanArray, BooleanBufferBuilder, LargeStringArray, StringArray};
-// Only the `#[cfg(test)]` bench/tests modules below still build a `BooleanArray`
-// row-by-row with a validity buffer; `contains_array` no longer does.
-#[cfg(test)]
-use arrow::array::BooleanBuilder;
+use arrow::array::{Array, BooleanArray, BooleanBuilder, LargeStringArray, StringArray};
 use arrow::compute::concat;
 use datafusion::common::hash_utils::{RandomState, with_hashes};
 use hashbrown::HashTable;
@@ -112,29 +108,28 @@ impl ArrowKeySet {
         // Haystack is LargeUtf8, needle is Utf8 — hashes match for equal `&str`
         // content (see struct-level comment).
         with_hashes([needles as &dyn Array], &self.state, |hashes| {
-            let mut values = BooleanBufferBuilder::new(needles.len());
+            let mut builder = BooleanBuilder::with_capacity(needles.len());
             for (i, &hash) in hashes.iter().enumerate() {
                 if needles.is_null(i) {
-                    // Position must stay aligned; the null mask below masks this slot.
-                    // (`hash_array` only writes valid indices, so never trust hashes[i] here.)
-                    values.append(false);
+                    // `hash_array` only writes valid indices; null slots hold garbage.
+                    builder.append_null();
                     continue;
                 }
                 // Prefilter: a miss means DEFINITELY absent — skip the exact
                 // table entirely. A hit still runs the exact probe below; the
                 // filter can never produce a `true` on its own.
                 if !self.filter.maybe_contains(hash) {
-                    values.append(false);
+                    builder.append_value(false);
                     continue;
                 }
                 let needle = needles.value(i);
-                values.append(
-                    self.table
-                        .find(hash, |&idx| self.keys.value(idx as usize) == needle)
-                        .is_some(),
-                );
+                let found = self
+                    .table
+                    .find(hash, |&idx| self.keys.value(idx as usize) == needle)
+                    .is_some();
+                builder.append_value(found);
             }
-            Ok(BooleanArray::new(values.finish(), needles.nulls().cloned()))
+            Ok(builder.finish())
         })
         .map_err(|e| e.to_string())
     }
@@ -606,29 +601,6 @@ mod bench {
         builder.finish()
     }
 
-    /// Same probe as `contains_array` but building the output with `BooleanBuilder`
-    /// (per-row validity bookkeeping) instead of `BooleanBufferBuilder` + the
-    /// needles' own null mask. Isolates the output-buffer change.
-    fn contains_array_nodedup(set: &ArrowKeySet, needles: &StringArray) -> BooleanArray {
-        with_hashes([needles as &dyn Array], &set.state, |hashes| {
-            let mut builder = BooleanBuilder::with_capacity(needles.len());
-            for (i, &hash) in hashes.iter().enumerate() {
-                if needles.is_null(i) {
-                    builder.append_null();
-                    continue;
-                }
-                let needle = needles.value(i);
-                let found = set
-                    .table
-                    .find(hash, |&idx| set.keys.value(idx as usize) == needle)
-                    .is_some();
-                builder.append_value(found);
-            }
-            Ok(builder.finish())
-        })
-        .expect("probe")
-    }
-
     fn checksum(arr: &BooleanArray) -> u64 {
         let mut n = 0u64;
         for i in 0..arr.len() {
@@ -654,16 +626,6 @@ mod bench {
         let mut sum = 0u64;
         for batch in batches {
             let out = set.contains_array(batch).expect("probe");
-            sum += checksum(black_box(&out));
-        }
-        (start.elapsed(), sum)
-    }
-
-    fn run_arrow_nodedup(set: &ArrowKeySet, batches: &[StringArray]) -> (std::time::Duration, u64) {
-        let start = Instant::now();
-        let mut sum = 0u64;
-        for batch in batches {
-            let out = contains_array_nodedup(set, batch);
             sum += checksum(black_box(&out));
         }
         (start.elapsed(), sum)
@@ -956,33 +918,14 @@ mod bench {
         const REPS: usize = 3;
         for (scenario, batches) in scenarios {
             let (hs_elapsed, hs_sum) = best_of(REPS, || run_hashset(&hashset, batches));
-            let (nd_elapsed, nd_sum) = best_of(REPS, || run_arrow_nodedup(&arrow, batches));
             let (ar_elapsed, ar_sum) = best_of(REPS, || run_arrow(&arrow, batches));
             assert_eq!(
                 hs_sum, ar_sum,
                 "checksum mismatch scenario={scenario}: hashset={hs_sum} arrow={ar_sum}"
             );
-            assert_eq!(
-                nd_sum, ar_sum,
-                "output-buffer change altered results scenario={scenario}: boolbuilder={nd_sum} bufbuilder={ar_sum}"
-            );
             report(scenario, "hashset", hs_elapsed);
-            report(scenario, "arrow-boolbuilder", nd_elapsed);
-            report(scenario, "arrow-bufbuilder", ar_elapsed);
+            report(scenario, "arrow", ar_elapsed);
             report_ratio(scenario, hs_elapsed, ar_elapsed);
-            let nd = nd_elapsed.as_secs_f64();
-            let ar = ar_elapsed.as_secs_f64();
-            if ar <= nd {
-                println!(
-                    "scenario={scenario} bufbuilder is {:.2}x faster than boolbuilder",
-                    nd / ar
-                );
-            } else {
-                println!(
-                    "scenario={scenario} bufbuilder is {:.2}x SLOWER than boolbuilder",
-                    ar / nd
-                );
-            }
             println!();
         }
     }
