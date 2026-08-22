@@ -555,6 +555,9 @@ mod tests {
 #[cfg(test)]
 mod bench {
     use super::*;
+    use arrow::array::{DictionaryArray, StringDictionaryBuilder};
+    use arrow::compute::take;
+    use arrow::datatypes::Int32Type;
     use std::collections::HashSet;
     use std::hint::black_box;
     use std::time::Instant;
@@ -627,6 +630,48 @@ mod bench {
         for batch in batches {
             let out = set.contains_array(batch).expect("probe");
             sum += checksum(black_box(&out));
+        }
+        (start.elapsed(), sum)
+    }
+
+    /// Dictionary-encode a batch: K distinct values plus Int32 keys. Built OUTSIDE
+    /// the timed section on purpose — the premise is that the data ARRIVES
+    /// dictionary-encoded (parquet/avro sources produce it). If we had to encode
+    /// it ourselves per batch we would just be rebuilding grouping by hand, which
+    /// is exactly the software dedup that measured slower.
+    fn to_dict(batch: &StringArray) -> DictionaryArray<Int32Type> {
+        let mut b = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..batch.len() {
+            if batch.is_null(i) {
+                b.append_null();
+            } else {
+                b.append_value(batch.value(i));
+            }
+        }
+        b.finish()
+    }
+
+    /// Probe only the K distinct dictionary values, then map answers onto the N
+    /// rows with `take` — the encoding supplies the dedup for free.
+    fn run_dict(
+        set: &ArrowKeySet,
+        dicts: &[DictionaryArray<Int32Type>],
+    ) -> (std::time::Duration, u64) {
+        let start = Instant::now();
+        let mut sum = 0u64;
+        for d in dicts {
+            let values = d
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("dict values are Utf8");
+            let vc = set.contains_array(values).expect("probe");
+            let out = take(&vc, d.keys(), None).expect("take");
+            let b = out
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("take of boolean is boolean");
+            sum += checksum(black_box(b));
         }
         (start.elapsed(), sum)
     }
@@ -911,6 +956,43 @@ mod bench {
             report("  all_miss", label, d_miss);
             report("  miss98", label, d_98);
             report("  all_hit", label, d_hit);
+        }
+        println!();
+
+        // --- dictionary-encoded probe vs plain row-by-row probe ---
+        // `dup_heavy` has 5 distinct values per 50 rows, so the dictionary should
+        // win big there; the all-distinct scenarios show what `take` costs when
+        // there is no duplication to exploit.
+        println!("--- dictionary probe (K distinct values + take) vs plain N-row probe ---");
+        for (label, batches) in [
+            ("dup_heavy_5of50", &dup_heavy),
+            ("all_miss", &all_miss),
+            ("miss98", &miss98),
+        ] {
+            let dicts: Vec<DictionaryArray<Int32Type>> = batches.iter().map(to_dict).collect();
+            let distinct: usize =
+                dicts.iter().map(|d| d.values().len()).sum::<usize>() / dicts.len();
+            let (d_plain, s_plain) = best_of(3, || run_arrow(&arrow, batches));
+            let (d_dict, s_dict) = best_of(3, || run_dict(&arrow, &dicts));
+            assert_eq!(
+                s_plain, s_dict,
+                "dictionary path changed results for {label}"
+            );
+            report(label, "plain", d_plain);
+            report(label, "dictionary", d_dict);
+            let pl = d_plain.as_secs_f64();
+            let dc = d_dict.as_secs_f64();
+            if dc <= pl {
+                println!(
+                    "scenario={label} dictionary is {:.2}x faster (avg {distinct} distinct of {BATCH_SIZE} rows)",
+                    pl / dc
+                );
+            } else {
+                println!(
+                    "scenario={label} dictionary is {:.2}x SLOWER (avg {distinct} distinct of {BATCH_SIZE} rows)",
+                    dc / pl
+                );
+            }
         }
         println!();
 
