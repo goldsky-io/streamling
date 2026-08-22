@@ -7016,6 +7016,7 @@ dependencies = [
  "extism",
  "fixed_deque",
  "futures",
+ "hashbrown 0.15.2",
  "heck",
  "indexmap",
  "indoc",

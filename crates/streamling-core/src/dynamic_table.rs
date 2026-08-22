@@ -1,4 +1,5 @@
 mod in_memory;
+mod key_set;
 mod postgres;
 
 use arrow_schema::DataType;

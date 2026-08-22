@@ -1,11 +1,12 @@
+use crate::dynamic_table::key_set::ArrowKeySet;
 use crate::dynamic_table::{DynamicTableBackend, DynamicTableBackendError, extract_string_values};
 use crate::error::Result as StreamlingResult;
 use crate::error::ResultExt;
 use crate::retry::retry_forever_with_backoff_async_returning;
 use crate::streamling_user_err;
 use async_trait::async_trait;
-use datafusion::arrow::array::builder::BooleanBuilder;
-use datafusion::arrow::array::{Array, ArrayRef, StringArray};
+use datafusion::arrow::array::builder::{BooleanBuilder, LargeStringBuilder};
+use datafusion::arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use futures::future::join_all;
 use regex::Regex;
 use sqlx::pool::PoolOptions;
@@ -228,13 +229,20 @@ impl PostgresDynamicTableBackendFactory {
 #[derive(Debug)]
 struct PostgresDynamicTableCache {
     updated_at: Option<String>,
-    values: HashSet<Box<str>>,
+    values: ArrowKeySet,
 }
 
 impl PostgresDynamicTableCache {
-    fn append(&mut self, update: Self) {
-        self.updated_at = update.updated_at;
-        self.values.extend(update.values);
+    fn append(
+        &mut self,
+        updated_at: Option<String>,
+        keys: LargeStringArray,
+    ) -> Result<(), DynamicTableBackendError> {
+        self.values
+            .extend_from(keys)
+            .map_err(DynamicTableBackendError::Query)?;
+        self.updated_at = updated_at;
+        Ok(())
     }
 }
 
@@ -316,7 +324,7 @@ impl PostgresDynamicTableBackend {
         &self,
         pool: Arc<PgPool>,
         updated_since: Option<&str>,
-    ) -> (PostgresDynamicTableCache, usize) {
+    ) -> (Option<String>, LargeStringArray, usize) {
         // Serialized append-only writers assign CLOCK_TIMESTAMP after taking the
         // table lock; use a dedicated version cursor if that contract changes.
         let max_query: Arc<str> = format!(
@@ -391,7 +399,7 @@ impl PostgresDynamicTableBackend {
                             format!("failed to open cache cursor for table {full_table_name}")
                         })?;
 
-                    let mut values = HashSet::new();
+                    let mut builder = LargeStringBuilder::new();
                     let mut pages_loaded = 0;
                     loop {
                         let page: Vec<String> = sqlx::query_scalar(fetch_page_query.as_ref())
@@ -404,16 +412,15 @@ impl PostgresDynamicTableBackend {
                             break;
                         }
                         pages_loaded += 1;
-                        values.extend(page.into_iter().map(String::into_boxed_str));
+                        for value in page {
+                            builder.append_value(value);
+                        }
                     }
 
                     transaction.commit().await.streamling_with_context(|| {
                         format!("failed to finish cache load for table {full_table_name}")
                     })?;
-                    Ok((
-                        PostgresDynamicTableCache { updated_at, values },
-                        pages_loaded,
-                    ))
+                    Ok((updated_at, builder.finish(), pages_loaded))
                 }
             },
             &operation_name,
@@ -421,7 +428,7 @@ impl PostgresDynamicTableBackend {
         .await
     }
 
-    async fn refresh_cache(&self, pool: Arc<PgPool>) {
+    async fn refresh_cache(&self, pool: Arc<PgPool>) -> Result<(), DynamicTableBackendError> {
         let cache = self
             .cache
             .as_ref()
@@ -431,14 +438,14 @@ impl PostgresDynamicTableBackend {
         if let Some(cached) = cache.read().await.as_ref()
             && cached.updated_at == updated_at
         {
-            return;
+            return Ok(());
         }
 
         let mut cached = cache.write().await;
         if let Some(current) = cached.as_ref()
             && current.updated_at == updated_at
         {
-            return;
+            return Ok(());
         }
 
         let updated_since = cached
@@ -446,12 +453,13 @@ impl PostgresDynamicTableBackend {
             .and_then(|current| current.updated_at.as_deref())
             .map(str::to_owned);
         let load_started_at = Instant::now();
-        let (refreshed, pages_loaded) = self.load_cache(pool, updated_since.as_deref()).await;
+        let (updated_at, keys, pages_loaded) =
+            self.load_cache(pool, updated_since.as_deref()).await;
         let elapsed_ms = load_started_at.elapsed().as_millis();
+        let added_entries = keys.len();
 
         if let Some(current) = cached.as_mut() {
-            let added_entries = refreshed.values.len();
-            current.append(refreshed);
+            current.append(updated_at, keys)?;
             debug!(
                 table = %self.full_table_name,
                 added_entries,
@@ -463,16 +471,20 @@ impl PostgresDynamicTableBackend {
                 "Refreshed PostgreSQL dynamic table cache"
             );
         } else {
+            let values = ArrowKeySet::from_keys(keys).map_err(DynamicTableBackendError::Query)?;
+            let cache = PostgresDynamicTableCache { updated_at, values };
             info!(
                 table = %self.full_table_name,
-                total_entries = refreshed.values.len(),
+                total_entries = cache.values.len(),
                 pages_loaded,
                 elapsed_ms = ?elapsed_ms,
-                watermark = ?refreshed.updated_at.as_deref(),
+                watermark = ?cache.updated_at.as_deref(),
                 "Populated PostgreSQL dynamic table cache"
             );
-            *cached = Some(refreshed);
+            *cached = Some(cache);
         }
+
+        Ok(())
     }
 
     fn build_contains_result(
@@ -488,10 +500,6 @@ impl PostgresDynamicTableBackend {
                 let value = string_array.value(i);
                 let contains_value = existing_set.contains(value);
                 builder.append_value(contains_value);
-                trace!(
-                    "[contains] for table name '{}' with value '{}' result '{:?}'",
-                    self.full_table_name, value, contains_value
-                );
             }
         }
         Arc::new(builder.finish())
@@ -937,13 +945,16 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
         if let Some(cache) = &self.cache {
             // Check for table changes on every invocation, including empty/all-null batches.
-            self.refresh_cache(pool).await;
+            self.refresh_cache(pool).await?;
             let cached = cache.read().await;
-            let existing_set = &cached
+            let values = &cached
                 .as_ref()
                 .expect("cache is loaded after refresh_cache")
                 .values;
-            return Ok(self.build_contains_result(string_array, existing_set));
+            let result = values
+                .contains_array(string_array)
+                .map_err(DynamicTableBackendError::Query)?;
+            return Ok(Arc::new(result));
         }
 
         // Uncached queries need owned strings for retries.
@@ -1025,19 +1036,24 @@ mod tests {
     fn cache_append_preserves_existing_values() {
         let mut cache = PostgresDynamicTableCache {
             updated_at: Some("old".to_string()),
-            values: HashSet::from([Box::<str>::from("existing")]),
-        };
-        let update = PostgresDynamicTableCache {
-            updated_at: Some("new".to_string()),
-            values: HashSet::from([Box::<str>::from("appended")]),
+            values: ArrowKeySet::from_keys(LargeStringArray::from(vec!["existing"]))
+                .expect("build initial cache"),
         };
 
-        cache.append(update);
+        cache
+            .append(
+                Some("new".to_string()),
+                LargeStringArray::from(vec!["appended"]),
+            )
+            .expect("append delta");
 
         assert_eq!(cache.updated_at.as_deref(), Some("new"));
         assert_eq!(cache.values.len(), 2);
-        assert!(cache.values.contains("existing"));
-        assert!(cache.values.contains("appended"));
+        let needles = StringArray::from(vec!["existing", "appended", "missing"]);
+        let out = cache.values.contains_array(&needles).expect("probe");
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(!out.value(2));
     }
 
     #[tokio::test]
