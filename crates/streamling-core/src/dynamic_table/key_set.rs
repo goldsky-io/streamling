@@ -244,6 +244,40 @@ mod tests {
     }
 
     #[test]
+    fn utf8view_hashes_differ_from_utf8() {
+        // Guard rail, not an aspiration. `create_hashes` sends Utf8/LargeUtf8
+        // through the generic `hash_array` (hashed as `&str`) but Utf8View through
+        // `hash_generic_byte_view_array`, which hashes the raw u128 view when the
+        // string is inline (<=12 bytes) and the raw `&[u8]` otherwise. Rust's
+        // `Hash for str` appends 0xff; `Hash for [u8]` writes a length prefix. So
+        // the same content hashes DIFFERENTLY across these types.
+        //
+        // Consequence: storing a StringViewArray haystack and probing it with
+        // Utf8 needle hashes makes every lookup miss — silently, with no error.
+        // If this test ever starts failing because upstream unified the paths,
+        // that is good news; delete it. Until then, keep hashing keys as `&str`.
+        let values = ["one", "a-string-longer-than-twelve-bytes"];
+        let utf8 = StringArray::from(values.to_vec());
+        let view = arrow::array::StringViewArray::from(values.to_vec());
+        let state = RandomState::default();
+
+        let utf8_hashes = with_hashes([&utf8 as &dyn Array], &state, |h| {
+            Ok::<_, datafusion::common::DataFusionError>(h.to_vec())
+        })
+        .expect("hash utf8");
+        let view_hashes = with_hashes([&view as &dyn Array], &state, |h| {
+            Ok::<_, datafusion::common::DataFusionError>(h.to_vec())
+        })
+        .expect("hash utf8view");
+
+        assert_ne!(
+            utf8_hashes, view_hashes,
+            "Utf8 and Utf8View hashed the same; re-check the cross-type invariant \
+             before relying on it"
+        );
+    }
+
+    #[test]
     fn extend_preserves_existing_and_adds_new() {
         let mut set = ArrowKeySet::from_keys(large_keys([Some("a"), Some("b")])).expect("build");
         set.extend_from(large_keys([Some("c")])).expect("extend");
