@@ -78,7 +78,17 @@ impl ArrowKeySet {
         // Haystack is LargeUtf8, needle is Utf8 — hashes match for equal `&str`
         // content (see struct-level comment).
         with_hashes([needles as &dyn Array], &self.state, |hashes| {
+            // Batch-local dedup: probing the big key set is a DRAM miss per lookup, so a
+            // repeated value must only cost one. `seen` maps a value's hash to the first row
+            // index that carried it; `answers` holds that row's verdict. Reuses the hashes
+            // computed above, so dedup costs no extra hashing.
+            //
+            // `needles` is a `StringArray` (i32 offsets), so its length cannot exceed
+            // i32::MAX — the `as u32` row indices below can never truncate.
+            let mut seen: HashTable<u32> = HashTable::with_capacity(needles.len());
+            let mut answers = vec![false; needles.len()];
             let mut builder = BooleanBuilder::with_capacity(needles.len());
+
             for (i, &hash) in hashes.iter().enumerate() {
                 if needles.is_null(i) {
                     // `hash_array` only writes valid indices; null slots hold garbage.
@@ -86,10 +96,18 @@ impl ArrowKeySet {
                     continue;
                 }
                 let needle = needles.value(i);
+
+                if let Some(&first) = seen.find(hash, |&j| needles.value(j as usize) == needle) {
+                    builder.append_value(answers[first as usize]);
+                    continue;
+                }
+
                 let found = self
                     .table
                     .find(hash, |&idx| self.keys.value(idx as usize) == needle)
                     .is_some();
+                answers[i] = found;
+                seen.insert_unique(hash, i as u32, |&j| hashes[j as usize]);
                 builder.append_value(found);
             }
             Ok(builder.finish())
@@ -254,5 +272,105 @@ mod tests {
         assert!(out.is_null(1));
         assert!(out.value(2));
         assert!(!out.value(3));
+    }
+
+    #[test]
+    fn duplicate_needles_match_undeduped_results() {
+        let set = ArrowKeySet::from_keys(large_keys([Some("a"), Some("c")])).expect("build");
+        let needles = utf8_needles([
+            Some("a"),
+            Some("b"),
+            Some("a"),
+            Some("c"),
+            Some("b"),
+            None,
+            Some("a"),
+        ]);
+        let out = set.contains_array(&needles).expect("probe");
+        assert_eq!(out.len(), 7);
+        assert!(out.value(0)); // a hit
+        assert!(!out.value(1)); // b miss
+        assert!(out.value(2)); // a repeat
+        assert!(out.value(3)); // c hit
+        assert!(!out.value(4)); // b repeat
+        assert!(out.is_null(5)); // null stays null
+        assert!(out.value(6)); // a repeat
+    }
+
+    #[test]
+    fn heavy_duplication_is_exact() {
+        const SET_N: usize = 5_000;
+        const NEEDLE_N: usize = 50_000;
+        const CYCLE: usize = 200; // 100 present + 100 absent
+
+        let present: Vec<String> = (0..SET_N).map(|i| format!("key{i}")).collect();
+        let haystack =
+            LargeStringArray::from(present.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let set = ArrowKeySet::from_keys(haystack).expect("build");
+
+        // Cycle over 100 present keys and 100 absent keys; null every 7th row.
+        let needles: Vec<Option<String>> = (0..NEEDLE_N)
+            .map(|i| {
+                if i % 7 == 0 {
+                    return None;
+                }
+                let slot = i % CYCLE;
+                if slot < 100 {
+                    Some(format!("key{slot}"))
+                } else {
+                    Some(format!("miss{}", slot - 100))
+                }
+            })
+            .collect();
+        let needle_array =
+            StringArray::from(needles.iter().map(|o| o.as_deref()).collect::<Vec<_>>());
+        let out = set.contains_array(&needle_array).expect("probe");
+
+        assert_eq!(out.len(), NEEDLE_N);
+        for (i, expected) in needles.iter().enumerate() {
+            match expected {
+                None => assert!(out.is_null(i), "row {i} should be null"),
+                Some(s) if s.starts_with("key") => {
+                    assert!(!out.is_null(i), "row {i} should be non-null");
+                    assert!(out.value(i), "row {i} present key should hit");
+                }
+                Some(_) => {
+                    assert!(!out.is_null(i), "row {i} should be non-null");
+                    assert!(!out.value(i), "row {i} absent key should miss");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_distinct_needles_still_exact() {
+        const N: usize = 1_000;
+        let present: Vec<String> = (0..N / 2).map(|i| format!("p{i}")).collect();
+        let haystack =
+            LargeStringArray::from(present.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let set = ArrowKeySet::from_keys(haystack).expect("build");
+
+        // All distinct: first half present, second half absent.
+        let needles: Vec<String> = (0..N)
+            .map(|i| {
+                if i < N / 2 {
+                    format!("p{i}")
+                } else {
+                    format!("m{i}")
+                }
+            })
+            .collect();
+        let needle_array =
+            StringArray::from(needles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let out = set.contains_array(&needle_array).expect("probe");
+
+        assert_eq!(out.len(), N);
+        assert_eq!(out.null_count(), 0);
+        for i in 0..N / 2 {
+            assert!(out.value(i), "present row {i}");
+        }
+        for i in N / 2..N {
+            assert!(!out.value(i), "absent row {i}");
+        }
     }
 }
