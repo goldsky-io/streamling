@@ -7,6 +7,8 @@ use arrow::compute::concat;
 use datafusion::common::hash_utils::{RandomState, with_hashes};
 use hashbrown::HashTable;
 
+use super::bloom::BlockedBloom;
+
 /// Exact membership set over contiguous Arrow string keys.
 ///
 /// Hash values only select candidate buckets; equality is decided by comparing
@@ -25,27 +27,38 @@ pub(crate) struct ArrowKeySet {
     state: RandomState,
     /// Index into `keys`.
     table: HashTable<u32>,
+    /// Cache-resident prefilter that answers "definitely absent" without
+    /// touching the (large) exact table. It uses the SAME u64 hashes as `table`
+    /// and can never produce a hit on its own — a maybe is re-checked exactly.
+    filter: BlockedBloom,
 }
 
 impl ArrowKeySet {
-    pub(crate) fn new() -> Self {
-        Self {
-            keys: LargeStringArray::from_iter_values(std::iter::empty::<&str>()),
-            hashes: Vec::new(),
-            state: RandomState::default(),
-            table: HashTable::new(),
-        }
+    pub(crate) fn from_keys(keys: LargeStringArray) -> Result<Self, String> {
+        // Default sizing: 10 bits/key, k=6, capacity = 2x keys (min 1024 so
+        // tiny sets still work).
+        let capacity_keys = (2 * keys.len()).max(1024);
+        Self::from_keys_sized(keys, capacity_keys * 10, 6)
     }
 
-    pub(crate) fn from_keys(keys: LargeStringArray) -> Result<Self, String> {
-        if keys.is_empty() {
-            return Ok(Self::new());
-        }
+    /// Build with an explicit filter sizing so benchmarks can compare.
+    /// `filter_bits == 0` gives a disabled (zero-overhead) filter.
+    pub(crate) fn from_keys_sized(
+        keys: LargeStringArray,
+        filter_bits: usize,
+        k: u32,
+    ) -> Result<Self, String> {
+        // Deliberately no early return for empty keys. A shortcut that built a
+        // DISABLED filter here would have no rebuild path, so a cache whose first
+        // load found an empty table would never gain a prefilter as it filled up.
+        // `hash_and_insert_range` is already a no-op when there is nothing to add.
+        let capacity_keys = (2 * keys.len()).max(1024);
         let mut set = Self {
             hashes: vec![0; keys.len()],
             keys,
             state: RandomState::default(),
             table: HashTable::new(),
+            filter: BlockedBloom::with_bits(filter_bits, k, capacity_keys),
         };
         set.hash_and_insert_range(0)?;
         Ok(set)
@@ -71,7 +84,24 @@ impl ArrowKeySet {
             .clone();
 
         self.hashes.resize(self.keys.len(), 0);
-        self.hash_and_insert_range(start)
+        self.hash_and_insert_range(start)?;
+
+        // The filter's FPR decays toward 1 once the set outgrows its design
+        // capacity. Rebuild at double the capacity and double the bits (keeping
+        // bits/key constant), then re-insert every non-null key's hash from
+        // `self.hashes` — no re-hashing needed.
+        if !self.filter.is_disabled() && self.table.len() > self.filter.capacity_keys() {
+            let new_capacity = self.filter.capacity_keys() * 2;
+            let new_bits = self.filter.bytes() * 16; // 2x bits: bytes()*8 = bits, doubled
+            let k = self.filter.k();
+            self.filter = BlockedBloom::with_bits(new_bits, k, new_capacity);
+            for idx in 0..self.keys.len() {
+                if !self.keys.is_null(idx) {
+                    self.filter.insert(self.hashes[idx]);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -87,6 +117,13 @@ impl ArrowKeySet {
                 if needles.is_null(i) {
                     // Position must stay aligned; the null mask below masks this slot.
                     // (`hash_array` only writes valid indices, so never trust hashes[i] here.)
+                    values.append(false);
+                    continue;
+                }
+                // Prefilter: a miss means DEFINITELY absent — skip the exact
+                // table entirely. A hit still runs the exact probe below; the
+                // filter can never produce a `true` on its own.
+                if !self.filter.maybe_contains(hash) {
                     values.append(false);
                     continue;
                 }
@@ -121,6 +158,7 @@ impl ArrowKeySet {
             keys,
             hashes,
             table,
+            filter,
             ..
         } = self;
 
@@ -141,6 +179,9 @@ impl ArrowKeySet {
                 continue;
             }
             table.insert_unique(hash, idx_u32, |&i| hashes[i as usize]);
+            // Same hash, same loop, same null-skip as the table. Duplicates are
+            // skipped (bit-set is idempotent, so this is exact).
+            filter.insert(hash);
         }
 
         Ok(())
@@ -161,7 +202,10 @@ mod tests {
 
     #[test]
     fn empty_set_misses_and_preserves_nulls() {
-        let set = ArrowKeySet::new();
+        // Built the way production builds it when the first load finds no rows,
+        // so this also covers probing through an enabled-but-empty prefilter.
+        let set = ArrowKeySet::from_keys(LargeStringArray::from(Vec::<&str>::new()))
+            .expect("empty build");
         let needles = utf8_needles([Some("a"), None, Some("b")]);
         let out = set.contains_array(&needles).expect("probe");
         assert_eq!(out.len(), 3);
@@ -360,6 +404,123 @@ mod tests {
             assert!(!out.value(i), "absent row {i}");
         }
     }
+
+    #[test]
+    fn empty_initial_load_still_gets_a_filter() {
+        // A cache whose first load found an empty table must still gain a working
+        // prefilter as deltas arrive — the disabled-filter path has no rebuild.
+        let mut set = ArrowKeySet::from_keys(LargeStringArray::from(Vec::<&str>::new()))
+            .expect("empty build");
+        assert!(
+            !set.filter.is_disabled(),
+            "empty initial load left the filter disabled"
+        );
+
+        set.extend_from(large_keys([Some("a"), Some("b")]))
+            .expect("extend");
+        let out = set
+            .contains_array(&utf8_needles([Some("a"), Some("b"), Some("zzz")]))
+            .expect("probe");
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(!out.value(2));
+    }
+
+    #[test]
+    fn filter_sizings_agree() {
+        const N: usize = 5_000;
+        let present: Vec<String> = (0..N).map(|i| format!("present-{i}")).collect();
+        let keys = LargeStringArray::from(present.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
+        let disabled = ArrowKeySet::from_keys_sized(keys.clone(), 0, 0).expect("build disabled");
+        let six_bits = ArrowKeySet::from_keys_sized(keys.clone(), N * 6, 4).expect("build 6b/k");
+        let ten_bits = ArrowKeySet::from_keys_sized(keys.clone(), N * 10, 6).expect("build 10b/k");
+        assert!(disabled.filter.is_disabled());
+        assert!(!six_bits.filter.is_disabled());
+        assert!(!ten_bits.filter.is_disabled());
+
+        // Mix: every present key, absent keys with nulls every 7th row.
+        let mut needles: Vec<Option<String>> = Vec::with_capacity(2 * N);
+        needles.extend((0..N).map(|i| Some(format!("present-{i}"))));
+        needles.extend((0..N).map(|i| {
+            if i % 7 == 0 {
+                None
+            } else {
+                Some(format!("absent-{i}"))
+            }
+        }));
+        let needle_array = utf8_needles(needles.iter().map(|o| o.as_deref()));
+
+        let out_disabled = disabled
+            .contains_array(&needle_array)
+            .expect("probe disabled");
+        let out_six = six_bits.contains_array(&needle_array).expect("probe 6b/k");
+        let out_ten = ten_bits.contains_array(&needle_array).expect("probe 10b/k");
+
+        // Sanity: the disabled (exact) result has the expected shape.
+        assert!(out_disabled.iter().take(N).all(|v| v == Some(true)));
+        assert_eq!(
+            out_disabled.null_count(),
+            (0..N).filter(|i| i % 7 == 0).count()
+        );
+        assert!(
+            out_disabled
+                .iter()
+                .skip(N)
+                .filter(|v| *v == Some(true))
+                .count()
+                == 0
+        );
+
+        // The filter must never change an answer, at any sizing.
+        assert_eq!(out_disabled, out_six);
+        assert_eq!(out_disabled, out_ten);
+    }
+
+    #[test]
+    fn rebuild_keeps_membership_exact() {
+        // capacity_keys floor is 1024; start tiny and extend past it so the
+        // filter rebuilds at least once.
+        let mut set =
+            ArrowKeySet::from_keys_sized(large_keys([Some("k0"), Some("k1")]), 1024 * 10, 6)
+                .expect("build");
+        assert!(!set.filter.is_disabled());
+        let initial_capacity = set.filter.capacity_keys();
+        assert_eq!(initial_capacity, 1024);
+
+        let mut inserted: Vec<String> = vec!["k0".to_string(), "k1".to_string()];
+        for chunk in 0..5 {
+            let extra: Vec<String> = (0..500).map(|i| format!("k{chunk}-{i}")).collect();
+            set.extend_from(large_keys(extra.iter().map(|s| Some(s.as_str()))))
+                .expect("extend");
+            inserted.extend(extra);
+        }
+        assert!(
+            set.len() > initial_capacity,
+            "extend must outgrow the initial filter capacity"
+        );
+        assert!(
+            set.filter.capacity_keys() > initial_capacity,
+            "extend must have rebuilt the filter"
+        );
+
+        // Every key ever inserted must still hit; known-absent keys must miss.
+        let mut needles: Vec<Option<String>> = inserted.iter().map(|s| Some(s.clone())).collect();
+        needles.extend((0..500).map(|i| Some(format!("absent-{i}"))));
+        let out = set
+            .contains_array(&utf8_needles(needles.iter().map(|o| o.as_deref())))
+            .expect("probe");
+        assert_eq!(out.len(), needles.len());
+        for (i, n) in needles.iter().enumerate() {
+            match n {
+                Some(s) if s.starts_with("absent") => {
+                    assert!(!out.value(i), "absent {s} must miss at row {i}")
+                }
+                Some(_) => assert!(out.value(i), "inserted key must hit at row {i}"),
+                None => unreachable!("no nulls in this test"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +654,33 @@ mod bench {
         (best, sum)
     }
 
+    /// Fraction of needles the prefilter lets through. Called with all-absent
+    /// needles, this IS the measured false-positive rate.
+    fn filter_pass_rate(set: &ArrowKeySet, batches: &[StringArray]) -> f64 {
+        let mut pass = 0usize;
+        let mut total = 0usize;
+        for b in batches.iter().take(2_000) {
+            let (p, t) = with_hashes([b as &dyn Array], &set.state, |hashes| {
+                let mut p = 0usize;
+                let mut t = 0usize;
+                for (i, &h) in hashes.iter().enumerate() {
+                    if b.is_null(i) {
+                        continue;
+                    }
+                    t += 1;
+                    if set.filter.maybe_contains(h) {
+                        p += 1;
+                    }
+                }
+                Ok::<_, datafusion::common::DataFusionError>((p, t))
+            })
+            .expect("hash");
+            pass += p;
+            total += t;
+        }
+        pass as f64 / total.max(1) as f64
+    }
+
     fn report(scenario: &str, impl_name: &str, elapsed: std::time::Duration) {
         let total_ms = elapsed.as_secs_f64() * 1_000.0;
         let per_batch_us = elapsed.as_secs_f64() * 1_000_000.0 / N_BATCHES as f64;
@@ -608,7 +796,32 @@ mod bench {
             dup_heavy.push(StringArray::from(batch));
         }
 
+        // 98% miss / 2% hit: the stated production shape.
+        let mut miss98 = Vec::with_capacity(N_BATCHES);
+        for _ in 0..N_BATCHES {
+            let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
+            batch.push(keys[(next(&mut state) as usize) % N_KEYS].clone());
+            while batch.len() < BATCH_SIZE {
+                let k = gen_addr(&mut state);
+                if !lookup.contains(k.as_str()) {
+                    batch.push(k);
+                }
+            }
+            miss98.push(StringArray::from(
+                batch.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ));
+        }
+
         drop(lookup);
+
+        // A tiny, fully cache-resident set built from the same key space. If probing it
+        // is no faster than probing the 1.4M set, then memory latency is NOT what a miss
+        // costs — and a Bloom/roaring prefilter (which can only accelerate misses) has no
+        // headroom to capture.
+        let small = ArrowKeySet::from_keys(LargeStringArray::from(
+            keys[..2_000].iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))
+        .expect("small set");
 
         // --- memory (outside timed section) ---
         let arrow_keys_bytes = arrow.keys.get_buffer_memory_size();
@@ -630,11 +843,12 @@ mod bench {
             hashset.capacity()
         );
 
-        let scenarios: [(&str, &[StringArray]); 4] = [
+        let scenarios: [(&str, &[StringArray]); 5] = [
             ("all_hit", &all_hit),
             ("all_miss", &all_miss),
             ("mixed", &mixed),
             ("dup_heavy_5of50", &dup_heavy),
+            ("miss98_1hit_of50", &miss98),
         ];
 
         // --- warm-up (untimed): one pass each scenario × structure ---
@@ -642,6 +856,67 @@ mod bench {
             let _ = run_hashset(&hashset, &batches[..1.min(batches.len())]);
             let _ = run_arrow(&arrow, &batches[..1.min(batches.len())]);
         }
+
+        // --- decisive check: same all_miss needles against 1.4M keys vs 2k keys ---
+        const REPS_SMALL: usize = 3;
+        let (big_miss, _) = best_of(REPS_SMALL, || run_arrow(&arrow, &all_miss));
+        let (small_miss, _) = best_of(REPS_SMALL, || run_arrow(&small, &all_miss));
+        report("all_miss_1.4M_keys", "arrow", big_miss);
+        report("all_miss_2k_keys", "arrow", small_miss);
+        println!(
+            "MEMORY-BOUND CHECK: shrinking the set 700x changes a miss by {:.2}x  (near 1.00x => misses are NOT memory bound => a prefilter cannot help)",
+            big_miss.as_secs_f64() / small_miss.as_secs_f64()
+        );
+        println!();
+
+        // --- prefilter sizing sweep: does the L2 cliff exist? ---
+        // Baselines from the already-built `arrow` set; every sizing must match them.
+        let (_, baseline_miss) = best_of(1, || run_arrow(&arrow, &all_miss));
+        let (_, baseline_98) = best_of(1, || run_arrow(&arrow, &miss98));
+        let (_, baseline_hit) = best_of(1, || run_arrow(&arrow, &all_hit));
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let mk = |bits: usize, k: u32| {
+            ArrowKeySet::from_keys_sized(LargeStringArray::from(key_refs.clone()), bits, k)
+                .expect("sized build")
+        };
+        let sizings: [(&str, usize, u32); 4] = [
+            ("nofilter", 0, 0),
+            ("bloom_1.0MB_k4", 8_388_608, 4),
+            ("bloom_1.75MB_k6", 14_680_064, 6),
+            ("bloom_3.5MB_k6", 29_360_128, 6),
+        ];
+        println!("--- prefilter sizing sweep (L2=1MB/core, L3=32MB, exact table=7.34MB) ---");
+        for (label, bits, k) in sizings {
+            let set = mk(bits, k);
+            let fpr = if bits == 0 {
+                1.0
+            } else {
+                filter_pass_rate(&set, &all_miss)
+            };
+            let (d_miss, s_miss) = best_of(3, || run_arrow(&set, &all_miss));
+            let (d_98, s_98) = best_of(3, || run_arrow(&set, &miss98));
+            let (d_hit, s_hit) = best_of(3, || run_arrow(&set, &all_hit));
+            // Every sizing must agree with the no-filter baseline, or the
+            // prefilter is dropping real members (a false negative).
+            assert_eq!(
+                s_miss, baseline_miss,
+                "filter {label} changed all_miss results"
+            );
+            assert_eq!(s_98, baseline_98, "filter {label} changed miss98 results");
+            assert_eq!(
+                s_hit, baseline_hit,
+                "filter {label} changed all_hit results"
+            );
+            println!(
+                "filter={label:16} bytes={:>9} measured_FPR={:>6.2}%",
+                set.filter.bytes(),
+                fpr * 100.0
+            );
+            report("  all_miss", label, d_miss);
+            report("  miss98", label, d_98);
+            report("  all_hit", label, d_hit);
+        }
+        println!();
 
         // --- timed runs: best of REPS, all three implementations ---
         const REPS: usize = 3;
