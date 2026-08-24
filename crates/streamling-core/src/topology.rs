@@ -101,6 +101,8 @@ pub struct HybridUnboundedSource {
     pub source_type: String,
     pub topic: String,
     pub filter: Option<String>,
+    /// Mirrors `KafkaSource::starting_offsets` for the hybrid path: `earliest`/`latest`,
+    /// an epoch-millisecond timestamp, or a datetime.
     pub start_at: Option<String>,
     /// Mirrors `KafkaSource::validate_writer_schema_ordering` for the hybrid path.
     /// Defaults to true when omitted.
@@ -153,6 +155,15 @@ impl HybridOffsetTable {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct KafkaSource {
     pub topic: String,
+    /// Where to start reading a partition that has no persisted offset. Ignored for
+    /// partitions the state backend already holds an offset for — those always resume.
+    ///
+    /// Accepts `earliest` (the default) or `latest`, an epoch-millisecond timestamp
+    /// (e.g. `1754049600000`), or a datetime (e.g. `2025-08-01T12:00:00Z`,
+    /// `2025-08-01 12:00:00`, `2025-08-01` — a value without an offset is read as UTC).
+    ///
+    /// With a timestamp, each partition starts at its first message timestamped at or
+    /// after that instant; a partition with no such message starts at its end.
     pub starting_offsets: Option<String>,
     pub include_metadata: Option<bool>,
     pub filter: Option<String>,

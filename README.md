@@ -344,6 +344,29 @@ sources:
     topic: app.events
 ```
 
+**Starting position.** `starting_offsets` controls where a partition starts when the state backend holds no offset for
+it. Partitions that do have a persisted offset always resume from it, so this only applies on a first run (or to a
+partition added later).
+
+```yaml
+sources:
+  raw_events:
+    type: kafka
+    topic: app.events
+    starting_offsets: 2025-08-01T12:00:00Z
+```
+
+| Value | Behaviour |
+| --- | --- |
+| `earliest` (default) | Start at the oldest retained message |
+| `latest` | Start at the end of the partition — only messages produced from now on |
+| A datetime, e.g. `2025-08-01T12:00:00Z` | Start at the first message timestamped at or after that instant. `2025-08-01 12:00:00` and `2025-08-01` also work; a value without an offset is read as UTC |
+| Epoch milliseconds, e.g. `1754049600000` | Same as above. Must be milliseconds — a seconds-sized value is rejected rather than silently rewinding to 1970 |
+
+With a timestamp, the source asks the brokers for each partition's first offset at or after that instant before it
+starts consuming. A partition with no message that late starts at its end, so it picks up whatever arrives next.
+Partitions assigned later by a rebalance fall back to `earliest` (the timestamp is only resolved at startup).
+
 **JSON format.** Set `data_format: json` (the default is `avro`) and declare the input schema as a `column → type` map.
 Each Kafka message payload is treated as a single UTF-8 JSON object (one row); Schema Registry is not used.
 
@@ -1243,7 +1266,7 @@ The state backend plays a crucial role in Kafka source reliability:
   - On startup, Kafka source:
     - Queries state backend for stored offsets
     - Seeks to stored positions if found
-    - Starts from configured position (earliest/latest) for new partitions
+    - Starts from the configured `starting_offsets` position (earliest/latest/timestamp) for new partitions
 
 ## Error Handling
 

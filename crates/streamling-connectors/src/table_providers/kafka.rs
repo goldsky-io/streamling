@@ -21,6 +21,7 @@ use crate::table_providers::kafka::schema_registry::{
     retry_registry_call,
 };
 use apache_avro::Schema as AvroSchema;
+use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -284,6 +285,86 @@ impl FromStr for KafkaFormat {
             "avro" => Ok(KafkaFormat::Avro),
             "json" => Ok(KafkaFormat::Json),
             _ => Err(streamling_user_err!("unsupported Kafka format: {}", s)),
+        }
+    }
+}
+
+/// Where a Kafka source starts reading a partition when it has no persisted offset.
+///
+/// Parsed from the source's `starting_offsets` (`start_at` on a hybrid source):
+/// - `earliest` (the default) or `latest`, plus librdkafka's aliases for both
+/// - an epoch-millisecond timestamp, e.g. `1754049600000`
+/// - a datetime, e.g. `2025-08-01T12:00:00Z`, `2025-08-01 12:00:00` or `2025-08-01`
+///   (a value without an offset is read as UTC)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum KafkaStartPosition {
+    #[default]
+    Earliest,
+    Latest,
+    /// Start at the first message whose Kafka timestamp is >= this epoch-millisecond
+    /// value. Partitions with no such message start at the end of the partition.
+    Timestamp(i64),
+}
+
+/// Smallest epoch-millisecond value accepted for a timestamp start position
+/// (1973-03-03). A number below it is almost always epoch *seconds* by mistake,
+/// which would silently rewind the source to the start of the topic.
+const MIN_START_TIMESTAMP_MS: i64 = 100_000_000_000;
+
+impl KafkaStartPosition {
+    /// The `auto.offset.reset` policy to configure on the consumer.
+    ///
+    /// Startup always seeks explicitly, so this only covers partitions we never
+    /// seek — e.g. ones handed to us by a rebalance after startup. A timestamp
+    /// position falls back to `earliest` so a late-assigned partition replays
+    /// from the beginning rather than skipping the backlog.
+    fn auto_offset_reset(&self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Earliest | Self::Timestamp(_) => "earliest",
+        }
+    }
+}
+
+impl FromStr for KafkaStartPosition {
+    type Err = StreamlingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.trim();
+        match value.to_lowercase().as_str() {
+            // The three spellings librdkafka accepts for each end of the topic,
+            // since this value used to be passed straight to `auto.offset.reset`.
+            "earliest" | "smallest" | "beginning" => return Ok(Self::Earliest),
+            "latest" | "largest" | "end" => return Ok(Self::Latest),
+            _ => {}
+        }
+
+        if let Ok(epoch_ms) = value.parse::<i64>() {
+            if epoch_ms < MIN_START_TIMESTAMP_MS {
+                streamling_user_bail!(
+                    "starting_offsets '{}' is too small to be an epoch-millisecond timestamp \
+                     (expected at least {}): pass the timestamp in milliseconds, or use \
+                     'earliest' to start at the beginning of the topic",
+                    value,
+                    MIN_START_TIMESTAMP_MS
+                );
+            }
+            return Ok(Self::Timestamp(epoch_ms));
+        }
+
+        match string_to_timestamp_nanos(value) {
+            Ok(nanos) if nanos >= 0 => Ok(Self::Timestamp(nanos / 1_000_000)),
+            Ok(_) => streamling_user_bail!(
+                "starting_offsets '{}' is before the Unix epoch; use 'earliest' to start at the \
+                 beginning of the topic",
+                value
+            ),
+            Err(_) => streamling_user_bail!(
+                "unsupported starting_offsets '{}': expected 'earliest', 'latest', a datetime \
+                 (e.g. '2025-08-01T12:00:00Z'), or an epoch-millisecond timestamp \
+                 (e.g. 1754049600000)",
+                value
+            ),
         }
     }
 }
@@ -592,7 +673,7 @@ struct KafkaSourceExec {
     should_enrich_op_column: bool,
     kafka_config: KafkaConfig,
     topic: String,
-    start_at: Option<String>,
+    start_at: KafkaStartPosition,
     filter: Option<String>,
     cached_properties: Arc<PlanProperties>,
     record_batch_interval_ms: u64,
@@ -640,7 +721,7 @@ impl KafkaSourceExec {
         payload_schema: SchemaRef,
         config: KafkaConfig,
         topic: String,
-        start_at: Option<String>,
+        start_at: KafkaStartPosition,
         filter: Option<String>,
         decoding: KafkaSourceDecoding,
         should_enrich_op_column: bool,
@@ -703,7 +784,7 @@ impl KafkaSourceExec {
 
     fn create_consumer(
         config: &KafkaConfig,
-        starting_offsets: &Option<String>,
+        start_at: KafkaStartPosition,
         reference_name: &str,
         is_lag_consumer: bool,
     ) -> StreamConsumer {
@@ -727,10 +808,7 @@ impl KafkaSourceExec {
             .set("group.id", group_id)
             .set("enable.auto.commit", "false")
             // .set("debug", "all") // enable for debugging
-            .set(
-                "auto.offset.reset",
-                starting_offsets.as_deref().unwrap_or("earliest"),
-            );
+            .set("auto.offset.reset", start_at.auto_offset_reset());
 
         let kafka_config_optimizer = KafkaConfigOptimizer::new(config);
         kafka_config_optimizer
@@ -853,6 +931,129 @@ impl KafkaSourceExec {
         }
 
         state_topic_partition_list
+    }
+
+    /// Build the partition list to seek to when the state backend holds no
+    /// offsets for this source, i.e. the configured start position applied to
+    /// every assigned partition.
+    fn resolve_start_offsets(
+        consumer: &StreamConsumer,
+        topic: &str,
+        start_at: KafkaStartPosition,
+    ) -> streamling_core::error::Result<KafkaTopicPartitionList> {
+        let mut assignment = consumer.assignment().streamling_with_context(|| {
+            format!("failed to get consumer assignment (topic: {})", topic)
+        })?;
+
+        let target_offset = match start_at {
+            KafkaStartPosition::Earliest => Offset::Beginning,
+            KafkaStartPosition::Latest => Offset::End,
+            KafkaStartPosition::Timestamp(timestamp_ms) => {
+                return Self::resolve_offsets_for_timestamp(
+                    consumer,
+                    topic,
+                    &assignment,
+                    timestamp_ms,
+                );
+            }
+        };
+
+        assignment
+            .set_all_offsets(target_offset)
+            .streamling_with_context(|| {
+                format!(
+                    "failed to set offsets to {:?} (topic: {})",
+                    target_offset, topic
+                )
+            })?;
+
+        Ok(assignment)
+    }
+
+    /// Ask the brokers which offset each partition's first message at or after
+    /// `timestamp_ms` sits at.
+    ///
+    /// librdkafka reads the target timestamp out of each element's offset field
+    /// and replaces it with the resolved offset, or with `Offset::End` when the
+    /// partition holds no message that late (an empty partition, or a timestamp
+    /// past the last message) — so those partitions start streaming from
+    /// whatever arrives next.
+    fn resolve_offsets_for_timestamp(
+        consumer: &StreamConsumer,
+        topic: &str,
+        assignment: &KafkaTopicPartitionList,
+        timestamp_ms: i64,
+    ) -> streamling_core::error::Result<KafkaTopicPartitionList> {
+        let mut query = assignment.clone();
+        query
+            .set_all_offsets(Offset::Offset(timestamp_ms))
+            .streamling_with_context(|| {
+                format!(
+                    "failed to set lookup timestamp {} (topic: {})",
+                    timestamp_ms, topic
+                )
+            })?;
+
+        let resolved = consumer
+            .offsets_for_times(
+                query,
+                Timeout::After(Duration::from_secs(CONSUMER_SEEK_TIMEOUT_SEC)),
+            )
+            .streamling_with_context(|| {
+                format!(
+                    "failed to look up offsets for timestamp {} (topic: {})",
+                    timestamp_ms, topic
+                )
+            })?;
+
+        let mut to_seek = KafkaTopicPartitionList::new();
+        for topic_partition in resolved.elements() {
+            if let Err(e) = topic_partition.error() {
+                return Err(streamling_err!(
+                    "failed to look up offset for timestamp {} (topic: {}, partition: {}): {}",
+                    timestamp_ms,
+                    topic_partition.topic(),
+                    topic_partition.partition(),
+                    e
+                ));
+            }
+
+            // `Invalid` isn't a documented outcome of the lookup and can't be
+            // seeked to, so treat it the same as "nothing at or after the
+            // timestamp" instead of failing the source.
+            let offset = match topic_partition.offset() {
+                Offset::Invalid => {
+                    warn!(
+                        "No offset resolved for timestamp {} (topic: {}, partition: {}), starting at the end of the partition",
+                        timestamp_ms,
+                        topic_partition.topic(),
+                        topic_partition.partition()
+                    );
+                    Offset::End
+                }
+                offset => offset,
+            };
+
+            debug!(
+                "Timestamp {} resolved to topic: {}, partition: {}, offset: {:?}",
+                timestamp_ms,
+                topic_partition.topic(),
+                topic_partition.partition(),
+                offset
+            );
+
+            to_seek
+                .add_partition_offset(topic_partition.topic(), topic_partition.partition(), offset)
+                .streamling_with_context(|| {
+                    format!(
+                        "failed to record resolved offset (topic: {}, partition: {})",
+                        topic_partition.topic(),
+                        topic_partition.partition()
+                    )
+                })?;
+        }
+
+        Ok(to_seek)
     }
 }
 
@@ -1151,7 +1352,7 @@ impl ExecutionPlan for KafkaSourceExec {
 
         let consumer = SafeKafkaConsumer::new(Self::create_consumer(
             &self.kafka_config,
-            &self.start_at,
+            self.start_at,
             &self.reference_name,
             false,
         ));
@@ -1249,7 +1450,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 .full_schema_projected
                 .field_with_name(COLUMN_NAME_OP)
                 .is_ok();
-        let start_at = self.start_at.clone();
+        let start_at = self.start_at;
         let mut shutdown_rx = self.shutdown_rx.clone();
         let num_records_before_stop = self.num_records_before_stop;
         let metric_metadata_id = self.metric_metadata_id.clone();
@@ -1260,7 +1461,7 @@ impl ExecutionPlan for KafkaSourceExec {
         // (the documented deadlock the main consumer is already protected from).
         let lag_consumer = SafeKafkaConsumer::new(Self::create_consumer(
             &self.kafka_config,
-            &self.start_at,
+            self.start_at,
             &self.reference_name,
             true,
         ));
@@ -1333,29 +1534,14 @@ impl ExecutionPlan for KafkaSourceExec {
                 committed_offsets = Some(kafka_topic_partition_list_to_seek);
             } else {
                 // No offsets found in the state backend, so we need to seek to the configured
-                // starting position (earliest/latest) for all assigned partitions
-                let target_offset = match start_at.as_deref() {
-                    Some("latest") => Offset::End,
-                    _ => Offset::Beginning, // "earliest" or default
-                };
+                // starting position (earliest/latest/timestamp) for all assigned partitions
+                debug!("No state found, seeking all partitions to start_at={:?}", start_at);
 
-                debug!(
-                    "No state found, seeking all partitions to {:?}",
-                    target_offset
-                );
-
-                // Get the current assignment and set all partitions to the target offset
-                let mut assignment = consumer
-                    .assignment()
-                    .streamling_with_context(|| format!("failed to get consumer assignment (topic: {})", topic))?;
-
-                assignment
-                    .set_all_offsets(target_offset)
-                    .streamling_with_context(|| format!("failed to set offsets to {:?} (topic: {})", target_offset, topic))?;
+                let assignment = Self::resolve_start_offsets(&consumer, &topic, start_at)?;
 
                 let seek_result = consumer
                     .seek_partitions(assignment, Timeout::After(Duration::from_secs(CONSUMER_SEEK_TIMEOUT_SEC)))
-                    .streamling_with_context(|| format!("failed to seek partitions to {:?} (topic: {})", target_offset, topic))?;
+                    .streamling_with_context(|| format!("failed to seek partitions to start_at={:?} (topic: {})", start_at, topic))?;
 
                 let mut seek_count = 0usize;
                 for topic_partition in seek_result.elements() {
@@ -1375,7 +1561,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 }
                 debug!(
                     "Seeked {} partitions of topic '{}' to start_at={:?}",
-                    seek_count, topic, target_offset
+                    seek_count, topic, start_at
                 );
             }
 
@@ -1756,7 +1942,7 @@ pub struct KafkaSourceTableProvider {
     metric_metadata_id: String,
     config: KafkaConfig,
     topic: String,
-    start_at: Option<String>, // TODO: use enum
+    start_at: KafkaStartPosition,
     filter: Option<String>,
     full_schema: SchemaRef,
     payload_schema: SchemaRef,
@@ -1833,6 +2019,13 @@ impl KafkaSourceTableProvider {
         format: KafkaFormat,
         json_schema: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
+        // Parse the start position up front so a bad value fails validation
+        // instead of surfacing as a librdkafka config error at execute time.
+        let start_at = match start_at.as_deref() {
+            Some(value) => value.parse::<KafkaStartPosition>()?,
+            None => KafkaStartPosition::default(),
+        };
+
         let (payload_schema, decoding, extracted_primary_key) = match format {
             KafkaFormat::Avro => {
                 if json_schema.is_some() {
@@ -2029,7 +2222,7 @@ impl KafkaSourceTableProvider {
         payload_schema: SchemaRef,
         config: KafkaConfig,
         topic: String,
-        start_at: Option<String>,
+        start_at: KafkaStartPosition,
         filter: Option<String>,
         decoding: KafkaSourceDecoding,
         should_enrich_op_column: bool,
@@ -2236,7 +2429,7 @@ impl TableProvider for KafkaSourceTableProvider {
             self.payload_schema.clone(),
             self.config.clone(),
             self.topic.clone(),
-            self.start_at.clone(),
+            self.start_at,
             self.filter.clone(),
             self.decoding.clone(),
             self.should_enrich_op_column,
@@ -3026,6 +3219,91 @@ impl TableProvider for KafkaSinkTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_start_at(value: &str) -> KafkaStartPosition {
+        value
+            .parse::<KafkaStartPosition>()
+            .unwrap_or_else(|e| panic!("'{}' should parse: {}", value, e))
+    }
+
+    #[test]
+    fn start_position_parses_topic_boundaries() {
+        for value in ["earliest", "smallest", "beginning", " EARLIEST "] {
+            assert_eq!(parse_start_at(value), KafkaStartPosition::Earliest);
+        }
+        for value in ["latest", "largest", "end", "Latest"] {
+            assert_eq!(parse_start_at(value), KafkaStartPosition::Latest);
+        }
+        assert_eq!(KafkaStartPosition::default(), KafkaStartPosition::Earliest);
+    }
+
+    #[test]
+    fn start_position_parses_epoch_millis() {
+        assert_eq!(
+            parse_start_at("1754049600000"),
+            KafkaStartPosition::Timestamp(1_754_049_600_000)
+        );
+    }
+
+    #[test]
+    fn start_position_parses_datetimes_as_utc() {
+        // Same instant expressed three ways: RFC 3339, a space separator with no
+        // zone (read as UTC), and an explicit offset.
+        assert_eq!(
+            parse_start_at("2025-08-01T12:00:00Z"),
+            KafkaStartPosition::Timestamp(1_754_049_600_000)
+        );
+        assert_eq!(
+            parse_start_at("2025-08-01 12:00:00"),
+            KafkaStartPosition::Timestamp(1_754_049_600_000)
+        );
+        assert_eq!(
+            parse_start_at("2025-08-01T14:00:00+02:00"),
+            KafkaStartPosition::Timestamp(1_754_049_600_000)
+        );
+    }
+
+    /// A timestamp passed in seconds would otherwise resolve to 1970 and rewind
+    /// the source to the start of the topic, which is the opposite of what a
+    /// user asking for "start here" wants.
+    #[test]
+    fn start_position_rejects_epoch_seconds() {
+        let err = "1754049600"
+            .parse::<KafkaStartPosition>()
+            .expect_err("epoch seconds must be rejected");
+        assert!(
+            err.to_string().contains("milliseconds"),
+            "error should point at milliseconds, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn start_position_rejects_unparseable_values() {
+        for value in ["", "yesterday", "error", "2025-13-45"] {
+            let err = match value.parse::<KafkaStartPosition>() {
+                Ok(parsed) => panic!("'{}' must be rejected, parsed as {:?}", value, parsed),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("starting_offsets"),
+                "error should name the setting, got: {}",
+                err
+            );
+        }
+    }
+
+    /// A timestamp start still needs a reset policy for partitions assigned
+    /// after startup (a rebalance), and replaying is safer than skipping.
+    #[test]
+    fn timestamp_start_falls_back_to_earliest_reset() {
+        assert_eq!(
+            KafkaStartPosition::Timestamp(1_754_049_600_000).auto_offset_reset(),
+            "earliest"
+        );
+        assert_eq!(KafkaStartPosition::Earliest.auto_offset_reset(), "earliest");
+        assert_eq!(KafkaStartPosition::Latest.auto_offset_reset(), "latest");
+    }
 
     /// A topology-level source `filter:` is defined against the source's full
     /// payload schema. When the engine pushes a scan projection that prunes a
