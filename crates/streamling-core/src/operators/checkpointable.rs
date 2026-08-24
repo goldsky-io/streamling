@@ -405,6 +405,12 @@ impl ExecutionPlan for CheckpointableExec {
         // Aggregate DataFusion metrics across this transform's ENTIRE physical
         // subtree, not just the root operator.
         //
+        // Performance contract: called once per stream, not per batch.
+        // `WrappingExec::execute` snapshots this after `execute_input_stream`
+        // and reuses the `MetricsSet` (Arc-backed counters) for the rest of
+        // the stream. Each call walks the subtree and allocates a
+        // `HashSet<usize>` for DAG-dedup; do not put this on a per-batch path.
+        //
         // The topology for a SQL transform is
         // `WrappingExec -> CheckpointableExec -> <SQL plan>`, and `WrappingExec`
         // folds these DataFusion metrics into the node's `elapsed_compute` (via

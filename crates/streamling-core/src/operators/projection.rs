@@ -72,13 +72,19 @@ impl StreamingProjectionExec {
     /// Whether this projection is owned by an upstream source node
     /// (re-applied above the source's `WrappingExec`); see the
     /// `source_owned` field.
-    pub fn is_source_owned(&self) -> bool {
+    ///
+    /// Crate-internal: the mark is only set by
+    /// `wrap_with_side_outputs_before_filter` (and tests that model that path).
+    pub(crate) fn is_source_owned(&self) -> bool {
         self.source_owned
     }
 
     /// Consume `self`, returning it marked as owned by an upstream source
     /// node (see the `source_owned` field).
-    pub fn with_source_owned(mut self) -> Self {
+    ///
+    /// Crate-internal: only `wrap_with_side_outputs_before_filter` should set
+    /// this mark (tests may model that path).
+    pub(crate) fn with_source_owned(mut self) -> Self {
         self.source_owned = true;
         self
     }
