@@ -994,22 +994,31 @@ impl KafkaSourceExec {
                 )
             })?;
 
+        // Retriable: this is a ListOffsets round-trip to the brokers, so a blip
+        // here is transient and a restart resolves it — unlike a bad config
+        // value, which is already rejected when the source is constructed. Same
+        // reasoning as the assignment timeout in `wait_for_assignment`.
         let resolved = consumer
             .offsets_for_times(
                 query,
                 Timeout::After(Duration::from_secs(CONSUMER_SEEK_TIMEOUT_SEC)),
             )
-            .streamling_with_context(|| {
-                format!(
-                    "failed to look up offsets for timestamp {} (topic: {})",
-                    timestamp_ms, topic
+            .map_err(|e| {
+                streamling_retriable_err!(
+                    "failed to look up offsets for timestamp {} (topic: {}): {}",
+                    timestamp_ms,
+                    topic,
+                    e
                 )
             })?;
 
         let mut to_seek = KafkaTopicPartitionList::new();
         for topic_partition in resolved.elements() {
+            // Per-partition lookup failures are broker-side error codes (an
+            // unavailable leader, a partition still settling after a rebalance),
+            // so they are retriable for the same reason as the call itself.
             if let Err(e) = topic_partition.error() {
-                return Err(streamling_err!(
+                return Err(streamling_retriable_err!(
                     "failed to look up offset for timestamp {} (topic: {}, partition: {}): {}",
                     timestamp_ms,
                     topic_partition.topic(),
