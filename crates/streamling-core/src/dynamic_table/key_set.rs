@@ -1,23 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use arrow::array::{Array, BooleanArray, BooleanBuilder, LargeStringArray, StringArray};
 use arrow::compute::concat;
 use datafusion::common::hash_utils::{RandomState, with_hashes};
 use hashbrown::HashTable;
-
-use super::bloom::BlockedBloom;
-
-// Adaptive prefilter guard. Measured: the prefilter makes misses cheaper but
-// makes hits ~1.8x more expensive (112ns -> 202ns), because a hit pays the
-// filter probe and then still does the full exact probe. Break-even is around a
-// ~19% hit rate. A first-seen/dedup table's hit rate RISES as it fills, so a
-// filter that helps at deploy time silently becomes a tax later. These constants
-// steer `filter_is_paying_off` so the filter turns itself off once hits dominate.
-const FILTER_WARMUP_PROBES: u64 = 100_000;
-// 15% < the ~19% break-even, so the guard leaves margin: it switches the filter
-// off before hits get expensive enough to be a net regression.
-const FILTER_MAX_HIT_PERCENT: u64 = 15;
-const FILTER_DECAY_PROBES: u64 = 1_000_000;
 
 /// Exact membership set over contiguous Arrow string keys.
 ///
@@ -37,45 +21,19 @@ pub(crate) struct ArrowKeySet {
     state: RandomState,
     /// Index into `keys`.
     table: HashTable<u32>,
-    /// Cache-resident prefilter that answers "definitely absent" without
-    /// touching the (large) exact table. It uses the SAME u64 hashes as `table`
-    /// and can never produce a hit on its own — a maybe is re-checked exactly.
-    filter: BlockedBloom,
-    /// Rolling probe/hit counts used to disable the prefilter if the workload
-    /// turns hit-heavy. Relaxed ordering: these only steer a performance
-    /// decision, never a result, so a torn or stale read is harmless.
-    probes: AtomicU64,
-    hits: AtomicU64,
 }
 
 impl ArrowKeySet {
     pub(crate) fn from_keys(keys: LargeStringArray) -> Result<Self, String> {
-        // Default sizing: 10 bits/key, k=6, capacity = 2x keys (min 1024 so
-        // tiny sets still work).
-        let capacity_keys = (2 * keys.len()).max(1024);
-        Self::from_keys_sized(keys, capacity_keys * 10, 6)
-    }
-
-    /// Build with an explicit filter sizing so benchmarks can compare.
-    /// `filter_bits == 0` gives a disabled (zero-overhead) filter.
-    pub(crate) fn from_keys_sized(
-        keys: LargeStringArray,
-        filter_bits: usize,
-        k: u32,
-    ) -> Result<Self, String> {
-        // Deliberately no early return for empty keys. A shortcut that built a
-        // DISABLED filter here would have no rebuild path, so a cache whose first
-        // load found an empty table would never gain a prefilter as it filled up.
-        // `hash_and_insert_range` is already a no-op when there is nothing to add.
-        let capacity_keys = (2 * keys.len()).max(1024);
+        // Deliberately no early return for empty keys. A shortcut that early-returned
+        // a degenerate empty set here would leave a cache whose first load found an
+        // empty table unable to work as it fills up. `hash_and_insert_range` is already
+        // a no-op when there is nothing to add, so building unconditionally is free.
         let mut set = Self {
             hashes: vec![0; keys.len()],
             keys,
             state: RandomState::default(),
             table: HashTable::new(),
-            filter: BlockedBloom::with_bits(filter_bits, k, capacity_keys),
-            probes: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
         };
         set.hash_and_insert_range(0)?;
         Ok(set)
@@ -102,22 +60,6 @@ impl ArrowKeySet {
 
         self.hashes.resize(self.keys.len(), 0);
         self.hash_and_insert_range(start)?;
-
-        // The filter's FPR decays toward 1 once the set outgrows its design
-        // capacity. Rebuild at double the capacity and double the bits (keeping
-        // bits/key constant), then re-insert every non-null key's hash from
-        // `self.hashes` — no re-hashing needed.
-        if !self.filter.is_disabled() && self.table.len() > self.filter.capacity_keys() {
-            let new_capacity = self.filter.capacity_keys() * 2;
-            let new_bits = self.filter.bytes() * 16; // 2x bits: bytes()*8 = bits, doubled
-            let k = self.filter.k();
-            self.filter = BlockedBloom::with_bits(new_bits, k, new_capacity);
-            for idx in 0..self.keys.len() {
-                if !self.keys.is_null(idx) {
-                    self.filter.insert(self.hashes[idx]);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -128,82 +70,24 @@ impl ArrowKeySet {
     pub(crate) fn contains_array(&self, needles: &StringArray) -> Result<BooleanArray, String> {
         // Haystack is LargeUtf8, needle is Utf8 — hashes match for equal `&str`
         // content (see struct-level comment).
-        //
-        // Decide ONCE PER BATCH whether the prefilter pays, not per row — an
-        // atomic load inside the inner loop would cost more than the filter
-        // saves. Accumulate batch-local totals and fold them into the shared
-        // counters once at the end (two atomics per batch, negligible).
-        let use_filter = !self.filter.is_disabled() && self.filter_is_paying_off();
-
         with_hashes([needles as &dyn Array], &self.state, |hashes| {
             let mut builder = BooleanBuilder::with_capacity(needles.len());
-            let mut batch_probes: u64 = 0;
-            let mut batch_hits: u64 = 0;
             for (i, &hash) in hashes.iter().enumerate() {
                 if needles.is_null(i) {
                     // `hash_array` only writes valid indices; null slots hold garbage.
                     builder.append_null();
                     continue;
                 }
-                batch_probes += 1;
-                if use_filter {
-                    // Prefilter: a miss means DEFINITELY absent — skip the exact
-                    // table entirely. A hit still runs the exact probe below; the
-                    // filter can never produce a `true` on its own.
-                    if !self.filter.maybe_contains(hash) {
-                        builder.append_value(false);
-                        continue;
-                    }
-                }
                 let needle = needles.value(i);
                 let found = self
                     .table
                     .find(hash, |&idx| self.keys.value(idx as usize) == needle)
                     .is_some();
-                // A hit is a needle present in the set — the filter only helps
-                // when misses dominate, so watch the real hit rate, not whether
-                // the exact probe ran (a filter false-positive is still a miss).
-                if found {
-                    batch_hits += 1;
-                }
                 builder.append_value(found);
-            }
-            if use_filter {
-                self.probes.fetch_add(batch_probes, Ordering::Relaxed);
-                self.hits.fetch_add(batch_hits, Ordering::Relaxed);
             }
             Ok(builder.finish())
         })
         .map_err(|e| e.to_string())
-    }
-
-    /// Whether consulting the prefilter is still a performance win on the
-    /// recent workload.
-    ///
-    /// SAFETY: consulting the filter or not CANNOT change results — the filter
-    /// only ever short-circuits a negative (a miss is DEFINITELY absent), so
-    /// skipping it just means always running the exact probe. Because it is a
-    /// pure performance switch, a torn or stale read of the counters is
-    /// harmless: at worst the filter stays on (or off) one batch too long. That
-    /// is why the atomics use Relaxed ordering and the periodic halving is
-    /// racy.
-    fn filter_is_paying_off(&self) -> bool {
-        let probes = self.probes.load(Ordering::Relaxed);
-        // Assume it pays until there is enough evidence to say otherwise.
-        if probes < FILTER_WARMUP_PROBES {
-            return true;
-        }
-        // Halve both counters periodically so this tracks the RECENT hit rate
-        // rather than the lifetime average — a cache that starts cold and fills
-        // up must be able to switch the filter off, and a workload that changes
-        // back must be able to switch it on again.
-        if probes >= FILTER_DECAY_PROBES {
-            self.probes.store(probes / 2, Ordering::Relaxed);
-            self.hits
-                .store(self.hits.load(Ordering::Relaxed) / 2, Ordering::Relaxed);
-        }
-        let hits = self.hits.load(Ordering::Relaxed);
-        hits.saturating_mul(100) / probes.max(1) < FILTER_MAX_HIT_PERCENT
     }
 
     fn hash_and_insert_range(&mut self, start: usize) -> Result<(), String> {
@@ -225,7 +109,6 @@ impl ArrowKeySet {
             keys,
             hashes,
             table,
-            filter,
             ..
         } = self;
 
@@ -246,9 +129,6 @@ impl ArrowKeySet {
                 continue;
             }
             table.insert_unique(hash, idx_u32, |&i| hashes[i as usize]);
-            // Same hash, same loop, same null-skip as the table. Duplicates are
-            // skipped (bit-set is idempotent, so this is exact).
-            filter.insert(hash);
         }
 
         Ok(())
@@ -269,8 +149,6 @@ mod tests {
 
     #[test]
     fn empty_set_misses_and_preserves_nulls() {
-        // Built the way production builds it when the first load finds no rows,
-        // so this also covers probing through an enabled-but-empty prefilter.
         let set = ArrowKeySet::from_keys(LargeStringArray::from(Vec::<&str>::new()))
             .expect("empty build");
         let needles = utf8_needles([Some("a"), None, Some("b")]);
@@ -507,15 +385,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_initial_load_still_gets_a_filter() {
-        // A cache whose first load found an empty table must still gain a working
-        // prefilter as deltas arrive — the disabled-filter path has no rebuild.
+    fn empty_initial_load_then_extend_works() {
+        // A cache whose first load found an empty table must still work as it
+        // fills: `from_keys` must not early-return a degenerate empty set, because
+        // a cache whose first load finds an empty table still has to work as it
+        // fills.
         let mut set = ArrowKeySet::from_keys(LargeStringArray::from(Vec::<&str>::new()))
             .expect("empty build");
-        assert!(
-            !set.filter.is_disabled(),
-            "empty initial load left the filter disabled"
-        );
 
         set.extend_from(large_keys([Some("a"), Some("b")]))
             .expect("extend");
@@ -525,219 +401,6 @@ mod tests {
         assert!(out.value(0));
         assert!(out.value(1));
         assert!(!out.value(2));
-    }
-
-    #[test]
-    fn filter_sizings_agree() {
-        const N: usize = 5_000;
-        let present: Vec<String> = (0..N).map(|i| format!("present-{i}")).collect();
-        let keys = LargeStringArray::from(present.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-
-        let disabled = ArrowKeySet::from_keys_sized(keys.clone(), 0, 0).expect("build disabled");
-        let six_bits = ArrowKeySet::from_keys_sized(keys.clone(), N * 6, 4).expect("build 6b/k");
-        let ten_bits = ArrowKeySet::from_keys_sized(keys.clone(), N * 10, 6).expect("build 10b/k");
-        assert!(disabled.filter.is_disabled());
-        assert!(!six_bits.filter.is_disabled());
-        assert!(!ten_bits.filter.is_disabled());
-
-        // Mix: every present key, absent keys with nulls every 7th row.
-        let mut needles: Vec<Option<String>> = Vec::with_capacity(2 * N);
-        needles.extend((0..N).map(|i| Some(format!("present-{i}"))));
-        needles.extend((0..N).map(|i| {
-            if i % 7 == 0 {
-                None
-            } else {
-                Some(format!("absent-{i}"))
-            }
-        }));
-        let needle_array = utf8_needles(needles.iter().map(|o| o.as_deref()));
-
-        let out_disabled = disabled
-            .contains_array(&needle_array)
-            .expect("probe disabled");
-        let out_six = six_bits.contains_array(&needle_array).expect("probe 6b/k");
-        let out_ten = ten_bits.contains_array(&needle_array).expect("probe 10b/k");
-
-        // Sanity: the disabled (exact) result has the expected shape.
-        assert!(out_disabled.iter().take(N).all(|v| v == Some(true)));
-        assert_eq!(
-            out_disabled.null_count(),
-            (0..N).filter(|i| i % 7 == 0).count()
-        );
-        assert!(
-            out_disabled
-                .iter()
-                .skip(N)
-                .filter(|v| *v == Some(true))
-                .count()
-                == 0
-        );
-
-        // The filter must never change an answer, at any sizing.
-        assert_eq!(out_disabled, out_six);
-        assert_eq!(out_disabled, out_ten);
-    }
-
-    #[test]
-    fn rebuild_keeps_membership_exact() {
-        // capacity_keys floor is 1024; start tiny and extend past it so the
-        // filter rebuilds at least once.
-        let mut set =
-            ArrowKeySet::from_keys_sized(large_keys([Some("k0"), Some("k1")]), 1024 * 10, 6)
-                .expect("build");
-        assert!(!set.filter.is_disabled());
-        let initial_capacity = set.filter.capacity_keys();
-        assert_eq!(initial_capacity, 1024);
-
-        let mut inserted: Vec<String> = vec!["k0".to_string(), "k1".to_string()];
-        for chunk in 0..5 {
-            let extra: Vec<String> = (0..500).map(|i| format!("k{chunk}-{i}")).collect();
-            set.extend_from(large_keys(extra.iter().map(|s| Some(s.as_str()))))
-                .expect("extend");
-            inserted.extend(extra);
-        }
-        assert!(
-            set.len() > initial_capacity,
-            "extend must outgrow the initial filter capacity"
-        );
-        assert!(
-            set.filter.capacity_keys() > initial_capacity,
-            "extend must have rebuilt the filter"
-        );
-
-        // Every key ever inserted must still hit; known-absent keys must miss.
-        let mut needles: Vec<Option<String>> = inserted.iter().map(|s| Some(s.clone())).collect();
-        needles.extend((0..500).map(|i| Some(format!("absent-{i}"))));
-        let out = set
-            .contains_array(&utf8_needles(needles.iter().map(|o| o.as_deref())))
-            .expect("probe");
-        assert_eq!(out.len(), needles.len());
-        for (i, n) in needles.iter().enumerate() {
-            match n {
-                Some(s) if s.starts_with("absent") => {
-                    assert!(!out.value(i), "absent {s} must miss at row {i}")
-                }
-                Some(_) => assert!(out.value(i), "inserted key must hit at row {i}"),
-                None => unreachable!("no nulls in this test"),
-            }
-        }
-    }
-
-    fn assert_equals(pattern: &str, out: &BooleanArray, expected_len: usize, is_hit: bool) {
-        assert_eq!(out.len(), expected_len, "{pattern}: wrong length");
-        for i in 0..expected_len {
-            assert!(!out.is_null(i), "{pattern}: unexpected null at row {i}");
-            assert_eq!(out.value(i), is_hit, "{pattern}: wrong answer at row {i}");
-        }
-    }
-
-    #[test]
-    fn filter_disables_itself_when_hits_dominate() {
-        // All hits — exactly the workload where the filter is a tax. Probe well
-        // past warmup so `filter_is_paying_off` must flip to false, and assert
-        // every result stays exactly correct throughout (the whole point of the
-        // guard is that flipping the switch never changes an answer).
-        let present: Vec<String> = (0..64).map(|i| format!("present-{i}")).collect();
-        let set = ArrowKeySet::from_keys(large_keys(present.iter().map(|s| Some(s.as_str()))))
-            .expect("build");
-        // Repeat the present keys so every needle is a hit.
-        let needle_vals: Vec<String> = (0..1024).map(|i| format!("present-{}", i % 64)).collect();
-        let needles = utf8_needles(needle_vals.iter().map(|s| Some(s.as_str())));
-
-        let rounds = (FILTER_WARMUP_PROBES as usize / needles.len()) + 5;
-        for _ in 0..rounds {
-            let out = set.contains_array(&needles).expect("probe");
-            assert_equals("hit-heavy", &out, needles.len(), true);
-        }
-        // Enough probes accumulated to cross warmup; the guard must have turned
-        // the filter off (hit rate ~100% > 15%), yet answers are still exact.
-        assert!(
-            set.probes.load(Ordering::Relaxed) >= FILTER_WARMUP_PROBES,
-            "test must have crossed warmup"
-        );
-        assert!(
-            !set.filter_is_paying_off(),
-            "hit-heavy workload must disable the filter"
-        );
-    }
-
-    #[test]
-    fn filter_stays_on_for_miss_heavy_workload() {
-        // Mostly-absent needles — the workload the filter is built to win. Probe
-        // past warmup; the filter must stay on and answers stay exactly correct.
-        let present: Vec<String> = (0..64).map(|i| format!("present-{i}")).collect();
-        let set = ArrowKeySet::from_keys(large_keys(present.iter().map(|s| Some(s.as_str()))))
-            .expect("build");
-        // Mostly absent, a sprinkle of present to make it a realistic mix.
-        let mut raw: Vec<String> = (0..1024).map(|i| format!("absent-{i}")).collect();
-        raw[0] = "present-0".to_string();
-        raw[511] = "present-31".to_string();
-        let needles = utf8_needles(raw.iter().map(|s| Some(s.as_str())));
-
-        let rounds = (FILTER_WARMUP_PROBES as usize / needles.len()) + 5;
-        for _ in 0..rounds {
-            let out = set.contains_array(&needles).expect("probe");
-            // Rows 0 and 511 are present (hits); the rest are absent misses.
-            for i in 0..out.len() {
-                let expect_hit = i == 0 || i == 511;
-                assert!(!out.is_null(i), "miss-heavy: null at row {i}");
-                assert_eq!(
-                    out.value(i),
-                    expect_hit,
-                    "miss-heavy: wrong answer at row {i}"
-                );
-            }
-        }
-        assert!(
-            set.probes.load(Ordering::Relaxed) >= FILTER_WARMUP_PROBES,
-            "test must have crossed warmup"
-        );
-        // ~0.2% hits < 15%: the filter must still be considered worth keeping.
-        assert!(
-            set.filter_is_paying_off(),
-            "miss-heavy workload must keep the filter on"
-        );
-    }
-
-    #[test]
-    fn hit_rate_guard_never_changes_results() {
-        // A filter-enabled set and a filter-disabled set (`filter_bits = 0`)
-        // MUST produce identical answers for every batch, including while the
-        // enabled set crosses warmup and its guard flips the filter off.
-        let present: Vec<String> = (0..64).map(|i| format!("present-{i}")).collect();
-        let keys = large_keys(present.iter().map(|s| Some(s.as_str())));
-        let enabled = ArrowKeySet::from_keys_sized(keys.clone(), 64 * 64, 6).expect("build");
-        let disabled = ArrowKeySet::from_keys_sized(keys, 0, 0).expect("build");
-
-        // Alternate hit-heavy and miss-heavy batches so the hit rate ends up
-        // crossing warmup with a mixed signal; RandomState is deterministic per
-        // batch, so answers are comparable across the two sets.
-        let hit_vals: Vec<String> = (0..1024).map(|i| format!("present-{}", i % 64)).collect();
-        let hit_needles = utf8_needles(hit_vals.iter().map(|s| Some(s.as_str())));
-        let miss_vals: Vec<String> = (0..1024).map(|i| format!("absent-{i}")).collect();
-        let miss_needles = utf8_needles(miss_vals.iter().map(|s| Some(s.as_str())));
-
-        let rounds = (FILTER_WARMUP_PROBES as usize / 1024) + 5;
-        for round in 0..rounds {
-            // Alternate pure-hit and pure-miss rounds: a mixed signal that
-            // crosses warmup (filter on at first) and then, with ~50% hits,
-            // trips the guard off — exercising both sides of the switch.
-            let needles = if round % 2 == 0 {
-                &hit_needles
-            } else {
-                &miss_needles
-            };
-            let a = enabled.contains_array(needles).expect("enabled probe");
-            let b = disabled.contains_array(needles).expect("disabled probe");
-            assert_eq!(
-                a, b,
-                "enabled and disabled sets must agree at round {round}"
-            );
-        }
-        assert!(
-            enabled.probes.load(Ordering::Relaxed) >= FILTER_WARMUP_PROBES,
-            "test must have crossed warmup"
-        );
     }
 }
 
@@ -882,33 +545,6 @@ mod bench {
             }
         }
         (best, sum)
-    }
-
-    /// Fraction of needles the prefilter lets through. Called with all-absent
-    /// needles, this IS the measured false-positive rate.
-    fn filter_pass_rate(set: &ArrowKeySet, batches: &[StringArray]) -> f64 {
-        let mut pass = 0usize;
-        let mut total = 0usize;
-        for b in batches.iter().take(2_000) {
-            let (p, t) = with_hashes([b as &dyn Array], &set.state, |hashes| {
-                let mut p = 0usize;
-                let mut t = 0usize;
-                for (i, &h) in hashes.iter().enumerate() {
-                    if b.is_null(i) {
-                        continue;
-                    }
-                    t += 1;
-                    if set.filter.maybe_contains(h) {
-                        p += 1;
-                    }
-                }
-                Ok::<_, datafusion::common::DataFusionError>((p, t))
-            })
-            .expect("hash");
-            pass += p;
-            total += t;
-        }
-        pass as f64 / total.max(1) as f64
     }
 
     fn report(scenario: &str, impl_name: &str, elapsed: std::time::Duration) {
@@ -1097,55 +733,6 @@ mod bench {
             "MEMORY-BOUND CHECK: shrinking the set 700x changes a miss by {:.2}x  (near 1.00x => misses are NOT memory bound => a prefilter cannot help)",
             big_miss.as_secs_f64() / small_miss.as_secs_f64()
         );
-        println!();
-
-        // --- prefilter sizing sweep: does the L2 cliff exist? ---
-        // Baselines from the already-built `arrow` set; every sizing must match them.
-        let (_, baseline_miss) = best_of(1, || run_arrow(&arrow, &all_miss));
-        let (_, baseline_98) = best_of(1, || run_arrow(&arrow, &miss98));
-        let (_, baseline_hit) = best_of(1, || run_arrow(&arrow, &all_hit));
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let mk = |bits: usize, k: u32| {
-            ArrowKeySet::from_keys_sized(LargeStringArray::from(key_refs.clone()), bits, k)
-                .expect("sized build")
-        };
-        let sizings: [(&str, usize, u32); 4] = [
-            ("nofilter", 0, 0),
-            ("bloom_1.0MB_k4", 8_388_608, 4),
-            ("bloom_1.75MB_k6", 14_680_064, 6),
-            ("bloom_3.5MB_k6", 29_360_128, 6),
-        ];
-        println!("--- prefilter sizing sweep (L2=1MB/core, L3=32MB, exact table=7.34MB) ---");
-        for (label, bits, k) in sizings {
-            let set = mk(bits, k);
-            let fpr = if bits == 0 {
-                1.0
-            } else {
-                filter_pass_rate(&set, &all_miss)
-            };
-            let (d_miss, s_miss) = best_of(3, || run_arrow(&set, &all_miss));
-            let (d_98, s_98) = best_of(3, || run_arrow(&set, &miss98));
-            let (d_hit, s_hit) = best_of(3, || run_arrow(&set, &all_hit));
-            // Every sizing must agree with the no-filter baseline, or the
-            // prefilter is dropping real members (a false negative).
-            assert_eq!(
-                s_miss, baseline_miss,
-                "filter {label} changed all_miss results"
-            );
-            assert_eq!(s_98, baseline_98, "filter {label} changed miss98 results");
-            assert_eq!(
-                s_hit, baseline_hit,
-                "filter {label} changed all_hit results"
-            );
-            println!(
-                "filter={label:16} bytes={:>9} measured_FPR={:>6.2}%",
-                set.filter.bytes(),
-                fpr * 100.0
-            );
-            report("  all_miss", label, d_miss);
-            report("  miss98", label, d_98);
-            report("  all_hit", label, d_hit);
-        }
         println!();
 
         // --- dictionary-encoded probe vs plain row-by-row probe ---

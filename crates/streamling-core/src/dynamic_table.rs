@@ -1,4 +1,3 @@
-mod bloom;
 mod in_memory;
 mod key_set;
 mod postgres;
