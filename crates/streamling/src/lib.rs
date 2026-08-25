@@ -68,7 +68,7 @@ use streamling_core::plugin::{
 };
 use streamling_core::side_output::SupportsSideOutputs;
 use streamling_core::sql_parse::extract_table_references_from_sql;
-use streamling_core::telemetry::recorder::initialize_metrics_recorder;
+use streamling_core::telemetry::recorder::{get_metrics_recorder, initialize_metrics_recorder};
 use streamling_state::{StateBackendFactories, StateOperatorBackendFactory};
 
 /// Represents the source of a primary key definition
@@ -2075,6 +2075,12 @@ impl Streamling {
         }
 
         init_node_registry(node_contexts);
+
+        // Seed each non-sink node's elapsed_compute series only now: plugin
+        // construction above merged plugin-declared identity labels
+        // (`merge_metadata_tags`), so the seeded samples land on the final
+        // label set instead of an orphan pre-merge series.
+        get_metrics_recorder().seed_elapsed_compute_series();
 
         let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 

@@ -22,7 +22,10 @@ use datafusion::physical_plan::{
 use crate::checkpoints::checkpoint_management::{
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
 };
-use datafusion::physical_plan::metrics::MetricsSet;
+use crate::operators::filter::StreamingFilterExec;
+use crate::operators::projection::StreamingProjectionExec;
+use crate::operators::wrapping::WrappingExec;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -128,11 +131,119 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
     }
 }
 
+/// Whether `plan` marks the edge of this transform's own physical subtree for
+/// metric attribution.
+///
+/// Types opt in via [`crate::operators::TopologyBoundary`]. This walk still
+/// downcasts the closed set because DataFusion's `ExecutionPlan` has no local
+/// hook; adding a boundary type means `impl TopologyBoundary` plus one arm.
+///
+/// Three kinds of boundary exist:
+/// - A [`WrappingExec`]: a *separate* topology node that records its own
+///   `elapsed_compute`; descending into it would fold another node's compute
+///   into this transform's aggregate, double-counting it.
+/// - A nested [`CheckpointableExec`]: another transform's aggregation point
+///   (its `metrics()` already covers its subtree).
+/// - A source-owned [`StreamingFilterExec`] / [`StreamingProjectionExec`]:
+///   `wrap_with_side_outputs_before_filter` re-applies a source's filter and
+///   projection ABOVE the source's `WrappingExec` (so side outputs observe
+///   pre-filter rows), which places those source-owned operators inside the
+///   consuming transform's subtree. Without stopping at them, an expensive
+///   source-level filter would be misattributed to the transform's compute.
+fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    // Closed set: `topology_boundary_closed_set_matches_operator_execution_plans`
+    // fails if a new operators/ ExecutionPlan is added without classifying it
+    // here (and `impl TopologyBoundary`). A missing arm silently bleeds metrics.
+    topology_boundary_of::<WrappingExec>(plan)
+        .or_else(|| topology_boundary_of::<CheckpointableExec>(plan))
+        .or_else(|| topology_boundary_of::<StreamingFilterExec>(plan))
+        .or_else(|| topology_boundary_of::<StreamingProjectionExec>(plan))
+        .unwrap_or(false)
+}
+
+fn topology_boundary_of<T: crate::operators::TopologyBoundary + ExecutionPlan + 'static>(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<bool> {
+    plan.downcast_ref::<T>()
+        .map(crate::operators::TopologyBoundary::bounds_metric_aggregation)
+}
+
+/// DataFusion's [`MetricsSet`] has no `is_empty()`. This helper is the
+/// emptiness check `CheckpointableExec::metrics` uses to restore the
+/// metric-less short-circuit, until DataFusion grows `is_empty()`.
+fn metrics_set_is_empty(set: &MetricsSet) -> bool {
+    set.iter().next().is_none()
+}
+
+/// Recursively merge the DataFusion `MetricsSet` of `plan` and its descendants
+/// into `out`, stopping at any topology boundary (see [`is_topology_boundary`]).
+///
+/// Everything strictly between this `CheckpointableExec` and the next topology
+/// boundary is this transform's own compute and belongs in its aggregate.
+///
+/// The boundary check is applied to `plan` itself, not just its children:
+/// `WrappingExec` delegates both `metrics()` and `children()` to its inner
+/// plan, so if the boundary node were reached as the recursion root (e.g. the
+/// `CheckpointableExec`'s input is a passthrough SQL whose projection was
+/// pushed down, leaving the upstream `WrappingExec` directly beneath it), a
+/// children-only guard would collect its delegated metrics and descend into the
+/// nested topology anyway.
+fn collect_subtree_metrics(plan: &Arc<dyn ExecutionPlan>, out: &mut MetricsSet) {
+    let mut visited = std::collections::HashSet::new();
+    collect_subtree_metrics_inner(plan, out, &mut visited);
+}
+
+fn collect_subtree_metrics_inner(
+    plan: &Arc<dyn ExecutionPlan>,
+    out: &mut MetricsSet,
+    visited: &mut std::collections::HashSet<usize>,
+) {
+    // A physical plan can be a DAG: one Arc-shared subplan reachable from two
+    // parents (e.g. UNION ALL over a common input) must be counted once.
+    // The visited-set key is Arc pointer identity, not operator equality —
+    // two separately constructed plans wrapping the same operator would
+    // both be walked (extremely unlikely in a single physical tree).
+    if !visited.insert(Arc::as_ptr(plan) as *const () as usize) {
+        return;
+    }
+    if is_topology_boundary(plan) {
+        return;
+    }
+    if let Some(set) = plan.metrics() {
+        for metric in set.iter() {
+            // Capture only the variants the per-batch delta path exports
+            // (`subtree_delta_metric_values`); dropping the rest here —
+            // timestamps, output_rows/bytes/batches per operator per
+            // partition — keeps the per-batch loop from re-walking dead
+            // entries on every batch.
+            match metric.value() {
+                MetricValue::ElapsedCompute(_)
+                | MetricValue::Count { .. }
+                | MetricValue::Time { .. }
+                | MetricValue::Gauge { .. } => out.push(Arc::clone(metric)),
+                _ => {}
+            }
+        }
+    }
+    for child in plan.children() {
+        collect_subtree_metrics_inner(child, out, visited);
+    }
+}
+
 struct CheckpointableExec {
     input: Arc<dyn ExecutionPlan>,
     internal_buffer_size: u32,
     reference_name: String,
     cache: Arc<PlanProperties>,
+}
+
+impl crate::operators::TopologyBoundary for CheckpointableExec {
+    /// Nested CheckpointableExec is another transform's aggregation point:
+    /// its `metrics()` already covers its own subtree, so descending past it
+    /// would double-count everything below (and misattribute it to this node).
+    fn bounds_metric_aggregation(&self) -> bool {
+        true
+    }
 }
 
 impl CheckpointableExec {
@@ -291,7 +402,34 @@ impl ExecutionPlan for CheckpointableExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        self.input.metrics()
+        // Aggregate DataFusion metrics across this transform's ENTIRE physical
+        // subtree, not just the root operator.
+        //
+        // Performance contract: called once per stream, not per batch.
+        // `WrappingExec::execute` snapshots this after `execute_input_stream`
+        // and reuses the `MetricsSet` (Arc-backed counters) for the rest of
+        // the stream. Each call walks the subtree and allocates a
+        // `HashSet<usize>` for DAG-dedup; do not put this on a per-batch path.
+        //
+        // The topology for a SQL transform is
+        // `WrappingExec -> CheckpointableExec -> <SQL plan>`, and `WrappingExec`
+        // folds these DataFusion metrics into the node's `elapsed_compute` (via
+        // `record_execution_plan_metrics`). Forwarding only `self.input.metrics()`
+        // (the SQL plan's ROOT operator) drops the `elapsed_compute` recorded by
+        // deeper operators — e.g. a `FilterExec` beneath a `ProjectionExec` does
+        // the real work but sits below the root. With that deep compute missing,
+        // the transform's reported `elapsed_compute` collapsed to near zero and
+        // a compute-bound transform looked idle.
+        //
+        // Return `None` (not `Some(empty)`) when the subtree exposes nothing,
+        // so per-batch consumers keep their metric-less short-circuit.
+        let mut aggregated = MetricsSet::new();
+        collect_subtree_metrics(&self.input, &mut aggregated);
+        if metrics_set_is_empty(&aggregated) {
+            None
+        } else {
+            Some(aggregated)
+        }
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -307,10 +445,14 @@ mod tests {
     use arrow::array::{BooleanArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use datafusion::datasource::MemTable;
+    use datafusion::datasource::TableProvider;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_expr::Partitioning as PhysicalPartitioning;
+    use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::*;
     use futures::StreamExt;
+    use std::time::Duration;
 
     fn create_test_schema_with_metadata(metadata: HashMap<String, String>) -> SchemaRef {
         Arc::new(Schema::new_with_metadata(
@@ -692,5 +834,586 @@ mod tests {
             Some(&"another_value".to_string()),
             "Custom metadata 'another_key' should be preserved"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // elapsed_compute (query latency) subtree aggregation regression.
+    //
+    // A SQL transform under-reported its `elapsed_compute` because
+    // `CheckpointableExec::metrics` forwarded only the SQL plan's ROOT
+    // operator, dropping compute recorded by deeper operators.
+    // ------------------------------------------------------------------
+
+    /// A test operator that records a fixed `elapsed_compute` per input batch
+    /// via DataFusion's `BaselineMetrics`, modeling a compute-bound SQL operator
+    /// (e.g. `FilterExec`). Used to prove `CheckpointableExec::metrics` gathers
+    /// compute from operators *below* the SQL plan root, and stops at nested
+    /// `WrappingExec` topology boundaries.
+    #[derive(Debug)]
+    struct ComputeExec {
+        input: Arc<dyn ExecutionPlan>,
+        per_batch_compute: Duration,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl ComputeExec {
+        fn new(input: Arc<dyn ExecutionPlan>, per_batch_compute: Duration) -> Self {
+            Self {
+                input,
+                per_batch_compute,
+                metrics: ExecutionPlanMetricsSet::new(),
+            }
+        }
+    }
+
+    impl DisplayAs for ComputeExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "ComputeExec")
+        }
+    }
+
+    impl ExecutionPlan for ComputeExec {
+        fn name(&self) -> &'static str {
+            "ComputeExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ComputeExec::new(
+                children.swap_remove(0),
+                self.per_batch_compute,
+            )))
+        }
+        fn metrics(&self) -> Option<MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let baseline = BaselineMetrics::new(&self.metrics, partition);
+            let mut input = self.input.execute(partition, context)?;
+            let compute = self.per_batch_compute;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                while let Some(item) = input.next().await {
+                    match item {
+                        Ok(batch) => {
+                            // The timer measures wall-clock exactly as a real
+                            // operator's `elapsed_compute` does; the sleep
+                            // simulates the transform's own compute.
+                            let timer = baseline.elapsed_compute().timer();
+                            if !compute.is_zero() {
+                                tokio::time::sleep(compute).await;
+                            }
+                            timer.done();
+                            yield Ok(batch);
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            break;
+                        }
+                    }
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    async fn multi_batch_source(num_batches: usize) -> Arc<dyn ExecutionPlan> {
+        let batch = create_test_batch_with_checkpoint(&[]);
+        let schema = batch.schema();
+        let batches = std::iter::repeat_n(batch, num_batches).collect();
+        let mem_table = MemTable::try_new(schema, vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        // Awaited directly: `block_on` inside a tokio worker panics the
+        // moment the scanned future yields.
+        mem_table.scan(&ctx.state(), None, &[], None).await.unwrap()
+    }
+
+    /// Execute partition 0 of `plan` to completion, discarding the batches.
+    async fn drain(plan: &Arc<dyn ExecutionPlan>) {
+        let stream = plan.execute(0, SessionContext::new().task_ctx()).unwrap();
+        datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+    }
+
+    /// Aggregated `elapsed_compute` of `plan`, in whole milliseconds.
+    fn elapsed_ms(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+        plan.metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64
+            / 1_000_000
+    }
+
+    /// Nominal compute in these tests is 3 batches × 15ms sleep = 45ms.
+    /// CI load can compress `Instant` readings well below that; this floor
+    /// only needs to prove the setup recorded *some* compute (a broken timer
+    /// or root-only walk reports ~0). Do not env-var-skip.
+    const RECORDED_COMPUTE_FLOOR_MS: u64 = 5;
+    /// Exclusion must report far less than the compute sitting below the
+    /// boundary. 10ms is well below the 45ms nominal and above timer noise.
+    const BOUNDARY_EXCLUSION_CEILING_MS: u64 = 10;
+
+    /// Shared body for the boundary-exclusion tests: record ~45ms of real
+    /// compute on an operator (executed directly, so a boundary node's own
+    /// `execute()` side effects — e.g. `WrappingExec` initializing the
+    /// process-global `LiveDataInspect` singleton — never run), place it
+    /// below the boundary built by `make_boundary`, and assert
+    /// `CheckpointableExec::metrics` excludes it.
+    async fn assert_boundary_excludes(
+        make_boundary: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
+    ) {
+        let below: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(3).await,
+            Duration::from_millis(15),
+        ));
+        drain(&below).await;
+        let below_ms = elapsed_ms(&below);
+        assert!(
+            below_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "test setup: compute below the boundary must have recorded \
+             elapsed_compute, got {below_ms}ms"
+        );
+
+        let checkpointable: Arc<dyn ExecutionPlan> = Arc::new(CheckpointableExec::new(
+            make_boundary(below),
+            1,
+            "t".to_string(),
+        ));
+        let aggregated_ms = elapsed_ms(&checkpointable);
+        assert!(
+            aggregated_ms < BOUNDARY_EXCLUSION_CEILING_MS,
+            "compute at/below a topology boundary must be excluded, got {aggregated_ms}ms"
+        );
+    }
+
+    /// Regression: `CheckpointableExec::metrics` must aggregate `elapsed_compute`
+    /// from operators *below* the SQL plan root. Previously it forwarded only
+    /// `self.input.metrics()` (the root operator), so compute recorded by deeper
+    /// operators was dropped and never reached the node's `elapsed_compute` —
+    /// the reason a compute-bound SQL transform under-reported query latency.
+    #[tokio::test]
+    async fn checkpointable_metrics_aggregate_subtree_compute() {
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        // Root is a zero-compute passthrough; the real work happens one level
+        // deeper (mirroring a `FilterExec` beneath a `ProjectionExec`). Root-only
+        // forwarding would therefore report ~0 compute.
+        let deep_compute = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
+        let root: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(deep_compute, Duration::ZERO));
+
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, "t".to_string()));
+
+        drain(&checkpointable).await;
+
+        // ~NUM_BATCHES * 15ms of deep compute; assert well below the nominal
+        // total so CI load can't flake it, but far above the ~0 a root-only
+        // forward would report. Do not env-var-skip.
+        let aggregated_ms = elapsed_ms(&checkpointable);
+        assert!(
+            aggregated_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "expected aggregated subtree elapsed_compute >= {RECORDED_COMPUTE_FLOOR_MS}ms \
+             (got {aggregated_ms}ms); deep-operator compute was dropped"
+        );
+    }
+
+    /// `CheckpointableExec::metrics` must stop at a nested `WrappingExec`: that is
+    /// a separate topology node recording its own `elapsed_compute`, so folding
+    /// its subtree in here would double-count another node's compute against this
+    /// transform's query latency.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_nested_wrapping_exec() {
+        assert_boundary_excludes(|below| {
+            let nested_wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+                below,
+                "nested_upstream".to_string(),
+                vec![],
+                vec![],
+                None,
+            ));
+            // A zero-compute root above the boundary, so this transform's own
+            // compute is ~0.
+            Arc::new(ComputeExec::new(nested_wrapping, Duration::ZERO))
+        })
+        .await;
+    }
+
+    /// `CheckpointableExec::metrics` must also stop when the *root* of its input
+    /// is itself a `WrappingExec` (e.g. a passthrough SQL transform whose
+    /// projection was pushed down, leaving the upstream node's `WrappingExec`
+    /// directly beneath the boundary). Because `WrappingExec` delegates both
+    /// `metrics()` and `children()` to its inner plan, a boundary check that
+    /// only inspected *children* would collect this node's delegated metrics and
+    /// descend into the nested topology — folding another node's compute in.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_root_wrapping_exec() {
+        // The `WrappingExec` is the input's ROOT — no intervening operator
+        // between it and the `CheckpointableExec`. If the boundary check only
+        // guarded children (not the root), this would collect the compute.
+        assert_boundary_excludes(|below| {
+            Arc::new(WrappingExec::new(
+                below,
+                "nested_upstream".to_string(),
+                vec![],
+                vec![],
+                None,
+            ))
+        })
+        .await;
+    }
+
+    /// Nested `CheckpointableExec` is another transform's aggregation point;
+    /// descending past it would double-count (and misattribute) its subtree.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_nested_checkpointable_exec() {
+        assert_boundary_excludes(|below| {
+            Arc::new(CheckpointableExec::new(below, 1, "nested".to_string()))
+        })
+        .await;
+    }
+
+    /// A *source-owned* `StreamingFilterExec` (a source's filter re-applied
+    /// above the source's `WrappingExec` by
+    /// `wrap_with_side_outputs_before_filter`) must also act as a topology
+    /// boundary: its compute belongs to the source, not to the consuming
+    /// transform. A transform-owned filter (not marked) is still descended
+    /// into.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_source_owned_filter() {
+        use datafusion::physical_plan::expressions::lit;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        assert_boundary_excludes(|below| {
+            let original = FilterExec::try_new(lit(true), below).unwrap();
+            Arc::new(
+                StreamingFilterExec::from_original(original)
+                    .unwrap()
+                    .with_source_owned(),
+            )
+        })
+        .await;
+
+        // Control: the SAME shape without the source-owned mark is the
+        // transform's own filter, so the compute below it IS collected.
+        let below: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(3).await,
+            Duration::from_millis(15),
+        ));
+        drain(&below).await;
+        let original = FilterExec::try_new(lit(true), Arc::clone(&below)).unwrap();
+        let own_filter: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingFilterExec::from_original(original).unwrap());
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(own_filter, 1, "t".to_string()));
+        let own_ms = elapsed_ms(&checkpointable);
+        assert!(
+            own_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "a transform-owned filter must not bound the walk, got {own_ms}ms"
+        );
+    }
+
+    /// Sibling of `checkpointable_metrics_stop_at_source_owned_filter`: a
+    /// source-owned `StreamingProjectionExec` must bound the walk the same
+    /// way. A transform-owned projection (not marked) is still descended into.
+    #[tokio::test]
+    async fn checkpointable_metrics_stop_at_source_owned_projection() {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        use datafusion::physical_plan::PhysicalExpr;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        assert_boundary_excludes(|below| {
+            let original = ProjectionExec::try_new(
+                vec![(
+                    Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                    "id".to_string(),
+                )],
+                below,
+            )
+            .unwrap();
+            Arc::new(
+                StreamingProjectionExec::from_original(original)
+                    .unwrap()
+                    .with_source_owned(),
+            )
+        })
+        .await;
+
+        // Control: the SAME shape without the source-owned mark is the
+        // transform's own projection, so the compute below it IS collected.
+        let below: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(3).await,
+            Duration::from_millis(15),
+        ));
+        drain(&below).await;
+        let original = ProjectionExec::try_new(
+            vec![(
+                Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                "id".to_string(),
+            )],
+            Arc::clone(&below),
+        )
+        .unwrap();
+        let own_proj: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingProjectionExec::from_original(original).unwrap());
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(own_proj, 1, "t".to_string()));
+        let own_ms = elapsed_ms(&checkpointable);
+        assert!(
+            own_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "a transform-owned projection must not bound the walk, got {own_ms}ms"
+        );
+    }
+
+    /// A source-owned filter must refuse DataFusion's ProjectionPushdown
+    /// swap outright: pushing the transform's projection below the boundary
+    /// would exclude the transform's own projection compute from its metrics,
+    /// and rebuilding the filter risks dropping the boundary mark. An
+    /// unmarked (transform-owned) filter must still allow the swap.
+    ///
+    /// NOTE: the production session never runs ProjectionPushdown (the
+    /// physical rule set is replaced by `StreamlingPhysicalOptimizerRules`,
+    /// see session.rs); this covers the defense-in-depth guard for embedders
+    /// and future rule-set changes.
+    #[tokio::test]
+    async fn source_owned_filter_refuses_projection_swap() {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        use datafusion::physical_plan::PhysicalExpr;
+        use datafusion::physical_plan::expressions::lit;
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let input = multi_batch_source(1).await;
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+
+        // A narrowing projection directly above the filter, as ProjectionPushdown
+        // would present it.
+        let narrowing_projection = |child: &Arc<dyn ExecutionPlan>| {
+            ProjectionExec::try_new(
+                vec![(
+                    Arc::new(PhysicalColumn::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                    "id".to_string(),
+                )],
+                Arc::clone(child),
+            )
+            .unwrap()
+        };
+
+        let swapped = filter
+            .try_swapping_with_projection(&narrowing_projection(&filter))
+            .unwrap();
+        assert!(
+            swapped.is_none(),
+            "a source-owned filter must refuse the projection swap"
+        );
+        assert!(
+            filter
+                .downcast_ref::<StreamingFilterExec>()
+                .expect("original filter still in place")
+                .is_source_owned(),
+            "refusing the swap must leave the original boundary mark in place"
+        );
+
+        // Control: the same shape without the mark swaps as usual.
+        let original = FilterExec::try_new(lit(true), multi_batch_source(1).await).unwrap();
+        let own_filter: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingFilterExec::from_original(original).unwrap());
+        let swapped = own_filter
+            .try_swapping_with_projection(&narrowing_projection(&own_filter))
+            .unwrap();
+        assert!(
+            swapped.is_some(),
+            "a transform-owned filter must still allow the swap"
+        );
+    }
+
+    /// One Arc-shared subplan reachable from two parents (a DAG, e.g. UNION
+    /// ALL over a common input) must have its metrics counted once, not once
+    /// per path.
+    #[tokio::test]
+    async fn checkpointable_metrics_count_shared_subplan_once() {
+        use datafusion::physical_plan::union::UnionExec;
+
+        const NUM_BATCHES: usize = 3;
+        let per_batch = Duration::from_millis(15);
+
+        let shared: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
+        drain(&shared).await;
+
+        let single_ms = elapsed_ms(&shared);
+        assert!(
+            single_ms >= RECORDED_COMPUTE_FLOOR_MS,
+            "setup: expected recorded compute, got {single_ms}ms"
+        );
+
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![Arc::clone(&shared), Arc::clone(&shared)]).unwrap();
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(union, 1, "t".to_string()));
+
+        let aggregated_ms = elapsed_ms(&checkpointable);
+        assert_eq!(
+            aggregated_ms, single_ms,
+            "shared subplan must be counted once, not per parent"
+        );
+    }
+
+    /// Types in `is_topology_boundary`. Adding a type there without listing
+    /// it here (or vice versa) fails this test.
+    const TOPOLOGY_BOUNDARY_TYPES: &[&str] = &[
+        "WrappingExec",
+        "CheckpointableExec",
+        "StreamingFilterExec",
+        "StreamingProjectionExec",
+    ];
+
+    /// Production `impl ExecutionPlan` types under `operators/` that are *not*
+    /// topology-boundary downcast targets. A new wrapper of foreign topology
+    /// must move to [`TOPOLOGY_BOUNDARY_TYPES`] and gain an `is_topology_boundary`
+    /// arm; any other new operator ExecutionPlan must be listed here so the
+    /// choice is explicit.
+    const NON_BOUNDARY_OPERATOR_EXEC_TYPES: &[&str] = &[
+        "StreamSourcePlan",    // scan-sharing source adapter; sits inside a source node
+        "MultiSinkExec",       // sink fan-out
+        "StreamingUnnestExec", // this transform's own compute
+        "BroadcastingExec",    // scan-sharing fan-out
+        "ExternalHandlerExec", // this node's HTTP transform
+        "RebatchExec",         // this node's rebatch; nested WrappingExec still bounds
+        "WasmRunnerExec",      // this node's wasm transform
+    ];
+
+    /// Sentinel: a new `impl ExecutionPlan for` in `operators/` (top-level,
+    /// not inside `mod tests`) must be classified as either a topology
+    /// boundary or an explicit non-boundary. The previous `// EXTEND:` comment
+    /// was silent; this fails the build instead.
+    #[test]
+    fn topology_boundary_closed_set_matches_operator_execution_plans() {
+        let checkpointable_src = include_str!("checkpointable.rs");
+        for ty in TOPOLOGY_BOUNDARY_TYPES {
+            let needle = format!("topology_boundary_of::<{ty}>");
+            assert!(
+                checkpointable_src.contains(&needle),
+                "is_topology_boundary is missing `{needle}`; a new boundary type \
+                 silently bleeds metrics until this arm is added"
+            );
+        }
+
+        let operators_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/operators");
+        let mut found = production_execution_plan_types(&operators_dir);
+        found.sort();
+        found.dedup();
+
+        let mut expected: Vec<String> = TOPOLOGY_BOUNDARY_TYPES
+            .iter()
+            .chain(NON_BOUNDARY_OPERATOR_EXEC_TYPES.iter())
+            .map(|s| (*s).to_string())
+            .collect();
+        expected.sort();
+        expected.dedup();
+
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|t| !expected.contains(t))
+            .cloned()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "new operators/ ExecutionPlan type(s) {missing:?} are not classified. \
+             If the type wraps foreign topology, add `impl TopologyBoundary`, \
+             a `topology_boundary_of::<T>` arm in `is_topology_boundary`, and \
+             the name to TOPOLOGY_BOUNDARY_TYPES. Otherwise add it to \
+             NON_BOUNDARY_OPERATOR_EXEC_TYPES."
+        );
+
+        let extra: Vec<_> = expected
+            .iter()
+            .filter(|t| !found.contains(t))
+            .cloned()
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "classified ExecutionPlan type(s) {extra:?} were not found as \
+             top-level `impl ExecutionPlan for` in operators/; update the \
+             sentinel lists"
+        );
+
+        // Every closed-set type must opt in via the trait, not only the walk.
+        let mut operators_src = String::new();
+        collect_rust_sources(&operators_dir, &mut operators_src);
+        for ty in TOPOLOGY_BOUNDARY_TYPES {
+            let needle = format!("TopologyBoundary for {ty}");
+            assert!(
+                operators_src.contains(&needle),
+                "{ty} is in is_topology_boundary but has no `impl TopologyBoundary`"
+            );
+        }
+    }
+
+    fn production_execution_plan_types(dir: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        collect_production_execution_plan_types(dir, &mut names);
+        names
+    }
+
+    fn collect_production_execution_plan_types(dir: &std::path::Path, names: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_production_execution_plan_types(&path, names);
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for line in src.lines() {
+                // Test-module impls are indented; production impls are top-level.
+                let Some(rest) = line.strip_prefix("impl ExecutionPlan for ") else {
+                    continue;
+                };
+                let name = rest.trim().trim_end_matches('{').trim();
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut String) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            out.push_str(&std::fs::read_to_string(&path).unwrap());
+            out.push('\n');
+        }
     }
 }
