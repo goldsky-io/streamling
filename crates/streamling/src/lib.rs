@@ -1964,15 +1964,22 @@ impl Streamling {
                     // Apply ClickHouse-sink app_config defaults so the rebatcher
                     // always has a concrete batch_size/interval regardless of
                     // whether the topology supplied them.
-                    let effective_batch_size = batch_size.unwrap_or(app_config.record_batch_size);
-                    let effective_batch_flush_interval =
-                        Some(raw_batch_flush_interval.unwrap_or_else(|| {
-                            Duration::from_millis(app_config.record_batch_interval_ms)
-                        }));
+                    let clickhouse_config = &app_config.clickhouse_sink;
+                    let effective_batch_size = batch_size.unwrap_or(clickhouse_config.batch_size);
+                    let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
+                        Some(d) => d,
+                        None => humantime::parse_duration(&clickhouse_config.batch_flush_interval)
+                            .streamling_with_context(|| {
+                                format!(
+                                    "invalid clickhouse batch_flush_interval '{}' resolved for sink '{}'",
+                                    clickhouse_config.batch_flush_interval, reference_name
+                                )
+                            })?,
+                    });
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),
                         table.as_str(),
-                        app_config.clickhouse_sink.clone(),
+                        clickhouse_config.connection.clone(),
                         effective_batch_size,
                         app_config.num_records_before_stop,
                         pk_metadata_opt.map(|pk| pk.to_str()).unwrap_or_default(),

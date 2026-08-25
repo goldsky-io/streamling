@@ -669,7 +669,7 @@ impl ClickHouseTableProvider {
     pub fn new_sink(
         metric_metadata_id: String,
         table_name: &str,
-        config: ClickHouseSinkConfig,
+        config: ClickHouseConfig,
         batch_size: u32,
         num_records_before_stop: Option<u64>,
         primary_key: String,

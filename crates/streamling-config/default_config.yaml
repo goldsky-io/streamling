@@ -87,6 +87,14 @@ clickhouse_sink:
   user: default
   password: ""
   database: default
+  # Defaults for sinks that omit batch_size / batch_flush_interval. 100k rows
+  # with a 1s flush measured ~12x the throughput of the previous fallback
+  # (record_batch_size, 1000) on row-heavy backfills. Override per-process with
+  # STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE and
+  # STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL, or per-sink in the
+  # pipeline YAML.
+  batch_size: 100000
+  batch_flush_interval: "1s"
 print_sink:
   sample_every: "1"
 postgres_sink:

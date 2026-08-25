@@ -440,7 +440,35 @@ pub struct ClickHouseSourceConfig {
     pub sort_key_range: Option<i64>,
 }
 
-pub type ClickHouseSinkConfig = ClickHouseConfig;
+/// Global defaults for every ClickHouse sink in the pipeline. Connection fields
+/// are flattened, so `clickhouse_sink.url` / `STREAMLING__CLICKHOUSE_SINK__URL`
+/// keep working unchanged.
+#[derive(Clone, Deserialize)]
+pub struct ClickHouseSinkConfig {
+    #[serde(flatten)]
+    pub connection: ClickHouseConfig,
+    /// Rows per INSERT for sinks that omit `batch_size` in the pipeline YAML.
+    /// The old fallback (the global `record_batch_size`, 1000) caps row-heavy
+    /// backfills well below what ClickHouse will accept; 100k measured ~12x
+    /// higher throughput on transaction-shaped data (STRM-6530). Override with
+    /// `STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE`.
+    pub batch_size: u32,
+    /// Flush interval for sinks that omit `batch_flush_interval`, as a
+    /// humantime duration (`"1s"`, `"500ms"`). Bounds tail latency for
+    /// low-volume pipelines that would never fill a `batch_size` batch.
+    /// Override with `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL`.
+    pub batch_flush_interval: String,
+}
+
+impl std::fmt::Debug for ClickHouseSinkConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseSinkConfig")
+            .field("connection", &self.connection)
+            .field("batch_size", &self.batch_size)
+            .field("batch_flush_interval", &self.batch_flush_interval)
+            .finish()
+    }
+}
 
 impl std::fmt::Debug for ClickHouseConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1142,6 +1170,66 @@ mod tests {
             .expect("prod sink connection must be populated from env");
         assert_eq!(prod.host.as_deref(), Some("prod.example.com"));
         assert_eq!(prod.db, None);
+    }
+
+    /// The embedded defaults are what every pipeline that omits `batch_size`
+    /// actually runs with, so pin them: silently reverting to the old
+    /// `record_batch_size` fallback (1000) would quietly re-cap backfills.
+    #[test]
+    fn clickhouse_sink_batch_defaults_come_from_embedded_config() {
+        let config = base_app_config();
+
+        assert_eq!(config.clickhouse_sink.batch_size, 100_000);
+        assert_eq!(config.clickhouse_sink.batch_flush_interval, "1s");
+        assert!(
+            humantime::parse_duration(&config.clickhouse_sink.batch_flush_interval).is_ok(),
+            "the shipped default must parse as a humantime duration, or every \
+             ClickHouse pipeline fails to plan"
+        );
+        // Flattening the connection must not shadow the connection fields.
+        assert_eq!(config.clickhouse_sink.connection.database, "default");
+    }
+
+    /// `batch_size` sits behind `#[serde(flatten)]`, and env vars arrive as
+    /// strings — the combination is exactly where config-rs coercion tends to
+    /// break, so exercise the documented override end to end.
+    #[test]
+    fn clickhouse_sink_batch_defaults_are_env_overridable() {
+        let _guard = env_guard();
+
+        let vars = [
+            ("STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE", "250000"),
+            ("STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL", "500ms"),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            AppConfig::load().expect("embedded defaults plus env overrides must load")
+        });
+
+        // SAFETY: see above.
+        unsafe {
+            for (name, value) in previous {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let config = result.expect("test body panicked");
+        assert_eq!(config.clickhouse_sink.batch_size, 250_000);
+        assert_eq!(config.clickhouse_sink.batch_flush_interval, "500ms");
     }
 
     /// Verifies the full path: STREAMLING__HTTP_SECRET_HEADER__* and STREAMLING__HTTP_SECRET_VALUE__* env
