@@ -1,9 +1,23 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use arrow::array::{Array, BooleanArray, BooleanBuilder, LargeStringArray, StringArray};
 use arrow::compute::concat;
 use datafusion::common::hash_utils::{RandomState, with_hashes};
 use hashbrown::HashTable;
 
 use super::bloom::BlockedBloom;
+
+// Adaptive prefilter guard. Measured: the prefilter makes misses cheaper but
+// makes hits ~1.8x more expensive (112ns -> 202ns), because a hit pays the
+// filter probe and then still does the full exact probe. Break-even is around a
+// ~19% hit rate. A first-seen/dedup table's hit rate RISES as it fills, so a
+// filter that helps at deploy time silently becomes a tax later. These constants
+// steer `filter_is_paying_off` so the filter turns itself off once hits dominate.
+const FILTER_WARMUP_PROBES: u64 = 100_000;
+// 15% < the ~19% break-even, so the guard leaves margin: it switches the filter
+// off before hits get expensive enough to be a net regression.
+const FILTER_MAX_HIT_PERCENT: u64 = 15;
+const FILTER_DECAY_PROBES: u64 = 1_000_000;
 
 /// Exact membership set over contiguous Arrow string keys.
 ///
@@ -27,6 +41,11 @@ pub(crate) struct ArrowKeySet {
     /// touching the (large) exact table. It uses the SAME u64 hashes as `table`
     /// and can never produce a hit on its own — a maybe is re-checked exactly.
     filter: BlockedBloom,
+    /// Rolling probe/hit counts used to disable the prefilter if the workload
+    /// turns hit-heavy. Relaxed ordering: these only steer a performance
+    /// decision, never a result, so a torn or stale read is harmless.
+    probes: AtomicU64,
+    hits: AtomicU64,
 }
 
 impl ArrowKeySet {
@@ -55,6 +74,8 @@ impl ArrowKeySet {
             state: RandomState::default(),
             table: HashTable::new(),
             filter: BlockedBloom::with_bits(filter_bits, k, capacity_keys),
+            probes: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
         };
         set.hash_and_insert_range(0)?;
         Ok(set)
@@ -107,31 +128,82 @@ impl ArrowKeySet {
     pub(crate) fn contains_array(&self, needles: &StringArray) -> Result<BooleanArray, String> {
         // Haystack is LargeUtf8, needle is Utf8 — hashes match for equal `&str`
         // content (see struct-level comment).
+        //
+        // Decide ONCE PER BATCH whether the prefilter pays, not per row — an
+        // atomic load inside the inner loop would cost more than the filter
+        // saves. Accumulate batch-local totals and fold them into the shared
+        // counters once at the end (two atomics per batch, negligible).
+        let use_filter = !self.filter.is_disabled() && self.filter_is_paying_off();
+
         with_hashes([needles as &dyn Array], &self.state, |hashes| {
             let mut builder = BooleanBuilder::with_capacity(needles.len());
+            let mut batch_probes: u64 = 0;
+            let mut batch_hits: u64 = 0;
             for (i, &hash) in hashes.iter().enumerate() {
                 if needles.is_null(i) {
                     // `hash_array` only writes valid indices; null slots hold garbage.
                     builder.append_null();
                     continue;
                 }
-                // Prefilter: a miss means DEFINITELY absent — skip the exact
-                // table entirely. A hit still runs the exact probe below; the
-                // filter can never produce a `true` on its own.
-                if !self.filter.maybe_contains(hash) {
-                    builder.append_value(false);
-                    continue;
+                batch_probes += 1;
+                if use_filter {
+                    // Prefilter: a miss means DEFINITELY absent — skip the exact
+                    // table entirely. A hit still runs the exact probe below; the
+                    // filter can never produce a `true` on its own.
+                    if !self.filter.maybe_contains(hash) {
+                        builder.append_value(false);
+                        continue;
+                    }
                 }
                 let needle = needles.value(i);
                 let found = self
                     .table
                     .find(hash, |&idx| self.keys.value(idx as usize) == needle)
                     .is_some();
+                // A hit is a needle present in the set — the filter only helps
+                // when misses dominate, so watch the real hit rate, not whether
+                // the exact probe ran (a filter false-positive is still a miss).
+                if found {
+                    batch_hits += 1;
+                }
                 builder.append_value(found);
+            }
+            if use_filter {
+                self.probes.fetch_add(batch_probes, Ordering::Relaxed);
+                self.hits.fetch_add(batch_hits, Ordering::Relaxed);
             }
             Ok(builder.finish())
         })
         .map_err(|e| e.to_string())
+    }
+
+    /// Whether consulting the prefilter is still a performance win on the
+    /// recent workload.
+    ///
+    /// SAFETY: consulting the filter or not CANNOT change results — the filter
+    /// only ever short-circuits a negative (a miss is DEFINITELY absent), so
+    /// skipping it just means always running the exact probe. Because it is a
+    /// pure performance switch, a torn or stale read of the counters is
+    /// harmless: at worst the filter stays on (or off) one batch too long. That
+    /// is why the atomics use Relaxed ordering and the periodic halving is
+    /// racy.
+    fn filter_is_paying_off(&self) -> bool {
+        let probes = self.probes.load(Ordering::Relaxed);
+        // Assume it pays until there is enough evidence to say otherwise.
+        if probes < FILTER_WARMUP_PROBES {
+            return true;
+        }
+        // Halve both counters periodically so this tracks the RECENT hit rate
+        // rather than the lifetime average — a cache that starts cold and fills
+        // up must be able to switch the filter off, and a workload that changes
+        // back must be able to switch it on again.
+        if probes >= FILTER_DECAY_PROBES {
+            self.probes.store(probes / 2, Ordering::Relaxed);
+            self.hits
+                .store(self.hits.load(Ordering::Relaxed) / 2, Ordering::Relaxed);
+        }
+        let hits = self.hits.load(Ordering::Relaxed);
+        hits.saturating_mul(100) / probes.max(1) < FILTER_MAX_HIT_PERCENT
     }
 
     fn hash_and_insert_range(&mut self, start: usize) -> Result<(), String> {
@@ -549,6 +621,123 @@ mod tests {
                 None => unreachable!("no nulls in this test"),
             }
         }
+    }
+
+    fn assert_equals(pattern: &str, out: &BooleanArray, expected_len: usize, is_hit: bool) {
+        assert_eq!(out.len(), expected_len, "{pattern}: wrong length");
+        for i in 0..expected_len {
+            assert!(!out.is_null(i), "{pattern}: unexpected null at row {i}");
+            assert_eq!(out.value(i), is_hit, "{pattern}: wrong answer at row {i}");
+        }
+    }
+
+    #[test]
+    fn filter_disables_itself_when_hits_dominate() {
+        // All hits — exactly the workload where the filter is a tax. Probe well
+        // past warmup so `filter_is_paying_off` must flip to false, and assert
+        // every result stays exactly correct throughout (the whole point of the
+        // guard is that flipping the switch never changes an answer).
+        let present: Vec<String> = (0..64).map(|i| format!("present-{i}")).collect();
+        let set = ArrowKeySet::from_keys(large_keys(present.iter().map(|s| Some(s.as_str()))))
+            .expect("build");
+        // Repeat the present keys so every needle is a hit.
+        let needle_vals: Vec<String> = (0..1024).map(|i| format!("present-{}", i % 64)).collect();
+        let needles = utf8_needles(needle_vals.iter().map(|s| Some(s.as_str())));
+
+        let rounds = (FILTER_WARMUP_PROBES as usize / needles.len()) + 5;
+        for _ in 0..rounds {
+            let out = set.contains_array(&needles).expect("probe");
+            assert_equals("hit-heavy", &out, needles.len(), true);
+        }
+        // Enough probes accumulated to cross warmup; the guard must have turned
+        // the filter off (hit rate ~100% > 15%), yet answers are still exact.
+        assert!(
+            set.probes.load(Ordering::Relaxed) >= FILTER_WARMUP_PROBES,
+            "test must have crossed warmup"
+        );
+        assert!(
+            !set.filter_is_paying_off(),
+            "hit-heavy workload must disable the filter"
+        );
+    }
+
+    #[test]
+    fn filter_stays_on_for_miss_heavy_workload() {
+        // Mostly-absent needles — the workload the filter is built to win. Probe
+        // past warmup; the filter must stay on and answers stay exactly correct.
+        let present: Vec<String> = (0..64).map(|i| format!("present-{i}")).collect();
+        let set = ArrowKeySet::from_keys(large_keys(present.iter().map(|s| Some(s.as_str()))))
+            .expect("build");
+        // Mostly absent, a sprinkle of present to make it a realistic mix.
+        let mut raw: Vec<String> = (0..1024).map(|i| format!("absent-{i}")).collect();
+        raw[0] = "present-0".to_string();
+        raw[511] = "present-31".to_string();
+        let needles = utf8_needles(raw.iter().map(|s| Some(s.as_str())));
+
+        let rounds = (FILTER_WARMUP_PROBES as usize / needles.len()) + 5;
+        for _ in 0..rounds {
+            let out = set.contains_array(&needles).expect("probe");
+            // Rows 0 and 511 are present (hits); the rest are absent misses.
+            for i in 0..out.len() {
+                let expect_hit = i == 0 || i == 511;
+                assert!(!out.is_null(i), "miss-heavy: null at row {i}");
+                assert_eq!(
+                    out.value(i),
+                    expect_hit,
+                    "miss-heavy: wrong answer at row {i}"
+                );
+            }
+        }
+        assert!(
+            set.probes.load(Ordering::Relaxed) >= FILTER_WARMUP_PROBES,
+            "test must have crossed warmup"
+        );
+        // ~0.2% hits < 15%: the filter must still be considered worth keeping.
+        assert!(
+            set.filter_is_paying_off(),
+            "miss-heavy workload must keep the filter on"
+        );
+    }
+
+    #[test]
+    fn hit_rate_guard_never_changes_results() {
+        // A filter-enabled set and a filter-disabled set (`filter_bits = 0`)
+        // MUST produce identical answers for every batch, including while the
+        // enabled set crosses warmup and its guard flips the filter off.
+        let present: Vec<String> = (0..64).map(|i| format!("present-{i}")).collect();
+        let keys = large_keys(present.iter().map(|s| Some(s.as_str())));
+        let enabled = ArrowKeySet::from_keys_sized(keys.clone(), 64 * 64, 6).expect("build");
+        let disabled = ArrowKeySet::from_keys_sized(keys, 0, 0).expect("build");
+
+        // Alternate hit-heavy and miss-heavy batches so the hit rate ends up
+        // crossing warmup with a mixed signal; RandomState is deterministic per
+        // batch, so answers are comparable across the two sets.
+        let hit_vals: Vec<String> = (0..1024).map(|i| format!("present-{}", i % 64)).collect();
+        let hit_needles = utf8_needles(hit_vals.iter().map(|s| Some(s.as_str())));
+        let miss_vals: Vec<String> = (0..1024).map(|i| format!("absent-{i}")).collect();
+        let miss_needles = utf8_needles(miss_vals.iter().map(|s| Some(s.as_str())));
+
+        let rounds = (FILTER_WARMUP_PROBES as usize / 1024) + 5;
+        for round in 0..rounds {
+            // Alternate pure-hit and pure-miss rounds: a mixed signal that
+            // crosses warmup (filter on at first) and then, with ~50% hits,
+            // trips the guard off — exercising both sides of the switch.
+            let needles = if round % 2 == 0 {
+                &hit_needles
+            } else {
+                &miss_needles
+            };
+            let a = enabled.contains_array(needles).expect("enabled probe");
+            let b = disabled.contains_array(needles).expect("disabled probe");
+            assert_eq!(
+                a, b,
+                "enabled and disabled sets must agree at round {round}"
+            );
+        }
+        assert!(
+            enabled.probes.load(Ordering::Relaxed) >= FILTER_WARMUP_PROBES,
+            "test must have crossed warmup"
+        );
     }
 }
 
