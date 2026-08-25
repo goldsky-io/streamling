@@ -1968,13 +1968,11 @@ impl Streamling {
                     let effective_batch_size = batch_size.unwrap_or(clickhouse_config.batch_size);
                     let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
                         Some(d) => d,
-                        None => humantime::parse_duration(&clickhouse_config.batch_flush_interval)
-                            .streamling_with_context(|| {
-                                format!(
-                                    "invalid clickhouse batch_flush_interval '{}' resolved for sink '{}'",
-                                    clickhouse_config.batch_flush_interval, reference_name
-                                )
-                            })?,
+                        // Already validated at AppConfig load, so this only
+                        // fires if the config was constructed some other way.
+                        None => clickhouse_config
+                            .parsed_batch_flush_interval()
+                            .map_err(|e| streamling_user_err!("{}: {e:#}", ctx.format()))?,
                     });
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),

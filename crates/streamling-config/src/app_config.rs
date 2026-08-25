@@ -7,6 +7,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Formatter;
+use std::time::Duration;
 
 fn default_sslmode() -> String {
     "require".to_string()
@@ -443,6 +444,9 @@ pub struct ClickHouseSourceConfig {
 /// Global defaults for every ClickHouse sink in the pipeline. Connection fields
 /// are flattened, so `clickhouse_sink.url` / `STREAMLING__CLICKHOUSE_SINK__URL`
 /// keep working unchanged.
+///
+/// `deny_unknown_fields` is deliberately absent: serde rejects it alongside
+/// `flatten`, since the flattened struct is what consumes the "unknown" keys.
 #[derive(Clone, Deserialize)]
 pub struct ClickHouseSinkConfig {
     #[serde(flatten)]
@@ -458,6 +462,23 @@ pub struct ClickHouseSinkConfig {
     /// low-volume pipelines that would never fill a `batch_size` batch.
     /// Override with `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL`.
     pub batch_flush_interval: String,
+}
+
+impl ClickHouseSinkConfig {
+    /// Parses `batch_flush_interval` into a `Duration`.
+    ///
+    /// Called during `AppConfig` load so a malformed value (typically a typo in
+    /// `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL`) fails startup with a
+    /// clear message, instead of surviving until the first ClickHouse sink is
+    /// planned.
+    pub fn parsed_batch_flush_interval(&self) -> anyhow::Result<Duration> {
+        humantime::parse_duration(&self.batch_flush_interval).with_context(|| {
+            format!(
+                "clickhouse_sink.batch_flush_interval must be a duration like \"1s\" or \"500ms\", got '{}'",
+                self.batch_flush_interval
+            )
+        })
+    }
 }
 
 impl std::fmt::Debug for ClickHouseSinkConfig {
@@ -944,6 +965,7 @@ impl AppConfig {
             .state_backend
             .validate()
             .context("invalid state backend configuration")?;
+        app_config.clickhouse_sink.parsed_batch_flush_interval()?;
         Ok(app_config.apply_env_overrides())
     }
 
@@ -1230,6 +1252,41 @@ mod tests {
         let config = result.expect("test body panicked");
         assert_eq!(config.clickhouse_sink.batch_size, 250_000);
         assert_eq!(config.clickhouse_sink.batch_flush_interval, "500ms");
+    }
+
+    /// A typo in the interval env var must fail startup, not survive until the
+    /// first ClickHouse sink is planned (which for a job-mode backfill can be
+    /// minutes of source setup later).
+    #[test]
+    fn clickhouse_sink_rejects_unparseable_batch_flush_interval_at_load() {
+        let _guard = env_guard();
+
+        let name = "STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL";
+        let previous = std::env::var(name).ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var(name, "1 fortnight");
+        }
+
+        let result = std::panic::catch_unwind(AppConfig::load);
+
+        // SAFETY: see above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let err = result
+            .expect("test body panicked")
+            .expect_err("an unparseable batch_flush_interval must fail the load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("batch_flush_interval") && rendered.contains("1 fortnight"),
+            "the error must name the field and the offending value, got: {rendered}"
+        );
     }
 
     /// Verifies the full path: STREAMLING__HTTP_SECRET_HEADER__* and STREAMLING__HTTP_SECRET_VALUE__* env

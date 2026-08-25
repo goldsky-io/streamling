@@ -31,7 +31,7 @@ thiserror.workspace = true
 # Utilities
 percent-encoding.workspace = true
 async-trait.workspace = true
+humantime.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
-humantime = { workspace = true }
