@@ -3158,6 +3158,10 @@ impl Streamling {
         static WATCHDOG_DEADLINE: OnceLock<std::time::Instant> = OnceLock::new();
         *WATCHDOG_DEADLINE.get_or_init(|| {
             let deadline = std::time::Instant::now() + budget;
+            // Publish it as the process-wide budget clock: every bounded wait
+            // in the engine and in plugin dylibs paces itself by the time left
+            // before this fires.
+            streamling_core::shutdown::set_hard_exit_deadline(deadline);
             let spawn_result = std::thread::Builder::new()
                 .name("shutdown-watchdog".to_string())
                 .spawn(move || {

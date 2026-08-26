@@ -21,25 +21,45 @@ pub use tokio_util::sync::CancellationToken;
 
 static SHUTDOWN: Lazy<watch::Sender<bool>> = Lazy::new(|| watch::channel(false).0);
 
-/// When shutdown was first requested. Drives [`remaining_budget`], so bounded
-/// waits taken late in the drain shrink by however much has already elapsed
-/// instead of each restarting the full budget.
-static REQUESTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// When the watchdog will force the process to exit, once it has been armed.
+/// Drives [`remaining_budget`].
+///
+/// Deliberately keyed on the watchdog and NOT on when shutdown was requested.
+/// Those coincide on the SIGTERM and component-failure paths, where the two
+/// are armed on adjacent lines — but not on every path. A bounded plugin
+/// source calls `request_shutdown()` when its range completes (the lever
+/// `HostShutdownSignal::request_shutdown` exposes across the FFI boundary),
+/// and the watchdog is only armed later, in teardown, after the whole
+/// sink-drain phase. Measured from the request, the budget could therefore
+/// read zero while the process still had its entire drain ahead of it, and
+/// every component pacing a bounded wait by it would give up immediately —
+/// dropping work a live reader would have accepted. Measured from the hard
+/// exit, it means what all its callers already assume: time left before the
+/// process dies.
+static HARD_EXIT_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Request process-wide graceful shutdown. Idempotent.
 pub fn request_shutdown() {
-    let _ = REQUESTED_AT.set(std::time::Instant::now());
     let _ = SHUTDOWN.send(true);
 }
 
-/// How much of the shutdown budget is left: the full budget until shutdown is
-/// requested, then budget minus elapsed, saturating at zero. This mirrors the
-/// watchdog's own clock (armed from the same request), so a component pacing a
-/// wait by this value never outlives the hard exit.
+/// Record when the watchdog will force-exit the process. Idempotent; the first
+/// arming wins, matching the watchdog itself.
+pub fn set_hard_exit_deadline(at: std::time::Instant) {
+    let _ = HARD_EXIT_AT.set(at);
+}
+
+/// How long until the process is force-exited: the full budget until the
+/// watchdog is armed, then the time actually left, saturating at zero.
+///
+/// A component pacing a bounded wait by this value never outlives the hard
+/// exit. Before the watchdog is armed there is no hard exit to pace against,
+/// so the full budget is the honest answer — reporting zero there would make
+/// callers abandon work that had plenty of time to finish.
 pub fn remaining_budget() -> std::time::Duration {
-    match REQUESTED_AT.get() {
+    match HARD_EXIT_AT.get() {
         None => shutdown_budget(),
-        Some(at) => shutdown_budget().saturating_sub(at.elapsed()),
+        Some(at) => at.saturating_duration_since(std::time::Instant::now()),
     }
 }
 
