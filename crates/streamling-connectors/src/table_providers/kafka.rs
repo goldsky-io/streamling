@@ -55,6 +55,7 @@ use streamling_core::operators::projection::StreamingProjectionExec;
 use streamling_core::schema::arrow_schema_from_type_map;
 use streamling_core::session::SessionManager;
 use streamling_core::topology::SchemaIdOverride;
+use streamling_state::StateBackendErrorKind;
 use streamling_state::StateKey;
 use streamling_state::StateOperatorBackend;
 
@@ -946,17 +947,41 @@ impl KafkaSourceExec {
                         let mut retry_shutdown = streamling_core::shutdown::subscribe();
                         let persisted = tokio::time::timeout(
                             state_put_timeout,
-                            streamling_core::retry::retry_forever_with_backoff_until_cancelled(
+                            streamling_core::retry::retry_if_retriable_until_cancelled(
                                 || {
                                     let entries = entries.clone();
                                     let backend = state_backend.clone();
                                     async move {
                                         backend.put_many(entries).await.map_err(|e| {
-                                            streamling_err!(
-                                                "saving {} partition offset(s) to state backend: {:?}",
-                                                partition_count,
-                                                e
-                                            )
+                                            let kind = e.kind();
+                                            let msg = format!(
+                                                "saving {partition_count} partition offset(s) to state backend: {e:?}"
+                                            );
+                                            match kind {
+                                                // The backend is there but not
+                                                // answering right now — a
+                                                // failover, a pool timeout, a
+                                                // brief partition. Worth
+                                                // riding out; that is the
+                                                // whole point of retrying
+                                                // here.
+                                                StateBackendErrorKind::Connection
+                                                | StateBackendErrorKind::Query => {
+                                                    StreamlingError::retriable(msg)
+                                                }
+                                                // Schema, credentials, a value
+                                                // that will not serialize:
+                                                // waiting cannot fix these.
+                                                // Retrying them would burn the
+                                                // caller's whole bound on
+                                                // every finalize and then
+                                                // report a config error as an
+                                                // outage.
+                                                StateBackendErrorKind::Initialization
+                                                | StateBackendErrorKind::Serialization => {
+                                                    streamling_err!("{}", msg)
+                                                }
+                                            }
                                         })
                                     }
                                 },
@@ -966,13 +991,10 @@ impl KafkaSourceExec {
                         )
                         .await;
                         match persisted {
-                            Ok(streamling_core::retry::RetryOutcome::Completed) => {}
-                            Ok(streamling_core::retry::RetryOutcome::Cancelled) => {
-                                return Err(streamling_err!(
-                                    "state backend did not persist {} partition offset(s) before shutdown; offsets stay uncommitted (tail replays on restart)",
-                                    partition_count
-                                ));
-                            }
+                            // Carries the real cause, whether it gave up
+                            // because the error was permanent or because a
+                            // drain cut the retries short.
+                            Ok(res) => res?,
                             Err(_elapsed) => {
                                 return Err(streamling_err!(
                                     "state backend did not persist {} partition offset(s) within {:?} — backend unreachable or wedged; offsets stay uncommitted (tail replays on restart)",

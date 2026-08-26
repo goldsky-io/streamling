@@ -1,26 +1,28 @@
-//! Pins the two properties the Kafka source's offset-persistence retry relies
-//! on, because they pull in opposite directions and a change to either would
-//! be silent.
+//! Pins the three properties the Kafka source's offset-persistence retry
+//! relies on. They pull against each other, and a regression in any one of
+//! them is silent.
 //!
-//! The mid-flight checkpoint commit does not retry at its own call site: its
-//! `?` propagates, the stream tears down, and the pipeline restarts. So a blip
-//! long enough to fail one state-backend acquire — a failover, a connection
-//! storm, a brief partition — would restart an otherwise healthy pipeline. The
-//! commit therefore retries *inside*, and relies on:
+//! The mid-flight checkpoint commit does not retry at its call site: the `?`
+//! propagates, the stream tears down, and the pipeline restarts. That is the
+//! intended answer to a backend that is genuinely gone — the call passes a 60s
+//! bound and says so. It is the wrong answer to a backend that blipped. So the
+//! commit retries *inside* that bound, and depends on:
 //!
-//! 1. **Steady state: retry.** Not shutting down, a transient failure must be
-//!    ridden out rather than propagated. The caller's own 60s bound is what
-//!    defines giving up ("a backend gone THAT long should restart the
-//!    pipeline"); everything shorter should survive.
-//! 2. **Draining: exactly one attempt.** The helper must attempt BEFORE it
-//!    consults the signal, so a drain still tries to commit the tail — but
+//! 1. **Transient failure, running: retry.** A failover, a pool timeout, a
+//!    brief partition must be ridden out rather than propagated. Propagating
+//!    is what restarts a healthy pipeline.
+//! 2. **Permanent failure, running: do not retry.** Schema, credentials, a
+//!    value that will not serialize — waiting cannot fix these. Retrying would
+//!    burn the caller's whole bound on every finalize and then report a config
+//!    error as an outage.
+//! 3. **Draining: attempt exactly once.** The helper must attempt BEFORE it
+//!    consults the signal, so a drain still tries to commit its tail — but
 //!    must not then retry, because the drain budget is not there to be spent
-//!    on a backend that is already down. The failure has to surface at once so
-//!    the terminal caller can report the tail as uncommitted.
+//!    on a backend that is already down.
 //!
-//! If (2) regressed to "check the signal first", a drain would stop committing
-//! its tail at all. If it regressed to "keep retrying", a dead backend would
-//! eat the shutdown budget — the original wedge.
+//! If (3) regressed to "check the signal first", a drain would stop committing
+//! tails at all. If it regressed to "keep retrying", a dead backend would eat
+//! the shutdown budget — the original wedge.
 //!
 //! Lives in `tests/` (its own process): the shutdown signal is a one-way
 //! process-global, so flipping it here cannot contaminate the crate's other
@@ -29,41 +31,42 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
+use streamling_core::error::StreamlingError;
+use streamling_core::retry::retry_if_retriable_until_cancelled;
 use streamling_core::{shutdown, streamling_err};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transient_failures_are_ridden_out_but_a_drain_attempts_exactly_once() {
-    // ---- 1. steady state: a transient failure must not propagate ----
+async fn retries_transient_not_permanent_and_attempts_once_while_draining() {
     assert!(
         !*shutdown::subscribe().borrow(),
         "precondition: this test must start before any shutdown request"
     );
 
+    // ---- 1. transient failure while running: ridden out ----
     let attempts = Arc::new(AtomicU32::new(0));
     let mut rx = shutdown::subscribe();
-    let outcome = retry_forever_with_backoff_until_cancelled(
+    let result: Result<(), _> = retry_if_retriable_until_cancelled(
         || {
             let attempts = attempts.clone();
             async move {
-                // Fail twice, then succeed — a backend that blipped and came
-                // back, which is the case that must not restart a pipeline.
+                // Fails twice then succeeds: a backend that blipped and came
+                // back, which must not restart a pipeline.
                 if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-                    Err(streamling_err!("transient backend failure"))
+                    Err(StreamlingError::retriable("transient backend failure"))
                 } else {
                     Ok(())
                 }
             }
         },
-        "state-backend offset persistence (test)",
+        "state-backend offset persistence (transient)",
         &mut rx,
     )
     .await;
 
     assert!(
-        matches!(outcome, RetryOutcome::Completed),
+        result.is_ok(),
         "a transient state-backend failure must be ridden out, not propagated: propagating \
-         is what restarts a healthy pipeline. Got {outcome:?}"
+         is what restarts a healthy pipeline. Got {result:?}"
     );
     assert_eq!(
         attempts.load(Ordering::SeqCst),
@@ -71,7 +74,40 @@ async fn transient_failures_are_ridden_out_but_a_drain_attempts_exactly_once() {
         "expected two failures then a success"
     );
 
-    // ---- 2. draining: attempt once, then give up immediately ----
+    // ---- 2. permanent failure while running: surfaced at once ----
+    let attempts = Arc::new(AtomicU32::new(0));
+    let mut rx = shutdown::subscribe();
+    let started = std::time::Instant::now();
+    let result: Result<(), _> = retry_if_retriable_until_cancelled(
+        || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(streamling_err!("schema is wrong; waiting will not fix it"))
+            }
+        },
+        "state-backend offset persistence (permanent)",
+        &mut rx,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a permanent failure must surface, not loop"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a permanent error must not be retried: retrying it burns the caller's entire bound \
+         on every finalize and then misreports a config error as a backend outage"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "a permanent failure must surface immediately, not after backoff; took {elapsed:?}"
+    );
+
+    // ---- 3. draining: attempt once, then give up ----
     shutdown::request_shutdown();
     assert!(
         *shutdown::subscribe().borrow(),
@@ -81,30 +117,31 @@ async fn transient_failures_are_ridden_out_but_a_drain_attempts_exactly_once() {
     let attempts = Arc::new(AtomicU32::new(0));
     let mut rx = shutdown::subscribe();
     let started = std::time::Instant::now();
-    let outcome = retry_forever_with_backoff_until_cancelled(
+    let result: Result<(), _> = retry_if_retriable_until_cancelled(
         || {
             let attempts = attempts.clone();
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(streamling_err!("backend is down"))
+                // Retriable on purpose: without the drain this would loop.
+                Err::<(), _>(StreamlingError::retriable("backend is down"))
             }
         },
-        "state-backend offset persistence (test, draining)",
+        "state-backend offset persistence (draining)",
         &mut rx,
     )
     .await;
     let elapsed = started.elapsed();
 
     assert!(
-        matches!(outcome, RetryOutcome::Cancelled),
-        "a failing write during a drain must give up, not retry. Got {outcome:?}"
+        result.is_err(),
+        "a failing write during a drain must give up, not retry. Got {result:?}"
     );
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         1,
-        "the drain must still ATTEMPT the commit exactly once — zero attempts means a \
-         drain stops committing its tail at all; more than one means a dead backend eats \
-         the shutdown budget, which is the wedge this bound exists to prevent"
+        "the drain must still ATTEMPT the commit exactly once — zero attempts means a drain \
+         stops committing its tail at all; more than one means a dead backend eats the \
+         shutdown budget, which is the wedge this bound exists to prevent"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(2),
