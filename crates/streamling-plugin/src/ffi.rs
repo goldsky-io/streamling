@@ -382,6 +382,39 @@ pub struct PluginChannel {
     pub receiver: RReceiver<PluginMsg_NE>,
 }
 
+/// Budget left untouched when a control-message send gives up, so the host
+/// still has time to notice the dispatcher exited and drain it.
+const DRAIN_SEND_RESERVE: Duration = Duration::from_secs(2);
+
+/// Retry policy for control-message sends (source completion, checkpoint
+/// marker/finalizer/ack).
+///
+/// While the pipeline is running a full channel is ordinary backpressure and
+/// the host is still reading, so retry indefinitely — giving up there would
+/// drop a checkpoint message for no reason.
+///
+/// Once a drain starts that stops being true. The host's source forwarder
+/// stops reading this channel for good after it has forwarded the batches it
+/// snapshotted, so a retry against a full channel can never succeed. Without a
+/// bound the dispatcher spins at 50ms forever, `start()` never returns, and the
+/// host's plugin drain waits out its whole budget on a dispatcher that has
+/// nothing left to do — reporting it as unflushed when in fact it had already
+/// flushed.
+///
+/// This bounds the *wait*, not the outcome. Callers treat the resulting error
+/// as a failed best-effort send, and every checkpoint path that can surface it
+/// leaves the epoch unacked — so offsets stay uncommitted and the tail replays
+/// rather than being falsely reported durable.
+fn stop_retrying_once_the_drain_needs_us_gone()
+-> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+    Box::pin(async move {
+        if !crate::shutdown::is_shutting_down() {
+            return true;
+        }
+        crate::shutdown::remaining_budget() > DRAIN_SEND_RESERVE
+    })
+}
+
 impl PluginChannel {
     pub fn new(channels: (RSender<PluginMsg_NE>, RReceiver<PluginMsg_NE>)) -> Self {
         let (sender, receiver) = channels;
@@ -401,7 +434,7 @@ impl PluginChannel {
             runtime,
             op_name,
             create_payload,
-            None::<fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>>,
+            Some(stop_retrying_once_the_drain_needs_us_gone),
             Duration::from_millis(50),
         )
         .await
