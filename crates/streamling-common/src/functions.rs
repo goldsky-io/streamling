@@ -21,6 +21,7 @@ use crate::functions::json_objects_to_clickhouse_tuples::JsonObjectsToClickhouse
 use crate::functions::keccak256::Keccak256Func;
 use crate::functions::now::VolatileNowFunc;
 use crate::functions::split_string_to_array::SplitStringToArrayFunc;
+use crate::functions::to_base58::ToBase58Func;
 use crate::functions::to_large_list::ToLargeListFunc;
 use crate::functions::u256_ops::{
     ToU256Func, U256AddFunc, U256DivFunc, U256ModFunc, U256MulFunc, U256SubFunc, U256ToStringFunc,
@@ -51,6 +52,7 @@ pub mod json_string;
 pub mod keccak256;
 pub mod now;
 pub mod split_string_to_array;
+pub mod to_base58;
 pub mod to_large_list;
 pub mod u256_ops;
 pub mod util;
@@ -84,6 +86,7 @@ impl CommonFunctions {
             create_from_base58_udf(),
             ScalarUDF::from(HexToByteFunc::new()),
             ScalarUDF::from(ByteToHexFunc::new()),
+            ScalarUDF::from(ToBase58Func::new()),
             ScalarUDF::from(ReverseBytes32Func::new()),
             create_gs_map_to_array_struct_udf(),
             // U256 functions
