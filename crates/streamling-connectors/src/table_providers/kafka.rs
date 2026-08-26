@@ -915,29 +915,64 @@ impl KafkaSourceExec {
                                 )
                             })
                             .collect();
-                        // Bounded: an unreachable backend leaves sqlx in its
-                        // own connect-retry loop and this await never
-                        // resolves — observed on shutdown as the terminal
-                        // commit silently eating the ENTIRE budget until the
-                        // watchdog force-exits, with nothing in the log naming
-                        // the cause (only a sqlx pool WARN). The timeout turns
-                        // that into the ordinary error path, which the callers
-                        // already handle truthfully (terminal: "failed to
-                        // commit ... tail replays"; mid-flight: stream
-                        // teardown naming the backend).
-                        match tokio::time::timeout(
+                        // Retried, and bounded around the retry.
+                        //
+                        // Bounded because an unreachable backend leaves sqlx
+                        // in its own connect-retry loop — observed on shutdown
+                        // as the terminal commit silently eating the ENTIRE
+                        // budget until the watchdog force-exits, with nothing
+                        // in the log naming the cause (only a sqlx pool WARN).
+                        // The timeout turns that into the ordinary error path,
+                        // which the callers already handle truthfully
+                        // (terminal: "failed to commit ... tail replays";
+                        // mid-flight: stream teardown naming the backend).
+                        //
+                        // Retried because the mid-flight caller does NOT
+                        // retry: its `?` propagates, the stream tears down and
+                        // the pipeline restarts. Without a retry here, any
+                        // blip long enough to fail one acquire — a failover, a
+                        // connection storm, a brief partition — restarts an
+                        // otherwise healthy pipeline. That caller's own bound
+                        // says what it means to give up: a backend gone for
+                        // 60s. Riding out everything shorter is the intent.
+                        //
+                        // The two compose without conflicting because the
+                        // retry helper attempts BEFORE consulting the signal.
+                        // In steady state that means retry-with-backoff until
+                        // the caller's bound expires; during a drain the
+                        // signal is already set, so it attempts exactly once
+                        // and the failure surfaces immediately — no drain
+                        // budget is spent retrying a backend that is down.
+                        let mut retry_shutdown = streamling_core::shutdown::subscribe();
+                        let persisted = tokio::time::timeout(
                             state_put_timeout,
-                            state_backend.put_many(entries),
+                            streamling_core::retry::retry_forever_with_backoff_until_cancelled(
+                                || {
+                                    let entries = entries.clone();
+                                    let backend = state_backend.clone();
+                                    async move {
+                                        backend.put_many(entries).await.map_err(|e| {
+                                            streamling_err!(
+                                                "saving {} partition offset(s) to state backend: {:?}",
+                                                partition_count,
+                                                e
+                                            )
+                                        })
+                                    }
+                                },
+                                "state-backend offset persistence",
+                                &mut retry_shutdown,
+                            ),
                         )
-                        .await
-                        {
-                            Ok(res) => res.map_err(|e| {
-                                streamling_err!(
-                                    "saving {} partition offset(s) to state backend: {:?}",
-                                    partition_count,
-                                    e
-                                )
-                            })?,
+                        .await;
+                        match persisted {
+                            Ok(streamling_core::retry::RetryOutcome::Completed) => {}
+                            Ok(streamling_core::retry::RetryOutcome::Cancelled) => {
+                                return Err(streamling_err!(
+                                    "state backend did not persist {} partition offset(s) before shutdown; offsets stay uncommitted (tail replays on restart)",
+                                    partition_count
+                                ));
+                            }
                             Err(_elapsed) => {
                                 return Err(streamling_err!(
                                     "state backend did not persist {} partition offset(s) within {:?} — backend unreachable or wedged; offsets stay uncommitted (tail replays on restart)",
