@@ -235,6 +235,24 @@ mod tests {
         assert!(out.value(2));
         assert!(!out.value(3));
     }
+    #[test]
+    fn extend_from_makes_new_keys_immediately_visible() {
+        // Property the append-path cache update relies on: after `extend_from`,
+        // probes see the new keys with no intermediate step.
+        let mut set = ArrowKeySet::from_keys(large_keys([Some("existing")])).expect("build");
+        set.extend_from(large_keys([Some("just-appended")]))
+            .expect("extend");
+        let out = set
+            .contains_array(&utf8_needles([
+                Some("existing"),
+                Some("just-appended"),
+                Some("missing"),
+            ]))
+            .expect("probe");
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(!out.value(2));
+    }
 
     #[test]
     fn duplicates_do_not_grow_distinct_len() {

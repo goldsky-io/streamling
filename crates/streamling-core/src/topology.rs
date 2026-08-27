@@ -488,6 +488,15 @@ pub struct DynamicTableTransform {
     pub schema: Option<String>,
     pub column: Option<String>,
     pub time_column: Option<String>,
+    /// How long to trust the in-memory cache before re-checking the table's
+    /// freshness (`SELECT MAX(<time_column>)`). `0` (the default) re-checks on
+    /// every batch, which is one database round trip per batch.
+    ///
+    /// Raising this trades staleness for round trips: lookups may miss rows
+    /// written by OTHER writers for up to this long. This pipeline's own writes
+    /// stay visible immediately (see `append`).
+    #[serde(default)]
+    pub cache_refresh_debounce_ms: Option<u64>,
     pub telemetry: Option<Telemetry>,
 }
 

@@ -625,6 +625,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("dynamic_table1".to_string(), dynamic_table1);
@@ -636,6 +637,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("dynamic_table2".to_string(), dynamic_table2);
@@ -663,6 +665,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             });
         transforms.insert("independent_dynamic".to_string(), independent_dynamic);
@@ -712,6 +715,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("filtered_market".to_string(), filtered_market);
@@ -1184,6 +1188,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("hot_wallets".to_string(), dt);

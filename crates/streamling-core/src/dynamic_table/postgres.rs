@@ -15,6 +15,7 @@ use sqlx::{Executor, PgPool, Postgres};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use streamling_config::app_config::PostgresDynamicTableBackendConfig;
 use tokio::sync::{OnceCell, RwLock};
@@ -168,6 +169,7 @@ impl PostgresDynamicTableBackendFactory {
         column: Option<String>,
         time_column: Option<String>,
         max_batch_size: usize,
+        cache_refresh_debounce_ms: u64,
     ) -> Result<PostgresDynamicTableBackend, DynamicTableBackendError> {
         debug!(
             "Creating dynamic table backend: entity={}, schema={:?}, column={:?}, time_column={:?}",
@@ -222,6 +224,7 @@ impl PostgresDynamicTableBackendFactory {
             column_name,
             time_column,
             max_batch_size,
+            cache_refresh_debounce_ms,
         ))
     }
 }
@@ -257,6 +260,12 @@ pub struct PostgresDynamicTableBackend {
     time_column_name: String,
     cache: Option<RwLock<Option<PostgresDynamicTableCache>>>,
     max_batch_size: usize,
+    /// Debounce window for the freshness check; 0 disables debouncing.
+    cache_refresh_debounce_ms: u64,
+    /// Monotonic base for the debounce clock.
+    created_at: Instant,
+    /// Millis since `created_at` at the last freshness check.
+    last_freshness_check_ms: AtomicU64,
 }
 
 impl PostgresDynamicTableBackend {
@@ -268,6 +277,7 @@ impl PostgresDynamicTableBackend {
         column_name: String,
         time_column_name: Option<String>,
         max_batch_size: usize,
+        cache_refresh_debounce_ms: u64,
     ) -> Self {
         let cache_enabled = config.cache_enabled && time_column_name.is_some();
         debug!(
@@ -289,6 +299,9 @@ impl PostgresDynamicTableBackend {
             time_column_name,
             cache,
             max_batch_size,
+            cache_refresh_debounce_ms,
+            created_at: Instant::now(),
+            last_freshness_check_ms: AtomicU64::new(0),
         }
     }
 
@@ -433,6 +446,17 @@ impl PostgresDynamicTableBackend {
             .cache
             .as_ref()
             .expect("cache is present when refresh_cache is called");
+        if self.cache_refresh_debounce_ms > 0 {
+            let now_ms = self.created_at.elapsed().as_millis() as u64;
+            let last = self.last_freshness_check_ms.load(Ordering::Relaxed);
+            // Only debounce once a cache exists — the first load must always run.
+            let populated = cache.read().await.is_some();
+            if populated && now_ms.saturating_sub(last) < self.cache_refresh_debounce_ms {
+                return Ok(());
+            }
+            self.last_freshness_check_ms
+                .store(now_ms, Ordering::Relaxed);
+        }
         let updated_at = self.latest_update(pool.clone()).await;
 
         if let Some(cached) = cache.read().await.as_ref()
@@ -889,7 +913,17 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             return Ok(());
         }
 
-        // Split into batches if exceeding max_batch_size
+        // Keep this pipeline's own writes visible without waiting for the next
+        // freshness check: insert the keys we just committed to postgres into the
+        // cached set. Safe because we only add keys that were just written, so
+        // this can never produce a false positive. `updated_at` is deliberately
+        // left untouched, so the next real refresh still fetches everything since
+        // the old watermark (re-fetching our own rows is idempotent — `extend_from`
+        // dedups).
+        let appended_keys = self
+            .cache
+            .as_ref()
+            .map(|_| LargeStringArray::from_iter(values.iter().map(|v| Some(v.as_str()))));
         if values_len <= self.max_batch_size {
             // Single batch - process directly
             self.append_batch(pool, values).await;
@@ -923,6 +957,22 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             "[append] completed for table name '{}' with {} values",
             self.full_table_name, values_len
         );
+        if let (Some(cache), Some(appended)) = (&self.cache, appended_keys) {
+            let mut cached = cache.write().await;
+            if let Some(current) = cached.as_mut() {
+                let appended_count = appended.len();
+                current
+                    .values
+                    .extend_from(appended)
+                    .map_err(DynamicTableBackendError::Query)?;
+                trace!(
+                    table = %self.full_table_name,
+                    appended = appended_count,
+                    total_entries = current.values.len(),
+                    "Added own appended keys to PostgreSQL dynamic table cache"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -1068,6 +1118,7 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                0,
             )
             .await
             .expect("backend should be valid");
@@ -1076,7 +1127,7 @@ mod tests {
         let enabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
             .expect("factory should be valid");
         let missing_time_column = enabled_factory
-            .create_backend("missing_time_column".to_string(), None, None, None, 1000)
+            .create_backend("missing_time_column".to_string(), None, None, None, 1000, 0)
             .await
             .expect("backend should be valid");
         assert!(missing_time_column.cache.is_none());
@@ -1089,10 +1140,45 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                0,
             )
             .await
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
+    }
+    #[tokio::test]
+    async fn debounce_defaults_to_zero() {
+        let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "debounce_default".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+            )
+            .await
+            .expect("backend should be valid");
+        assert_eq!(backend.cache_refresh_debounce_ms, 0);
+    }
+    #[tokio::test]
+    async fn debounce_config_is_plumbed() {
+        let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "debounce_plumbed".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                5000,
+            )
+            .await
+            .expect("backend should be valid");
+        assert_eq!(backend.cache_refresh_debounce_ms, 5000);
     }
     #[test]
     fn deduplicate_value_indices_removes_duplicates() {

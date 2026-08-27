@@ -1065,6 +1065,7 @@ impl Streamling {
                     let schema = dt.schema.clone();
                     let column = dt.column.clone();
                     let time_column = dt.time_column.clone();
+                    let cache_refresh_debounce_ms = dt.cache_refresh_debounce_ms.unwrap_or(0);
                     let dynamic_table_backend = dynamic_table_backend_factory
                         .create(
                             backend_type,
@@ -1072,6 +1073,7 @@ impl Streamling {
                             schema,
                             column,
                             time_column,
+                            cache_refresh_debounce_ms,
                         )
                         .await
                         .map_err(|e| {

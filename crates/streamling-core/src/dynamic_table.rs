@@ -69,6 +69,7 @@ impl DynamicTableBackendFactory {
         schema: Option<String>,
         column: Option<String>,
         time_column: Option<String>,
+        cache_refresh_debounce_ms: u64,
     ) -> Result<Arc<dyn DynamicTableBackend>, DynamicTableBackendError> {
         let max_batch_size = self.config.max_batch_size.unwrap_or(1000);
         match backend_type {
@@ -78,6 +79,7 @@ impl DynamicTableBackendFactory {
                 column,
                 time_column,
                 max_batch_size,
+                // InMemory has no freshness-check cache; the debounce window does not apply.
             ))),
             DynamicTableBackendType::Postgres => {
                 let postgres_config = self.config.postgres.clone().ok_or_else(|| {
@@ -97,6 +99,7 @@ impl DynamicTableBackendFactory {
                         column,
                         time_column,
                         max_batch_size,
+                        cache_refresh_debounce_ms,
                     )
                     .await?;
                 Ok(Arc::new(backend))
@@ -544,6 +547,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
         );
@@ -557,6 +561,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
         );
@@ -570,6 +575,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
         );
