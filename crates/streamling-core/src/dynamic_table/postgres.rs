@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use streamling_config::app_config::PostgresDynamicTableBackendConfig;
 use tokio::sync::{OnceCell, RwLock};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
 const DEFAULT_SCHEMA_NAME: &str = "streamling";
@@ -284,6 +284,13 @@ impl PostgresDynamicTableBackend {
     ) -> Self {
         let cache_enabled =
             cache_enabled_override.unwrap_or(config.cache_enabled) && time_column_name.is_some();
+        if cache_refresh_debounce_ms > 0 {
+            warn!(
+                table = %full_table_name,
+                cache_refresh_debounce_ms,
+                "Cache freshness-check debounce is active: rows written by OTHER writers may be missed for up to this long; this pipeline's own writes stay visible"
+            );
+        }
         debug!(
             table = %full_table_name,
             cache_enabled,

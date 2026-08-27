@@ -47,7 +47,7 @@ impl ArrowKeySet {
         let start = self.keys.len();
         // `concat` is append-only: existing indices stay valid, so incremental
         // refresh only needs to hash/insert the newly appended slice — no full rebuild.
-        // ponytail: concat copies the whole key buffer, so a refresh is O(total bytes).
+        // NOTE: concat copies the whole key buffer, so a refresh is O(total bytes).
         // Fine while refreshes are rare (the read-mostly case this set exists for); if
         // they get frequent, keep a Vec of chunks and pack (chunk, row) into the index.
         let concatenated =
@@ -118,7 +118,7 @@ impl ArrowKeySet {
             }
             let hash = hashes[idx];
             let key = keys.value(idx);
-            // ponytail: u32 indices cap the set at ~4.3B keys; widen to u64 if that is ever near.
+            // NOTE: u32 indices cap the set at ~4.3B keys; widen to u64 if that is ever near.
             let idx_u32 = u32::try_from(idx)
                 .map_err(|_| format!("ArrowKeySet exceeded u32::MAX keys at index {idx}"))?;
 

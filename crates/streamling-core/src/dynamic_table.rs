@@ -65,6 +65,16 @@ impl DynamicTableBackendFactory {
 }
 
 impl DynamicTableBackendFactory {
+    /// Creates a backend instance for a single dynamic table.
+    ///
+    /// Parameter precedence: `cache_refresh_debounce_ms_override` wins when
+    /// `Some`; `None` falls back to the global
+    /// `dynamic_table_backend.postgres.cache_refresh_debounce_ms`, which itself
+    /// defaults to 0 (re-check freshness on every batch). Likewise
+    /// `cache_enabled_override` wins when `Some`; `None` falls back to the
+    /// global `cache_enabled`. Note that caching additionally requires a
+    /// `time_column`; without one the cache is disabled regardless of either
+    /// setting.
     pub async fn create(
         &self,
         backend_type: DynamicTableBackendType,
