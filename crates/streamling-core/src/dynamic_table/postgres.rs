@@ -818,7 +818,8 @@ impl PostgresDynamicTableBackend {
                         .rsplit_once('.')
                         .map(|(_, table)| table)
                         .unwrap_or(self.full_table_name.as_str());
-                    let index_name = format!("idx_{}_{}", bare_table, self.time_column_name);
+                    let index_name =
+                        build_time_column_index_name(bare_table, &self.time_column_name);
                     let create_index_sql = format!(
                         r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
                         index_name, self.full_table_name, self.time_column_name
@@ -879,6 +880,32 @@ impl PostgresDynamicTableBackend {
             .await
             .cloned()
     }
+}
+
+/// Build the deterministic index name for a dynamic table's time column.
+///
+/// PostgreSQL silently truncates identifiers to `NAMEDATALEN - 1` (63) bytes,
+/// so a naive `idx_{table}_{column}` can collide after truncation — two long
+/// names can truncate to the same identifier, and `CREATE INDEX IF NOT EXISTS`
+/// would then no-op against the wrong index on subsequent startups. When the
+/// name exceeds the limit we keep a readable prefix and append a short, stable
+/// hash of the full name, keeping it unique and under 63 bytes. Identifiers are
+/// ASCII (`[A-Za-z0-9_]`), so byte slicing is always on a char boundary.
+fn build_time_column_index_name(bare_table: &str, time_column: &str) -> String {
+    const MAX_IDENT_BYTES: usize = 63;
+    let raw = format!("idx_{}_{}", bare_table, time_column);
+    if raw.len() <= MAX_IDENT_BYTES {
+        return raw;
+    }
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut hasher);
+        format!("{:08x}", hasher.finish())
+    };
+    // '_' + 8 hex hash chars.
+    let prefix_len = MAX_IDENT_BYTES - 1 - hash.len();
+    format!("{}_{}", &raw[..prefix_len], hash)
 }
 
 /// Remove duplicate values from `(index, value)` pairs, keeping only the first
@@ -1109,6 +1136,32 @@ mod tests {
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
     }
+    #[test]
+    fn build_time_column_index_name_stays_under_limit() {
+        // Short names pass through unchanged.
+        let short = build_time_column_index_name("blocks", "block_timestamp");
+        assert_eq!(short, "idx_blocks_block_timestamp");
+        assert!(short.len() <= 63);
+
+        // Long names are truncated + hash-suffixed to stay under 63 bytes, and
+        // stay deterministic across calls so IF NOT EXISTS is stable at startup.
+        let long_bare_table = "a".repeat(60);
+        let long_col = "updated_at";
+        let name = build_time_column_index_name(&long_bare_table, long_col);
+        assert!(name.len() <= 63);
+        assert_eq!(
+            name,
+            build_time_column_index_name(&long_bare_table, long_col)
+        );
+
+        // Distinct long names produce distinct identifiers (no silent truncation collision).
+        let other = build_time_column_index_name(&"b".repeat(60), long_col);
+        assert_ne!(name, other);
+
+        // The readable `idx_` prefix is preserved for debuggability.
+        assert!(name.starts_with("idx_"));
+    }
+
     #[test]
     fn deduplicate_value_indices_removes_duplicates() {
         let input = vec![
