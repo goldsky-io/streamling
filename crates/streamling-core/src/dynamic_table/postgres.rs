@@ -167,6 +167,7 @@ impl PostgresDynamicTableBackendFactory {
         column: Option<String>,
         time_column: Option<String>,
         max_batch_size: usize,
+        cache_enabled_override: Option<bool>,
     ) -> Result<PostgresDynamicTableBackend, DynamicTableBackendError> {
         debug!(
             "Creating dynamic table backend: entity={}, schema={:?}, column={:?}, time_column={:?}",
@@ -221,6 +222,7 @@ impl PostgresDynamicTableBackendFactory {
             column_name,
             time_column,
             max_batch_size,
+            cache_enabled_override,
         ))
     }
 }
@@ -260,8 +262,10 @@ impl PostgresDynamicTableBackend {
         column_name: String,
         time_column_name: Option<String>,
         max_batch_size: usize,
+        cache_enabled_override: Option<bool>,
     ) -> Self {
-        let cache_enabled = config.cache_enabled && time_column_name.is_some();
+        let cache_enabled =
+            cache_enabled_override.unwrap_or(config.cache_enabled) && time_column_name.is_some();
         debug!(
             table = %full_table_name,
             cache_enabled,
@@ -1110,6 +1114,7 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                None,
             )
             .await
             .expect("backend should be valid");
@@ -1118,7 +1123,14 @@ mod tests {
         let enabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
             .expect("factory should be valid");
         let missing_time_column = enabled_factory
-            .create_backend("missing_time_column".to_string(), None, None, None, 1000)
+            .create_backend(
+                "missing_time_column".to_string(),
+                None,
+                None,
+                None,
+                1000,
+                None,
+            )
             .await
             .expect("backend should be valid");
         assert!(missing_time_column.cache.is_none());
@@ -1131,10 +1143,72 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                None,
             )
             .await
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn cache_resolution_falls_back_to_global_unless_overridden() {
+        // Topology override wins over the global flag.
+        let global_off = PostgresDynamicTableBackendFactory::new(postgres_config(false))
+            .expect("factory should be valid");
+        let forced_on = global_off
+            .create_backend(
+                "forced_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                Some(true),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_on.cache.is_some());
+
+        let global_on = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let forced_off = global_on
+            .create_backend(
+                "forced_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                Some(false),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_off.cache.is_none());
+
+        // No override: falls back to the global flag.
+        let defaulted_on = global_on
+            .create_backend(
+                "defaulted_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_on.cache.is_some());
+
+        let defaulted_off = global_off
+            .create_backend(
+                "defaulted_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_off.cache.is_none());
     }
     #[test]
     fn build_time_column_index_name_stays_under_limit() {
