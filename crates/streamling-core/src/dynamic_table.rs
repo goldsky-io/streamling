@@ -49,6 +49,9 @@ impl From<DynamicTableBackendError> for crate::error::StreamlingError {
 pub trait DynamicTableBackend: Debug + Sync + Send {
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError>;
     async fn contains(&self, values: ArrayRef) -> Result<ArrayRef, DynamicTableBackendError>;
+
+    /// Downcast support (e.g. to inspect backend-specific configuration in tests).
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub struct DynamicTableBackendFactory {
@@ -69,7 +72,8 @@ impl DynamicTableBackendFactory {
         schema: Option<String>,
         column: Option<String>,
         time_column: Option<String>,
-        cache_refresh_debounce_ms: u64,
+        cache_refresh_debounce_ms_override: Option<u64>,
+        cache_enabled_override: Option<bool>,
     ) -> Result<Arc<dyn DynamicTableBackend>, DynamicTableBackendError> {
         let max_batch_size = self.config.max_batch_size.unwrap_or(1000);
         match backend_type {
@@ -88,6 +92,12 @@ impl DynamicTableBackendFactory {
                     )
                 })?;
 
+                // Topology value wins; otherwise fall back to the global
+                // `dynamic_table_backend.postgres.cache_refresh_debounce_ms`
+                // (which itself defaults to 0: re-check on every batch).
+                let cache_refresh_debounce_ms = cache_refresh_debounce_ms_override
+                    .unwrap_or(postgres_config.cache_refresh_debounce_ms.unwrap_or(0));
+
                 // TODO: store the factory somewhere to avoid recreating it each time
                 // Note: new() doesn't connect - connection happens lazily on first use
                 let factory = PostgresDynamicTableBackendFactory::new(postgres_config)?;
@@ -100,6 +110,7 @@ impl DynamicTableBackendFactory {
                         time_column,
                         max_batch_size,
                         cache_refresh_debounce_ms,
+                        cache_enabled_override,
                     )
                     .await?;
                 Ok(Arc::new(backend))
@@ -499,6 +510,88 @@ pub fn extract_string_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn debounce_resolution_prefers_topology_then_global_then_zero() {
+        use streamling_config::app_config::{
+            DynamicTableBackendConfig, DynamicTableBackendType, PostgresDynamicTableBackendConfig,
+        };
+
+        let make_config = |global_ms: Option<u64>| DynamicTableBackendConfig {
+            postgres: Some(PostgresDynamicTableBackendConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                db: "postgres".to_string(),
+                user: "postgres".to_string(),
+                password: "postgres".to_string(),
+                sslmode: "disable".to_string(),
+                max_connections: None,
+                dt_schema_name: None,
+                cache_enabled: false,
+                cache_refresh_debounce_ms: global_ms,
+            }),
+            max_batch_size: None,
+        };
+
+        // Topology value wins over the global default.
+        let factory = DynamicTableBackendFactory::new(make_config(Some(9999)));
+        let backend = factory
+            .create(
+                DynamicTableBackendType::Postgres,
+                "debounce_topology_wins".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                Some(7),
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        let pg = backend
+            .as_any()
+            .downcast_ref::<PostgresDynamicTableBackend>()
+            .expect("postgres backend");
+        assert_eq!(pg.cache_refresh_debounce_ms, 7);
+
+        // No topology value: falls back to the global default.
+        let backend = factory
+            .create(
+                DynamicTableBackendType::Postgres,
+                "debounce_global_fallback".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        let pg = backend
+            .as_any()
+            .downcast_ref::<PostgresDynamicTableBackend>()
+            .expect("postgres backend");
+        assert_eq!(pg.cache_refresh_debounce_ms, 9999);
+
+        // Neither set: 0 (re-check on every batch).
+        let factory = DynamicTableBackendFactory::new(make_config(None));
+        let backend = factory
+            .create(
+                DynamicTableBackendType::Postgres,
+                "debounce_zero_default".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        let pg = backend
+            .as_any()
+            .downcast_ref::<PostgresDynamicTableBackend>()
+            .expect("postgres backend");
+        assert_eq!(pg.cache_refresh_debounce_ms, 0);
+    }
     use crate::side_output::SourceSideOutput;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -547,6 +640,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
@@ -561,6 +655,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
@@ -575,6 +670,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),

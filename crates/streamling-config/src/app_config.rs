@@ -162,9 +162,22 @@ pub struct PostgresDynamicTableBackendConfig {
     pub sslmode: String,
     pub max_connections: Option<u32>,
     pub dt_schema_name: Option<String>,
-    /// Enables incremental in-memory caching for dynamic tables that explicitly set `time_column`.
+    /// Global default for incremental in-memory caching of dynamic tables.
+    ///
+    /// Individual `dynamic_table` transforms may override this per topology via
+    /// their `cache` field; when that field is omitted the global value applies.
+    /// Caching is only ever active when the table sets `time_column`.
     #[serde(default)]
     pub cache_enabled: bool,
+    /// Global default for the cache freshness-check debounce window in
+    /// milliseconds (see `cache_refresh_debounce_ms` on dynamic_table
+    /// transforms). Individual transforms override this via their own field;
+    /// when that field is omitted the global value applies. Defaults to 0
+    /// (re-check on every batch). Settable via the
+    /// `STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_REFRESH_DEBOUNCE_MS`
+    /// environment variable.
+    #[serde(default)]
+    pub cache_refresh_debounce_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
@@ -184,6 +197,7 @@ impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
             .field("max_connections", &self.max_connections)
             .field("dt_schema_name", &self.dt_schema_name)
             .field("cache_enabled", &self.cache_enabled)
+            .field("cache_refresh_debounce_ms", &self.cache_refresh_debounce_ms)
             .finish()
     }
 }

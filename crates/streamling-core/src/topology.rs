@@ -488,9 +488,15 @@ pub struct DynamicTableTransform {
     pub schema: Option<String>,
     pub column: Option<String>,
     pub time_column: Option<String>,
+    /// Opt-in caching for this dynamic table. When omitted, falls back to the
+    /// global `dynamic_table_backend.postgres.cache_enabled` config. Caching is
+    /// only ever active when `time_column` is set.
+    #[serde(default)]
+    pub cache: Option<bool>,
     /// How long to trust the in-memory cache before re-checking the table's
-    /// freshness (`SELECT MAX(<time_column>)`). `0` (the default) re-checks on
-    /// every batch, which is one database round trip per batch.
+    /// freshness (`SELECT MAX(<time_column>)`). When omitted, falls back to the
+    /// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms` config
+    /// (which defaults to 0: re-check on every batch, one database round trip).
     ///
     /// Raising this trades staleness for round trips: lookups may miss rows
     /// written by OTHER writers for up to this long. This pipeline's own writes
@@ -1094,6 +1100,67 @@ data_format: avro
 {extra}
 "#
         )
+    }
+
+    #[test]
+    fn dynamic_table_cache_and_debounce_parse_and_default() {
+        // Fields omitted -> None (falls back to global config at runtime).
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  dt_omitted:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    time_column: updated_at
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.transforms.get("dt_omitted").unwrap() {
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, None);
+                assert_eq!(dt.cache_refresh_debounce_ms, None);
+            }
+            _ => panic!("expected dynamic_table transform"),
+        }
+
+        // Explicit topology-level values are preserved.
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  dt_on:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    time_column: updated_at
+    cache: true
+    cache_refresh_debounce_ms: 5000
+  dt_off:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl2
+    time_column: updated_at
+    cache: false
+    cache_refresh_debounce_ms: 0
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.transforms.get("dt_on").unwrap() {
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, Some(true));
+                assert_eq!(dt.cache_refresh_debounce_ms, Some(5000));
+            }
+            _ => panic!("expected dynamic_table transform"),
+        }
+        match topology.transforms.get("dt_off").unwrap() {
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, Some(false));
+                assert_eq!(dt.cache_refresh_debounce_ms, Some(0));
+            }
+            _ => panic!("expected dynamic_table transform"),
+        }
     }
 
     #[test]

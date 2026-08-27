@@ -170,6 +170,7 @@ impl PostgresDynamicTableBackendFactory {
         time_column: Option<String>,
         max_batch_size: usize,
         cache_refresh_debounce_ms: u64,
+        cache_enabled_override: Option<bool>,
     ) -> Result<PostgresDynamicTableBackend, DynamicTableBackendError> {
         debug!(
             "Creating dynamic table backend: entity={}, schema={:?}, column={:?}, time_column={:?}",
@@ -225,6 +226,7 @@ impl PostgresDynamicTableBackendFactory {
             time_column,
             max_batch_size,
             cache_refresh_debounce_ms,
+            cache_enabled_override,
         ))
     }
 }
@@ -261,7 +263,7 @@ pub struct PostgresDynamicTableBackend {
     cache: Option<RwLock<Option<PostgresDynamicTableCache>>>,
     max_batch_size: usize,
     /// Debounce window for the freshness check; 0 disables debouncing.
-    cache_refresh_debounce_ms: u64,
+    pub(crate) cache_refresh_debounce_ms: u64,
     /// Monotonic base for the debounce clock.
     created_at: Instant,
     /// Millis since `created_at` at the last freshness check.
@@ -278,8 +280,10 @@ impl PostgresDynamicTableBackend {
         time_column_name: Option<String>,
         max_batch_size: usize,
         cache_refresh_debounce_ms: u64,
+        cache_enabled_override: Option<bool>,
     ) -> Self {
-        let cache_enabled = config.cache_enabled && time_column_name.is_some();
+        let cache_enabled =
+            cache_enabled_override.unwrap_or(config.cache_enabled) && time_column_name.is_some();
         debug!(
             table = %full_table_name,
             cache_enabled,
@@ -897,6 +901,10 @@ fn deduplicate_value_indices(value_indices: Vec<(usize, String)>) -> Vec<(usize,
 
 #[async_trait]
 impl DynamicTableBackend for PostgresDynamicTableBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError> {
         trace!("append() called for table: {}", self.full_table_name);
         let pool = self.get_pool().await.map_err(|e| {
@@ -1079,6 +1087,7 @@ mod tests {
             max_connections: None,
             dt_schema_name: None,
             cache_enabled,
+            cache_refresh_debounce_ms: None,
         }
     }
 
@@ -1119,6 +1128,7 @@ mod tests {
                 Some("updated_at".to_string()),
                 1000,
                 0,
+                None,
             )
             .await
             .expect("backend should be valid");
@@ -1127,7 +1137,15 @@ mod tests {
         let enabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
             .expect("factory should be valid");
         let missing_time_column = enabled_factory
-            .create_backend("missing_time_column".to_string(), None, None, None, 1000, 0)
+            .create_backend(
+                "missing_time_column".to_string(),
+                None,
+                None,
+                None,
+                1000,
+                0,
+                None,
+            )
             .await
             .expect("backend should be valid");
         assert!(missing_time_column.cache.is_none());
@@ -1141,6 +1159,7 @@ mod tests {
                 Some("updated_at".to_string()),
                 1000,
                 0,
+                None,
             )
             .await
             .expect("backend should be valid");
@@ -1158,6 +1177,7 @@ mod tests {
                 Some("updated_at".to_string()),
                 1000,
                 0,
+                None,
             )
             .await
             .expect("backend should be valid");
@@ -1175,10 +1195,76 @@ mod tests {
                 Some("updated_at".to_string()),
                 1000,
                 5000,
+                None,
             )
             .await
             .expect("backend should be valid");
         assert_eq!(backend.cache_refresh_debounce_ms, 5000);
+    }
+
+    #[tokio::test]
+    async fn cache_resolution_falls_back_to_global_unless_overridden() {
+        // Topology override wins over the global flag.
+        let global_off = PostgresDynamicTableBackendFactory::new(postgres_config(false))
+            .expect("factory should be valid");
+        let forced_on = global_off
+            .create_backend(
+                "forced_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                Some(true),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_on.cache.is_some());
+
+        let global_on = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let forced_off = global_on
+            .create_backend(
+                "forced_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                Some(false),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_off.cache.is_none());
+
+        // No override: falls back to the global flag.
+        let defaulted_on = global_on
+            .create_backend(
+                "defaulted_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_on.cache.is_some());
+
+        let defaulted_off = global_off
+            .create_backend(
+                "defaulted_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_off.cache.is_none());
     }
     #[test]
     fn deduplicate_value_indices_removes_duplicates() {

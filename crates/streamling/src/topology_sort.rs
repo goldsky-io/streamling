@@ -625,6 +625,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
             cache_refresh_debounce_ms: None,
             telemetry: None,
         });
@@ -637,6 +638,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
             cache_refresh_debounce_ms: None,
             telemetry: None,
         });
@@ -665,6 +667,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 cache_refresh_debounce_ms: None,
                 telemetry: None,
             });
@@ -715,6 +718,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
             cache_refresh_debounce_ms: None,
             telemetry: None,
         });
@@ -1188,6 +1192,7 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
             cache_refresh_debounce_ms: None,
             telemetry: None,
         });
