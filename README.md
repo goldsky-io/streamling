@@ -880,6 +880,7 @@ The ClickHouse sink writes records to a ClickHouse table over the HTTP interface
 - **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
 - **Compression**: INSERT request bodies are compressed with zstd by default. gzip and lz4 are also available. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
 - **Deduplication**: each batch is collapsed to the latest row per `primary_key` before writing. Set `deduplicate: false` for append-only tables whose rows are deltas rather than states (e.g. `SummingMergeTree`) — see `Batch Deduplication` below.
+- **Batching**: `batch_size` rows are accumulated per INSERT, flushed early after `batch_flush_interval`. Both are optional per sink and fall back to `clickhouse_sink.batch_size` (100000) and `clickhouse_sink.batch_flush_interval` (`1s`). Larger batches dominate ClickHouse INSERT throughput — 100k rows measured ~12x the rows/s of a 1k batch on row-heavy backfills — so lower them only for latency-sensitive or memory-constrained pipelines. `parallelism` splits each batch into that many concurrent INSERTs of `batch_size / parallelism` rows.
 
 Sample configuration:
 
@@ -903,6 +904,8 @@ sinks:
 | `STREAMLING__CLICKHOUSE_SINK__DATABASE` | `default` | Database name |
 | `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `zstd` | Wire compression for INSERTs (`none`, `gzip`, `zstd`, or `lz4`); the per-sink `compression` field overrides it |
 | `STREAMLING__CLICKHOUSE_SINK__COMPRESSION_LEVEL` | `6` | gzip compression level (0–9); ignored unless compression resolves to `gzip` |
+| `STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE` | `100000` | Rows per INSERT for sinks that omit `batch_size`; the per-sink field overrides it |
+| `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL` | `1s` | Flush interval for sinks that omit `batch_flush_interval`; the per-sink field overrides it |
 
 ## Dynamic Tables
 
