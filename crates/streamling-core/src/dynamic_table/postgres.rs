@@ -445,21 +445,44 @@ impl PostgresDynamicTableBackend {
         .await
     }
 
+    /// Returns true when the caller should run the freshness check now.
+    /// `populated` gates the very first load: only once a cache exists may the
+    /// debounce window suppress a check. The claim is a compare-and-swap on
+    /// `last_freshness_check_ms`, so concurrent callers on the same batch yield
+    /// at most one check per window instead of one per caller.
+    fn try_claim_freshness_window(&self, now_ms: u64, populated: bool) -> bool {
+        if self.cache_refresh_debounce_ms == 0 {
+            return true;
+        }
+        let last = self.last_freshness_check_ms.load(Ordering::Relaxed);
+        // Only debounce once a cache exists — the first load must always run.
+        if populated && now_ms.saturating_sub(last) < self.cache_refresh_debounce_ms {
+            return false;
+        }
+        if populated
+            && self
+                .last_freshness_check_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            // Another caller claimed this window; the populated cache it will
+            // refresh stays valid for our probe.
+            return false;
+        }
+        self.last_freshness_check_ms
+            .store(now_ms, Ordering::Relaxed);
+        true
+    }
+
     async fn refresh_cache(&self, pool: Arc<PgPool>) -> Result<(), DynamicTableBackendError> {
         let cache = self
             .cache
             .as_ref()
             .expect("cache is present when refresh_cache is called");
-        if self.cache_refresh_debounce_ms > 0 {
-            let now_ms = self.created_at.elapsed().as_millis() as u64;
-            let last = self.last_freshness_check_ms.load(Ordering::Relaxed);
-            // Only debounce once a cache exists — the first load must always run.
-            let populated = cache.read().await.is_some();
-            if populated && now_ms.saturating_sub(last) < self.cache_refresh_debounce_ms {
-                return Ok(());
-            }
-            self.last_freshness_check_ms
-                .store(now_ms, Ordering::Relaxed);
+        let populated = cache.read().await.is_some();
+        let now_ms = self.created_at.elapsed().as_millis() as u64;
+        if !self.try_claim_freshness_window(now_ms, populated) {
+            return Ok(());
         }
         let freshness_check_started_at = Instant::now();
         let updated_at = self.latest_update(pool.clone()).await;
@@ -634,9 +657,13 @@ impl PostgresDynamicTableBackend {
         .await
     }
 
-    /// Append a batch of values to the table (internal method that doesn't split batches)
-    /// Retries forever with exponential backoff. Statement timeout prevents individual queries from hanging.
-    /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
+    /// Append a batch of values to the table (internal method that doesn't split
+    /// batches). Retries forever with exponential backoff — it only returns when
+    /// the batch is committed (or the task is torn down), so callers may treat
+    /// its return as commit-success when deciding whether to mirror the keys
+    /// into the in-memory cache. Statement timeout prevents individual queries
+    /// from hanging. Uses Arc to wrap values so retry clones are cheap
+    /// (reference count increment only).
     async fn append_batch(&self, pool: Arc<PgPool>, values: Vec<String>) {
         if values.is_empty() {
             return;
@@ -945,15 +972,26 @@ fn build_time_column_index_name(bare_table: &str, time_column: &str) -> String {
     if raw.len() <= MAX_IDENT_BYTES {
         return raw;
     }
-    let hash = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        raw.hash(&mut hasher);
-        format!("{:08x}", hasher.finish())
-    };
-    // '_' + 8 hex hash chars.
-    let prefix_len = MAX_IDENT_BYTES - 1 - hash.len();
-    format!("{}_{}", &raw[..prefix_len], hash)
+    // FNV-1a rather than std's DefaultHasher: the doc contract below requires
+    // the suffix to be IDENTICAL across restarts and toolchain bumps so
+    // `CREATE INDEX IF NOT EXISTS` stays idempotent, and DefaultHasher makes
+    // no cross-version stability guarantee. FNV-1a is a fixed algorithm.
+    let hash = fnv1a64(raw.as_bytes());
+    // '_' + 16 hex hash chars.
+    let suffix = format!("_{:016x}", hash);
+    let prefix_len = MAX_IDENT_BYTES - suffix.len();
+    format!("{}_{}", &raw[..prefix_len], &suffix[1..])
+}
+
+/// Deterministic FNV-1a 64-bit over the raw name bytes; used only to keep
+/// generated identifier suffixes stable across processes and toolchains.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Remove duplicate values from `(index, value)` pairs, keeping only the first
@@ -993,7 +1031,8 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
         // Keep this pipeline's own writes visible without waiting for the next
         // freshness check: insert the keys we just committed to postgres into the
-        // cached set. Safe because we only add keys that were just written, so
+        // cached set. Safe because `append_batch` retries forever until the batch
+        // commits (see its doc), so any key reaching this point is persisted —
         // this can never produce a false positive. `updated_at` is deliberately
         // left untouched, so the next real refresh still fetches everything since
         // the old watermark (re-fetching our own rows is idempotent — `extend_from`
@@ -1319,6 +1358,51 @@ mod tests {
             .expect("backend should be valid");
         assert_eq!(backend.cache_refresh_debounce_ms, 0);
     }
+
+    #[tokio::test]
+    async fn freshness_window_claim_yields_at_most_one_check_per_window() {
+        let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "freshness_claim_test".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                1000, // 1s window
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+
+        // The very first load runs regardless of the window (cache unpopulated).
+        assert!(backend.try_claim_freshness_window(0, false));
+        // Inside the window with a populated cache: suppressed.
+        assert!(!backend.try_claim_freshness_window(500, true));
+        // A concurrent caller inside the window is also suppressed.
+        assert!(!backend.try_claim_freshness_window(600, true));
+        // Window elapsed: allowed again; the claim advances the window.
+        assert!(backend.try_claim_freshness_window(2000, true));
+        assert!(!backend.try_claim_freshness_window(2100, true));
+        assert!(backend.try_claim_freshness_window(3200, true));
+
+        // Debounce disabled: every caller refreshes.
+        let zero = factory
+            .create_backend(
+                "freshness_claim_zero".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(zero.try_claim_freshness_window(0, true));
+        assert!(zero.try_claim_freshness_window(1, true));
+    }
     #[tokio::test]
     async fn debounce_config_is_plumbed() {
         let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
@@ -1418,6 +1502,15 @@ mod tests {
         assert_eq!(
             name,
             build_time_column_index_name(&long_bare_table, long_col)
+        );
+
+        // Pin the exact suffix: the hash must be FNV-1a (a fixed algorithm),
+        // NOT std's DefaultHasher, which gives no cross-toolchain stability
+        // guarantee — a different suffix after a Rust upgrade would make
+        // `CREATE INDEX IF NOT EXISTS` create a duplicate index.
+        assert_eq!(
+            name,
+            "idx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_54465ea85ad5121b"
         );
 
         // Distinct long names produce distinct identifiers (no silent truncation collision).

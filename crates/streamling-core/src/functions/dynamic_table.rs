@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
-use tracing::debug;
+use tracing::trace;
 
 #[derive(Debug)]
 pub struct DynamicTableCheckFunc {
@@ -144,7 +144,7 @@ impl DynamicTableCheckFunc {
                         let rows_len = v_arr.len();
                         let worth_it = values_len.saturating_mul(2) <= v_arr.keys().len();
                         let ratio = values_len as f64 / rows_len.max(1) as f64;
-                        debug!(
+                        trace!(
                             "dynamic_table_check '{}': dictionary path {} (K={} distinct values, N={} rows, K/N={:.2})",
                             table_name,
                             if worth_it { "taken (fast path)" } else { "skipped (decoding to StringArray)" },
@@ -179,7 +179,7 @@ impl DynamicTableCheckFunc {
                 return Ok(ColumnarValue::Array(result_array_ref));
             }
             if let Some(values_arr) = v_arr.as_any().downcast_ref::<StringArray>() {
-                debug!(
+                trace!(
                     "Using dynamic table backend for table '{}' with {} values",
                     table_name,
                     values_arr.len()
@@ -249,7 +249,7 @@ impl DynamicTableCheckFunc {
         }
         let unique_values: ArrayRef = Arc::new(unique_builder.finish());
 
-        debug!(
+        trace!(
             "Using dynamic table backend for table '{}' with {} unique values across {} rows",
             table_name,
             unique_values.len(),
