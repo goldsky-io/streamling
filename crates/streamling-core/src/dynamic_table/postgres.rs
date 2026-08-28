@@ -1064,6 +1064,24 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
     async fn contains(&self, values: ArrayRef) -> Result<ArrayRef, DynamicTableBackendError> {
         trace!("contains() called for table: {}", self.full_table_name);
+
+        // Cast ArrayRef to StringArray
+        let string_array = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(DynamicTableBackendError::StringArrayExpected)?;
+
+        // Nothing to look up: membership is all-miss (nulls stay null)
+        // independent of cache state, so return before acquiring the pool or
+        // running the cached path's freshness check. Dataset sources emit
+        // empty heartbeat batches continuously; running refresh_cache on each
+        // turned the cached path into one `SELECT MAX` round trip per
+        // heartbeat (~117x more round trips than the uncached path in a live
+        // A/B at debounce=0).
+        if string_array.null_count() == string_array.len() {
+            return Ok(self.build_contains_result(string_array, &HashSet::new()));
+        }
+
         let pool = self.get_pool().await.map_err(|e| {
             error!(
                 "Failed to get pool for table {} in contains(): {}",
@@ -1072,14 +1090,8 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             e
         })?;
 
-        // Cast ArrayRef to StringArray
-        let string_array = values
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(DynamicTableBackendError::StringArrayExpected)?;
-
         if let Some(cache) = &self.cache {
-            // Check for table changes on every invocation, including empty/all-null batches.
+            // Check for table changes on every non-empty invocation.
             self.refresh_cache(pool).await?;
             let cached = cache.read().await;
             let values = &cached
@@ -1102,10 +1114,6 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
                 }
             })
             .collect();
-
-        if value_indices.is_empty() {
-            return Ok(self.build_contains_result(string_array, &HashSet::new()));
-        }
 
         // Deduplicate values so each unique value is queried only once.
         let value_indices = deduplicate_value_indices(value_indices);
@@ -1241,6 +1249,61 @@ mod tests {
             .await
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
+    }
+
+    /// An empty or all-null batch has nothing to look up, so `contains` must
+    /// return before any database work: no pool init, no cache freshness
+    /// check. The unreachable host makes any DB touch error out, so an `Ok`
+    /// result proves the early return happened. Dataset sources emit empty
+    /// heartbeat batches continuously; before the early return, the cached
+    /// path ran a `SELECT MAX` freshness round trip on every one of them
+    /// (~117x more round trips than the uncached path in a live A/B).
+    #[tokio::test]
+    async fn cached_contains_skips_db_on_empty_or_all_null_batches() {
+        let mut config = postgres_config(true);
+        config.host = "127.0.0.1".to_string();
+        config.port = 1; // nothing listens here: every connect fails fast
+        let factory =
+            PostgresDynamicTableBackendFactory::new(config).expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "empty_batch_test".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend construction is lazy and must not connect");
+
+        // Empty batch: zero-length result, no round trip.
+        let empty: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+        let out = backend
+            .contains(empty)
+            .await
+            .expect("empty batch must not touch the database");
+        assert_eq!(out.len(), 0);
+
+        // All-null batch: nulls preserved, no round trip.
+        let all_null: ArrayRef = Arc::new(StringArray::from(vec![
+            Option::<&str>::None,
+            Option::<&str>::None,
+        ]));
+        let out = backend
+            .contains(all_null)
+            .await
+            .expect("all-null batch must not touch the database");
+        assert_eq!(out.len(), 2);
+        assert!(out.is_null(0) && out.is_null(1));
+
+        // Control: a non-empty batch still requires the (unreachable) database.
+        let non_empty: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        assert!(
+            backend.contains(non_empty).await.is_err(),
+            "non-empty batch must attempt the database lookup"
+        );
     }
     #[tokio::test]
     async fn debounce_defaults_to_zero() {
