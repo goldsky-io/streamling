@@ -73,6 +73,10 @@ transforms:
     schema: public
     column: value
     time_column: updated_at
+    # These tests assert external-writer visibility on the next batch, which
+    # requires no debounce window; pin 0 explicitly (the engine default is
+    # DEFAULT_CACHE_REFRESH_DEBOUNCE_MS).
+    cache_refresh_debounce_ms: 0
   matched:
     type: sql
     sql: "SELECT id, data FROM input WHERE dynamic_table_check('membership', id)"

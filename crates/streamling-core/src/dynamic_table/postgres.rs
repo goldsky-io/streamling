@@ -284,13 +284,6 @@ impl PostgresDynamicTableBackend {
     ) -> Self {
         let cache_enabled =
             cache_enabled_override.unwrap_or(config.cache_enabled) && time_column_name.is_some();
-        if cache_refresh_debounce_ms > 0 {
-            warn!(
-                table = %full_table_name,
-                cache_refresh_debounce_ms,
-                "Cache freshness-check debounce is active: rows written by OTHER writers may be missed for up to this long; this pipeline's own writes stay visible"
-            );
-        }
         debug!(
             table = %full_table_name,
             cache_enabled,
@@ -1306,7 +1299,10 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn debounce_defaults_to_zero() {
+    async fn debounce_zero_passthrough_stays_zero() {
+        // Defaulting to DEFAULT_CACHE_REFRESH_DEBOUNCE_MS happens in
+        // DynamicTableBackendFactory::create; create_backend receives the
+        // resolved value and must pass 0 through unchanged.
         let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
             .expect("factory should be valid");
         let backend = factory

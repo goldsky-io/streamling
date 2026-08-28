@@ -151,6 +151,13 @@ impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
 }
 
 // TODO: perhaps this can be merged with PostgresStateBackendConfig
+
+/// Freshness-check debounce window (ms) for the postgres dynamic table cache,
+/// applied when neither the topology's `cache_refresh_debounce_ms` nor the
+/// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms` is set.
+/// An explicit 0 (topology or global) still disables the window.
+pub const DEFAULT_CACHE_REFRESH_DEBOUNCE_MS: u64 = 5000;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PostgresDynamicTableBackendConfig {
     pub host: String,
@@ -172,8 +179,9 @@ pub struct PostgresDynamicTableBackendConfig {
     /// Global default for the cache freshness-check debounce window in
     /// milliseconds (see `cache_refresh_debounce_ms` on dynamic_table
     /// transforms). Individual transforms override this via their own field;
-    /// when that field is omitted the global value applies. Defaults to 0
-    /// (re-check on every batch). Settable via the
+    /// when that field is omitted the global value applies. When neither is
+    /// set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (5000ms) applies; set 0
+    /// explicitly to re-check on every batch. Settable via the
     /// `STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_REFRESH_DEBOUNCE_MS`
     /// environment variable.
     #[serde(default)]

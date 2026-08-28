@@ -69,10 +69,11 @@ impl DynamicTableBackendFactory {
     ///
     /// Parameter precedence: `cache_refresh_debounce_ms_override` wins when
     /// `Some`; `None` falls back to the global
-    /// `dynamic_table_backend.postgres.cache_refresh_debounce_ms`, which itself
-    /// defaults to 0 (re-check freshness on every batch). Likewise
-    /// `cache_enabled_override` wins when `Some`; `None` falls back to the
-    /// global `cache_enabled`. Note that caching additionally requires a
+    /// `dynamic_table_backend.postgres.cache_refresh_debounce_ms`; when neither
+    /// is set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (5000ms) applies. An explicit
+    /// 0 either way disables the window (re-check freshness on every batch).
+    /// Likewise `cache_enabled_override` wins when `Some`; `None` falls back to
+    /// the global `cache_enabled`. Note that caching additionally requires a
     /// `time_column`; without one the cache is disabled regardless of either
     /// setting.
     pub async fn create(
@@ -103,10 +104,36 @@ impl DynamicTableBackendFactory {
                 })?;
 
                 // Topology value wins; otherwise fall back to the global
-                // `dynamic_table_backend.postgres.cache_refresh_debounce_ms`
-                // (which itself defaults to 0: re-check on every batch).
-                let cache_refresh_debounce_ms = cache_refresh_debounce_ms_override
-                    .unwrap_or(postgres_config.cache_refresh_debounce_ms.unwrap_or(0));
+                // `dynamic_table_backend.postgres.cache_refresh_debounce_ms`;
+                // when neither is set, DEFAULT_CACHE_REFRESH_DEBOUNCE_MS
+                // applies. An explicit 0 either way disables the window.
+                let (cache_refresh_debounce_ms, debounce_is_default) = match (
+                    cache_refresh_debounce_ms_override,
+                    postgres_config.cache_refresh_debounce_ms,
+                ) {
+                    (Some(v), _) => (v, false),
+                    (None, Some(v)) => (v, false),
+                    (None, None) => (
+                        streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS,
+                        true,
+                    ),
+                };
+                // The default window is a sane background choice, not an
+                // operator decision, so it logs at debug; an explicitly chosen
+                // non-zero window is an operator decision and stays a warn.
+                if debounce_is_default {
+                    tracing::debug!(
+                        table = %backend_entity_name,
+                        cache_refresh_debounce_ms,
+                        "Using default dynamic table cache freshness-check debounce: rows written by OTHER writers may be missed for up to this long; this pipeline's own writes stay visible"
+                    );
+                } else if cache_refresh_debounce_ms > 0 {
+                    tracing::warn!(
+                        table = %backend_entity_name,
+                        cache_refresh_debounce_ms,
+                        "Cache freshness-check debounce is active: rows written by OTHER writers may be missed for up to this long; this pipeline's own writes stay visible"
+                    );
+                }
 
                 // TODO: store the factory somewhere to avoid recreating it each time
                 // Note: new() doesn't connect - connection happens lazily on first use
@@ -522,7 +549,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn debounce_resolution_prefers_topology_then_global_then_zero() {
+    async fn debounce_resolution_prefers_topology_then_global_then_default_5000() {
         use streamling_config::app_config::{
             DynamicTableBackendConfig, DynamicTableBackendType, PostgresDynamicTableBackendConfig,
         };
@@ -582,16 +609,38 @@ mod tests {
             .expect("postgres backend");
         assert_eq!(pg.cache_refresh_debounce_ms, 9999);
 
-        // Neither set: 0 (re-check on every batch).
+        // Neither set: DEFAULT_CACHE_REFRESH_DEBOUNCE_MS (5000ms) applies.
         let factory = DynamicTableBackendFactory::new(make_config(None));
         let backend = factory
             .create(
                 DynamicTableBackendType::Postgres,
-                "debounce_zero_default".to_string(),
+                "debounce_default_5000".to_string(),
                 None,
                 None,
                 Some("updated_at".to_string()),
                 None,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        let pg = backend
+            .as_any()
+            .downcast_ref::<PostgresDynamicTableBackend>()
+            .expect("postgres backend");
+        assert_eq!(
+            pg.cache_refresh_debounce_ms,
+            streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS
+        );
+
+        // Explicit zero still wins: 0 disables the debounce window entirely.
+        let backend = factory
+            .create(
+                DynamicTableBackendType::Postgres,
+                "debounce_explicit_zero".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                Some(0),
                 None,
             )
             .await

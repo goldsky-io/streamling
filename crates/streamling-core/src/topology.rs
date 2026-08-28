@@ -495,8 +495,10 @@ pub struct DynamicTableTransform {
     pub cache: Option<bool>,
     /// How long to trust the in-memory cache before re-checking the table's
     /// freshness (`SELECT MAX(<time_column>)`). When omitted, falls back to the
-    /// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms` config
-    /// (which defaults to 0: re-check on every batch, one database round trip).
+    /// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms`
+    /// config; when neither is set,
+    /// `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (5000ms) applies. Set 0 explicitly
+    /// (here or globally) to re-check on every batch.
     ///
     /// Raising this trades staleness for round trips: lookups may miss rows
     /// written by OTHER writers for up to this long. This pipeline's own writes
