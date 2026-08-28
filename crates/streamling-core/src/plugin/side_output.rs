@@ -88,7 +88,7 @@ pub fn register_plugin_side_outputs(
     source_schemas: &HashMap<String, SchemaRef>,
     options: &HashMap<String, HashMap<String, String>>,
     application_id: &str,
-    channel_capacity: usize,
+    metrics_channel_capacity: usize,
 ) -> Result<()> {
     let registry = PLUGIN_SIDE_OUTPUT_DESCRIPTORS
         .read()
@@ -101,7 +101,7 @@ pub fn register_plugin_side_outputs(
         for (source_name, schema) in source_schemas {
             // Create a per-source metrics channel
             let metrics_channel =
-                PluginMetricsChannel::new(crossbeam_channel::bounded(channel_capacity));
+                PluginMetricsChannel::new(crossbeam_channel::bounded(metrics_channel_capacity));
             let metrics_recorder = PluginMetricsRecorder::new(metrics_channel.sender.clone());
 
             // Spawn metrics processing task with source-specific metric_metadata_id
