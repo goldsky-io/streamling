@@ -993,7 +993,7 @@ transforms:
     backend_entity_name: persistent_data
     time_column: updated_at
     # Optional: how long to trust the cache before re-checking table freshness
-    # (`SELECT MAX(time_column)`). When omitted (and unset globally), a 5000ms
+    # (`SELECT MAX(time_column)`). When omitted (and unset globally), a 1000ms
     # default applies; 0 re-checks on every batch — one database round trip per
     # batch. Raising it trades staleness for round trips: rows written by OTHER
     # writers may be missed for up to this long, while this pipeline's own

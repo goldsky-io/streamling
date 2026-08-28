@@ -156,7 +156,7 @@ impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
 /// applied when neither the topology's `cache_refresh_debounce_ms` nor the
 /// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms` is set.
 /// An explicit 0 (topology or global) still disables the window.
-pub const DEFAULT_CACHE_REFRESH_DEBOUNCE_MS: u64 = 5000;
+pub const DEFAULT_CACHE_REFRESH_DEBOUNCE_MS: u64 = 1000;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PostgresDynamicTableBackendConfig {
@@ -180,7 +180,7 @@ pub struct PostgresDynamicTableBackendConfig {
     /// milliseconds (see `cache_refresh_debounce_ms` on dynamic_table
     /// transforms). Individual transforms override this via their own field;
     /// when that field is omitted the global value applies. When neither is
-    /// set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (5000ms) applies; set 0
+    /// set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (1000ms) applies; set 0
     /// explicitly to re-check on every batch. Settable via the
     /// `STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_REFRESH_DEBOUNCE_MS`
     /// environment variable.
