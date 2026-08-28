@@ -456,6 +456,11 @@ impl PostgresDynamicTableBackend {
         }
         let last = self.last_freshness_check_ms.load(Ordering::Relaxed);
         // Only debounce once a cache exists — the first load must always run.
+        // ponytail: unpopulated callers all claim, so a burst before the first
+        // populate can run duplicate `SELECT MAX` probes (bounded by the
+        // populate window); refresh_cache's write-lock watermark re-check
+        // prevents duplicate page loads. Single-flight first load would need
+        // cross-task wait machinery that costs more than the duplicates.
         if populated && now_ms.saturating_sub(last) < self.cache_refresh_debounce_ms {
             return false;
         }

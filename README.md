@@ -1006,6 +1006,10 @@ loads the full table through bounded PostgreSQL cursor pages. Each later `dynami
 batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
 column so these checks and range reads stay cheap.
 
+Configs that omit the setting entirely — including ones written before it existed — get the
+built-in 1000ms default on upgrade. Set `cache_refresh_debounce_ms: 0` (globally or per
+transform) to restore the pre-debounce re-check-on-every-batch behavior.
+
 PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
 existing membership, including removals, is not supported in this mode. Keeping `time_column` current
 is a user requirement and part of the cache's correctness contract. Every process that appends table
