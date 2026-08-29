@@ -14,10 +14,11 @@ use sqlx::{Executor, PgPool, Postgres};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use streamling_config::app_config::PostgresDynamicTableBackendConfig;
 use tokio::sync::{OnceCell, RwLock};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
 const DEFAULT_SCHEMA_NAME: &str = "streamling";
@@ -167,6 +168,8 @@ impl PostgresDynamicTableBackendFactory {
         column: Option<String>,
         time_column: Option<String>,
         max_batch_size: usize,
+        cache_refresh_debounce_ms: u64,
+        cache_enabled_override: Option<bool>,
     ) -> Result<PostgresDynamicTableBackend, DynamicTableBackendError> {
         debug!(
             "Creating dynamic table backend: entity={}, schema={:?}, column={:?}, time_column={:?}",
@@ -221,6 +224,8 @@ impl PostgresDynamicTableBackendFactory {
             column_name,
             time_column,
             max_batch_size,
+            cache_refresh_debounce_ms,
+            cache_enabled_override,
         ))
     }
 }
@@ -249,6 +254,12 @@ pub struct PostgresDynamicTableBackend {
     time_column_name: String,
     cache: Option<RwLock<Option<PostgresDynamicTableCache>>>,
     max_batch_size: usize,
+    /// Debounce window for the freshness check; 0 disables debouncing.
+    pub(crate) cache_refresh_debounce_ms: u64,
+    /// Monotonic base for the debounce clock.
+    created_at: Instant,
+    /// Millis since `created_at` at the last freshness check.
+    last_freshness_check_ms: AtomicU64,
 }
 
 impl PostgresDynamicTableBackend {
@@ -260,8 +271,11 @@ impl PostgresDynamicTableBackend {
         column_name: String,
         time_column_name: Option<String>,
         max_batch_size: usize,
+        cache_refresh_debounce_ms: u64,
+        cache_enabled_override: Option<bool>,
     ) -> Self {
-        let cache_enabled = config.cache_enabled && time_column_name.is_some();
+        let cache_enabled =
+            cache_enabled_override.unwrap_or(config.cache_enabled) && time_column_name.is_some();
         debug!(
             table = %full_table_name,
             cache_enabled,
@@ -281,6 +295,9 @@ impl PostgresDynamicTableBackend {
             time_column_name,
             cache,
             max_batch_size,
+            cache_refresh_debounce_ms,
+            created_at: Instant::now(),
+            last_freshness_check_ms: AtomicU64::new(0),
         }
     }
 
@@ -421,12 +438,61 @@ impl PostgresDynamicTableBackend {
         .await
     }
 
+    /// Returns true when the caller should run the freshness check now.
+    /// `populated` gates the very first load: only once a cache exists may the
+    /// debounce window suppress a check. The claim is a compare-and-swap on
+    /// `last_freshness_check_ms`, so concurrent callers on the same batch yield
+    /// at most one check per window instead of one per caller.
+    fn try_claim_freshness_window(&self, now_ms: u64, populated: bool) -> bool {
+        if self.cache_refresh_debounce_ms == 0 {
+            return true;
+        }
+        let last = self.last_freshness_check_ms.load(Ordering::Relaxed);
+        // Only debounce once a cache exists — the first load must always run.
+        // ponytail: unpopulated callers all claim, so a burst before the first
+        // populate can run duplicate `SELECT MAX` probes (bounded by the
+        // populate window); refresh_cache's write-lock watermark re-check
+        // prevents duplicate page loads. Single-flight first load would need
+        // cross-task wait machinery that costs more than the duplicates.
+        if populated && now_ms.saturating_sub(last) < self.cache_refresh_debounce_ms {
+            return false;
+        }
+        if populated
+            && self
+                .last_freshness_check_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            // Another caller claimed this window; the populated cache it will
+            // refresh stays valid for our probe.
+            return false;
+        }
+        self.last_freshness_check_ms
+            .store(now_ms, Ordering::Relaxed);
+        true
+    }
+
     async fn refresh_cache(&self, pool: Arc<PgPool>) {
         let cache = self
             .cache
             .as_ref()
             .expect("cache is present when refresh_cache is called");
+        let populated = cache.read().await.is_some();
+        let now_ms = self.created_at.elapsed().as_millis() as u64;
+        if !self.try_claim_freshness_window(now_ms, populated) {
+            return;
+        }
+        let freshness_check_started_at = Instant::now();
         let updated_at = self.latest_update(pool.clone()).await;
+        let freshness_check_ms = freshness_check_started_at.elapsed().as_millis() as u64;
+        if freshness_check_ms >= 200 {
+            warn!(
+                table = %self.full_table_name,
+                freshness_check_ms,
+                debounce_ms = self.cache_refresh_debounce_ms,
+                "Slow dynamic table cache freshness check: the time column may be missing an index"
+            );
+        }
 
         if let Some(cached) = cache.read().await.as_ref()
             && cached.updated_at == updated_at
@@ -458,6 +524,7 @@ impl PostgresDynamicTableBackend {
                 total_entries = current.values.len(),
                 pages_loaded,
                 elapsed_ms = ?elapsed_ms,
+                freshness_check_ms,
                 previous_watermark = ?updated_since.as_deref(),
                 watermark = ?current.updated_at.as_deref(),
                 "Refreshed PostgreSQL dynamic table cache"
@@ -468,6 +535,7 @@ impl PostgresDynamicTableBackend {
                 total_entries = refreshed.values.len(),
                 pages_loaded,
                 elapsed_ms = ?elapsed_ms,
+                freshness_check_ms,
                 watermark = ?refreshed.updated_at.as_deref(),
                 "Populated PostgreSQL dynamic table cache"
             );
@@ -586,9 +654,13 @@ impl PostgresDynamicTableBackend {
         .await
     }
 
-    /// Append a batch of values to the table (internal method that doesn't split batches)
-    /// Retries forever with exponential backoff. Statement timeout prevents individual queries from hanging.
-    /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
+    /// Append a batch of values to the table (internal method that doesn't split
+    /// batches). Retries forever with exponential backoff — it only returns when
+    /// the batch is committed (or the task is torn down), so callers may treat
+    /// its return as commit-success when deciding whether to mirror the keys
+    /// into the in-memory cache. Statement timeout prevents individual queries
+    /// from hanging. Uses Arc to wrap values so retry clones are cheap
+    /// (reference count increment only).
     async fn append_batch(&self, pool: Arc<PgPool>, values: Vec<String>) {
         if values.is_empty() {
             return;
@@ -804,34 +876,66 @@ impl PostgresDynamicTableBackend {
                         "Creating PostgreSQL dynamic table: {}",
                         self.full_table_name
                     );
-                    let create_result = sqlx::query(
-                        format!(
-                            r#"
+                    let create_table_sql = format!(
+                        r#"
                             CREATE TABLE IF NOT EXISTS {} (
                                 "{}" TEXT PRIMARY KEY,
                                 "{}" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CLOCK_TIMESTAMP()
                             );
                         "#,
-                            self.full_table_name, self.column_name, self.time_column_name
-                        )
-                        .as_str(),
-                    )
-                    .execute(pool_arc.as_ref())
-                    .await;
+                        self.full_table_name, self.column_name, self.time_column_name
+                    );
+                    let bare_table = self
+                        .full_table_name
+                        .rsplit_once('.')
+                        .map(|(_, table)| table)
+                        .unwrap_or(self.full_table_name.as_str());
+                    let index_name =
+                        build_time_column_index_name(bare_table, &self.time_column_name);
+                    let create_index_sql = format!(
+                        r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
+                        index_name, self.full_table_name, self.time_column_name
+                    );
 
-                    match create_result {
-                        Ok(_) => {
-                            info!("Successfully created table: {}", self.full_table_name);
-                        }
-                        Err(e) => {
+                    let mut transaction = pool_arc.begin().await.map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to begin transaction for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+                    sqlx::query(&create_table_sql)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| {
                             let err = DynamicTableBackendError::Initialization(format!(
                                 "Failed to create table {}: {}",
                                 self.full_table_name, e
                             ));
                             error!("{}", err);
-                            return Err(err);
-                        }
-                    }
+                            err
+                        })?;
+                    sqlx::query(&create_index_sql)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| {
+                            let err = DynamicTableBackendError::Initialization(format!(
+                                "Failed to create index {} on table {}: {}",
+                                index_name, self.full_table_name, e
+                            ));
+                            error!("{}", err);
+                            err
+                        })?;
+                    transaction.commit().await.map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to commit transaction for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+                    info!("Successfully created table: {}", self.full_table_name);
                 } else {
                     debug!(
                         "Table {} already exists, skipping creation",
@@ -850,6 +954,43 @@ impl PostgresDynamicTableBackend {
     }
 }
 
+/// Build the deterministic index name for a dynamic table's time column.
+///
+/// PostgreSQL silently truncates identifiers to `NAMEDATALEN - 1` (63) bytes,
+/// so a naive `idx_{table}_{column}` can collide after truncation — two long
+/// names can truncate to the same identifier, and `CREATE INDEX IF NOT EXISTS`
+/// would then no-op against the wrong index on subsequent startups. When the
+/// name exceeds the limit we keep a readable prefix and append a short, stable
+/// hash of the full name, keeping it unique and under 63 bytes. Identifiers are
+/// ASCII (`[A-Za-z0-9_]`), so byte slicing is always on a char boundary.
+fn build_time_column_index_name(bare_table: &str, time_column: &str) -> String {
+    const MAX_IDENT_BYTES: usize = 63;
+    let raw = format!("idx_{}_{}", bare_table, time_column);
+    if raw.len() <= MAX_IDENT_BYTES {
+        return raw;
+    }
+    // FNV-1a rather than std's DefaultHasher: the doc contract below requires
+    // the suffix to be IDENTICAL across restarts and toolchain bumps so
+    // `CREATE INDEX IF NOT EXISTS` stays idempotent, and DefaultHasher makes
+    // no cross-version stability guarantee. FNV-1a is a fixed algorithm.
+    let hash = fnv1a64(raw.as_bytes());
+    // '_' + 16 hex hash chars.
+    let suffix = format!("_{:016x}", hash);
+    let prefix_len = MAX_IDENT_BYTES - suffix.len();
+    format!("{}_{}", &raw[..prefix_len], &suffix[1..])
+}
+
+/// Deterministic FNV-1a 64-bit over the raw name bytes; used only to keep
+/// generated identifier suffixes stable across processes and toolchains.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Remove duplicate values from `(index, value)` pairs, keeping only the first
 /// occurrence of each value. This shrinks the SQL parameter list and may reduce
 /// batch count in `contains()` without changing results, because
@@ -865,6 +1006,10 @@ fn deduplicate_value_indices(value_indices: Vec<(usize, String)>) -> Vec<(usize,
 
 #[async_trait]
 impl DynamicTableBackend for PostgresDynamicTableBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError> {
         trace!("append() called for table: {}", self.full_table_name);
         let pool = self.get_pool().await.map_err(|e| {
@@ -881,7 +1026,15 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             return Ok(());
         }
 
-        // Split into batches if exceeding max_batch_size
+        // Keep this pipeline's own writes visible without waiting for the next
+        // freshness check: insert the keys we just committed to postgres into the
+        // cached set. Safe because `append_batch` retries forever until the batch
+        // commits (see its doc), so any key reaching this point is persisted —
+        // this can never produce a false positive. `updated_at` is deliberately
+        // left untouched, so the next real refresh still fetches everything since
+        // the old watermark (re-fetching our own rows is idempotent — HashSet
+        // extend dedups).
+        let appended_keys: Option<Vec<String>> = self.cache.as_ref().map(|_| values.clone());
         if values_len <= self.max_batch_size {
             // Single batch - process directly
             self.append_batch(pool, values).await;
@@ -915,12 +1068,45 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             "[append] completed for table name '{}' with {} values",
             self.full_table_name, values_len
         );
+        if let (Some(cache), Some(appended)) = (&self.cache, appended_keys) {
+            let mut cached = cache.write().await;
+            if let Some(current) = cached.as_mut() {
+                let appended_count = appended.len();
+                current
+                    .values
+                    .extend(appended.into_iter().map(|v| v.as_str().into()));
+                trace!(
+                    table = %self.full_table_name,
+                    appended = appended_count,
+                    total_entries = current.values.len(),
+                    "Added own appended keys to PostgreSQL dynamic table cache"
+                );
+            }
+        }
 
         Ok(())
     }
 
     async fn contains(&self, values: ArrayRef) -> Result<ArrayRef, DynamicTableBackendError> {
         trace!("contains() called for table: {}", self.full_table_name);
+
+        // Cast ArrayRef to StringArray
+        let string_array = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(DynamicTableBackendError::StringArrayExpected)?;
+
+        // Nothing to look up: membership is all-miss (nulls stay null)
+        // independent of cache state, so return before acquiring the pool or
+        // running the cached path's freshness check. Dataset sources emit
+        // empty heartbeat batches continuously; running refresh_cache on each
+        // turned the cached path into one `SELECT MAX` round trip per
+        // heartbeat (~117x more round trips than the uncached path in a live
+        // A/B at debounce=0).
+        if string_array.null_count() == string_array.len() {
+            return Ok(self.build_contains_result(string_array, &HashSet::new()));
+        }
+
         let pool = self.get_pool().await.map_err(|e| {
             error!(
                 "Failed to get pool for table {} in contains(): {}",
@@ -929,14 +1115,8 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             e
         })?;
 
-        // Cast ArrayRef to StringArray
-        let string_array = values
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(DynamicTableBackendError::StringArrayExpected)?;
-
         if let Some(cache) = &self.cache {
-            // Check for table changes on every invocation, including empty/all-null batches.
+            // Check for table changes on every non-empty invocation.
             self.refresh_cache(pool).await;
             let cached = cache.read().await;
             let existing_set = &cached
@@ -956,10 +1136,6 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
                 }
             })
             .collect();
-
-        if value_indices.is_empty() {
-            return Ok(self.build_contains_result(string_array, &HashSet::new()));
-        }
 
         // Deduplicate values so each unique value is queried only once.
         let value_indices = deduplicate_value_indices(value_indices);
@@ -1018,6 +1194,7 @@ mod tests {
             max_connections: None,
             dt_schema_name: None,
             cache_enabled,
+            cache_refresh_debounce_ms: None,
         }
     }
 
@@ -1052,6 +1229,8 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                0,
+                None,
             )
             .await
             .expect("backend should be valid");
@@ -1060,7 +1239,15 @@ mod tests {
         let enabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
             .expect("factory should be valid");
         let missing_time_column = enabled_factory
-            .create_backend("missing_time_column".to_string(), None, None, None, 1000)
+            .create_backend(
+                "missing_time_column".to_string(),
+                None,
+                None,
+                None,
+                1000,
+                0,
+                None,
+            )
             .await
             .expect("backend should be valid");
         assert!(missing_time_column.cache.is_none());
@@ -1073,11 +1260,252 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                0,
+                None,
             )
             .await
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
     }
+
+    /// An empty or all-null batch has nothing to look up, so `contains` must
+    /// return before any database work: no pool init, no cache freshness
+    /// check. The unreachable host makes any DB touch error out, so an `Ok`
+    /// result proves the early return happened. Dataset sources emit empty
+    /// heartbeat batches continuously; before the early return, the cached
+    /// path ran a `SELECT MAX` freshness round trip on every one of them
+    /// (~117x more round trips than the uncached path in a live A/B).
+    #[tokio::test]
+    async fn cached_contains_skips_db_on_empty_or_all_null_batches() {
+        let mut config = postgres_config(true);
+        config.host = "127.0.0.1".to_string();
+        config.port = 1; // nothing listens here: every connect fails fast
+        let factory =
+            PostgresDynamicTableBackendFactory::new(config).expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "empty_batch_test".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend construction is lazy and must not connect");
+
+        // Empty batch: zero-length result, no round trip.
+        let empty: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+        let out = backend
+            .contains(empty)
+            .await
+            .expect("empty batch must not touch the database");
+        assert_eq!(out.len(), 0);
+
+        // All-null batch: nulls preserved, no round trip.
+        let all_null: ArrayRef = Arc::new(StringArray::from(vec![
+            Option::<&str>::None,
+            Option::<&str>::None,
+        ]));
+        let out = backend
+            .contains(all_null)
+            .await
+            .expect("all-null batch must not touch the database");
+        assert_eq!(out.len(), 2);
+        assert!(out.is_null(0) && out.is_null(1));
+
+        // Control: a non-empty batch still requires the (unreachable) database.
+        let non_empty: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        assert!(
+            backend.contains(non_empty).await.is_err(),
+            "non-empty batch must attempt the database lookup"
+        );
+    }
+    #[tokio::test]
+    async fn debounce_zero_passthrough_stays_zero() {
+        // Defaulting to DEFAULT_CACHE_REFRESH_DEBOUNCE_MS happens in
+        // DynamicTableBackendFactory::create; create_backend receives the
+        // resolved value and must pass 0 through unchanged.
+        let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "debounce_default".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert_eq!(backend.cache_refresh_debounce_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn freshness_window_claim_yields_at_most_one_check_per_window() {
+        let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "freshness_claim_test".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                1000, // 1s window
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+
+        // The very first load runs regardless of the window (cache unpopulated).
+        assert!(backend.try_claim_freshness_window(0, false));
+        // Inside the window with a populated cache: suppressed.
+        assert!(!backend.try_claim_freshness_window(500, true));
+        // A concurrent caller inside the window is also suppressed.
+        assert!(!backend.try_claim_freshness_window(600, true));
+        // Window elapsed: allowed again; the claim advances the window.
+        assert!(backend.try_claim_freshness_window(2000, true));
+        assert!(!backend.try_claim_freshness_window(2100, true));
+        assert!(backend.try_claim_freshness_window(3200, true));
+
+        // Debounce disabled: every caller refreshes.
+        let zero = factory
+            .create_backend(
+                "freshness_claim_zero".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(zero.try_claim_freshness_window(0, true));
+        assert!(zero.try_claim_freshness_window(1, true));
+    }
+    #[tokio::test]
+    async fn debounce_config_is_plumbed() {
+        let factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "debounce_plumbed".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                5000,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert_eq!(backend.cache_refresh_debounce_ms, 5000);
+    }
+
+    #[tokio::test]
+    async fn cache_resolution_falls_back_to_global_unless_overridden() {
+        // Topology override wins over the global flag.
+        let global_off = PostgresDynamicTableBackendFactory::new(postgres_config(false))
+            .expect("factory should be valid");
+        let forced_on = global_off
+            .create_backend(
+                "forced_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                Some(true),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_on.cache.is_some());
+
+        let global_on = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let forced_off = global_on
+            .create_backend(
+                "forced_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                Some(false),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_off.cache.is_none());
+
+        // No override: falls back to the global flag.
+        let defaulted_on = global_on
+            .create_backend(
+                "defaulted_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_on.cache.is_some());
+
+        let defaulted_off = global_off
+            .create_backend(
+                "defaulted_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_off.cache.is_none());
+    }
+    #[test]
+    fn build_time_column_index_name_stays_under_limit() {
+        // Short names pass through unchanged.
+        let short = build_time_column_index_name("blocks", "block_timestamp");
+        assert_eq!(short, "idx_blocks_block_timestamp");
+        assert!(short.len() <= 63);
+
+        // Long names are truncated + hash-suffixed to stay under 63 bytes, and
+        // stay deterministic across calls so IF NOT EXISTS is stable at startup.
+        let long_bare_table = "a".repeat(60);
+        let long_col = "updated_at";
+        let name = build_time_column_index_name(&long_bare_table, long_col);
+        assert!(name.len() <= 63);
+        assert_eq!(
+            name,
+            build_time_column_index_name(&long_bare_table, long_col)
+        );
+
+        // Pin the exact suffix: the hash must be FNV-1a (a fixed algorithm),
+        // NOT std's DefaultHasher, which gives no cross-toolchain stability
+        // guarantee — a different suffix after a Rust upgrade would make
+        // `CREATE INDEX IF NOT EXISTS` create a duplicate index.
+        assert_eq!(
+            name,
+            "idx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_54465ea85ad5121b"
+        );
+
+        // Distinct long names produce distinct identifiers (no silent truncation collision).
+        let other = build_time_column_index_name(&"b".repeat(60), long_col);
+        assert_ne!(name, other);
+
+        // The readable `idx_` prefix is preserved for debuggability.
+        assert!(name.starts_with("idx_"));
+    }
+
     #[test]
     fn deduplicate_value_indices_removes_duplicates() {
         let input = vec![
