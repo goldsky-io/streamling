@@ -1486,11 +1486,35 @@ impl Streamling {
                         metric_metadata_id: metric_key(&application_id, reference_name.as_str()),
                     };
 
+                    // Resolved before the node is built because the exchange
+                    // below it hashes on this key. `ExternalHandlerNode` and
+                    // `RebatchNode` both report their input's schema, so this is
+                    // the same schema the registration used to see.
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
+                        &Some(handler.primary_key),
+                        from.clone(),
+                        reference_name.clone(),
+                        source_plan.schema().inner(),
+                    )?;
+
+                    let pk_columns = pk_metadata_opt
+                        .map(|pk| pk.columns.clone())
+                        .unwrap_or_default();
+
                     let batch_size = handler.batch_size.map(|s| s as usize);
                     let batch_flush_interval =
                         parse_batch_flush_interval(&handler.batch_flush_interval, &ctx.format())?;
+                    // The exchange goes below the rebatcher, as at the sink edge:
+                    // rebatching after the split keeps each request stream's
+                    // batches whole. Keyed by the transform's primary key, so a
+                    // key is never in flight against the endpoint twice at once.
                     let handler_input = wrap_with_rebatch(
-                        source_plan,
+                        wrap_with_repartition(
+                            source_plan,
+                            &Placement::ByKey(pk_columns.clone()),
+                            handler.parallelism,
+                            reference_name.clone(),
+                        ),
                         batch_size,
                         batch_flush_interval,
                         reference_name.clone(),
@@ -1499,17 +1523,6 @@ impl Streamling {
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(ExternalHandlerNode::new(handler_input, handler_config)),
                     });
-
-                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
-                        &Some(handler.primary_key),
-                        from.clone(),
-                        reference_name.clone(),
-                        logical_plan.schema().inner(),
-                    )?;
-
-                    let pk_columns = pk_metadata_opt
-                        .map(|pk| pk.columns.clone())
-                        .unwrap_or_default();
 
                     let wrapping_node = Arc::new(WrappingNode::new_with_non_null_cols(
                         logical_plan,
@@ -1546,28 +1559,42 @@ impl Streamling {
                     let language = &script_transform.language;
                     let script = &script_transform.script;
                     let schema = &script_transform.schema;
-                    // Use topology-level parallelism/batch_size if specified, otherwise fall back to app_config
-                    let parallelism = script_transform
-                        .parallelism
-                        .unwrap_or(app_config.wasm_script.parallelism);
-                    let batch_size = script_transform
-                        .batch_size
-                        .unwrap_or(app_config.wasm_script.batch_size);
+                    let parallelism = script_transform.parallelism;
+                    let batch_size = script_transform.batch_size;
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
                             streamling_user_err!("{}: source '{}' not found", ctx.format(), from)
                         })?
                         .clone();
+
+                    let input_primary_key = PrimaryKeyMetadata::from_str(
+                        &script_transform.primary_key,
+                        PrimaryKeySource::TopologyDefined,
+                        reference_name.clone(),
+                    );
+                    if parallelism.is_some_and(|parallelism| parallelism > 1) {
+                        input_primary_key.validate_against_schema(source_plan.schema().inner())?;
+                    }
+
+                    let script_input = wrap_with_rebatch(
+                        wrap_with_repartition(
+                            source_plan,
+                            &Placement::ByKey(input_primary_key.columns),
+                            parallelism,
+                            reference_name.clone(),
+                        ),
+                        batch_size,
+                        None,
+                        reference_name.clone(),
+                    );
                     let wasm_node = WasmRunnerNode::with_options(
-                        source_plan,
+                        script_input,
                         language.clone(),
                         script.clone(),
                         app_config.wasm_script.runtime_wasm_file_path.clone(),
                         app_config.internal_buffer_size,
                         schema.clone(),
-                        parallelism,
-                        batch_size,
                     )
                     // Convert via `StreamlingError::from` (not `streamling_with_context`)
                     // so a user-facing schema error (e.g. unsupported dtype) is recovered
@@ -1748,7 +1775,7 @@ impl Streamling {
                         webhook.headers.clone()
                     };
 
-                    pk_registry.track_primary_key_for_transform_or_sink(
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
                         primary_key_opt,
                         from.clone(),
                         reference_name.clone(),
@@ -1780,10 +1807,11 @@ impl Streamling {
                             reference_name.clone(),
                             http_sink_provider,
                             RebatchConfig::new(webhook.batch_size, batch_flush_interval),
-                            // Concurrent `write_all` is untested for this sink, and
-                            // N streams would also multiply the in-flight requests.
-                            Placement::Single,
-                            None,
+                            // The payload carries a per-row op, so a receiver
+                            // applying upserts and deletes needs every row of a
+                            // key on one stream.
+                            Placement::ByKey(pk_columns(&pk_metadata_opt)),
+                            webhook.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -3266,6 +3294,189 @@ mod tests {
         }
     }
 
+    /// A handler transform's `parallelism` has to reach the HTTP calls
+    /// themselves: `ExternalHandlerExec` used to declare a single partition and
+    /// require `SinglePartition` input, which collapsed any width above it back
+    /// to one request stream.
+    ///
+    /// The exchange is keyed, so a primary key is never in flight against the
+    /// endpoint on two streams at once.
+    #[tokio::test]
+    async fn handler_parallelism_widens_the_request_streams() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let handler_input = wrap_with_rebatch(
+            wrap_with_repartition(source_plan, &by_key(&["id"]), Some(4), "enrich".to_string()),
+            None,
+            None,
+            "enrich".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(ExternalHandlerNode::new(
+                handler_input,
+                ExternalHandlerConfig {
+                    url: "http://localhost/enrich".to_string(),
+                    headers: None,
+                    one_row_per_request: None,
+                    payload_version: None,
+                    trigger_max_count: 1,
+                    operator_timeout_sec: 1,
+                    schema_override: None,
+                    buffer_size: 1,
+                    metric_metadata_id: "app::enrich".to_string(),
+                },
+            )),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        for expected in [
+            "ExternalHandlerExec: url=http://localhost/enrich, partitions=4",
+            "StreamingRepartitionExec: partitions=4, keys=[id@0]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in plan:\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn script_parallelism_and_batch_size_shape_the_wasm_streams() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan.clone(),
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            Some(2),
+            None,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        for expected in [
+            "WasmRunnerExec (lang: javascript), partitions=4",
+            "RebatchExec(batch_size=2, partitions=4)",
+            "StreamingRepartitionExec: partitions=4, keys=[id@0]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in plan:\n{rendered}"
+            );
+        }
+
+        let inherited_input =
+            wrap_with_repartition(source_plan, &by_key(&["id"]), None, "normalize".to_string());
+        let inherited_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    inherited_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        let inherited_physical_plan = session_manager
+            .new_df(inherited_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let inherited_rendered = displayable(inherited_physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        for expected in [
+            "WasmRunnerExec (lang: javascript), partitions=3",
+            "StreamingRepartitionExec: partitions=3, keys=[id@0]",
+        ] {
+            assert!(
+                inherited_rendered.contains(expected),
+                "expected {expected:?} in plan:\n{inherited_rendered}"
+            );
+        }
+        assert!(
+            !inherited_rendered.contains("RebatchExec"),
+            "unexpected RebatchExec in plan:\n{inherited_rendered}"
+        );
+    }
+
     fn empty_plan() -> LogicalPlan {
         LogicalPlanBuilder::empty(true).build().unwrap()
     }
@@ -3320,7 +3531,7 @@ mod tests {
             empty_plan(),
             &Placement::Single,
             None,
-            "webhook_sink".to_string(),
+            "plugin_sink".to_string(),
         );
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
@@ -3334,10 +3545,10 @@ mod tests {
     fn a_single_sink_forces_the_whole_group_to_one_stream() {
         let sinks = vec![
             sink_entry("warehouse", by_key(&["id"]), None),
-            sink_entry("webhook", Placement::Single, None),
+            sink_entry("plugin", Placement::Single, None),
         ];
 
-        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "warehouse, webhook");
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "warehouse, plugin");
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::Single);

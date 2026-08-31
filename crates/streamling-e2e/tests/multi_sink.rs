@@ -633,15 +633,16 @@ sinks:
 }
 
 /// Scenario 6: `MultiSinkExec` never executes a sink's physical plan — it calls `write_all`
-/// once per (input partition, sink). A sink that cannot be parallelized therefore
-/// cannot guard itself from inside `insert_into`; the whole group has to be
-/// narrowed at planning time, which is what `Placement::Single` does.
+/// once per (input partition, sink), so the fan-out's own width *is* every
+/// sink's write-stream count. The sinks share one input and therefore one
+/// exchange, which can only be keyed one way.
 ///
-/// A webhook beside a postgres sink over a parallel source is the case that used
-/// to slip through: both sinks still get every row, and the webhook still writes
-/// from one stream.
+/// A webhook beside a postgres sink is the case where that matters: both key on
+/// `id`, so they agree and the group keeps its input's width instead of being
+/// narrowed to the slowest common denominator. Both sinks must still get every
+/// row.
 #[tokio::test]
-async fn test_multi_sink_with_a_webhook_runs_on_one_stream() {
+async fn test_multi_sink_with_a_webhook_shares_the_keyed_exchange() {
     init_tracing();
 
     use streamling_e2e::resources::WebhookResource;
@@ -651,7 +652,7 @@ async fn test_multi_sink_with_a_webhook_runs_on_one_stream() {
         .expect("Failed to create test context");
 
     let topic = ctx
-        .create_kafka_topic_with_partitions("fanout_single_stream", 4)
+        .create_kafka_topic_with_partitions("fanout_keyed_group", 4)
         .await
         .expect("Failed to create multi-partition topic");
     topic
@@ -692,7 +693,7 @@ sinks:
   pg_sink:
     type: postgres
     from: kafka_source
-    table: fanout_single_stream_pg
+    table: fanout_keyed_group_pg
     schema: public
     primary_key: id
     on_conflict: update
@@ -701,6 +702,7 @@ sinks:
     type: webhook
     from: kafka_source
     url: {webhook_url}
+    primary_key: id
     one_row_per_request: true
     payload_version: 0
 "#,
@@ -728,8 +730,8 @@ sinks:
     // never appears here — the fan-out's own width *is* the sink's write-stream
     // count, one `write_all` per input partition per sink.
     assert!(
-        output.stderr.contains("MultiSinkExec: partitions=1"),
-        "the fan-out must reach both sinks on one stream; stderr:\n{}",
+        output.stderr.contains("MultiSinkExec: partitions=2"),
+        "sinks agreeing on a key must keep the group at its input's width; stderr:\n{}",
         output.stderr
     );
 
@@ -748,7 +750,7 @@ sinks:
 
     let pg_count = ctx
         .postgres
-        .count("SELECT COUNT(*) FROM public.fanout_single_stream_pg")
+        .count("SELECT COUNT(*) FROM public.fanout_keyed_group_pg")
         .await
         .expect("Failed to query PostgreSQL count");
     assert_eq!(

@@ -535,6 +535,11 @@ pub struct HandlerTransform {
     pub one_row_per_request: Option<bool>,
     pub payload_version: Option<u32>,
     pub schema_override: Option<BTreeMap<String, Option<String>>>,
+    /// Number of concurrent request streams, hash-partitioned by `primary_key`
+    /// so a key is never in flight against the endpoint twice at once.
+    /// Each stream runs its own HTTP client, so in-flight requests multiply by
+    /// this. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -548,11 +553,11 @@ pub struct ScriptTransform {
     pub language: String,
     pub script: String,
     pub schema: Option<BTreeMap<String, String>>,
-    /// Number of WASM plugin instances for parallel processing.
-    /// Overrides the global wasm_script.parallelism if specified.
+    /// Number of concurrent WASM execution streams, hash-partitioned by
+    /// `primary_key`. Each stream owns one WASM instance. Defaults to the input
+    /// width.
     pub parallelism: Option<usize>,
-    /// Minimum rows to accumulate before processing.
-    /// Overrides the global wasm_script.batch_size if specified.
+    /// Rows accumulated per execution stream before invoking WASM.
     pub batch_size: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
@@ -596,16 +601,13 @@ impl Transform {
 
     /// Requested output width for this transform.
     ///
-    /// `script` is deliberately absent: its `parallelism` sizes the WASM instance
-    /// pool inside a single stream, which is a different thing from plan width.
-    /// `handler`, `plugin` and `dynamic_table` are `SinglePartition` operators.
+    /// `plugin` and `dynamic_table` are `SinglePartition` operators.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Transform::sql(t) => t.parallelism,
-            Transform::dynamic_table(_)
-            | Transform::handler(_)
-            | Transform::script(_)
-            | Transform::plugin(_) => None,
+            Transform::handler(t) => t.parallelism,
+            Transform::script(t) => t.parallelism,
+            Transform::dynamic_table(_) | Transform::plugin(_) => None,
         }
     }
 }
@@ -621,6 +623,12 @@ pub struct WebhookSink {
     pub payload_version: Option<u32>,
     pub skip_on_error: Option<bool>,
     pub primary_key: Option<String>,
+    /// Number of concurrent write streams, keyed by `primary_key` so a key is
+    /// never delivered by two streams at once — the payload carries a per-row
+    /// op, so a receiver applying upserts and deletes depends on that ordering.
+    /// In-flight HTTP requests against the endpoint multiply by this. Defaults
+    /// to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -879,7 +887,8 @@ impl Sink {
             Sink::print(s) => s.parallelism,
             Sink::blackhole(s) => s.parallelism,
             Sink::memory(s) => s.parallelism,
-            Sink::webhook(_) | Sink::plugin(_) => None,
+            Sink::webhook(s) => s.parallelism,
+            Sink::plugin(_) => None,
         }
     }
 }

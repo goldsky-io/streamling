@@ -1,18 +1,12 @@
 //! An operator that can execute provided WASM code. Currently, it relies on the runtime's
 //! `eval` method.
 //!
-//! # Performance Optimizations
+//! Each physical input partition is processed by one isolated WASM instance.
+//! Plan-level repartitioning controls concurrency; this operator preserves the
+//! input width and processes each partition in order.
 //!
-//! This module supports several optimizations for high-throughput scenarios:
-//!
-//! 1. **WASM Plugin Pool**: Uses `extism::Pool` to maintain multiple WASM plugin instances
-//!    that can process batches concurrently. Configure via `parallelism` parameter.
-//!
-//! 2. **Configurable Parallelism**: Set the number of concurrent WASM runners to balance
-//!    throughput and resource usage (default: 4).
-//!
-//! 3. **Batch Accumulation**: Accumulates smaller batches into larger ones before processing
-//!    to reduce WASM call overhead. Configure via `batch_size` parameter.
+//! Extism calls are blocking, so each invocation runs on Tokio's blocking pool
+//! while the async partition stream provides backpressure.
 
 mod transpiler;
 
@@ -23,7 +17,6 @@ use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DFSchemaRef, Statistics};
 use datafusion::error::DataFusionError;
@@ -35,26 +28,20 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_input_stream,
-    execution_plan::{Boundedness, EmissionType},
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    execute_input_stream,
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use extism::{Manifest, Plugin, Pool, Wasm};
+use extism::{Manifest, Plugin, Wasm};
 use futures::StreamExt;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
-use tracing::{self, debug, error, info};
+use tracing::{self, debug, error};
 
 const WASM_FUNCTION_INVOKE: &str = "invoke";
-
-/// Default number of WASM plugin instances in the pool
-const DEFAULT_POOL_SIZE: usize = 4;
-
-/// Default minimum batch size for accumulation (0 = no accumulation, process each batch immediately)
-const DEFAULT_BATCH_SIZE: usize = 0;
 
 /// The JS/TS WASM runtime, embedded so the binary is self-contained. Used when
 /// `runtime_wasm_file_path` is not set; an explicit path overrides it.
@@ -68,15 +55,6 @@ pub struct WasmRunnerNode {
     internal_buffer_size: u32,
     schema_map: Option<BTreeMap<String, String>>,
     schema: Option<Arc<DFSchema>>,
-    /// Number of WASM plugin instances to use for parallel processing.
-    /// Higher values allow more concurrent batch processing but use more memory.
-    /// Default is 4.
-    parallelism: usize,
-    /// Minimum number of rows to accumulate before processing.
-    /// Smaller batches are combined until this threshold is reached.
-    /// Set to 0 to disable accumulation and process each batch immediately.
-    /// Default is 0 (disabled).
-    batch_size: usize,
 }
 
 impl WasmRunnerNode {
@@ -95,13 +73,11 @@ impl WasmRunnerNode {
             runtime_wasm_file_path,
             internal_buffer_size,
             schema_map,
-            DEFAULT_POOL_SIZE,
-            DEFAULT_BATCH_SIZE,
         )
         .expect("WasmRunnerNode::new called with an invalid schema map")
     }
 
-    /// Create a new WasmRunnerNode with configurable pool size.
+    /// Create a new WasmRunnerNode with a validated output schema.
     ///
     /// # Arguments
     /// * `input` - The input logical plan
@@ -110,42 +86,6 @@ impl WasmRunnerNode {
     /// * `runtime_wasm_file_path` - Path to the WASM runtime file
     /// * `internal_buffer_size` - Size of the internal buffer for batch processing
     /// * `schema_map` - Optional output schema mapping
-    /// * `parallelism` - Number of WASM plugin instances for parallel processing (default: 4)
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_parallelism(
-        input: LogicalPlan,
-        language: String,
-        script: String,
-        runtime_wasm_file_path: Option<String>,
-        internal_buffer_size: u32,
-        schema_map: Option<BTreeMap<String, String>>,
-        parallelism: usize,
-    ) -> Self {
-        Self::with_options(
-            input,
-            language,
-            script,
-            runtime_wasm_file_path,
-            internal_buffer_size,
-            schema_map,
-            parallelism,
-            DEFAULT_BATCH_SIZE,
-        )
-        .expect("WasmRunnerNode::with_parallelism called with an invalid schema map")
-    }
-
-    /// Create a new WasmRunnerNode with full configuration options.
-    ///
-    /// # Arguments
-    /// * `input` - The input logical plan
-    /// * `language` - The script language ("javascript", "js", "typescript", "ts")
-    /// * `script` - The script code
-    /// * `runtime_wasm_file_path` - Path to the WASM runtime file
-    /// * `internal_buffer_size` - Size of the internal buffer for batch processing
-    /// * `schema_map` - Optional output schema mapping
-    /// * `parallelism` - Number of WASM plugin instances for parallel processing (default: 4)
-    /// * `batch_size` - Minimum rows to accumulate before processing (0 = disabled)
-    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         input: LogicalPlan,
         language: String,
@@ -153,8 +93,6 @@ impl WasmRunnerNode {
         runtime_wasm_file_path: Option<String>,
         internal_buffer_size: u32,
         schema_map: Option<BTreeMap<String, String>>,
-        parallelism: usize,
-        batch_size: usize,
     ) -> Result<Self> {
         // Build DF schema directly here. If a target schema is provided, use it;
         // otherwise default to the input plan's schema.
@@ -171,9 +109,6 @@ impl WasmRunnerNode {
             Some(Arc::new(input.schema().as_ref().clone()))
         };
 
-        // Ensure parallelism is at least 1
-        let parallelism = parallelism.max(1);
-
         Ok(Self {
             input,
             language,
@@ -182,8 +117,6 @@ impl WasmRunnerNode {
             internal_buffer_size,
             schema_map,
             schema,
-            parallelism,
-            batch_size,
         })
     }
 
@@ -260,8 +193,6 @@ impl UserDefinedLogicalNodeCore for WasmRunnerNode {
             internal_buffer_size: self.internal_buffer_size,
             schema_map: self.schema_map.clone(),
             schema: self.schema.clone(),
-            parallelism: self.parallelism,
-            batch_size: self.batch_size,
         })
     }
 
@@ -286,8 +217,7 @@ impl ExtensionPlanner for WasmRunnerExtensionPlanner {
             if let Some(wasm_runner_node) = node.as_any().downcast_ref::<WasmRunnerNode>() {
                 let input_physical = planner
                     .create_physical_plan(&wasm_runner_node.input, session_state)
-                    .await
-                    .unwrap();
+                    .await?;
 
                 let output_schema = wasm_runner_node.get_output_schema()?;
 
@@ -298,8 +228,6 @@ impl ExtensionPlanner for WasmRunnerExtensionPlanner {
                     wasm_runner_node.runtime_wasm_file_path.clone(),
                     wasm_runner_node.internal_buffer_size,
                     output_schema,
-                    wasm_runner_node.parallelism,
-                    wasm_runner_node.batch_size,
                 ));
                 Some(wasm_exec)
             } else {
@@ -317,16 +245,11 @@ struct WasmRunnerExec {
     internal_buffer_size: u32,
     cache: Arc<PlanProperties>,
     schema: SchemaRef,
-    /// Number of WASM plugin instances in the pool
-    parallelism: usize,
-    /// Minimum rows to accumulate before processing (0 = disabled)
-    batch_size: usize,
     /// Pre-transpiled code (cached for efficiency)
     transpiled_code: String,
 }
 
 impl WasmRunnerExec {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         input: Arc<dyn ExecutionPlan>,
         language: String,
@@ -334,11 +257,9 @@ impl WasmRunnerExec {
         runtime_wasm_file_path: Option<String>,
         internal_buffer_size: u32,
         schema: SchemaRef,
-        parallelism: usize,
-        batch_size: usize,
     ) -> Self {
         let transpiler = TsToJSTranspiler::new();
-        let cache = Self::compute_properties(schema.clone());
+        let cache = Self::compute_properties(&input, schema.clone());
 
         // Pre-transpile the code at construction time for efficiency
         let transpiled_code = match language.as_str() {
@@ -353,11 +274,6 @@ impl WasmRunnerExec {
             _ => script.clone(),
         };
 
-        info!(
-            "WasmRunnerExec created with parallelism={}, batch_size={}",
-            parallelism, batch_size
-        );
-
         Self {
             input,
             language,
@@ -366,53 +282,17 @@ impl WasmRunnerExec {
             internal_buffer_size,
             cache: Arc::new(cache),
             schema,
-            parallelism,
-            batch_size,
             transpiled_code,
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Unbounded {
-                requires_infinite_memory: false,
-            },
+            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
+            input.pipeline_behavior(),
+            input.boundedness(),
         )
-    }
-
-    fn create_wasm_plugin(&self) -> Plugin {
-        let wasm_file = match &self.runtime_wasm_file_path {
-            Some(path) => Wasm::file(path.clone()),
-            None => Wasm::data(EMBEDDED_RUNTIME_WASM),
-        };
-        // Use pre-transpiled code for efficiency
-        let wasm_manifest =
-            Manifest::new([wasm_file]).with_config_key("code", self.transpiled_code.clone());
-        Plugin::new(&wasm_manifest, [], true).unwrap()
-    }
-
-    /// Create a pool of WASM plugins for concurrent processing
-    fn create_wasm_pool(&self) -> Pool {
-        let runtime_wasm_file_path = self.runtime_wasm_file_path.clone();
-        let transpiled_code = self.transpiled_code.clone();
-
-        debug!(
-            "Creating WASM plugin pool with {} instances",
-            self.parallelism
-        );
-
-        Pool::new(move || {
-            let wasm_file = match &runtime_wasm_file_path {
-                Some(path) => Wasm::file(path.clone()),
-                None => Wasm::data(EMBEDDED_RUNTIME_WASM),
-            };
-            let wasm_manifest =
-                Manifest::new([wasm_file]).with_config_key("code", transpiled_code.clone());
-            Plugin::new(&wasm_manifest, [], true)
-        })
     }
 }
 
@@ -449,7 +329,7 @@ impl ExecutionPlan for WasmRunnerExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -467,8 +347,6 @@ impl ExecutionPlan for WasmRunnerExec {
             self.runtime_wasm_file_path.clone(),
             self.internal_buffer_size,
             self.schema.clone(),
-            self.parallelism,
-            self.batch_size,
         )))
     }
 
@@ -477,7 +355,7 @@ impl ExecutionPlan for WasmRunnerExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let data = execute_input_stream(
+        let mut data = execute_input_stream(
             Arc::clone(&self.input),
             Arc::clone(&self.input.schema()),
             partition,
@@ -485,23 +363,8 @@ impl ExecutionPlan for WasmRunnerExec {
         )?;
 
         let output_schema = self.schema.clone();
-        let input_schema = self.input.schema();
-        let parallelism = self.parallelism;
-        let batch_size = self.batch_size;
-
-        // Create WASM pool for concurrent processing
-        let wasm_pool = if parallelism > 1 {
-            Some(Arc::new(self.create_wasm_pool()))
-        } else {
-            None
-        };
-
-        // Fallback to single plugin if parallelism is 1
-        let single_plugin = if parallelism == 1 {
-            Some(std::sync::Mutex::new(self.create_wasm_plugin()))
-        } else {
-            None
-        };
+        let runtime_wasm_file_path = self.runtime_wasm_file_path.clone();
+        let transpiled_code = self.transpiled_code.clone();
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             self.schema(),
@@ -510,34 +373,53 @@ impl ExecutionPlan for WasmRunnerExec {
         let tx = builder.tx();
 
         builder.spawn(async move {
-            let mut stream = data;
+            let plugin = tokio::task::spawn_blocking(move || {
+                Self::create_wasm_plugin(runtime_wasm_file_path, transpiled_code)
+            })
+            .await
+            .map_err(|error| {
+                DataFusionError::from(crate::streamling_err!(
+                    "WASM instance task failed: {}",
+                    error
+                ))
+            })??;
+            let plugin = Arc::new(std::sync::Mutex::new(plugin));
 
-            // For parallelism > 1, we can process batches concurrently
-            // For parallelism == 1, we process sequentially (backward compatible)
-            if parallelism > 1 {
-                // Concurrent processing with pool
-                Self::execute_with_pool(
-                    &mut stream,
-                    wasm_pool.as_ref().unwrap(),
-                    output_schema,
-                    input_schema,
-                    batch_size,
-                    parallelism,
-                    tx,
-                )
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                let plugin = Arc::clone(&plugin);
+                let batch_output_schema = Arc::clone(&output_schema);
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut plugin = plugin.lock().map_err(|error| {
+                        DataFusionError::from(crate::streamling_err!(
+                            "failed to lock WASM instance: {}",
+                            error
+                        ))
+                    })?;
+                    Self::process_batch(&batch, &mut plugin, &batch_output_schema)
+                })
                 .await
-            } else {
-                // Sequential processing with single plugin
-                Self::execute_sequential(
-                    &mut stream,
-                    single_plugin.as_ref().unwrap(),
-                    output_schema,
-                    input_schema,
-                    batch_size,
-                    tx,
-                )
-                .await
+                .map_err(|error| {
+                    DataFusionError::from(crate::streamling_err!(
+                        "WASM invocation task failed: {}",
+                        error
+                    ))
+                })?;
+
+                match result {
+                    Ok(batch) => {
+                        if tx.send(Ok(batch)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        break;
+                    }
+                }
             }
+
+            Ok(())
         });
 
         Ok(builder.build())
@@ -549,322 +431,26 @@ impl ExecutionPlan for WasmRunnerExec {
 }
 
 impl WasmRunnerExec {
-    /// Execute batches sequentially with a single WASM plugin
-    /// Supports batch accumulation when batch_size > 0
-    async fn execute_sequential(
-        stream: &mut SendableRecordBatchStream,
-        plugin_mutex: &std::sync::Mutex<Plugin>,
-        output_schema: SchemaRef,
-        input_schema: SchemaRef,
-        batch_size: usize,
-        tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
-    ) -> Result<()> {
-        let arrow_to_ipc_converter = FromArrowToIpcConverter::new();
-        let mut from_ipc_converter = FromIpcToArrowConverter::new(output_schema.clone());
-
-        // Batch accumulation state
-        let mut accumulated_batches: Vec<RecordBatch> = Vec::new();
-        let mut accumulated_rows: usize = 0;
-
-        while let Some(batch) = stream.next().await {
-            match batch {
-                Ok(batch) => {
-                    // If batch accumulation is disabled (batch_size == 0), process immediately
-                    if batch_size == 0 {
-                        let result = Self::process_single_batch(
-                            &batch,
-                            plugin_mutex,
-                            &arrow_to_ipc_converter,
-                            &mut from_ipc_converter,
-                            &output_schema,
-                        );
-
-                        match result {
-                            Ok(output_batch) => {
-                                if tx.send(Ok(output_batch)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(e)).await;
-                                break;
-                            }
-                        }
-                    } else {
-                        // Accumulate batches until we reach batch_size
-                        let batch_rows = batch.num_rows();
-                        if batch_rows > 0 {
-                            accumulated_batches.push(batch);
-                            accumulated_rows += batch_rows;
-                        }
-
-                        // Process when we've accumulated enough rows
-                        if accumulated_rows >= batch_size {
-                            let combined_batch =
-                                Self::combine_batches(&accumulated_batches, &input_schema)?;
-                            accumulated_batches.clear();
-                            accumulated_rows = 0;
-
-                            let result = Self::process_single_batch(
-                                &combined_batch,
-                                plugin_mutex,
-                                &arrow_to_ipc_converter,
-                                &mut from_ipc_converter,
-                                &output_schema,
-                            );
-
-                            match result {
-                                Ok(output_batch) => {
-                                    if tx.send(Ok(output_batch)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-
-        // Process any remaining accumulated batches
-        if !accumulated_batches.is_empty() {
-            let combined_batch = Self::combine_batches(&accumulated_batches, &input_schema)?;
-            let result = Self::process_single_batch(
-                &combined_batch,
-                plugin_mutex,
-                &arrow_to_ipc_converter,
-                &mut from_ipc_converter,
-                &output_schema,
-            );
-
-            if let Ok(output_batch) = result {
-                let _ = tx.send(Ok(output_batch)).await;
-            }
-        }
-
-        Ok(())
+    fn create_wasm_plugin(
+        runtime_wasm_file_path: Option<String>,
+        transpiled_code: String,
+    ) -> Result<Plugin> {
+        let wasm = match runtime_wasm_file_path {
+            Some(path) => Wasm::file(path),
+            None => Wasm::data(EMBEDDED_RUNTIME_WASM),
+        };
+        let manifest = Manifest::new([wasm]).with_config_key("code", transpiled_code);
+        Plugin::new(&manifest, [], true).map_err(|error| {
+            DataFusionError::from(crate::streamling_err!(
+                "failed to create WASM instance: {}",
+                error
+            ))
+        })
     }
 
-    /// Combine multiple batches into a single batch using concat_batches
-    fn combine_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordBatch> {
-        if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(schema.clone()));
-        }
-
-        if batches.len() == 1 {
-            return Ok(batches[0].clone());
-        }
-
-        // Preserve metadata from the last batch (most recent checkpoint info)
-        let last_metadata = batches.last().unwrap().schema().metadata().clone();
-
-        let combined = concat_batches(schema, batches)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-        // Re-apply metadata to the combined batch
-        enrich_batch_with_metadata(combined, last_metadata).map_err(|e| e.into())
-    }
-
-    /// Execute batches concurrently using a pool of WASM plugins
-    /// Supports batch accumulation when batch_size > 0
-    async fn execute_with_pool(
-        stream: &mut SendableRecordBatchStream,
-        pool: &Arc<Pool>,
-        output_schema: SchemaRef,
-        input_schema: SchemaRef,
-        batch_size: usize,
-        parallelism: usize,
-        tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
-    ) -> Result<()> {
-        // Batch accumulation state
-        let mut accumulated_batches: Vec<RecordBatch> = Vec::new();
-        let mut accumulated_rows: usize = 0;
-
-        while let Some(batch) = stream.next().await {
-            match batch {
-                Ok(batch) => {
-                    // Determine the batch to process (either immediate or accumulated)
-                    let batch_to_process = if batch_size == 0 {
-                        // No accumulation, process immediately
-                        Some(batch)
-                    } else {
-                        // Accumulate batches
-                        let batch_rows = batch.num_rows();
-                        if batch_rows > 0 {
-                            accumulated_batches.push(batch);
-                            accumulated_rows += batch_rows;
-                        }
-
-                        if accumulated_rows >= batch_size {
-                            let combined =
-                                Self::combine_batches(&accumulated_batches, &input_schema)?;
-                            accumulated_batches.clear();
-                            accumulated_rows = 0;
-                            Some(combined)
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(batch) = batch_to_process {
-                        Self::parallel_process_batch(
-                            &batch,
-                            pool,
-                            &output_schema,
-                            parallelism,
-                            &tx,
-                        )
-                        .await?;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-
-        // Process any remaining accumulated batches
-        if !accumulated_batches.is_empty() {
-            let combined = Self::combine_batches(&accumulated_batches, &input_schema)?;
-            Self::parallel_process_batch(&combined, pool, &output_schema, parallelism, &tx).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Process a batch in parallel by slicing it and using buffered stream
-    async fn parallel_process_batch(
+    fn process_batch(
         batch: &RecordBatch,
-        pool: &Arc<Pool>,
-        output_schema: &SchemaRef,
-        parallelism: usize,
-        tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
-    ) -> Result<()> {
-        let total_rows = batch.num_rows();
-        if total_rows == 0 {
-            // For empty batches, emit an empty batch with the output schema and preserved metadata
-            let input_metadata = batch.schema().metadata().clone();
-            let empty_batch = RecordBatch::new_empty(output_schema.clone());
-            let result =
-                enrich_batch_with_metadata(empty_batch, input_metadata).map_err(|e| e.into());
-            let _ = tx.send(result).await;
-            return Ok(());
-        }
-
-        // Calculate effective workers and slice the batch
-        let effective_workers = parallelism.min(total_rows).max(1);
-        let shard_capacity = total_rows.div_ceil(effective_workers);
-
-        let mut slices: Vec<RecordBatch> = Vec::with_capacity(effective_workers);
-        for i in 0..effective_workers {
-            let start = i.saturating_mul(shard_capacity);
-            let remaining = total_rows.saturating_sub(start);
-            let len = remaining.min(shard_capacity);
-            if len > 0 {
-                slices.push(batch.slice(start, len));
-            }
-        }
-
-        // Process slices in parallel using buffered (preserves order unlike buffer_unordered)
-        let pool = Arc::clone(pool);
-        let output_schema = output_schema.clone();
-        let batch_start = std::time::Instant::now();
-
-        let results_with_timing: Vec<(Result<RecordBatch>, std::time::Duration)> =
-            futures::stream::iter(slices.into_iter())
-                .map(|slice| {
-                    let pool = Arc::clone(&pool);
-                    let output_schema = output_schema.clone();
-                    async move {
-                        let start = std::time::Instant::now();
-                        let result = tokio::task::spawn_blocking(move || {
-                            Self::process_batch_with_pool(&slice, &pool, &output_schema)
-                        })
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::from(crate::streamling_err!(
-                                "WASM task join error: {}",
-                                e
-                            ))
-                        });
-                        let elapsed = start.elapsed();
-                        // Flatten the nested Result: Result<Result<RecordBatch>, JoinError> -> Result<RecordBatch>
-                        let flattened = match result {
-                            Ok(inner) => inner,
-                            Err(e) => Err(e),
-                        };
-                        (flattened, elapsed)
-                    }
-                })
-                .buffered(effective_workers)
-                .collect()
-                .await;
-
-        // Log summary for all slices
-        let total_elapsed = batch_start.elapsed();
-        let slice_times: Vec<_> = results_with_timing.iter().map(|(_, d)| *d).collect();
-        let min_time = slice_times.iter().min().copied().unwrap_or_default();
-        let max_time = slice_times.iter().max().copied().unwrap_or_default();
-        debug!(
-            "WASM parallel batch: {} rows, {} slices, total={:?}, slice_times=[min={:?}, max={:?}]",
-            total_rows,
-            results_with_timing.len(),
-            total_elapsed,
-            min_time,
-            max_time
-        );
-
-        // Collect successful batches and check for errors
-        let mut successful_batches: Vec<RecordBatch> = Vec::new();
-        for (result, _) in results_with_timing {
-            match result {
-                Ok(batch) => successful_batches.push(batch),
-                Err(e) => {
-                    // Send error and return early
-                    let _ = tx.send(Err(e)).await;
-                    return Ok(());
-                }
-            }
-        }
-
-        // Merge all successful batches into one and send
-        if successful_batches.is_empty() {
-            // All slices produced empty results, send empty batch with correct schema
-            let input_metadata = batch.schema().metadata().clone();
-            let empty_batch = RecordBatch::new_empty(output_schema.clone());
-            let result =
-                enrich_batch_with_metadata(empty_batch, input_metadata).map_err(|e| e.into());
-            let _ = tx.send(result).await;
-        } else if successful_batches.len() == 1 {
-            // Only one batch, send directly
-            let _ = tx.send(Ok(successful_batches.remove(0))).await;
-        } else {
-            // Multiple batches, merge them preserving metadata from input
-            let input_metadata = batch.schema().metadata().clone();
-            let merged = concat_batches(&output_schema, &successful_batches)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let result = enrich_batch_with_metadata(merged, input_metadata).map_err(|e| e.into());
-            let _ = tx.send(result).await;
-        }
-
-        Ok(())
-    }
-
-    /// Process a single batch using a mutex-protected plugin (sequential mode)
-    fn process_single_batch(
-        batch: &RecordBatch,
-        plugin_mutex: &std::sync::Mutex<Plugin>,
-        arrow_to_ipc_converter: &FromArrowToIpcConverter,
-        from_ipc_converter: &mut FromIpcToArrowConverter,
+        plugin: &mut Plugin,
         output_schema: &SchemaRef,
     ) -> Result<RecordBatch> {
         let input_metadata = batch.schema().metadata().clone();
@@ -877,99 +463,33 @@ impl WasmRunnerExec {
 
         if batch.num_rows() == 0 {
             let empty_batch = RecordBatch::new_empty(output_schema.clone());
-            return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(|e| e.into());
+            return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(Into::into);
         }
 
-        // Serialize RecordBatch to Arrow IPC bytes
-        let ipc_bytes_vec = arrow_to_ipc_converter.convert_from_batch(batch)?;
+        let ipc_bytes = FromArrowToIpcConverter::new()
+            .convert_from_batch(batch)?
+            .into_iter()
+            .next();
 
-        if ipc_bytes_vec.is_empty() {
+        let Some(ipc_bytes) = ipc_bytes else {
             let empty_batch = RecordBatch::new_empty(output_schema.clone());
-            return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(|e| e.into());
-        }
+            return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(Into::into);
+        };
 
-        let ipc_bytes = &ipc_bytes_vec[0];
-
-        // Call WASM plugin with Arrow IPC bytes
-        let output_ipc_bytes = {
-            let mut plugin = plugin_mutex.lock().map_err(|e| {
-                DataFusionError::from(crate::streamling_err!("failed to lock WASM plugin: {}", e))
+        let output_ipc_bytes = plugin
+            .call::<Vec<u8>, Vec<u8>>(WASM_FUNCTION_INVOKE, ipc_bytes)
+            .map_err(|error| {
+                error!("Script encountered errors: \n{}", error);
+                DataFusionError::from(crate::streamling_user_err!(
+                    "WASM script execution failed: {}",
+                    error
+                ))
             })?;
 
-            plugin
-                .call::<Vec<u8>, Vec<u8>>(WASM_FUNCTION_INVOKE, ipc_bytes.clone())
-                .map_err(|e| {
-                    error!("Script encountered errors: \n{}", e);
-                    DataFusionError::from(crate::streamling_user_err!(
-                        "WASM script execution failed: {}",
-                        e
-                    ))
-                })?
-        };
-
-        // Buffer and convert output
-        from_ipc_converter.buffer(output_ipc_bytes);
-        let output_batch = from_ipc_converter.convert_to_batch()?;
-        enrich_batch_with_metadata(output_batch, input_metadata).map_err(|e| e.into())
-    }
-
-    /// Process a single batch using the plugin pool (concurrent mode)
-    fn process_batch_with_pool(
-        batch: &RecordBatch,
-        pool: &Pool,
-        output_schema: &SchemaRef,
-    ) -> Result<RecordBatch> {
-        let input_metadata = batch.schema().metadata().clone();
-
-        if batch.num_rows() == 0 {
-            let empty_batch = RecordBatch::new_empty(output_schema.clone());
-            return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(|e| e.into());
-        }
-
-        let arrow_to_ipc_converter = FromArrowToIpcConverter::new();
-        let mut from_ipc_converter = FromIpcToArrowConverter::new(output_schema.clone());
-
-        // Serialize RecordBatch to Arrow IPC bytes
-        let ipc_bytes_vec = arrow_to_ipc_converter.convert_from_batch(batch)?;
-
-        if ipc_bytes_vec.is_empty() {
-            let empty_batch = RecordBatch::new_empty(output_schema.clone());
-            return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(|e| e.into());
-        }
-
-        let ipc_bytes = &ipc_bytes_vec[0];
-
-        // Get a plugin instance from the pool and call it
-        let output_ipc_bytes = {
-            let mut plugin_handle = pool
-                .get(std::time::Duration::from_secs(60))
-                .map_err(|e| {
-                    DataFusionError::from(crate::streamling_err!(
-                        "failed to get WASM plugin from pool: {}",
-                        e
-                    ))
-                })?
-                .ok_or_else(|| {
-                    DataFusionError::from(crate::streamling_err!(
-                        "timed out waiting for WASM plugin from pool (60s)"
-                    ))
-                })?;
-
-            plugin_handle
-                .call::<Vec<u8>, Vec<u8>>(WASM_FUNCTION_INVOKE, ipc_bytes.clone())
-                .map_err(|e| {
-                    error!("Script encountered errors: \n{}", e);
-                    DataFusionError::from(crate::streamling_user_err!(
-                        "WASM script execution failed: {}",
-                        e
-                    ))
-                })?
-        };
-
-        // Buffer and convert output
-        from_ipc_converter.buffer(output_ipc_bytes);
-        let output_batch = from_ipc_converter.convert_to_batch()?;
-        enrich_batch_with_metadata(output_batch, input_metadata).map_err(|e| e.into())
+        let mut converter = FromIpcToArrowConverter::new(output_schema.clone());
+        converter.buffer(output_ipc_bytes);
+        let output_batch = converter.convert_to_batch()?;
+        enrich_batch_with_metadata(output_batch, input_metadata).map_err(Into::into)
     }
 }
 
@@ -980,8 +500,6 @@ impl PartialEq for WasmRunnerNode {
             && self.runtime_wasm_file_path == other.runtime_wasm_file_path
             && self.internal_buffer_size == other.internal_buffer_size
             && self.schema_map == other.schema_map
-            && self.parallelism == other.parallelism
-            && self.batch_size == other.batch_size
     }
 }
 
@@ -1004,8 +522,6 @@ impl Ord for WasmRunnerNode {
             )
             .then(self.internal_buffer_size.cmp(&other.internal_buffer_size))
             .then(self.schema_map.cmp(&other.schema_map))
-            .then(self.parallelism.cmp(&other.parallelism))
-            .then(self.batch_size.cmp(&other.batch_size))
     }
 }
 
@@ -1016,8 +532,6 @@ impl std::hash::Hash for WasmRunnerNode {
         self.runtime_wasm_file_path.hash(state);
         self.internal_buffer_size.hash(state);
         self.schema_map.hash(state);
-        self.parallelism.hash(state);
-        self.batch_size.hash(state);
     }
 }
 
@@ -1028,6 +542,8 @@ mod tests {
     use crate::operators::planner::StreamlingQueryPlanner;
 
     use datafusion::arrow::array::{Array, BooleanArray, Int64Array, StringArray};
+    use datafusion::arrow::compute::concat_batches;
+    use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::Extension;
     use datafusion::prelude::SessionContext;
@@ -1794,9 +1310,7 @@ mod tests {
         schema_map.insert("active".to_string(), "boolean".to_string());
         schema_map.insert("count".to_string(), "int64".to_string());
 
-        // Use parallelism=1 because this test relies on all rows being processed together
-        // to correctly handle missing/undefined fields across rows in the same IPC batch
-        let wasm_node = WasmRunnerNode::with_parallelism(
+        let wasm_node = WasmRunnerNode::new(
             ctx.table("test_table")
                 .await
                 .unwrap()
@@ -1807,7 +1321,6 @@ mod tests {
             None,
             1000,
             Some(schema_map),
-            1, // parallelism=1 to process all rows together
         );
 
         let df = match ctx.execute_logical_plan(wasm_node.into()).await {
@@ -1828,7 +1341,6 @@ mod tests {
         // Verify we got batches
         assert!(!batches.is_empty(), "Should have at least one batch");
 
-        // With parallelism=1, all rows should be in the same batch
         let combined_batch = &batches[0];
         let schema = combined_batch.schema();
 
@@ -2352,11 +1864,17 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("custom_metadata".to_string(), "test_value".to_string());
         metadata.insert("another_key".to_string(), "another_value".to_string());
-        // Add checkpoint messages - these should be removed
-        use crate::checkpoints::checkpoint_management::CHECKPOINT_MESSAGES_KEY;
-        metadata.insert(
-            CHECKPOINT_MESSAGES_KEY.to_string(),
-            r#"[{"Marker":100}]"#.to_string(),
+        use crate::checkpoints::checkpoint_management::{
+            CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+            extract_checkpoint_messages,
+        };
+        let checkpoint_epoch = CheckpointEpoch(100);
+        enrich_batch_metadata_with_checkpoints(
+            &mut metadata,
+            &[CheckpointMessage::Marker {
+                epoch: checkpoint_epoch.clone(),
+                created_at_ms: 0,
+            }],
         );
 
         let empty_batch = RecordBatch::new_empty(input_schema.clone());
@@ -2453,7 +1971,7 @@ mod tests {
             "Empty batch should NOT have input_field2 (wrong schema)"
         );
 
-        // Verify metadata propagation (checkpoint_messages should be removed)
+        // Verify metadata propagation
         let output_metadata = output_schema.metadata();
         assert_eq!(
             output_metadata.get("custom_metadata"),
@@ -2465,6 +1983,11 @@ mod tests {
             Some(&"another_value".to_string()),
             "Another metadata key should be propagated"
         );
+        let checkpoint_messages = extract_checkpoint_messages(output_metadata);
+        assert!(matches!(
+            checkpoint_messages.as_slice(),
+            [CheckpointMessage::Marker { epoch, .. }] if epoch == &checkpoint_epoch
+        ));
         // Verify the batch is actually empty
         assert_eq!(empty_batch.num_rows(), 0, "Batch should be empty");
         assert_eq!(
@@ -2475,17 +1998,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wasm_pool_preserves_row_order() {
-        // Test that parallel processing with parallelism > 1 preserves row order
-        // This verifies the execute_with_pool and parallel_process_batch functions
-        // maintain ordering when processing slices concurrently
+    async fn test_wasm_processes_every_input_partition() {
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
             .build();
         let ctx = SessionContext::new_with_state(state);
 
-        // Create input data with 100 rows to ensure parallel slicing kicks in
         let num_rows = 100;
         let input_data: Vec<String> = (0..num_rows)
             .map(|i| format!(r#"{{"id": {}, "name": "test{}"}}"#, i, i))
@@ -2504,7 +2023,15 @@ mod tests {
         }
         let input_batch = input_converter.convert_to_batch().unwrap();
 
-        ctx.register_batch("test_table", input_batch).unwrap();
+        let table = MemTable::try_new(
+            input_schema,
+            vec![
+                vec![input_batch.slice(0, num_rows / 2)],
+                vec![input_batch.slice(num_rows / 2, num_rows / 2)],
+            ],
+        )
+        .unwrap();
+        ctx.register_table("test_table", Arc::new(table)).unwrap();
 
         // Script that returns id doubled to verify data integrity
         let script = r#"
@@ -2522,8 +2049,7 @@ mod tests {
         schema_map.insert("doubled".to_string(), "int64".to_string());
         schema_map.insert("name".to_string(), "string".to_string());
 
-        // Use parallelism = 8 to ensure parallel processing with multiple slices
-        let wasm_node = WasmRunnerNode::with_parallelism(
+        let wasm_node = WasmRunnerNode::new(
             ctx.table("test_table")
                 .await
                 .unwrap()
@@ -2534,7 +2060,6 @@ mod tests {
             None,
             1000,
             Some(schema_map),
-            8, // parallelism > 1 triggers parallel processing
         );
 
         let df = match ctx.execute_logical_plan(wasm_node.into()).await {
@@ -2544,60 +2069,64 @@ mod tests {
                 panic!("Error executing logical plan: {:?}", e);
             }
         };
-        let batches = match df.collect().await {
-            Ok(batches) => batches,
+        let partitioned_batches = match df.collect_partitioned().await {
+            Ok(partitioned_batches) => partitioned_batches,
             Err(e) => {
-                eprintln!("Error collecting batches: {:?}", e);
-                panic!("Error collecting batches: {:?}", e);
+                eprintln!("Error collecting partitioned batches: {:?}", e);
+                panic!("Error collecting partitioned batches: {:?}", e);
             }
         };
 
-        let batch = &batches[0];
-
-        // Verify the batch has all rows
         assert_eq!(
-            batch.num_rows(),
+            partitioned_batches.len(),
+            2,
+            "WASM must preserve input width"
+        );
+        assert_eq!(
+            partitioned_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
             num_rows,
-            "Merged batch should have {} rows",
-            num_rows
+            "every input partition must be processed"
         );
 
-        // Extract columns for verification
-        let id_col = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let doubled_col = batch
-            .column_by_name("doubled")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let rows_per_partition = num_rows / partitioned_batches.len();
+        for (partition, batches) in partitioned_batches.iter().enumerate() {
+            let schema = batches
+                .first()
+                .expect("each input partition must produce a batch")
+                .schema();
+            let batch = concat_batches(&schema, batches).unwrap();
+            assert_eq!(batch.num_rows(), rows_per_partition);
 
-        // Verify row order is preserved: IDs should be 0, 1, 2, ..., 99 in order
-        for idx in 0..num_rows {
-            let id = id_col.value(idx);
-            assert_eq!(
-                id, idx as i64,
-                "Row {} should have id={}, but got id={}. Order not preserved!",
-                idx, idx, id
-            );
-        }
+            let id_column = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let doubled_column = batch
+                .column_by_name("doubled")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
 
-        // Verify data integrity: doubled should be id * 2
-        for idx in 0..num_rows {
-            let id = id_col.value(idx);
-            let doubled = doubled_col.value(idx);
-            assert_eq!(
-                doubled,
-                id * 2,
-                "Row {} should have doubled={}, but got doubled={}",
-                idx,
-                id * 2,
-                doubled
-            );
+            for row in 0..rows_per_partition {
+                let expected_id = (partition * rows_per_partition + row) as i64;
+                assert_eq!(
+                    id_column.value(row),
+                    expected_id,
+                    "partition {partition} must preserve row order"
+                );
+                assert_eq!(
+                    doubled_column.value(row),
+                    expected_id * 2,
+                    "partition {partition}, row {row} must preserve transformed values"
+                );
+            }
         }
     }
 }

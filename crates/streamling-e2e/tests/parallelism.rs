@@ -91,6 +91,45 @@ sinks:
     )
 }
 
+fn script_pipeline(path: &std::path::Path, parallelism: usize) -> String {
+    format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    parallelism: 1
+    mode:
+      type: bounded
+
+transforms:
+  normalize:
+    type: script
+    from: file_src
+    language: javascript
+    primary_key: id
+    parallelism: {parallelism}
+    batch_size: 2
+    script: |
+      function(input) {{
+        return {{
+          id: input.id,
+          value: input.value.toUpperCase(),
+        }};
+      }}
+
+sinks:
+  print_sink:
+    type: print
+    from: normalize
+    sample_every: 1
+"#,
+        path = path.display(),
+    )
+}
+
 /// Collects the `id` column from a captured print-sink run, sorted.
 async fn run_and_collect_ids(ctx: &TestContext, pipeline: &str) -> Vec<i64> {
     let output = ctx
@@ -132,6 +171,27 @@ async fn transform_parallelism_widens_a_narrow_source() {
         ids,
         (1..=total).collect::<Vec<i64>>(),
         "every row must survive the 1 -> 4 exchange exactly once"
+    );
+}
+
+/// Script parallelism is physical plan width, not row slicing inside a single
+/// stream. This covers the complete 1 -> 4 path, including per-stream
+/// rebatching, one WASM instance per partition, and terminal checkpoint drain.
+#[tokio::test]
+async fn script_parallelism_widens_a_narrow_source() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let (dir, total) = write_csv_files(&ctx, "script_widen", 4);
+
+    let ids = run_and_collect_ids(&ctx, &script_pipeline(&dir, 4)).await;
+
+    assert_eq!(
+        ids,
+        (1..=total).collect::<Vec<i64>>(),
+        "every row must pass through one of the four WASM streams exactly once"
     );
 }
 
