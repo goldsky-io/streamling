@@ -45,7 +45,9 @@ use tracing::{info, warn};
 ///
 /// Deliberately not `yield_now()`: an empty channel is the steady state for a
 /// live pipeline, and an immediate reschedule spins every runtime worker
-/// instead of letting them park.
+/// instead of letting them park. Mirrors `IDLE_POLL_INTERVAL` in
+/// `streamling-plugin/src/dispatch.rs`, which drains the other end of the same
+/// channels; keep the two in step.
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]

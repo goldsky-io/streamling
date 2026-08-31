@@ -19,7 +19,9 @@ use tracing::error;
 ///
 /// Deliberately not `yield_now()`: an empty channel is the steady state for a
 /// live pipeline, and an immediate reschedule spins every runtime worker
-/// instead of letting them park.
+/// instead of letting them park. Mirrors `IDLE_POLL_INTERVAL` in
+/// `streamling-core/src/plugin.rs`, which drains the other end of the same
+/// channels; keep the two in step.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Outcome of [`wait_for_initialization`]: distinguishes the two messages the
@@ -981,6 +983,34 @@ mod tests {
         }
     }
 
+    fn counting_runtime(calls: &RuntimeCalls) -> PluginAsyncRuntimeObj {
+        PluginAsyncRuntime_TO::from_value(
+            CountingRuntime {
+                inner: DirectTokioProxy::new(),
+                calls: calls.clone(),
+            },
+            TD_Opaque,
+        )
+    }
+
+    fn assert_parked_not_spun(calls: &RuntimeCalls) {
+        assert_eq!(
+            calls.yields.load(Ordering::SeqCst),
+            0,
+            "empty input must not busy-yield: it spins every runtime worker"
+        );
+        assert!(
+            calls.sleeps.load(Ordering::SeqCst) > 0,
+            "empty input must park on the runtime timer"
+        );
+    }
+
+    /// Runs the loop against an empty input channel for 20ms, then stops it.
+    async fn stop_after_idle_window(running: &AtomicBool) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        running.store(false, Ordering::SeqCst);
+    }
+
     #[tokio::test]
     async fn transform_dispatcher_parks_instead_of_spinning_on_empty_input() {
         let channels = make_channels();
@@ -998,30 +1028,36 @@ mod tests {
             .unwrap();
 
         let calls = RuntimeCalls::default();
-        let runtime = PluginAsyncRuntime_TO::from_value(
-            CountingRuntime {
-                inner: DirectTokioProxy::new(),
-                calls: calls.clone(),
-            },
-            TD_Opaque,
+        let (result, ()) = tokio::join!(
+            dispatcher.start(counting_runtime(&calls)),
+            stop_after_idle_window(&plugin.running)
         );
-
-        // Let the loop run against an empty input channel, then stop it.
-        let stop = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            plugin.running.store(false, Ordering::SeqCst);
-        };
-        let (result, ()) = tokio::join!(dispatcher.start(runtime), stop);
         result.expect("dispatcher should exit cleanly once the plugin stops");
 
-        assert_eq!(
-            calls.yields.load(Ordering::SeqCst),
-            0,
-            "empty input must not busy-yield: it spins every runtime worker"
+        assert_parked_not_spun(&calls);
+    }
+
+    #[tokio::test]
+    async fn sink_dispatcher_parks_instead_of_spinning_on_empty_input() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin = Arc::new(RecordingSink::new(recorder));
+        let dispatcher =
+            SinkPluginDispatcher::new(channels.clone(), plugin.clone() as Arc<dyn SinkPlugin>);
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let calls = RuntimeCalls::default();
+        let (result, ()) = tokio::join!(
+            dispatcher.start(counting_runtime(&calls)),
+            stop_after_idle_window(&plugin.running)
         );
-        assert!(
-            calls.sleeps.load(Ordering::SeqCst) > 0,
-            "empty input must park on the runtime timer"
-        );
+        result.expect("dispatcher should exit cleanly once the plugin stops");
+
+        assert_parked_not_spun(&calls);
     }
 }
