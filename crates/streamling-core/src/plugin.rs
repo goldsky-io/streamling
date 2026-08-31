@@ -33,6 +33,7 @@ use std::time::Duration;
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
 };
+pub(crate) use streamling_plugin::ffi::IDLE_POLL_INTERVAL;
 use streamling_plugin::ffi::PluginMetricsChannel;
 pub use streamling_plugin::{
     PluginChannel, PluginChannelCaps, PluginChannels, PluginLabel, PluginLogging, PluginModuleRef,
@@ -40,15 +41,6 @@ pub use streamling_plugin::{
 };
 use tokio::runtime::Handle;
 use tracing::{info, warn};
-
-/// How long a plugin-channel drain loop parks when the channel is empty.
-///
-/// Deliberately not `yield_now()`: an empty channel is the steady state for a
-/// live pipeline, and an immediate reschedule spins every runtime worker
-/// instead of letting them park. Mirrors `IDLE_POLL_INTERVAL` in
-/// `streamling-plugin/src/dispatch.rs`, which drains the other end of the same
-/// channels; keep the two in step.
-pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct PluginId {

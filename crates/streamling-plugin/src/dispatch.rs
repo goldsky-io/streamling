@@ -15,14 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::error;
 
-/// How long a dispatcher parks when its input channel is empty.
-///
-/// Deliberately not `yield_now()`: an empty channel is the steady state for a
-/// live pipeline, and an immediate reschedule spins every runtime worker
-/// instead of letting them park. Mirrors `IDLE_POLL_INTERVAL` in
-/// `streamling-core/src/plugin.rs`, which drains the other end of the same
-/// channels; keep the two in step.
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+use crate::ffi::IDLE_POLL_INTERVAL;
 
 /// Outcome of [`wait_for_initialization`]: distinguishes the two messages the
 /// caller can legitimately receive on the input channel before any data flows.
