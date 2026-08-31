@@ -290,6 +290,10 @@ impl HybridTableProvider {
                             // standalone Kafka source.
                             KafkaFormat::Avro,
                             None,
+                            // The hybrid source orchestrates a bounded->unbounded
+                            // transition through one cursor, so its Kafka phase is
+                            // always a single consumer instance.
+                            1,
                         )
                         .streamling_with_context(|| {
                             format!(
@@ -921,7 +925,12 @@ impl HybridSourceExec {
 
 impl DisplayAs for HybridSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "HybridSourceExec[{}]", self.inner.name())
+        write!(
+            f,
+            "HybridSourceExec[{}]: partitions={}",
+            self.inner.name(),
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -1938,7 +1947,7 @@ mod tests {
 
     static SESSION_MANAGER: LazyLock<SessionManager, fn() -> SessionManager> =
         LazyLock::new(|| {
-            SessionManager::new(100, 10, DynamicTableRegistry::new())
+            SessionManager::new(100, 10, DynamicTableRegistry::new(), 1)
                 .expect("session manager initialisation failed")
         });
 
