@@ -2,7 +2,8 @@ use crate::dynamic_table::key_set::ArrowKeySet;
 use crate::dynamic_table::{DynamicTableBackend, DynamicTableBackendError, extract_string_values};
 use crate::error::Result as StreamlingResult;
 use crate::error::ResultExt;
-use crate::retry::retry_forever_with_backoff_async_returning;
+use crate::error::StreamlingError;
+use crate::retry::{retry_forever_with_backoff_async_returning, retry_if_retriable};
 use crate::streamling_user_err;
 use async_trait::async_trait;
 use datafusion::arrow::array::builder::{BooleanBuilder, LargeStringBuilder};
@@ -29,6 +30,39 @@ const CACHE_LOAD_CURSOR_NAME: &str = "streamling_dynamic_table_cache";
 const CACHE_LOAD_PAGE_SIZE: usize = 1_000;
 /// Statement timeout for each individual database query (30 seconds)
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// PostgreSQL error codes that indicate a transient infrastructure failure
+/// rather than a permanent configuration problem: connection exceptions
+/// (08000-08006), admin/cluster shutdown (57P01-57P03), and
+/// too-many-connections (53300).
+fn pg_code_is_transient(code: &str) -> bool {
+    matches!(
+        code,
+        "08000" | "08001" | "08003" | "08004" | "08006" | "57P01" | "57P02" | "57P03" | "53300"
+    )
+}
+
+/// True when a sqlx error is transient infrastructure trouble (lost
+/// connection, pool exhaustion, server shutdown) that a retry can plausibly
+/// recover from.
+fn sqlx_error_is_transient(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => true,
+        sqlx::Error::Database(db) => db.code().is_some_and(|c| pg_code_is_transient(&c)),
+        _ => false,
+    }
+}
+
+/// Classify a sqlx error raised during lazy backend initialization:
+/// transient failures become `Connection` (retried by `get_pool`), everything
+/// else stays `Initialization` (permanent, fails fast).
+fn classify_sqlx_error(operation: &str, table: &str, e: &sqlx::Error) -> DynamicTableBackendError {
+    if sqlx_error_is_transient(e) {
+        DynamicTableBackendError::Connection(format!("{operation} for table {table}: {e}"))
+    } else {
+        DynamicTableBackendError::Initialization(format!("{operation} for table {table}: {e}"))
+    }
+}
 
 /// PostgreSQL factory that maintains the connection pool and schema information
 pub struct PostgresDynamicTableBackendFactory {
@@ -92,10 +126,7 @@ impl PostgresDynamicTableBackendFactory {
                 Ok(())
             }
             Err(e) => {
-                let err = DynamicTableBackendError::Initialization(format!(
-                    "Failed to initialize schema '{}': {}",
-                    dt_schema_name, e
-                ));
+                let err = classify_sqlx_error("Failed to initialize schema", dt_schema_name, &e);
                 error!("{}", err);
                 Err(err)
             }
@@ -150,11 +181,14 @@ impl PostgresDynamicTableBackendFactory {
                     );
                     Ok(false)
                 } else {
-                    // Other errors (permissions, etc.) return error
-                    let err = DynamicTableBackendError::Initialization(format!(
-                        "Dynamic table postgres error: Failed to check table existence for {}: {}",
-                        full_table_name, e
-                    ));
+                    // Other errors: transient infrastructure failures are
+                    // retried by get_pool; permanent ones (permissions, etc.)
+                    // fail fast.
+                    let err = classify_sqlx_error(
+                        "Failed to check table existence",
+                        &full_table_name,
+                        &e,
+                    );
                     error!("{}", err);
                     Err(err)
                 }
@@ -581,12 +615,15 @@ impl PostgresDynamicTableBackend {
             r#"SELECT MAX("{}")::TEXT FROM {} WHERE "{}" >= CURRENT_TIMESTAMP AND FALSE"#,
             self.time_column_name, self.full_table_name, self.time_column_name
         );
-
         sqlx::query(&query).execute(pool).await.map_err(|e| {
-            let err = DynamicTableBackendError::Initialization(format!(
-                "Failed to validate cache time column '{}' for table {}: {}",
-                self.time_column_name, self.full_table_name, e
-            ));
+            let err = classify_sqlx_error(
+                &format!(
+                    "Failed to validate cache time column '{}'",
+                    self.time_column_name
+                ),
+                &self.full_table_name,
+                &e,
+            );
             error!("{}", err);
             err
         })?;
@@ -777,8 +814,16 @@ impl PostgresDynamicTableBackend {
             self.full_table_name, values_len
         );
     }
-
     /// Ensure the pool is initialized and table exists. Called lazily on first use.
+    ///
+    /// The whole init attempt (connect + table/index setup + cache validation)
+    /// is retried forever with backoff while errors are retriable
+    /// (`Connection`: failed connects, transient Postgres outages) so a
+    /// temporarily unavailable database never fails the batch/pipeline.
+    /// Permanent configuration errors (`Initialization`: invalid identifiers,
+    /// missing column, non-orderable time column) fail fast. Each attempt is
+    /// bounded: sqlx's acquire timeout bounds connect, the statement timeout
+    /// bounds every query.
     async fn get_pool(&self) -> Result<Arc<PgPool>, DynamicTableBackendError> {
         debug!(
             "Initializing PostgreSQL connection pool for dynamic table: {}",
@@ -786,179 +831,181 @@ impl PostgresDynamicTableBackend {
         );
         self.pool
             .get_or_try_init(|| async {
-                // Initialize pool
-                trace!(
-                    "Connecting to PostgreSQL for table: {}",
-                    self.full_table_name
-                );
-
-                let connect_options = PgConnectOptions::from_str(
-                    self.config.connection_url().as_str(),
-                )
-                .map_err(|e| {
-                    let err = DynamicTableBackendError::Connection(format!(
-                        "Failed to parse connection URL for table {}: {}",
-                        self.full_table_name, e
-                    ));
-                    error!("{}", err);
-                    err
-                })?;
-
-                // Set statement_timeout via SQL after connect (compatible with Neon and other pooled providers)
-                let statement_timeout_ms = STATEMENT_TIMEOUT.as_millis();
-                let pool_options: PoolOptions<Postgres> = PoolOptions::default()
-                    .max_connections(
-                        self.config
-                            .max_connections
-                            .unwrap_or(DEFAULT_MAX_CONNECTIONS),
-                    )
-                    .after_connect(move |conn: &mut sqlx::PgConnection, _meta| {
-                        Box::pin(async move {
-                            conn.execute(
-                                format!("SET statement_timeout = {}", statement_timeout_ms)
-                                    .as_str(),
-                            )
-                            .await?;
-                            Ok(())
-                        })
-                    });
-
-                let pool = pool_options
-                    .connect_with(connect_options)
-                    .await
-                    .map_err(|e| {
-                        let err = DynamicTableBackendError::Connection(format!(
-                            "Failed to connect to Postgres for table {}: {}",
-                            self.full_table_name, e
-                        ));
-                        error!("{}", err);
-                        err
-                    })?;
-
-                trace!(
-                    "Successfully connected to PostgreSQL for table: {}",
-                    self.full_table_name
-                );
-                let pool_arc = Arc::new(pool);
-
-                // Check if table exists
-                trace!("Checking if table exists: {}", self.full_table_name);
-                let table_exists = PostgresDynamicTableBackendFactory::ensure_table_exists(
-                    pool_arc.clone(),
-                    self.full_table_name.clone(),
-                    &self.column_name,
+                let operation_name = format!("DynamicTable init pool ({})", self.full_table_name);
+                retry_if_retriable(
+                    || async { self.try_init_pool().await.map_err(StreamlingError::from) },
+                    &operation_name,
                 )
                 .await
                 .map_err(|e| {
-                    let err = DynamicTableBackendError::Initialization(format!(
-                        "Failed to check table existence for {}: {}",
-                        self.full_table_name, e
-                    ));
-                    error!("{}", err);
-                    err
-                })?;
+                    e.inner()
+                        .downcast_ref::<DynamicTableBackendError>()
+                        .cloned()
+                        .unwrap_or_else(|| DynamicTableBackendError::Initialization(e.to_string()))
+                })
+            })
+            .await
+            .cloned()
+    }
 
-                // Create table if it doesn't exist
-                if !table_exists {
-                    // Initialize schema only if table doesn't exist
-                    // This requires less permissions if user prefers to create the table themselves
-                    debug!(
-                        "Table does not exist, initializing schema '{}' for table: {}",
-                        self.dt_schema_name, self.full_table_name
-                    );
-                    PostgresDynamicTableBackendFactory::initialize_schema(
-                        pool_arc.clone(),
-                        &self.dt_schema_name,
+    /// One attempt of lazy pool init: connect, ensure the table (and index)
+    /// exist, validate the cache time column. Connection errors are retried
+    /// by [`Self::get_pool`]; Initialization errors are permanent.
+    async fn try_init_pool(&self) -> Result<Arc<PgPool>, DynamicTableBackendError> {
+        // Initialize pool
+        trace!(
+            "Connecting to PostgreSQL for table: {}",
+            self.full_table_name
+        );
+
+        let connect_options = PgConnectOptions::from_str(self.config.connection_url().as_str())
+            .map_err(|e| {
+                let err = DynamicTableBackendError::Connection(format!(
+                    "Failed to parse connection URL for table {}: {}",
+                    self.full_table_name, e
+                ));
+                error!("{}", err);
+                err
+            })?;
+
+        // Set statement_timeout via SQL after connect (compatible with Neon and other pooled providers)
+        let statement_timeout_ms = STATEMENT_TIMEOUT.as_millis();
+        let pool_options: PoolOptions<Postgres> = PoolOptions::default()
+            .max_connections(
+                self.config
+                    .max_connections
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            )
+            .after_connect(move |conn: &mut sqlx::PgConnection, _meta| {
+                Box::pin(async move {
+                    conn.execute(
+                        format!("SET statement_timeout = {}", statement_timeout_ms).as_str(),
                     )
-                    .await
-                    .map_err(|e| {
-                        let err = DynamicTableBackendError::Initialization(format!(
-                            "Failed to initialize schema '{}' for table {}: {}",
-                            self.dt_schema_name, self.full_table_name, e
-                        ));
-                        error!("{}", err);
-                        err
-                    })?;
+                    .await?;
+                    Ok(())
+                })
+            });
 
-                    info!(
-                        "Creating PostgreSQL dynamic table: {}",
-                        self.full_table_name
-                    );
-                    let create_table_sql = format!(
-                        r#"
+        let pool = pool_options
+            .connect_with(connect_options)
+            .await
+            .map_err(|e| {
+                let err = DynamicTableBackendError::Connection(format!(
+                    "Failed to connect to Postgres for table {}: {}",
+                    self.full_table_name, e
+                ));
+                error!("{}", err);
+                err
+            })?;
+
+        trace!(
+            "Successfully connected to PostgreSQL for table: {}",
+            self.full_table_name
+        );
+        let pool_arc = Arc::new(pool);
+
+        // Check if table exists
+        trace!("Checking if table exists: {}", self.full_table_name);
+        let table_exists = PostgresDynamicTableBackendFactory::ensure_table_exists(
+            pool_arc.clone(),
+            self.full_table_name.clone(),
+            &self.column_name,
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed table-existence check for {}: {}",
+                self.full_table_name, e
+            );
+            // Pass through: the error already carries its transient/permanent
+            // classification.
+            e
+        })?;
+
+        // Create table if it doesn't exist
+        if !table_exists {
+            // Initialize schema only if table doesn't exist
+            // This requires less permissions if user prefers to create the table themselves
+            debug!(
+                "Table does not exist, initializing schema '{}' for table: {}",
+                self.dt_schema_name, self.full_table_name
+            );
+            PostgresDynamicTableBackendFactory::initialize_schema(
+                pool_arc.clone(),
+                &self.dt_schema_name,
+            )
+            .await?;
+
+            info!(
+                "Creating PostgreSQL dynamic table: {}",
+                self.full_table_name
+            );
+            let create_table_sql = format!(
+                r#"
                             CREATE TABLE IF NOT EXISTS {} (
                                 "{}" TEXT PRIMARY KEY,
                                 "{}" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CLOCK_TIMESTAMP()
                             );
                         "#,
-                        self.full_table_name, self.column_name, self.time_column_name
-                    );
-                    let bare_table = self
-                        .full_table_name
-                        .rsplit_once('.')
-                        .map(|(_, table)| table)
-                        .unwrap_or(self.full_table_name.as_str());
-                    let index_name =
-                        build_time_column_index_name(bare_table, &self.time_column_name);
-                    let create_index_sql = format!(
-                        r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
-                        index_name, self.full_table_name, self.time_column_name
-                    );
+                self.full_table_name, self.column_name, self.time_column_name
+            );
+            let bare_table = self
+                .full_table_name
+                .rsplit_once('.')
+                .map(|(_, table)| table)
+                .unwrap_or(self.full_table_name.as_str());
+            let index_name = build_time_column_index_name(bare_table, &self.time_column_name);
+            let create_index_sql = format!(
+                r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
+                index_name, self.full_table_name, self.time_column_name
+            );
 
-                    let mut transaction = pool_arc.begin().await.map_err(|e| {
-                        let err = DynamicTableBackendError::Initialization(format!(
-                            "Failed to begin transaction for table {}: {}",
-                            self.full_table_name, e
-                        ));
-                        error!("{}", err);
-                        err
-                    })?;
-                    sqlx::query(&create_table_sql)
-                        .execute(&mut *transaction)
-                        .await
-                        .map_err(|e| {
-                            let err = DynamicTableBackendError::Initialization(format!(
-                                "Failed to create table {}: {}",
-                                self.full_table_name, e
-                            ));
-                            error!("{}", err);
-                            err
-                        })?;
-                    sqlx::query(&create_index_sql)
-                        .execute(&mut *transaction)
-                        .await
-                        .map_err(|e| {
-                            let err = DynamicTableBackendError::Initialization(format!(
-                                "Failed to create index {} on table {}: {}",
-                                index_name, self.full_table_name, e
-                            ));
-                            error!("{}", err);
-                            err
-                        })?;
-                    transaction.commit().await.map_err(|e| {
-                        let err = DynamicTableBackendError::Initialization(format!(
-                            "Failed to commit transaction for table {}: {}",
-                            self.full_table_name, e
-                        ));
-                        error!("{}", err);
-                        err
-                    })?;
-                    info!("Successfully created table: {}", self.full_table_name);
-                } else {
-                    debug!(
-                        "Table {} already exists, skipping creation",
-                        self.full_table_name
+            let mut transaction = pool_arc.begin().await.map_err(|e| {
+                let err =
+                    classify_sqlx_error("Failed to begin transaction", &self.full_table_name, &e);
+                error!("{}", err);
+                err
+            })?;
+            sqlx::query(&create_table_sql)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|e| {
+                    let err =
+                        classify_sqlx_error("Failed to create table", &self.full_table_name, &e);
+                    error!("{}", err);
+                    err
+                })?;
+            sqlx::query(&create_index_sql)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|e| {
+                    let err = classify_sqlx_error(
+                        &format!("Failed to create index {index_name}"),
+                        &self.full_table_name,
+                        &e,
                     );
-                }
+                    error!("{}", err);
+                    err
+                })?;
+            transaction.commit().await.map_err(|e| {
+                let err =
+                    classify_sqlx_error("Failed to commit transaction", &self.full_table_name, &e);
+                error!("{}", err);
+                err
+            })?;
+            info!("Successfully created table: {}", self.full_table_name);
+        } else {
+            debug!(
+                "Table {} already exists, skipping creation",
+                self.full_table_name
+            );
+        }
 
-                if self.cache.is_some() {
-                    self.validate_cache_time_column(pool_arc.as_ref()).await?;
-                }
+        if self.cache.is_some() {
+            self.validate_cache_time_column(pool_arc.as_ref()).await?;
+        }
 
-                Ok::<Arc<PgPool>, DynamicTableBackendError>(pool_arc)
-            })
-            .await
-            .cloned()
+        Ok(pool_arc)
     }
 }
 
@@ -1237,6 +1284,65 @@ mod tests {
         assert!(!out.value(2));
     }
 
+    #[test]
+    fn transient_sqlx_errors_classify_as_connection() {
+        // Lost connection / refused connection: transient infrastructure
+        // failure, must be retried, not fatal.
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        assert!(matches!(
+            classify_sqlx_error("op", "tbl", &io),
+            DynamicTableBackendError::Connection(_)
+        ));
+
+        assert!(sqlx_error_is_transient(&sqlx::Error::PoolTimedOut));
+        assert!(sqlx_error_is_transient(&sqlx::Error::PoolClosed));
+
+        // PostgreSQL connection exceptions and shutdowns are transient.
+        assert!(pg_code_is_transient("08000"));
+        assert!(pg_code_is_transient("08006"));
+        assert!(pg_code_is_transient("57P01"));
+        assert!(pg_code_is_transient("53300"));
+
+        // Permanent SQL errors (permissions, missing column, bad operator)
+        // stay Initialization so init fails fast.
+        assert!(!pg_code_is_transient("42501")); // insufficient privilege
+        assert!(!pg_code_is_transient("42703")); // column does not exist
+        assert!(!pg_code_is_transient("42883")); // operator does not exist
+
+        assert!(matches!(
+            classify_sqlx_error("op", "tbl", &sqlx::Error::ColumnNotFound("x".into())),
+            DynamicTableBackendError::Initialization(_)
+        ));
+    }
+
+    /// The user-facing error chain must carry the diagnostic detail, not just
+    /// the variant name (prod logs showed a bare `Caused by: Initialization`).
+    #[test]
+    fn backend_error_display_includes_detail() {
+        let err = DynamicTableBackendError::Initialization("bad column 'x'".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Initialization"), "got: {msg}");
+        assert!(msg.contains("bad column 'x'"), "got: {msg}");
+    }
+
+    /// Connection errors convert to retriable StreamlingErrors; Initialization
+    /// errors stay non-retriable (fail fast).
+    #[test]
+    fn streamling_error_flags_follow_variant() {
+        let conn = StreamlingError::from(DynamicTableBackendError::Connection(
+            "server closed".to_string(),
+        ));
+        assert!(conn.is_retriable());
+
+        let init = StreamlingError::from(DynamicTableBackendError::Initialization(
+            "missing column".to_string(),
+        ));
+        assert!(!init.is_retriable());
+    }
+
     #[tokio::test]
     async fn cache_requires_flag_and_explicit_time_column() {
         let disabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(false))
@@ -1335,11 +1441,49 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out.is_null(0) && out.is_null(1));
 
-        // Control: a non-empty batch still requires the (unreachable) database.
+        // Control: a non-empty batch must still require the (unreachable)
+        // database. Connection failures now retry forever, so that shows up
+        // as a blocked call rather than an error.
         let non_empty: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
         assert!(
-            backend.contains(non_empty).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(1000), backend.contains(non_empty))
+                .await
+                .is_err(),
             "non-empty batch must attempt the database lookup"
+        );
+    }
+    /// A failed initial connection must not surface as an error: the lazy
+    /// pool init retries forever with backoff (same as the query paths), so
+    /// `contains` keeps blocking until the database is reachable instead of
+    /// failing the batch/pipeline. The unreachable host makes every connect
+    /// attempt fail; sqlx internally retries for its 30s acquire timeout, so
+    /// the 65s simulated timeout only elapses if our own retry loop is in
+    /// charge (with paused time the wait costs no wall clock).
+    #[tokio::test(start_paused = true)]
+    async fn connect_failure_retries_instead_of_erroring() {
+        let mut config = postgres_config(false);
+        config.host = "127.0.0.1".to_string();
+        config.port = 1; // nothing listens here: every connect attempt fails
+        let factory =
+            PostgresDynamicTableBackendFactory::new(config).expect("factory should be valid");
+        let backend = factory
+            .create_backend(
+                "connect_retry_test".to_string(),
+                None,
+                None,
+                None,
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend construction is lazy and must not connect");
+
+        let batch: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        let result = tokio::time::timeout(Duration::from_secs(65), backend.contains(batch)).await;
+        assert!(
+            result.is_err(),
+            "connection failure must be retried, not returned as an error (got {result:?})"
         );
     }
     #[tokio::test]

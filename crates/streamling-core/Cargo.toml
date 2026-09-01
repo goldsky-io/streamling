@@ -91,3 +91,4 @@ paste.workspace = true
 rand.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 serial_test.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

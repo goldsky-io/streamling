@@ -12,7 +12,6 @@ use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{ColumnarValue, Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
-use enum_display::EnumDisplay;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
@@ -28,12 +27,23 @@ use crate::topology::{DynamicTableTransform, PipelineTopology, Transform};
 pub use in_memory::InMemoryDynamicTableBackend;
 pub use postgres::PostgresDynamicTableBackend;
 
-#[derive(Debug, PartialEq, Eq, EnumDisplay)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DynamicTableBackendError {
     Initialization(String),
     Connection(String),
     Query(String),
     StringArrayExpected,
+}
+
+impl std::fmt::Display for DynamicTableBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initialization(detail) => write!(f, "Initialization: {detail}"),
+            Self::Connection(detail) => write!(f, "Connection: {detail}"),
+            Self::Query(detail) => write!(f, "Query: {detail}"),
+            Self::StringArrayExpected => write!(f, "StringArrayExpected"),
+        }
+    }
 }
 
 impl std::error::Error for DynamicTableBackendError {}
