@@ -1694,7 +1694,26 @@ impl ExecutionPlan for KafkaSourceExec {
             // Unfortunately, the high-level StreamConsumer doesn't expose this method
             // So, instead, we trigger it indirectly by calling "next" on the stream
             // We'll seek to the correct position afterward based on state backend or config
-            Self::wait_for_initial_assignment_or_message(&consumer, &topic).await?;
+            if let Err(e) = Self::wait_for_initial_assignment_or_message(&consumer, &topic).await {
+                // A shutdown requested while this instance was still starting
+                // (e.g. the record-limit stop path firing off a sibling
+                // instance's records) is a graceful stop, not a pipeline
+                // failure: this instance consumed nothing, so ending its
+                // stream empty is exact — there is no tail to lose. Letting
+                // the cancellation error propagate instead fails the sink
+                // future and turns a requested drain into exit 1.
+                if *streamling_core::shutdown::subscribe().borrow() || *shutdown_rx.borrow() {
+                    info!(
+                        "Kafka source '{}': shutdown requested during startup; stopping before first assignment",
+                        reference_name
+                    );
+                    unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
+                    consumer.unsubscribe();
+                    consumer.forget();
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
