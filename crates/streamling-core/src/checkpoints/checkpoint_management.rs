@@ -64,11 +64,35 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Send an ack for `epoch` on behalf of `sink_id`.
+///
+/// The coordinator subscriber can exit before a sink's last stream does, so a
+/// failed send is logged rather than fatal — the pipeline is shutting down and
+/// there is nothing left to finalize.
+pub fn send_checkpoint_ack(epoch: CheckpointEpoch, sink_id: &str) {
+    if let Err(e) = send(
+        CHECKPOINT_COORDINATOR_CHANNEL,
+        CheckpointMessage::Ack {
+            epoch: epoch.clone(),
+            sink_id: sink_id.to_string(),
+        },
+    ) {
+        error!(
+            "failed to send checkpoint ack for epoch {} from sink '{}': {}",
+            epoch.0, sink_id, e
+        );
+    }
+}
+
 /// Process checkpoint messages from a batch: record arrival latency, send ack,
 /// and record sink flush time. This is the standard pattern used by all sinks.
 ///
 /// `arrival_time_ms` should be captured via `now_ms()` at the start of batch processing,
 /// before any flush work begins, to accurately measure marker propagation time.
+///
+/// When the sink writes several partition streams concurrently the ack is gated
+/// by [`report_marker_at_sink`], so the coordinator only sees the epoch once
+/// every stream has flushed it.
 pub fn process_checkpoint_acks(
     messages: Vec<CheckpointMessage>,
     arrival_time_ms: u64,
@@ -90,15 +114,11 @@ pub fn process_checkpoint_acks(
                 metric_metadata_id,
             );
             // Best-effort: during shutdown a source may have dropped its
-            // channel receiver already; a failed broadcast must not panic the
-            // sink mid-drain.
-            let _ = send(
-                CHECKPOINT_COORDINATOR_CHANNEL,
-                CheckpointMessage::Ack {
-                    epoch,
-                    sink_id: sink_id.to_string(),
-                },
-            );
+            // channel receiver already; `send_checkpoint_ack` logs instead of
+            // panicking so a failed broadcast can't kill the sink mid-drain.
+            if report_marker_at_sink(sink_id, epoch.clone()) {
+                send_checkpoint_ack(epoch, sink_id);
+            }
             metrics_recorder.record_time(
                 "checkpoint_sink_flush",
                 ack_start.elapsed(),
@@ -106,6 +126,159 @@ pub fn process_checkpoint_acks(
             );
         }
     }
+}
+
+/// Per-epoch bookkeeping for [`MarkerAligner`].
+#[derive(Debug, Default)]
+struct MarkerState {
+    copies: usize,
+    released: bool,
+}
+
+/// Aligns checkpoint markers arriving on several concurrent streams down to a
+/// single copy.
+///
+/// Streamling's correctness invariant is that **every stream carries at most one
+/// marker copy per epoch**: a sink acks an epoch as soon as it sees a marker, and
+/// the coordinator finalizes on the first ack per sink name. Any place where N
+/// streams merge into one — `StreamingCoalesceExec`, a `StreamingRepartitionExec`
+/// output, a sink writing N partitions — must therefore hold a marker back until
+/// every live input has delivered it, or the source commits offsets for data that
+/// is still in flight on the slower streams.
+///
+/// Alignment only ever *delays* a marker; data is never blocked, so at-least-once
+/// delivery is preserved.
+#[derive(Debug)]
+pub struct MarkerAligner {
+    live_inputs: usize,
+    /// Released epochs stay recorded so a late copy from a slower input is
+    /// absorbed rather than releasing the same epoch a second time. Entries are
+    /// pruned when the epoch is finalized.
+    epochs: BTreeMap<CheckpointEpoch, MarkerState>,
+    seen_finalizers: HashSet<u64>,
+    seen_source_completions: HashSet<String>,
+}
+
+impl MarkerAligner {
+    pub fn new(inputs: usize) -> Self {
+        Self {
+            live_inputs: inputs,
+            epochs: BTreeMap::new(),
+            seen_finalizers: HashSet::new(),
+            seen_source_completions: HashSet::new(),
+        }
+    }
+
+    /// Feed the messages observed on one input stream, returning the messages
+    /// that may now be forwarded downstream.
+    pub fn observe(&mut self, messages: Vec<CheckpointMessage>) -> Vec<CheckpointMessage> {
+        let mut released = Vec::new();
+        for message in messages {
+            match message {
+                CheckpointMessage::Marker {
+                    ref epoch,
+                    created_at_ms,
+                } => {
+                    let live = self.live_inputs;
+                    let state = self.epochs.entry(epoch.clone()).or_default();
+                    if state.released {
+                        continue;
+                    }
+                    state.copies += 1;
+                    if state.copies >= live.max(1) {
+                        state.released = true;
+                        released.push(CheckpointMessage::Marker {
+                            epoch: epoch.clone(),
+                            created_at_ms,
+                        });
+                    }
+                }
+                // A finalizer/completion is a broadcast notification rather than a
+                // per-stream barrier: forwarding the first copy is both necessary
+                // and sufficient.
+                CheckpointMessage::Finalizer(ref epoch) => {
+                    self.epochs.retain(|e, _| e.0 > epoch.0);
+                    if self.seen_finalizers.insert(epoch.0) {
+                        released.push(message);
+                    }
+                }
+                CheckpointMessage::SourceComplete(ref source) => {
+                    if self.seen_source_completions.insert(source.clone()) {
+                        released.push(message);
+                    }
+                }
+                CheckpointMessage::Ack { .. } => released.push(message),
+            }
+        }
+        released
+    }
+
+    /// Record that one input stream has ended. Its share of every pending epoch
+    /// counts as delivered, so epochs it would never contribute to are released.
+    pub fn input_done(&mut self) -> Vec<CheckpointMessage> {
+        self.live_inputs = self.live_inputs.saturating_sub(1);
+        let live = self.live_inputs.max(1);
+        let mut released = Vec::new();
+        for (epoch, state) in self.epochs.iter_mut() {
+            if !state.released && (state.copies >= live || self.live_inputs == 0) {
+                state.released = true;
+                released.push(CheckpointMessage::Marker {
+                    epoch: epoch.clone(),
+                    created_at_ms: now_ms(),
+                });
+            }
+        }
+        released
+    }
+}
+
+/// Tracks, per sink, how many concurrent write streams must flush an epoch
+/// before the sink acks it. See [`MarkerAligner`] for why this gate exists.
+static SINK_ACK_GATES: once_cell::sync::Lazy<Mutex<HashMap<String, MarkerAligner>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Declare that `sink_id` is written by `streams` concurrent partition streams.
+///
+/// Sinks that never register are treated as single-stream, which is exactly the
+/// ungated behaviour they had before.
+pub fn register_sink_streams(sink_id: &str, streams: usize) {
+    if streams <= 1 {
+        return;
+    }
+    SINK_ACK_GATES
+        .lock()
+        .insert(sink_id.to_string(), MarkerAligner::new(streams));
+}
+
+/// Report that one write stream of `sink_id` has flushed `epoch`. Returns true
+/// when this was the last stream outstanding and the ack should be sent.
+pub fn report_marker_at_sink(sink_id: &str, epoch: CheckpointEpoch) -> bool {
+    let mut gates = SINK_ACK_GATES.lock();
+    let Some(gate) = gates.get_mut(sink_id) else {
+        return true;
+    };
+    !gate
+        .observe(vec![CheckpointMessage::Marker {
+            epoch,
+            created_at_ms: now_ms(),
+        }])
+        .is_empty()
+}
+
+/// Report that one write stream of `sink_id` has finished, returning any epochs
+/// that become ackable because the stream will never report them itself.
+pub fn sink_stream_done(sink_id: &str) -> Vec<CheckpointEpoch> {
+    let mut gates = SINK_ACK_GATES.lock();
+    let Some(gate) = gates.get_mut(sink_id) else {
+        return Vec::new();
+    };
+    gate.input_done()
+        .into_iter()
+        .filter_map(|m| match m {
+            CheckpointMessage::Marker { epoch, .. } => Some(epoch),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1013,6 +1186,122 @@ pub fn strip_checkpoint_messages(batch: &RecordBatch) -> RecordBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marker(epoch: u64) -> CheckpointMessage {
+        CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(epoch),
+            created_at_ms: 0,
+        }
+    }
+
+    fn epochs_of(messages: &[CheckpointMessage]) -> Vec<u64> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                CheckpointMessage::Marker { epoch, .. } => Some(epoch.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aligner_releases_a_marker_only_after_every_input_delivers_it() {
+        let mut aligner = MarkerAligner::new(2);
+        assert!(
+            aligner.observe(vec![marker(1)]).is_empty(),
+            "one of two inputs is not enough"
+        );
+        assert_eq!(
+            epochs_of(&aligner.observe(vec![marker(1)])),
+            vec![1],
+            "the second copy completes the epoch"
+        );
+    }
+
+    #[test]
+    fn aligner_absorbs_a_late_copy_of_an_already_released_epoch() {
+        let mut aligner = MarkerAligner::new(2);
+        aligner.observe(vec![marker(1)]);
+        assert_eq!(epochs_of(&aligner.observe(vec![marker(1)])), vec![1]);
+        // A third copy (e.g. from an input that ended and was re-counted) must
+        // not release the epoch a second time — that would break the
+        // "at most one copy per stream per epoch" invariant the sink ack relies on.
+        assert!(aligner.observe(vec![marker(1)]).is_empty());
+    }
+
+    #[test]
+    fn aligner_treats_an_ended_input_as_having_delivered() {
+        let mut aligner = MarkerAligner::new(2);
+        assert!(aligner.observe(vec![marker(7)]).is_empty());
+        assert_eq!(
+            epochs_of(&aligner.input_done()),
+            vec![7],
+            "an input that ends can no longer withhold an epoch"
+        );
+    }
+
+    #[test]
+    fn aligner_releases_later_epochs_at_the_reduced_input_count() {
+        let mut aligner = MarkerAligner::new(2);
+        aligner.input_done();
+        assert_eq!(
+            epochs_of(&aligner.observe(vec![marker(3)])),
+            vec![3],
+            "with one input left a single copy completes the epoch"
+        );
+    }
+
+    #[test]
+    fn aligner_forwards_finalizers_and_completions_once() {
+        let mut aligner = MarkerAligner::new(2);
+        let first = aligner.observe(vec![CheckpointMessage::Finalizer(CheckpointEpoch(1))]);
+        assert_eq!(first.len(), 1, "the first finalizer copy is forwarded");
+        assert!(
+            aligner
+                .observe(vec![CheckpointMessage::Finalizer(CheckpointEpoch(1))])
+                .is_empty(),
+            "a finalizer is a broadcast, not a barrier: later copies are dropped"
+        );
+
+        let complete = CheckpointMessage::SourceComplete("src".to_string());
+        assert_eq!(aligner.observe(vec![complete.clone()]).len(), 1);
+        assert!(aligner.observe(vec![complete]).is_empty());
+    }
+
+    #[test]
+    fn sink_gate_acks_once_every_stream_reported() {
+        let sink = "gate_test_sink";
+        register_sink_streams(sink, 2);
+        assert!(
+            !report_marker_at_sink(sink, CheckpointEpoch(1)),
+            "the first of two write streams must not ack"
+        );
+        assert!(
+            report_marker_at_sink(sink, CheckpointEpoch(1)),
+            "the last write stream releases the ack"
+        );
+    }
+
+    #[test]
+    fn sink_gate_releases_when_a_write_stream_finishes() {
+        let sink = "gate_test_sink_stream_done";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink(sink, CheckpointEpoch(4)));
+        assert_eq!(
+            sink_stream_done(sink),
+            vec![CheckpointEpoch(4)],
+            "a finished stream cannot report the epoch, so it is released"
+        );
+    }
+
+    #[test]
+    fn unregistered_sink_acks_immediately() {
+        assert!(
+            report_marker_at_sink("never_registered_sink", CheckpointEpoch(1)),
+            "single-stream sinks keep their ungated behaviour"
+        );
+    }
+
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Fields};
     use serial_test::serial;
