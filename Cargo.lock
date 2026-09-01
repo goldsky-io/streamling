@@ -6932,6 +6932,7 @@ dependencies = [
  "regex",
  "serde_json",
  "sha3",
+ "streamling-retry",
  "tracing",
  "tracing-subscriber",
  "uint",
@@ -7041,12 +7042,14 @@ dependencies = [
  "streamling-config",
  "streamling-flink-compat",
  "streamling-plugin",
+ "streamling-retry",
  "swc",
  "swc_common",
  "swc_ecma_ast",
  "swc_ecma_lexer",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -7097,7 +7100,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "abi_stable",
  "arrow",
@@ -7107,13 +7110,16 @@ dependencies = [
  "crossbeam-channel",
  "datafusion",
  "datafusion-ffi",
+ "futures",
  "serde",
  "serde_json",
  "streamling-common",
  "streamling-config",
  "streamling-plugin-derive",
+ "streamling-retry",
  "streamling-state",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -7125,6 +7131,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "streamling-retry"
+version = "0.3.1"
+dependencies = [
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8446,6 +8460,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

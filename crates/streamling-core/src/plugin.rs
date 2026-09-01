@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod operator;
 mod preprocessor;
 pub mod side_output;
@@ -40,7 +41,7 @@ pub use streamling_plugin::{
     PluginMsg, PluginOptions, PluginStateBackendConfig,
 };
 use tokio::runtime::Handle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct PluginId {
@@ -91,11 +92,22 @@ lazy_static! {
 }
 
 fn register_plugin_instance(instance_key: &str, channels: PluginChannels) {
+    // Keep a clone of the metrics receiver for the shutdown watchdog: at
+    // watchdog time the async metrics forwarder may be long past its last
+    // poll, and the crossbeam receiver clone lets the dump drain the
+    // dispatcher's final liveness markers without a runtime.
+    diagnostics::register_diag_receiver(instance_key, channels.metrics.receiver.clone());
     let mut reg = PLUGIN_INSTANCE_REGISTRY.write().unwrap();
     reg.insert(instance_key.to_string(), channels);
 }
 
-pub fn terminate_all_plugins() -> Result<()> {
+/// `send_budget` bounds the TOTAL time spent signalling Terminate across all
+/// plugins: each send gets an equal slice of it (floored at 100ms so a healthy
+/// plugin always gets a real chance, capped at the legacy 5s). `None` keeps
+/// the legacy 5s-per-plugin bound — fine for one plugin, but N wedged plugins
+/// serialize to N×5s, which overruns the shutdown budget from N=5; shutdown
+/// paths with a deadline should pass their remaining budget instead.
+pub fn terminate_all_plugins(send_budget: Option<Duration>) -> Result<()> {
     info!("Terminating all plugins");
     let mut reg = PLUGIN_INSTANCE_REGISTRY.write().unwrap();
     if reg.is_empty() {
@@ -103,7 +115,41 @@ pub fn terminate_all_plugins() -> Result<()> {
     }
     let ids: Vec<(String, PluginChannels)> = reg.drain().collect();
     drop(reg);
-    terminate_plugins(ids)
+    terminate_plugins(ids, send_budget)
+}
+
+/// Non-blocking, panic-safe variant of [`terminate_all_plugins`] for contexts
+/// that must never park — the global panic hook in particular. A panic while a
+/// plugin's input channel is full would otherwise block the panicking thread
+/// on the bounded send (up to the timeout, per plugin), and a wedged panic
+/// hook leaves a process that neither crashes nor exits. Best-effort: a plugin whose channel is
+/// full simply doesn't get the Terminate — process death is the backstop.
+/// Uses `eprintln!` rather than `tracing`/`Result` so it can run safely inside
+/// the hook.
+pub fn terminate_all_plugins_nonblocking() {
+    let mut reg = match PLUGIN_INSTANCE_REGISTRY.write() {
+        Ok(guard) => guard,
+        // Poisoned by the very panic we're hooking: take the inner value —
+        // unwrapping here would double-panic and abort before any output.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if reg.is_empty() {
+        return;
+    }
+    let ids: Vec<(String, PluginChannels)> = reg.drain().collect();
+    drop(reg);
+    for (plugin_id, channels) in ids {
+        if let Err(e) = channels
+            .input
+            .sender
+            .try_send(NonExhaustive::new(PluginMsg::Terminate))
+        {
+            eprintln!(
+                "panic hook: could not signal Terminate to plugin {} (channel full or closed): {:?}",
+                plugin_id, e
+            );
+        }
+    }
 }
 
 #[repr(transparent)]
@@ -117,7 +163,21 @@ struct PluginTokioWrapper {
 /// allowing it to spawn futures, sleep, and block.
 impl PluginAsyncRuntime for PluginTokioWrapper {
     fn spawn(&self, fut: FfiFuture<()>) -> FfiFuture<()> {
-        self.inner.spawn(fut).map(|_| ()).into_ffi()
+        // The sanctioned bridge itself: this IS the spawn surface handed to
+        // legacy (shared-runtime) plugin libraries, so it cannot route through
+        // a scope without moving plugin tasks onto host drain stages.
+        #[allow(clippy::disallowed_methods)]
+        let handle = self.inner.spawn(fut);
+        async move {
+            // This await is the ONLY observer of the task's JoinError. Mapping
+            // it away silently turned a panicked plugin task (e.g. a source's
+            // generate loop) into an unexplained wedge — the dispatcher keeps
+            // looping while the work it awaited never happened.
+            if let Err(e) = handle.await {
+                error!("Plugin task panicked or was cancelled: {e}");
+            }
+        }
+        .into_ffi()
     }
 
     fn sleep(&self, dur: RDuration) -> FfiFuture<()> {
@@ -180,15 +240,66 @@ pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Load the root module from a plugin library, tolerating libraries built
+/// against an older SDK whose `PluginModule` has fewer (suffix) fields.
+///
+/// abi_stable's layout check is one-directional: a library with MORE module
+/// fields than the host expects passes, but one with FEWER is rejected with a
+/// `FieldCountMismatch` even when the missing fields sit after
+/// `last_prefix_field` — the runtime `Option` accessors never get a chance.
+/// So on a primary-check failure, re-validate the library against the frozen
+/// four-field twin (`streamling_plugin::compat`); if that passes, the shared
+/// prefix is proven intact and loading the primary ref with the layout check
+/// skipped is sound — every suffix accessor past the library's own recorded
+/// field count returns `None` via abi_stable's runtime field guard, which is
+/// exactly the degraded-but-bounded path the call sites already handle.
+fn load_plugin_module(plugin_path: &Path) -> Result<PluginModuleRef> {
+    let header = lib_header_from_path(plugin_path)
+        .map_err(|e| streamling_err!("Unable to read plugin library {:?}: {}", plugin_path, e))?;
+
+    match header.init_root_module::<PluginModuleRef>() {
+        Ok(module) => Ok(module),
+        Err(primary_err) => {
+            header
+                .init_root_module::<streamling_plugin::compat::PluginModuleRef>()
+                .map_err(|compat_err| {
+                    streamling_err!(
+                        "Unable to load plugin from {:?}: not a compatible plugin module \
+                         (current-ABI check: {}; frozen-ABI check: {})",
+                        plugin_path,
+                        primary_err,
+                        compat_err
+                    )
+                })?;
+
+            info!(
+                "Plugin library predates the current module ABI; loading in \
+                 compatibility mode (newer capabilities report as absent): {:?}",
+                plugin_path
+            );
+
+            // SAFETY: the compat probe above validated the library's module
+            // against the frozen four-field layout, which is a prefix of the
+            // primary layout; suffix-field access is guarded at runtime by
+            // the library's own recorded field count.
+            unsafe { header.init_root_module_with_unchecked_layout::<PluginModuleRef>() }.map_err(
+                |e| {
+                    streamling_err!(
+                        "Unable to load plugin from {:?} in compatibility mode: {}",
+                        plugin_path,
+                        e
+                    )
+                },
+            )
+        }
+    }
+}
+
 pub fn load_and_initialize_plugin(path: &str, app_config: &AppConfig) -> Result<()> {
     let plugin_path = Path::new(path);
     info!("Loading plugin from: {:?}", plugin_path);
 
-    let plugin_module = Arc::new(
-        lib_header_from_path(plugin_path)
-            .and_then(|x| x.init_root_module::<PluginModuleRef>())
-            .expect("Unable to load plugin from path"),
-    );
+    let plugin_module = Arc::new(load_plugin_module(plugin_path)?);
 
     let logging_config = create_logging(app_config);
     let init_fn = plugin_module.init();
@@ -214,6 +325,21 @@ pub fn load_and_initialize_plugin(path: &str, app_config: &AppConfig) -> Result<
         {
             caps_registry.insert(plugin_id_key, *caps);
         }
+    }
+
+    // Hand the library an out-of-band shutdown signal. The accessor returns
+    // None for libraries built against an older SDK (the field sits after
+    // `last_prefix_field`), in which case the SDK falls back to its finite
+    // defaults — degraded, never unbounded.
+    match plugin_module.set_shutdown_signal() {
+        Some(set_signal) => {
+            set_signal(create_shutdown_signal());
+            info!("Installed shutdown signal for plugin: {:?}", path);
+        }
+        None => info!(
+            "Plugin library predates the shutdown signal; SDK defaults apply: {:?}",
+            path
+        ),
     }
 
     // Load UDF descriptors if the plugin provides them
@@ -288,6 +414,49 @@ fn create_plugin_async_runtime(handle: Handle) -> PluginAsyncRuntimeObj {
     PluginAsyncRuntime_TO::from_value(PluginTokioWrapper { inner: handle }, TD_Opaque)
 }
 
+/// Host-side shutdown signal handed to each plugin library at load time via
+/// `PluginModule::set_shutdown_signal`. Bridges the process-global shutdown
+/// watch and drain budget across the FFI boundary — the plugin's own copy of
+/// those statics can never observe the host's (separate dylib statics), so
+/// the handle must be passed explicitly.
+#[derive(Clone)]
+struct HostShutdownSignal;
+
+impl streamling_plugin::shutdown::ShutdownSignal for HostShutdownSignal {
+    fn is_shutting_down(&self) -> bool {
+        *crate::shutdown::subscribe().borrow()
+    }
+
+    fn cancelled(&self) -> FfiFuture<()> {
+        async {
+            let mut rx = crate::shutdown::subscribe();
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    // The sender is a process-global static that never drops
+                    // in production; park rather than resolve spuriously.
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+        .into_ffi()
+    }
+
+    fn remaining_budget_ms(&self) -> u64 {
+        u64::try_from(crate::shutdown::remaining_budget().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn request_shutdown(&self) {
+        crate::shutdown::request_shutdown();
+    }
+}
+
+fn create_shutdown_signal() -> streamling_plugin::shutdown::ShutdownSignalObj {
+    streamling_plugin::shutdown::ShutdownSignal_TO::from_value(HostShutdownSignal, TD_Opaque)
+}
+
 fn create_plugin_state_backend_config(
     app_config: &AppConfig,
     reference_name: &str,
@@ -322,6 +491,130 @@ fn create_channels_for_plugin(app_config: &AppConfig, plugin_type: &PluginId) ->
         );
     }
     create_channels_with_caps(default, default, default)
+}
+
+/// Slice for bounded sends into plugin input channels: short enough that a
+/// shutdown flip is observed promptly, long enough not to spin.
+const PLUGIN_SEND_SLICE: Duration = Duration::from_millis(100);
+/// How long a full plugin input channel may keep refusing a message AFTER
+/// process shutdown was requested before the host abandons the send.
+const PLUGIN_SHUTDOWN_SEND_GRACE: Duration = Duration::from_secs(5);
+/// Bound for the sync [`send_to_plugin_blocking`] variant (used for `Init`
+/// on a freshly created, near-empty channel — hitting this bound at all
+/// means the dispatcher never started consuming).
+const PLUGIN_BLOCKING_SEND_BOUND: Duration = Duration::from_secs(5);
+
+/// Shutdown-aware replacement for a blocking crossbeam `send().unwrap()` into
+/// a plugin's input channel.
+///
+/// A full input channel in steady state is ordinary backpressure — a slow
+/// plugin is SUPPOSED to slow the pipeline — so before shutdown this waits
+/// indefinitely, in short bounded slices instead of one indefinite park. Once
+/// shutdown is requested, a plugin that still refuses the message after
+/// [`PLUGIN_SHUTDOWN_SEND_GRACE`] is treated as wedged and the send is
+/// abandoned with an error, so the caller's drain can wind down instead of
+/// holding a runtime worker hostage until the watchdog hard-exits. A
+/// disconnected channel (dispatcher already exited) errors immediately — the
+/// `.unwrap()`s this replaces panicked the host there.
+///
+/// On a multi-thread runtime each blocking slice runs under `block_in_place`
+/// so sibling tasks migrate off the worker; on a current-thread runtime
+/// (unit tests) it blocks directly, bounded by the slice.
+pub async fn send_to_plugin<T>(
+    sender: &crossbeam_channel::RSender<T>,
+    msg: T,
+    plugin_id: &str,
+) -> Result<()> {
+    let rx = crate::shutdown::subscribe();
+    send_to_plugin_with(sender, msg, plugin_id, move || *rx.borrow(), {
+        PLUGIN_SHUTDOWN_SEND_GRACE
+    })
+    .await
+}
+
+/// [`send_to_plugin`] with the shutdown signal and grace injected, so tests
+/// can exercise the abandon path without flipping the process-wide watch
+/// (which would contaminate every later test in the binary).
+async fn send_to_plugin_with<T>(
+    sender: &crossbeam_channel::RSender<T>,
+    msg: T,
+    plugin_id: &str,
+    is_shutting_down: impl Fn() -> bool,
+    shutdown_grace: Duration,
+) -> Result<()> {
+    use crossbeam::channel::{SendTimeoutError, TrySendError};
+
+    // Fast path: room in the channel (the common case).
+    let mut msg = match sender.try_send(msg) {
+        Ok(()) => return Ok(()),
+        Err(TrySendError::Full(m)) => m,
+        Err(TrySendError::Disconnected(_)) => return Err(plugin_channel_closed(plugin_id)),
+    };
+
+    let block_in_place_ok = Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    let mut grace_deadline: Option<std::time::Instant> = None;
+    loop {
+        let res = if block_in_place_ok {
+            tokio::task::block_in_place(|| sender.send_timeout(msg, PLUGIN_SEND_SLICE))
+        } else {
+            sender.send_timeout(msg, PLUGIN_SEND_SLICE)
+        };
+        msg = match res {
+            Ok(()) => return Ok(()),
+            Err(SendTimeoutError::Timeout(m)) => m,
+            Err(SendTimeoutError::Disconnected(_)) => {
+                return Err(plugin_channel_closed(plugin_id));
+            }
+        };
+        if is_shutting_down() {
+            let deadline =
+                *grace_deadline.get_or_insert_with(|| std::time::Instant::now() + shutdown_grace);
+            if std::time::Instant::now() >= deadline {
+                return Err(streamling_err!(
+                    "plugin '{}' input channel still full {:?} after shutdown was requested; \
+                     abandoning the send so the drain can proceed (dispatcher presumed wedged)",
+                    plugin_id,
+                    shutdown_grace
+                ));
+            }
+        }
+        // Yield between slices so a current-thread runtime can run the tasks
+        // that would drain this channel.
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Sync-context variant of [`send_to_plugin`] for the two `Init` sends that
+/// happen inside DataFusion's non-async `execute()`. `Init` targets a fresh,
+/// near-empty channel, so the fixed [`PLUGIN_BLOCKING_SEND_BOUND`] is
+/// generous — reaching it means the dispatcher never started consuming, and
+/// erroring beats the panic (`unwrap`) and the unbounded park this replaces.
+pub fn send_to_plugin_blocking<T>(
+    sender: &crossbeam_channel::RSender<T>,
+    msg: T,
+    plugin_id: &str,
+) -> Result<()> {
+    use crossbeam::channel::SendTimeoutError;
+
+    match sender.send_timeout(msg, PLUGIN_BLOCKING_SEND_BOUND) {
+        Ok(()) => Ok(()),
+        Err(SendTimeoutError::Timeout(_)) => Err(streamling_err!(
+            "plugin '{}' did not accept a message within {:?} of pipeline start \
+             (dispatcher not consuming)",
+            plugin_id,
+            PLUGIN_BLOCKING_SEND_BOUND
+        )),
+        Err(SendTimeoutError::Disconnected(_)) => Err(plugin_channel_closed(plugin_id)),
+    }
+}
+
+fn plugin_channel_closed(plugin_id: &str) -> crate::error::StreamlingError {
+    streamling_err!(
+        "plugin '{}' input channel is closed (dispatcher exited); cannot deliver message",
+        plugin_id
+    )
 }
 
 fn create_logging(app_config: &AppConfig) -> PluginLogging {
@@ -569,25 +862,35 @@ pub fn create_preprocessor_plugin(
     })
 }
 
-pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
+pub fn terminate_plugins(
+    plugins: Vec<(String, PluginChannels)>,
+    send_budget: Option<Duration>,
+) -> Result<()> {
     // Bound the send so a plugin whose input channel is full (a wedged
     // dispatcher) cannot park this call — and thus the whole shutdown path —
     // forever on a blocking crossbeam send. A failure to signal one plugin must
     // not stop us from terminating the rest, so warn and continue rather than
     // bailing; the host awaits the dispatchers afterwards and the shutdown
     // watchdog is the final backstop.
-    const TERMINATE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+    const TERMINATE_SEND_TIMEOUT_MAX: Duration = Duration::from_secs(5);
+    const TERMINATE_SEND_TIMEOUT_MIN: Duration = Duration::from_millis(100);
+    let per_plugin = match send_budget {
+        Some(total) => (total / plugins.len().max(1) as u32)
+            .clamp(TERMINATE_SEND_TIMEOUT_MIN, TERMINATE_SEND_TIMEOUT_MAX),
+        None => TERMINATE_SEND_TIMEOUT_MAX,
+    };
     for (plugin_id, channels) in plugins {
         info!("Terminating plugin {}", plugin_id);
 
-        if let Err(e) = channels.input.sender.send_timeout(
-            NonExhaustive::new(PluginMsg::Terminate),
-            TERMINATE_SEND_TIMEOUT,
-        ) {
+        if let Err(e) = channels
+            .input
+            .sender
+            .send_timeout(NonExhaustive::new(PluginMsg::Terminate), per_plugin)
+        {
             warn!(
                 "Failed to send termination message to plugin {} within {:?}: {}. \
                  Continuing to terminate remaining plugins.",
-                plugin_id, TERMINATE_SEND_TIMEOUT, e
+                plugin_id, per_plugin, e
             );
         }
     }
@@ -598,6 +901,85 @@ pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §1.2 facade: a disconnected input channel (dispatcher exited) must be
+    /// a typed error, not the panic the old `send().unwrap()` produced.
+    #[tokio::test]
+    async fn send_to_plugin_errors_on_disconnected_channel() {
+        let (rtx, rrx) = crossbeam_channel::bounded::<u32>(1);
+        drop(rrx);
+        let err = send_to_plugin_with(&rtx, 7u32, "p", || false, Duration::from_secs(1))
+            .await
+            .expect_err("disconnected channel must error");
+        assert!(err.to_string().contains("closed"), "got: {err}");
+    }
+
+    /// §1.2 facade: a full channel AFTER shutdown is requested is abandoned
+    /// within the grace bound instead of parking forever.
+    #[tokio::test]
+    async fn send_to_plugin_abandons_full_channel_after_shutdown_grace() {
+        let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
+        rtx.try_send(1).unwrap(); // fill the single slot; nothing ever drains it
+
+        let start = std::time::Instant::now();
+        let err = send_to_plugin_with(&rtx, 2u32, "p", || true, Duration::from_millis(300))
+            .await
+            .expect_err("wedged channel must be abandoned");
+        assert!(err.to_string().contains("abandoning"), "got: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must abandon within the grace bound, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// §1.2 facade: pre-shutdown a full channel is plain backpressure — the
+    /// send must succeed once the dispatcher drains a slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_to_plugin_waits_out_backpressure_before_shutdown() {
+        let (rtx, rrx) = crossbeam_channel::bounded::<u32>(1);
+        rtx.try_send(1).unwrap();
+
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let v = rrx.recv().unwrap();
+            (v, rrx)
+        });
+        send_to_plugin_with(&rtx, 2u32, "p", || false, Duration::from_millis(100))
+            .await
+            .expect("send must succeed once a slot frees up");
+        let (first, rrx) = drainer.join().unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(rrx.recv().unwrap(), 2);
+    }
+
+    /// Regression: the panic hook calls
+    /// into plugin termination; with a plugin input channel already full, a
+    /// blocking (or even bounded-timeout) send parks the panicking thread and
+    /// the process neither crashes nor exits. The non-blocking variant must
+    /// return promptly no matter the channel state.
+    #[test]
+    fn nonblocking_terminate_returns_promptly_with_full_channel() {
+        let channels = create_channels_with_caps(1, 1, 1);
+        channels
+            .input
+            .sender
+            .try_send(NonExhaustive::new(PluginMsg::Init))
+            .expect("fills the single-slot input channel");
+        register_plugin_instance("nonblocking-terminate-test", channels);
+
+        let start = std::time::Instant::now();
+        terminate_all_plugins_nonblocking();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must not block on a full channel, took {:?}",
+            start.elapsed()
+        );
+
+        // The registry was drained even though the send could not go through.
+        assert!(PLUGIN_INSTANCE_REGISTRY.read().unwrap().is_empty());
+    }
+
     use crate::error::StreamlingError;
     use arrow_schema::Schema;
 

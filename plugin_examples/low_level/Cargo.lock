@@ -4302,6 +4302,7 @@ dependencies = [
  "regex",
  "serde_json",
  "sha3",
+ "streamling-retry",
  "tracing",
  "tracing-subscriber",
  "uint",
@@ -4328,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "abi_stable",
  "arrow",
@@ -4343,8 +4344,10 @@ dependencies = [
  "streamling-common",
  "streamling-config",
  "streamling-plugin-derive",
+ "streamling-retry",
  "streamling-state",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4356,6 +4359,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "streamling-retry"
+version = "0.3.1"
+dependencies = [
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4629,6 +4640,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

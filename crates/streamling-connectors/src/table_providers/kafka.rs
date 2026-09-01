@@ -3,9 +3,9 @@ mod metadata;
 mod schema_registry;
 
 use streamling_config::{KafkaCompression, KafkaConfig};
-use streamling_core::checkpoints::channels::{send, subscribe_with_id, unsubscribe};
+use streamling_core::checkpoints::channels::{subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointControl, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
     report_marker_at_sink, send_checkpoint_ack,
 };
@@ -162,6 +162,12 @@ static PARTITION_COUNT_FETCH_TIMEOUT_SEC: u64 = 10;
 
 static DEFAULT_NUM_PARTITIONS: i32 = 4;
 
+/// How long the sink keeps absorbing `QueueFull` backpressure after shutdown
+/// has been requested. Long enough for a healthy broker to drain the queue
+/// mid-drain, short enough that a wedged broker can't pin the drain past the
+/// shutdown watchdog budget.
+static QUEUE_FULL_SHUTDOWN_RETRY_WINDOW: StdDuration = StdDuration::from_secs(10);
+
 /// Wrapper around StreamConsumer that safely handles drop.
 ///
 /// Dropping rdkafka consumers synchronously on a tokio worker thread can cause
@@ -202,15 +208,66 @@ impl std::ops::Deref for SafeKafkaConsumer {
 impl Drop for SafeKafkaConsumer {
     fn drop(&mut self) {
         if let Some(consumer) = self.consumer.take() {
-            // Move the drop to a blocking thread to prevent deadlock with rdkafka threads
+            // Run rd_kafka_destroy on a detached OS thread, NOT spawn_blocking:
+            // a blocking task queued while the runtime is shutting down never
+            // runs — its closure is dropped inline on the shutdown thread,
+            // which puts rd_kafka_destroy right back where it deadlocks. A
+            // plain thread always runs, never wedges the runtime, and if the
+            // process exits first the in-flight destroy is simply abandoned
+            // with it.
             tracing::warn!(
                 "SafeKafkaConsumer: drop() triggered (early exit path), \
-                 moving rd_kafka_destroy to spawn_blocking to prevent deadlock"
+                 moving rd_kafka_destroy to a detached thread to prevent deadlock"
             );
-            tokio::task::spawn_blocking(move || {
-                tracing::info!("SafeKafkaConsumer: spawn_blocking starting rd_kafka_destroy");
+            std::thread::spawn(move || {
+                tracing::info!("SafeKafkaConsumer: detached rd_kafka_destroy starting");
                 drop(consumer);
-                tracing::info!("SafeKafkaConsumer: spawn_blocking rd_kafka_destroy completed");
+                tracing::info!("SafeKafkaConsumer: detached rd_kafka_destroy completed");
+            });
+        }
+    }
+}
+
+/// Wrapper that keeps rdkafka *producer* teardown off tokio worker threads.
+///
+/// Same rationale as [`SafeKafkaConsumer`]: dropping the last handle runs
+/// `rd_kafka_destroy()`, which waits on internal librdkafka threads and can
+/// deadlock a tokio worker — at runtime teardown that wedges `Runtime::drop`
+/// and the process hangs until SIGKILL. The sink's producers are dropped with
+/// the DataFusion plan on a worker thread, so they need the same deferral.
+struct SafeKafkaProducers {
+    producers: Option<Vec<KafkaThreadedProducer>>,
+}
+
+impl SafeKafkaProducers {
+    fn new(producers: Vec<KafkaThreadedProducer>) -> Self {
+        Self {
+            producers: Some(producers),
+        }
+    }
+
+    fn as_slice(&self) -> &[KafkaThreadedProducer] {
+        self.producers.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for SafeKafkaProducers {
+    fn drop(&mut self) {
+        if let Some(producers) = self.producers.take() {
+            // Detached OS thread, not spawn_blocking — see SafeKafkaConsumer:
+            // a blocking task queued during runtime shutdown never runs and
+            // its closure is dropped inline on the shutdown thread, restoring
+            // the very deadlock this wrapper exists to prevent. The sink has
+            // already flushed by the time producers drop, so abandoning the
+            // destroy at process exit loses nothing.
+            tracing::info!(
+                "SafeKafkaProducers: moving rd_kafka_destroy of {} producer(s) \
+                 to a detached thread to prevent worker-thread deadlock",
+                producers.len()
+            );
+            std::thread::spawn(move || {
+                drop(producers);
+                tracing::info!("SafeKafkaProducers: rd_kafka_destroy completed");
             });
         }
     }
@@ -606,7 +663,17 @@ struct KafkaSourceExec {
     include_metadata: bool,
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     shutdown_rx: watch::Receiver<bool>,
-    num_records_before_stop: Option<u64>,
+    /// Present when the run loop wired this source for terminal
+    /// checkpointing (Decision 1B): on graceful exit the consume task mints
+    /// the terminal epoch and commits the drained tail's offsets once the
+    /// sinks ack it. Absent in contexts that manage their own terminal epoch
+    /// (the hybrid source's Kafka phase).
+    checkpoint_control: Option<CheckpointControl>,
+    /// Present when the run loop owns a ShutdownController: helper tasks
+    /// (the lag reporter) are spawned through the scope so the drain ladder
+    /// tracks them. Absent = legacy raw-spawn path (hybrid inner providers,
+    /// direct construction in tests) until those are ported.
+    scope: Arc<streamling_core::shutdown::ComponentScope>,
     /// Number of concurrent consumer instances; one `execute` call per instance.
     parallelism: usize,
     /// Resolved once at construction so every instance joins the *same* consumer
@@ -663,8 +730,9 @@ impl KafkaSourceExec {
         include_metadata: bool,
         state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
         shutdown_rx: watch::Receiver<bool>,
-        num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
+        checkpoint_control: Option<CheckpointControl>,
+        scope: Arc<streamling_core::shutdown::ComponentScope>,
         parallelism: usize,
     ) -> Self {
         let full_schema_projected = project_schema(&full_schema, projections).unwrap();
@@ -701,7 +769,8 @@ impl KafkaSourceExec {
             include_metadata,
             state_backend,
             shutdown_rx,
-            num_records_before_stop,
+            checkpoint_control,
+            scope,
             parallelism,
             group_id,
             lag_group_id,
@@ -724,6 +793,185 @@ impl KafkaSourceExec {
                 requires_infinite_memory: false,
             },
         )
+    }
+
+    /// Commit the consumer position recorded for `epoch` (offset commit +
+    /// state-backend save), shared by the in-loop Finalizer dispatch and the
+    /// terminal-checkpoint path on shutdown. No recorded position is the
+    /// normal case for epochs whose Marker never reached this source; commits
+    /// are cumulative, so skipping is always safe (the tail replays on
+    /// restart, at-least-once).
+    ///
+    /// Returns `Ok(true)` when the epoch's offsets are durably covered (the
+    /// broker commit landed, or there was nothing new to commit) and
+    /// `Ok(false)` when the broker commit itself failed. A failed broker
+    /// commit is soft, not `Err`: mid-flight it is routine (a rebalance's
+    /// NoOffset — the next epoch commits the reassigned partitions), so it
+    /// must not tear down the stream; but the terminal caller MUST NOT log
+    /// its "drained tail committed" line on it — the offsets were not
+    /// committed and the tail replays.
+    async fn commit_offsets_for_finalized_epoch(
+        consumer: &StreamConsumer,
+        state_backend: &Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
+        reference_name: &str,
+        consumer_offsets: &mut BTreeMap<CheckpointEpoch, KafkaTopicPartitionList>,
+        committed_offsets: &mut Option<KafkaTopicPartitionList>,
+        epoch: &CheckpointEpoch,
+        // Hard bound on the state-backend persistence await (see the timeout
+        // at the put_many below). The terminal caller sizes this from its
+        // finalize slice so a dead backend cannot eat the shutdown budget;
+        // the in-loop caller passes a generous liveness bound.
+        state_put_timeout: Duration,
+    ) -> streamling_core::error::Result<bool> {
+        let Some(position) = consumer_offsets.get(epoch) else {
+            // Expected for epochs whose Marker never reached this source.
+            // Commits are cumulative, so a missed epoch never loses data; the
+            // uncommitted tail replays on restart (at-least-once).
+            debug!(
+                "No recorded position for finalized epoch {:?}; skipping commit (cumulative commits make this safe)",
+                epoch
+            );
+            return Ok(true);
+        };
+        let mut broker_commit_failed = false;
+
+        if committed_offsets.is_some() && position == committed_offsets.as_ref().unwrap() {
+            debug!("Current position already committed, so skipping commit");
+        } else {
+            // Filter out invalid offsets
+            // This is needed in order to make commit progress on other partitions that are valid
+            // A few known reasons for the offsets to be "invalid":
+            // - A newly assigned partition after a rebalance
+            // - No new messages in the topic after the seek
+            let mut filtered_position = KafkaTopicPartitionList::new();
+            for tp in position
+                .elements()
+                .iter()
+                .filter(|tp| tp.offset() != Offset::Invalid)
+            {
+                filtered_position
+                    .add_partition_offset(tp.topic(), tp.partition(), tp.offset())
+                    .streamling_with_context(|| {
+                        format!(
+                            "failed to add partition offset (topic: {}, partition: {}, offset: {:?})",
+                            tp.topic(),
+                            tp.partition(),
+                            tp.offset()
+                        )
+                    })?;
+            }
+            let position = &filtered_position;
+
+            if !position.elements().is_empty() {
+                debug!("Committing position: {:?}", position);
+                // TODO: better rebalancing handling can be implemented
+                // Currently, every time a group rebalances it's possible to see the following error:
+                //     Consumer commit error: NoOffset (Local: No offset stored)
+                // This is OK because the next checkpoint epoch will commit the newly assigned partitions anyway
+                //
+                // rd_kafka_commit with async=0 blocks the calling thread for a
+                // full broker round trip — coordinator rediscovery and retry
+                // backoff included — so run it under block_in_place: during a
+                // drain every async worker is needed, and a slow commit
+                // (observed multi-second in the field) must not pin one. The
+                // flavor check keeps current_thread runtimes (unit tests) on
+                // the direct call, where block_in_place would panic.
+                let commit_started = std::time::Instant::now();
+                let commit_result = if tokio::runtime::Handle::current().runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread
+                {
+                    tokio::task::block_in_place(|| consumer.commit(position, CommitMode::Sync))
+                } else {
+                    consumer.commit(position, CommitMode::Sync)
+                };
+                let commit_elapsed = commit_started.elapsed();
+                if commit_elapsed > Duration::from_secs(1) {
+                    warn!(
+                        "Kafka source '{}': sync offset commit for epoch {} took {:?} (broker/coordinator round trip; see the commit-latency note above)",
+                        reference_name, epoch.0, commit_elapsed
+                    );
+                }
+                match commit_result {
+                    Ok(_) => {
+                        // Saving the position to the state backend as ONE
+                        // batched write: this runs on every checkpoint
+                        // finalize, and per-partition round trips measured
+                        // ~0.18s each against a remote backend — linear in
+                        // partition count, ~14.5s for an 80-partition topic,
+                        // dominating the terminal commit. Per-partition
+                        // entries are emitted at trace! level so a topic with
+                        // many partitions doesn't dump N debug lines here.
+                        let puts_started = std::time::Instant::now();
+                        let topic_partition_list = TopicPartitionList::from(position.clone());
+                        let partition_count = topic_partition_list.topic_partitions.len();
+                        let entries: Vec<_> = topic_partition_list
+                            .topic_partitions
+                            .into_iter()
+                            .map(|topic_partition| {
+                                trace!("Saving position to state backend: {:?}", topic_partition);
+                                (
+                                    topic_partition.state_key(reference_name.to_string()).into(),
+                                    topic_partition.offset,
+                                )
+                            })
+                            .collect();
+                        // Bounded: an unreachable backend leaves sqlx in its
+                        // own connect-retry loop and this await never
+                        // resolves — observed on shutdown as the terminal
+                        // commit silently eating the ENTIRE budget until the
+                        // watchdog force-exits, with nothing in the log naming
+                        // the cause (only a sqlx pool WARN). The timeout turns
+                        // that into the ordinary error path, which the callers
+                        // already handle truthfully (terminal: "failed to
+                        // commit ... tail replays"; mid-flight: stream
+                        // teardown naming the backend).
+                        match tokio::time::timeout(
+                            state_put_timeout,
+                            state_backend.put_many(entries),
+                        )
+                        .await
+                        {
+                            Ok(res) => res.map_err(|e| {
+                                streamling_err!(
+                                    "saving {} partition offset(s) to state backend: {:?}",
+                                    partition_count,
+                                    e
+                                )
+                            })?,
+                            Err(_elapsed) => {
+                                return Err(streamling_err!(
+                                    "state backend did not persist {} partition offset(s) within {:?} — backend unreachable or wedged; offsets stay uncommitted (tail replays on restart)",
+                                    partition_count,
+                                    state_put_timeout
+                                ));
+                            }
+                        }
+                        let puts_elapsed = puts_started.elapsed();
+                        if puts_elapsed > Duration::from_secs(1) {
+                            warn!(
+                                "Kafka source '{}': state-backend offset persistence for epoch {} took {:?} across {} partition(s)",
+                                reference_name, epoch.0, puts_elapsed, partition_count
+                            );
+                        }
+                        debug!(
+                            "Saved {} partition offset(s) to state backend for epoch {}",
+                            partition_count, epoch.0
+                        );
+
+                        *committed_offsets = Some(position.clone());
+                    }
+                    Err(e) => {
+                        error!("Failed to commit position {:?}: {}", position, e);
+                        broker_commit_failed = true;
+                    }
+                }
+            } else {
+                debug!("No valid offsets to commit");
+            }
+        }
+
+        consumer_offsets.remove(epoch);
+        Ok(!broker_commit_failed)
     }
 
     /// Each source gets its own consumer group so sources reading different
@@ -827,6 +1075,22 @@ impl KafkaSourceExec {
         consumer: &StreamConsumer,
         topic: &str,
     ) -> streamling_core::error::Result<()> {
+        let shutdown = streamling_core::shutdown::subscribe();
+        Self::wait_for_initial_assignment_or_message_cancellable(consumer, topic, shutdown).await
+    }
+
+    /// [`Self::wait_for_initial_assignment_or_message`] with an explicit
+    /// shutdown watch (unit-testable without flipping the process-global
+    /// signal).
+    ///
+    /// A SIGTERM during startup used to be unobservable here: this wait looped
+    /// forever (broker unreachable, stuck rebalance, idle topic) and the
+    /// consume loop's shutdown handling hadn't been reached yet.
+    async fn wait_for_initial_assignment_or_message_cancellable(
+        consumer: &StreamConsumer,
+        topic: &str,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> streamling_core::error::Result<()> {
         let fetch_timeout_sec = Self::consumer_fetch_timeout_sec();
         loop {
             if let Ok(tpl) = consumer.assignment()
@@ -834,32 +1098,52 @@ impl KafkaSourceExec {
             {
                 return Ok(());
             }
+            if *shutdown.borrow() {
+                return Err(streamling_retriable_err!(
+                    "Kafka source startup for topic '{}' cancelled by shutdown",
+                    topic
+                ));
+            }
 
-            match tokio::time::timeout(
-                Duration::from_secs(fetch_timeout_sec),
-                consumer.stream().next(),
-            )
-            .await
-            {
-                Ok(Some(Ok(_message))) => return Ok(()),
-                Ok(Some(Err(e))) => {
-                    return Err(streamling_err!(
-                        "fetching initial message from topic '{}': {:?}",
-                        topic,
-                        e
-                    ));
-                }
-                Ok(None) => {
-                    return Err(streamling_err!(
-                        "Kafka stream ended unexpectedly (topic: {})",
-                        topic
-                    ));
-                }
-                Err(_) => {
-                    debug!(
-                        "initial message fetch timed out after {}s (topic: {}), no new records yet; retrying",
-                        fetch_timeout_sec, topic
-                    );
+            let mut stream = consumer.stream();
+            tokio::select! {
+                fetched = tokio::time::timeout(
+                    Duration::from_secs(fetch_timeout_sec),
+                    stream.next(),
+                ) => match fetched {
+                    Ok(Some(Ok(_message))) => return Ok(()),
+                    Ok(Some(Err(e))) => {
+                        return Err(streamling_err!(
+                            "fetching initial message from topic '{}': {:?}",
+                            topic,
+                            e
+                        ));
+                    }
+                    Ok(None) => {
+                        return Err(streamling_err!(
+                            "Kafka stream ended unexpectedly (topic: {})",
+                            topic
+                        ));
+                    }
+                    Err(_) => {
+                        debug!(
+                            "initial message fetch timed out after {}s (topic: {}), no new records yet; retrying",
+                            fetch_timeout_sec, topic
+                        );
+                    }
+                },
+                res = shutdown.changed() => {
+                    if res.is_err() {
+                        // Watch sender dropped (cannot happen for the
+                        // process-global signal): treat as shutdown rather
+                        // than spinning on a closed channel.
+                        return Err(streamling_retriable_err!(
+                            "Kafka source startup for topic '{}' cancelled by shutdown",
+                            topic
+                        ));
+                    }
+                    // Flag flipped: loop back — the borrow check at the top
+                    // returns the cancellation error.
                 }
             }
         }
@@ -1026,20 +1310,29 @@ async fn calculate_lag_task(
     lag_report_interval_ms: Option<u64>,
     max_lag_tx: watch::Sender<Option<i64>>,
     mut shutdown_rx: watch::Receiver<bool>,
+    cancel: Option<streamling_core::shutdown::CancellationToken>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(
         lag_report_interval_ms.unwrap_or(DEFAULT_LAG_REPORT_INTERVAL_MS),
     ));
 
-    // Also observe the process-wide shutdown signal: outside job mode nothing
+    // Cancellation: ported call sites hand this task its scope's token (the
+    // drain ladder cancels it and awaits the tracker). Unported ones (the
+    // hybrid source's inner providers, until their Phase 2 port) pass None
+    // and lean on the process-wide watch instead — outside job mode nothing
     // flips the provider-level channel, and a lag task that outlives the
-    // pipeline gets cancelled at runtime teardown — where its consumer's
+    // pipeline gets cancelled at runtime teardown, where its consumer's
     // rd_kafka_destroy can no longer be deferred to a blocking thread.
-    let mut global_shutdown_rx = streamling_core::shutdown::subscribe();
+    let mut global_shutdown_rx = cancel.is_none().then(streamling_core::shutdown::subscribe);
 
     loop {
-        if *global_shutdown_rx.borrow() {
-            info!("Lag task observed process shutdown for {}", reference_name);
+        let already_cancelled = match (&cancel, &global_shutdown_rx) {
+            (Some(token), _) => token.is_cancelled(),
+            (None, Some(rx)) => *rx.borrow(),
+            (None, None) => unreachable!("one cancellation source is always present"),
+        };
+        if already_cancelled {
+            info!("Lag task observed shutdown for {}", reference_name);
             break;
         }
         tokio::select! {
@@ -1049,9 +1342,20 @@ async fn calculate_lag_task(
                     break;
                 }
             },
-            _ = global_shutdown_rx.changed() => {
-                if *global_shutdown_rx.borrow() {
-                    info!("Lag task observed process shutdown for {}", reference_name);
+            _ = async {
+                match (&cancel, &mut global_shutdown_rx) {
+                    (Some(token), _) => token.cancelled().await,
+                    (None, Some(rx)) => { let _ = rx.changed().await; }
+                    (None, None) => unreachable!("one cancellation source is always present"),
+                }
+            } => {
+                let cancelled_now = match (&cancel, &global_shutdown_rx) {
+                    (Some(token), _) => token.is_cancelled(),
+                    (None, Some(rx)) => *rx.borrow(),
+                    (None, None) => false,
+                };
+                if cancelled_now {
+                    info!("Lag task observed shutdown for {}", reference_name);
                     break;
                 }
             },
@@ -1301,7 +1605,8 @@ impl ExecutionPlan for KafkaSourceExec {
                 .is_ok();
         let start_at = self.start_at.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
-        let num_records_before_stop = self.num_records_before_stop;
+        let checkpoint_control = self.checkpoint_control.clone();
+        let scope = self.scope.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
         let kafka_lag_reporter_interval = self.kafka_config.lag_report_interval_ms;
         let metrics_recorder = get_metrics_recorder().clone();
@@ -1336,8 +1641,11 @@ impl ExecutionPlan for KafkaSourceExec {
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
+            // Only the instance that was handed the lag consumer reports lag
+            // (one per source, not one per parallel instance); it spawns
+            // through the scope so the drain ladder tracks it.
             if let Some(lag_consumer) = lag_consumer {
-                tokio::spawn(calculate_lag_task(
+                let lag_task = calculate_lag_task(
                     reference_name.clone(),
                     metric_metadata_id.clone(),
                     kafka_topic_partition_list.clone(),
@@ -1347,7 +1655,9 @@ impl ExecutionPlan for KafkaSourceExec {
                     kafka_lag_reporter_interval,
                     max_lag_tx,
                     shutdown_rx.clone(),
-                ));
+                    Some(scope.token().clone()),
+                );
+                scope.spawn(lag_task);
             }
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
@@ -1448,20 +1758,6 @@ impl ExecutionPlan for KafkaSourceExec {
             // we pull off the channel that isn't acted on immediately lands
             // here and is replayed through the main dispatch after the next
             // batch is built.
-            //
-            // NOTE: today this buffer only fills in test/job mode, because the
-            // sole producer (the SourceComplete probe below) is gated on
-            // `num_records_before_stop`. Production deployments don't set
-            // that env, so this vec stays empty and the main dispatch is the
-            // only path consuming the channel. Keep the indirection regardless
-            // so that any future intra-select probe can route through here
-            // without re-introducing the marker-loss bug.
-            let mut pending_checkpoint_messages: Vec<CheckpointMessage> = Vec::new();
-
-            // Create interval timer for checking SourceComplete (only in test mode)
-            let mut source_complete_interval = num_records_before_stop
-                .map(|_| tokio::time::interval(Duration::from_millis(5)));
-
             // Process-wide shutdown signal (one top-level SIGTERM/SIGINT
             // handler flips it). This replaces the per-iteration
             // `signal(SignalKind::terminate())` listener this loop used to
@@ -1473,6 +1769,11 @@ impl ExecutionPlan for KafkaSourceExec {
             // the batch already buffered in the converter is still converted
             // and sent (drain, don't drop), then exit the outer loop.
             let mut drain_and_stop = false;
+            // True only for exits where downstream is still consuming
+            // (shutdown drain, SourceComplete) — the terminal checkpoint
+            // below is skipped when the receiver is already gone, since no
+            // sink could ever ack it and the wait would just burn budget.
+            let mut graceful_exit = false;
 
             'outer: loop {
                 // A shutdown requested before this iteration started (e.g.
@@ -1486,6 +1787,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 // delivers them on a synthetic batch.
                 if drain_and_stop || *global_shutdown_rx.borrow() {
                     info!("Kafka source '{}': shutdown requested; stopping", reference_name);
+                    graceful_exit = true;
                     break 'outer;
                 }
 
@@ -1516,37 +1818,6 @@ impl ExecutionPlan for KafkaSourceExec {
                                 info!("Kafka source '{}': received shutdown signal, draining in-flight batch", reference_name);
                                 drain_and_stop = true;
                                 break;
-                            }
-                        },
-                        // Check for SourceComplete messages (only in test mode with num_records_before_stop).
-                        //
-                        // This probe shares the checkpoint-coordinator receiver with the main
-                        // marker/finalizer dispatch below, so we MUST NOT drop any non-SourceComplete
-                        // messages we happen to drain here — otherwise Markers/Finalizers that arrive
-                        // while the kafka consumer is idle (notably: just after a hybrid
-                        // bounded→unbounded transition, before kafka has emitted its first batch)
-                        // get silently consumed and the coordinator stalls forever waiting for an
-                        // ack that the sink will never see. Anything we pull off the channel that
-                        // isn't a SourceComplete is forwarded to `pending_checkpoint_messages` and
-                        // replayed through the main dispatch loop.
-                        _ = async {
-                            if let Some(ref mut interval) = source_complete_interval {
-                                interval.tick().await;
-                            } else {
-                                futures::future::pending::<()>().await;
-                            }
-                        } => {
-                            loop {
-                                match receiver.try_recv() {
-                                    Ok(CheckpointMessage::SourceComplete(name)) => {
-                                        debug!("Received SourceComplete as part of num_records_before_stop for {}, shutting down", name);
-                                        break 'outer;
-                                    }
-                                    Ok(msg) => {
-                                        pending_checkpoint_messages.push(msg);
-                                    }
-                                    Err(_) => break,
-                                }
                             }
                         },
                         // Await the next record
@@ -1622,14 +1893,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 }
 
                 // Always check for checkpoint messages (non-blocking).
-                //
-                // Messages can come from two places: any that the inner SourceComplete
-                // probe consumed but didn't itself act on land in
-                // `pending_checkpoint_messages`; the rest we drain off the receiver here.
-                // Both feed into the same dispatch below so Markers/Finalizers/SourceComplete
-                // are handled identically regardless of which path pulled them off the channel.
-                let mut messages_to_process: Vec<CheckpointMessage> =
-                    std::mem::take(&mut pending_checkpoint_messages);
+                let mut messages_to_process: Vec<CheckpointMessage> = Vec::new();
                 loop {
                     match receiver.try_recv() {
                         Ok(msg) => messages_to_process.push(msg),
@@ -1665,91 +1929,30 @@ impl ExecutionPlan for KafkaSourceExec {
                             debug!("Received epoch finalizer: {:?}", epoch);
                             checkpoint_messages_buffer.push(CheckpointMessage::Finalizer(epoch.clone()));
 
-                            if let Some(position) = consumer_offsets.get(&epoch) {
-
-                                if committed_offsets.is_some() && position == committed_offsets.as_ref().unwrap() {
-                                    debug!("Current position already committed, so skipping commit");
-                                } else {
-                                    // Filter out invalid offsets
-                                    // This is needed in order to make commit progress on other partitions that are valid
-                                    // A few known reasons for the offsets to be "invalid":
-                                    // - A newly assigned partition after a rebalance
-                                    // - No new messages in the topic after the seek
-                                    let mut filtered_position = KafkaTopicPartitionList::new();
-                                    for tp in position.elements().iter().filter(|tp| tp.offset() != Offset::Invalid) {
-                                        filtered_position
-                                            .add_partition_offset(tp.topic(), tp.partition(), tp.offset())
-                                            .streamling_with_context(|| format!(
-                                                "failed to add partition offset (topic: {}, partition: {}, offset: {:?})",
-                                                tp.topic(), tp.partition(), tp.offset()
-                                            ))?;
-                                    }
-                                    let position = &filtered_position;
-
-                                    if !position.elements().is_empty() {
-                                        debug!("Committing position: {:?}", position);
-                                        // TODO: better rebalancing handling can be implemented
-                                        // Currently, every time a group rebalances it's possible to see the following error:
-                                        //     Consumer commit error: NoOffset (Local: No offset stored)
-                                        // This is OK because the next checkpoint epoch will commit the newly assigned partitions anyway
-                                        match consumer.commit(position, CommitMode::Sync) {
-                                            Ok(_) => {
-                                                // Saving the position to the state backend.
-                                                // Per-partition writes are emitted at trace! level so a
-                                                // topic with many partitions doesn't dump N debug lines
-                                                // on every checkpoint finalize.
-                                                let topic_partition_list = TopicPartitionList::from(position.clone());
-                                                let partition_count = topic_partition_list.topic_partitions.len();
-                                                for topic_partition in topic_partition_list.topic_partitions {
-                                                    trace!("Saving position to state backend: {:?}", topic_partition);
-                                                    let tp_topic = topic_partition.topic.clone();
-                                                    let tp_partition = topic_partition.partition;
-                                                    let tp_offset_debug = format!("{:?}", topic_partition.offset);
-                                                    state_backend
-                                                        .put(topic_partition.state_key(reference_name.clone()).into(), topic_partition.offset)
-                                                        .await
-                                                        .map_err(|e|
-                                                            streamling_err!("saving offset to state backend (topic: {}, partition: {}, offset: {}): {:?}",
-                                                                tp_topic, tp_partition, tp_offset_debug, e
-                                                            )
-                                                        )?;
-                                                }
-                                                debug!(
-                                                    "Saved {} partition offset(s) to state backend for epoch {}",
-                                                    partition_count, epoch.0
-                                                );
-
-                                                committed_offsets = Some(position.clone());
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to commit position {:?}: {}", position, e);
-                                            }
-                                        }
-                                    } else {
-                                        debug!("No valid offsets to commit");
-                                    }
-                                }
-
-                                consumer_offsets.remove(&epoch);
-                            } else {
-                                // Expected for epochs whose Marker never reached this
-                                // source — notably the terminal epoch, whose Marker
-                                // travels inline to the sinks only. Commits are
-                                // cumulative, so a missed epoch never loses data; the
-                                // uncommitted tail replays on restart (at-least-once).
-                                debug!(
-                                    "No recorded position for finalized epoch {:?}; skipping commit (cumulative commits make this safe)",
-                                    epoch
-                                );
-                            }
+                            // A soft broker-commit failure (Ok(false)) is
+                            // tolerated mid-flight: the next epoch's
+                            // cumulative commit covers it (rebalance NoOffset
+                            // is the routine case). Hard errors still tear
+                            // down the stream — including the state-backend
+                            // put timing out (60s is far beyond any healthy
+                            // put; a backend gone THAT long should restart
+                            // the pipeline rather than wedge this loop, which
+                            // also serves the shutdown drain).
+                            let _ = Self::commit_offsets_for_finalized_epoch(
+                                &consumer,
+                                &state_backend,
+                                &reference_name,
+                                &mut consumer_offsets,
+                                &mut committed_offsets,
+                                &epoch,
+                                Duration::from_secs(60),
+                            ).await?;
                         }
-                        CheckpointMessage::SourceComplete(name) => {
-                            // TODO add verification that the name matches
-                            debug!("Received SourceComplete for {}, shutting down", name.clone());
-                            checkpoint_messages_buffer.push(CheckpointMessage::SourceComplete(name));
-
-                            break 'outer;
-                        }
+                        // SourceComplete no longer arrives on the coordinator
+                        // channel: record-limit sinks now request process-wide
+                        // shutdown instead (§5.1 Decision 3A), which the select
+                        // above observes — falls through to the buffer with the
+                        // other pass-through messages.
                         msg => {
                             checkpoint_messages_buffer.push(msg);
                         }
@@ -1767,6 +1970,42 @@ impl ExecutionPlan for KafkaSourceExec {
                 metrics_recorder.record_elapsed_compute(outer_loop_start_at.elapsed(), metric_metadata_id.as_str());
             }
 
+            // Terminal checkpoint on graceful exit (§8.1 Decision 1B). The
+            // loop above drained and sent the in-flight batch, but its offsets
+            // commit only on a checkpoint Finalizer — and outside job mode no
+            // terminal epoch used to be minted, so the drained tail was
+            // written by the sinks yet never committed: every streaming
+            // restart replayed it (duplicate publishes on non-idempotent
+            // sinks). Mint the terminal epoch (idempotent across the sources
+            // of a multi-source pipeline — first caller mints, the rest
+            // reuse), record the position it covers, and ride its Marker on
+            // the final flush batch below so the sinks flush and ack it.
+            let terminal_epoch = match (&checkpoint_control, graceful_exit) {
+                (Some(control), true) => {
+                    let terminal = control.begin_terminal_checkpoint();
+                    match consumer.position() {
+                        Ok(position) => {
+                            consumer_offsets.insert(terminal.clone(), position);
+                        }
+                        Err(e) => {
+                            // Without a recorded position the finalize below
+                            // degrades to a no-op commit — same replay window
+                            // as before 1B, never worse.
+                            error!(
+                                "Kafka source '{}': failed to read consumer position for terminal epoch: {}",
+                                reference_name, e
+                            );
+                        }
+                    }
+                    checkpoint_messages_buffer.push(CheckpointMessage::Marker {
+                        epoch: terminal.clone(),
+                        created_at_ms: now_ms(),
+                    });
+                    Some(terminal)
+                }
+                _ => None,
+            };
+
             // Flush any checkpoint messages buffered to ride the next batch —
             // no exit path from the loop above produces one. Without this, a
             // Marker/Finalizer that arrived after the last batch was built is
@@ -1774,7 +2013,8 @@ impl ExecutionPlan for KafkaSourceExec {
             // collect this branch's acks, and its offsets are never committed
             // before teardown (replayed on restart, but the clean drain is
             // lost). Mirrors the end-of-stream flush in the ClickHouse and
-            // hybrid sources.
+            // hybrid sources. The terminal Marker minted above (if any) rides
+            // this same batch, after all real data.
             {
                 let flush_batch = crate::table_providers::clickhouse::build_checkpoint_flush_batch(
                     &mut checkpoint_messages_buffer,
@@ -1786,6 +2026,81 @@ impl ExecutionPlan for KafkaSourceExec {
                     warn!(
                         "Kafka source '{}': receiver dropped before final checkpoint flush",
                         reference_name
+                    );
+                }
+            }
+
+            // Wait (bounded, always under the watchdog budget) for the sinks
+            // to ack the terminal epoch, then commit the drained tail's
+            // offsets — closing the streaming-restart duplicate window. On
+            // timeout the offsets stay uncommitted and the tail replays on
+            // restart: exactly the pre-1B behaviour, never worse.
+            if let (Some(control), Some(terminal)) = (&checkpoint_control, terminal_epoch) {
+                let finalize_timeout =
+                    streamling_core::shutdown::terminal_checkpoint_finalize_timeout();
+                // The wait and the commit are timed separately so a slow
+                // drained-tail commit is attributable from one log line:
+                // "waited" is finalization latency (sink acks + notify wake),
+                // "committed in" is the broker commit + state-backend
+                // persistence that follows.
+                let wait_started = std::time::Instant::now();
+                if tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
+                    .await
+                    .is_ok()
+                {
+                    let waited = wait_started.elapsed();
+                    let commit_started = std::time::Instant::now();
+                    // The commit spends what the finalize wait did not use of
+                    // the terminal slice (floored so a fast ack still leaves
+                    // a real window). This keeps a dead state backend from
+                    // silently eating the remaining shutdown budget until the
+                    // watchdog force-exits with nothing naming the cause —
+                    // the timeout lands in the Err arm below instead.
+                    let commit_timeout = finalize_timeout
+                        .saturating_sub(waited)
+                        .max(Duration::from_secs(2));
+                    match Self::commit_offsets_for_finalized_epoch(
+                        &consumer,
+                        &state_backend,
+                        &reference_name,
+                        &mut consumer_offsets,
+                        &mut committed_offsets,
+                        &terminal,
+                        commit_timeout,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                "Kafka source '{}': terminal epoch {} finalized; drained tail committed (waited {:?} for finalization, committed in {:?})",
+                                reference_name,
+                                terminal.0,
+                                waited,
+                                commit_started.elapsed()
+                            );
+                        }
+                        // The broker commit failed: the offsets were NOT
+                        // committed, so the success line above must not
+                        // print — its presence is the primary pass criterion
+                        // for drain verification, and printing it here would
+                        // hide a replaying tail behind a "committed" claim.
+                        Ok(false) => {
+                            error!(
+                                "Kafka source '{}': broker offset commit FAILED for terminal epoch {}; offsets stay uncommitted (tail replays on restart)",
+                                reference_name, terminal.0
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Kafka source '{}': failed to commit offsets for terminal epoch {}: {} (tail replays on restart)",
+                                reference_name, terminal.0, e
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Kafka source '{}': terminal epoch {} did not finalize within {:?}; offsets stay uncommitted (tail replays on restart)",
+                        reference_name, terminal.0, finalize_timeout
                     );
                 }
             }
@@ -1830,8 +2145,9 @@ pub struct KafkaSourceTableProvider {
     session_manager: SessionManager,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
-    num_records_before_stop: Option<u64>,
     extracted_primary_key: Option<String>,
+    checkpoint_control: Option<CheckpointControl>,
+    scope: Arc<streamling_core::shutdown::ComponentScope>,
     parallelism: usize,
 }
 
@@ -1850,7 +2166,6 @@ impl Debug for KafkaSourceTableProvider {
             .field("record_batch_size", &self.record_batch_size)
             .field("internal_buffer_size", &self.internal_buffer_size)
             .field("include_metadata", &self.include_metadata)
-            .field("num_records_before_stop", &self.num_records_before_stop)
             .finish()
     }
 }
@@ -1886,7 +2201,6 @@ impl KafkaSourceTableProvider {
         include_metadata: bool,
         state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
         session_manager: SessionManager,
-        num_records_before_stop: Option<u64>,
         validate_writer_schema_ordering: bool,
         schema_id_overrides: Vec<SchemaIdOverride>,
         skip_schema_resolution_unconditional: bool,
@@ -2002,14 +2316,33 @@ impl KafkaSourceTableProvider {
             session_manager,
             shutdown_tx,
             shutdown_rx,
-            num_records_before_stop,
             extracted_primary_key,
+            checkpoint_control: None,
+            scope: streamling_core::shutdown::ComponentScope::detached("kafka-source"),
             parallelism: Self::effective_parallelism(
                 &config_for_metadata,
                 &topic_for_metadata,
                 parallelism,
             ),
         })
+    }
+
+    /// Wire this source for terminal checkpointing (Decision 1B): on graceful
+    /// exit (shutdown drain or SourceComplete) the consume task mints the
+    /// terminal epoch, rides its Marker on the final flush batch, and commits
+    /// the drained tail's offsets once the sinks ack — closing the
+    /// streaming-restart duplicate window. Not used by the hybrid source,
+    /// which manages its own terminal epoch.
+    pub fn with_checkpoint_control(mut self, control: CheckpointControl) -> Self {
+        self.checkpoint_control = Some(control);
+        self
+    }
+
+    /// Attach the run loop's shutdown scope: helper tasks (the lag reporter)
+    /// spawn through it so the drain ladder tracks and cancels them.
+    pub fn with_scope(mut self, scope: Arc<streamling_core::shutdown::ComponentScope>) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Clamps `parallelism` to the topic's partition count.
@@ -2178,8 +2511,9 @@ impl KafkaSourceTableProvider {
             include_metadata,
             state_backend,
             self.shutdown_rx.clone(),
-            self.num_records_before_stop,
             self.metric_metadata_id.clone(),
+            self.checkpoint_control.clone(),
+            self.scope.clone(),
             self.parallelism,
         ));
 
@@ -2379,9 +2713,8 @@ pub struct KafkaSink {
     /// Global `num_records_before_stop` progress across the concurrent
     /// per-partition `write_all` streams (`ParallelSinkExec`).
     rows_received: AtomicU64,
-    source_name: String,
     metric_metadata_id: String,
-    producer: OnceCell<KafkaThreadedProducer>,
+    producers: OnceCell<SafeKafkaProducers>,
     primary_key: Option<String>,
     /// Maximum number of messages to batch before sending (maps to Kafka's batch.num.messages)
     batch_size: Option<u32>,
@@ -2402,7 +2735,6 @@ impl KafkaSink {
         topic_partitions: Option<i32>,
         format: KafkaFormat,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         primary_key: Option<String>,
         batch_size: Option<u32>,
         batch_flush_interval_ms: Option<u64>,
@@ -2422,9 +2754,8 @@ impl KafkaSink {
             subject_name_strategy,
             num_records_before_stop,
             rows_received: AtomicU64::new(0),
-            source_name,
             metric_metadata_id: reference_name,
-            producer: OnceCell::new(),
+            producers: OnceCell::new(),
             primary_key,
             batch_size,
             batch_flush_interval_ms,
@@ -2433,19 +2764,44 @@ impl KafkaSink {
         }
     }
 
-    /// Flush all buffered messages to Kafka, blocking until complete.
+    /// Flush all buffered messages to Kafka, blocking until complete — or, once
+    /// shutdown is requested, until the in-flight attempt fails.
     /// Runs via `block_in_place` to avoid stalling other Tokio tasks.
-    fn flush_producer(producer: &KafkaThreadedProducer, topic: &str) {
+    ///
+    /// Mirrors `retry_forever_with_backoff_until_cancelled`: the first attempt
+    /// always runs even when shutdown was already requested — a SIGTERM drain
+    /// flushes the tail through here, and abandoning it up front is exactly the
+    /// tail loss the drain exists to prevent. What shutdown cuts short is the
+    /// infinite RE-try loop, so a sick broker (producers are built with
+    /// `message.timeout.ms=600000`) can no longer pin the drain until the
+    /// watchdog kills the process. Giving up returns an error so the caller
+    /// never acks a checkpoint for messages that were not delivered.
+    fn flush_producer(
+        producer: &KafkaThreadedProducer,
+        topic: &str,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) -> streamling_core::error::Result<()> {
+        Self::flush_producer_bounded(producer, topic, shutdown, StdDuration::from_secs(10))
+    }
+
+    /// [`Self::flush_producer`] with an explicit per-attempt timeout, so unit
+    /// tests don't have to wait out the production 10s attempts.
+    fn flush_producer_bounded(
+        producer: &KafkaThreadedProducer,
+        topic: &str,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+        attempt_timeout: StdDuration,
+    ) -> streamling_core::error::Result<()> {
         let flush_start = StdInstant::now();
         loop {
-            match producer.flush(Timeout::After(StdDuration::from_secs(10))) {
+            match producer.flush(Timeout::After(attempt_timeout)) {
                 Ok(()) => {
                     debug!(
                         "Kafka producer flush complete for topic: {} (took {:?})",
                         topic,
                         flush_start.elapsed()
                     );
-                    break;
+                    return Ok(());
                 }
                 Err(e) => {
                     warn!(
@@ -2455,6 +2811,70 @@ impl KafkaSink {
                         producer.in_flight_count(),
                         e
                     );
+                    if *shutdown.borrow() {
+                        return Err(streamling_core::streamling_err!(
+                            "Kafka producer flush for topic {} abandoned by shutdown after {:?} ({} message(s) still queued)",
+                            topic,
+                            flush_start.elapsed(),
+                            producer.in_flight_count()
+                        )
+                        .mark_retriable());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send one record, absorbing rdkafka `QueueFull` backpressure by polling
+    /// the producer and retrying.
+    ///
+    /// Once shutdown is requested, the retry window becomes bounded: a healthy
+    /// broker drains the queue within the window (the tail keeps flowing
+    /// during a SIGTERM drain), while a wedged broker can no longer pin the
+    /// drain forever. Outside shutdown the loop retries indefinitely, exactly
+    /// as before.
+    fn send_record_absorbing_queue_full<K, P>(
+        producer: &KafkaThreadedProducer,
+        mut record: BaseRecord<'_, K, P>,
+        topic: &str,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+        shutdown_retry_window: StdDuration,
+    ) -> streamling_core::error::Result<()>
+    where
+        K: rdkafka::message::ToBytes + ?Sized,
+        P: rdkafka::message::ToBytes + ?Sized,
+    {
+        let send_start = StdInstant::now();
+        loop {
+            match producer.send(record) {
+                Ok(()) => return Ok(()),
+                Err((
+                    rdkafka::error::KafkaError::MessageProduction(
+                        rdkafka::types::RDKafkaErrorCode::QueueFull,
+                    ),
+                    returned_record,
+                )) => {
+                    if *shutdown.borrow() && send_start.elapsed() >= shutdown_retry_window {
+                        return Err(streamling_core::streamling_err!(
+                            "Kafka send for topic {} abandoned by shutdown: queue still full after {:?}",
+                            topic,
+                            send_start.elapsed()
+                        )
+                        .mark_retriable());
+                    }
+                    debug!(
+                        "rdkafka queue full for topic: {}, polling and retrying",
+                        topic
+                    );
+                    producer.poll(StdDuration::from_millis(100));
+                    record = returned_record;
+                }
+                Err((e, _)) => {
+                    return Err(streamling_core::streamling_err!(
+                        "Kafka send failed for topic {}: {}",
+                        topic,
+                        e
+                    ));
                 }
             }
         }
@@ -2648,6 +3068,7 @@ impl KafkaSink {
         producer: &KafkaThreadedProducer,
     ) -> streamling_core::error::Result<()> {
         let topic = &self.topic;
+        let shutdown = streamling_core::shutdown::subscribe();
         tokio::task::block_in_place(|| {
             for (i, encoded_bytes) in payloads.into_iter().enumerate() {
                 let key = keys.map(|k| &k[i]);
@@ -2667,31 +3088,13 @@ impl KafkaSink {
                     record = record.key(k.as_str());
                 }
 
-                loop {
-                    match producer.send(record) {
-                        Ok(()) => break,
-                        Err((
-                            rdkafka::error::KafkaError::MessageProduction(
-                                rdkafka::types::RDKafkaErrorCode::QueueFull,
-                            ),
-                            returned_record,
-                        )) => {
-                            debug!(
-                                "rdkafka queue full for topic: {}, polling and retrying",
-                                topic
-                            );
-                            producer.poll(StdDuration::from_millis(100));
-                            record = returned_record;
-                        }
-                        Err((e, _)) => {
-                            return Err(streamling_err!(
-                                "Kafka send failed for topic {}: {}",
-                                topic,
-                                e
-                            ));
-                        }
-                    }
-                }
+                Self::send_record_absorbing_queue_full(
+                    producer,
+                    record,
+                    topic,
+                    &shutdown,
+                    QUEUE_FULL_SHUTDOWN_RETRY_WINDOW,
+                )?;
             }
             Ok(())
         })
@@ -2858,9 +3261,20 @@ impl DataSink for KafkaSink {
 
         self.ensure_topic_and_schema_exist().await?;
 
-        let producer: &KafkaThreadedProducer =
-            self.producer.get_or_try_init(|| self.create_producer())?;
+        // One producer, shared by the concurrent per-partition write_all
+        // streams (write parallelism comes from the plan, not from producer
+        // fan-out) — still inside SafeKafkaProducers so its rdkafka teardown
+        // runs on a detached OS thread and can never deadlock the drain.
+        let producers: &[KafkaThreadedProducer] = self
+            .producers
+            .get_or_try_init(|| {
+                self.create_producer()
+                    .map(|producer| SafeKafkaProducers::new(vec![producer]))
+            })?
+            .as_slice();
+        let producer: &KafkaThreadedProducer = &producers[0];
         let metrics_recorder = get_metrics_recorder().clone();
+        let shutdown = streamling_core::shutdown::subscribe();
 
         let sink_converter = match self.format {
             KafkaFormat::Avro => KafkaSinkConverter::Avro {
@@ -2936,9 +3350,13 @@ impl DataSink for KafkaSink {
                         "Received marker for epoch {}, flushing Kafka producer for topic: {}",
                         epoch.0, self.topic,
                     );
-                    tokio::task::block_in_place(|| {
-                        Self::flush_producer(producer, &self.topic);
-                    });
+                    tokio::task::block_in_place(|| -> streamling_core::error::Result<()> {
+                        for producer in producers {
+                            Self::flush_producer(producer, &self.topic, &shutdown)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(datafusion::error::DataFusionError::from)?;
 
                     producer.context().check_error().map_err(|e| {
                         datafusion::error::DataFusionError::from(
@@ -2966,18 +3384,22 @@ impl DataSink for KafkaSink {
             if let Some(num_records_before_stop) = self.num_records_before_stop
                 && total_received >= num_records_before_stop
             {
-                let _ = send(
-                    CHECKPOINT_COORDINATOR_CHANNEL,
-                    CheckpointMessage::SourceComplete(self.source_name.clone()),
-                );
+                // Record-limit reached: request process-wide graceful shutdown
+                // so every source drains and ends its stream — the same path
+                // SIGTERM takes (test-only mode).
+                streamling_core::shutdown::request_shutdown();
                 break;
             }
         }
 
-        tokio::task::block_in_place(|| {
-            Self::flush_producer(producer, &self.topic);
-        });
-        {
+        tokio::task::block_in_place(|| -> streamling_core::error::Result<()> {
+            for producer in producers {
+                Self::flush_producer(producer, &self.topic, &shutdown)?;
+            }
+            Ok(())
+        })
+        .map_err(datafusion::error::DataFusionError::from)?;
+        for producer in producers {
             producer.context().check_error().map_err(|e| {
                 datafusion::error::DataFusionError::from(
                     streamling_core::streamling_err!("Kafka producer error: {}", e)
@@ -3017,7 +3439,6 @@ pub struct KafkaSinkTableProvider {
     topic_partitions: Option<i32>,
     format: KafkaFormat,
     num_records_before_stop: Option<u64>,
-    source_name: String,
     primary_key: Option<String>,
     /// Maximum number of messages to batch before sending (maps to Kafka's batch.num.messages)
     batch_size: Option<u32>,
@@ -3041,7 +3462,6 @@ impl KafkaSinkTableProvider {
         topic_partitions: Option<i32>,
         format: KafkaFormat,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         primary_key: Option<String>,
         batch_size: Option<u32>,
         batch_flush_interval_ms: Option<u64>,
@@ -3058,7 +3478,6 @@ impl KafkaSinkTableProvider {
             topic_partitions,
             format,
             num_records_before_stop,
-            source_name,
             primary_key,
             batch_size,
             batch_flush_interval_ms,
@@ -3104,7 +3523,6 @@ impl TableProvider for KafkaSinkTableProvider {
             self.topic_partitions,
             self.format.clone(),
             self.num_records_before_stop,
-            self.source_name.clone(),
             self.primary_key.clone(),
             self.batch_size,
             self.batch_flush_interval_ms,
@@ -3167,7 +3585,6 @@ mod tests {
             false,
             state_backend,
             session_manager.clone(),
-            None,
             false,
             vec![],
             true,
@@ -3230,7 +3647,6 @@ mod tests {
             false,
             state_backend,
             session_manager,
-            None,
             false,
             vec![],
             false,
@@ -3350,6 +3766,164 @@ mod tests {
         // Invariants that must always hold for the sink producer.
         assert_eq!(cfg.get("acks"), Some("all"));
         assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
+    }
+
+    fn unreachable_broker_producer(extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
+        let mut config = test_kafka_config();
+        // Port 1 never hosts a broker; producer creation is offline so this
+        // still succeeds and everything sent just sits in the local queue.
+        config.brokers = "127.0.0.1:1".to_string();
+        let mut builder =
+            KafkaSink::build_producer_config(&config, None, None, None, KafkaCompression::None);
+        for (key, value) in extra_config {
+            builder.set(*key, *value);
+        }
+        builder
+            .create_with_context(KafkaProducerContext::new())
+            .expect("producer creation does not contact the broker")
+    }
+
+    /// Regression: the pre-consume startup
+    /// wait looped forever with no shutdown observation — a SIGTERM during a
+    /// broker outage or stuck rebalance at startup had no effect because the
+    /// consume loop's shutdown handling hadn't been reached yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_wait_cancels_on_shutdown() {
+        // A black-hole "broker": accepts TCP connections and never answers.
+        // (A refused port would surface a BrokerTransportFailure on the
+        // stream and error out; the hang mode is a broker that just never
+        // responds, so the fetch times out and the loop retries forever.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole broker");
+        let broker_addr = listener.local_addr().expect("local addr").to_string();
+        std::thread::spawn(move || {
+            let mut held_sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept() {
+                held_sockets.push(socket);
+            }
+        });
+
+        let mut config = test_kafka_config();
+        config.brokers = broker_addr;
+        let consumer: StreamConsumer = KafkaCommon::build_client(&config)
+            .set("group.id", "startup-cancel-test")
+            .create()
+            .expect("consumer creation does not contact the broker");
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        // Test-only helper task; the disallowed-methods lint targets production code.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = tx.send(true);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            KafkaSourceExec::wait_for_initial_assignment_or_message_cancellable(
+                &consumer,
+                "startup-cancel-topic",
+                rx,
+            ),
+        )
+        .await
+        .expect("shutdown must cancel the startup wait promptly");
+        let err = result.expect_err("cancelled startup must error");
+        assert!(err.to_string().contains("cancelled by shutdown"), "{err}");
+    }
+
+    /// Regression: `flush_producer` used to
+    /// retry its 10s blocking flush forever — with producers built with
+    /// `message.timeout.ms=600000`, a broker outage at shutdown pinned the
+    /// drain until the watchdog killed the process.
+    #[test]
+    fn flush_gives_up_between_attempts_once_shutdown_requested() {
+        let producer = unreachable_broker_producer(&[]);
+        producer
+            .send(BaseRecord::<str, str>::to("flush-topic").payload("payload"))
+            .map_err(|(e, _)| e)
+            .expect("send only queues locally");
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let result = KafkaSink::flush_producer_bounded(
+            &producer,
+            "flush-topic",
+            &shutdown_rx,
+            StdDuration::from_millis(200),
+        );
+
+        let err = result.expect_err("a dead broker with shutdown requested must abandon the flush");
+        assert!(err.to_string().contains("abandoned by shutdown"), "{err}");
+        // The queued message can never be delivered; skip rd_kafka_destroy's
+        // teardown wait the same way SafeKafkaConsumer::forget does.
+        std::mem::forget(producer);
+    }
+
+    /// Regression: the `QueueFull` send loop
+    /// had no shutdown check — against a wedged broker it polled and retried
+    /// forever, so the drain never completed.
+    #[test]
+    fn queue_full_retry_gives_up_after_shutdown_window() {
+        let producer = unreachable_broker_producer(&[("queue.buffering.max.messages", "1")]);
+        producer
+            .send(BaseRecord::<str, str>::to("qf-topic").payload("fills-the-queue"))
+            .map_err(|(e, _)| e)
+            .expect("first send fits the single-slot queue");
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let start = StdInstant::now();
+        let result = KafkaSink::send_record_absorbing_queue_full(
+            &producer,
+            BaseRecord::<str, str>::to("qf-topic").payload("overflows"),
+            "qf-topic",
+            &shutdown_rx,
+            StdDuration::from_millis(300),
+        );
+
+        let err = result
+            .expect_err("a queue pinned by a dead broker must not retry past the shutdown window");
+        assert!(err.to_string().contains("abandoned by shutdown"), "{err}");
+        assert!(
+            start.elapsed() < StdDuration::from_secs(10),
+            "the shutdown retry window must be honored, took {:?}",
+            start.elapsed()
+        );
+        std::mem::forget(producer);
+    }
+
+    /// Without shutdown, `QueueFull` handling still retries (and succeeds once
+    /// the queue frees up) — the bounded window only applies to the drain.
+    #[test]
+    fn queue_full_retry_keeps_retrying_without_shutdown() {
+        let producer = unreachable_broker_producer(&[("queue.buffering.max.messages", "1")]);
+        producer
+            .send(BaseRecord::<str, str>::to("qf-topic").payload("fills-the-queue"))
+            .map_err(|(e, _)| e)
+            .expect("first send fits the single-slot queue");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Flip the watch only after the loop has been retrying for a while,
+        // proving the un-flipped watch alone never stops it.
+        let flip = std::thread::spawn(move || {
+            std::thread::sleep(StdDuration::from_millis(600));
+            let _ = shutdown_tx.send(true);
+        });
+        let start = StdInstant::now();
+        let result = KafkaSink::send_record_absorbing_queue_full(
+            &producer,
+            BaseRecord::<str, str>::to("qf-topic").payload("overflows"),
+            "qf-topic",
+            &shutdown_rx,
+            StdDuration::from_millis(0),
+        );
+        flip.join().expect("flip thread");
+
+        result.expect_err("still wedged once shutdown finally arrives");
+        assert!(
+            start.elapsed() >= StdDuration::from_millis(600),
+            "the loop must keep retrying until shutdown is requested, gave up after {:?}",
+            start.elapsed()
+        );
+        std::mem::forget(producer);
     }
 
     #[test]

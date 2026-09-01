@@ -9,7 +9,7 @@ use schema_registry_converter::async_impl::schema_registry::{
 use schema_registry_converter::error::SRCError;
 use schema_registry_converter::schema_registry_common::SrCall;
 use streamling_core::error::StreamlingError;
-use streamling_core::retry::retry_if_retriable;
+use streamling_core::retry::retry_if_retriable_until_cancelled;
 use streamling_core::streamling_err;
 use tokio::sync::OnceCell;
 
@@ -125,7 +125,24 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, SRCError>>,
 {
-    retry_if_retriable(
+    let shutdown = streamling_core::shutdown::subscribe();
+    retry_registry_call_cancellable(op_name, op, shutdown).await
+}
+
+/// [`retry_registry_call`] with an explicit shutdown watch (unit-testable without flipping the
+/// process-global signal). A registry outage used to retry transient errors forever — at startup
+/// that wait is reached before any shutdown handling exists, so SIGTERM had no effect. Retries now stop between attempts once shutdown is
+/// requested; the last transient error is surfaced to the caller.
+pub(crate) async fn retry_registry_call_cancellable<F, Fut, T>(
+    op_name: String,
+    op: F,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> streamling_core::error::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, SRCError>>,
+{
+    retry_if_retriable_until_cancelled(
         || async {
             op().await.map_err(|e| {
                 if e.retriable {
@@ -136,6 +153,7 @@ where
             })
         },
         &op_name,
+        &mut shutdown,
     )
     .await
 }
@@ -462,6 +480,47 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             3,
             "expected 2 retries before success"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_registry_call_gives_up_on_shutdown() {
+        // Regression: a down registry kept
+        // retrying transient errors forever — at startup that loop is reached
+        // before any shutdown handling exists, so SIGTERM had no effect. With
+        // shutdown requested the first attempt still runs, but the transient
+        // failure is surfaced instead of retried indefinitely.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+
+        let result: streamling_core::error::Result<u32> = retry_registry_call_cancellable(
+            "test_op".to_string(),
+            move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(SRCError::retryable_with_cause(
+                        "transient",
+                        "fake network blip",
+                    ))
+                }
+            },
+            shutdown_rx,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "shutdown must stop the retry loop and surface the failure"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the first attempt runs; the re-try loop is what shutdown cuts"
         );
     }
 

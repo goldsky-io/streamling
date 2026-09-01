@@ -148,6 +148,10 @@ pub struct HybridTableProvider {
     /// current phase, emits the terminal checkpoint, and ends its stream
     /// instead of advancing to the next phase. `None` in tests.
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The run loop's shutdown scope: the hybrid driver, marker forwarder,
+    /// and shutdown watcher spawn through it so the teardown drain ladder
+    /// tracks them. `None` in tests (direct construction).
+    scope: Arc<streamling_core::shutdown::ComponentScope>,
 }
 impl Debug for HybridTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -214,6 +218,7 @@ impl HybridTableProvider {
             session_manager,
             checkpoint_control: None,
             shutdown_rx: None,
+            scope: streamling_core::shutdown::ComponentScope::detached("hybrid-source"),
         };
 
         Ok(provider)
@@ -234,6 +239,14 @@ impl HybridTableProvider {
         self
     }
 
+    /// Attach the run loop's shutdown scope so the hybrid's helper tasks are
+    /// tracked by the teardown drain ladder. Builder-style, applied before the
+    /// provider is wrapped in an `Arc`.
+    pub fn with_scope(mut self, scope: Arc<streamling_core::shutdown::ComponentScope>) -> Self {
+        self.scope = scope;
+        self
+    }
+
     pub fn new_from_topology(
         reference_name: String,
         bounded_sources: Vec<HybridBoundedSource>,
@@ -250,6 +263,10 @@ impl HybridTableProvider {
         // phase emits under its own `metric_key_hybrid_src_*` suffix (R9),
         // so bounded vs unbounded series are tag-distinguishable downstream.
         telemetry: Option<&Telemetry>,
+        // One scope covers the hybrid's own helper tasks and both inner
+        // phases' background tasks (Kafka lag reporter, ClickHouse
+        // checkpointing) — all drain together at teardown.
+        scope: Arc<streamling_core::shutdown::ComponentScope>,
     ) -> DataFusionResult<Self> {
         use crate::table_providers::clickhouse::ClickHouseTableProvider;
         use crate::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -277,7 +294,6 @@ impl HybridTableProvider {
                             false,
                             state_backend_factory.create(application_id.as_str()),
                             session_manager.clone(),
-                            app_config.num_records_before_stop,
                             unbounded_source
                                 .validate_writer_schema_ordering
                                 .unwrap_or(true),
@@ -300,7 +316,8 @@ impl HybridTableProvider {
                                 "hybrid source '{}': failed to create Kafka source",
                                 reference_name
                             )
-                        })?,
+                        })?
+                        .with_scope(scope.clone()),
                     );
                     Arc::new(WrappingSourceTableProvider::new(
                         kafka_table_provider,
@@ -346,18 +363,21 @@ impl HybridTableProvider {
                         schema_adapter
                             .get_columns(bounded_source.table_name.as_str(), &unbounded_schema)?,
                     );
-                    let clickhouse_provider = Arc::new(ClickHouseTableProvider::new_source(
-                        reference_name.clone(),
-                        metric_key(&application_id, &reference_name),
-                        bounded_source.table_name.as_str(),
-                        app_config.clickhouse_source.clone(),
-                        start_at,
-                        bounded_source.filter,
-                        columns,
-                        state_backend_factory.create(application_id.as_str()),
-                        app_config.internal_buffer_size as usize,
-                        app_config.record_batch_size as usize,
-                    )?);
+                    let clickhouse_provider = Arc::new(
+                        ClickHouseTableProvider::new_source(
+                            reference_name.clone(),
+                            metric_key(&application_id, &reference_name),
+                            bounded_source.table_name.as_str(),
+                            app_config.clickhouse_source.clone(),
+                            start_at,
+                            bounded_source.filter,
+                            columns,
+                            state_backend_factory.create(application_id.as_str()),
+                            app_config.internal_buffer_size as usize,
+                            app_config.record_batch_size as usize,
+                        )?
+                        .with_scope(scope.clone()),
+                    );
                     debug!(
                         "Clickhouse schema for bounded source: {:?}",
                         clickhouse_provider.schema()
@@ -410,7 +430,8 @@ impl HybridTableProvider {
             schema,
             state_backend,
             session_manager,
-        )?;
+        )?
+        .with_scope(scope);
         debug!("Created HybridTableProvider: {:?}", provider);
 
         Ok(provider)
@@ -1024,7 +1045,8 @@ impl ExecutionPlan for HybridSourceExec {
         // to stay responsive to shutdown (same pattern as
         // `ClickHouseSourceExec::execute`'s `checkpointing_task`).
         let pending_for_drain = pending_markers.clone();
-        let forwarder_handle = tokio::spawn(async move {
+        let scope = provider.scope.clone();
+        let forwarder_handle = scope.spawn(async move {
             loop {
                 let rx = hybrid_marker_rx.clone();
                 let recv = tokio::task::spawn_blocking(move || {
@@ -1096,7 +1118,7 @@ impl ExecutionPlan for HybridSourceExec {
         let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
             let provider_for_shutdown = provider.clone();
             let ref_name = reference_name_for_spawn.clone();
-            tokio::spawn(async move {
+            scope.spawn(async move {
                 while !*sd.borrow() {
                     if sd.changed().await.is_err() {
                         return;
@@ -1110,7 +1132,7 @@ impl ExecutionPlan for HybridSourceExec {
             })
         });
 
-        tokio::spawn(async move {
+        scope.spawn(async move {
             // Every exit path from the loop falls through to the
             // post-loop teardown below — `break 'outer` is used uniformly
             // (instead of `return`) so the forwarder is signalled to
@@ -1466,25 +1488,10 @@ fn merge_pending_markers(
     }
 }
 
-/// The bound on how long a completing source waits for the terminal checkpoint
-/// to finalize. On timeout the terminal Finalizer is SKIPPED (never emitted
-/// for an unconfirmed epoch — see `emit_terminal_checkpoint`); this bound only
-/// keeps a sink that never acks from hanging the source task.
-///
-/// Derived from the run loop's shared shutdown budget
-/// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
-/// is armed with), minus a margin so this wait always expires BEFORE the
-/// watchdog hard-exits the process. The minimum-floor is itself capped at
-/// budget − 2s so a deliberately tiny budget can never invert the invariant:
-/// for budgets ≤ 2s the timeout collapses to zero, which expires immediately
-/// and takes the safe branch (Finalizer skipped).
-fn terminal_checkpoint_finalize_timeout() -> Duration {
-    const MARGIN_SECS: u64 = 10;
-    const MIN_TIMEOUT_SECS: u64 = 5;
-    let budget = streamling_core::shutdown::shutdown_budget().as_secs();
-    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2));
-    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(capped_floor))
-}
+// The finalize-timeout bound lives in `streamling_core::shutdown`
+// (`terminal_checkpoint_finalize_timeout`) so every terminal-checkpoint
+// emitter (this source and the Kafka streaming shutdown path) shares it.
+use streamling_core::shutdown::terminal_checkpoint_finalize_timeout;
 
 /// Emit the terminal checkpoint round-trip inline on the data stream, so both
 /// the marker and the finalizer keep a consistent cut and reach inline
@@ -1619,7 +1626,10 @@ async fn flush_pending_to_synth_batch(
     // Finalizer twice (once forwarded from the checkpoint channel by the
     // forwarder task, once pushed inline by `emit_terminal_checkpoint`).
     // Consumers are idempotent for duplicate Finalizers, but there is no
-    // reason to make them exercise that property.
+    // reason to make them exercise that property. Note the dedup is
+    // PER-CALL only — a marker flushed here and again by a later call is
+    // not caught, so consumer idempotency stays the contract; this filter
+    // is a courtesy, not a delivery guarantee.
     let mut seen_marker = HashSet::new();
     let mut seen_finalizer = HashSet::new();
     let to_flush: Vec<CheckpointMessage> = drained

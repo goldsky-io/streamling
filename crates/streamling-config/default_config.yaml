@@ -117,3 +117,9 @@ live_data_inspect:
   refresh_in_secs: 30
 admin_api_port: 3000
 # job_mode: false  # When true, hybrid sources terminate after bounded phases complete
+# drain_policy: auto  # Graceful-shutdown drain policy: auto | drain | fast.
+#   auto (default): pipelines with bounded work (job mode, hybrid/clickhouse/
+#   bounded-file sources) drain and terminally checkpoint the in-flight tail;
+#   plain streaming exits fast (tail replays on restart). `drain`/`fast` force
+#   either behavior, except that bounded work always drains (its tail has no
+#   replay to recover it).
