@@ -354,18 +354,21 @@ impl CancelSignal for NeverCancelled {
 #[derive(Debug, Clone)]
 pub struct WatchSignal {
     rx: tokio::sync::watch::Receiver<bool>,
-    budget: Option<Duration>,
+    // The deadline itself, not a Duration snapshot: remaining_budget() must
+    // shrink as time passes, or the sleep cap and the budget-exhaustion check
+    // both work from the value frozen at construction.
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl WatchSignal {
     pub fn new(rx: tokio::sync::watch::Receiver<bool>) -> Self {
-        Self { rx, budget: None }
+        Self { rx, deadline: None }
     }
 
     /// Adds a wall-clock ceiling, re-evaluated against `deadline` on each
     /// attempt.
     pub fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
-        self.budget = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        self.deadline = Some(deadline);
         self
     }
 }
@@ -393,7 +396,8 @@ impl CancelSignal for WatchSignal {
     }
 
     fn remaining_budget(&self) -> Option<Duration> {
-        self.budget
+        self.deadline
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
     }
 }
 
@@ -752,5 +756,19 @@ mod tests {
             waited.is_err(),
             "cancelled() must not resolve without a signal"
         );
+    }
+
+    /// remaining_budget() must count down as time passes, not return the
+    /// duration snapshotted when with_deadline() was called.
+    #[tokio::test(start_paused = true)]
+    async fn watch_signal_budget_decays_toward_deadline() {
+        let (_tx, signal) = watch(false);
+        let signal =
+            signal.with_deadline(tokio::time::Instant::now() + Duration::from_secs(10));
+        assert_eq!(signal.remaining_budget(), Some(Duration::from_secs(10)));
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert_eq!(signal.remaining_budget(), Some(Duration::from_secs(3)));
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert_eq!(signal.remaining_budget(), Some(Duration::ZERO));
     }
 }

@@ -13,7 +13,7 @@ use streamling_core::operators::inspect::LiveDataInspect;
 use streamling_core::plugin::{
     build_plugin_preprocessors, load_and_initialize_plugins, terminate_all_plugins,
 };
-use tracing::info;
+use tracing::{error, info};
 use tracing::log::warn;
 use tracing_subscriber::EnvFilter;
 
@@ -185,8 +185,20 @@ async fn run_pipeline(
     let result = streamling.start_with(dry_run).await;
 
     // Usually a no-op: the run loop already terminated and drained the
-    // registry on its way out. Legacy per-plugin bound is fine here.
-    terminate_all_plugins(None).unwrap();
+    // registry on its way out. Legacy per-plugin bound is fine here. A
+    // failure is a real teardown error: it must reach the exit code when
+    // the run itself was clean, but never panic the exit path.
+    let result = match (result, terminate_all_plugins(None)) {
+        (Ok(()), Err(e)) => {
+            error!("Plugin teardown failed after a clean run: {e}");
+            Err(e)
+        }
+        (result, Err(e)) => {
+            error!("Plugin teardown failed (run already failed): {e}");
+            result
+        }
+        (result, Ok(())) => result,
+    };
 
     if let Some(handle) = admin_api_handle {
         info!("Shutting down Admin API server");

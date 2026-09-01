@@ -836,7 +836,7 @@ impl KafkaSourceExec {
         };
         let mut broker_commit_failed = false;
 
-        if committed_offsets.is_some() && position == committed_offsets.as_ref().unwrap() {
+        if committed_offsets.as_ref().is_some_and(|co| position == co) {
             debug!("Current position already committed, so skipping commit");
         } else {
             // Filter out invalid offsets
