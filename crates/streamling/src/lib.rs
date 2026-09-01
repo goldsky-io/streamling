@@ -651,6 +651,72 @@ fn pk_columns(pk_metadata: &Option<PrimaryKeyMetadata>) -> Vec<String> {
 /// asking for N streams needs the exchange to produce them. With neither, the
 /// plan is returned untouched and the sink simply inherits its input's width.
 /// The planner elides the node when the input already satisfies the placement.
+/// How a `script` transform's INPUT should be placed across streams.
+#[derive(Debug, PartialEq)]
+struct ScriptInputPlacement {
+    placement: Placement,
+    /// Declared key columns the script produces rather than receives, if those
+    /// are what forced a different placement. Reported so the caller can warn.
+    generated_columns: Vec<String>,
+    /// True when placement fell back to the upstream node's own key.
+    used_upstream_key: bool,
+}
+
+/// Chooses how a `script` transform's INPUT is placed across streams.
+///
+/// A script's `primary_key` describes its OUTPUT — the columns the script
+/// produces, declared in its own `schema` block — so those columns need not
+/// exist upstream. Keying the input exchange by them fails planning ("cannot
+/// partition by primary key column '<c>', which is not in the input schema")
+/// for any script whose key includes a generated column.
+///
+/// Preference order:
+///
+/// 1. the script's own key, when every column is genuinely available upstream
+///    (the common `primary_key: id` pass-through — placement unchanged);
+/// 2. otherwise the **upstream node's** key, which by construction describes the
+///    schema this exchange is actually placing, so rows of one entity still land
+///    on one stream and per-key ordering survives the transform;
+/// 3. round-robin only when neither key is usable.
+///
+/// Falling straight to round-robin would scatter an entity's rows across
+/// streams, so step 2 keeps the useful property that step 1 was reaching for.
+fn script_input_placement(
+    key_columns: &[String],
+    upstream_key_columns: Option<&[String]>,
+    input_field_names: &[String],
+) -> ScriptInputPlacement {
+    let resolvable =
+        |cols: &[String]| !cols.is_empty() && cols.iter().all(|c| input_field_names.contains(c));
+
+    if resolvable(key_columns) {
+        return ScriptInputPlacement {
+            placement: Placement::ByKey(key_columns.to_vec()),
+            generated_columns: Vec::new(),
+            used_upstream_key: false,
+        };
+    }
+
+    let generated_columns: Vec<String> = key_columns
+        .iter()
+        .filter(|c| !input_field_names.contains(c))
+        .cloned()
+        .collect();
+
+    match upstream_key_columns {
+        Some(upstream) if resolvable(upstream) => ScriptInputPlacement {
+            placement: Placement::ByKey(upstream.to_vec()),
+            generated_columns,
+            used_upstream_key: true,
+        },
+        _ => ScriptInputPlacement {
+            placement: Placement::RoundRobin,
+            generated_columns,
+            used_upstream_key: false,
+        },
+    }
+}
+
 fn wrap_with_repartition(
     plan: LogicalPlan,
     placement: &Placement,
@@ -1573,14 +1639,60 @@ impl Streamling {
                         PrimaryKeySource::TopologyDefined,
                         reference_name.clone(),
                     );
-                    if parallelism.is_some_and(|parallelism| parallelism > 1) {
-                        input_primary_key.validate_against_schema(source_plan.schema().inner())?;
+
+                    // A script transform's `primary_key` describes its OUTPUT: the
+                    // columns the script produces, declared in its own `schema`
+                    // block. Those columns need not exist upstream, so they cannot
+                    // in general be used to place rows on the transform's INPUT —
+                    // doing so fails planning with "cannot partition by primary key
+                    // column '<c>', which is not in the input schema" for any script
+                    // whose key includes a generated column.
+                    //
+                    // Key the input exchange only when every key column is genuinely
+                    // available upstream (the common `primary_key: id` pass-through
+                    // case, whose placement is unchanged). Otherwise fall back to
+                    // round-robin: the key's real job is downstream dedup, which the
+                    // sink's own `ByKey` exchange enforces, not this one.
+                    let input_field_names: Vec<String> = source_plan
+                        .schema()
+                        .inner()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
+                    // Read-only lookup: `propagate` would re-register the key under
+                    // this node and clobber the script's own declared key.
+                    let upstream_key = pk_registry.get(from.as_str()).map(|m| m.columns);
+                    let chosen = script_input_placement(
+                        &input_primary_key.columns,
+                        upstream_key.as_deref(),
+                        &input_field_names,
+                    );
+                    if !chosen.generated_columns.is_empty() {
+                        if chosen.used_upstream_key {
+                            warn!(
+                                "{}: primary key column(s) {:?} are produced by the script and \
+                                 are not in its input schema; placing its input by the upstream \
+                                 node's key instead",
+                                ctx.format(),
+                                chosen.generated_columns
+                            );
+                        } else {
+                            warn!(
+                                "{}: primary key column(s) {:?} are produced by the script and \
+                                 are not in its input schema, and the upstream node has no \
+                                 usable key, so its input is distributed round-robin",
+                                ctx.format(),
+                                chosen.generated_columns
+                            );
+                        }
                     }
+                    let input_placement = chosen.placement;
 
                     let script_input = wrap_with_rebatch(
                         wrap_with_repartition(
                             source_plan,
-                            &Placement::ByKey(input_primary_key.columns),
+                            &input_placement,
                             parallelism,
                             reference_name.clone(),
                         ),
@@ -3198,6 +3310,85 @@ impl Streamling {
 
 #[cfg(test)]
 mod tests {
+    use super::{Placement, script_input_placement};
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Regression: a script whose key includes a column it PRODUCES must not be
+    /// used to place its own input. Planning previously failed outright with
+    /// "cannot partition by primary key column '<c>', which is not in the input
+    /// schema", taking the pipeline down whenever such a script fed a sink.
+    ///
+    /// The upstream node's key describes the schema actually being placed, so it
+    /// is preferred over round-robin: an entity's rows still share one stream.
+    #[test]
+    fn script_key_naming_a_generated_column_falls_back_to_the_upstream_key() {
+        let key = names(&["hash", "chain_id", "community_id", "label", "wallet"]);
+        let upstream_key = names(&["id"]);
+        let upstream_schema = names(&["id", "hash", "chain_id", "label", "wallet", "value_rows"]);
+
+        let chosen = script_input_placement(&key, Some(&upstream_key), &upstream_schema);
+
+        assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
+        assert!(chosen.used_upstream_key);
+        assert_eq!(
+            chosen.generated_columns,
+            names(&["community_id"]),
+            "the generated column is reported so the operator can be warned"
+        );
+    }
+
+    /// With no usable upstream key there is nothing to place by.
+    #[test]
+    fn script_key_generated_and_no_upstream_key_uses_round_robin() {
+        let key = names(&["community_id"]);
+        let upstream_schema = names(&["value_rows"]);
+
+        let chosen = script_input_placement(&key, None, &upstream_schema);
+
+        assert_eq!(chosen.placement, Placement::RoundRobin);
+        assert!(!chosen.used_upstream_key);
+        assert_eq!(chosen.generated_columns, names(&["community_id"]));
+    }
+
+    /// An upstream key that is itself absent from the schema is not usable either.
+    #[test]
+    fn unusable_upstream_key_falls_through_to_round_robin() {
+        let chosen = script_input_placement(
+            &names(&["community_id"]),
+            Some(&names(&["not_here"])),
+            &names(&["value_rows"]),
+        );
+        assert_eq!(chosen.placement, Placement::RoundRobin);
+        assert!(!chosen.used_upstream_key);
+    }
+
+    /// The common pass-through case keeps its keyed placement unchanged, and must
+    /// win over the upstream key.
+    #[test]
+    fn script_key_present_upstream_still_partitions_by_its_own_key() {
+        let chosen = script_input_placement(
+            &names(&["id"]),
+            Some(&names(&["other"])),
+            &names(&["id", "other", "payload"]),
+        );
+        assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
+        assert!(!chosen.used_upstream_key);
+        assert!(chosen.generated_columns.is_empty());
+    }
+
+    /// A script with no declared key falls to the upstream key when one exists.
+    #[test]
+    fn script_without_a_key_uses_the_upstream_key() {
+        let chosen = script_input_placement(&[], Some(&names(&["id"])), &names(&["id", "payload"]));
+        assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
+        assert!(
+            chosen.generated_columns.is_empty(),
+            "an absent key is not a generated column"
+        );
+    }
     use super::*;
 
     fn sink_entry(name: &str, placement: Placement, parallelism: Option<usize>) -> SinkEntry {
