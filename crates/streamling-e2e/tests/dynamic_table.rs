@@ -641,6 +641,50 @@ async fn test_postgres_dynamic_table_cache_loads_and_refreshes_after_append() {
     );
 }
 
+#[tokio::test]
+async fn test_postgres_dynamic_table_creates_time_column_index() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("failed to create test context");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("failed to register schema");
+    ctx.kafka
+        .produce_avro_records(&[record("indexed_member")])
+        .await
+        .expect("failed to produce dynamic-table value");
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &append_pipeline(&ctx, "indexed_members", true),
+            cached_postgres_opts(&ctx, 1, Duration::from_secs(30)),
+        )
+        .await
+        .expect("pipeline failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    let index_count = ctx
+        .postgres
+        .query::<(i64,)>(
+            r#"
+            SELECT COUNT(*)::bigint FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'indexed_members'
+              AND indexdef LIKE '%updated_at%'
+            "#,
+        )
+        .await
+        .expect("failed to query pg_indexes");
+    assert_eq!(
+        index_count,
+        [(1,)],
+        "fresh Streamling-created table should index the time column"
+    );
+}
+
 /// Verify that deduplication in the uncached `contains()` path produces identical
 /// results for duplicate values. This exercises the exact code path the dedup
 /// changes: with MAX_BATCH_SIZE=3 and 6 total values (3 unique), without dedup

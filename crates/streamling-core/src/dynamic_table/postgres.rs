@@ -167,6 +167,7 @@ impl PostgresDynamicTableBackendFactory {
         column: Option<String>,
         time_column: Option<String>,
         max_batch_size: usize,
+        cache_enabled_override: Option<bool>,
     ) -> Result<PostgresDynamicTableBackend, DynamicTableBackendError> {
         debug!(
             "Creating dynamic table backend: entity={}, schema={:?}, column={:?}, time_column={:?}",
@@ -221,6 +222,7 @@ impl PostgresDynamicTableBackendFactory {
             column_name,
             time_column,
             max_batch_size,
+            cache_enabled_override,
         ))
     }
 }
@@ -260,8 +262,10 @@ impl PostgresDynamicTableBackend {
         column_name: String,
         time_column_name: Option<String>,
         max_batch_size: usize,
+        cache_enabled_override: Option<bool>,
     ) -> Self {
-        let cache_enabled = config.cache_enabled && time_column_name.is_some();
+        let cache_enabled =
+            cache_enabled_override.unwrap_or(config.cache_enabled) && time_column_name.is_some();
         debug!(
             table = %full_table_name,
             cache_enabled,
@@ -804,34 +808,66 @@ impl PostgresDynamicTableBackend {
                         "Creating PostgreSQL dynamic table: {}",
                         self.full_table_name
                     );
-                    let create_result = sqlx::query(
-                        format!(
-                            r#"
+                    let create_table_sql = format!(
+                        r#"
                             CREATE TABLE IF NOT EXISTS {} (
                                 "{}" TEXT PRIMARY KEY,
                                 "{}" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CLOCK_TIMESTAMP()
                             );
                         "#,
-                            self.full_table_name, self.column_name, self.time_column_name
-                        )
-                        .as_str(),
-                    )
-                    .execute(pool_arc.as_ref())
-                    .await;
+                        self.full_table_name, self.column_name, self.time_column_name
+                    );
+                    let bare_table = self
+                        .full_table_name
+                        .rsplit_once('.')
+                        .map(|(_, table)| table)
+                        .unwrap_or(self.full_table_name.as_str());
+                    let index_name =
+                        build_time_column_index_name(bare_table, &self.time_column_name);
+                    let create_index_sql = format!(
+                        r#"CREATE INDEX IF NOT EXISTS "{}" ON {} ("{}")"#,
+                        index_name, self.full_table_name, self.time_column_name
+                    );
 
-                    match create_result {
-                        Ok(_) => {
-                            info!("Successfully created table: {}", self.full_table_name);
-                        }
-                        Err(e) => {
+                    let mut transaction = pool_arc.begin().await.map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to begin transaction for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+                    sqlx::query(&create_table_sql)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| {
                             let err = DynamicTableBackendError::Initialization(format!(
                                 "Failed to create table {}: {}",
                                 self.full_table_name, e
                             ));
                             error!("{}", err);
-                            return Err(err);
-                        }
-                    }
+                            err
+                        })?;
+                    sqlx::query(&create_index_sql)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| {
+                            let err = DynamicTableBackendError::Initialization(format!(
+                                "Failed to create index {} on table {}: {}",
+                                index_name, self.full_table_name, e
+                            ));
+                            error!("{}", err);
+                            err
+                        })?;
+                    transaction.commit().await.map_err(|e| {
+                        let err = DynamicTableBackendError::Initialization(format!(
+                            "Failed to commit transaction for table {}: {}",
+                            self.full_table_name, e
+                        ));
+                        error!("{}", err);
+                        err
+                    })?;
+                    info!("Successfully created table: {}", self.full_table_name);
                 } else {
                     debug!(
                         "Table {} already exists, skipping creation",
@@ -848,6 +884,32 @@ impl PostgresDynamicTableBackend {
             .await
             .cloned()
     }
+}
+
+/// Build the deterministic index name for a dynamic table's time column.
+///
+/// PostgreSQL silently truncates identifiers to `NAMEDATALEN - 1` (63) bytes,
+/// so a naive `idx_{table}_{column}` can collide after truncation — two long
+/// names can truncate to the same identifier, and `CREATE INDEX IF NOT EXISTS`
+/// would then no-op against the wrong index on subsequent startups. When the
+/// name exceeds the limit we keep a readable prefix and append a short, stable
+/// hash of the full name, keeping it unique and under 63 bytes. Identifiers are
+/// ASCII (`[A-Za-z0-9_]`), so byte slicing is always on a char boundary.
+fn build_time_column_index_name(bare_table: &str, time_column: &str) -> String {
+    const MAX_IDENT_BYTES: usize = 63;
+    let raw = format!("idx_{}_{}", bare_table, time_column);
+    if raw.len() <= MAX_IDENT_BYTES {
+        return raw;
+    }
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut hasher);
+        format!("{:08x}", hasher.finish())
+    };
+    // '_' + 8 hex hash chars.
+    let prefix_len = MAX_IDENT_BYTES - 1 - hash.len();
+    format!("{}_{}", &raw[..prefix_len], hash)
 }
 
 /// Remove duplicate values from `(index, value)` pairs, keeping only the first
@@ -1052,6 +1114,7 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                None,
             )
             .await
             .expect("backend should be valid");
@@ -1060,7 +1123,14 @@ mod tests {
         let enabled_factory = PostgresDynamicTableBackendFactory::new(postgres_config(true))
             .expect("factory should be valid");
         let missing_time_column = enabled_factory
-            .create_backend("missing_time_column".to_string(), None, None, None, 1000)
+            .create_backend(
+                "missing_time_column".to_string(),
+                None,
+                None,
+                None,
+                1000,
+                None,
+            )
             .await
             .expect("backend should be valid");
         assert!(missing_time_column.cache.is_none());
@@ -1073,11 +1143,99 @@ mod tests {
                 None,
                 Some("updated_at".to_string()),
                 1000,
+                None,
             )
             .await
             .expect("backend should be valid");
         assert!(cached.cache.is_some());
     }
+
+    #[tokio::test]
+    async fn cache_resolution_falls_back_to_global_unless_overridden() {
+        // Topology override wins over the global flag.
+        let global_off = PostgresDynamicTableBackendFactory::new(postgres_config(false))
+            .expect("factory should be valid");
+        let forced_on = global_off
+            .create_backend(
+                "forced_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                Some(true),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_on.cache.is_some());
+
+        let global_on = PostgresDynamicTableBackendFactory::new(postgres_config(true))
+            .expect("factory should be valid");
+        let forced_off = global_on
+            .create_backend(
+                "forced_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                Some(false),
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(forced_off.cache.is_none());
+
+        // No override: falls back to the global flag.
+        let defaulted_on = global_on
+            .create_backend(
+                "defaulted_on".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_on.cache.is_some());
+
+        let defaulted_off = global_off
+            .create_backend(
+                "defaulted_off".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                None,
+            )
+            .await
+            .expect("backend should be valid");
+        assert!(defaulted_off.cache.is_none());
+    }
+    #[test]
+    fn build_time_column_index_name_stays_under_limit() {
+        // Short names pass through unchanged.
+        let short = build_time_column_index_name("blocks", "block_timestamp");
+        assert_eq!(short, "idx_blocks_block_timestamp");
+        assert!(short.len() <= 63);
+
+        // Long names are truncated + hash-suffixed to stay under 63 bytes, and
+        // stay deterministic across calls so IF NOT EXISTS is stable at startup.
+        let long_bare_table = "a".repeat(60);
+        let long_col = "updated_at";
+        let name = build_time_column_index_name(&long_bare_table, long_col);
+        assert!(name.len() <= 63);
+        assert_eq!(
+            name,
+            build_time_column_index_name(&long_bare_table, long_col)
+        );
+
+        // Distinct long names produce distinct identifiers (no silent truncation collision).
+        let other = build_time_column_index_name(&"b".repeat(60), long_col);
+        assert_ne!(name, other);
+
+        // The readable `idx_` prefix is preserved for debuggability.
+        assert!(name.starts_with("idx_"));
+    }
+
     #[test]
     fn deduplicate_value_indices_removes_duplicates() {
         let input = vec![

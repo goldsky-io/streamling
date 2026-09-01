@@ -68,6 +68,7 @@ impl DynamicTableBackendFactory {
         schema: Option<String>,
         column: Option<String>,
         time_column: Option<String>,
+        cache_enabled_override: Option<bool>,
     ) -> Result<Arc<dyn DynamicTableBackend>, DynamicTableBackendError> {
         let max_batch_size = self.config.max_batch_size.unwrap_or(1000);
         match backend_type {
@@ -96,6 +97,7 @@ impl DynamicTableBackendFactory {
                         column,
                         time_column,
                         max_batch_size,
+                        cache_enabled_override,
                     )
                     .await?;
                 Ok(Arc::new(backend))
@@ -544,6 +546,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 telemetry: None,
             }),
         );
@@ -557,6 +560,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 telemetry: None,
             }),
         );
@@ -570,6 +574,7 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
                 telemetry: None,
             }),
         );

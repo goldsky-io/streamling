@@ -1301,6 +1301,7 @@ impl Streamling {
                             schema,
                             column,
                             time_column,
+                            dt.cache,
                         )
                         .await
                         .map_err(|e| {

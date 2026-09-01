@@ -509,6 +509,11 @@ pub struct DynamicTableTransform {
     pub schema: Option<String>,
     pub column: Option<String>,
     pub time_column: Option<String>,
+    /// Opt-in caching for this dynamic table. When omitted, falls back to the
+    /// global `dynamic_table_backend.postgres.cache_enabled` config. Caching is
+    /// only ever active when `time_column` is set.
+    #[serde(default)]
+    pub cache: Option<bool>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -1177,6 +1182,56 @@ data_format: avro
 {extra}
 "#
         )
+    }
+
+    #[test]
+    fn dynamic_table_cache_defaults_to_none_and_parses_explicit() {
+        // When `cache` is omitted the field is None (falls back to global).
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  dt_omitted:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    time_column: updated_at
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.transforms.get("dt_omitted").unwrap() {
+            Transform::dynamic_table(dt) => assert_eq!(dt.cache, None),
+            _ => panic!("expected dynamic_table transform"),
+        }
+
+        // An explicit topology-level value is preserved.
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  dt_on:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    time_column: updated_at
+    cache: true
+  dt_off:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl2
+    time_column: updated_at
+    cache: false
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.transforms.get("dt_on").unwrap() {
+            Transform::dynamic_table(dt) => assert_eq!(dt.cache, Some(true)),
+            _ => panic!("expected dynamic_table transform"),
+        }
+        match topology.transforms.get("dt_off").unwrap() {
+            Transform::dynamic_table(dt) => assert_eq!(dt.cache, Some(false)),
+            _ => panic!("expected dynamic_table transform"),
+        }
     }
 
     #[test]
