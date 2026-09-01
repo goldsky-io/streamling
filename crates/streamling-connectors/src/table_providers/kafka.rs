@@ -2986,6 +2986,13 @@ impl DataSink for KafkaSink {
             })?;
         }
 
+        info!(
+            "[{}] write_all completed with {} rows (topic '{}')",
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+            row_count,
+            self.topic
+        );
+
         Ok(row_count as u64)
     }
 }
