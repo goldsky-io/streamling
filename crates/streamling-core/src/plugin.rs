@@ -309,9 +309,12 @@ fn create_channels_with_caps(input: usize, output: usize, metrics: usize) -> Plu
     }
 }
 
-/// Default capacity for the plugin→host metrics channel. Distinct from
-/// `plugin.channel_capacity` (data-plane backpressure). Metrics are
-/// best-effort `try_send`; a 50-slot bound overflows on high-rate plugins.
+/// Default capacity for the plugin→host metrics channel.
+/// Distinct from `plugin.channel_capacity` (data-plane backpressure, default 50).
+/// Plugins emit with non-blocking `try_send`; a full channel drops the sample
+/// (`Encountered error dispatching metrics`) rather than applying backpressure.
+/// A `0` metrics cap used to fall back to that 50 and dropped samples on
+/// high-rate plugins; this default is the metrics fallback instead.
 pub const DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY: usize = 4096;
 
 /// Resolve per-plugin channel sizes. A `0` cap means "use the default":
