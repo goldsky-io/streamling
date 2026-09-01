@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::error;
 
+use crate::ffi::IDLE_POLL_INTERVAL;
+
 /// Outcome of [`wait_for_initialization`]: distinguishes the two messages the
 /// caller can legitimately receive on the input channel before any data flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,7 +313,7 @@ impl TransformPluginDispatcher {
                     self.transform_plugin.terminate().await?;
                 }
                 Err(TryRecvError::Empty) => {
-                    runtime.yield_now().await;
+                    runtime.sleep(IDLE_POLL_INTERVAL.into()).await;
                 }
                 Err(TryRecvError::Disconnected) => {
                     break;
@@ -402,7 +404,7 @@ impl SinkPluginDispatcher {
                     self.sink_plugin.terminate().await?;
                 }
                 Err(TryRecvError::Empty) => {
-                    runtime.yield_now().await;
+                    runtime.sleep(IDLE_POLL_INTERVAL.into()).await;
                 }
                 Err(TryRecvError::Disconnected) => {
                     break;
@@ -923,5 +925,132 @@ mod tests {
             1,
             "terminate() must be called exactly once on Terminate-before-Init"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // An idle dispatcher must park, not spin.
+    //
+    // The empty-input arm used to call `yield_now()`, which reschedules the
+    // task immediately. A live pipeline's input channel is empty almost all
+    // the time, so that turned every plugin node into a runtime-wide spin
+    // loop (~0.29 cores per transform node with no data flowing). Guard the
+    // contract rather than the CPU number: the empty path awaits the
+    // runtime's timer and never `yield_now`.
+    // ------------------------------------------------------------------
+
+    use crate::r#async::{PluginAsyncRuntime, PluginAsyncRuntime_TO};
+    use abi_stable::derive_macro_reexports::{RResult, TD_Opaque};
+    use abi_stable::std_types::RDuration;
+    use async_ffi::FfiFuture;
+
+    #[derive(Clone, Default)]
+    struct RuntimeCalls {
+        sleeps: Arc<AtomicUsize>,
+        yields: Arc<AtomicUsize>,
+    }
+
+    /// Delegates to the real runtime, recording *how* the caller waited.
+    #[derive(Clone)]
+    struct CountingRuntime {
+        inner: DirectTokioProxy,
+        calls: RuntimeCalls,
+    }
+
+    impl PluginAsyncRuntime for CountingRuntime {
+        fn spawn(&self, fut: FfiFuture<()>) -> FfiFuture<()> {
+            self.inner.spawn(fut)
+        }
+        fn sleep(&self, dur: RDuration) -> FfiFuture<()> {
+            self.calls.sleeps.fetch_add(1, Ordering::SeqCst);
+            self.inner.sleep(dur)
+        }
+        fn timeout(&self, dur: RDuration, fut: FfiFuture<()>) -> FfiFuture<RResult<(), ()>> {
+            self.inner.timeout(dur, fut)
+        }
+        fn block_on(&self, fut: FfiFuture<()>) {
+            self.inner.block_on(fut)
+        }
+        fn yield_now(&self) -> FfiFuture<()> {
+            self.calls.yields.fetch_add(1, Ordering::SeqCst);
+            self.inner.yield_now()
+        }
+    }
+
+    fn counting_runtime(calls: &RuntimeCalls) -> PluginAsyncRuntimeObj {
+        PluginAsyncRuntime_TO::from_value(
+            CountingRuntime {
+                inner: DirectTokioProxy::new(),
+                calls: calls.clone(),
+            },
+            TD_Opaque,
+        )
+    }
+
+    fn assert_parked_not_spun(calls: &RuntimeCalls) {
+        assert_eq!(
+            calls.yields.load(Ordering::SeqCst),
+            0,
+            "empty input must not busy-yield: it spins every runtime worker"
+        );
+        assert!(
+            calls.sleeps.load(Ordering::SeqCst) > 0,
+            "empty input must park on the runtime timer"
+        );
+    }
+
+    /// Runs the loop against an empty input channel for 20ms, then stops it.
+    async fn stop_after_idle_window(running: &AtomicBool) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        running.store(false, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn transform_dispatcher_parks_instead_of_spinning_on_empty_input() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin = Arc::new(RecordingTransform::new(recorder));
+        let dispatcher = TransformPluginDispatcher::new(
+            channels.clone(),
+            plugin.clone() as Arc<dyn TransformPlugin>,
+        );
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let calls = RuntimeCalls::default();
+        let (result, ()) = tokio::join!(
+            dispatcher.start(counting_runtime(&calls)),
+            stop_after_idle_window(&plugin.running)
+        );
+        result.expect("dispatcher should exit cleanly once the plugin stops");
+
+        assert_parked_not_spun(&calls);
+    }
+
+    #[tokio::test]
+    async fn sink_dispatcher_parks_instead_of_spinning_on_empty_input() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin = Arc::new(RecordingSink::new(recorder));
+        let dispatcher =
+            SinkPluginDispatcher::new(channels.clone(), plugin.clone() as Arc<dyn SinkPlugin>);
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let calls = RuntimeCalls::default();
+        let (result, ()) = tokio::join!(
+            dispatcher.start(counting_runtime(&calls)),
+            stop_after_idle_window(&plugin.running)
+        );
+        result.expect("dispatcher should exit cleanly once the plugin stops");
+
+        assert_parked_not_spun(&calls);
     }
 }
