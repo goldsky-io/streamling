@@ -1,12 +1,11 @@
 name: AI Code Review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, ready_for_review]
 permissions:
   contents: read
   pull-requests: write
-  id-token: write
 
 # Cancel in-progress reviews when new commits are pushed
 concurrency:
@@ -18,22 +17,19 @@ jobs:
   # Job 1: Deterministic risk scoring (fast, free)
   # ──────────────────────────────────────────────────────────────────────
   risk-scoring:
-    if: github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     outputs:
       risk_json: ${{ steps.score.outputs.risk_json }}
       overall_risk: ${{ steps.score.outputs.overall_risk }}
       risk_level: ${{ steps.score.outputs.risk_level }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.base.sha }}
 
-      - name: Fetch base branch
-        run: git fetch origin ${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}
-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -48,7 +44,7 @@ jobs:
       - name: Compute risk scores
         id: score
         run: |
-          BASE_REF=$(git merge-base origin/${{ github.event.pull_request.base.ref }} HEAD 2>/dev/null || echo "origin/${{ github.event.pull_request.base.ref }}")
+          BASE_REF=HEAD
           echo "Using base ref: $BASE_REF"
 
           python scripts/ai-review/risk_score.py \
@@ -61,7 +57,7 @@ jobs:
           echo "overall_risk=$(jq -r .overall_risk risk_report.json)" >> "$GITHUB_OUTPUT"
           echo "risk_level=$(jq -r .risk_level risk_report.json)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: risk-report
           path: risk_report.json
@@ -71,19 +67,18 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────
   claude-review:
     needs: [risk-scoring]
-    if: github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
-      issues: write
-      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
+          ref: ${{ github.event.pull_request.base.sha }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: risk-report
 
@@ -125,7 +120,7 @@ jobs:
               f.write('risk_table<<EOF\n' + table + '\nEOF\n')
           "
 
-      - uses: anthropics/claude-code-action@v1
+      - uses: anthropics/claude-code-action@833fb0f8c9f6686b33d963a8bae0a94f4936ab2a # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           use_sticky_comment: true
