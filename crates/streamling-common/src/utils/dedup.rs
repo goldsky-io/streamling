@@ -75,6 +75,15 @@ pub fn deduplicate_record_batch(batch: &RecordBatch, primary_key: &str) -> Resul
     // order of distinct PK tuples is preserved.
     let mut unique_indices: Vec<i64> = buckets.into_values().flatten().map(|i| i as i64).collect();
     unique_indices.sort_unstable();
+
+    // Every row survived, so the sorted indices are exactly `0..num_rows` and the
+    // take below would copy every column just to reproduce the input. Batches
+    // with unique primary keys are the common case (an append-only backfill hits
+    // it on every flush), and at sink batch sizes the copy is hundreds of MB.
+    if unique_indices.len() == batch.num_rows() {
+        return Ok(batch.clone());
+    }
+
     let indices_array = Int64Array::from(unique_indices);
 
     let unique_columns: Vec<ArrayRef> = batch
@@ -510,6 +519,28 @@ mod tests {
         let value_array: ArrayRef = Arc::new(Int64Array::from(value_values));
 
         RecordBatch::try_new(Arc::new(schema), vec![id_array, name_array, value_array]).unwrap()
+    }
+
+    /// Nothing to deduplicate must cost nothing: the input's column buffers are
+    /// handed back rather than copied through a full `take`.
+    #[test]
+    fn test_deduplicate_without_duplicates_does_not_copy() {
+        let batch = create_test_batch(
+            vec![Some("1"), Some("2"), Some("3")],
+            vec![Some("Alice"), Some("Bob"), Some("Carol")],
+            vec![Some(10), Some(20), Some(30)],
+        );
+
+        let result = deduplicate_record_batch(&batch, "id").unwrap();
+
+        assert_eq!(result.num_rows(), 3, "every row must survive");
+        assert_eq!(result.schema(), batch.schema());
+        for column in 0..batch.num_columns() {
+            assert!(
+                Arc::ptr_eq(batch.column(column), result.column(column)),
+                "column {column} was copied despite having nothing to deduplicate"
+            );
+        }
     }
 
     #[test]

@@ -19,8 +19,6 @@ use streamling_core::types::{i256::I256Type, u256::U256Type};
 use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
 use streamling_core::utils::parse_primary_key_columns;
 
-use crate::util::parallel::parallel_execute;
-
 use async_stream;
 use datafusion::arrow::ipc::reader::FileReader;
 use datafusion::arrow::ipc::writer::FileWriter;
@@ -38,7 +36,7 @@ use streamling_core::checkpoints::checkpoint_management::{
 use streamling_core::utils::batch::enrich_batch_with_metadata;
 
 use bytes::Bytes;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::Operator;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::PhysicalExpr;
@@ -59,6 +57,7 @@ pub use streamling_config::{
 };
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::node_context::get_node_context;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
@@ -347,10 +346,8 @@ struct SinkParams {
     table_name: String,
     source_name: String,
     reference_name: String,
-    write_batch_size: u32,
     num_records_before_stop: Option<u64>,
     primary_keys: Vec<String>,
-    parallelism: usize,
     append_only_mode: bool,
     deduplicate: bool,
     version_column_name: Option<String>,
@@ -669,12 +666,10 @@ impl ClickHouseTableProvider {
     pub fn new_sink(
         metric_metadata_id: String,
         table_name: &str,
-        config: ClickHouseSinkConfig,
-        batch_size: u32,
+        config: ClickHouseConfig,
         num_records_before_stop: Option<u64>,
         primary_key: String,
         source_name: String,
-        parallelism: Option<usize>,
         append_only_mode: Option<bool>,
         deduplicate: Option<bool>,
         version_column_name: Option<String>,
@@ -700,17 +695,12 @@ impl ClickHouseTableProvider {
 
         let empty_schema = Arc::new(arrow::datatypes::Schema::empty());
 
-        let parallelism = parallelism.unwrap_or(1).max(1);
-        let write_batch_size = batch_size.div_ceil(parallelism as u32).max(1);
-
         let sink_params = SinkParams {
             table_name: table_name.to_string(),
             source_name,
             reference_name: reference_name.clone(),
-            write_batch_size,
             num_records_before_stop,
             primary_keys,
-            parallelism,
             append_only_mode: append_only_mode.unwrap_or(true),
             deduplicate: deduplicate.unwrap_or(true),
             version_column_name,
@@ -900,17 +890,17 @@ impl TableProvider for ClickHouseTableProvider {
         let clickhouse_sink = Arc::new(ClickHouseSinkExec {
             client: self.client.clone(),
             table_name: sink_params.table_name.clone(),
-            write_batch_size: sink_params.write_batch_size,
             num_records_before_stop: sink_params.num_records_before_stop,
             source_name: sink_params.source_name.clone(),
             reference_name: sink_params.reference_name.clone(),
             schema,
             primary_keys: Arc::new(sink_params.primary_keys.clone()),
             metric_metadata_id: self.metric_metadata_id.clone(),
-            parallelism: sink_params.parallelism,
             append_only_mode: sink_params.append_only_mode,
             version_column_name: sink_params.version_column_name.clone(),
             schema_override: sink_params.schema_override.clone(),
+            table_created: tokio::sync::OnceCell::new(),
+            records_processed: std::sync::atomic::AtomicU64::new(0),
         });
         let wrapper_sink = Arc::new(WrappingDataSink::new(
             clickhouse_sink,
@@ -920,29 +910,98 @@ impl TableProvider for ClickHouseTableProvider {
                 .then(|| sink_params.primary_keys.join(",")),
             sink_params.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(
+        Ok(Arc::new(ParallelSinkExec::new(
             projection_exec,
             wrapper_sink,
-            None,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
         )))
     }
+}
+
+/// Splits a batch's rows by `_gs_op` into the rows to INSERT (`None` when the
+/// batch has none) and the row indices to DELETE.
+///
+/// When nothing is deleted the batch passes through untouched: the insert
+/// indices are then exactly `0..num_rows`, so taking them would copy every
+/// column just to reproduce the input. Append-only sources hit that case on
+/// every batch, and at sink batch sizes the copy is hundreds of MB.
+fn split_rows_by_operation(batch: &RecordBatch) -> Result<(Option<RecordBatch>, Vec<u32>)> {
+    use datafusion::arrow::array::StringArray;
+    use std::str::FromStr;
+
+    let op_column = batch.column_by_name(COLUMN_NAME_OP).ok_or_else(|| {
+        DataFusionError::from(streamling_core::streamling_err!(
+            "missing required column '{}' in ClickHouse sink batch",
+            COLUMN_NAME_OP
+        ))
+    })?;
+    let op_array = op_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            DataFusionError::from(streamling_core::streamling_err!(
+                "column '{}' must be StringArray, got {:?}",
+                COLUMN_NAME_OP,
+                op_column.data_type()
+            ))
+        })?;
+
+    let mut insert_indices = Vec::new();
+    let mut delete_indices = Vec::new();
+
+    for (idx, op) in op_array.iter().enumerate() {
+        if let Some(op_str) = op {
+            let row_kind = RowKind::from_str(op_str).unwrap_or(RowKind::Insert);
+            match row_kind {
+                RowKind::Delete => delete_indices.push(idx as u32),
+                RowKind::Insert | RowKind::Update => insert_indices.push(idx as u32),
+            }
+        } else {
+            insert_indices.push(idx as u32);
+        }
+    }
+
+    let insert_rows = if insert_indices.is_empty() {
+        None
+    } else if delete_indices.is_empty() {
+        Some(batch.clone())
+    } else {
+        let indices_array = arrow::array::UInt32Array::from(insert_indices);
+        // Use streamling_core::utils::arrow::safe_take_record_batch to
+        // recover from the documented arrow take_bytes overflow panic on
+        // deeply nested schemas. Native take_record_batch panics with
+        // Option::expect("overflow") inside take_bytes for batches whose
+        // Utf8/Binary columns' cumulative byte offsets exceed i32::MAX;
+        // the panic crosses the extern "C" plugin boundary and crashes
+        // the process with exit 132/133 if not caught here.
+        Some(streamling_core::utils::arrow::safe_take_record_batch(
+            batch,
+            &indices_array,
+        )?)
+    };
+
+    Ok((insert_rows, delete_indices))
 }
 
 #[derive(Debug)]
 pub struct ClickHouseSinkExec {
     client: ClickHouseClient,
     table_name: String,
-    write_batch_size: u32,
     num_records_before_stop: Option<u64>,
     source_name: String,
     reference_name: String,
     schema: SchemaRef,
     primary_keys: Arc<Vec<String>>,
     metric_metadata_id: String,
-    parallelism: usize,
     append_only_mode: bool,
     version_column_name: Option<String>,
     schema_override: Option<std::collections::HashMap<String, String>>,
+    /// One CREATE TABLE across `ParallelSinkExec`'s concurrent per-partition
+    /// `write_all` calls: concurrent `CREATE TABLE IF NOT EXISTS` on replicated
+    /// ClickHouse can fail with "Table already exists".
+    table_created: tokio::sync::OnceCell<()>,
+    /// Global `num_records_before_stop` progress across all partition streams.
+    records_processed: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -965,22 +1024,27 @@ impl DataSink for ClickHouseSinkExec {
             node_label, self.table_name
         );
         // Use sink schema (normalized) for table creation
-        self.client
-            .create_table_if_not_exists(
-                &self.table_name,
-                &self.schema,
-                (*self.primary_keys).clone(),
-                self.append_only_mode,
-                self.version_column_name.as_deref(),
-                self.schema_override.as_ref(),
-            )
-            .await
-            .streamling_with_context(|| {
-                format!(
-                    "{}: failed to create table '{}'",
-                    node_label, self.table_name
-                )
-            })?;
+        self.table_created
+            .get_or_try_init(|| async {
+                self.client
+                    .create_table_if_not_exists(
+                        &self.table_name,
+                        &self.schema,
+                        (*self.primary_keys).clone(),
+                        self.append_only_mode,
+                        self.version_column_name.as_deref(),
+                        self.schema_override.as_ref(),
+                    )
+                    .await
+                    .streamling_with_context(|| {
+                        format!(
+                            "{}: failed to create table '{}'",
+                            node_label, self.table_name
+                        )
+                    })?;
+                Ok::<_, datafusion::common::DataFusionError>(())
+            })
+            .await?;
 
         let client = self.client.clone();
         let table_name = self.table_name.clone();
@@ -1037,14 +1101,11 @@ impl DataSink for ClickHouseSinkExec {
             }
         };
         let primary_keys = self.primary_keys.clone();
-        let parallelism = self.parallelism.max(1);
-        let write_batch_size = self.write_batch_size;
         let append_only_mode = self.append_only_mode;
         let source_name = self.source_name.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
         let metrics_recorder = get_metrics_recorder().clone();
         let mut row_count: usize = 0;
-        let mut records_processed: u64 = 0;
         let mut data = data;
 
         while let Some(result) = data.next().await {
@@ -1098,141 +1159,63 @@ impl DataSink for ClickHouseSinkExec {
 
             if append_only_mode {
                 // append_only_mode=true: INSERT all rows directly
-                parallel_execute(&normalized_batch, parallelism, write_batch_size as usize, {
-                    let client_closure = client.clone();
-                    let table_closure = table_name.clone();
-                    let schema_closure = normalized_schema.clone();
-                    let node_label_closure = node_label.clone();
-                    move |slice: RecordBatch| {
-                        let client = client_closure.clone();
-                        let table_name = table_closure.clone();
-                        let schema = schema_closure.clone();
-                        let node_label = node_label_closure.clone();
-                        async move {
-                            let operation_name =
-                                format!("{}: INSERT into '{}'", node_label, table_name);
-                            let mut shutdown = streamling_core::shutdown::subscribe();
-                            match retry_forever_with_backoff_until_cancelled(
-                                || async {
-                                    client
-                                        .send_arrow_batch(&table_name, &slice, &schema)
-                                        .await
-                                        .streamling_context("failed to send Arrow batch")
-                                },
-                                &operation_name,
-                                &mut shutdown,
-                            )
+                let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
+                let mut shutdown = streamling_core::shutdown::subscribe();
+                match retry_forever_with_backoff_until_cancelled(
+                    || async {
+                        client
+                            .send_arrow_batch(&table_name, &normalized_batch, &normalized_schema)
                             .await
-                            {
-                                RetryOutcome::Completed => Ok(()),
-                                RetryOutcome::Cancelled => Err(streamling_core::streamling_err!(
-                                    "{} aborted: shutdown requested before the write succeeded",
-                                    operation_name
-                                )),
-                            }
-                        }
-                    }
-                })
-                .await?;
-            } else {
-                // append_only_mode=false: split rows by _gs_op into inserts vs deletes
-                use datafusion::arrow::array::StringArray;
-                use std::str::FromStr;
-
-                let op_column =
-                    normalized_batch
-                        .column_by_name(COLUMN_NAME_OP)
-                        .ok_or_else(|| {
-                            DataFusionError::from(streamling_core::streamling_err!(
-                                "missing required column '{}' in ClickHouse sink batch",
-                                COLUMN_NAME_OP
-                            ))
-                        })?;
-                let op_array = op_column
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::from(streamling_core::streamling_err!(
-                            "column '{}' must be StringArray, got {:?}",
-                            COLUMN_NAME_OP,
-                            op_column.data_type()
-                        ))
-                    })?;
-
-                let mut insert_indices = Vec::new();
-                let mut delete_indices = Vec::new();
-
-                for (idx, op) in op_array.iter().enumerate() {
-                    if let Some(op_str) = op {
-                        let row_kind = RowKind::from_str(op_str).unwrap_or(RowKind::Insert);
-                        match row_kind {
-                            RowKind::Delete => delete_indices.push(idx as u32),
-                            RowKind::Insert | RowKind::Update => insert_indices.push(idx as u32),
-                        }
-                    } else {
-                        insert_indices.push(idx as u32);
+                            .streamling_context("failed to send Arrow batch")
+                    },
+                    &operation_name,
+                    &mut shutdown,
+                )
+                .await
+                {
+                    RetryOutcome::Completed => {}
+                    RetryOutcome::Cancelled => {
+                        return Err(DataFusionError::from(streamling_core::streamling_err!(
+                            "{} aborted: shutdown requested before the write succeeded",
+                            operation_name
+                        )));
                     }
                 }
+            } else {
+                // append_only_mode=false: split rows by _gs_op into inserts vs deletes
+                let (insert_rows, delete_indices) = split_rows_by_operation(&normalized_batch)?;
 
                 // Process inserts/updates: strip _gs_op, then send via Arrow IPC
-                if !insert_indices.is_empty() {
-                    let indices_array = arrow::array::UInt32Array::from(insert_indices);
-                    // Use streamling_core::utils::arrow::safe_take_record_batch to
-                    // recover from the documented arrow take_bytes overflow panic on
-                    // deeply nested schemas. Native take_record_batch panics with
-                    // Option::expect("overflow") inside take_bytes for batches whose
-                    // Utf8/Binary columns' cumulative byte offsets exceed i32::MAX;
-                    // the panic crosses the extern "C" plugin boundary and crashes
-                    // the process with exit 132/133 if not caught here.
-                    let insert_batch = streamling_core::utils::arrow::safe_take_record_batch(
-                        &normalized_batch,
-                        &indices_array,
-                    )?;
-                    let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_batch)?;
+                if let Some(insert_rows) = insert_rows {
+                    let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
                     // Build schema without _gs_op for INSERTs
                     let insert_schema =
                         Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
                             insert_batch.schema().as_ref(),
                         ));
 
-                    parallel_execute(&insert_batch, parallelism, write_batch_size as usize, {
-                        let client_closure = client.clone();
-                        let table_closure = table_name.clone();
-                        let schema_closure = insert_schema;
-                        let node_label_closure = node_label.clone();
-                        move |slice: RecordBatch| {
-                            let client = client_closure.clone();
-                            let table_name = table_closure.clone();
-                            let schema = schema_closure.clone();
-                            let node_label = node_label_closure.clone();
-                            async move {
-                                let operation_name =
-                                    format!("{}: INSERT into '{}'", node_label, table_name);
-                                let mut shutdown = streamling_core::shutdown::subscribe();
-                                match retry_forever_with_backoff_until_cancelled(
-                                    || async {
-                                        client
-                                            .send_arrow_batch(&table_name, &slice, &schema)
-                                            .await
-                                            .streamling_context("failed to send Arrow batch")
-                                    },
-                                    &operation_name,
-                                    &mut shutdown,
-                                )
+                    let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
+                    let mut shutdown = streamling_core::shutdown::subscribe();
+                    match retry_forever_with_backoff_until_cancelled(
+                        || async {
+                            client
+                                .send_arrow_batch(&table_name, &insert_batch, &insert_schema)
                                 .await
-                                {
-                                    RetryOutcome::Completed => Ok(()),
-                                    RetryOutcome::Cancelled => {
-                                        Err(streamling_core::streamling_err!(
-                                            "{} aborted: shutdown requested before the write succeeded",
-                                            operation_name
-                                        ))
-                                    }
-                                }
-                            }
+                                .streamling_context("failed to send Arrow batch")
+                        },
+                        &operation_name,
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        RetryOutcome::Completed => {}
+                        RetryOutcome::Cancelled => {
+                            return Err(DataFusionError::from(streamling_core::streamling_err!(
+                                "{} aborted: shutdown requested before the write succeeded",
+                                operation_name
+                            )));
                         }
-                    })
-                    .await?;
+                    }
                 }
 
                 // Process deletes: extract PK columns and issue ALTER TABLE DELETE
@@ -1246,7 +1229,7 @@ impl DataSink for ClickHouseSinkExec {
                 }
                 if !delete_indices.is_empty() && !primary_keys.is_empty() {
                     let indices_array = arrow::array::UInt32Array::from(delete_indices);
-                    // See safe_take_record_batch comment on the insert path above.
+                    // See the safe_take_record_batch comment in `split_rows_by_operation`.
                     let delete_batch = streamling_core::utils::arrow::safe_take_record_batch(
                         &normalized_batch,
                         &indices_array,
@@ -1302,7 +1285,12 @@ impl DataSink for ClickHouseSinkExec {
             );
 
             if let Some(limit) = num_records_before_stop {
-                records_processed += num_rows;
+                // Shared across the concurrent per-partition streams so the stop
+                // threshold stays global, matching the single-stream behavior.
+                let records_processed = self
+                    .records_processed
+                    .fetch_add(num_rows, std::sync::atomic::Ordering::SeqCst)
+                    + num_rows;
 
                 tracing::info!(
                     "[{}] records processed: {}, just added: {} (table '{}')",
@@ -1347,7 +1335,11 @@ pub struct ClickHouseSourceExec {
 
 impl DisplayAs for ClickHouseSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "ClickHouseSourceExec")
+        write!(
+            f,
+            "ClickHouseSourceExec: partitions={}",
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -3307,6 +3299,77 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
+
+    fn batch_with_operations(ops: Vec<&str>) -> RecordBatch {
+        use arrow::array::{Int32Array, StringArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+        ]));
+        let ids: Vec<i32> = (0..ops.len() as i32).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(ops)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn ids_of(batch: &RecordBatch) -> Vec<i32> {
+        use arrow::array::Int32Array;
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    /// An all-inserts batch must pass through without a `take`: its insert
+    /// indices are exactly `0..num_rows`, so copying would only reproduce it.
+    #[test]
+    fn split_rows_by_operation_passes_through_when_nothing_is_deleted() {
+        let batch = batch_with_operations(vec!["i", "u", "i"]);
+
+        let (insert_rows, delete_indices) = split_rows_by_operation(&batch).unwrap();
+
+        assert!(delete_indices.is_empty());
+        let insert_rows = insert_rows.expect("inserts must be returned");
+        assert_eq!(ids_of(&insert_rows), vec![0, 1, 2]);
+        for column in 0..batch.num_columns() {
+            assert!(
+                Arc::ptr_eq(batch.column(column), insert_rows.column(column)),
+                "column {column} was copied despite there being no deletes"
+            );
+        }
+    }
+
+    #[test]
+    fn split_rows_by_operation_separates_inserts_from_deletes() {
+        let batch = batch_with_operations(vec!["i", "d", "u", "d"]);
+
+        let (insert_rows, delete_indices) = split_rows_by_operation(&batch).unwrap();
+
+        assert_eq!(delete_indices, vec![1, 3]);
+        assert_eq!(
+            ids_of(&insert_rows.expect("inserts must be returned")),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn split_rows_by_operation_reports_no_inserts_for_an_all_delete_batch() {
+        let batch = batch_with_operations(vec!["d", "d"]);
+
+        let (insert_rows, delete_indices) = split_rows_by_operation(&batch).unwrap();
+
+        assert!(insert_rows.is_none());
+        assert_eq!(delete_indices, vec![0, 1]);
+    }
 
     #[test]
     fn split_range_start_reads_first_sorting_key() {

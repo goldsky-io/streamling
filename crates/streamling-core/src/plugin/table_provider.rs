@@ -2,13 +2,14 @@ use crate::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
 };
+use crate::operators::parallel_sink::ParallelSinkExec;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::{DataFusionError, not_impl_err, project_schema};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -22,6 +23,7 @@ use std::fmt::{Debug, Formatter};
 use crate::checkpoints::channels::{send, subscribe_with_id, unsubscribe};
 use crate::operators::wrapping::WrappingDataSink;
 use crate::plugin::telemetry::process_plugin_metrics;
+use crate::telemetry::provider::get_reference_name_from_metric_key;
 use crate::telemetry::recorder::get_metrics_recorder;
 use crate::topology::Telemetry;
 use crate::utils::metrics::metric_metadata_id_to_reference_name;
@@ -84,7 +86,11 @@ impl PluginSourceExec {
 
 impl DisplayAs for PluginSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-        write!(f, "PluginSourceExec")
+        write!(
+            f,
+            "PluginSourceExec: partitions={}",
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -286,7 +292,7 @@ impl ExecutionPlan for PluginSourceExec {
                             break;
                         }
                     } else {
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
                     }
                 }
 
@@ -463,6 +469,9 @@ struct PluginSink {
     plugin_channels: Arc<PluginChannels>,
     num_records_before_stop: Option<u64>, // for integration tests only!
     metric_metadata_id: String,
+    /// One `PluginMsg::Init` and one metrics-forwarder task regardless of how
+    /// many partition streams `ParallelSinkExec` writes concurrently.
+    init: std::sync::Once,
 }
 
 impl PluginSink {
@@ -477,6 +486,7 @@ impl PluginSink {
             plugin_channels,
             num_records_before_stop,
             metric_metadata_id,
+            init: std::sync::Once::new(),
         }
     }
 }
@@ -497,70 +507,72 @@ impl DataSink for PluginSink {
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let metrics_recorder = get_metrics_recorder();
-        tokio::spawn(process_plugin_metrics(
-            self.plugin_channels.metrics.receiver.clone(),
-            metrics_recorder.clone(),
-            self.metric_metadata_id.clone(),
-        ));
+        self.init.call_once(|| {
+            tokio::spawn(process_plugin_metrics(
+                self.plugin_channels.metrics.receiver.clone(),
+                metrics_recorder.clone(),
+                self.metric_metadata_id.clone(),
+            ));
 
-        // Forward plugin checkpoint acks to the coordinator independently of
-        // batch arrival. An ack lands on the plugin output channel only after
-        // the plugin's durable flush completes, and the terminal marker rides
-        // the LAST batch — so an ack drained only from inside the batch loop
-        // is never picked up: the loop is parked on a stream that ends only
-        // once the coordinator finalizes the terminal epoch, which needs this
-        // very ack. A dedicated task breaks that cycle. Same polling pattern
-        // as process_plugin_metrics (the channel is a sync crossbeam channel;
-        // a blocking recv() here would pin an executor thread); exits when the
-        // plugin output channel disconnects at plugin teardown.
-        let ack_receiver = self.plugin_channels.output.receiver.clone();
-        let sink_id = metric_metadata_id_to_reference_name(&self.metric_metadata_id)
-            .unwrap_or_else(|| self.metric_metadata_id.clone());
-        tokio::spawn(async move {
-            loop {
-                match ack_receiver.try_recv() {
-                    Ok(message) => match message.into_enum() {
-                        Ok(PluginMsg::CheckpointAck { epoch }) => {
-                            debug!(
-                                "Propagating checkpoint Ack with epoch {} from plugin",
-                                epoch.0
-                            );
-                            if let Err(e) = send(
-                                CHECKPOINT_COORDINATOR_CHANNEL,
-                                CheckpointMessage::Ack {
-                                    epoch: CheckpointEpoch(epoch.0),
-                                    sink_id: sink_id.clone(),
-                                },
-                            ) {
-                                warn!(
-                                    "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
-                                    epoch.0, e
+            // Forward plugin checkpoint acks to the coordinator independently of
+            // batch arrival. An ack lands on the plugin output channel only after
+            // the plugin's durable flush completes, and the terminal marker rides
+            // the LAST batch — so an ack drained only from inside the batch loop
+            // is never picked up: the loop is parked on a stream that ends only
+            // once the coordinator finalizes the terminal epoch, which needs this
+            // very ack. A dedicated task breaks that cycle. Same polling pattern
+            // as process_plugin_metrics (the channel is a sync crossbeam channel;
+            // a blocking recv() here would pin an executor thread); exits when the
+            // plugin output channel disconnects at plugin teardown.
+            let ack_receiver = self.plugin_channels.output.receiver.clone();
+            let sink_id = metric_metadata_id_to_reference_name(&self.metric_metadata_id)
+                .unwrap_or_else(|| self.metric_metadata_id.clone());
+            tokio::spawn(async move {
+                loop {
+                    match ack_receiver.try_recv() {
+                        Ok(message) => match message.into_enum() {
+                            Ok(PluginMsg::CheckpointAck { epoch }) => {
+                                debug!(
+                                    "Propagating checkpoint Ack with epoch {} from plugin",
+                                    epoch.0
                                 );
-                                break;
+                                if let Err(e) = send(
+                                    CHECKPOINT_COORDINATOR_CHANNEL,
+                                    CheckpointMessage::Ack {
+                                        epoch: CheckpointEpoch(epoch.0),
+                                        sink_id: sink_id.clone(),
+                                    },
+                                ) {
+                                    warn!(
+                                        "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
+                                        epoch.0, e
+                                    );
+                                    break;
+                                }
                             }
+                            _ => {
+                                warn!("Received unexpected message from plugin channel");
+                            }
+                        },
+                        Err(TryRecvError::Empty) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }
-                        _ => {
-                            warn!("Received unexpected message from plugin channel");
+                        Err(TryRecvError::Disconnected) => {
+                            debug!("Plugin output channel disconnected, stopping ack forwarder");
+                            break;
                         }
-                    },
-                    Err(TryRecvError::Empty) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        debug!("Plugin output channel disconnected, stopping ack forwarder");
-                        break;
                     }
                 }
-            }
+            });
+
+            self.plugin_channels
+                .input
+                .sender
+                .send(NonExhaustive::new(PluginMsg::Init))
+                .unwrap();
         });
 
         let mut row_count = 0;
-
-        self.plugin_channels
-            .input
-            .sender
-            .send(NonExhaustive::new(PluginMsg::Init))
-            .unwrap();
 
         while let Some(batch) = data.next().await.transpose()? {
             row_count += batch.num_rows();
@@ -721,7 +733,14 @@ impl TableProvider for PluginSinkProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(input, telemetry_sink, None)))
+        // Always one write stream: planning marks plugin sinks `Placement::Single`,
+        // so the input is coalesced above this point on both the single-sink and
+        // the fan-out path.
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            telemetry_sink,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+        )))
     }
 }
 

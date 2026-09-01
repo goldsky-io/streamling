@@ -7,6 +7,7 @@ use streamling_core::checkpoints::channels::{send, subscribe_with_id, unsubscrib
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
+    report_marker_at_sink, send_checkpoint_ack,
 };
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::error::{ResultExt, StreamlingError};
@@ -60,7 +61,7 @@ use streamling_state::StateOperatorBackend;
 use crate::util::lag::LagResult;
 use apache_avro::types::Value::Union;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
@@ -82,13 +83,13 @@ use schema_registry_converter::schema_registry_common::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
-use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
@@ -154,6 +155,10 @@ static DEFAULT_CONSUMER_FETCH_TIMEOUT_SEC: u64 = 60;
 static DEFAULT_STALL_WATCHDOG_TIMEOUT_SEC: u64 = 60;
 static DEFAULT_LAG_REPORT_INTERVAL_MS: u64 = 30_000;
 static WATCHDOG_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Kept short because the lookup runs inside the synchronous provider
+/// constructor, which planning calls from an async context — it blocks a Tokio
+/// worker thread for its duration.
+static PARTITION_COUNT_FETCH_TIMEOUT_SEC: u64 = 10;
 
 static DEFAULT_NUM_PARTITIONS: i32 = 4;
 
@@ -602,6 +607,14 @@ struct KafkaSourceExec {
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     shutdown_rx: watch::Receiver<bool>,
     num_records_before_stop: Option<u64>,
+    /// Number of concurrent consumer instances; one `execute` call per instance.
+    parallelism: usize,
+    /// Resolved once at construction so every instance joins the *same* consumer
+    /// group. Computing it per `create_consumer` call would mint a fresh
+    /// `df-consumer-{uuid}` per instance when no group is configured, and each
+    /// instance would then read the whole topic instead of a disjoint slice.
+    group_id: String,
+    lag_group_id: String,
 }
 
 impl Debug for KafkaSourceExec {
@@ -652,9 +665,13 @@ impl KafkaSourceExec {
         shutdown_rx: watch::Receiver<bool>,
         num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
+        parallelism: usize,
     ) -> Self {
         let full_schema_projected = project_schema(&full_schema, projections).unwrap();
-        let cached_properties = Self::compute_properties(full_schema_projected.clone());
+        let cached_properties =
+            Self::compute_properties(full_schema_projected.clone(), parallelism);
+        let group_id = Self::resolve_group_id(&config, &reference_name, false);
+        let lag_group_id = Self::resolve_group_id(&config, &reference_name, true);
 
         let payload_projection = projections.cloned().map(|vec| {
             // Filter to only include indices valid for the payload schema.
@@ -685,15 +702,23 @@ impl KafkaSourceExec {
             state_backend,
             shutdown_rx,
             num_records_before_stop,
+            parallelism,
+            group_id,
+            lag_group_id,
         }
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+    ///
+    /// Deliberately `UnknownPartitioning`, never `Hash`: Kafka places records by
+    /// murmur2 over the message key, which has nothing to do with the hash a
+    /// downstream keyed sink needs. Declaring `Hash` here would let the planner
+    /// elide the sink-edge exchange that actually does the keying.
+    fn compute_properties(schema: SchemaRef, parallelism: usize) -> PlanProperties {
         let eq_properties = EquivalenceProperties::new(schema);
         PlanProperties::new(
             eq_properties,
-            Partitioning::UnknownPartitioning(1), // TODO
+            Partitioning::UnknownPartitioning(parallelism.max(1)),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -701,22 +726,32 @@ impl KafkaSourceExec {
         )
     }
 
+    /// Each source gets its own consumer group so sources reading different
+    /// topics never fight over assignments; all instances of *one* source share
+    /// that group, which is what makes the broker split the topic's partitions
+    /// between them. The lag consumer needs a separate group so it doesn't
+    /// compete for partitions with the main consumers.
+    fn resolve_group_id(
+        config: &KafkaConfig,
+        reference_name: &str,
+        is_lag_consumer: bool,
+    ) -> String {
+        match &config.consumer_group_id {
+            Some(base_id) if is_lag_consumer => format!("{}-{}-lag", base_id, reference_name),
+            Some(base_id) => format!("{}-{}", base_id, reference_name),
+            None if is_lag_consumer => format!("df-consumer-{}-lag", Uuid::new_v4()),
+            None => format!("df-consumer-{}", Uuid::new_v4()),
+        }
+    }
+
     fn create_consumer(
         config: &KafkaConfig,
         starting_offsets: &Option<String>,
         reference_name: &str,
+        group_id: &str,
         is_lag_consumer: bool,
     ) -> StreamConsumer {
         let mut builder = KafkaCommon::build_client(config);
-
-        // Each source should have its own consumer group to avoid partition assignment conflicts
-        // when multiple sources read from different topics.
-        // The lag consumer needs a separate group so it doesn't compete for partitions with the main consumer.
-        let group_id = match &config.consumer_group_id {
-            Some(base_id) if is_lag_consumer => format!("{}-{}-lag", base_id, reference_name),
-            Some(base_id) => format!("{}-{}", base_id, reference_name),
-            None => format!("df-consumer-{}", Uuid::new_v4()),
-        };
 
         debug!(
             "[{}] Using consumer group id: {} (lag_consumer: {})",
@@ -1112,7 +1147,15 @@ async fn calculate_lag_task(
 
 impl DisplayAs for KafkaSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-        write!(f, "KafkaSourceExec")
+        // One consumer instance per partition, so this is the source's
+        // `parallelism` and the width the rest of the plan inherits.
+        write!(
+            f,
+            "KafkaSourceExec: partitions={}",
+            self.cached_properties
+                .output_partitioning()
+                .partition_count()
+        )
     }
 }
 
@@ -1138,7 +1181,7 @@ impl ExecutionPlan for KafkaSourceExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStreamBuilder::new(
@@ -1149,10 +1192,15 @@ impl ExecutionPlan for KafkaSourceExec {
 
         let state_backend = self.state_backend.clone();
 
+        // One consumer instance per output partition, all in the same group: the
+        // broker hands each a disjoint slice of the topic's Kafka partitions.
+        // Checkpoint state is keyed by (topic, kafka partition) and seeks are
+        // scoped to this instance's assignment, so instances never collide.
         let consumer = SafeKafkaConsumer::new(Self::create_consumer(
             &self.kafka_config,
             &self.start_at,
             &self.reference_name,
+            &self.group_id,
             false,
         ));
         consumer
@@ -1224,11 +1272,13 @@ impl ExecutionPlan for KafkaSourceExec {
         let batch_size_limit = self.record_batch_size as u64;
 
         let reference_name = self.reference_name.clone();
-        // Keep the subscriber id so the consume task can unsubscribe on exit:
-        // dropping the receiver while the sender stays in the global channel
-        // map makes every later broadcast return SendError — which used to
-        // panic sinks/coordinator mid-drain the moment this source exited on
-        // shutdown.
+        // Each consumer instance is its own subscriber; keep the subscriber id
+        // so the consume task can unsubscribe on exit. Dropping the receiver
+        // while the sender stays in the global channel map makes every later
+        // broadcast return SendError — which used to panic sinks/coordinator
+        // mid-drain the moment this source exited on shutdown, and with several
+        // instances would also fail the coordinator's broadcast to the
+        // instances still running.
         let (receiver, checkpoint_subscriber_id) =
             subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
 
@@ -1255,15 +1305,21 @@ impl ExecutionPlan for KafkaSourceExec {
         let metric_metadata_id = self.metric_metadata_id.clone();
         let kafka_lag_reporter_interval = self.kafka_config.lag_report_interval_ms;
         let metrics_recorder = get_metrics_recorder().clone();
+        // Lag is a per-source metric, and every instance would report the same
+        // topic-wide numbers, so only instance 0 runs the reporter.
+        //
         // Wrap the lag consumer so its rd_kafka_destroy is deferred to a
         // blocking thread on drop, instead of running inline on a tokio worker
         // (the documented deadlock the main consumer is already protected from).
-        let lag_consumer = SafeKafkaConsumer::new(Self::create_consumer(
-            &self.kafka_config,
-            &self.start_at,
-            &self.reference_name,
-            true,
-        ));
+        let lag_consumer = (partition == 0).then(|| {
+            SafeKafkaConsumer::new(Self::create_consumer(
+                &self.kafka_config,
+                &self.start_at,
+                &self.reference_name,
+                &self.lag_group_id,
+                true,
+            ))
+        });
         let topic = self.topic.clone();
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
@@ -1280,17 +1336,19 @@ impl ExecutionPlan for KafkaSourceExec {
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
-            tokio::spawn(calculate_lag_task(
-                reference_name.clone(),
-                metric_metadata_id.clone(),
-                kafka_topic_partition_list.clone(),
-                lag_consumer,
-                state_backend.clone(),
-                metrics_recorder.clone(),
-                kafka_lag_reporter_interval,
-                max_lag_tx,
-                shutdown_rx.clone(),
-            ));
+            if let Some(lag_consumer) = lag_consumer {
+                tokio::spawn(calculate_lag_task(
+                    reference_name.clone(),
+                    metric_metadata_id.clone(),
+                    kafka_topic_partition_list.clone(),
+                    lag_consumer,
+                    state_backend.clone(),
+                    metrics_recorder.clone(),
+                    kafka_lag_reporter_interval,
+                    max_lag_tx,
+                    shutdown_rx.clone(),
+                ));
+            }
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
@@ -1733,6 +1791,8 @@ impl ExecutionPlan for KafkaSourceExec {
             }
 
             info!("Shutting down Kafka consumer: unsubscribing and unassigning");
+            // Drop this instance's subscription before its receiver, or the
+            // coordinator's next broadcast fails for every instance still running.
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
             consumer.unsubscribe();
             consumer.unassign().expect("Failed to unassign consumer");
@@ -1772,6 +1832,7 @@ pub struct KafkaSourceTableProvider {
     shutdown_rx: watch::Receiver<bool>,
     num_records_before_stop: Option<u64>,
     extracted_primary_key: Option<String>,
+    parallelism: usize,
 }
 
 impl Debug for KafkaSourceTableProvider {
@@ -1832,6 +1893,7 @@ impl KafkaSourceTableProvider {
         skip_schema_resolution_for_reader_schema_ids: Vec<u32>,
         format: KafkaFormat,
         json_schema: Option<BTreeMap<String, String>>,
+        parallelism: usize,
     ) -> Result<Self> {
         let (payload_schema, decoding, extracted_primary_key) = match format {
             KafkaFormat::Avro => {
@@ -1918,6 +1980,8 @@ impl KafkaSourceTableProvider {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config_for_metadata = config.clone();
+        let topic_for_metadata = topic.clone();
 
         Ok(KafkaSourceTableProvider {
             reference_name,
@@ -1940,7 +2004,59 @@ impl KafkaSourceTableProvider {
             shutdown_rx,
             num_records_before_stop,
             extracted_primary_key,
+            parallelism: Self::effective_parallelism(
+                &config_for_metadata,
+                &topic_for_metadata,
+                parallelism,
+            ),
         })
+    }
+
+    /// Clamps `parallelism` to the topic's partition count.
+    ///
+    /// Instances beyond that count get an empty broker assignment, and
+    /// `wait_for_assignment` fails the source after its timeout rather than
+    /// idling — so an over-provisioned `parallelism` would take the pipeline
+    /// down. Clamp and say so instead.
+    fn effective_parallelism(config: &KafkaConfig, topic: &str, requested: usize) -> usize {
+        let requested = requested.max(1);
+        if requested == 1 {
+            return 1;
+        }
+        let partitions = KafkaCommon::build_client(config)
+            .create::<rdkafka::consumer::BaseConsumer>()
+            .and_then(|client| {
+                client.fetch_metadata(
+                    Some(topic),
+                    Duration::from_secs(PARTITION_COUNT_FETCH_TIMEOUT_SEC),
+                )
+            })
+            .map(|metadata| {
+                metadata
+                    .topics()
+                    .first()
+                    .map_or(0, |t| t.partitions().len())
+            });
+
+        match partitions {
+            Ok(partitions) if partitions > 0 && partitions < requested => {
+                warn!(
+                    "source parallelism {} exceeds the {} partition(s) of topic '{}'; \
+                     running {} consumer instance(s) instead",
+                    requested, partitions, topic, partitions
+                );
+                partitions
+            }
+            Err(e) => {
+                warn!(
+                    "could not read the partition count of topic '{}' ({}); running the \
+                     requested {} consumer instance(s) unclamped",
+                    topic, e, requested
+                );
+                requested
+            }
+            _ => requested,
+        }
     }
 
     /// Get the payload schema (data columns only, without _gs_op or __kafka_* metadata)
@@ -2064,6 +2180,7 @@ impl KafkaSourceTableProvider {
             self.shutdown_rx.clone(),
             self.num_records_before_stop,
             self.metric_metadata_id.clone(),
+            self.parallelism,
         ));
 
         if let Some(filter_expr) = &filter {
@@ -2259,9 +2376,12 @@ pub struct KafkaSink {
     format: KafkaFormat,
     subject_name_strategy: SubjectNameStrategy,
     num_records_before_stop: Option<u64>, // for integration tests only!
+    /// Global `num_records_before_stop` progress across the concurrent
+    /// per-partition `write_all` streams (`ParallelSinkExec`).
+    rows_received: AtomicU64,
     source_name: String,
     metric_metadata_id: String,
-    producers: OnceCell<Vec<KafkaThreadedProducer>>,
+    producer: OnceCell<KafkaThreadedProducer>,
     primary_key: Option<String>,
     /// Maximum number of messages to batch before sending (maps to Kafka's batch.num.messages)
     batch_size: Option<u32>,
@@ -2269,8 +2389,6 @@ pub struct KafkaSink {
     batch_flush_interval_ms: Option<u64>,
     /// Maximum Kafka protocol request message size in bytes (maps to message.max.bytes)
     message_max_bytes: Option<u32>,
-    /// Number of parallel producers (each with independent connections/queues)
-    parallelism: usize,
     /// Producer compression codec (maps to librdkafka's compression.type)
     compression: KafkaCompression,
 }
@@ -2289,7 +2407,6 @@ impl KafkaSink {
         batch_size: Option<u32>,
         batch_flush_interval_ms: Option<u64>,
         message_max_bytes: Option<u32>,
-        parallelism: Option<usize>,
         compression: KafkaCompression,
     ) -> Self {
         let subject_name_strategy = SubjectNameStrategy::TopicNameStrategy(topic.to_owned(), false);
@@ -2304,14 +2421,14 @@ impl KafkaSink {
             format,
             subject_name_strategy,
             num_records_before_stop,
+            rows_received: AtomicU64::new(0),
             source_name,
             metric_metadata_id: reference_name,
-            producers: OnceCell::new(),
+            producer: OnceCell::new(),
             primary_key,
             batch_size,
             batch_flush_interval_ms,
             message_max_bytes,
-            parallelism: parallelism.unwrap_or(1).max(1),
             compression,
         }
     }
@@ -2377,10 +2494,17 @@ impl KafkaSink {
         builder
     }
 
-    fn create_producers(&self) -> streamling_core::error::Result<Vec<KafkaThreadedProducer>> {
+    /// One producer per sink, shared by every concurrent write stream.
+    ///
+    /// The sink used to fan out to N producers and route rows between them by
+    /// `hash(key) % N` — a hash exchange hand-rolled inside the sink. The
+    /// `parallelism` knob now drives a real `StreamingRepartitionExec` upstream,
+    /// which gives each key its own write stream, so the internal routing is
+    /// gone. `ThreadedProducer` is `Sync` and batches internally, so the streams
+    /// share it.
+    fn create_producer(&self) -> streamling_core::error::Result<KafkaThreadedProducer> {
         info!(
-            "Creating {} Kafka producer(s) for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={})",
-            self.parallelism,
+            "Creating Kafka producer for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={})",
             self.topic,
             self.batch_size,
             self.batch_flush_interval_ms,
@@ -2388,25 +2512,21 @@ impl KafkaSink {
             self.compression.as_str(),
         );
 
-        (0..self.parallelism)
-            .map(|_| {
-                Self::build_producer_config(
-                    &self.config,
-                    self.batch_size,
-                    self.batch_flush_interval_ms,
-                    self.message_max_bytes,
-                    self.compression,
-                )
-                .create_with_context(KafkaProducerContext::new())
-                .streamling_context("failed to create Kafka producer")
-            })
-            .collect()
+        Self::build_producer_config(
+            &self.config,
+            self.batch_size,
+            self.batch_flush_interval_ms,
+            self.message_max_bytes,
+            self.compression,
+        )
+        .create_with_context(KafkaProducerContext::new())
+        .streamling_context("failed to create Kafka producer")
     }
 
     async fn send_batch_to_kafka_as_avro(
         &self,
         batch: &RecordBatch,
-        producers: &[KafkaThreadedProducer],
+        producer: &KafkaThreadedProducer,
         converter: &FromArrowToAvroConverter,
         encoder: &AvroEncoder<'_>,
         metrics_recorder: Arc<MetricsRecorder>,
@@ -2414,10 +2534,8 @@ impl KafkaSink {
         let num_rows = batch.num_rows();
 
         debug!(
-            "Sending batch with {} rows to Kafka topic: {} (producers: {})",
-            num_rows,
-            self.topic,
-            producers.len(),
+            "Sending batch with {} rows to Kafka topic: {}",
+            num_rows, self.topic,
         );
 
         let serialized_values = converter.convert_from_batch(batch)?;
@@ -2458,7 +2576,7 @@ impl KafkaSink {
             num_rows, self.topic, total_bytes, avg_msg_bytes,
         );
 
-        self.send_payloads_to_producers(encoded_payloads, &row_kinds, keys.as_ref(), producers)
+        self.send_payloads_to_producer(encoded_payloads, &row_kinds, keys.as_ref(), producer)
     }
 
     /// Extract keys from batch based on primary key column names
@@ -2496,16 +2614,14 @@ impl KafkaSink {
     fn send_batch_to_kafka_as_json(
         &self,
         batch: &RecordBatch,
-        producers: &[KafkaThreadedProducer],
+        producer: &KafkaThreadedProducer,
         converter: &FromArrowToJsonConverter,
     ) -> streamling_core::error::Result<()> {
         let num_rows = batch.num_rows();
 
         debug!(
-            "Sending batch with {} rows as JSON to Kafka topic: {} (producers: {})",
-            num_rows,
-            self.topic,
-            producers.len(),
+            "Sending batch with {} rows as JSON to Kafka topic: {}",
+            num_rows, self.topic,
         );
 
         let serialized_values = converter.convert_from_batch(batch)?;
@@ -2518,33 +2634,23 @@ impl KafkaSink {
             None
         };
 
-        self.send_payloads_to_producers(serialized_values, &row_kinds, keys.as_ref(), producers)
+        self.send_payloads_to_producer(serialized_values, &row_kinds, keys.as_ref(), producer)
     }
 
     /// Send pre-serialized payloads to Kafka producers with key-based partitioning,
     /// operation headers, and backpressure handling.
     /// Uses `block_in_place` since rdkafka's `send` is a blocking call.
-    fn send_payloads_to_producers(
+    fn send_payloads_to_producer(
         &self,
         payloads: Vec<Vec<u8>>,
         row_kinds: &[RowKind],
         keys: Option<&Vec<String>>,
-        producers: &[KafkaThreadedProducer],
+        producer: &KafkaThreadedProducer,
     ) -> streamling_core::error::Result<()> {
         let topic = &self.topic;
-        let num_producers = producers.len();
         tokio::task::block_in_place(|| {
             for (i, encoded_bytes) in payloads.into_iter().enumerate() {
                 let key = keys.map(|k| &k[i]);
-                let producer_idx = match key {
-                    Some(k) => {
-                        let mut hasher = DefaultHasher::new();
-                        k.hash(&mut hasher);
-                        hasher.finish() as usize % num_producers
-                    }
-                    None => i % num_producers,
-                };
-                let producer = &producers[producer_idx];
                 producer.context().check_error()?;
 
                 let op = row_kinds[i].to_dbz_op();
@@ -2752,8 +2858,8 @@ impl DataSink for KafkaSink {
 
         self.ensure_topic_and_schema_exist().await?;
 
-        let producers: &[KafkaThreadedProducer] =
-            self.producers.get_or_try_init(|| self.create_producers())?;
+        let producer: &KafkaThreadedProducer =
+            self.producer.get_or_try_init(|| self.create_producer())?;
         let metrics_recorder = get_metrics_recorder().clone();
 
         let sink_converter = match self.format {
@@ -2775,7 +2881,7 @@ impl DataSink for KafkaSink {
                     KafkaSinkConverter::Avro { converter, encoder } => {
                         self.send_batch_to_kafka_as_avro(
                             &batch,
-                            producers,
+                            producer,
                             converter,
                             encoder,
                             metrics_recorder.clone(),
@@ -2783,7 +2889,7 @@ impl DataSink for KafkaSink {
                         .await?;
                     }
                     KafkaSinkConverter::Json { converter } => {
-                        self.send_batch_to_kafka_as_json(&batch, producers, converter)?;
+                        self.send_batch_to_kafka_as_json(&batch, producer, converter)?;
                     }
                 }
                 metrics_recorder.record_time(
@@ -2800,6 +2906,10 @@ impl DataSink for KafkaSink {
             }
 
             row_count += batch.num_rows();
+            let total_received = self
+                .rows_received
+                .fetch_add(batch.num_rows() as u64, Ordering::SeqCst)
+                + batch.num_rows() as u64;
 
             let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
             trace!(
@@ -2823,33 +2933,26 @@ impl DataSink for KafkaSink {
                     let ack_start = StdInstant::now();
 
                     debug!(
-                        "Received marker for epoch {}, flushing {} Kafka producer(s) for topic: {}",
-                        epoch.0,
-                        producers.len(),
-                        self.topic,
+                        "Received marker for epoch {}, flushing Kafka producer for topic: {}",
+                        epoch.0, self.topic,
                     );
                     tokio::task::block_in_place(|| {
-                        for producer in producers {
-                            Self::flush_producer(producer, &self.topic);
-                        }
+                        Self::flush_producer(producer, &self.topic);
                     });
 
-                    for producer in producers {
-                        producer.context().check_error().map_err(|e| {
-                            datafusion::error::DataFusionError::from(
-                                streamling_core::streamling_err!("Kafka producer error: {}", e)
-                                    .mark_retriable(),
-                            )
-                        })?;
-                    }
+                    producer.context().check_error().map_err(|e| {
+                        datafusion::error::DataFusionError::from(
+                            streamling_core::streamling_err!("Kafka producer error: {}", e)
+                                .mark_retriable(),
+                        )
+                    })?;
 
                     let sink_id = get_reference_name_from_metric_key(&self.metric_metadata_id);
                     // Best-effort: see the postgres sink — a receiver dropped
                     // during shutdown must not panic the sink mid-drain.
-                    let _ = send(
-                        CHECKPOINT_COORDINATOR_CHANNEL,
-                        CheckpointMessage::Ack { epoch, sink_id },
-                    );
+                    if report_marker_at_sink(&sink_id, epoch.clone()) {
+                        send_checkpoint_ack(epoch, &sink_id);
+                    }
                     metrics_recorder.record_time(
                         "checkpoint_sink_flush",
                         ack_start.elapsed(),
@@ -2858,8 +2961,10 @@ impl DataSink for KafkaSink {
                 }
             }
 
+            // Compare against the global received count so the stop threshold
+            // stays global across the concurrent per-partition streams.
             if let Some(num_records_before_stop) = self.num_records_before_stop
-                && row_count >= num_records_before_stop as usize
+                && total_received >= num_records_before_stop
             {
                 let _ = send(
                     CHECKPOINT_COORDINATOR_CHANNEL,
@@ -2870,11 +2975,9 @@ impl DataSink for KafkaSink {
         }
 
         tokio::task::block_in_place(|| {
-            for producer in producers {
-                Self::flush_producer(producer, &self.topic);
-            }
+            Self::flush_producer(producer, &self.topic);
         });
-        for producer in producers {
+        {
             producer.context().check_error().map_err(|e| {
                 datafusion::error::DataFusionError::from(
                     streamling_core::streamling_err!("Kafka producer error: {}", e)
@@ -2922,7 +3025,6 @@ pub struct KafkaSinkTableProvider {
     batch_flush_interval_ms: Option<u64>,
     /// Maximum Kafka protocol request message size in bytes (maps to message.max.bytes)
     message_max_bytes: Option<u32>,
-    parallelism: Option<usize>,
     /// Producer compression codec (maps to librdkafka's compression.type)
     compression: KafkaCompression,
     deduplicate: bool,
@@ -2944,7 +3046,6 @@ impl KafkaSinkTableProvider {
         batch_size: Option<u32>,
         batch_flush_interval_ms: Option<u64>,
         message_max_bytes: Option<u32>,
-        parallelism: Option<usize>,
         compression: KafkaCompression,
         deduplicate: Option<bool>,
         telemetry: Option<Telemetry>,
@@ -2962,7 +3063,6 @@ impl KafkaSinkTableProvider {
             batch_size,
             batch_flush_interval_ms,
             message_max_bytes,
-            parallelism,
             compression,
             deduplicate: deduplicate.unwrap_or(true),
             telemetry,
@@ -3009,7 +3109,6 @@ impl TableProvider for KafkaSinkTableProvider {
             self.batch_size,
             self.batch_flush_interval_ms,
             self.message_max_bytes,
-            self.parallelism,
             self.compression,
         ));
         let metric_metadata_id = self.metric_metadata_id.clone();
@@ -3019,7 +3118,11 @@ impl TableProvider for KafkaSinkTableProvider {
             self.primary_key.clone().filter(|_| self.deduplicate),
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(input, wrapper_data_sink, None)))
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            wrapper_data_sink,
+            get_reference_name_from_metric_key(&metric_metadata_id),
+        )))
     }
 }
 
@@ -3040,7 +3143,8 @@ mod tests {
         use streamling_state::StateOperatorBackendFactory;
         use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
 
-        let session_manager = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let session_manager =
+            SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         let state_backend = InMemoryStateOperatorBackendFactory::new()
             .unwrap()
             .create::<TopicPartitionOffset>("test-kafka-filter");
@@ -3070,6 +3174,7 @@ mod tests {
             vec![],
             KafkaFormat::Json,
             Some(json_schema),
+            1,
         )
         .unwrap();
 
@@ -3102,7 +3207,8 @@ mod tests {
         use streamling_state::StateOperatorBackendFactory;
         use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
 
-        let session_manager = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let session_manager =
+            SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         let state_backend = InMemoryStateOperatorBackendFactory::new()
             .unwrap()
             .create::<TopicPartitionOffset>("test-kafka-bad-schema");
@@ -3131,6 +3237,7 @@ mod tests {
             vec![],
             KafkaFormat::Json,
             Some(json_schema),
+            1,
         )
         .expect_err("unknown schema type must fail source creation");
 
@@ -3391,47 +3498,6 @@ mod tests {
         assert_eq!(watchdog.max_observed_lag, None);
     }
 
-    /// Verifies that the key-hash producer routing is deterministic:
-    /// the same key always maps to the same producer index.
-    #[test]
-    fn test_key_hash_producer_routing() {
-        let num_producers = 4usize;
-
-        let keys = vec![
-            "user_1", "user_2", "user_3", "user_1", "user_2", "user_3", "user_1", "order_42",
-            "order_42", "order_42",
-        ];
-
-        let mut key_to_producer: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-
-        for key in &keys {
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            let producer_idx = hasher.finish() as usize % num_producers;
-
-            if let Some(&prev_idx) = key_to_producer.get(key) {
-                assert_eq!(
-                    prev_idx, producer_idx,
-                    "Key '{}' mapped to producer {} previously but now maps to {}",
-                    key, prev_idx, producer_idx
-                );
-            } else {
-                key_to_producer.insert(key, producer_idx);
-            }
-        }
-
-        // Verify that at least 2 distinct keys map to different producers
-        let unique_producers: std::collections::HashSet<usize> =
-            key_to_producer.values().copied().collect();
-        assert!(
-            unique_producers.len() > 1,
-            "Expected keys to be distributed across multiple producers, but all {} keys mapped to producer {}",
-            key_to_producer.len(),
-            unique_producers.iter().next().unwrap()
-        );
-    }
-
     mod filter_validation {
         use super::*;
         use arrow_schema::{DataType, Field, Schema};
@@ -3439,7 +3505,7 @@ mod tests {
         use streamling_core::session::SessionManager;
 
         fn test_session_manager() -> SessionManager {
-            SessionManager::new(100, 10, DynamicTableRegistry::new())
+            SessionManager::new(100, 10, DynamicTableRegistry::new(), 1)
                 .expect("test session manager initialisation failed")
         }
 

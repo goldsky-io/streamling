@@ -254,10 +254,15 @@ impl WrappingSourceTableProvider {
                 Vec::new(),
                 event_time_instrumentation.clone(),
             ));
-            let rebuilt = Arc::new(filter_exec.clone())
+            // Mark the re-applied filter/projection as source-owned: they sit
+            // ABOVE this source's `WrappingExec`, i.e. inside the downstream
+            // consumer's plan subtree, and must act as a topology boundary so
+            // their compute is not attributed to the consuming transform.
+            let rebuilt = Arc::new(filter_exec.clone().with_source_owned())
                 .with_new_children(vec![wrapped_source])
                 .and_then(|new_filter| {
-                    Arc::new(projection_exec.clone()).with_new_children(vec![new_filter])
+                    Arc::new(projection_exec.clone().with_source_owned())
+                        .with_new_children(vec![new_filter])
                 });
             match rebuilt {
                 Ok(plan) => return plan,
@@ -281,7 +286,12 @@ impl WrappingSourceTableProvider {
                 Vec::new(),
                 event_time_instrumentation.clone(),
             ));
-            match Arc::new(filter_exec.clone()).with_new_children(vec![wrapped_source]) {
+            // Source-owned for the same reason as the projection+filter
+            // branch above: this filter is re-applied above the source's
+            // `WrappingExec` and must bound downstream metric aggregation.
+            match Arc::new(filter_exec.clone().with_source_owned())
+                .with_new_children(vec![wrapped_source])
+            {
                 Ok(plan) => plan,
                 Err(e) => {
                     warn!(
@@ -458,6 +468,12 @@ pub struct WrappingExec {
     event_time_instrumentation: Option<EventTimeInstrumentation>,
 }
 
+impl crate::operators::TopologyBoundary for WrappingExec {
+    fn bounds_metric_aggregation(&self) -> bool {
+        true
+    }
+}
+
 impl WrappingExec {
     pub fn new(
         inner: Arc<dyn ExecutionPlan>,
@@ -501,6 +517,15 @@ impl WrappingExec {
             event_time_instrumentation,
         }
     }
+}
+
+/// Wall-clock around `data.next().await` is idle-wait dominated. SQL nodes
+/// that already expose a DataFusion subtree emit per-batch compute via
+/// `record_execution_plan_metrics`; recording wall-clock too would fold
+/// idle-wait into the same `elapsed_compute` series. A passthrough SQL
+/// node with no subtree metrics keeps wall-clock as the only signal.
+fn should_record_wall_clock_compute(has_subtree_metrics: bool, is_sql_node: bool) -> bool {
+    !has_subtree_metrics || !is_sql_node
 }
 
 /// Used to intercept `execute()` calls and run additional logic like telemetry processing
@@ -559,7 +584,6 @@ impl ExecutionPlan for WrappingExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let metric_metadata_id = self.reference_name.clone();
-        let metrics = self.metrics();
         let metrics_recorder = get_metrics_recorder().clone();
         let live_data_inspect = LiveDataInspect::get_instance();
 
@@ -576,6 +600,29 @@ impl ExecutionPlan for WrappingExec {
             partition,
             Arc::clone(&context),
         )?;
+
+        // Read the input's metrics AFTER `execute_input_stream` has run: a
+        // DataFusion operator only registers its `BaselineMetrics`
+        // (`elapsed_compute`, ...) when its `execute` is called. Snapshotting
+        // before that returned an empty set whose live Arc-backed counters were
+        // never captured, so a SQL transform's compute never reached
+        // `elapsed_compute`. The `MetricsSet` holds Arc-shared counters, so
+        // this single read stays live as batches flow.
+        let metrics = self.metrics();
+
+        // Static per node: resolve once per stream, not per batch. SQL
+        // transforms get accurate per-batch compute from the DataFusion
+        // subtree delta; the wall-clock span below is measured around
+        // `data.next().await` (dominated by upstream idle-wait) and would
+        // pollute the same `elapsed_compute` series for them. When the
+        // subtree exposes NO metrics at all (e.g. a passthrough transform
+        // whose input is directly the upstream topology boundary), the delta
+        // path can never emit, so wall-clock stays on as the only available
+        // signal rather than leaving the series dead.
+        let record_wall_clock_compute = should_record_wall_clock_compute(
+            metrics.is_some(),
+            metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
+        );
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
@@ -595,15 +642,18 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        // Record per-batch compute time
-                        metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+                        // Record per-batch compute time (non-sql nodes only;
+                        // see `record_wall_clock_compute` above)
+                        if record_wall_clock_compute {
+                            metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+                        }
 
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
                             RowCountMeasurementType::OutputRowCount,
-                            metrics.clone(),
+                            metrics.as_ref(),
                         );
 
                         // Record checkpoint marker arrival time for transforms
@@ -746,7 +796,7 @@ impl DataSink for WrappingDataSink {
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
                             RowCountMeasurementType::InputRowCount,
-                            metrics.clone(),
+                            metrics.as_ref(),
                         );
 
                         // End-to-end freshness at sink ingress. Same code
@@ -1057,6 +1107,22 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn sql_with_subtree_metrics_suppresses_wall_clock() {
+        assert!(!should_record_wall_clock_compute(true, true));
+    }
+
+    #[test]
+    fn sql_passthrough_without_subtree_metrics_keeps_wall_clock() {
+        assert!(should_record_wall_clock_compute(false, true));
+    }
+
+    #[test]
+    fn non_sql_always_records_wall_clock() {
+        assert!(should_record_wall_clock_compute(true, false));
+        assert!(should_record_wall_clock_compute(false, false));
+    }
+
     #[derive(Debug)]
     struct CountingSideOutput {
         rows_seen: Arc<AtomicUsize>,
@@ -1134,20 +1200,33 @@ mod tests {
         );
 
         // Order must be projection -> filter -> wrapper -> source, so side
-        // outputs / event-time observe every pre-filter row (R7).
+        // outputs / event-time observe every pre-filter row (R7). Both
+        // rebuilt nodes must keep the source-owned topology-boundary mark.
+        let rebuilt_proj = result
+            .downcast_ref::<StreamingProjectionExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected top-level plan to be StreamingProjectionExec, got: {}",
+                    result.name()
+                )
+            });
         assert!(
-            result.downcast_ref::<StreamingProjectionExec>().is_some(),
-            "Expected top-level plan to be StreamingProjectionExec, got: {}",
-            result.name()
+            rebuilt_proj.is_source_owned(),
+            "rebuilt source projection must stay a topology boundary"
         );
         let proj_children = result.children();
         assert_eq!(proj_children.len(), 1);
+        let rebuilt_filter = proj_children[0]
+            .downcast_ref::<StreamingFilterExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected projection's child to be StreamingFilterExec, got: {}",
+                    proj_children[0].name()
+                )
+            });
         assert!(
-            proj_children[0]
-                .downcast_ref::<StreamingFilterExec>()
-                .is_some(),
-            "Expected projection's child to be StreamingFilterExec, got: {}",
-            proj_children[0].name()
+            rebuilt_filter.is_source_owned(),
+            "rebuilt source filter must stay a topology boundary after with_new_children"
         );
         let filter_children = proj_children[0].children();
         assert_eq!(filter_children.len(), 1);
@@ -1187,10 +1266,17 @@ mod tests {
         );
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
+        let rebuilt_filter = result
+            .downcast_ref::<StreamingFilterExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected top-level plan to be StreamingFilterExec, got: {}",
+                    result.name()
+                )
+            });
         assert!(
-            result.downcast_ref::<StreamingFilterExec>().is_some(),
-            "Expected top-level plan to be StreamingFilterExec, got: {}",
-            result.name()
+            rebuilt_filter.is_source_owned(),
+            "wrap reconstruction must keep the source-owned topology boundary"
         );
 
         // Its child should be WrappingExec (side outputs run before the filter)
