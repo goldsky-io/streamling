@@ -763,8 +763,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watch_signal_budget_decays_toward_deadline() {
         let (_tx, signal) = watch(false);
-        let signal =
-            signal.with_deadline(tokio::time::Instant::now() + Duration::from_secs(10));
+        let signal = signal.with_deadline(tokio::time::Instant::now() + Duration::from_secs(10));
         assert_eq!(signal.remaining_budget(), Some(Duration::from_secs(10)));
         tokio::time::advance(Duration::from_secs(7)).await;
         assert_eq!(signal.remaining_budget(), Some(Duration::from_secs(3)));

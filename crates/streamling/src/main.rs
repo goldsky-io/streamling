@@ -13,8 +13,8 @@ use streamling_core::operators::inspect::LiveDataInspect;
 use streamling_core::plugin::{
     build_plugin_preprocessors, load_and_initialize_plugins, terminate_all_plugins,
 };
-use tracing::{error, info};
 use tracing::log::warn;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 mod initializations;
