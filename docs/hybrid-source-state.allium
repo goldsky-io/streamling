@@ -216,31 +216,59 @@ rule HybridSourceRecoversAsFirstRun {
 -- ---- Phase advancement -------------------------------------------------
 
 -- When the active bounded phase's stream ends, the hybrid source
--- advances to the next phase. The phase state is persisted to the
--- state backend immediately after the in-memory advance.
+-- advances to the next phase IN MEMORY. The phase state is NOT
+-- persisted at this point: the rows the finished phase emitted are only
+-- durable once every sink has acknowledged a checkpoint Marker that
+-- travelled behind them. Persisting `completed_phases` earlier would let
+-- a restart skip those rows if a sink fails before that (observed when
+-- the sink was unavailable at first start).
 --
--- The bounded source's own resume cursor was already saved during the
--- most recent epoch finalization (see checkpointing.allium). Phase state
--- and bounded cursors are persisted independently and there is no
--- atomicity between them.
+-- The bounded source's own resume cursor is saved during epoch
+-- finalization (see checkpointing.allium). Phase state and bounded
+-- cursors are persisted independently and there is no atomicity between
+-- them.
 rule AdvanceFromBoundedPhase {
     when: BoundedStreamEnded(hybrid)
     requires: hybrid.is_in_bounded_phase
     ensures: hybrid.current_phase = hybrid.current_phase + 1
+    ensures: hybrid.transition_at = now
+    ensures: not HybridPhaseStatePersisted(hybrid)
+}
+
+-- The phase state (and the seeded offsets below) become durable on the
+-- first Finalizer whose Marker was created after the transition. Such a
+-- Marker was broadcast after the last bounded batch was sent downstream,
+-- so it reaches every sink behind that batch; its Finalizer therefore
+-- proves the finished phase is durable everywhere. Until then a restart
+-- lands on the phase the persisted state names (phase 0 on a first run),
+-- re-emitting the finished phase's rows -- at-least-once, never loss.
+rule PersistPhaseStateOnFirstCoveringFinalizer {
+    when: FinalizerObserved(hybrid, epoch)
+    requires: hybrid.transition_at != null
+    requires: exists marker: MarkerObserved(hybrid, marker)
+        and marker.epoch <= epoch
+        and marker.created_at > hybrid.transition_at
     ensures: HybridPhaseStatePersisted(hybrid)
+    ensures:
+        for offset in hybrid.seeded_offsets
+            where UnboundedPersistedOffset(hybrid.unbounded_phase, offset.partition) = null:
+                UnboundedPartitionOffsetPersisted(
+                    source: hybrid.unbounded_phase,
+                    offset: offset
+                )
+    ensures: hybrid.transition_at = null
 }
 
 -- When advancing OUT of the last bounded phase, fetch unbounded
--- partition offsets from the offset provider and seed them into the
--- unbounded source's per-partition state BEFORE the unbounded phase
--- begins consuming. The offsets are also recorded in hybrid phase
--- state for diagnostic purposes.
+-- partition offsets from the offset provider and hand them to the
+-- unbounded source IN MEMORY before the unbounded phase begins
+-- consuming. The offsets are also recorded in hybrid phase state.
 --
 -- Seeding ensures the unbounded source resumes from the correct
 -- position relative to where the final bounded phase left off, rather
--- than from its configured default (earliest/latest). After seeding,
--- the unbounded source's per-partition state contains a value for each
--- seeded partition, regardless of whether one already existed.
+-- than from its configured default (earliest/latest). Nothing is
+-- written to the unbounded source's per-partition state here; see
+-- PersistPhaseStateOnFirstCoveringFinalizer.
 rule SeedUnboundedOffsetsAtHandoff {
     when: BoundedStreamEnded(hybrid)
     requires: hybrid.is_in_bounded_phase
@@ -256,15 +284,16 @@ rule SeedUnboundedOffsetsAtHandoff {
             )
 }
 
--- The unbounded source observes seeded offsets via direct write to the
--- same per-partition state key it reads on its own startup. The
--- unbounded source itself does not need to be running at the time of
--- seeding -- the write is durable and is consumed by its next startup.
--- See checkpointing.allium for the unbounded source's normal commit
--- path during steady state.
+-- The unbounded source keeps seeded offsets in memory and, on startup,
+-- seeks each assigned partition to its persisted offset if one exists,
+-- else to its seeded offset if one exists, else to its configured
+-- default. Its own steady-state commit path (see checkpointing.allium)
+-- persists positions on Finalizer; partitions that saw no traffic since
+-- the seek are covered by PersistPhaseStateOnFirstCoveringFinalizer.
 rule UnboundedAcceptsSeededOffset {
     when: UnboundedPartitionOffsetSeeded(source, offset)
-    -- Effect: the source's persisted partition offset becomes `offset`.
+    -- Effect: the source's in-memory start position for the partition
+    -- becomes `offset`; the persisted partition offset is unchanged.
     -- Modeled as a contract on UnboundedSource (see
     -- UnboundedOffsetSeedingContract surface).
 }
@@ -318,21 +347,27 @@ rule HybridPhaseStatePersisted {
 ------------------------------------------------------------
 
 -- Contract for unbounded source implementations consuming seeded
--- offsets. The hybrid source writes seed offsets to the same per-
--- partition state keys the unbounded source reads on startup, so this
--- contract is satisfied implicitly by any unbounded source that
--- prefers persisted offsets over its configured default.
+-- offsets. The hybrid source hands seed offsets to the unbounded source
+-- in memory; the unbounded source must prefer, in order, a persisted
+-- per-partition offset, then a seeded one, then its configured default.
 surface UnboundedOffsetSeedingContract {
     facing implementer: UnboundedSource
 
     context offset: PartitionOffset
 
-    @guarantee UnboundedPrefersPersistedOffset
-        -- An UnboundedSource MUST, on startup, prefer a persisted
-        -- per-partition offset over its configured default
+    @guarantee UnboundedPrefersPersistedThenSeededOffset
+        -- An UnboundedSource MUST, on startup, seek each partition to
+        -- its persisted offset if one exists, else to its seeded
+        -- offset if one exists, else to its configured default
         -- (earliest/latest). Violation breaks the bounded ->
         -- unbounded handoff: the unbounded source would resume from
         -- the wrong position despite seeding.
+
+    @guarantee SeedIsNotDurable
+        -- Seeding MUST NOT write the per-partition state key. Only a
+        -- finalized checkpoint (the source's own commit path, or the
+        -- hybrid source's PersistPhaseStateOnFirstCoveringFinalizer)
+        -- may persist a position.
 }
 
 -- Contract for bounded source implementations exposing resume state.

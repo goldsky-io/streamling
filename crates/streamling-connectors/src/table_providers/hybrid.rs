@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -831,6 +832,29 @@ impl HybridTableProvider {
             }
         }
         drop(state);
+        // Deliberately NOT persisted here. The rows the finished phase emitted
+        // are not durable until a sink-acknowledged checkpoint covers them;
+        // persisting `completed_phases` now would make a restart skip them if
+        // the sink fails first (observed: sink unavailable at first start).
+        // `persist_phase_state` runs from the execute loop on the first
+        // Finalizer whose Marker was created after this transition.
+        Ok(())
+    }
+
+    /// Durably record the current phase state plus the Kafka seed offsets
+    /// handed over at the last transition. Only call once a checkpoint that
+    /// covers everything emitted before the transition has finalized.
+    pub async fn persist_phase_state(&self) -> DataFusionResult<()> {
+        if let Some(wrapping_provider) = self
+            .config
+            .unbounded_source
+            .downcast_ref::<WrappingSourceTableProvider>()
+            && let Some(kafka_provider) = wrapping_provider
+                .get_inner()
+                .downcast_ref::<KafkaSourceTableProvider>()
+        {
+            kafka_provider.persist_seeded_offsets().await?;
+        }
         self.save_state().await
     }
 
@@ -1024,6 +1048,18 @@ impl ExecutionPlan for HybridSourceExec {
         // to stay responsive to shutdown (same pattern as
         // `ClickHouseSourceExec::execute`'s `checkpointing_task`).
         let pending_for_drain = pending_markers.clone();
+
+        // Deferred phase-state persistence (see `advance_to_next_phase`): the
+        // main loop stamps `transition_at_ms` after a phase advance; the
+        // forwarder then waits for a Marker created after that instant and
+        // persists on that epoch's Finalizer. A Marker created after the last
+        // bounded batch was sent travels behind it, so its Finalizer proves
+        // every sink durably wrote the finished phase.
+        let transition_at_ms = Arc::new(AtomicU64::new(0));
+        let min_eligible_epoch = Arc::new(AtomicU64::new(u64::MAX));
+        let transition_for_drain = transition_at_ms.clone();
+        let eligible_for_drain = min_eligible_epoch.clone();
+        let provider_for_drain = provider.clone();
         let forwarder_handle = tokio::spawn(async move {
             loop {
                 let rx = hybrid_marker_rx.clone();
@@ -1035,6 +1071,36 @@ impl ExecutionPlan for HybridSourceExec {
                     _ = forwarder_shutdown_rx.changed() => break,
                     res = recv => match res {
                         Ok(Ok(msg)) => {
+                            match &msg {
+                                CheckpointMessage::Marker { epoch, created_at_ms } => {
+                                    let t = transition_for_drain.load(Ordering::SeqCst);
+                                    if t != 0 && *created_at_ms > t {
+                                        eligible_for_drain.fetch_min(epoch.0, Ordering::SeqCst);
+                                    }
+                                }
+                                CheckpointMessage::Finalizer(epoch) => {
+                                    if transition_for_drain.load(Ordering::SeqCst) != 0
+                                        && epoch.0 >= eligible_for_drain.load(Ordering::SeqCst)
+                                    {
+                                        match provider_for_drain.persist_phase_state().await {
+                                            Ok(()) => {
+                                                info!(
+                                                    "Hybrid source '{}': phase state persisted after epoch {} finalized",
+                                                    provider_for_drain.reference_name, epoch.0
+                                                );
+                                                transition_for_drain.store(0, Ordering::SeqCst);
+                                                eligible_for_drain.store(u64::MAX, Ordering::SeqCst);
+                                            }
+                                            Err(e) => warn!(
+                                                "Hybrid source '{}': deferred phase-state persist failed; \
+                                                 will retry on the next Finalizer: {:?}",
+                                                provider_for_drain.reference_name, e
+                                            ),
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                             if matches!(
                                 msg,
                                 CheckpointMessage::Marker { .. }
@@ -1297,6 +1363,10 @@ impl ExecutionPlan for HybridSourceExec {
 
                 match provider.advance_to_next_phase().await {
                     Ok(()) => {
+                        // Arm the deferred persist: only a Marker created from
+                        // now on proves the finished phase is durable.
+                        min_eligible_epoch.store(u64::MAX, Ordering::SeqCst);
+                        transition_at_ms.store(now_ms(), Ordering::SeqCst);
                         let state = provider.state.read().await;
                         let now_unbounded =
                             state.current_phase >= provider.config.bounded_sources.len();
@@ -2881,7 +2951,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = hybrid_provider.advance_to_next_phase().await;
+        hybrid_provider.advance_to_next_phase().await.unwrap();
+        let result = hybrid_provider.persist_phase_state().await;
         assert!(
             result.is_err(),
             "save_state should fail due to injected fault"
@@ -2931,6 +3002,62 @@ mod tests {
     }
 
     // ========================================================================
+    // Phase advance is not durable until persist_phase_state (first
+    // finalized checkpoint after the transition)
+    // ========================================================================
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_advance_to_next_phase_defers_persistence() {
+        let state_backend = create_state_backend("deferred_persist_test").await;
+        let config = HybridSourceConfig {
+            bounded_sources: vec![
+                Arc::new(MockTableProvider::new("bounded1".to_string())) as Arc<dyn TableProvider>
+            ],
+            unbounded_source: Arc::new(MockTableProvider::new("unbounded".to_string()))
+                as Arc<dyn TableProvider>,
+            offset_provider: Some(Arc::new(MockOffsetProvider::new(HashMap::from([(
+                0, 1000,
+            )])))),
+            job_mode: false,
+        };
+        let hybrid_provider = HybridTableProvider::new(
+            "test_hybrid".to_string(),
+            config,
+            create_test_schema(),
+            state_backend.clone(),
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        hybrid_provider.advance_to_next_phase().await.unwrap();
+        assert_eq!(hybrid_provider.state.read().await.current_phase, 1);
+
+        // A sink failure between here and the first finalized checkpoint must
+        // leave a restart on phase 0, so the bounded rows are re-emitted.
+        let persisted = state_backend
+            .get(StateKey("hybrid_source_test_hybrid_v1".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            persisted.is_none(),
+            "phase advance must not be durable before a finalized checkpoint"
+        );
+
+        hybrid_provider.persist_phase_state().await.unwrap();
+        let persisted = state_backend
+            .get(StateKey("hybrid_source_test_hybrid_v1".to_string()))
+            .await
+            .unwrap()
+            .expect("state persisted by persist_phase_state");
+        assert_eq!(persisted.current_phase, 1);
+        assert!(persisted.completed_phases[0]);
+        assert_eq!(
+            persisted.unbounded_offsets.as_ref().unwrap().get(&0),
+            Some(&1000)
+        );
+    }
+
+    // ========================================================================
     // FM1: hybrid state cleared, source silently regresses to phase 0
     // ========================================================================
 
@@ -2957,8 +3084,10 @@ mod tests {
         )
         .unwrap();
 
-        // Advance through bounded to unbounded
+        // Advance through bounded to unbounded, then persist (as the execute
+        // loop does once the covering checkpoint finalizes)
         hybrid_provider.advance_to_next_phase().await.unwrap();
+        hybrid_provider.persist_phase_state().await.unwrap();
         let state = hybrid_provider.state.read().await;
         assert_eq!(state.current_phase, 1, "should be in unbounded phase");
         drop(state);
@@ -3051,8 +3180,9 @@ mod tests {
         )
         .unwrap();
 
-        // advance_to_next_phase should succeed because retry recovers
-        let result = hybrid_provider.advance_to_next_phase().await;
+        hybrid_provider.advance_to_next_phase().await.unwrap();
+        // persist_phase_state should succeed because retry recovers
+        let result = hybrid_provider.persist_phase_state().await;
         assert!(
             result.is_ok(),
             "should succeed after retry: {:?}",
@@ -3107,7 +3237,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = hybrid_provider.advance_to_next_phase().await;
+        hybrid_provider.advance_to_next_phase().await.unwrap();
+        let result = hybrid_provider.persist_phase_state().await;
         assert!(
             result.is_err(),
             "should fail after all retry attempts exhausted"

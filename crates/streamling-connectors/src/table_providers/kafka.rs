@@ -607,6 +607,10 @@ struct KafkaSourceExec {
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     shutdown_rx: watch::Receiver<bool>,
     num_records_before_stop: Option<u64>,
+    /// In-memory start offsets handed over by the hybrid source (ClickHouse
+    /// max offsets). Used only for partitions with no committed offset in the
+    /// state backend; never persisted from here.
+    seeded_offsets: Arc<std::sync::Mutex<HashMap<i32, u32>>>,
     /// Number of concurrent consumer instances; one `execute` call per instance.
     parallelism: usize,
     /// Resolved once at construction so every instance joins the *same* consumer
@@ -666,6 +670,7 @@ impl KafkaSourceExec {
         num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
         parallelism: usize,
+        seeded_offsets: Arc<std::sync::Mutex<HashMap<i32, u32>>>,
     ) -> Self {
         let full_schema_projected = project_schema(&full_schema, projections).unwrap();
         let cached_properties =
@@ -702,6 +707,7 @@ impl KafkaSourceExec {
             state_backend,
             shutdown_rx,
             num_records_before_stop,
+            seeded_offsets,
             parallelism,
             group_id,
             lag_group_id,
@@ -1300,6 +1306,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 .field_with_name(COLUMN_NAME_OP)
                 .is_ok();
         let start_at = self.start_at.clone();
+        let seeded_offsets = self.seeded_offsets.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let num_records_before_stop = self.num_records_before_stop;
         let metric_metadata_id = self.metric_metadata_id.clone();
@@ -1349,11 +1356,46 @@ impl ExecutionPlan for KafkaSourceExec {
                     shutdown_rx.clone(),
                 ));
             }
-            let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
+            let mut kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
-                kafka_topic_partition_list,
+                kafka_topic_partition_list.clone(),
             ).await;
+
+            // Partitions with no committed offset fall back to the in-memory
+            // seed from the hybrid handover. Seeds are deliberately NOT written
+            // to the state backend here: only a finalized checkpoint (below, or
+            // the hybrid source's deferred persist) may durably advance a
+            // source position.
+            let seeds = seeded_offsets.lock().unwrap().clone();
+            if !seeds.is_empty() {
+                let already_seeking: std::collections::HashSet<i32> = kafka_topic_partition_list_to_seek
+                    .elements()
+                    .iter()
+                    .map(|tp| tp.partition())
+                    .collect();
+                let mut seeded_count = 0usize;
+                for tp in TopicPartitionList::from(kafka_topic_partition_list).topic_partitions {
+                    if already_seeking.contains(&tp.partition) {
+                        continue;
+                    }
+                    if let Some(offset) = seeds.get(&tp.partition) {
+                        kafka_topic_partition_list_to_seek
+                            .add_partition_offset(&tp.topic, tp.partition, Offset::Offset(*offset as i64))
+                            .streamling_with_context(|| format!(
+                                "seeding partition {} from hybrid handover (topic: {})",
+                                tp.partition, tp.topic
+                            ))?;
+                        seeded_count += 1;
+                    }
+                }
+                if seeded_count > 0 {
+                    info!(
+                        "Seeking {} partition(s) of topic '{}' from in-memory hybrid seed offsets",
+                        seeded_count, topic
+                    );
+                }
+            }
 
             if kafka_topic_partition_list_to_seek.count() > 0 {
                 // One info! summary so the multi-partition case doesn't dump
@@ -1833,6 +1875,10 @@ pub struct KafkaSourceTableProvider {
     num_records_before_stop: Option<u64>,
     extracted_primary_key: Option<String>,
     parallelism: usize,
+    /// Start offsets handed over by the hybrid source at the bounded→unbounded
+    /// transition. Held in memory; persisted only by `persist_seeded_offsets`
+    /// once a checkpoint covering the bounded phase has finalized.
+    seeded_offsets: Arc<std::sync::Mutex<HashMap<i32, u32>>>,
 }
 
 impl Debug for KafkaSourceTableProvider {
@@ -2004,6 +2050,7 @@ impl KafkaSourceTableProvider {
             shutdown_rx,
             num_records_before_stop,
             extracted_primary_key,
+            seeded_offsets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             parallelism: Self::effective_parallelism(
                 &config_for_metadata,
                 &topic_for_metadata,
@@ -2074,43 +2121,76 @@ impl KafkaSourceTableProvider {
         let _ = self.shutdown_tx.send(true);
     }
 
-    /// Seed the Kafka state backend with offsets from an external source (e.g., ClickHouse).
-    /// This is used during hybrid source handoff to ensure the Kafka consumer starts
-    /// from the correct position after the bounded source completes.
+    /// Hand over start offsets from an external source (e.g. ClickHouse max
+    /// offsets at the hybrid bounded→unbounded transition). Held in memory
+    /// only: the consumer seeks to them for partitions without a committed
+    /// offset. Nothing is written to the state backend here — a position may
+    /// only become durable once a checkpoint covering everything emitted
+    /// before it has finalized (see `persist_seeded_offsets`).
     pub async fn seed_offsets(&self, offsets: &HashMap<i32, u32>) -> Result<()> {
+        *self.seeded_offsets.lock().unwrap() = offsets.clone();
+        debug!(
+            "Seeded {} in-memory Kafka partition offset(s) for topic '{}'",
+            offsets.len(),
+            self.topic
+        );
+        Ok(())
+    }
+
+    /// Persist the seeded offsets for every partition that does not already
+    /// have a committed offset in the state backend. Called by the hybrid
+    /// source once the first checkpoint after the transition has finalized;
+    /// partitions the consumer has since committed keep their (newer) offset.
+    pub async fn persist_seeded_offsets(&self) -> Result<()> {
+        let seeds = self.seeded_offsets.lock().unwrap().clone();
+        if seeds.is_empty() {
+            return Ok(());
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        for (partition, offset) in offsets {
+        let mut written = 0usize;
+        for (partition, offset) in &seeds {
             let state_key = StateKey::from(format!(
                 "{}:{}:{}",
                 self.reference_name, self.topic, partition
             ));
-            let offset_state = TopicPartitionOffset {
-                offset: *offset as i64,
-                updated_at: now,
-            };
-            self.state_backend
-                .put(state_key, offset_state)
+            let existing = self
+                .state_backend
+                .get(state_key.clone())
                 .await
                 .map_err(|e| {
-                    streamling_err!("seeding offset for partition {}: {:?}", partition, e)
+                    streamling_err!("reading offset for partition {}: {:?}", partition, e)
                 })?;
-            // Per-partition seed line, kept at debug! since this fires once
-            // per hybrid bounded→unbounded transition (not per checkpoint).
-            debug!(
-                "Seeded Kafka offset for topic {} partition {} to offset {}",
-                self.topic, partition, offset
-            );
+            if existing.is_some() {
+                continue;
+            }
+            self.state_backend
+                .put(
+                    state_key,
+                    TopicPartitionOffset {
+                        offset: *offset as i64,
+                        updated_at: now,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    streamling_err!(
+                        "persisting seeded offset for partition {}: {:?}",
+                        partition,
+                        e
+                    )
+                })?;
+            written += 1;
         }
         debug!(
-            "Seeded {} Kafka partition offset(s) for topic '{}'",
-            offsets.len(),
+            "Persisted {} of {} seeded Kafka partition offset(s) for topic '{}' (rest already committed)",
+            written,
+            seeds.len(),
             self.topic
         );
-
         Ok(())
     }
 
@@ -2181,6 +2261,7 @@ impl KafkaSourceTableProvider {
             self.num_records_before_stop,
             self.metric_metadata_id.clone(),
             self.parallelism,
+            self.seeded_offsets.clone(),
         ));
 
         if let Some(filter_expr) = &filter {
