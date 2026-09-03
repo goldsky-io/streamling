@@ -310,18 +310,45 @@ fn create_channels_with_caps(input: usize, output: usize, metrics: usize) -> Plu
     }
 }
 
+/// Default capacity for the plugin→host metrics channel.
+/// Distinct from `plugin.channel_capacity` (data-plane backpressure, default 50).
+/// Plugins emit with non-blocking `try_send`; a full channel drops the sample
+/// (`Encountered error dispatching metrics`) rather than applying backpressure.
+/// A `0` metrics cap used to fall back to that 50 and dropped samples on
+/// high-rate plugins; this default is the metrics fallback instead.
+pub const DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY: usize = 4096;
+
+/// Resolve per-plugin channel sizes. A `0` cap means "use the default":
+/// input/output fall back to the data-plane default, metrics fall back to
+/// the metrics default so a tight output buffer (e.g. Solana's 1) does not
+/// also shrink the metrics channel.
+fn resolve_channel_caps(
+    data_default: usize,
+    metrics_default: usize,
+    caps: Option<PluginChannelCaps>,
+) -> (usize, usize, usize) {
+    let Some(caps) = caps else {
+        return (data_default, data_default, metrics_default);
+    };
+    let to_sz = |v: u32, fallback: usize| {
+        if v == 0 { fallback } else { v as usize }
+    };
+    (
+        to_sz(caps.input, data_default),
+        to_sz(caps.output, data_default),
+        to_sz(caps.metrics, metrics_default),
+    )
+}
+
 fn create_channels_for_plugin(app_config: &AppConfig, plugin_type: &PluginId) -> PluginChannels {
     let default = app_config.plugin.channel_capacity as usize;
     let caps_registry = PLUGIN_DEFAULT_CAPS.read().unwrap();
-    if let Some(caps) = caps_registry.get(plugin_type) {
-        let to_sz = |v: u32| if v == 0 { default } else { v as usize };
-        return create_channels_with_caps(
-            to_sz(caps.input),
-            to_sz(caps.output),
-            to_sz(caps.metrics),
-        );
-    }
-    create_channels_with_caps(default, default, default)
+    let (input, output, metrics) = resolve_channel_caps(
+        default,
+        DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY,
+        caps_registry.get(plugin_type).copied(),
+    );
+    create_channels_with_caps(input, output, metrics)
 }
 
 fn create_logging(app_config: &AppConfig) -> PluginLogging {
@@ -687,5 +714,42 @@ mod tests {
             Ok(_) => panic!("expected Err for unknown plugin"),
             Err(err) => assert_unknown_plugin_user_error(err),
         }
+    }
+
+    /// Regression: a `0` metrics cap (every plugin today) used the data-plane
+    /// default of 50, so high-rate plugins overflowed the metrics channel.
+    #[test]
+    fn resolve_channel_caps_uses_metrics_default_when_unset() {
+        assert_eq!(
+            resolve_channel_caps(50, 4096, None),
+            (50, 50, 4096),
+            "no plugin caps: data channels stay at 50, metrics use 4096"
+        );
+        assert_eq!(
+            resolve_channel_caps(
+                50,
+                4096,
+                Some(PluginChannelCaps {
+                    input: 0,
+                    output: 1,
+                    metrics: 0,
+                }),
+            ),
+            (50, 1, 4096),
+            "Solana-style output=1 must not shrink the metrics channel to 50"
+        );
+        assert_eq!(
+            resolve_channel_caps(
+                50,
+                4096,
+                Some(PluginChannelCaps {
+                    input: 8,
+                    output: 8,
+                    metrics: 16,
+                }),
+            ),
+            (8, 8, 16),
+            "an explicit metrics cap must win"
+        );
     }
 }
