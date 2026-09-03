@@ -11,15 +11,18 @@ on:
       - ".github/workflows/streamling.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
       core: ${{ steps.filter.outputs.core == 'true' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         with:
           token: ${{ github.token }}
           filters: |
@@ -46,13 +49,14 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "10G"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
         with:
+          toolchain: 1.90.0
           components: clippy, rustfmt
       - name: Install sccache
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: sccache
       - name: Set SCCACHE_DIR env
@@ -60,14 +64,14 @@ jobs:
       - name: Prepare sccache dir
         run: mkdir -p "$SCCACHE_DIR"
       - name: Cache sccache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-streamling-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             sccache-streamling-${{ runner.os }}-1.90.0-
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "streamling"
           cache-targets: true
@@ -76,7 +80,7 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets --all-features -- -D warnings --A clippy::result_large_err
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: nextest
       - name: Run unit tests
@@ -108,13 +112,13 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Try to restore a previously-built binary.
       # Key covers all source inputs that affect the build output.
       - name: Cache main binary
         id: main-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release/streamling
           key: main-bin-v2-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
@@ -122,10 +126,12 @@ jobs:
       # Everything below only runs on cache miss
       - name: Configure Rust toolchain
         if: steps.main-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Install sccache
         if: steps.main-cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: sccache
       - name: Set SCCACHE_DIR env
@@ -136,7 +142,7 @@ jobs:
         run: mkdir -p "$SCCACHE_DIR"
       - name: Cache sccache
         if: steps.main-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-main-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-${{ hashFiles('Cargo.lock') }}
@@ -144,7 +150,7 @@ jobs:
             sccache-main-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-
       - name: Setup rust cache
         if: steps.main-cache.outputs.cache-hit != 'true'
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "v0-release-main-${{ matrix.os }}-${{ matrix.arch }}"
           cache-targets: true
@@ -163,7 +169,7 @@ jobs:
         run: sccache --show-stats || true
 
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release/streamling
@@ -177,12 +183,14 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Rust toolchain + caching (needed to compile the e2e test crate)
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "v0-streamling-e2e"
           cache-targets: true
@@ -190,7 +198,7 @@ jobs:
 
       # Reuse the release binary from build-release-main instead of rebuilding.
       - name: Download release binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-binary-linux-x86_64
           path: release-artifacts/
@@ -202,9 +210,9 @@ jobs:
 
       # Infrastructure setup
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Set up Docker Builder
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682 # v1
       - name: Pre-pull e2e images
         run: |
           set -euo pipefail
@@ -233,7 +241,7 @@ jobs:
         timeout-minutes: 5
 
       # Build and run e2e tests
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: nextest
       - name: Build e2e tests
@@ -296,14 +304,14 @@ jobs:
             os: linux
             arch: aarch64
             image_arch: arm64
-    steps: &image_push_steps
+    steps:
       - name: Mask AWS account ID
         env:
           AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
         run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download release binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: release-artifacts/
@@ -313,17 +321,17 @@ jobs:
           cp release-artifacts/streamling target/release/
           chmod +x target/release/streamling
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Set up Docker Builder
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682 # v1
       - name: Generate tags
         id: generate_tags
         env:
@@ -339,34 +347,13 @@ jobs:
           echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
           echo "tag_latest=$TAG_LATEST" >> "$GITHUB_OUTPUT"
       - name: Build and push Docker image (prebuilt artifacts)
-        uses: useblacksmith/build-push-action@v2
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2
         with:
           context: .
           file: Dockerfile
           push: true
           tags: ${{ steps.generate_tags.outputs.tags }}
           provenance: false
-
-  build-and-push-image-branch:
-    needs: [validate-and-test, build-release-main]
-    if: ${{ always() && github.ref_name != 'main' && needs.validate-and-test.result != 'failure' && needs.build-release-main.result == 'success' }}
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      id-token: write
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: blacksmith-8vcpu-ubuntu-2204
-            os: linux
-            arch: x86_64
-            image_arch: amd64
-          - runner: blacksmith-8vcpu-ubuntu-2204-arm
-            os: linux
-            arch: aarch64
-            image_arch: arm64
-    steps: *image_push_steps
 
   create-manifest-main:
     needs: [build-and-push-image-main]
@@ -381,57 +368,13 @@ jobs:
           AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
         run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Create and push multi-arch manifest
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: streamling
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
-          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG
-          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest
-
-          docker manifest create $TAG_SHA \
-            $TAG_SHA-amd64 \
-            $TAG_SHA-arm64
-          docker manifest push $TAG_SHA
-
-          docker manifest create $TAG_LATEST \
-            $TAG_LATEST-amd64 \
-            $TAG_LATEST-arm64
-          docker manifest push $TAG_LATEST
-
-          echo "Created multi-arch manifests:"
-          echo "  - $TAG_SHA"
-          echo "  - $TAG_LATEST"
-
-  create-manifest-branch:
-    needs: [build-and-push-image-branch]
-    if: ${{ always() && github.ref_name != 'main' && needs.build-and-push-image-branch.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Mask AWS account ID
-        env:
-          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
-        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
       - name: Create and push multi-arch manifest
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -468,7 +411,7 @@ jobs:
       contents: write
     steps:
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-binary-*-*
           path: release-artifacts/
