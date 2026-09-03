@@ -3211,6 +3211,85 @@ impl TableProvider for KafkaSinkTableProvider {
 mod tests {
     use super::*;
 
+    /// Hybrid handover seeds must not become durable on their own: only a
+    /// finalized checkpoint may persist a position. `persist_seeded_offsets`
+    /// then writes only partitions the commit path has not already covered.
+    #[tokio::test]
+    async fn seed_offsets_stay_in_memory_until_persist_seeded_offsets() {
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+
+        let session_manager =
+            SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
+        let state_backend = InMemoryStateOperatorBackendFactory::new()
+            .unwrap()
+            .create::<TopicPartitionOffset>("test-kafka-seeds");
+
+        let mut json_schema = BTreeMap::new();
+        json_schema.insert("a".to_string(), "string".to_string());
+
+        let provider = KafkaSourceTableProvider::new(
+            "src".to_string(),
+            "src-metrics".to_string(),
+            test_kafka_config(),
+            "test-topic".to_string(),
+            None,
+            None,
+            1000,
+            10,
+            10,
+            false,
+            state_backend.clone(),
+            session_manager,
+            None,
+            false,
+            vec![],
+            true,
+            vec![],
+            KafkaFormat::Json,
+            Some(json_schema),
+            1,
+        )
+        .unwrap();
+
+        let key = |p: i32| StateKey::from(format!("src:test-topic:{p}"));
+
+        provider
+            .seed_offsets(&HashMap::from([(0, 100), (1, 200)]))
+            .await
+            .unwrap();
+        assert!(
+            state_backend.get(key(0)).await.unwrap().is_none()
+                && state_backend.get(key(1)).await.unwrap().is_none(),
+            "seeding must not write the state backend"
+        );
+
+        // Partition 1 was committed by the Finalizer path in the meantime.
+        state_backend
+            .put(
+                key(1),
+                TopicPartitionOffset {
+                    offset: 999,
+                    updated_at: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        provider.persist_seeded_offsets().await.unwrap();
+        assert_eq!(
+            state_backend.get(key(0)).await.unwrap().unwrap().offset,
+            100,
+            "uncommitted partition gets its seed"
+        );
+        assert_eq!(
+            state_backend.get(key(1)).await.unwrap().unwrap().offset,
+            999,
+            "committed partition keeps the newer offset"
+        );
+    }
+
     /// A topology-level source `filter:` is defined against the source's full
     /// payload schema. When the engine pushes a scan projection that prunes a
     /// column the filter references, the filter must still plan against the

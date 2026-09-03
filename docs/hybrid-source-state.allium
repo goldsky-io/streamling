@@ -242,12 +242,20 @@ rule AdvanceFromBoundedPhase {
 -- proves the finished phase is durable everywhere. Until then a restart
 -- lands on the phase the persisted state names (phase 0 on a first run),
 -- re-emitting the finished phase's rows -- at-least-once, never loss.
+--
+-- A finalized terminal checkpoint (job completion or shutdown) also
+-- covers: its Marker is emitted inline after every row of the source.
+-- If the persist fails, the transition stays armed and the next covering
+-- Finalizer retries. A disarm compares against the arm it observed, so
+-- a persist that completes after a newer transition re-armed the source
+-- (multiple bounded phases) cannot clear the newer arm.
 rule PersistPhaseStateOnFirstCoveringFinalizer {
-    when: FinalizerObserved(hybrid, epoch)
+    when: FinalizerObserved(hybrid, epoch) or TerminalCheckpointFinalized(hybrid)
     requires: hybrid.transition_at != null
-    requires: exists marker: MarkerObserved(hybrid, marker)
-        and marker.epoch <= epoch
-        and marker.created_at > hybrid.transition_at
+    requires: TerminalCheckpointFinalized(hybrid)
+        or exists marker: MarkerObserved(hybrid, marker)
+            and marker.epoch <= epoch
+            and marker.created_at > hybrid.transition_at
     ensures: HybridPhaseStatePersisted(hybrid)
     ensures:
         for offset in hybrid.seeded_offsets
@@ -307,7 +315,10 @@ rule JobModeTerminatesAfterFinalBounded {
     requires: hybrid.current_phase + 1 = hybrid.bounded_phases.count
     requires: hybrid.job_mode
     ensures: hybrid.current_phase = hybrid.bounded_phases.count + 1   -- finished
-    ensures: HybridPhaseStatePersisted(hybrid)
+    -- Persisted iff the terminal checkpoint finalized: its Marker is
+    -- emitted inline after every row, so a finalized terminal epoch
+    -- covers the last phase (PersistPhaseStateOnFirstCoveringFinalizer).
+    ensures: TerminalCheckpointFinalized(hybrid) implies HybridPhaseStatePersisted(hybrid)
     ensures: HybridSourceShutdown(hybrid)
 }
 
