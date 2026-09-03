@@ -1504,4 +1504,61 @@ mod tests {
             "equivalence properties are propagated, not rebuilt"
         );
     }
+
+    /// End-to-end busy triad: for `WrappingExec -> CheckpointableExec ->
+    /// <compute-bound plan>`, `busy = elapsed_compute - starved` must reflect the
+    /// transform's compute instead of collapsing to the per-batch seed. The
+    /// `WrappingExec`'s `data.next().await` conflates the spawned compute task
+    /// with upstream wait (inflating `starved`), so the compute must be recovered
+    /// through `elapsed_compute` — which requires `CheckpointableExec::metrics`
+    /// to surface the deep-operator compute.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn busy_triad_reflects_compute_for_sql_transform() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_busy_transform";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let per_batch = Duration::from_millis(12);
+
+        // Deep compute under a zero-compute root, wrapped by CheckpointableExec
+        // (spawns the compute into its own task) and then WrappingExec (the
+        // instrumented topology boundary).
+        let deep_compute = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            per_batch,
+        ));
+        let root: Arc<dyn ExecutionPlan> = Arc::new(ComputeExec::new(deep_compute, Duration::ZERO));
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(root, 1, node_id.to_string()));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        // Fast consumer: no downstream sleep, so wait is upstream/compute, not
+        // blocked. `data.next().await` still absorbs the spawned compute task.
+        drain(&wrapping).await;
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        let busy = elapsed_compute.saturating_sub(starved);
+
+        // Pre-fix, the deep compute never reached `elapsed_compute`, so
+        // `elapsed_compute` was just the starved-fold plus per-batch seed and
+        // `busy` sat at ~NUM_BATCHES (the 1ms seed). With the fix it reflects the
+        // transform's real compute.
+        assert!(
+            busy >= 24,
+            "busy (elapsed_compute {elapsed_compute}ms - starved {starved}ms = {busy}ms) must \
+             reflect the compute-bound transform, not collapse to the per-batch seed"
+        );
+    }
 }
