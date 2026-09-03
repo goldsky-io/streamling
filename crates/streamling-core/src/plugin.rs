@@ -33,6 +33,7 @@ use std::time::Duration;
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
 };
+pub(crate) use streamling_plugin::ffi::IDLE_POLL_INTERVAL;
 use streamling_plugin::ffi::PluginMetricsChannel;
 pub use streamling_plugin::{
     PluginChannel, PluginChannelCaps, PluginChannels, PluginLabel, PluginLogging, PluginModuleRef,

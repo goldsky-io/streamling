@@ -423,7 +423,7 @@ impl ExecutionPlan for PluginExec {
                                     checkpoint_buffer.push(CheckpointMessage::Finalizer(CheckpointEpoch(epoch.0)));
                                 }
                                 Err(TryRecvError::Empty) => {
-                                    tokio::task::yield_now().await;
+                                    tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
                                 }
                                 Err(TryRecvError::Disconnected) => {
                                     break 'outer;

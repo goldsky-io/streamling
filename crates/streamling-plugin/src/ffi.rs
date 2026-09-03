@@ -350,6 +350,17 @@ impl PluginMetricsRecorder {
     }
 }
 
+/// How long a loop draining a [`PluginChannel`] parks when the channel is
+/// empty, on either side of the FFI boundary.
+///
+/// Deliberately not `yield_now()`: an empty channel is the steady state for a
+/// live pipeline, and an immediate reschedule spins every runtime worker
+/// instead of letting them park. 1 ms is what the metrics loop
+/// (`streamling-core/src/plugin/telemetry.rs`) and the checkpoint-ack forwarder
+/// (`table_provider.rs`) have always used: small enough to be invisible next to
+/// a checkpoint interval, large enough that the poll costs nothing.
+pub const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 #[repr(C)]
 #[derive(StableAbi, Clone, Debug)]
 pub struct PluginChannel {

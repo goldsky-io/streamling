@@ -1,0 +1,11 @@
+{
+  "$schema": "https://maestro.goldsky.com/maestrorc/schema",
+  "sandbox": {
+    "clone_strategy": "blobless",
+    "baton": {
+      "enabled": true,
+      "workspace_repo": "goldsky-io/streamling-workspace",
+      "workspace_ref": "main"
+    }
+  }
+}

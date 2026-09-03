@@ -292,7 +292,7 @@ impl ExecutionPlan for PluginSourceExec {
                             break;
                         }
                     } else {
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
                     }
                 }
 
