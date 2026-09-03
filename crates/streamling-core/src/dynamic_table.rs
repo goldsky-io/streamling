@@ -1,4 +1,5 @@
 mod in_memory;
+mod key_set;
 mod postgres;
 
 use arrow_schema::DataType;
@@ -11,7 +12,6 @@ use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{ColumnarValue, Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
-use enum_display::EnumDisplay;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
@@ -27,12 +27,23 @@ use crate::topology::{DynamicTableTransform, PipelineTopology, Transform};
 pub use in_memory::InMemoryDynamicTableBackend;
 pub use postgres::PostgresDynamicTableBackend;
 
-#[derive(Debug, PartialEq, Eq, EnumDisplay)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DynamicTableBackendError {
     Initialization(String),
     Connection(String),
     Query(String),
     StringArrayExpected,
+}
+
+impl std::fmt::Display for DynamicTableBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initialization(detail) => write!(f, "Initialization: {detail}"),
+            Self::Connection(detail) => write!(f, "Connection: {detail}"),
+            Self::Query(detail) => write!(f, "Query: {detail}"),
+            Self::StringArrayExpected => write!(f, "StringArrayExpected"),
+        }
+    }
 }
 
 impl std::error::Error for DynamicTableBackendError {}
@@ -50,6 +61,27 @@ pub trait DynamicTableBackend: Debug + Sync + Send {
     async fn contains(&self, values: ArrayRef) -> Result<ArrayRef, DynamicTableBackendError>;
 }
 
+/// Resolves the cache freshness-check debounce window for a dynamic table.
+///
+/// Precedence: the topology (per-table) value wins when present; otherwise the
+/// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms`; when
+/// neither is set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` applies. An explicit 0
+/// either way disables the window. The bool reports whether the default was
+/// applied (drives debug-vs-warn logging in `create`).
+fn resolve_cache_refresh_debounce_ms(
+    override_ms: Option<u64>,
+    global_ms: Option<u64>,
+) -> (u64, bool) {
+    match (override_ms, global_ms) {
+        (Some(v), _) => (v, false),
+        (None, Some(v)) => (v, false),
+        (None, None) => (
+            streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS,
+            true,
+        ),
+    }
+}
+
 pub struct DynamicTableBackendFactory {
     config: DynamicTableBackendConfig,
 }
@@ -61,6 +93,17 @@ impl DynamicTableBackendFactory {
 }
 
 impl DynamicTableBackendFactory {
+    /// Creates a backend instance for a single dynamic table.
+    ///
+    /// Parameter precedence: `cache_refresh_debounce_ms_override` wins when
+    /// `Some`; `None` falls back to the global
+    /// `dynamic_table_backend.postgres.cache_refresh_debounce_ms`; when neither
+    /// is set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (1000ms) applies. An explicit
+    /// 0 either way disables the window (re-check freshness on every batch).
+    /// Likewise `cache_enabled_override` wins when `Some`; `None` falls back to
+    /// the global `cache_enabled`. Note that caching additionally requires a
+    /// `time_column`; without one the cache is disabled regardless of either
+    /// setting.
     pub async fn create(
         &self,
         backend_type: DynamicTableBackendType,
@@ -68,6 +111,8 @@ impl DynamicTableBackendFactory {
         schema: Option<String>,
         column: Option<String>,
         time_column: Option<String>,
+        cache_refresh_debounce_ms_override: Option<u64>,
+        cache_enabled_override: Option<bool>,
     ) -> Result<Arc<dyn DynamicTableBackend>, DynamicTableBackendError> {
         let max_batch_size = self.config.max_batch_size.unwrap_or(1000);
         match backend_type {
@@ -77,6 +122,7 @@ impl DynamicTableBackendFactory {
                 column,
                 time_column,
                 max_batch_size,
+                // InMemory has no freshness-check cache; the debounce window does not apply.
             ))),
             DynamicTableBackendType::Postgres => {
                 let postgres_config = self.config.postgres.clone().ok_or_else(|| {
@@ -84,6 +130,28 @@ impl DynamicTableBackendFactory {
                         "Postgres backend config is required".to_string(),
                     )
                 })?;
+
+                let (cache_refresh_debounce_ms, debounce_is_default) =
+                    resolve_cache_refresh_debounce_ms(
+                        cache_refresh_debounce_ms_override,
+                        postgres_config.cache_refresh_debounce_ms,
+                    );
+                // The default window is a sane background choice, not an
+                // operator decision, so it logs at debug; an explicitly chosen
+                // non-zero window is an operator decision and stays a warn.
+                if debounce_is_default {
+                    tracing::debug!(
+                        table = %backend_entity_name,
+                        cache_refresh_debounce_ms,
+                        "Using default dynamic table cache freshness-check debounce: rows written by OTHER writers may be missed for up to this long; this pipeline's own writes stay visible"
+                    );
+                } else if cache_refresh_debounce_ms > 0 {
+                    tracing::warn!(
+                        table = %backend_entity_name,
+                        cache_refresh_debounce_ms,
+                        "Cache freshness-check debounce is active: rows written by OTHER writers may be missed for up to this long; this pipeline's own writes stay visible"
+                    );
+                }
 
                 // TODO: store the factory somewhere to avoid recreating it each time
                 // Note: new() doesn't connect - connection happens lazily on first use
@@ -96,6 +164,8 @@ impl DynamicTableBackendFactory {
                         column,
                         time_column,
                         max_batch_size,
+                        cache_refresh_debounce_ms,
+                        cache_enabled_override,
                     )
                     .await?;
                 Ok(Arc::new(backend))
@@ -495,6 +565,35 @@ pub fn extract_string_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debounce_resolution_prefers_topology_then_global_then_default_1000() {
+        use streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS;
+
+        // Topology value wins over the global default.
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(Some(7), Some(9999)),
+            (7, false)
+        );
+
+        // No topology value: falls back to the global default.
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(None, Some(9999)),
+            (9999, false)
+        );
+
+        // Neither set: DEFAULT_CACHE_REFRESH_DEBOUNCE_MS (1000ms) applies.
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(None, None),
+            (DEFAULT_CACHE_REFRESH_DEBOUNCE_MS, true)
+        );
+
+        // Explicit zero still wins: 0 disables the debounce window entirely.
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(Some(0), Some(9999)),
+            (0, false)
+        );
+    }
     use crate::side_output::SourceSideOutput;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -544,6 +643,8 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
         );
@@ -557,6 +658,8 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
         );
@@ -570,6 +673,8 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             }),
         );

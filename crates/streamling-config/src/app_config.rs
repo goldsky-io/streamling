@@ -152,6 +152,13 @@ impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
 }
 
 // TODO: perhaps this can be merged with PostgresStateBackendConfig
+
+/// Freshness-check debounce window (ms) for the postgres dynamic table cache,
+/// applied when neither the topology's `cache_refresh_debounce_ms` nor the
+/// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms` is set.
+/// An explicit 0 (topology or global) still disables the window.
+pub const DEFAULT_CACHE_REFRESH_DEBOUNCE_MS: u64 = 1000;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PostgresDynamicTableBackendConfig {
     pub host: String,
@@ -163,9 +170,23 @@ pub struct PostgresDynamicTableBackendConfig {
     pub sslmode: String,
     pub max_connections: Option<u32>,
     pub dt_schema_name: Option<String>,
-    /// Enables incremental in-memory caching for dynamic tables that explicitly set `time_column`.
+    /// Global default for incremental in-memory caching of dynamic tables.
+    ///
+    /// Individual `dynamic_table` transforms may override this per topology via
+    /// their `cache` field; when that field is omitted the global value applies.
+    /// Caching is only ever active when the table sets `time_column`.
     #[serde(default)]
     pub cache_enabled: bool,
+    /// Global default for the cache freshness-check debounce window in
+    /// milliseconds (see `cache_refresh_debounce_ms` on dynamic_table
+    /// transforms). Individual transforms override this via their own field;
+    /// when that field is omitted the global value applies. When neither is
+    /// set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (1000ms) applies; set 0
+    /// explicitly to re-check on every batch. Settable via the
+    /// `STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_REFRESH_DEBOUNCE_MS`
+    /// environment variable.
+    #[serde(default)]
+    pub cache_refresh_debounce_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
@@ -185,6 +206,7 @@ impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
             .field("max_connections", &self.max_connections)
             .field("dt_schema_name", &self.dt_schema_name)
             .field("cache_enabled", &self.cache_enabled)
+            .field("cache_refresh_debounce_ms", &self.cache_refresh_debounce_ms)
             .finish()
     }
 }

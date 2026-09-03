@@ -995,12 +995,23 @@ transforms:
     backend_type: Postgres
     backend_entity_name: persistent_data
     time_column: updated_at
+    # Optional: how long to trust the cache before re-checking table freshness
+    # (`SELECT MAX(time_column)`). When omitted (and unset globally), a 1000ms
+    # default applies; 0 re-checks on every batch — one database round trip per
+    # batch. Raising it trades staleness for round trips: rows written by OTHER
+    # writers may be missed for up to this long, while this pipeline's own
+    # writes stay visible immediately.
+    cache_refresh_debounce_ms: 5000
 ```
 
 The cache is off by default and is used only when both settings are present. The initial lookup
 loads the full table through bounded PostgreSQL cursor pages. Each later `dynamic_table_check`
 batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
 column so these checks and range reads stay cheap.
+
+Configs that omit the setting entirely — including ones written before it existed — get the
+built-in 1000ms default on upgrade. Set `cache_refresh_debounce_ms: 0` (globally or per
+transform) to restore the pre-debounce re-check-on-every-batch behavior.
 
 PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
 existing membership, including removals, is not supported in this mode. Keeping `time_column` current
