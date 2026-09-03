@@ -1,6 +1,7 @@
 use crate::operators::broadcast::MultiSinkExec;
 use crate::operators::coalesce::StreamingCoalesceExec;
 use crate::operators::filter::StreamingFilterExec;
+use crate::operators::parallel_sink::ParallelSinkExec;
 use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::rebatch::RebatchExec;
 use crate::operators::scan_sharing::BroadcastingExec;
@@ -11,7 +12,7 @@ use crate::telemetry::provider::get_reference_name_from_metric_key;
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::config::ConfigOptions;
-use datafusion::datasource::sink::DataSinkExec;
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::physical_expr::Distribution;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::filter::FilterExec;
@@ -158,8 +159,10 @@ impl PhysicalOptimizerRule for StreamingUnnestRewritePhysicalOptimizerRule {
 /// stateless TreeNode passes can't express. Data flows leaves->root, so a node's
 /// downstream is its parent. On descent:
 ///
-/// - `DataSinkExec` (root): passes the sink's name (from its `WrappingDataSink`)
-///   as the downstream for its child (the topmost transform).
+/// - `DataSinkExec` / `ParallelSinkExec` (root): passes the sink's name (from
+///   its `WrappingDataSink`) as the downstream for its child (the topmost
+///   transform). Streamling connectors emit `ParallelSinkExec`; `DataSinkExec`
+///   remains for MemTable / non-streamling sinks.
 /// - `WrappingExec`: stamps `Edge(named_downstream)` (or `Unattributed`), then
 ///   becomes the named downstream for its children.
 /// - `MultiSinkExec`: marks its producer `WrappingExec` as `FanOutProducer`
@@ -274,14 +277,26 @@ fn attribute_downstream(
         return Ok(Arc::new(rebatch.clone_with_inner(attributed_inner)));
     }
 
-    // DataSinkExec (root of a sink plan): the sink is the named downstream for
-    // the topmost transform. Recover its plain name from the WrappingDataSink.
-    if let Some(dse) = node.downcast_ref::<DataSinkExec>() {
-        let sink_downstream: Option<String> = dse
-            .sink()
-            .downcast_ref::<WrappingDataSink>()
-            .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
-            .or_else(|| named_downstream.map(str::to_string));
+    // DataSinkExec / ParallelSinkExec (root of a sink plan): the sink is the
+    // named downstream for the topmost transform. Recover its plain name from
+    // the WrappingDataSink. ParallelSinkExec is what streamling connectors
+    // emit; DataSinkExec remains for MemTable / non-streamling sinks.
+    // Name is extracted before the recurse so the downcast borrow ends before
+    // `node` is moved into `with_new_children`.
+    let sink_downstream = if let Some(dse) = node.downcast_ref::<DataSinkExec>() {
+        Some(named_downstream_from_wrapping_sink(
+            dse.sink(),
+            named_downstream,
+        ))
+    } else if let Some(pse) = node.downcast_ref::<ParallelSinkExec>() {
+        Some(named_downstream_from_wrapping_sink(
+            pse.sink(),
+            named_downstream,
+        ))
+    } else {
+        None
+    };
+    if let Some(sink_downstream) = sink_downstream {
         let new_children = node
             .children()
             .into_iter()
@@ -309,6 +324,18 @@ fn attribute_downstream(
         })
         .collect::<Result<Vec<_>>>()?;
     node.with_new_children(new_children)
+}
+
+/// Recover the sink's plain name from a `WrappingDataSink`, falling back to the
+/// inherited `named_downstream` (same fallback as the pre-#96 `DataSinkExec`
+/// branch). Shared by `DataSinkExec` and `ParallelSinkExec` roots.
+fn named_downstream_from_wrapping_sink(
+    sink: &dyn DataSink,
+    named_downstream: Option<&str>,
+) -> Option<String> {
+    sink.downcast_ref::<WrappingDataSink>()
+        .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
+        .or_else(|| named_downstream.map(str::to_string))
 }
 
 /// Attribute the edges inside a scan-shared producer's stashed `base_exec`.
@@ -452,6 +479,7 @@ impl StreamlingPhysicalOptimizerRules {
 mod attribution_tests {
     use super::*;
     use crate::operators::broadcast::MultiSinkExec;
+    use crate::operators::parallel_sink::ParallelSinkExec;
     use crate::operators::rebatch::RebatchExec;
     use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle};
     use crate::operators::wrapping::WrappingExec;
@@ -527,14 +555,34 @@ mod attribution_tests {
         }
     }
 
-    fn sink(input: Arc<dyn ExecutionPlan>, metric_key_name: &str) -> Arc<dyn ExecutionPlan> {
-        let wrapping_sink = WrappingDataSink::new(
+    fn wrapping_noop_sink(metric_key_name: &str) -> WrappingDataSink {
+        WrappingDataSink::new(
             Arc::new(NoopDataSink { schema: schema() }),
             metric_key_name.to_string(),
             None,
             None,
-        );
-        Arc::new(DataSinkExec::new(input, Arc::new(wrapping_sink), None))
+        )
+    }
+
+    fn sink(input: Arc<dyn ExecutionPlan>, metric_key_name: &str) -> Arc<dyn ExecutionPlan> {
+        Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(wrapping_noop_sink(metric_key_name)),
+            None,
+        ))
+    }
+
+    /// Production single-sink root after parallel-exec (#96): every streamling
+    /// `insert_into` returns `ParallelSinkExec` wrapping a `WrappingDataSink`.
+    fn parallel_sink(
+        input: Arc<dyn ExecutionPlan>,
+        metric_key_name: &str,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(ParallelSinkExec::new(
+            input,
+            Arc::new(wrapping_noop_sink(metric_key_name)),
+            get_reference_name_from_metric_key(metric_key_name),
+        ))
     }
 
     fn role_of(node: &Arc<dyn ExecutionPlan>) -> BackpressureRole {
@@ -560,6 +608,28 @@ mod attribution_tests {
     fn linear_chain_gets_edge_stamps() {
         // DataSinkExec(pg_sink) <- W(sql) <- mid <- W(kafka_source) <- leaf
         let plan = sink(
+            wrap(mid(wrap(leaf(), "app::kafka_source")), "app::sql"),
+            "app::pg_sink",
+        );
+        let optimized = run(plan);
+
+        let w_sql = child(&optimized, 0);
+        assert_eq!(
+            role_of(&w_sql),
+            BackpressureRole::Edge("pg_sink".to_string())
+        );
+        let w_src = child(&w_sql, 0);
+        assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
+    }
+
+    /// Same linear chain as `linear_chain_gets_edge_stamps`, but with the
+    /// production `ParallelSinkExec` root. Without a dedicated branch the walk
+    /// treats it as a generic node, so `named_downstream` stays `None` and both
+    /// wrappers stay `Unattributed`.
+    #[test]
+    fn parallel_sink_linear_chain_gets_edge_stamps() {
+        // ParallelSinkExec(pg_sink) <- W(sql) <- mid <- W(kafka_source) <- leaf
+        let plan = parallel_sink(
             wrap(mid(wrap(leaf(), "app::kafka_source")), "app::sql"),
             "app::pg_sink",
         );
@@ -768,6 +838,33 @@ mod attribution_tests {
             BackpressureRole::Edge("web_sink".to_string())
         );
         // ...and its upstream source is attributed to the transform (not the sink).
+        let w_src = child(&w_sql, 0);
+        assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
+    }
+
+    /// Production e2e shape after parallel-exec: `ParallelSinkExec` ← `RebatchExec`
+    /// ← W(sql) ← mid ← W(source). The rule must recover the sink name from
+    /// `ParallelSinkExec`'s `WrappingDataSink` and pass it through `RebatchExec`.
+    #[test]
+    fn parallel_sink_rebatch_before_sink_still_attributes_feeding_transform() {
+        // ParallelSinkExec(web_sink) <- RebatchExec <- W(sql) <- mid <- W(source) <- leaf
+        let plan = parallel_sink(
+            rebatch(wrap(mid(wrap(leaf(), "app::source")), "app::sql")),
+            "app::web_sink",
+        );
+        let optimized = run(plan);
+
+        let rebatch_node = child(&optimized, 0);
+        let w_sql = Arc::clone(
+            rebatch_node
+                .downcast_ref::<RebatchExec>()
+                .expect("expected a RebatchExec")
+                .inner(),
+        );
+        assert_eq!(
+            role_of(&w_sql),
+            BackpressureRole::Edge("web_sink".to_string())
+        );
         let w_src = child(&w_sql, 0);
         assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
     }
