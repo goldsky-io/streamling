@@ -4,8 +4,9 @@ use abi_stable::traits::IntoReprC;
 use streamling_config::preprocessors::{Preprocessor, PreprocessorError};
 pub use streamling_plugin::PluginMsg;
 use streamling_plugin::{PluginChannel, PluginChannels};
+use tracing::warn;
 
-use super::create_preprocessor_plugin;
+use super::{create_preprocessor_plugin, registered_plugin_ids};
 
 pub struct PluginPreprocessorAdapter {
     app_config: AppConfig,
@@ -110,16 +111,85 @@ impl Preprocessor for PluginPreprocessorAdapter {
     }
 }
 
+/// Builds registered preprocessors in configured order.
+///
+/// Unknown ids are skipped so shared configuration remains compatible with
+/// older plugin bundles. The warning keeps the mismatch visible to callers.
 pub fn build_plugin_preprocessors(app_config: &AppConfig) -> Vec<Box<dyn Preprocessor>> {
-    app_config
-        .plugin
-        .preprocessor_ids
-        .iter()
+    let registered = registered_plugin_ids();
+    let (available, skipped) =
+        split_available_preprocessor_ids(&app_config.plugin.preprocessor_ids, &registered);
+
+    for id in &skipped {
+        warn!(
+            preprocessor_id = %id,
+            "Preprocessor '{}' is not registered by any loaded plugin; skipping it. Registered plugin ids: [{}]",
+            id,
+            registered.join(", ")
+        );
+    }
+
+    available
+        .into_iter()
         .map(|id| {
-            Box::new(PluginPreprocessorAdapter::new(
-                app_config.clone(),
-                id.clone(),
-            )) as Box<dyn Preprocessor>
+            Box::new(PluginPreprocessorAdapter::new(app_config.clone(), id))
+                as Box<dyn Preprocessor>
         })
         .collect()
+}
+
+/// Partitions ids without changing their configured order.
+fn split_available_preprocessor_ids(
+    configured: &[String],
+    registered: &[String],
+) -> (Vec<String>, Vec<String>) {
+    configured
+        .iter()
+        .cloned()
+        .partition(|id| registered.contains(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn unregistered_ids_are_skipped_and_resolved_order_is_preserved() {
+        let (available, skipped) = split_available_preprocessor_ids(
+            &ids(&[
+                "first_preprocessor",
+                "new_optional_preprocessor",
+                "last_preprocessor",
+            ]),
+            &ids(&["last_preprocessor", "first_preprocessor"]),
+        );
+
+        assert_eq!(
+            available,
+            ids(&["first_preprocessor", "last_preprocessor"]),
+            "resolved ids must keep their configured relative order"
+        );
+        assert_eq!(skipped, ids(&["new_optional_preprocessor"]));
+    }
+
+    #[test]
+    fn empty_config_builds_nothing() {
+        let (available, skipped) = split_available_preprocessor_ids(&[], &ids(&["some_expander"]));
+        assert!(available.is_empty());
+        assert!(skipped.is_empty());
+    }
+
+    /// Regression: an id no loaded plugin provides used to be instantiated
+    /// anyway and then fail the whole pipeline at startup.
+    #[test]
+    fn build_with_no_plugins_loaded_skips_every_configured_id() {
+        let mut app_config = AppConfig::load().expect("embedded config must load");
+        app_config.plugin.preprocessor_ids = ids(&["new_optional_preprocessor"]);
+
+        assert!(build_plugin_preprocessors(&app_config).is_empty());
+    }
 }

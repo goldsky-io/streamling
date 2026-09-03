@@ -35,24 +35,14 @@ dynamic_table_backend:
     password: ""
     sslmode: "require"
     cache_enabled: false
+    # cache_refresh_debounce_ms: omitted = built-in default (1000ms); 0 = re-check
+    # every batch. Overridable per dynamic_table transform via cache_refresh_debounce_ms.
 external_http_handler:
   trigger_max_count: "2000"
   operator_timeout_sec: "300"
   # the number of in-flight record batches executed concurrently by the external HTTP handler
   buffer_size: "25"
-wasm_script:
-  # The WASM runtime is embedded in the binary; uncomment runtime_wasm_file_path
-  # only to override it with an external .wasm file.
-  # runtime_wasm_file_path: "/path/to/runtime.wasm"
-  # Number of WASM plugin instances in the pool for concurrent processing.
-  # Higher values allow more concurrent batch processing but use more memory.
-  # Default is 4.
-  parallelism: 4
-  # Minimum number of rows to accumulate before processing.
-  # Smaller batches are combined until this threshold is reached.
-  # Set to 0 to disable accumulation and process each batch immediately.
-  # Default is 0 (disabled).
-  batch_size: 0
+wasm_script: {}
 plugin: {}
 kafka_source:
   brokers: "localhost:9092"
@@ -87,6 +77,14 @@ clickhouse_sink:
   user: default
   password: ""
   database: default
+  # Defaults for sinks that omit batch_size / batch_flush_interval. 100k rows
+  # with a 1s flush measured ~12x the throughput of the previous fallback
+  # (record_batch_size, 1000) on row-heavy backfills. Override per-process with
+  # STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE and
+  # STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL, or per-sink in the
+  # pipeline YAML.
+  batch_size: 100000
+  batch_flush_interval: "1s"
 print_sink:
   sample_every: "1"
 postgres_sink:

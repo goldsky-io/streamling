@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use streamling_config::AppConfig;
 use streamling_core::checkpoints::channels::{subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
-    extract_checkpoint_messages,
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointControl, CheckpointMessage,
+    enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
 };
 use streamling_core::data::COLUMN_NAME_OP;
 use streamling_core::error::ResultExt;
@@ -139,6 +139,15 @@ pub struct HybridTableProvider {
     pub state: Arc<RwLock<HybridSourceState>>,
     reference_name: String,
     session_manager: SessionManager,
+    /// Control handle for the checkpoint coordinator. When set, this source
+    /// begins a terminal checkpoint and emits its marker/finalizer inline after
+    /// the last batch when it completes (job mode) or when shutdown is
+    /// requested (streaming mode). `None` outside a running pipeline (tests).
+    checkpoint_control: Option<CheckpointControl>,
+    /// Process-wide shutdown signal. When it flips true the source drains its
+    /// current phase, emits the terminal checkpoint, and ends its stream
+    /// instead of advancing to the next phase. `None` in tests.
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 impl Debug for HybridTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -203,9 +212,26 @@ impl HybridTableProvider {
             state: Arc::new(RwLock::new(initial_state)),
             reference_name,
             session_manager,
+            checkpoint_control: None,
+            shutdown_rx: None,
         };
 
         Ok(provider)
+    }
+
+    /// Attach the checkpoint control handle so this source begins the terminal
+    /// checkpoint when it completes / shuts down. Builder-style so the provider
+    /// can be configured before being wrapped in an `Arc`.
+    pub fn with_checkpoint_control(mut self, control: CheckpointControl) -> Self {
+        self.checkpoint_control = Some(control);
+        self
+    }
+
+    /// Attach the process-wide shutdown signal so this source drains and emits
+    /// the terminal checkpoint on SIGTERM instead of advancing phases.
+    pub fn with_shutdown(mut self, shutdown_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown_rx = Some(shutdown_rx);
+        self
     }
 
     pub fn new_from_topology(
@@ -264,6 +290,10 @@ impl HybridTableProvider {
                             // standalone Kafka source.
                             KafkaFormat::Avro,
                             None,
+                            // The hybrid source orchestrates a bounded->unbounded
+                            // transition through one cursor, so its Kafka phase is
+                            // always a single consumer instance.
+                            1,
                         )
                         .streamling_with_context(|| {
                             format!(
@@ -895,7 +925,12 @@ impl HybridSourceExec {
 
 impl DisplayAs for HybridSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "HybridSourceExec[{}]", self.inner.name())
+        write!(
+            f,
+            "HybridSourceExec[{}]: partitions={}",
+            self.inner.name(),
+            self.properties().output_partitioning().partition_count()
+        )
     }
 }
 
@@ -1047,6 +1082,33 @@ impl ExecutionPlan for HybridSourceExec {
         let pending_for_main = pending_markers.clone();
 
         let reference_name_for_spawn = self.provider.reference_name.clone();
+        let checkpoint_control = provider.checkpoint_control.clone();
+        let shutdown_rx = provider.shutdown_rx.clone();
+
+        // Shutdown watcher: when the process-wide shutdown signal fires, stop
+        // the inner unbounded source (Kafka) so its stream ends and the main
+        // loop below falls through to the terminal-checkpoint path. Without
+        // this the loop would block indefinitely in `stream.next()` on a live
+        // topic and never observe the signal. Bounded-phase (ClickHouse)
+        // streams have no equivalent stop hook — the forwarding loop below
+        // selects on the shutdown watch instead, and the ClickHouse scan also
+        // checks the signal between pages.
+        let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
+            let provider_for_shutdown = provider.clone();
+            let ref_name = reference_name_for_spawn.clone();
+            tokio::spawn(async move {
+                while !*sd.borrow() {
+                    if sd.changed().await.is_err() {
+                        return;
+                    }
+                }
+                info!(
+                    "Hybrid source '{}': shutdown requested; stopping inner unbounded source",
+                    ref_name
+                );
+                provider_for_shutdown.shutdown();
+            })
+        });
 
         tokio::spawn(async move {
             // Every exit path from the loop falls through to the
@@ -1088,7 +1150,51 @@ impl ExecutionPlan for HybridSourceExec {
                     }
                 };
 
-                while let Some(batch_result) = stream.next().await {
+                // Forward batches until the inner stream ends — or, during a
+                // BOUNDED phase, until the process-wide shutdown signal flips.
+                // The select on the shutdown watch is what makes bounded
+                // (ClickHouse) phases shutdown-aware: the watcher task above
+                // only stops the Kafka unbounded source, and the post-loop
+                // check below only runs after the stream ends, so without
+                // this arm a SIGTERM during a long bounded scan would sit in
+                // `stream.next()` until the scan finished and the watchdog
+                // force-exited instead of draining. Ending a bounded stream
+                // early is safe: nothing past the last emitted batch is
+                // checkpoint-covered, so a restart resumes from the last
+                // finalized cursor. The unbounded (Kafka) phase is exempt on
+                // purpose — its source observes the signal itself and drains
+                // the in-flight batch before ending its stream, which this
+                // loop must keep consuming.
+                let mut shutdown_for_stream = shutdown_rx.clone();
+                let mut shutdown_watch_dead = false;
+                loop {
+                    let next = match (&mut shutdown_for_stream, shutdown_watch_dead) {
+                        (Some(sd), false) if !is_executing_unbounded => {
+                            if *sd.borrow() {
+                                info!(
+                                    "Hybrid source '{}': shutdown requested; ending bounded stream early",
+                                    reference_name_for_spawn,
+                                );
+                                break;
+                            }
+                            tokio::select! {
+                                biased;
+                                changed = sd.changed() => {
+                                    // On a real change the next iteration sees
+                                    // borrow()==true and breaks; a closed
+                                    // sender means no shutdown signal exists,
+                                    // so stop watching rather than spin.
+                                    shutdown_watch_dead = changed.is_err();
+                                    continue;
+                                }
+                                n = stream.next() => n,
+                            }
+                        }
+                        _ => stream.next().await,
+                    };
+                    let Some(batch_result) = next else {
+                        break;
+                    };
                     match batch_result {
                         Ok(batch) => {
                             // Bounded sources (ClickHouse) emit u256/i256 columns as
@@ -1134,41 +1240,103 @@ impl ExecutionPlan for HybridSourceExec {
                 )
                 .await;
 
+                let shutdown_requested =
+                    shutdown_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false);
+
                 // Stream ended — use our local knowledge of what phase we were
                 // executing to decide whether to advance or exit.
                 if is_executing_unbounded {
-                    warn!("Unbounded source stream ended, exiting hybrid source");
+                    // The unbounded (Kafka) stream ended — in practice only on
+                    // shutdown (the watcher above called `provider.shutdown()`)
+                    // or if the topic itself ended. Emit the terminal checkpoint
+                    // so the tail is covered and the sinks flush + ack a final
+                    // epoch before we stop, then exit.
+                    if shutdown_requested {
+                        info!(
+                            "Hybrid source '{}': unbounded stream ended after shutdown request, finalizing",
+                            reference_name_for_spawn
+                        );
+                    } else {
+                        warn!("Unbounded source stream ended, exiting hybrid source");
+                    }
+                    if let Some(control) = &checkpoint_control {
+                        emit_terminal_checkpoint(
+                            control,
+                            &pending_for_main,
+                            &schema_for_synth,
+                            &tx,
+                            &reference_name_for_spawn,
+                        )
+                        .await;
+                    }
                     break 'outer;
-                } else {
-                    match provider.advance_to_next_phase().await {
-                        Ok(()) => {
-                            let state = provider.state.read().await;
-                            let now_unbounded =
-                                state.current_phase >= provider.config.bounded_sources.len();
-                            drop(state);
+                }
 
-                            if now_unbounded && provider.config.job_mode {
-                                info!(
-                                    "Job mode: all {} bounded phase(s) complete, terminating hybrid source",
-                                    provider.config.bounded_sources.len()
-                                );
-                                provider.shutdown();
-                                break 'outer;
-                            }
+                // Bounded stream ended. If shutdown was requested, do not advance
+                // into another phase: emit the terminal checkpoint for what we
+                // produced and stop.
+                if shutdown_requested {
+                    info!(
+                        "Hybrid source '{}': shutdown requested during bounded phase; \
+                         emitting terminal checkpoint and stopping",
+                        reference_name_for_spawn
+                    );
+                    provider.shutdown();
+                    if let Some(control) = &checkpoint_control {
+                        emit_terminal_checkpoint(
+                            control,
+                            &pending_for_main,
+                            &schema_for_synth,
+                            &tx,
+                            &reference_name_for_spawn,
+                        )
+                        .await;
+                    }
+                    break 'outer;
+                }
 
-                            info!("Advanced to next phase, continuing with new source");
-                            continue;
-                        }
-                        Err(e) => {
-                            error!(
-                                "Hybrid source '{}': advance_to_next_phase failed; \
-                                 hybrid state may not have persisted the phase advance. \
-                                 The next restart will probe per-phase state for recovery: {:?}",
-                                provider.reference_name, e
+                match provider.advance_to_next_phase().await {
+                    Ok(()) => {
+                        let state = provider.state.read().await;
+                        let now_unbounded =
+                            state.current_phase >= provider.config.bounded_sources.len();
+                        drop(state);
+
+                        if now_unbounded && provider.config.job_mode {
+                            info!(
+                                "Job mode: all {} bounded phase(s) complete, terminating hybrid source",
+                                provider.config.bounded_sources.len()
                             );
-                            let _ = tx.send(Err(e)).await;
+                            // Emit the terminal checkpoint while the sinks are
+                            // still consuming this stream, so the last bounded
+                            // rows are covered by a finalized checkpoint and the
+                            // sinks flush + ack before teardown.
+                            if let Some(control) = &checkpoint_control {
+                                emit_terminal_checkpoint(
+                                    control,
+                                    &pending_for_main,
+                                    &schema_for_synth,
+                                    &tx,
+                                    &reference_name_for_spawn,
+                                )
+                                .await;
+                            }
+                            provider.shutdown();
                             break 'outer;
                         }
+
+                        info!("Advanced to next phase, continuing with new source");
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Hybrid source '{}': advance_to_next_phase failed; \
+                             hybrid state may not have persisted the phase advance. \
+                             The next restart will probe per-phase state for recovery: {:?}",
+                            provider.reference_name, e
+                        );
+                        let _ = tx.send(Err(e)).await;
+                        break 'outer;
                     }
                 }
             }
@@ -1198,6 +1366,14 @@ impl ExecutionPlan for HybridSourceExec {
             let _ = forwarder_shutdown_tx.send(());
             let _ = forwarder_handle.await;
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, hybrid_marker_sub_id);
+            // The shutdown watcher may never fire (clean job-mode completion);
+            // abort it so it doesn't pin the provider Arc until process exit.
+            if let Some(handle) = shutdown_watcher_handle {
+                handle.abort();
+                // Await the aborted task so the provider Arc it captured is
+                // deterministically dropped before this task ends.
+                let _ = handle.await;
+            }
         });
 
         Ok(builder.build())
@@ -1290,6 +1466,129 @@ fn merge_pending_markers(
     }
 }
 
+/// The bound on how long a completing source waits for the terminal checkpoint
+/// to finalize. On timeout the terminal Finalizer is SKIPPED (never emitted
+/// for an unconfirmed epoch — see `emit_terminal_checkpoint`); this bound only
+/// keeps a sink that never acks from hanging the source task.
+///
+/// Derived from the run loop's shared shutdown budget
+/// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
+/// is armed with), minus a margin so this wait always expires BEFORE the
+/// watchdog hard-exits the process. The minimum-floor is itself capped at
+/// budget − 2s so a deliberately tiny budget can never invert the invariant:
+/// for budgets ≤ 2s the timeout collapses to zero, which expires immediately
+/// and takes the safe branch (Finalizer skipped).
+fn terminal_checkpoint_finalize_timeout() -> Duration {
+    const MARGIN_SECS: u64 = 10;
+    const MIN_TIMEOUT_SECS: u64 = 5;
+    let budget = streamling_core::shutdown::shutdown_budget().as_secs();
+    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2));
+    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(capped_floor))
+}
+
+/// Emit the terminal checkpoint round-trip inline on the data stream, so both
+/// the marker and the finalizer keep a consistent cut and reach inline
+/// consumers (sinks) the same way every other checkpoint does:
+///
+/// 1. `Marker` on a synthetic batch after all real data, so the sinks flush and
+///    ack a final epoch covering everything they received.
+/// 2. Wait (bounded) for the coordinator to finalize that epoch — meaning every
+///    live sink acked it.
+/// 3. `Finalizer` on a second synthetic batch, so inline consumers run their
+///    finalize work (offset/state commit, staging truncation) before the stream
+///    ends.
+///
+/// `begin_terminal_checkpoint` is idempotent across the sources of a
+/// multi-source pipeline: the first caller mints the epoch, the rest reuse it,
+/// and it finalizes once every sink has acked it (or been dropped from the
+/// expected set via `sink_completed`).
+///
+/// Send failures on `tx` are logged, not surfaced: every call site is a
+/// completion path that ends the stream immediately after this returns, and
+/// the only way the receiver is gone is that downstream already tore down —
+/// there is no caller decision an error could change.
+async fn emit_terminal_checkpoint(
+    control: &CheckpointControl,
+    pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
+    schema_for_synth: &SchemaRef,
+    tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
+    reference_name: &str,
+) {
+    let terminal = control.begin_terminal_checkpoint();
+
+    pending
+        .lock()
+        .expect("pending markers mutex poisoned")
+        .push(CheckpointMessage::Marker {
+            epoch: terminal.clone(),
+            created_at_ms: now_ms(),
+        });
+    flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+
+    // The send above is buffered and the sinks pull concurrently, so awaiting
+    // here does not block their consumption of the marker batch.
+    //
+    // How long to wait depends on WHY we are completing:
+    // - Shutdown requested (SIGTERM): the watchdog is armed, so the wait must
+    //   be bounded under the shutdown budget.
+    // - Natural job-mode completion: no deadline is running, and in a
+    //   multi-source job the shared terminal epoch cannot finalize until the
+    //   SLOWEST branch completes and its sinks ack — sibling skew can
+    //   legitimately exceed any SIGTERM-sized budget. Wait until finalized or
+    //   until a shutdown request arrives (then fall back to the bounded wait).
+    //   A sink wedged forever with no shutdown request keeps the pipeline
+    //   alive-but-stalled, exactly as an unacked epoch does on main; the
+    //   operator-initiated SIGTERM then drains it under the budget.
+    let mut shutdown = streamling_core::shutdown::subscribe();
+    let finalize_timeout = terminal_checkpoint_finalize_timeout();
+    let finalized = if *shutdown.borrow() {
+        tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
+            .await
+            .is_ok()
+    } else {
+        tokio::select! {
+            _ = control.await_terminal_finalized() => true,
+            _ = shutdown.changed() => {
+                tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
+                    .await
+                    .is_ok()
+            }
+        }
+    };
+    if !finalized {
+        // At least one live sink never confirmed its writes. Do NOT emit the
+        // Finalizer: it tells inline consumers to commit/truncate past the
+        // terminal epoch, and doing that for an epoch that never finalized
+        // would advance durable state past unconfirmed data — the restart
+        // would then skip replaying exactly the tail this mechanism exists to
+        // protect. Skipping only costs the end-of-job finalize work (e.g.
+        // staging cleanup); at-least-once replay covers the data itself.
+        warn!(
+            "Hybrid source '{}': terminal checkpoint did not finalize within {:?} of shutdown \
+             (sinks that never acked: {:?}); SKIPPING the terminal Finalizer so no consumer \
+             commits past unconfirmed data (it will be replayed on restart)",
+            reference_name,
+            finalize_timeout,
+            control.pending_terminal_ack_sinks()
+        );
+        // Counter alongside the warn: a skipped terminal Finalizer means the
+        // tail silently replays on the next restart — operators need a metric
+        // to alert on, not just a log line. Grouped under the coordinator's
+        // component id with the other checkpoint_* counters.
+        streamling_core::telemetry::recorder::get_control_plane_metrics_recorder(
+            "checkpoint_coordinator",
+        )
+        .record_count("checkpoint_terminal_finalizer_skipped", 1);
+        return;
+    }
+
+    pending
+        .lock()
+        .expect("pending markers mutex poisoned")
+        .push(CheckpointMessage::Finalizer(terminal));
+    flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+}
+
 /// Flush any markers currently buffered in `pending` to the downstream
 /// stream as a synthetic empty `RecordBatch` whose schema carries the
 /// markers in its metadata. Used both on inner-stream-end (so a marker
@@ -1309,26 +1608,52 @@ async fn flush_pending_to_synth_batch(
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
     reference_name: &str,
 ) {
-    let leftover: Vec<CheckpointMessage> = {
-        let mut g = pending.lock().unwrap();
+    let drained: Vec<CheckpointMessage> = {
+        let mut g = pending.lock().expect("pending markers mutex poisoned");
         std::mem::take(&mut *g)
     };
-    if leftover.is_empty() {
+    if drained.is_empty() {
         return;
     }
+    // Dedup by epoch within the flush: the terminal path can buffer the same
+    // Finalizer twice (once forwarded from the checkpoint channel by the
+    // forwarder task, once pushed inline by `emit_terminal_checkpoint`).
+    // Consumers are idempotent for duplicate Finalizers, but there is no
+    // reason to make them exercise that property.
+    let mut seen_marker = HashSet::new();
+    let mut seen_finalizer = HashSet::new();
+    let to_flush: Vec<CheckpointMessage> = drained
+        .into_iter()
+        .filter(|msg| match msg {
+            CheckpointMessage::Marker { epoch, .. } => seen_marker.insert(epoch.0),
+            CheckpointMessage::Finalizer(epoch) => seen_finalizer.insert(epoch.0),
+            _ => true,
+        })
+        .collect();
     debug!(
         "Hybrid source '{}': flushing {} unattached marker(s) on a synthetic empty batch",
         reference_name,
-        leftover.len()
+        to_flush.len()
     );
     let mut md = HashMap::new();
-    enrich_batch_metadata_with_checkpoints(&mut md, &leftover);
+    enrich_batch_metadata_with_checkpoints(&mut md, &to_flush);
     let synth_schema = Arc::new(Schema::new_with_metadata(
         schema_for_synth.fields().clone(),
         md,
     ));
     let synth = RecordBatch::new_empty(synth_schema);
-    let _ = tx.send(Ok(synth)).await;
+    if tx.send(Ok(synth)).await.is_err() {
+        // Downstream already gone. On teardown paths this is expected; on the
+        // terminal-checkpoint path it means the Marker/Finalizer batch was
+        // dropped and the epoch will not finalize (at-least-once replay covers
+        // the data). Either way, make it visible instead of silent.
+        warn!(
+            "Hybrid source '{}': downstream closed; dropped a synthetic batch \
+             carrying {} checkpoint message(s)",
+            reference_name,
+            to_flush.len()
+        );
+    }
 }
 
 struct ClickHouseSchemaAdapter {
@@ -1451,6 +1776,60 @@ mod tests {
         ]))
     }
 
+    /// The terminal path can buffer the same Finalizer twice: once forwarded
+    /// from the checkpoint channel by the forwarder task, once pushed inline by
+    /// `emit_terminal_checkpoint` after the finalize wait. The synthetic flush
+    /// must collapse duplicates so inline consumers never see the same epoch's
+    /// Marker/Finalizer twice on one batch — making the "duplicate Finalizers
+    /// are idempotent" contract a defence-in-depth property instead of a
+    /// load-bearing one.
+    #[tokio::test]
+    async fn test_flush_pending_dedups_duplicate_markers_and_finalizers() {
+        use streamling_core::checkpoints::checkpoint_management::now_ms;
+
+        let pending: Arc<Mutex<Vec<CheckpointMessage>>> = Arc::new(Mutex::new(vec![
+            CheckpointMessage::Marker {
+                epoch: streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+                created_at_ms: now_ms(),
+            },
+            CheckpointMessage::Marker {
+                epoch: streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+                created_at_ms: now_ms(),
+            },
+            CheckpointMessage::Finalizer(
+                streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+            ),
+            CheckpointMessage::Finalizer(
+                streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(7),
+            ),
+        ]));
+        let schema = create_test_schema();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        flush_pending_to_synth_batch(&pending, &schema, &tx, "dedup_test").await;
+
+        let batch = rx
+            .recv()
+            .await
+            .expect("a synthetic batch should be flushed")
+            .expect("synthetic batch should not be an error");
+        let messages = extract_checkpoint_messages(batch.schema().metadata());
+        let markers = messages
+            .iter()
+            .filter(|m| matches!(m, CheckpointMessage::Marker { .. }))
+            .count();
+        let finalizers = messages
+            .iter()
+            .filter(|m| matches!(m, CheckpointMessage::Finalizer(_)))
+            .count();
+        assert_eq!(markers, 1, "duplicate Markers for one epoch must collapse");
+        assert_eq!(
+            finalizers, 1,
+            "duplicate Finalizers for one epoch must collapse"
+        );
+        assert!(pending.lock().unwrap().is_empty(), "pending fully drained");
+    }
+
     async fn create_state_backend(name: &str) -> Arc<dyn StateOperatorBackend<HybridSourceState>> {
         let state_config = StateBackendConfig {
             backend_type: streamling_config::StateBackendType::InMemory,
@@ -1568,7 +1947,7 @@ mod tests {
 
     static SESSION_MANAGER: LazyLock<SessionManager, fn() -> SessionManager> =
         LazyLock::new(|| {
-            SessionManager::new(100, 10, DynamicTableRegistry::new())
+            SessionManager::new(100, 10, DynamicTableRegistry::new(), 1)
                 .expect("session manager initialisation failed")
         });
 

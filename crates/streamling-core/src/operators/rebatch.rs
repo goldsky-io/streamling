@@ -142,7 +142,11 @@ impl ExecutionPlan for RebatchExec {
         let schema = data.schema();
 
         let accumulator = AsyncBatchAccumulator::new(self.batch_size, self.batch_flush_interval)
-            .with_name(self.name.clone());
+            .with_name(self.name.clone())
+            .with_flush_stagger(
+                partition,
+                self.properties().output_partitioning().partition_count(),
+            );
 
         let rebatched = accumulator.process_stream(data);
 
@@ -158,7 +162,11 @@ impl DisplayAs for RebatchExec {
                 if let Some(interval) = self.batch_flush_interval {
                     write!(f, ", interval={:?}", interval)?;
                 }
-                write!(f, ")")
+                write!(
+                    f,
+                    ", partitions={})",
+                    self.properties().output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "RebatchExec")

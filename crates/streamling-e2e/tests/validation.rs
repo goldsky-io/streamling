@@ -601,6 +601,85 @@ sinks:
 }
 
 // ============================================================================
+// Unknown plugin reference must be a validation error, not a panic
+// ============================================================================
+
+/// A sink referencing a plugin type that is not present in the plugin bundle
+/// used to make the validator `panic!("Plugin <name> not found!")` — exiting 101
+/// with empty stdout, which the control plane then misreported. `--validate` must
+/// instead emit structured JSON reporting the pipeline as invalid.
+#[tokio::test]
+async fn test_validate_unknown_plugin_is_error_not_panic() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    // Schema registration is still needed so the Kafka source can resolve its
+    // Avro schema during topology build; no records are produced because
+    // `--validate` does not consume data.
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // `definitely_not_a_real_plugin` is not a built-in sink type, so it binds to the
+    // plugin sink variant and is resolved against the (empty) plugin registry.
+    let pipeline = format!(
+        r#"
+sources:
+  test_kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  missing_plugin_sink:
+    type: definitely_not_a_real_plugin
+    from: test_kafka_source
+    primary_key: id
+"#,
+        topic = ctx.kafka_topic
+    );
+
+    let output = ctx
+        .run_pipeline_raw(&pipeline, PipelineOpts::new().arg("--validate"))
+        .await
+        .expect("Failed to run pipeline");
+
+    // The key regression: stdout must be parseable JSON (the validator did not panic).
+    let validation: ValidationOutput = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "Failed to parse validation JSON from stdout (validator likely panicked): {}\nstdout was:\n{}\nstderr was:\n{}",
+            e, output.stdout, output.stderr
+        )
+    });
+
+    assert!(
+        !validation.is_valid,
+        "Pipeline referencing an unknown plugin must be invalid, got: {:?}",
+        validation
+    );
+    assert!(
+        !validation.errors.is_empty(),
+        "Expected at least one error entry, got: {:?}",
+        validation
+    );
+
+    let all_errors = validation.errors.join("\n");
+    assert!(
+        all_errors.contains("definitely_not_a_real_plugin")
+            && all_errors.contains("is not available"),
+        "Error should name the missing plugin, got: {:?}",
+        validation.errors
+    );
+}
+
+// ============================================================================
 // STRM-5695: u256 comparison combined with boolean predicate via AND/OR
 // ============================================================================
 

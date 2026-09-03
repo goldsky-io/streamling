@@ -321,10 +321,15 @@ sinks:
 // ============================================================================
 
 /// Test that parallelism > 1 delivers all messages correctly with no data loss.
+///
+/// `parallelism` used to fan out to N producers inside the sink, routing rows
+/// between them by `hash(key) % N`. It now means N concurrent write streams fed
+/// by a `StreamingRepartitionExec` keyed on the sink's primary key, each owning
+/// one producer — so per-key ordering is a property of the exchange, covered by
+/// `every_row_of_a_key_lands_on_one_output` in `operators/repartition.rs`.
+///
 /// NOTE: primary_key is NOT set on the sink to avoid WrappingDataSink deduplication,
 /// which would reduce the record count and prevent the pipeline from exiting.
-/// Per-key ordering correctness (same key -> same producer) is verified in the
-/// unit test `test_key_hash_producer_routing` in kafka.rs.
 #[tokio::test]
 async fn test_kafka_sink_parallel_producers() {
     init_tracing();

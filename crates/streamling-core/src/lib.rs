@@ -26,6 +26,7 @@ pub mod retry;
 pub mod schema;
 pub mod serde;
 pub mod session;
+pub mod shutdown;
 pub mod side_output;
 pub mod sql_parse;
 pub mod telemetry;

@@ -77,6 +77,12 @@ impl PluginNode {
         internal_buffer_size: u32,
         metric_metadata_id: String,
     ) -> Self {
+        // Registry is keyed by metric_key(app_id, id) = "{app_id}::{id}".
+        // A bare reference name misses the lookup and every plugin metric is dropped.
+        debug_assert!(
+            metric_metadata_id.contains("::"),
+            "metric_metadata_id must be a metric_key(app_id, reference_name) composite; a bare reference name misses the metrics registry and every plugin metric is silently dropped"
+        );
         let id = format!("plugin_channel_{}", Uuid::new_v4());
 
         PLUGIN_CHANNELS
@@ -242,7 +248,11 @@ impl DisplayAs for PluginExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "PluginExec")
+                write!(
+                    f,
+                    "PluginExec: partitions={}",
+                    self.properties().output_partitioning().partition_count()
+                )
             }
         }
     }
@@ -413,7 +423,7 @@ impl ExecutionPlan for PluginExec {
                                     checkpoint_buffer.push(CheckpointMessage::Finalizer(CheckpointEpoch(epoch.0)));
                                 }
                                 Err(TryRecvError::Empty) => {
-                                    tokio::task::yield_now().await;
+                                    tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
                                 }
                                 Err(TryRecvError::Disconnected) => {
                                     break 'outer;

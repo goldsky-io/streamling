@@ -675,3 +675,426 @@ sinks:
         webhook.request_count()
     );
 }
+
+// ============================================================================
+// Scenario 5: Fan-out over a parallel source
+// ============================================================================
+
+/// A fan-out used to force its input back to a single stream: `MultiSinkExec`
+/// declared a `SinglePartition` requirement, so adding a second sink silently
+/// serialized a parallel source.
+///
+/// With a parallel Kafka source, each of the N input partitions now gets its own
+/// broadcast and its own write stream per sink. Both sinks must still receive
+/// every row exactly once, and the upsert keys must stay intact — the two sinks
+/// share one exchange, keyed on the primary key they agree on.
+#[tokio::test]
+async fn test_multi_sink_over_a_parallel_source() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("parallel_fanout", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce: i64 = 100;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    topic
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 2
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: parallel_fanout_pg
+    schema: public
+    primary_key: id
+    on_conflict: update
+
+  ch_sink:
+    type: clickhouse
+    from: kafka_source
+    table: parallel_fanout_ch
+    primary_key: id
+    schema_override:
+      _gs_op: "String"
+"#,
+        topic = topic.topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let pg_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.parallel_fanout_pg")
+        .await
+        .expect("Failed to query PostgreSQL count");
+    assert_eq!(
+        pg_count, records_to_produce,
+        "every row must reach the PostgreSQL sink across both partitions"
+    );
+
+    let ch_count: u64 = clickhouse
+        .count("SELECT COUNT(*) FROM parallel_fanout_ch FINAL")
+        .await
+        .expect("Failed to query ClickHouse count");
+    assert_eq!(
+        ch_count, records_to_produce as u64,
+        "every row must reach the ClickHouse sink across both partitions"
+    );
+
+    // No key may be missing from either sink — a dropped partition would show up
+    // as a gap rather than a count mismatch if duplicates were also present.
+    let missing: Vec<(i64,)> = ctx
+        .postgres
+        .query(
+            // `generate_series(int, int)` yields INT4; the ids are BIGINT.
+            "SELECT s.id::bigint FROM generate_series(1, 100) AS s(id) \
+             LEFT JOIN public.parallel_fanout_pg o ON o.id = s.id \
+             WHERE o.id IS NULL ORDER BY s.id",
+        )
+        .await
+        .expect("Failed to query missing ids");
+    assert!(
+        missing.is_empty(),
+        "fan-out lost rows: {:?}",
+        missing.iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+}
+
+/// Scenario 6: `MultiSinkExec` never executes a sink's physical plan — it calls `write_all`
+/// once per (input partition, sink), so the fan-out's own width *is* every
+/// sink's write-stream count. The sinks share one input and therefore one
+/// exchange, which can only be keyed one way.
+///
+/// A webhook beside a postgres sink is the case where that matters: both key on
+/// `id`, so they agree and the group keeps its input's width instead of being
+/// narrowed to the slowest common denominator. Both sinks must still get every
+/// row.
+#[tokio::test]
+async fn test_multi_sink_with_a_webhook_shares_the_keyed_exchange() {
+    init_tracing();
+
+    use streamling_e2e::resources::WebhookResource;
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("fanout_keyed_group", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let webhook = WebhookResource::new()
+        .await
+        .expect("Failed to start webhook server");
+
+    let records_to_produce: i64 = 60;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    topic
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 2
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: fanout_keyed_group_pg
+    schema: public
+    primary_key: id
+    on_conflict: update
+
+  webhook_sink:
+    type: webhook
+    from: kafka_source
+    url: {webhook_url}
+    primary_key: id
+    one_row_per_request: true
+    payload_version: 0
+"#,
+        topic = topic.topic,
+        webhook_url = webhook.webhook_url(),
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .env("RUST_LOG", "info")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(
+        output.status.success(),
+        "Pipeline should exit successfully; stderr:\n{}",
+        output.stderr
+    );
+    // `MultiSinkExec` never executes a sink's physical plan, so `ParallelSinkExec`
+    // never appears here — the fan-out's own width *is* the sink's write-stream
+    // count, one `write_all` per input partition per sink.
+    assert!(
+        output.stderr.contains("MultiSinkExec: partitions=2"),
+        "sinks agreeing on a key must keep the group at its input's width; stderr:\n{}",
+        output.stderr
+    );
+
+    let received_all = webhook
+        .wait_for_requests(
+            records_to_produce as usize,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+    assert!(
+        received_all,
+        "Expected {} webhook requests, got {}",
+        records_to_produce,
+        webhook.request_count()
+    );
+
+    let pg_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.fanout_keyed_group_pg")
+        .await
+        .expect("Failed to query PostgreSQL count");
+    assert_eq!(
+        pg_count, records_to_produce,
+        "every row must reach the PostgreSQL sink too"
+    );
+}
+
+// ============================================================================
+// Scenario 7: Two postgres sinks, two databases (STRM-6516)
+// ============================================================================
+
+/// Regression: two `postgres` sinks in one pipeline must write to the two
+/// databases they were each given, not both to whichever connection the
+/// deployer published last.
+///
+/// A streamling process has one global `postgres_sink` block, and
+/// streamling-agent used to flatten every sink's resolved secret into it, so the
+/// second secret it processed overwrote the first: both sinks connected to the
+/// same database and the other database received nothing (LiFi `solana-mainnet`,
+/// two sinks writing the same table name into a prod and a dev database).
+///
+/// Only `pg_second` gets per-sink keys, in the exact
+/// `STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__<FIELD>` form the agent
+/// writes. `pg_primary` stays on the global block and `pg_second` omits
+/// `SSLMODE`, so the run also covers the fallback path per sink and per field.
+///
+/// The two sinks write *different* table names so the misrouting is what fails,
+/// not a side effect of it: LiFi's sinks shared a table name, and pre-fix that
+/// means both sinks race to `CREATE TABLE` in the one database they both
+/// connected to. With distinct names, pre-fix leaves `multi_db_second` in the
+/// primary database and the second database empty — which is exactly what the
+/// assertions below check, in both directions.
+#[tokio::test]
+async fn test_multi_sink_two_postgres_databases() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let second = ctx
+        .create_postgres_database("second")
+        .await
+        .expect("Failed to create second PostgreSQL database");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let records_to_produce: i64 = 10;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_primary:
+    type: postgres
+    from: kafka_source
+    table: multi_db_primary
+    schema: public
+    primary_key: id
+    on_conflict: update
+
+  pg_second:
+    type: postgres
+    from: kafka_source
+    table: multi_db_second
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(std::time::Duration::from_secs(60))
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__HOST",
+                    second.host.clone(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__PORT",
+                    second.port.to_string(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__USER",
+                    second.user.clone(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__PASS",
+                    second.password.clone(),
+                )
+                .env(
+                    "STREAMLING__POSTGRES_SINK_CONNECTIONS__PG_SECOND__DB",
+                    second.database.clone(),
+                ),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let primary_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.multi_db_primary")
+        .await
+        .expect("Failed to query the primary database");
+    assert_eq!(
+        primary_count, records_to_produce,
+        "sink on the global connection should have written {} records to database '{}'",
+        records_to_produce, ctx.pg_database
+    );
+
+    // The regression, one direction: pre-fix pg_second connected to the primary
+    // database, so its table does not exist here at all.
+    let second_count = second
+        .count("SELECT COUNT(*) FROM public.multi_db_second")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "sink with per-sink connection keys did not write to database '{}': {}",
+                second.database, e
+            )
+        });
+    assert_eq!(
+        second_count, records_to_produce,
+        "sink with per-sink connection keys should have written {} records to database '{}'",
+        records_to_produce, second.database
+    );
+
+    let second_ids: Vec<(i64,)> = second
+        .query("SELECT id FROM public.multi_db_second ORDER BY id")
+        .await
+        .expect("Failed to query ids from the second database");
+    assert_eq!(
+        second_ids.iter().map(|row| row.0).collect::<Vec<_>>(),
+        (1..=records_to_produce).collect::<Vec<_>>(),
+        "the second database should hold every record, not a subset"
+    );
+
+    // The other direction: pg_second must not have touched the primary database.
+    let leaked: Vec<(bool,)> = ctx
+        .postgres
+        .query("SELECT to_regclass('public.multi_db_second') IS NOT NULL")
+        .await
+        .expect("Failed to probe the primary database for the second sink's table");
+    assert_eq!(
+        leaked,
+        vec![(false,)],
+        "sink 'pg_second' wrote into the primary database '{}' as well",
+        ctx.pg_database
+    );
+}

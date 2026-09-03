@@ -432,13 +432,32 @@ impl TestContext {
         SqsResource::new(sqs_url, &queue_name).await
     }
 
+    /// Create an additional isolated PostgreSQL database, for tests that need a
+    /// second destination on the same cluster (e.g. two postgres sinks resolving
+    /// their own per-sink connections). Dropped when the returned resource is.
+    pub async fn create_postgres_database(&self, suffix: &str) -> Result<PostgresResource> {
+        let database = format!("test_{}_{}", &self.test_id[..8], suffix);
+        PostgresResource::new(&self.config.postgres_url, &database).await
+    }
+
     /// Create an additional Kafka topic for use in tests (e.g., for sink output)
     pub async fn create_kafka_topic(&self, topic_suffix: &str) -> Result<KafkaResource> {
+        self.create_kafka_topic_with_partitions(topic_suffix, 1)
+            .await
+    }
+
+    /// Create an additional Kafka topic with `partitions` partitions.
+    pub async fn create_kafka_topic_with_partitions(
+        &self,
+        topic_suffix: &str,
+        partitions: i32,
+    ) -> Result<KafkaResource> {
         let topic = format!("test_{}_{}", &self.test_id[..8], topic_suffix);
-        KafkaResource::new(
+        KafkaResource::new_with_partitions(
             &self.config.kafka_broker,
             &self.config.schema_registry_url,
             &topic,
+            partitions,
         )
         .await
     }
@@ -506,6 +525,42 @@ impl TestContext {
         .map_err(|_| {
             E2eError::StreamlingFailed(format!("Pipeline execution timed out after {:?}", timeout))
         })?
+    }
+
+    /// Run streamling with pipeline YAML, send SIGTERM after `signal_after`,
+    /// and require the process to exit within `exit_deadline` of the signal.
+    ///
+    /// This is the graceful-shutdown chaos harness: it asserts the process
+    /// observes SIGTERM, drains, and exits well inside the k8s grace period
+    /// instead of hanging until SIGKILL.
+    #[cfg(unix)]
+    pub async fn run_pipeline_with_sigterm(
+        &self,
+        pipeline_yaml: &str,
+        opts: PipelineOpts,
+        signal_after: std::time::Duration,
+        exit_deadline: std::time::Duration,
+    ) -> Result<ExitStatus> {
+        let pipeline_path = self.temp_dir.path().join("pipeline.yaml");
+        std::fs::write(&pipeline_path, pipeline_yaml)?;
+
+        let mut env_vars = self.build_env_vars();
+        if let Some(limit) = opts.record_limit {
+            env_vars.push((
+                "STREAMLING__NUM_RECORDS_BEFORE_STOP".to_string(),
+                limit.to_string(),
+            ));
+        }
+        env_vars.extend(opts.extra_env);
+
+        streamling::run_streamling_with_sigterm(
+            &pipeline_path,
+            self.config.streamling_bin.as_deref(),
+            &env_vars,
+            signal_after,
+            exit_deadline,
+        )
+        .await
     }
 
     /// Run streamling with pipeline YAML and capture stdout/stderr for inspection

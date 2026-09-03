@@ -277,10 +277,15 @@ impl WrappingSourceTableProvider {
                 side_outputs.clone(),
                 event_time_instrumentation.clone(),
             ));
-            let rebuilt = Arc::new(filter_exec.clone())
+            // Mark the re-applied filter/projection as source-owned: they sit
+            // ABOVE this source's `WrappingExec`, i.e. inside the downstream
+            // consumer's plan subtree, and must act as a topology boundary so
+            // their compute is not attributed to the consuming transform.
+            let rebuilt = Arc::new(filter_exec.clone().with_source_owned())
                 .with_new_children(vec![wrapped_source])
                 .and_then(|new_filter| {
-                    Arc::new(projection_exec.clone()).with_new_children(vec![new_filter])
+                    Arc::new(projection_exec.clone().with_source_owned())
+                        .with_new_children(vec![new_filter])
                 });
             match rebuilt {
                 Ok(plan) => return plan,
@@ -302,7 +307,12 @@ impl WrappingSourceTableProvider {
                 side_outputs.clone(),
                 event_time_instrumentation.clone(),
             ));
-            match Arc::new(filter_exec.clone()).with_new_children(vec![wrapped_source]) {
+            // Source-owned for the same reason as the projection+filter
+            // branch above: this filter is re-applied above the source's
+            // `WrappingExec` and must bound downstream metric aggregation.
+            match Arc::new(filter_exec.clone().with_source_owned())
+                .with_new_children(vec![wrapped_source])
+            {
                 Ok(plan) => plan,
                 Err(e) => {
                     warn!(
@@ -529,6 +539,12 @@ pub struct WrappingExec {
     backpressure_role: BackpressureRole,
 }
 
+impl crate::operators::TopologyBoundary for WrappingExec {
+    fn bounds_metric_aggregation(&self) -> bool {
+        true
+    }
+}
+
 impl WrappingExec {
     pub fn new(
         inner: Arc<dyn ExecutionPlan>,
@@ -642,6 +658,15 @@ impl WrappingExec {
     }
 }
 
+/// Wall-clock around `data.next().await` is idle-wait dominated. SQL nodes
+/// that already expose a DataFusion subtree emit per-batch compute via
+/// `record_execution_plan_metrics`; recording wall-clock too would fold
+/// idle-wait into the same `elapsed_compute` series. A passthrough SQL
+/// node with no subtree metrics keeps wall-clock as the only signal.
+fn should_record_wall_clock_compute(has_subtree_metrics: bool, is_sql_node: bool) -> bool {
+    !has_subtree_metrics || !is_sql_node
+}
+
 /// Used to intercept `execute()` calls and run additional logic like telemetry processing
 impl ExecutionPlan for WrappingExec {
     delegate! {
@@ -729,6 +754,19 @@ impl ExecutionPlan for WrappingExec {
         // this single read stays live as batches flow.
         let metrics = self.metrics();
 
+        // Static per node: resolve once per stream, not per batch. SQL
+        // transforms get accurate per-batch compute from the DataFusion
+        // subtree delta; the wall-clock span below is measured around
+        // `data.next().await` (dominated by upstream idle-wait) and would
+        // pollute the same `elapsed_compute` series for them. When the
+        // subtree exposes NO metrics at all (e.g. a passthrough transform
+        // whose input is directly the upstream topology boundary), the delta
+        // path can never emit, so wall-clock stays on as the only available
+        // signal rather than leaving the series dead.
+        let record_wall_clock_compute = should_record_wall_clock_compute(
+            metrics.is_some(),
+            metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
+        );
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
         let backpressure_role = self.backpressure_role.clone();
@@ -819,6 +857,14 @@ impl ExecutionPlan for WrappingExec {
                                 Duration::from_millis(starved_ms),
                                 &metric_metadata_id,
                             );
+                        } else if record_wall_clock_compute {
+                            // No whole starved millisecond this batch: keep #85's
+                            // wall-clock path for non-SQL / passthrough SQL so
+                            // sub-ms compute isn't dropped entirely.
+                            metrics_recorder.record_elapsed_compute(
+                                batch_elapsed,
+                                &metric_metadata_id,
+                            );
                         }
 
                         // Process telemetry
@@ -826,7 +872,7 @@ impl ExecutionPlan for WrappingExec {
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
                             RowCountMeasurementType::OutputRowCount,
-                            metrics.clone(),
+                            metrics.as_ref(),
                         );
 
                         // Record checkpoint marker arrival time for transforms
@@ -980,7 +1026,7 @@ impl DataSink for WrappingDataSink {
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
                             RowCountMeasurementType::InputRowCount,
-                            metrics.clone(),
+                            metrics.as_ref(),
                         );
 
                         // End-to-end freshness at sink ingress. Same code
@@ -1317,6 +1363,22 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn sql_with_subtree_metrics_suppresses_wall_clock() {
+        assert!(!should_record_wall_clock_compute(true, true));
+    }
+
+    #[test]
+    fn sql_passthrough_without_subtree_metrics_keeps_wall_clock() {
+        assert!(should_record_wall_clock_compute(false, true));
+    }
+
+    #[test]
+    fn non_sql_always_records_wall_clock() {
+        assert!(should_record_wall_clock_compute(true, false));
+        assert!(should_record_wall_clock_compute(false, false));
+    }
+
     #[derive(Debug)]
     struct CountingSideOutput {
         rows_seen: Arc<AtomicUsize>,
@@ -1395,20 +1457,33 @@ mod tests {
         );
 
         // Order must be projection -> filter -> wrapper -> source, so side
-        // outputs / event-time observe every pre-filter row (R7).
+        // outputs / event-time observe every pre-filter row (R7). Both
+        // rebuilt nodes must keep the source-owned topology-boundary mark.
+        let rebuilt_proj = result
+            .downcast_ref::<StreamingProjectionExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected top-level plan to be StreamingProjectionExec, got: {}",
+                    result.name()
+                )
+            });
         assert!(
-            result.downcast_ref::<StreamingProjectionExec>().is_some(),
-            "Expected top-level plan to be StreamingProjectionExec, got: {}",
-            result.name()
+            rebuilt_proj.is_source_owned(),
+            "rebuilt source projection must stay a topology boundary"
         );
         let proj_children = result.children();
         assert_eq!(proj_children.len(), 1);
+        let rebuilt_filter = proj_children[0]
+            .downcast_ref::<StreamingFilterExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected projection's child to be StreamingFilterExec, got: {}",
+                    proj_children[0].name()
+                )
+            });
         assert!(
-            proj_children[0]
-                .downcast_ref::<StreamingFilterExec>()
-                .is_some(),
-            "Expected projection's child to be StreamingFilterExec, got: {}",
-            proj_children[0].name()
+            rebuilt_filter.is_source_owned(),
+            "rebuilt source filter must stay a topology boundary after with_new_children"
         );
         let filter_children = proj_children[0].children();
         assert_eq!(filter_children.len(), 1);
@@ -1449,10 +1524,17 @@ mod tests {
         );
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
+        let rebuilt_filter = result
+            .downcast_ref::<StreamingFilterExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected top-level plan to be StreamingFilterExec, got: {}",
+                    result.name()
+                )
+            });
         assert!(
-            result.downcast_ref::<StreamingFilterExec>().is_some(),
-            "Expected top-level plan to be StreamingFilterExec, got: {}",
-            result.name()
+            rebuilt_filter.is_source_owned(),
+            "wrap reconstruction must keep the source-owned topology boundary"
         );
 
         // Its child should be WrappingExec (side outputs run before the filter)
@@ -2008,12 +2090,13 @@ mod tests {
     /// `starved` carries the sub-ms remainder (via `MillisAccumulator`), so if
     /// `elapsed_compute` instead floors each batch independently it drops that
     /// remainder and its input-wait portion falls *below* `starved` — exactly
-    /// the case the accumulator was meant to fix. `elapsed_compute` also carries
-    /// a deterministic 1ms-per-Ok-batch seed (`record_execution_plan_metrics`
-    /// keeps the histogram series alive), so the invariant is:
+    /// the case the accumulator was meant to fix. This node is a non-SQL source
+    /// with no subtree metrics, so `elapsed_compute` is only the folded
+    /// input-wait (series existence is seeded once per node at pipeline start,
+    /// not per batch):
     ///
     /// ```text
-    /// elapsed_compute == starved (folded input-wait) + 1ms * num_ok_batches (seed)
+    /// elapsed_compute == starved (folded input-wait)
     /// ```
     ///
     /// Both series derive from the same integer whole-ms drains, so this holds
@@ -2029,10 +2112,7 @@ mod tests {
         let node_id = "busy_quantization_source";
         test_support::init_recorder_with_node(node_id);
 
-        // Each Ok batch seeds exactly 1ms into elapsed_compute (see
-        // `record_execution_plan_metrics`), independent of the folded input-wait.
         const NUM_BATCHES: u64 = 30;
-        const SEED_MS_PER_BATCH: u64 = 1;
 
         let schema = test_schema();
         // Each batch carries a fractional-ms input wait (~1.5ms). Per-batch
@@ -2074,16 +2154,12 @@ mod tests {
             "expected real starvation to be recorded, got starved={starved}ms"
         );
         // Folded input-wait must equal `starved` exactly (identical
-        // quantization), so `elapsed_compute` is just that plus the per-batch
-        // seed. This keeps `busy = elapsed_compute - starved` == pure compute
-        // (here only the seed), never corrupted by dropped sub-ms remainders.
-        let expected = starved + NUM_BATCHES * SEED_MS_PER_BATCH;
+        // quantization). This keeps `busy = elapsed_compute - starved` == pure
+        // compute (here 0), never corrupted by dropped sub-ms remainders.
         assert_eq!(
-            elapsed_compute,
-            expected,
-            "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms) + seed \
-             ({}ms); a mismatch means the input-wait fold used a different quantization than starved",
-            NUM_BATCHES * SEED_MS_PER_BATCH
+            elapsed_compute, starved,
+            "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms); \
+             a mismatch means the input-wait fold used a different quantization than starved"
         );
     }
 
@@ -2214,5 +2290,105 @@ mod tests {
             starved_span_for_poll(&Some(Err::<(), ()>(())), waited),
             Duration::ZERO
         );
+    }
+
+    /// Records every row the inner sink actually receives.
+    #[derive(Debug)]
+    struct RecordingSink {
+        schema: SchemaRef,
+        ids_written: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    impl DisplayAs for RecordingSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "RecordingSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for RecordingSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            mut data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut rows = 0u64;
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column");
+                let mut written = self.ids_written.lock().unwrap();
+                for i in 0..batch.num_rows() {
+                    written.push(ids.value(i));
+                }
+                rows += batch.num_rows() as u64;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// Pushes one batch holding two rows that share primary key `1` through a
+    /// `WrappingDataSink` built with `primary_key`, and returns the ids that
+    /// reached the inner sink.
+    async fn ids_reaching_sink(primary_key: Option<String>) -> Vec<i64> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ]));
+        // Two deltas for one key: a retraction and the addition replacing it.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1])),
+                Arc::new(Int64Array::from(vec![-150i64, 120])),
+            ],
+        )
+        .unwrap();
+
+        let ids_written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = WrappingDataSink::new(
+            Arc::new(RecordingSink {
+                schema: schema.clone(),
+                ids_written: ids_written.clone(),
+            }),
+            "test_sink".to_string(),
+            primary_key,
+            None,
+        );
+
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        sink.write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+
+        let ids = ids_written.lock().unwrap();
+        ids.clone()
+    }
+
+    #[tokio::test]
+    async fn a_primary_key_collapses_rows_sharing_it() {
+        // Upsert semantics: only the latest state of key 1 is written.
+        assert_eq!(ids_reaching_sink(Some("id".to_string())).await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn no_primary_key_passes_every_row_through() {
+        // What `deduplicate: false` buys the ClickHouse/Postgres/Kafka sinks:
+        // both delta rows land instead of one silently disappearing.
+        assert_eq!(ids_reaching_sink(None).await, vec![1, 1]);
     }
 }

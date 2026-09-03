@@ -11,16 +11,9 @@
 
 ```
 
-Streamling is a columnar streaming runtime for real-time and historical processing, with a highly efficient plugin system. 
+Streamling is a columnar streaming runtime for real-time and historical data processing, extended through dynamically linked plugins.
 
-The runtime provides:
-
-- Performance in high-throughput (millions of rows per second) real-time filtering and enrichment scenarios like trading or gaming
-- Decoupled runtime vs logic. User code can be developed and deployed on a separate lifecycle, making drift easy to manage
-- At-least-once consistency through a checkpointing system 
-- Fast startup and operational ease. Checkpoint state can be kept any postgres database 
-
-Streamling powers [Goldsky Turbo](https://goldsky.com/products/turbo-pipelines), and runs vital production workloads that provide real-time data to banks, hedge funds, prediction markets, and more. 
+It powers [Goldsky Turbo](https://goldsky.com/products/turbo-pipelines), where thousands of user-created pipelines run in production for banks, hedge funds, and prediction markets.
 
 Install with one command (see [Quick start](#quick-start)) or read more at [streamling.dev](https://streamling.dev).
 
@@ -45,13 +38,12 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 
 ## Why Streamling
 
-Streamling enables teams to build and deploy custom sources, transforms, sinks, and UDFs through plugins without sacrificing performance or correctness. It's also meant to be highly efficient. 
+- **Plugin system on a columnar data plane.** Custom sources, transforms, and sinks are separate Rust crates dynamically linked at runtime. No forking or recompiling the engine. Every stage exchanges Arrow RecordBatches and processes millions of rows per second on one node. In [benchmarks against Flink](https://www.streamling.dev/blog/streamling-0-3-0), Streamling delivered roughly 40x the throughput per GB of memory on a Kafka workload.
+- **Transactional correctness.** At-least-once delivery through checkpointing. Checkpoint state lives in any Postgres database.
+- **Declarative pipelines, built-in connectors.** Define topologies in YAML. Kafka, Postgres, ClickHouse, files, and webhooks ship in a single binary with fast startup.
+- **Lean in production.** Allocator and Arrow-native decode work cut one customer workload writing million-row batches into ClickHouse from 31 GB of memory to 4 GB.
 
-Many other streaming frameworks can be extended like libaries (include, extend, compile) for higher performance or through external services and API endpoints. The intent behind Streamling is that to extend, you would write plugins and dynamically link them in instead of compiling, reducing the operational complexity. 
-
-Plugins are created as separate rust crates that are compiled and linked in at runtime. Users reuse them through a declarative YAML format for the precise solution. They have minimal overhead and have similiar efficiency to embedding code into the codebase despite the FFI boundary in real-world scenarios.
-
-A pipeline has three sections: `sources`, `transforms`, and `sinks`. Every node exchanges Arrow RecordBatches. Built-in connectors cover Kafka, Postgres, ClickHouse, webhooks, and WASM scripts; anything else can be a [plugin](#plugin-system).
+A pipeline has three sections: `sources`, `transforms`, and `sinks`.
 
 ```yaml
 sources:
@@ -77,20 +69,18 @@ sinks:
 
 **Streamling is a good fit when you need to:**
 
-- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline. The runtime enforces checkpointing, schema validation, and delivery guarantees around your code
-- **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source that emits data over time
-- **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in a single topology, all exchanging Arrow `RecordBatch`es
-- **Move data with minimal overhead**: Kafka, Postgres, ClickHouse, files, and webhooks. 
-- **Run bounded batch jobs** With the same logic as real-time and handle upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
-
-Use Streamling when you need a streaming engine to process continuously arriving data in order through a defined pipeline, not a distributed shuffle or windowed aggregation engine.
+- **Write your own operators and reuse them**: implement a source, transform, or sink once in Rust (or a transform in WASM/TypeScript), then drop it into any pipeline with runtime-enforced checkpointing and schema validation
+- **Run ongoing data processes** over continuous ordered inputs: event streams, database changelogs, polled APIs, or any plugin source
+- **Build multi-stage flows on one columnar data plane**: plugins, SQL, WASM, HTTP enrichment, and [dynamic tables](#dynamic-tables) chained in one topology, all exchanging Arrow `RecordBatch`es
+- **Move data with built-in connectors**: Kafka, Postgres, ClickHouse, files, and webhooks
+- **Run bounded batch jobs** with the same logic as real-time pipelines, including upserts (INSERT/UPDATE/DELETE via `_gs_op`) into Postgres or ClickHouse
 
 **Streamling is probably not the right fit when you need:**
 
-- **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes aren't supported today, but can be done through custom plugins
-- **A library to embed**: it's a standalone runtime you deploy and configure, not a crate you wire into your codebase
+- **Distributed stateful processing**: cross-partition joins, windowed aggregations, and coordinated checkpointing across nodes (custom plugins can cover some of these)
+- **An embeddable library**: Streamling is a standalone runtime you deploy and configure
 
-Streamling runs as a **single-node engine**. It can scale horizontally via Kafka consumer groups and multiple independent instances. Each instance checkpoints and progresses on its own.
+Streamling is a single-node engine. Scale horizontally with Kafka consumer groups and independent instances, each checkpointing on its own.
 
 ## Quick start
 
@@ -665,6 +655,9 @@ sinks:
 
 The PostgreSQL sink allows writing data to PostgreSQL tables. It create sink table automically.
 
+When a `primary_key` is set, each batch is collapsed to the latest row per key before writing; set `deduplicate: false`
+to disable that (see `Batch Deduplication` below).
+
 Sample configuration:
 
 ```yaml
@@ -687,6 +680,18 @@ sinks:
 | `STREAMLING__POSTGRES_SINK__DB` | `postgres` | Database name |
 | `STREAMLING__POSTGRES_SINK__SSLMODE` | `disable` | SSL mode (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`) |
 
+**Per-sink connections** — two `postgres` sinks in one pipeline can write to two
+different databases. Prefix a sink's connection with
+`STREAMLING__POSTGRES_SINK_CONNECTIONS__<SINK_NAME>__`, where `<SINK_NAME>` is
+the sink's key in `sinks:` with non-alphanumeric characters replaced by `_`; any
+field left unset falls back to the table above, and a sink with no entry uses it
+verbatim. For the sample above:
+
+```
+STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_BLOCKS__HOST=blocks.example.com
+STREAMLING__POSTGRES_SINK_CONNECTIONS__POSTGRES_BLOCKS__DB=blocks
+```
+
 Behavior for 256-bit integers (U256/I256):
 
 - Columns annotated as U256/I256 in the Arrow schema (FixedSizeBinary(32) with Streamling metadata) are created in Postgres as `NUMERIC(78,0)`.
@@ -698,6 +703,8 @@ Behavior for 256-bit integers (U256/I256):
 The PostgreSQL aggregation sink enables real-time aggregations directly in PostgreSQL using database triggers. Data flows into a landing table, and a trigger function automatically maintains aggregated values in a separate aggregation table.
 
 - **Landing Table**: Stores raw records in append-only mode with a composite primary key (`primary_key` + `_gs_op`).
+- **Deduplication**: each batch is collapsed to the latest row per `primary_key` before it reaches the landing table;
+  set `deduplicate: false` to disable that (see `Batch Deduplication` below).
 - **Aggregation Table**: Stores aggregated results, updated incrementally by the trigger.
 - **Operation Handling**: For `sum`, `count`, and `avg`, delete operations negate values. `count` also correctly handles updates (contributes 0 to the count). `min` and `max` do not support deletes or updates (use only for insert-only streams).
 
@@ -833,6 +840,8 @@ implemented as a custom DataFusion Table Provider (`TableProvider`) with the fol
   - Converts Arrow `RecordBatch`es to Avro-encoded messages.
   - Adds operation type column (`_gs_op`) to track INSERT/UPDATE/DELETE operations (see `Upsert Semantics` section
     below) as a message header with the `dbz.op` key.
+- **Deduplication**: when a `primary_key` is set, each batch is collapsed to the latest row per key before it is
+  produced; set `deduplicate: false` to disable that (see `Batch Deduplication` below). Message keying is unaffected.
 
 Kafka Sink uses
 high-level [FutureProducer](https://docs.rs/rdkafka/latest/rdkafka/producer/future_producer/struct.FutureProducer.html)
@@ -869,7 +878,9 @@ sinks:
 The ClickHouse sink writes records to a ClickHouse table over the HTTP interface. The destination table must already exist; the sink reads its schema and sorting keys at startup rather than creating the table.
 
 - **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
-- **Compression**: INSERT request bodies can be gzip-compressed. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
+- **Compression**: INSERT request bodies are compressed with zstd by default. gzip and lz4 are also available. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
+- **Deduplication**: each batch is collapsed to the latest row per `primary_key` before writing. Set `deduplicate: false` for append-only tables whose rows are deltas rather than states (e.g. `SummingMergeTree`) — see `Batch Deduplication` below.
+- **Batching**: `batch_size` rows are accumulated per INSERT, flushed early after `batch_flush_interval`. Both are optional per sink and fall back to `clickhouse_sink.batch_size` (100000) and `clickhouse_sink.batch_flush_interval` (`1s`). Larger batches dominate ClickHouse INSERT throughput — 100k rows measured ~12x the rows/s of a 1k batch on row-heavy backfills — so lower them only for latency-sensitive or memory-constrained pipelines. `parallelism` splits each batch into that many concurrent INSERTs of `batch_size / parallelism` rows.
 
 Sample configuration:
 
@@ -891,8 +902,10 @@ sinks:
 | `STREAMLING__CLICKHOUSE_SINK__USER` | `default` | Username |
 | `STREAMLING__CLICKHOUSE_SINK__PASSWORD` | _(empty)_ | Password |
 | `STREAMLING__CLICKHOUSE_SINK__DATABASE` | `default` | Database name |
-| `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `none` | Wire compression for INSERTs (`none` or `gzip`); the per-sink `compression` field overrides it |
+| `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `zstd` | Wire compression for INSERTs (`none`, `gzip`, `zstd`, or `lz4`); the per-sink `compression` field overrides it |
 | `STREAMLING__CLICKHOUSE_SINK__COMPRESSION_LEVEL` | `6` | gzip compression level (0–9); ignored unless compression resolves to `gzip` |
+| `STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE` | `100000` | Rows per INSERT for sinks that omit `batch_size`; the per-sink field overrides it |
+| `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL` | `1s` | Flush interval for sinks that omit `batch_flush_interval`; the per-sink field overrides it |
 
 ## Dynamic Tables
 
@@ -982,12 +995,23 @@ transforms:
     backend_type: Postgres
     backend_entity_name: persistent_data
     time_column: updated_at
+    # Optional: how long to trust the cache before re-checking table freshness
+    # (`SELECT MAX(time_column)`). When omitted (and unset globally), a 1000ms
+    # default applies; 0 re-checks on every batch — one database round trip per
+    # batch. Raising it trades staleness for round trips: rows written by OTHER
+    # writers may be missed for up to this long, while this pipeline's own
+    # writes stay visible immediately.
+    cache_refresh_debounce_ms: 5000
 ```
 
 The cache is off by default and is used only when both settings are present. The initial lookup
 loads the full table through bounded PostgreSQL cursor pages. Each later `dynamic_table_check`
 batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
 column so these checks and range reads stay cheap.
+
+Configs that omit the setting entirely — including ones written before it existed — get the
+built-in 1000ms default on upgrade. Set `cache_refresh_debounce_ms: 0` (globally or per
+transform) to restore the pre-debounce re-check-on-every-batch behavior.
 
 PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
 existing membership, including removals, is not supported in this mode. Keeping `time_column` current
@@ -1431,6 +1455,32 @@ By default, DataFusion passes data in a columnar format using `RecordBatch` with
 So, in order to support upsert semantics, an additional `_gs_op` column is added to the schema. Unfortunately, this
 comes with some challenges mentioned in https://github.com/goldsky-io/streamling/pull/2.
 
+### Batch Deduplication
+
+Every sink configured with a `primary_key` — Postgres, Kafka and ClickHouse — collapses each
+batch to the **latest row per key** before writing it. Only the newest state of a row matters to an upsert, so this
+saves redundant writes. Sinks with no primary key never deduplicate.
+
+That assumption breaks when rows are **deltas rather than states**. Delta rows are meant to accumulate, so several
+of them legitimately share a key and every one has to be written — a retraction and its addition, or two different
+entities rolling up to the same aggregate key. Collapsing them silently drops rows and the destination drifts. Set
+`deduplicate: false` on those sinks:
+
+```yaml
+sinks:
+  revenue_rollup:
+    type: clickhouse
+    from: revenue_deltas
+    table: product_revenue_daily
+    primary_key: revenue_date,product_id,currency
+    append_only_mode: false
+    deduplicate: false
+```
+
+The primary key still drives everything else it is used for — `ALTER TABLE ... DELETE` keying and `CREATE TABLE`
+ordering in ClickHouse, `ON CONFLICT` targeting in Postgres, message keying in Kafka. `deduplicate: false` turns off
+the batch collapse and nothing else.
+
 ## Plugin System
 
 ### Overview
@@ -1741,6 +1791,15 @@ plugin:
     my_preprocessor:
       key: value
 ```
+
+Preprocessors run in the configured order. An id that is not registered by the
+loaded plugin bundle is skipped with a warning. This allows shared configuration
+to add preprocessors without breaking older images that do not include them.
+Under `--validate`, the warning appears in the JSON `warnings` array.
+
+A pipeline that depends on a skipped preprocessor may still fail later when its
+topology is validated. Missing-plugin errors list the ids available in the loaded
+bundle to make version mismatches easier to diagnose.
 
 #### Side Output Trait
 

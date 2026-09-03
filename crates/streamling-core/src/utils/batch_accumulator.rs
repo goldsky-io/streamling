@@ -313,9 +313,26 @@ pub fn merge_batches(
     }
 }
 
+/// How far to shift one stream's flush timer so that accumulators created
+/// together — one per partition, or one per fan-out sink — spread their flushes
+/// evenly across the interval instead of firing on the same tick.
+///
+/// `tokio::time::interval` is anchored to creation time, not to the last flush,
+/// so without this every stream started at the same moment keeps flushing on the
+/// same grid for the life of the job. Each flush merges, copies and serializes a
+/// full `batch_size` batch, so simultaneous flushes stack those peaks into one
+/// memory spike.
+fn flush_stagger(interval: Duration, position: usize, total: usize) -> Duration {
+    if total <= 1 || position >= total {
+        return Duration::ZERO;
+    }
+    interval.mul_f64(position as f64 / total as f64)
+}
+
 pub struct AsyncBatchAccumulator {
     accumulator: BatchAccumulator,
     batch_flush_interval: Option<Duration>,
+    flush_stagger: Duration,
     name: String,
 }
 
@@ -324,12 +341,24 @@ impl AsyncBatchAccumulator {
         Self {
             accumulator: BatchAccumulator::new(batch_size, batch_flush_interval),
             batch_flush_interval,
+            flush_stagger: Duration::ZERO,
             name: String::new(),
         }
     }
 
     pub fn with_name(mut self, name: String) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Offsets this stream's flush timer by its share of the interval, so
+    /// concurrent streams don't flush in lockstep — see [`flush_stagger`].
+    /// `position` is this stream's index among `total` streams sharing the sink.
+    pub fn with_flush_stagger(mut self, position: usize, total: usize) -> Self {
+        self.flush_stagger = self
+            .batch_flush_interval
+            .map(|interval| flush_stagger(interval, position, total))
+            .unwrap_or_default();
         self
     }
 
@@ -385,7 +414,10 @@ impl AsyncBatchAccumulator {
 
             if let Some(interval) = self.batch_flush_interval {
                 // Time + size based flushing
-                let mut timer = tokio::time::interval(interval);
+                let mut timer = tokio::time::interval_at(
+                    tokio::time::Instant::now() + self.flush_stagger,
+                    interval,
+                );
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
@@ -952,6 +984,59 @@ mod tests {
             .expect("Batch should not be an error");
 
         assert_eq!(first_batch.num_rows(), 5);
+    }
+
+    #[test]
+    fn test_flush_stagger_spreads_streams_across_the_interval() {
+        let interval = Duration::from_secs(10);
+
+        assert_eq!(flush_stagger(interval, 0, 3), Duration::ZERO);
+        assert_eq!(flush_stagger(interval, 1, 3), interval.mul_f64(1.0 / 3.0));
+        assert_eq!(flush_stagger(interval, 2, 3), interval.mul_f64(2.0 / 3.0));
+
+        // A lone stream has nothing to spread against, and an out-of-range
+        // position must not shift the timer past the interval.
+        assert_eq!(flush_stagger(interval, 0, 1), Duration::ZERO);
+        assert_eq!(flush_stagger(interval, 3, 3), Duration::ZERO);
+        assert_eq!(flush_stagger(interval, 0, 0), Duration::ZERO);
+    }
+
+    /// Without staggering, every accumulator started together flushes on the
+    /// same grid and their merge/copy/encode peaks stack. Position 1 of 2 must
+    /// shift this stream's grid by half an interval.
+    #[tokio::test]
+    async fn test_flush_stagger_shifts_the_time_flush_grid() {
+        let interval = Duration::from_millis(200);
+        let accumulator =
+            AsyncBatchAccumulator::new(1_000_000, Some(interval)).with_flush_stagger(1, 2);
+
+        // One small batch, then silence: only the timer can flush it.
+        let input = Box::pin(stream::unfold(0, |state| async move {
+            match state {
+                0 => Some((Ok(create_test_batch(5)), 1)),
+                _ => {
+                    sleep(Duration::from_secs(10)).await;
+                    None
+                }
+            }
+        }));
+        let mut output = Box::pin(accumulator.process_stream(input));
+
+        // Unstaggered this flushes at one interval (200ms); offset by half an
+        // interval its first flush cannot land before 300ms.
+        assert!(
+            timeout(Duration::from_millis(250), output.next())
+                .await
+                .is_err(),
+            "staggered stream flushed on the unstaggered grid"
+        );
+
+        let batch = timeout(Duration::from_secs(2), output.next())
+            .await
+            .expect("staggered flush must still arrive one interval after the offset")
+            .expect("stream should produce a batch")
+            .expect("batch should not be an error");
+        assert_eq!(batch.num_rows(), 5);
     }
 
     #[tokio::test]

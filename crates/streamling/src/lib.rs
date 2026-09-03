@@ -1,9 +1,11 @@
 use arrow_schema::SchemaRef;
 use datafusion::arrow::datatypes::ArrowNativeType;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::{ViewTable, provider_as_source};
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, dml::InsertOp};
+use datafusion::physical_plan::{collect, displayable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -46,6 +48,7 @@ use streamling_core::dynamic_table::{
 pub use streamling_core::operators;
 use streamling_core::operators::pg_aggregation::PostgresAggregator;
 use streamling_core::operators::rebatch::{RebatchConfig, RebatchNode};
+use streamling_core::operators::repartition::{Placement, RepartitionNode};
 use streamling_core::operators::scan_sharing::SharedSourceRegistry;
 use streamling_core::operators::wrapping::{WrappingNode, WrappingSourceTableProvider};
 
@@ -63,12 +66,12 @@ use streamling_core::plugin::side_output::{
 };
 use streamling_core::plugin::table_provider::{PluginSinkProvider, PluginSourceProvider};
 use streamling_core::plugin::{
-    ExecutionFuture, InitializedPlugin, create_sink_plugin, create_source_plugin,
-    create_transform_plugin, terminate_all_plugins,
+    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, ExecutionFuture, InitializedPlugin,
+    create_sink_plugin, create_source_plugin, create_transform_plugin, terminate_all_plugins,
 };
 use streamling_core::side_output::SupportsSideOutputs;
 use streamling_core::sql_parse::extract_table_references_from_sql;
-use streamling_core::telemetry::recorder::initialize_metrics_recorder;
+use streamling_core::telemetry::recorder::{get_metrics_recorder, initialize_metrics_recorder};
 use streamling_state::{StateBackendFactories, StateOperatorBackendFactory};
 
 /// Represents the source of a primary key definition
@@ -443,16 +446,303 @@ struct SinkEntry {
     name: String,
     provider: Arc<dyn TableProvider>,
     rebatch_config: RebatchConfig,
+    /// How this sink's rows must be spread across its write streams. Keyed for
+    /// order-sensitive sinks (upsert/delete, keep-last dedup), round-robin for
+    /// sinks that neither dedupe nor depend on ordering, single for sinks that
+    /// cannot write from more than one stream at all.
+    placement: Placement,
+    /// Number of concurrent write streams requested by the sink's `parallelism`.
+    parallelism: Option<usize>,
 }
 
 impl SinkEntry {
-    fn new(name: String, provider: Arc<dyn TableProvider>, rebatch_config: RebatchConfig) -> Self {
+    fn new(
+        name: String,
+        provider: Arc<dyn TableProvider>,
+        rebatch_config: RebatchConfig,
+        placement: Placement,
+        parallelism: Option<usize>,
+    ) -> Self {
         Self {
             name,
             provider,
             rebatch_config,
+            placement,
+            parallelism,
         }
     }
+}
+
+/// Validates every node's `parallelism` and returns the highest value declared.
+///
+/// There is deliberately no upper bound: the session's `target_partitions` is
+/// raised to whatever the topology asks for, so the same pipeline definition
+/// behaves the same on any machine. Node types that are structurally single-stream
+/// are rejected outright rather than silently clamped, so the config stays honest
+/// about what it will get.
+fn validate_parallelism(topology: &PipelineTopology) -> Result<usize> {
+    let mut max_declared = 1;
+
+    let mut check = |kind: &str, name: &str, parallelism: Option<usize>| -> Result<()> {
+        let Some(parallelism) = parallelism else {
+            return Ok(());
+        };
+        if parallelism == 0 {
+            streamling_user_bail!("{kind} '{name}': parallelism must be at least 1");
+        }
+        max_declared = max_declared.max(parallelism);
+        Ok(())
+    };
+
+    for (name, source) in &topology.sources {
+        check("source", name, source.parallelism())?;
+        if let topology::Source::file(file) = source
+            && file.parallelism.is_some_and(|p| p > 1)
+            && matches!(file.mode, topology::FileSourceMode::Continuous { .. })
+        {
+            streamling_user_bail!(
+                "source '{name}': a continuous file source is single-stream (one \
+                 watermark cursor and one checkpoint drain point) and cannot run \
+                 with parallelism > 1; use mode: bounded to read in parallel"
+            );
+        }
+    }
+    for (name, transform) in &topology.transforms {
+        check("transform", name, transform.parallelism())?;
+    }
+    for (name, sink) in &topology.sinks {
+        check("sink", name, sink.parallelism())?;
+    }
+
+    Ok(max_declared)
+}
+
+/// Decides the shared partitioning for a fan-out group of sinks.
+///
+/// Every sink in the group reads the same broadcast, so one exchange has to
+/// serve all of them and it can only be keyed one way:
+///
+/// - all key-sensitive sinks agree on a key → exchange on it, and the group runs
+///   as wide as the input (or as wide as the widest declared `parallelism`);
+/// - no key-sensitive sinks → any placement works, so the group only gets an
+///   exchange if one of them asked to be wider than its input;
+/// - the sinks disagree → no single placement is correct for all of them, so the
+///   group runs on one stream, which is what it did before it could be parallel.
+///
+/// A sink that cannot be parallelized at all short-circuits this: `MultiSinkExec`
+/// spawns one `write_all` per input partition per sink, so the only way to hold
+/// that sink to one write stream is to narrow the whole group.
+fn wrap_multi_sink_with_repartition(
+    plan: LogicalPlan,
+    sinks: &[SinkEntry],
+    group_name: &str,
+) -> LogicalPlan {
+    let single_stream_sinks: Vec<&str> = sinks
+        .iter()
+        .filter(|entry| matches!(entry.placement, Placement::Single))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if !single_stream_sinks.is_empty() {
+        warn!(
+            "sinks [{}] share one input, but [{}] cannot write from more than one stream; \
+             running the whole group on a single stream, since they all read one exchange",
+            group_name,
+            single_stream_sinks.join(", ")
+        );
+        return wrap_with_repartition(plan, &Placement::Single, None, group_name.to_string());
+    }
+
+    let mut key_sets: Vec<&Vec<String>> = sinks
+        .iter()
+        .filter_map(|entry| match &entry.placement {
+            Placement::ByKey(columns) if !columns.is_empty() => Some(columns),
+            _ => None,
+        })
+        .collect();
+    key_sets.sort();
+    key_sets.dedup();
+
+    let parallelism = sinks.iter().filter_map(|entry| entry.parallelism).max();
+
+    match key_sets.as_slice() {
+        // Round-robin serves every sink here, since none of them cares which
+        // stream a row lands on.
+        [] => wrap_with_repartition(
+            plan,
+            &Placement::RoundRobin,
+            parallelism,
+            group_name.to_string(),
+        ),
+        [keys] => wrap_with_repartition(
+            plan,
+            &Placement::ByKey((*keys).clone()),
+            parallelism,
+            group_name.to_string(),
+        ),
+        _ => {
+            warn!(
+                "sinks [{}] share one input but declare different primary keys ({}); \
+                 running them on a single stream, since one exchange cannot key for all of them",
+                group_name,
+                key_sets
+                    .iter()
+                    .map(|keys| keys.join("+"))
+                    .collect::<Vec<_>>()
+                    .join(" vs ")
+            );
+            wrap_with_repartition(
+                plan,
+                &Placement::RoundRobin,
+                Some(1),
+                group_name.to_string(),
+            )
+        }
+    }
+}
+
+/// Inserts a transform's exchange at its *input* — directly above the scan of
+/// the upstream node it reads.
+fn wrap_transform_input_with_repartition(
+    sql_plan: LogicalPlan,
+    source_name: &str,
+    placement: &Placement,
+    parallelism: usize,
+    name: &str,
+) -> Result<LogicalPlan> {
+    let mut wrapped = 0;
+    let plan = sql_plan
+        .transform_up(|node| {
+            let reads_upstream = matches!(
+                &node,
+                LogicalPlan::TableScan(scan) if scan.table_name.table() == source_name
+            );
+            if !reads_upstream {
+                return Ok(Transformed::no(node));
+            }
+            wrapped += 1;
+            Ok(Transformed::yes(wrap_with_repartition(
+                node,
+                placement,
+                Some(parallelism),
+                name.to_string(),
+            )))
+        })
+        .map(|transformed| transformed.data)?;
+
+    if wrapped == 0 {
+        streamling_user_bail!(
+            "{name}: cannot apply parallelism {parallelism}, the transform's SQL \
+             has no scan of its source '{source_name}'"
+        );
+    }
+    Ok(plan)
+}
+
+fn pk_columns(pk_metadata: &Option<PrimaryKeyMetadata>) -> Vec<String> {
+    pk_metadata
+        .as_ref()
+        .map(|pk| pk.columns.clone())
+        .unwrap_or_default()
+}
+
+/// Wraps `plan` in a sink-edge hash exchange when the sink needs one.
+///
+/// A sink with a primary key needs all rows of a key on one write stream; a sink
+/// asking for N streams needs the exchange to produce them. With neither, the
+/// plan is returned untouched and the sink simply inherits its input's width.
+/// The planner elides the node when the input already satisfies the placement.
+/// How a `script` transform's INPUT should be placed across streams.
+#[derive(Debug, PartialEq)]
+struct ScriptInputPlacement {
+    placement: Placement,
+    /// Declared key columns the script produces rather than receives, if those
+    /// are what forced a different placement. Reported so the caller can warn.
+    generated_columns: Vec<String>,
+    /// True when placement fell back to the upstream node's own key.
+    used_upstream_key: bool,
+}
+
+/// Chooses how a `script` transform's INPUT is placed across streams.
+///
+/// A script's `primary_key` describes its OUTPUT — the columns the script
+/// produces, declared in its own `schema` block — so those columns need not
+/// exist upstream. Keying the input exchange by them fails planning ("cannot
+/// partition by primary key column '<c>', which is not in the input schema")
+/// for any script whose key includes a generated column.
+///
+/// Preference order:
+///
+/// 1. the script's own key, when every column is genuinely available upstream
+///    (the common `primary_key: id` pass-through — placement unchanged);
+/// 2. otherwise the **upstream node's** key, which by construction describes the
+///    schema this exchange is actually placing, so rows of one entity still land
+///    on one stream and per-key ordering survives the transform;
+/// 3. round-robin only when neither key is usable.
+///
+/// Falling straight to round-robin would scatter an entity's rows across
+/// streams, so step 2 keeps the useful property that step 1 was reaching for.
+fn script_input_placement(
+    key_columns: &[String],
+    upstream_key_columns: Option<&[String]>,
+    input_field_names: &[String],
+) -> ScriptInputPlacement {
+    let resolvable =
+        |cols: &[String]| !cols.is_empty() && cols.iter().all(|c| input_field_names.contains(c));
+
+    if resolvable(key_columns) {
+        return ScriptInputPlacement {
+            placement: Placement::ByKey(key_columns.to_vec()),
+            generated_columns: Vec::new(),
+            used_upstream_key: false,
+        };
+    }
+
+    let generated_columns: Vec<String> = key_columns
+        .iter()
+        .filter(|c| !input_field_names.contains(c))
+        .cloned()
+        .collect();
+
+    match upstream_key_columns {
+        Some(upstream) if resolvable(upstream) => ScriptInputPlacement {
+            placement: Placement::ByKey(upstream.to_vec()),
+            generated_columns,
+            used_upstream_key: true,
+        },
+        _ => ScriptInputPlacement {
+            placement: Placement::RoundRobin,
+            generated_columns,
+            used_upstream_key: false,
+        },
+    }
+}
+
+fn wrap_with_repartition(
+    plan: LogicalPlan,
+    placement: &Placement,
+    parallelism: Option<usize>,
+    name: String,
+) -> LogicalPlan {
+    // Nothing to place and no width to hit: the sink just inherits its input.
+    let needs_node = match placement {
+        Placement::ByKey(columns) => !columns.is_empty(),
+        // The node *is* the coalesce for a single-stream sink, so it always has
+        // to be emitted — inheriting the input's width is exactly what it exists
+        // to prevent.
+        Placement::Single => true,
+        Placement::RoundRobin => false,
+    };
+    if !needs_node && parallelism.is_none() {
+        return plan;
+    }
+    LogicalPlan::Extension(Extension {
+        node: Arc::new(RepartitionNode::new(
+            plan,
+            placement.clone(),
+            parallelism,
+            name,
+        )),
+    })
 }
 
 type SourceToSinkMapping = HashMap<String, (LogicalPlan, Vec<SinkEntry>)>;
@@ -533,10 +823,13 @@ impl Streamling {
 
         let dynamic_table_registry = DynamicTableRegistry::new();
 
+        let max_declared_parallelism = validate_parallelism(&pipeline_topology)?;
+
         let session_manager = SessionManager::new(
             app_config.record_batch_size as u64,
             app_config.internal_buffer_size,
             dynamic_table_registry.clone(),
+            max_declared_parallelism,
         )?;
 
         let pk_registry = PrimaryKeyRegistry::new(app_config.enforce_primary_keys);
@@ -545,6 +838,15 @@ impl Streamling {
         let mut plugins: BTreeMap<String, InitializedPlugin> = BTreeMap::new();
 
         let mut checkpoint_coordinator = CheckpointCoordinator::new();
+        // Control handle shared with bounded sources (to begin the terminal
+        // checkpoint) and sink futures (to signal completion). Valid before the
+        // coordinator is started since it shares the coordinator's state.
+        let checkpoint_control = checkpoint_coordinator.control();
+        // Process-wide shutdown signal (streamling_core::shutdown). A single
+        // SIGTERM/SIGINT handler flips it (installed below); every source
+        // observes it and drains front-to-back, and deep call sites (sink
+        // retry loops) subscribe to it directly.
+        let shutdown_rx = streamling_core::shutdown::subscribe();
         let mut checkpoint_sink_names: Vec<String> = Vec::new();
 
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
@@ -625,9 +927,15 @@ impl Streamling {
                                 .unwrap_or_default(),
                             data_format,
                             kafka.schema.clone(),
+                            kafka.parallelism.unwrap_or(1),
                         )
-                        .streamling_with_context(|| {
-                            format!("{}: failed to create Kafka source", ctx.format())
+                        // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                        // so a user-facing schema error (e.g. unsupported JSON dtype) is
+                        // recovered from the `DataFusionError::External` wrapper and stays
+                        // user-facing. Otherwise `--validate` would misreport it as internal.
+                        .map_err(|e| {
+                            streamling_core::error::StreamlingError::from(e)
+                                .context(format!("{}: failed to create Kafka source", ctx.format()))
                         })?,
                     );
                     let extracted_pk = kafka_source_provider.get_extracted_primary_key();
@@ -767,20 +1075,29 @@ impl Streamling {
                     let offset_table = &hybrid.offset_table;
                     let primary_key_opt = &hybrid.primary_key;
 
-                    let hybrid_source_provider = Arc::new(HybridTableProvider::new_from_topology(
-                        reference_name.clone(),
-                        bounded_sources.clone(),
-                        unbounded_source.clone(),
-                        offset_table.clone(),
-                        &app_config,
-                        &state_backend_factory,
-                        session_manager.clone(),
-                        // Per-phase event-time config flows directly to the
-                        // inner WrappingSourceTableProviders (one per bounded
-                        // phase + one for unbounded), each carrying its own
-                        // `metric_key_hybrid_src_*` suffix. R9 falls out.
-                        hybrid.telemetry.as_ref(),
-                    )?);
+                    let hybrid_source_provider = Arc::new(
+                        HybridTableProvider::new_from_topology(
+                            reference_name.clone(),
+                            bounded_sources.clone(),
+                            unbounded_source.clone(),
+                            offset_table.clone(),
+                            &app_config,
+                            &state_backend_factory,
+                            session_manager.clone(),
+                            // Per-phase event-time config flows directly to the
+                            // inner WrappingSourceTableProviders (one per bounded
+                            // phase + one for unbounded), each carrying its own
+                            // `metric_key_hybrid_src_*` suffix. R9 falls out.
+                            hybrid.telemetry.as_ref(),
+                        )?
+                        // In job mode this source emits the terminal checkpoint
+                        // when its bounded phases complete; in streaming mode it
+                        // does so on shutdown. Give it the control handle (to gate
+                        // teardown on that epoch finalizing) and the shutdown
+                        // signal (to drain rather than drop on SIGTERM).
+                        .with_checkpoint_control(checkpoint_control.clone())
+                        .with_shutdown(shutdown_rx.clone()),
+                    );
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         hybrid_source_provider.clone(),
@@ -833,6 +1150,7 @@ impl Streamling {
                             &file.path,
                             file.format,
                             &session_manager,
+                            file.parallelism,
                         )
                         .await
                         .map_err(|e| {
@@ -992,7 +1310,7 @@ impl Streamling {
                 &source_schemas,
                 &app_config.plugin.side_output_options,
                 &application_id,
-                app_config.plugin.channel_capacity as usize,
+                DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY,
             )?;
 
             // Forward side outputs to hybrid inner sources so they see pre-filter
@@ -1042,6 +1360,7 @@ impl Streamling {
                     let schema = dt.schema.clone();
                     let column = dt.column.clone();
                     let time_column = dt.time_column.clone();
+                    let cache_refresh_debounce_ms = dt.cache_refresh_debounce_ms;
                     let dynamic_table_backend = dynamic_table_backend_factory
                         .create(
                             backend_type,
@@ -1049,6 +1368,8 @@ impl Streamling {
                             schema,
                             column,
                             time_column,
+                            cache_refresh_debounce_ms,
+                            dt.cache,
                         )
                         .await
                         .map_err(|e| {
@@ -1131,6 +1452,32 @@ impl Streamling {
                     )
                     .await?;
 
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
+                        &Some(sql_transform.primary_key),
+                        source_name.clone(),
+                        reference_name.clone(),
+                        sql_plan.schema().inner(),
+                    )?;
+
+                    let pk_columns = pk_metadata_opt
+                        .map(|pk| pk.columns.clone())
+                        .unwrap_or_default();
+
+                    // An explicit `parallelism` widens the transform itself: the
+                    // exchange goes under its SQL, so the filter/projection above
+                    // run at the requested width. Keyed by the transform's
+                    // primary key, so per-key ordering survives the widening.
+                    let sql_plan = match sql_transform.parallelism {
+                        Some(parallelism) => wrap_transform_input_with_repartition(
+                            sql_plan,
+                            &source_name,
+                            &Placement::ByKey(pk_columns.clone()),
+                            parallelism,
+                            &reference_name,
+                        )?,
+                        None => sql_plan,
+                    };
+
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(CheckpointableNode::new(
                             sql_plan,
@@ -1138,17 +1485,6 @@ impl Streamling {
                             reference_name.clone(),
                         )),
                     });
-
-                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
-                        &Some(sql_transform.primary_key),
-                        source_name.clone(),
-                        reference_name.clone(),
-                        logical_plan.schema().inner(),
-                    )?;
-
-                    let pk_columns = pk_metadata_opt
-                        .map(|pk| pk.columns.clone())
-                        .unwrap_or_default();
 
                     let wrapping_node = Arc::new(WrappingNode::new_with_non_null_cols(
                         logical_plan,
@@ -1219,11 +1555,35 @@ impl Streamling {
                         metric_metadata_id: metric_key(&application_id, reference_name.as_str()),
                     };
 
+                    // Resolved before the node is built because the exchange
+                    // below it hashes on this key. `ExternalHandlerNode` and
+                    // `RebatchNode` both report their input's schema, so this is
+                    // the same schema the registration used to see.
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
+                        &Some(handler.primary_key),
+                        from.clone(),
+                        reference_name.clone(),
+                        source_plan.schema().inner(),
+                    )?;
+
+                    let pk_columns = pk_metadata_opt
+                        .map(|pk| pk.columns.clone())
+                        .unwrap_or_default();
+
                     let batch_size = handler.batch_size.map(|s| s as usize);
                     let batch_flush_interval =
                         parse_batch_flush_interval(&handler.batch_flush_interval, &ctx.format())?;
+                    // The exchange goes below the rebatcher, as at the sink edge:
+                    // rebatching after the split keeps each request stream's
+                    // batches whole. Keyed by the transform's primary key, so a
+                    // key is never in flight against the endpoint twice at once.
                     let handler_input = wrap_with_rebatch(
-                        source_plan,
+                        wrap_with_repartition(
+                            source_plan,
+                            &Placement::ByKey(pk_columns.clone()),
+                            handler.parallelism,
+                            reference_name.clone(),
+                        ),
                         batch_size,
                         batch_flush_interval,
                         reference_name.clone(),
@@ -1232,17 +1592,6 @@ impl Streamling {
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(ExternalHandlerNode::new(handler_input, handler_config)),
                     });
-
-                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
-                        &Some(handler.primary_key),
-                        from.clone(),
-                        reference_name.clone(),
-                        logical_plan.schema().inner(),
-                    )?;
-
-                    let pk_columns = pk_metadata_opt
-                        .map(|pk| pk.columns.clone())
-                        .unwrap_or_default();
 
                     let wrapping_node = Arc::new(WrappingNode::new_with_non_null_cols(
                         logical_plan,
@@ -1279,29 +1628,99 @@ impl Streamling {
                     let language = &script_transform.language;
                     let script = &script_transform.script;
                     let schema = &script_transform.schema;
-                    // Use topology-level parallelism/batch_size if specified, otherwise fall back to app_config
-                    let parallelism = script_transform
-                        .parallelism
-                        .unwrap_or(app_config.wasm_script.parallelism);
-                    let batch_size = script_transform
-                        .batch_size
-                        .unwrap_or(app_config.wasm_script.batch_size);
+                    let parallelism = script_transform.parallelism;
+                    let batch_size = script_transform.batch_size;
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
                             streamling_user_err!("{}: source '{}' not found", ctx.format(), from)
                         })?
                         .clone();
+
+                    let input_primary_key = PrimaryKeyMetadata::from_str(
+                        &script_transform.primary_key,
+                        PrimaryKeySource::TopologyDefined,
+                        reference_name.clone(),
+                    );
+
+                    // A script transform's `primary_key` describes its OUTPUT: the
+                    // columns the script produces, declared in its own `schema`
+                    // block. Those columns need not exist upstream, so they cannot
+                    // in general be used to place rows on the transform's INPUT —
+                    // doing so fails planning with "cannot partition by primary key
+                    // column '<c>', which is not in the input schema" for any script
+                    // whose key includes a generated column.
+                    //
+                    // Key the input exchange only when every key column is genuinely
+                    // available upstream (the common `primary_key: id` pass-through
+                    // case, whose placement is unchanged). Otherwise fall back to
+                    // round-robin: the key's real job is downstream dedup, which the
+                    // sink's own `ByKey` exchange enforces, not this one.
+                    let input_field_names: Vec<String> = source_plan
+                        .schema()
+                        .inner()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
+                    // Read-only lookup: `propagate` would re-register the key under
+                    // this node and clobber the script's own declared key.
+                    let upstream_key = pk_registry.get(from.as_str()).map(|m| m.columns);
+                    let chosen = script_input_placement(
+                        &input_primary_key.columns,
+                        upstream_key.as_deref(),
+                        &input_field_names,
+                    );
+                    if !chosen.generated_columns.is_empty() {
+                        if chosen.used_upstream_key {
+                            warn!(
+                                "{}: primary key column(s) {:?} are produced by the script and \
+                                 are not in its input schema; placing its input by the upstream \
+                                 node's key instead",
+                                ctx.format(),
+                                chosen.generated_columns
+                            );
+                        } else {
+                            warn!(
+                                "{}: primary key column(s) {:?} are produced by the script and \
+                                 are not in its input schema, and the upstream node has no \
+                                 usable key, so its input is distributed round-robin",
+                                ctx.format(),
+                                chosen.generated_columns
+                            );
+                        }
+                    }
+                    let input_placement = chosen.placement;
+
+                    let script_input = wrap_with_rebatch(
+                        wrap_with_repartition(
+                            source_plan,
+                            &input_placement,
+                            parallelism,
+                            reference_name.clone(),
+                        ),
+                        batch_size,
+                        None,
+                        reference_name.clone(),
+                    );
                     let wasm_node = WasmRunnerNode::with_options(
-                        source_plan,
+                        script_input,
                         language.clone(),
                         script.clone(),
                         app_config.wasm_script.runtime_wasm_file_path.clone(),
                         app_config.internal_buffer_size,
                         schema.clone(),
-                        parallelism,
-                        batch_size,
-                    );
+                    )
+                    // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                    // so a user-facing schema error (e.g. unsupported dtype) is recovered
+                    // from the `DataFusionError::External` wrapper and stays user-facing.
+                    // Otherwise `--validate` would misreport it as an internal failure.
+                    .map_err(|e| {
+                        streamling_core::error::StreamlingError::from(e).context(format!(
+                            "{}: failed to build script transform",
+                            ctx.format()
+                        ))
+                    })?;
 
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(wasm_node),
@@ -1396,7 +1815,7 @@ impl Streamling {
                             output_schema,
                             Arc::new(initialized_plugin.channels.clone()),
                             app_config.internal_buffer_size,
-                            reference_name.clone(),
+                            metric_key(&application_id, reference_name.as_str()),
                         )),
                     });
 
@@ -1471,7 +1890,7 @@ impl Streamling {
                         webhook.headers.clone()
                     };
 
-                    pk_registry.track_primary_key_for_transform_or_sink(
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
                         primary_key_opt,
                         from.clone(),
                         reference_name.clone(),
@@ -1503,6 +1922,11 @@ impl Streamling {
                             reference_name.clone(),
                             http_sink_provider,
                             RebatchConfig::new(webhook.batch_size, batch_flush_interval),
+                            // The payload carries a per-row op, so a receiver
+                            // applying upserts and deletes needs every row of a
+                            // key on one stream.
+                            Placement::ByKey(pk_columns(&pk_metadata_opt)),
+                            webhook.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1544,6 +1968,8 @@ impl Streamling {
                             reference_name.clone(),
                             print_sink_provider,
                             RebatchConfig::new(print_sink.batch_size, batch_flush_interval),
+                            Placement::RoundRobin,
+                            print_sink.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1582,6 +2008,8 @@ impl Streamling {
                             reference_name.clone(),
                             blackhole_sink_provider,
                             RebatchConfig::new(blackhole.batch_size, batch_flush_interval),
+                            Placement::RoundRobin,
+                            blackhole.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1609,20 +2037,29 @@ impl Streamling {
                         validate_update_where(uw, &source_schema, &reference_name)?;
                     }
 
+                    // Per-sink connection: two postgres sinks in one pipeline can
+                    // target two different databases (STRM-6516). Falls back to the
+                    // global postgres_sink block when no per-sink keys are set.
+                    let postgres_config = app_config.postgres_sink_for(&reference_name);
+                    info!(
+                        "postgres sink '{}' resolved connection {:?}",
+                        reference_name, postgres_config
+                    );
+
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
-                        app_config.postgres_sink.clone(),
+                        postgres_config.clone(),
                         table.clone(),
                         schema.clone(),
-                        batch_size,
                         app_config.num_records_before_stop,
                         from.clone(),
-                        pk_metadata_opt.map(|pk| pk.to_str()),
+                        pk_metadata_opt.as_ref().map(|pk| pk.to_str()),
                         on_conflict.clone(),
                         update_where.clone(),
                         false, // append_only_mode (normal Postgres sink)
                         false, // checkpoint_truncation (disabled for normal sink)
+                        postgres.deduplicate,
                         reference_name.clone(),
                         postgres.parallelism,
                         sink_telemetry.clone(),
@@ -1636,18 +2073,16 @@ impl Streamling {
                     // always has a concrete batch_size/interval regardless of
                     // whether the topology supplied them.
                     let effective_batch_size =
-                        Some(batch_size.unwrap_or(app_config.postgres_sink.batch_size));
+                        Some(batch_size.unwrap_or(postgres_config.batch_size));
                     let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
                         Some(d) => d,
-                        None => humantime::parse_duration(
-                            &app_config.postgres_sink.batch_flush_interval,
-                        )
-                        .streamling_with_context(|| {
-                            format!(
-                                "invalid app_config.postgres_sink.batch_flush_interval '{}'",
-                                app_config.postgres_sink.batch_flush_interval
-                            )
-                        })?,
+                        None => humantime::parse_duration(&postgres_config.batch_flush_interval)
+                            .streamling_with_context(|| {
+                                format!(
+                                    "invalid postgres batch_flush_interval '{}' resolved for sink '{}'",
+                                    postgres_config.batch_flush_interval, reference_name
+                                )
+                            })?,
                     });
                     Self::update_source_to_sink_mapping(
                         &mut sources_to_sinks,
@@ -1660,6 +2095,8 @@ impl Streamling {
                                 effective_batch_size,
                                 effective_batch_flush_interval,
                             ),
+                            Placement::ByKey(pk_columns(&pk_metadata_opt)),
+                            postgres.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1685,12 +2122,16 @@ impl Streamling {
                         &source_schema,
                     )?;
 
-                    let primary_key = pk_metadata_opt.map(|pk| pk.to_str()).ok_or_else(|| {
-                        streamling_user_err!(
-                            "{}: primary key is required for Postgres aggregation sink",
-                            ctx.format()
-                        )
-                    })?;
+                    let primary_key =
+                        pk_metadata_opt
+                            .as_ref()
+                            .map(|pk| pk.to_str())
+                            .ok_or_else(|| {
+                                streamling_user_err!(
+                                    "{}: primary key is required for Postgres aggregation sink",
+                                    ctx.format()
+                                )
+                            })?;
 
                     let df_source_schema = DFSchema::try_from(source_schema.clone())
                         .streamling_with_context(|| {
@@ -1713,6 +2154,13 @@ impl Streamling {
                         format!("{}: failed to create PostgresAggregator", ctx.format())
                     })?;
 
+                    // Per-sink connection, as for the plain postgres sink above.
+                    let postgres_config = app_config.postgres_sink_for(&reference_name);
+                    info!(
+                        "postgres_aggregate sink '{}' resolved connection {:?}",
+                        reference_name, postgres_config
+                    );
+
                     if dry_run {
                         // Secrets are not resolved during dry-run (see
                         // secret_name_to_resolve), so there are no DB credentials
@@ -1723,17 +2171,16 @@ impl Streamling {
                         pg_aggregator.generate_trigger_statement_sql()?;
                     } else {
                         pg_aggregator
-                            .create_trigger_and_tables(&app_config.postgres_sink)
+                            .create_trigger_and_tables(&postgres_config)
                             .await?;
                     }
 
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
-                        app_config.postgres_sink.clone(),
+                        postgres_config.clone(),
                         landing_table.clone(),
                         schema.clone(),
-                        batch_size,
                         app_config.num_records_before_stop,
                         from.clone(),
                         Some(primary_key),
@@ -1741,8 +2188,9 @@ impl Streamling {
                         None, // update_where (not applicable for aggregation sink)
                         true, // append_only_mode (aggregation sink)
                         true, // checkpoint_truncation (enabled for aggregation sink)
+                        postgres.deduplicate,
                         reference_name.clone(),
-                        None, // parallelism (default for aggregation sink)
+                        postgres.parallelism,
                         sink_telemetry.clone(),
                     ));
 
@@ -1754,18 +2202,16 @@ impl Streamling {
                     // always has a concrete batch_size/interval regardless of
                     // whether the topology supplied them.
                     let effective_batch_size =
-                        Some(batch_size.unwrap_or(app_config.postgres_sink.batch_size));
+                        Some(batch_size.unwrap_or(postgres_config.batch_size));
                     let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
                         Some(d) => d,
-                        None => humantime::parse_duration(
-                            &app_config.postgres_sink.batch_flush_interval,
-                        )
-                        .streamling_with_context(|| {
-                            format!(
-                                "invalid app_config.postgres_sink.batch_flush_interval '{}'",
-                                app_config.postgres_sink.batch_flush_interval
-                            )
-                        })?,
+                        None => humantime::parse_duration(&postgres_config.batch_flush_interval)
+                            .streamling_with_context(|| {
+                                format!(
+                                    "invalid postgres batch_flush_interval '{}' resolved for sink '{}'",
+                                    postgres_config.batch_flush_interval, reference_name
+                                )
+                            })?,
                     });
                     Self::update_source_to_sink_mapping(
                         &mut sources_to_sinks,
@@ -1778,6 +2224,8 @@ impl Streamling {
                                 effective_batch_size,
                                 effective_batch_flush_interval,
                             ),
+                            Placement::ByKey(pk_columns(&pk_metadata_opt)),
+                            postgres.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1819,6 +2267,8 @@ impl Streamling {
                             reference_name.clone(),
                             memory_sink_provider,
                             RebatchConfig::new(memory_sink.batch_size, batch_flush_interval),
+                            Placement::RoundRobin,
+                            memory_sink.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1869,8 +2319,8 @@ impl Streamling {
                         batch_size,
                         batch_flush_interval_ms,
                         kafka_sink.message_max_bytes,
-                        kafka_sink.parallelism,
                         kafka_sink.compression,
+                        kafka_sink.deduplicate,
                         sink_telemetry.clone(),
                     ));
                     session_manager
@@ -1888,6 +2338,8 @@ impl Streamling {
                             reference_name.clone(),
                             kafka_sink_provider,
                             RebatchConfig::default(),
+                            Placement::ByKey(pk_metadata.columns.clone()),
+                            kafka_sink.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -1900,7 +2352,6 @@ impl Streamling {
                     let table = &clickhouse_sink.table;
                     let batch_flush_interval = &clickhouse_sink.batch_flush_interval;
                     let batch_size = clickhouse_sink.batch_size;
-                    let parallelism = clickhouse_sink.parallelism;
                     let (source_plan, source_schema) =
                         Self::find_plan_and_schema(&pipeline_plans, from.as_str())?;
 
@@ -1916,21 +2367,28 @@ impl Streamling {
                     // Apply ClickHouse-sink app_config defaults so the rebatcher
                     // always has a concrete batch_size/interval regardless of
                     // whether the topology supplied them.
-                    let effective_batch_size = batch_size.unwrap_or(app_config.record_batch_size);
-                    let effective_batch_flush_interval =
-                        Some(raw_batch_flush_interval.unwrap_or_else(|| {
-                            Duration::from_millis(app_config.record_batch_interval_ms)
-                        }));
+                    let clickhouse_config = &app_config.clickhouse_sink;
+                    let effective_batch_size = batch_size.unwrap_or(clickhouse_config.batch_size);
+                    let effective_batch_flush_interval = Some(match raw_batch_flush_interval {
+                        Some(d) => d,
+                        // Already validated at AppConfig load, so this only
+                        // fires if the config was constructed some other way.
+                        None => clickhouse_config
+                            .parsed_batch_flush_interval()
+                            .map_err(|e| streamling_user_err!("{}: {e:#}", ctx.format()))?,
+                    });
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),
                         table.as_str(),
-                        app_config.clickhouse_sink.clone(),
-                        effective_batch_size,
+                        clickhouse_config.connection.clone(),
                         app_config.num_records_before_stop,
-                        pk_metadata_opt.map(|pk| pk.to_str()).unwrap_or_default(),
+                        pk_metadata_opt
+                            .as_ref()
+                            .map(|pk| pk.to_str())
+                            .unwrap_or_default(),
                         from.clone(),
-                        parallelism,
                         clickhouse_sink.append_only_mode,
+                        clickhouse_sink.deduplicate,
                         clickhouse_sink.version_column_name.clone(),
                         clickhouse_sink.schema_override.clone(),
                         clickhouse_sink.compression,
@@ -1953,6 +2411,8 @@ impl Streamling {
                                 Some(effective_batch_size),
                                 effective_batch_flush_interval,
                             ),
+                            Placement::ByKey(pk_columns(&pk_metadata_opt)),
+                            clickhouse_sink.parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2015,6 +2475,12 @@ impl Streamling {
                             reference_name.clone(),
                             plugin_sink_provider,
                             RebatchConfig::new(plugin_sink.batch_size, batch_flush_interval),
+                            // A plugin acks epochs from inside the plugin, on a
+                            // channel poll decoupled from the marker that triggered
+                            // it, so the per-stream ack gate cannot see its markers.
+                            // The plugin ABI has no partition dimension either.
+                            Placement::Single,
+                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2027,80 +2493,147 @@ impl Streamling {
 
         init_node_registry(node_contexts);
 
+        // Seed each non-sink node's elapsed_compute series only now: plugin
+        // construction above merged plugin-declared identity labels
+        // (`merge_metadata_tags`), so the seeded samples land on the final
+        // label set instead of an orphan pre-merge series.
+        get_metrics_recorder().seed_elapsed_compute_series();
+
         let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 
-        sources_to_sinks
-            .into_iter()
-            .for_each(|(producer_name, (source_plan, mut sinks))| {
-                let future_name = sinks
-                    .iter()
-                    .map(|e| e.name.as_str())
-                    .collect::<Vec<&str>>()
-                    .join(", ");
-                let sink_plan = if sinks.len() > 1 {
-                    // Fan-out: each sink gets its own RebatchExec injected by
-                    // the MultiSinkExtensionPlanner, so the raw source_plan
-                    // flows into MultiSinkLogicalNode without any upstream
-                    // wrapping. Per-sink configs live on MultiSinkEntry.
-                    let entries: Vec<MultiSinkEntry> = sinks
-                        .into_iter()
-                        .map(|e| MultiSinkEntry {
-                            name: e.name,
-                            rebatch_config: e.rebatch_config,
-                        })
-                        .collect();
-                    // The map key is the producer's `from` reference name; its
-                    // metric_key is the BroadcastStream's upstream_metadata_id so
-                    // per-sink blocked-send is attributed to the producer node.
-                    let upstream_metadata_id: Option<Arc<str>> = Some(Arc::from(metric_key(
-                        &application_id,
-                        producer_name.as_str(),
-                    )));
-                    LogicalPlan::Extension(Extension {
-                        node: Arc::new(MultiSinkLogicalNode::new(
-                            source_plan,
-                            entries,
-                            upstream_metadata_id,
-                        )),
+        for (producer_name, (source_plan, mut sinks)) in sources_to_sinks.into_iter() {
+            let future_name = sinks
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ");
+            // Captured for the sink-completion signal below: one entry per
+            // sink driven by this future (a fan-out future drives several).
+            let sink_names: Vec<String> = sinks.iter().map(|e| e.name.clone()).collect();
+            let sink_plan = if sinks.len() > 1 {
+                // Fan-out: each sink gets its own RebatchExec injected by
+                // the MultiSinkExtensionPlanner, so the raw source_plan
+                // flows into MultiSinkLogicalNode without any upstream
+                // wrapping. Per-sink configs live on MultiSinkEntry.
+                //
+                // The one thing that *must* be decided upstream is the
+                // partitioning: the sinks share one input, so they share one
+                // exchange, and it can only be keyed one way.
+                let partitioned_plan =
+                    wrap_multi_sink_with_repartition(source_plan, &sinks, future_name.as_str());
+                let entries: Vec<MultiSinkEntry> = sinks
+                    .into_iter()
+                    .map(|e| MultiSinkEntry {
+                        name: e.name,
+                        rebatch_config: e.rebatch_config,
                     })
-                } else {
-                    // Single sink: wrap once at the logical level with this
-                    // sink's config, then insert_into.
-                    let entry = sinks.remove(0);
-                    let rebatched_plan = wrap_with_rebatch(
-                        source_plan,
-                        entry.rebatch_config.batch_size.map(|s| s as usize),
-                        entry.rebatch_config.batch_flush_interval,
-                        entry.name.clone(),
-                    );
-                    LogicalPlanBuilder::insert_into(
-                        rebatched_plan,
-                        entry.name.as_str(),
-                        provider_as_source(entry.provider.clone()),
-                        InsertOp::Append,
-                    )
-                    .unwrap()
-                    .build()
-                    .unwrap()
-                };
+                    .collect();
+                // The map key is the producer's `from` reference name; its
+                // metric_key is the BroadcastStream's upstream_metadata_id so
+                // per-sink blocked-send is attributed to the producer node.
+                let upstream_metadata_id: Option<Arc<str>> = Some(Arc::from(metric_key(
+                    &application_id,
+                    producer_name.as_str(),
+                )));
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(MultiSinkLogicalNode::new(
+                        partitioned_plan,
+                        entries,
+                        upstream_metadata_id,
+                    )),
+                })
+            } else {
+                // Single sink: wrap once at the logical level with this
+                // sink's config, then insert_into.
+                let entry = sinks.remove(0);
+                // The exchange goes *below* the rebatcher: rebatching after
+                // the split keeps each write stream's batches whole, where
+                // splitting a rebatched batch would re-fragment it.
+                let partitioned_plan = wrap_with_repartition(
+                    source_plan,
+                    &entry.placement,
+                    entry.parallelism,
+                    entry.name.clone(),
+                );
+                let rebatched_plan = wrap_with_rebatch(
+                    partitioned_plan,
+                    entry.rebatch_config.batch_size.map(|s| s as usize),
+                    entry.rebatch_config.batch_flush_interval,
+                    entry.name.clone(),
+                );
+                LogicalPlanBuilder::insert_into(
+                    rebatched_plan,
+                    entry.name.as_str(),
+                    provider_as_source(entry.provider.clone()),
+                    InsertOp::Append,
+                )
+                .map_err(|e| {
+                    streamling_core::error::StreamlingError::from(e).context(format!(
+                        "failed to build insert plan for sink [{}]",
+                        entry.name
+                    ))
+                })?
+                .build()
+                .map_err(|e| {
+                    streamling_core::error::StreamlingError::from(e).context(format!(
+                        "failed to build insert plan for sink [{}]",
+                        entry.name
+                    ))
+                })?
+            };
 
-                if !dry_run {
-                    let session_manager = session_manager.clone();
-                    let sink_future = async move {
-                        let result = session_manager.new_df(sink_plan).collect().await;
-                        if let Err(err) = &result {
+            if !dry_run {
+                let session_manager = session_manager.clone();
+                let checkpoint_control = checkpoint_control.clone();
+                let sink_future = async move {
+                    // `DataFrame::collect`, split so the planned physical
+                    // plan can be logged before execution starts.
+                    let df = session_manager.new_df(sink_plan);
+                    let task_ctx = Arc::new(df.task_ctx());
+                    let result = match df.create_physical_plan().await {
+                        Ok(plan) => {
+                            info!(
+                                "Pipeline physical plan:\n{}",
+                                displayable(plan.as_ref()).indent(true)
+                            );
+                            collect(plan, task_ctx).await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    match &result {
+                        Ok(_) => {
+                            // The sink has SUCCESSFULLY drained its input and
+                            // will not ack any further checkpoint epochs. Tell
+                            // the coordinator so it drops these sinks from the
+                            // expected-ack set and can finalize in-flight
+                            // epochs the remaining live sinks already acked,
+                            // instead of blocking on a sink that is gone (the
+                            // multi-source completion case).
+                            for sink_name in &sink_names {
+                                checkpoint_control.sink_completed(sink_name);
+                            }
+                        }
+                        Err(err) => {
+                            // A FAILED sink must NOT be deregistered: its
+                            // missing acks are the coordinator's only signal
+                            // that the epochs it touched are not durable.
+                            // Removing it would let those epochs (including
+                            // the terminal one) finalize as if the data had
+                            // been written. The pipeline is failing anyway —
+                            // let the epochs stall and the error propagate.
                             error!(
                                 "Sink future [{}] completed with error: {}",
                                 future_name, err
                             );
                         }
-                        result
-                    };
-                    sink_futures.push(sink_future);
-                } else {
-                    dry_run_plans.push((future_name, sink_plan));
-                }
-            });
+                    }
+                    result
+                };
+                sink_futures.push(sink_future);
+            } else {
+                dry_run_plans.push((future_name, sink_plan));
+            }
+        }
 
         // During dry_run, create physical plans to catch type coercion
         // and other SQL errors that only manifest at physical planning time.
@@ -2128,49 +2661,128 @@ impl Streamling {
             );
         }
 
-        let app_result = if !plugins.is_empty() {
-            let plugin_futures: Vec<ExecutionFuture> = plugins
-                .into_values()
-                .map(|plugin| plugin.execution_future)
-                .collect();
+        // One top-level shutdown trigger. On SIGTERM/SIGINT it flips the shared
+        // signal (sources drain front-to-back) and arms the watchdog. This
+        // replaces the per-component signal handlers (notably the plugin
+        // watcher that used to kill plugins first, inverting the drain order).
+        if !dry_run {
+            tokio::spawn(async move {
+                Self::wait_for_shutdown_signal().await;
+                info!("Shutdown signal received; draining pipeline front-to-back");
+                streamling_core::shutdown::request_shutdown();
+                Self::arm_shutdown_watchdog(Self::shutdown_budget());
+            });
+        }
 
-            // We terminate the application in two cases:
-            // 1. If ANY plugin future completes (assuming an error)
-            // 2. If ANY sink future fails
-            let result: Result<()> = tokio::select! {
-                plugin_outcome = futures::future::select_all(plugin_futures) => {
-                    let (res, _idx, _rest) = plugin_outcome;
-                    match res {
-                        Ok(()) => {
-                            debug!("Terminating because a plugin future completed gracefully");
-                            Ok(())
-                        }
-                        Err(msg) => {
-                            debug!("Terminating because a plugin future completed with error: {}", msg);
-                            Err(streamling_err!("Plugin error: {}", msg))
-                        }
+        // Plugin dispatchers run as detached tasks; their execution futures are
+        // join wrappers. We keep them in a set so that AFTER the sinks drain we
+        // can send Terminate and AWAIT the dispatchers finishing their flush,
+        // rather than dropping them and letting the runtime cancel them
+        // mid-flush at process exit (the job-mode tail-loss bug).
+        let mut plugin_set: futures::stream::FuturesUnordered<ExecutionFuture> =
+            plugins.into_values().map(|p| p.execution_future).collect();
+
+        // Drive to completion. The terminal condition is "all sinks drained"
+        // (every source ended its stream, via bounded completion or shutdown).
+        // A plugin dispatcher exiting on its own is NOT terminal unless it
+        // errored — otherwise we would drop in-flight sink work and lose the
+        // tail, exactly the previous behaviour.
+        // The sinks are driven individually (not try_join_all): a failing sink
+        // must not CANCEL its siblings mid-flush — dropping their futures would
+        // abort in-flight writes and re-widen the very tail-loss window this
+        // change closes. Instead, the first failure triggers the same graceful
+        // drain as SIGTERM (sources stop, streams end, the remaining sinks
+        // finish flushing — all bounded by the watchdog), and the error is
+        // propagated once every sink has wound down. No epoch a failed sink
+        // touched is ever acked, so at-least-once is preserved either way.
+        let app_result: Result<()> = {
+            use futures::StreamExt as _;
+            let mut sink_set: futures::stream::FuturesUnordered<_> =
+                sink_futures.into_iter().collect();
+            let mut first_error: Option<streamling_core::error::StreamlingError> = None;
+            let fail_drain = |err: streamling_core::error::StreamlingError,
+                              first_error: &mut Option<
+                streamling_core::error::StreamlingError,
+            >| {
+                if first_error.is_none() {
+                    if !dry_run {
+                        warn!(
+                            "Pipeline component failed; draining remaining sinks before exit: {}",
+                            err
+                        );
+                        streamling_core::shutdown::request_shutdown();
+                        Self::arm_shutdown_watchdog(Self::shutdown_budget());
                     }
-                },
-                result = futures::future::try_join_all(sink_futures) => {
-                    result
-                        .map(|_| ())
-                        .map_err(|e| {
-                            debug!("Terminating because a sink future completed with error");
-                            e.into()
-                        })
+                    *first_error = Some(err);
                 }
             };
-
-            result
-        } else {
-            futures::future::try_join_all(sink_futures)
-                .await
-                .map(|_| ())
-                .map_err(Into::into)
+            while !sink_set.is_empty() {
+                tokio::select! {
+                    Some(sink_res) = sink_set.next() => {
+                        if let Err(e) = sink_res {
+                            debug!("A sink future completed with error");
+                            fail_drain(e.into(), &mut first_error);
+                        }
+                    }
+                    Some(plugin_res) = plugin_set.next() => {
+                        match plugin_res {
+                            Ok(()) => {
+                                debug!("A plugin future completed; continuing to drain sinks");
+                            }
+                            Err(msg) => {
+                                fail_drain(
+                                    streamling_err!("Plugin error: {}", msg),
+                                    &mut first_error,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            match first_error {
+                None => Ok(()),
+                Some(e) => Err(e),
+            }
         };
 
-        // Issue SourceComplete message to plugins. This is needed to fully clean up checkpoint channels when plugins
-        // terminate.
+        // Teardown. Everything below is bounded by a single deadline shared
+        // with the watchdog: arming is idempotent and returns the deadline of
+        // the FIRST arming (SIGTERM time, if one arrived), so after a long
+        // drain the bounded waits below correctly see less time remaining
+        // instead of overrunning into the hard exit. A 2s margin keeps these
+        // waits expiring before the watchdog fires. Dry runs never arm the
+        // watchdog (there is nothing to drain).
+        let deadline = if dry_run {
+            std::time::Instant::now() + Self::shutdown_budget()
+        } else {
+            let watchdog_deadline = Self::arm_shutdown_watchdog(Self::shutdown_budget());
+            watchdog_deadline
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or(watchdog_deadline)
+        };
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        if !dry_run {
+            // The sinks drained. Before tearing anything down, wait (bounded)
+            // for the terminal checkpoint to finalize so the tail is durably
+            // checkpointed and its Finalizer reaches components that commit on
+            // it. No-op in the streaming case where no terminal checkpoint was
+            // begun, and skipped on error (none will arrive).
+            if app_result.is_ok()
+                && timeout(remaining(), checkpoint_control.await_terminal_finalized())
+                    .await
+                    .is_err()
+            {
+                warn!(
+                    "Terminal checkpoint did not finalize within budget; proceeding with shutdown"
+                );
+            }
+            // Ensure sources observe shutdown even on a clean job-mode completion
+            // (so any lingering helper tasks — lag reporters — wind down).
+            streamling_core::shutdown::request_shutdown();
+        }
+
+        // Issue SourceComplete to plugin sources so the checkpoint channels are
+        // fully cleaned up when the plugins terminate.
         {
             use streamling_core::checkpoints::channels::send as checkpoint_send;
             use streamling_core::checkpoints::checkpoint_management::CheckpointMessage;
@@ -2186,23 +2798,136 @@ impl Streamling {
         }
 
         shutdown_plugin_side_outputs();
+
+        // Terminate plugins, then AWAIT their dispatchers finishing their drain
+        // (bounded) so the last buffered batches are flushed durably before the
+        // runtime is dropped. This is the fix for the plugin/pubsub tail loss.
         terminate_all_plugins()?;
-        // Stop checkpoint coordinator only if it was started (not in dry_run mode)
-        // Stop it before checking app_result to ensure cleanup happens even if there's an error
+        if !plugin_set.is_empty() {
+            use futures::StreamExt as _;
+            let drain = async {
+                while let Some(res) = plugin_set.next().await {
+                    if let Err(msg) = res {
+                        warn!("Plugin exited with error during drain: {}", msg);
+                    }
+                }
+            };
+            match timeout(remaining(), drain).await {
+                Ok(()) => info!("All plugin dispatchers drained cleanly"),
+                Err(_) => warn!(
+                    "Plugin drain exceeded the shutdown budget; {} dispatcher(s) may not have flushed",
+                    plugin_set.len()
+                ),
+            }
+        }
+
+        // Stop the checkpoint coordinator only if it was started (not dry_run).
         if !dry_run {
-            // Use timeout to prevent hanging if checkpoint coordinator tasks are stuck
-            match timeout(Duration::from_secs(30), checkpoint_coordinator.stop()).await {
+            match timeout(remaining(), checkpoint_coordinator.stop()).await {
                 Ok(_) => {}
                 Err(_) => {
-                    warn!(
-                        "Checkpoint coordinator stop timed out after 5 seconds, continuing anyway"
-                    );
+                    warn!("Checkpoint coordinator stop timed out; continuing anyway");
                 }
             }
         }
 
         app_result?;
         Ok(())
+    }
+
+    /// The total time budget for graceful shutdown. Delegates to the shared
+    /// definition in `streamling_core::shutdown` so every consumer (this run
+    /// loop's watchdog, the hybrid source's terminal-finalize wait) reads the
+    /// same value and they can never drift.
+    fn shutdown_budget() -> Duration {
+        streamling_core::shutdown::shutdown_budget()
+    }
+
+    /// Arm a last-resort watchdog: a plain OS thread that hard-exits the process
+    /// after `budget`, so a wedged FFI/rdkafka teardown or a plugin that never
+    /// finishes its drain can never hold the process past the k8s grace period.
+    ///
+    /// Idempotent — the first arming wins and later calls are no-ops. Always
+    /// returns the deadline of the FIRST arming so callers slice their bounded
+    /// waits against the watchdog's real deadline (e.g. teardown after a long
+    /// SIGTERM-triggered drain must not assume a fresh budget).
+    ///
+    /// The forced exit is non-zero: this path only fires when teardown failed
+    /// to complete in time, and it must surface to k8s/alerting as an abnormal
+    /// exit, not a clean completion.
+    fn arm_shutdown_watchdog(budget: Duration) -> std::time::Instant {
+        use std::sync::OnceLock;
+        static WATCHDOG_DEADLINE: OnceLock<std::time::Instant> = OnceLock::new();
+        *WATCHDOG_DEADLINE.get_or_init(|| {
+            let deadline = std::time::Instant::now() + budget;
+            let spawn_result = std::thread::Builder::new()
+                .name("shutdown-watchdog".to_string())
+                .spawn(move || {
+                    std::thread::sleep(budget);
+                    // A plain OS thread's exit cannot be blocked by a wedged
+                    // tokio worker or a hung FFI call, so this always fires.
+                    eprintln!(
+                        "[streamling] shutdown budget of {:?} exceeded; forcing process exit",
+                        budget
+                    );
+                    std::process::exit(1);
+                });
+            if let Err(e) = spawn_result {
+                // Without the watchdog nothing guarantees the process exits
+                // before the grace period; make that loudly visible instead of
+                // failing silently (behaviour then degrades to pre-watchdog).
+                eprintln!(
+                    "[streamling] FAILED to spawn shutdown watchdog thread: {}; \
+                     a wedged teardown can no longer be force-exited",
+                    e
+                );
+            }
+            deadline
+        })
+    }
+
+    /// Await SIGTERM / SIGINT / Ctrl-C — the single shutdown trigger for the
+    /// whole process, replacing the per-component signal handlers.
+    async fn wait_for_shutdown_signal() {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let handlers = (|| {
+                Ok::<_, std::io::Error>((
+                    signal(SignalKind::terminate())?,
+                    signal(SignalKind::interrupt())?,
+                ))
+            })();
+            let (mut sigterm, mut sigint) = match handlers {
+                Ok(h) => h,
+                Err(e) => {
+                    // Installation failed: the caller treats this function
+                    // returning as "signal received" and starts a drain, so
+                    // returning here would trigger a SPURIOUS shutdown at
+                    // startup. Pend forever instead — the process keeps
+                    // running and degrades to the OS default SIGTERM
+                    // disposition (immediate kill, no graceful drain), which
+                    // is the pre-existing behaviour without a handler.
+                    error!(
+                        "Failed to install SIGTERM/SIGINT handlers ({}); \
+                         graceful shutdown on signal is DISABLED for this run",
+                        e
+                    );
+                    futures::future::pending::<()>().await;
+                    unreachable!("pending() never resolves");
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => info!("Received SIGTERM"),
+                _ = sigint.recv() => info!("Received SIGINT"),
+                _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Received Ctrl-C");
+        }
     }
 
     fn find_plan_and_schema(
@@ -2599,7 +3324,492 @@ impl Streamling {
 
 #[cfg(test)]
 mod tests {
+    use super::{Placement, script_input_placement};
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Regression: a script whose key includes a column it PRODUCES must not be
+    /// used to place its own input. Planning previously failed outright with
+    /// "cannot partition by primary key column '<c>', which is not in the input
+    /// schema", taking the pipeline down whenever such a script fed a sink.
+    ///
+    /// The upstream node's key describes the schema actually being placed, so it
+    /// is preferred over round-robin: an entity's rows still share one stream.
+    #[test]
+    fn script_key_naming_a_generated_column_falls_back_to_the_upstream_key() {
+        let key = names(&["hash", "chain_id", "community_id", "label", "wallet"]);
+        let upstream_key = names(&["id"]);
+        let upstream_schema = names(&["id", "hash", "chain_id", "label", "wallet", "value_rows"]);
+
+        let chosen = script_input_placement(&key, Some(&upstream_key), &upstream_schema);
+
+        assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
+        assert!(chosen.used_upstream_key);
+        assert_eq!(
+            chosen.generated_columns,
+            names(&["community_id"]),
+            "the generated column is reported so the operator can be warned"
+        );
+    }
+
+    /// With no usable upstream key there is nothing to place by.
+    #[test]
+    fn script_key_generated_and_no_upstream_key_uses_round_robin() {
+        let key = names(&["community_id"]);
+        let upstream_schema = names(&["value_rows"]);
+
+        let chosen = script_input_placement(&key, None, &upstream_schema);
+
+        assert_eq!(chosen.placement, Placement::RoundRobin);
+        assert!(!chosen.used_upstream_key);
+        assert_eq!(chosen.generated_columns, names(&["community_id"]));
+    }
+
+    /// An upstream key that is itself absent from the schema is not usable either.
+    #[test]
+    fn unusable_upstream_key_falls_through_to_round_robin() {
+        let chosen = script_input_placement(
+            &names(&["community_id"]),
+            Some(&names(&["not_here"])),
+            &names(&["value_rows"]),
+        );
+        assert_eq!(chosen.placement, Placement::RoundRobin);
+        assert!(!chosen.used_upstream_key);
+    }
+
+    /// The common pass-through case keeps its keyed placement unchanged, and must
+    /// win over the upstream key.
+    #[test]
+    fn script_key_present_upstream_still_partitions_by_its_own_key() {
+        let chosen = script_input_placement(
+            &names(&["id"]),
+            Some(&names(&["other"])),
+            &names(&["id", "other", "payload"]),
+        );
+        assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
+        assert!(!chosen.used_upstream_key);
+        assert!(chosen.generated_columns.is_empty());
+    }
+
+    /// A script with no declared key falls to the upstream key when one exists.
+    #[test]
+    fn script_without_a_key_uses_the_upstream_key() {
+        let chosen = script_input_placement(&[], Some(&names(&["id"])), &names(&["id", "payload"]));
+        assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
+        assert!(
+            chosen.generated_columns.is_empty(),
+            "an absent key is not a generated column"
+        );
+    }
     use super::*;
+
+    fn sink_entry(name: &str, placement: Placement, parallelism: Option<usize>) -> SinkEntry {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let provider =
+            Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap());
+        SinkEntry::new(
+            name.to_string(),
+            provider,
+            RebatchConfig::default(),
+            placement,
+            parallelism,
+        )
+    }
+
+    fn by_key(columns: &[&str]) -> Placement {
+        Placement::ByKey(columns.iter().map(|c| c.to_string()).collect())
+    }
+
+    /// A transform's `parallelism` has to widen the transform's own work, so the
+    /// exchange belongs under its SQL. Placed above, the filter would keep
+    /// running at the source's width and only downstream nodes would widen —
+    /// which is the knob doing nothing for the case it exists for.
+    ///
+    /// Also pins that `PushDownFilter` does not slide the filter back under the
+    /// exchange: `RepartitionNode`'s default `prevent_predicate_push_down_columns`
+    /// covers every column.
+    #[tokio::test]
+    async fn transform_parallelism_widens_the_transform_itself() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("vid", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        // Three input partitions, like a `parallelism: 3` kafka source.
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (sql_plan, source_name) = session_manager
+            .create_supported_logical_plan("select * from blocks where vid = 100".to_string())
+            .await
+            .unwrap();
+
+        let sql_plan = wrap_transform_input_with_repartition(
+            sql_plan,
+            &source_name,
+            &by_key(&["id"]),
+            4,
+            "filter_blocks",
+        )
+        .unwrap();
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(CheckpointableNode::new(
+                sql_plan,
+                10,
+                "filter_blocks".to_string(),
+            )),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        // The exchange sits directly above the scan, and everything above it —
+        // the filter and the checkpoint wrapper — runs at the widened width.
+        for expected in [
+            "CheckpointableExec (for FilterExec), partitions=4",
+            "FilterExec: vid@1 = 100, partitions=4",
+            "StreamingRepartitionExec: partitions=4, keys=[id@0]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in plan:\n{rendered}"
+            );
+        }
+    }
+
+    /// A handler transform's `parallelism` has to reach the HTTP calls
+    /// themselves: `ExternalHandlerExec` used to declare a single partition and
+    /// require `SinglePartition` input, which collapsed any width above it back
+    /// to one request stream.
+    ///
+    /// The exchange is keyed, so a primary key is never in flight against the
+    /// endpoint on two streams at once.
+    #[tokio::test]
+    async fn handler_parallelism_widens_the_request_streams() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let handler_input = wrap_with_rebatch(
+            wrap_with_repartition(source_plan, &by_key(&["id"]), Some(4), "enrich".to_string()),
+            None,
+            None,
+            "enrich".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(ExternalHandlerNode::new(
+                handler_input,
+                ExternalHandlerConfig {
+                    url: "http://localhost/enrich".to_string(),
+                    headers: None,
+                    one_row_per_request: None,
+                    payload_version: None,
+                    trigger_max_count: 1,
+                    operator_timeout_sec: 1,
+                    schema_override: None,
+                    buffer_size: 1,
+                    metric_metadata_id: "app::enrich".to_string(),
+                },
+            )),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        for expected in [
+            "ExternalHandlerExec: url=http://localhost/enrich, partitions=4",
+            "StreamingRepartitionExec: partitions=4, keys=[id@0]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in plan:\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn script_parallelism_and_batch_size_shape_the_wasm_streams() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan.clone(),
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            Some(2),
+            None,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        for expected in [
+            "WasmRunnerExec (lang: javascript), partitions=4",
+            "RebatchExec(batch_size=2, partitions=4)",
+            "StreamingRepartitionExec: partitions=4, keys=[id@0]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in plan:\n{rendered}"
+            );
+        }
+
+        let inherited_input =
+            wrap_with_repartition(source_plan, &by_key(&["id"]), None, "normalize".to_string());
+        let inherited_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    inherited_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        let inherited_physical_plan = session_manager
+            .new_df(inherited_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let inherited_rendered = displayable(inherited_physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        for expected in [
+            "WasmRunnerExec (lang: javascript), partitions=3",
+            "StreamingRepartitionExec: partitions=3, keys=[id@0]",
+        ] {
+            assert!(
+                inherited_rendered.contains(expected),
+                "expected {expected:?} in plan:\n{inherited_rendered}"
+            );
+        }
+        assert!(
+            !inherited_rendered.contains("RebatchExec"),
+            "unexpected RebatchExec in plan:\n{inherited_rendered}"
+        );
+    }
+
+    fn empty_plan() -> LogicalPlan {
+        LogicalPlanBuilder::empty(true).build().unwrap()
+    }
+
+    fn repartition_node(plan: &LogicalPlan) -> Option<&RepartitionNode> {
+        match plan {
+            LogicalPlan::Extension(extension) => {
+                extension.node.as_any().downcast_ref::<RepartitionNode>()
+            }
+            _ => None,
+        }
+    }
+
+    /// Sinks that agree on a key can all be served by one exchange, so the group
+    /// stays as wide as the widest `parallelism` any of them asked for.
+    #[test]
+    fn multi_sink_group_with_one_key_gets_one_exchange() {
+        let sinks = vec![
+            sink_entry("a", by_key(&["id"]), Some(4)),
+            sink_entry("b", by_key(&["id"]), None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b");
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::ByKey(vec!["id".to_string()]));
+        assert_eq!(node.target_parallelism, Some(4));
+    }
+
+    /// Nothing to key by and nothing to widen to: the group inherits its input's
+    /// width with no exchange at all.
+    #[test]
+    fn keyless_multi_sink_group_is_left_alone() {
+        let sinks = vec![
+            sink_entry("a", Placement::RoundRobin, None),
+            sink_entry("b", Placement::RoundRobin, None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b");
+
+        assert!(
+            repartition_node(&plan).is_none(),
+            "a keyless fan-out needs no exchange"
+        );
+    }
+
+    /// A sink that cannot be parallelized has to get its node even with nothing
+    /// to key by and no width to hit — the node *is* what narrows its input.
+    #[test]
+    fn single_sink_gets_a_coalescing_node() {
+        let plan = wrap_with_repartition(
+            empty_plan(),
+            &Placement::Single,
+            None,
+            "plugin_sink".to_string(),
+        );
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::Single);
+    }
+
+    /// `MultiSinkExec` fans one `write_all` per input partition per sink, so a
+    /// sink that cannot be parallelized narrows the whole group — there is no
+    /// way to keep the others wide.
+    #[test]
+    fn a_single_sink_forces_the_whole_group_to_one_stream() {
+        let sinks = vec![
+            sink_entry("warehouse", by_key(&["id"]), None),
+            sink_entry("plugin", Placement::Single, None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "warehouse, plugin");
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::Single);
+    }
+
+    /// The sinks share one input, so one exchange has to serve all of them. When
+    /// they disagree on the key, no placement is correct for every sink and the
+    /// group falls back to a single stream.
+    #[test]
+    fn multi_sink_group_with_conflicting_keys_falls_back_to_one_stream() {
+        let sinks = vec![
+            sink_entry("a", by_key(&["id"]), None),
+            sink_entry("b", by_key(&["account"]), None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b");
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.target_parallelism, Some(1));
+        assert_eq!(
+            node.placement,
+            Placement::RoundRobin,
+            "a single stream needs no key to hash by"
+        );
+    }
+
+    /// A keyless sink alongside keyed ones is not a conflict: it does not care
+    /// which stream a row lands on, so the keyed sinks' placement wins.
+    #[test]
+    fn a_keyless_sink_does_not_conflict_with_a_keyed_one() {
+        let sinks = vec![
+            sink_entry("printer", Placement::RoundRobin, None),
+            sink_entry("warehouse", by_key(&["id"]), None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "printer, warehouse");
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::ByKey(vec!["id".to_string()]));
+    }
+
+    /// Print and blackhole neither dedupe nor depend on ordering, so a group of
+    /// them widens round-robin — no primary key required.
+    #[test]
+    fn keyless_multi_sink_group_widens_round_robin() {
+        let sinks = vec![
+            sink_entry("printer", Placement::RoundRobin, Some(4)),
+            sink_entry("void", Placement::RoundRobin, None),
+        ];
+
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "printer, void");
+
+        let node = repartition_node(&plan).expect("expected a RepartitionNode");
+        assert_eq!(node.placement, Placement::RoundRobin);
+        assert_eq!(node.target_parallelism, Some(4));
+    }
 
     #[test]
     fn test_normalize_secret_name_hyphens_and_dots() {
@@ -2977,6 +4187,30 @@ sinks: {}
         assert_eq!(
             meta.additional_tags.get("topic"),
             Some(&"v2.evm.blocks".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plugin_transform_metric_metadata_keyed_by_composite_key() {
+        let yaml = r#"
+sources:
+  blocks:
+    type: kafka
+    topic: v2.evm.blocks
+transforms:
+  token_metadata:
+    type: test_transform_plugin
+    from: blocks
+sinks: {}
+"#;
+        let map = build_metadata_from_yaml(yaml);
+        assert!(
+            map.contains_key(&metric_key("test_app", "token_metadata")),
+            "plugin transform metadata must be keyed by metric_key(app_id, reference_name)"
+        );
+        assert!(
+            !map.contains_key("token_metadata"),
+            "bare reference name is not a registry key; consumers must look up by the composite key"
         );
     }
 

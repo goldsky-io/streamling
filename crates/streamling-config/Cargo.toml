@@ -1,6 +1,6 @@
 [package]
 name = "streamling-config"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Configuration types and parsing for Streamling."
@@ -31,6 +31,7 @@ thiserror.workspace = true
 # Utilities
 percent-encoding.workspace = true
 async-trait.workspace = true
+humantime.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

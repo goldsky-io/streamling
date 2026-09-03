@@ -277,6 +277,7 @@ mod tests {
         topology::Transform::sql(topology::SqlTransform {
             primary_key: "id".to_string(),
             sql: sql.to_string(),
+            parallelism: None,
             telemetry: None,
         })
     }
@@ -291,6 +292,7 @@ mod tests {
             one_row_per_request: Some(true),
             payload_version: Some(0),
             schema_override: None,
+            parallelism: None,
             telemetry: None,
             batch_size: None,
             batch_flush_interval: None,
@@ -625,6 +627,8 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("dynamic_table1".to_string(), dynamic_table1);
@@ -636,6 +640,8 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("dynamic_table2".to_string(), dynamic_table2);
@@ -644,6 +650,7 @@ mod tests {
         let sql_with_dynamic_deps = topology::Transform::sql(topology::SqlTransform {
             primary_key: "id".to_string(),
             sql: "SELECT * FROM some_source WHERE dynamic_table_check('dynamic_table1', id) AND dynamic_table_check('dynamic_table2', name)".to_string(),
+            parallelism: None,
             telemetry: None,
         });
         transforms.insert("sql_with_dynamic_deps".to_string(), sql_with_dynamic_deps);
@@ -663,6 +670,8 @@ mod tests {
                 schema: None,
                 column: None,
                 time_column: None,
+                cache: None,
+                cache_refresh_debounce_ms: None,
                 telemetry: None,
             });
         transforms.insert("independent_dynamic".to_string(), independent_dynamic);
@@ -712,6 +721,8 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("filtered_market".to_string(), filtered_market);
@@ -720,6 +731,7 @@ mod tests {
         let updated_transactions = topology::Transform::sql(topology::SqlTransform {
             primary_key: "id".to_string(),
             sql: "SELECT id, vid, _gs_op FROM preprocessed_transactions WHERE dynamic_table_check('filtered_market', id)".to_string(),
+            parallelism: None,
             telemetry: None,
         });
         transforms.insert("updated_transactions".to_string(), updated_transactions);
@@ -777,6 +789,7 @@ mod tests {
       where
         program_id = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'"
                 .to_string(),
+            parallelism: None,
             telemetry: None,
         });
         transforms.insert("cash".to_string(), sql_transform);
@@ -1184,6 +1197,8 @@ mod tests {
             schema: None,
             column: None,
             time_column: None,
+            cache: None,
+            cache_refresh_debounce_ms: None,
             telemetry: None,
         });
         transforms.insert("hot_wallets".to_string(), dt);

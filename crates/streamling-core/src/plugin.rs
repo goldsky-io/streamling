@@ -12,7 +12,7 @@ use crate::data::COLUMN_NAME_OP;
 use crate::error::Result;
 use crate::telemetry::provider::metric_key;
 use crate::telemetry::recorder::merge_metadata_tags;
-use crate::{streamling_bail, streamling_err, streamling_user_bail};
+use crate::{streamling_err, streamling_user_bail, streamling_user_err};
 use abi_stable::StableAbi;
 use abi_stable::derive_macro_reexports::{NonExhaustive, TD_Opaque};
 use abi_stable::external_types::crossbeam_channel;
@@ -28,18 +28,19 @@ use std::fmt;
 use std::fmt::Debug;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
 };
+pub(crate) use streamling_plugin::ffi::IDLE_POLL_INTERVAL;
 use streamling_plugin::ffi::PluginMetricsChannel;
 pub use streamling_plugin::{
     PluginChannel, PluginChannelCaps, PluginChannels, PluginLabel, PluginLogging, PluginModuleRef,
     PluginMsg, PluginOptions, PluginStateBackendConfig,
 };
 use tokio::runtime::Handle;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct PluginId {
@@ -89,8 +90,6 @@ lazy_static! {
         RwLock::new(HashMap::new());
 }
 
-static SHUTDOWN_WATCH_STARTED: OnceLock<()> = OnceLock::new();
-
 fn register_plugin_instance(instance_key: &str, channels: PluginChannels) {
     let mut reg = PLUGIN_INSTANCE_REGISTRY.write().unwrap();
     reg.insert(instance_key.to_string(), channels);
@@ -105,31 +104,6 @@ pub fn terminate_all_plugins() -> Result<()> {
     let ids: Vec<(String, PluginChannels)> = reg.drain().collect();
     drop(reg);
     terminate_plugins(ids)
-}
-
-fn start_shutdown_watcher_once() {
-    if SHUTDOWN_WATCH_STARTED.set(()).is_ok() {
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut sigterm =
-                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-                let mut sigint =
-                    signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-                tokio::select! {
-                    _ = sigterm.recv() => {},
-                    _ = sigint.recv() => {},
-                    _ = tokio::signal::ctrl_c() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-            let _ = self::terminate_all_plugins();
-        });
-    }
 }
 
 #[repr(transparent)]
@@ -288,6 +262,27 @@ fn find_plugin(plugin_id: &PluginId) -> Option<Arc<PluginModuleRef>> {
     module_registry.get(plugin_id).cloned()
 }
 
+/// Returns all loaded plugin ids in a stable order.
+fn registered_plugin_ids() -> Vec<String> {
+    let module_registry = PLUGIN_MODULE_REGISTRY
+        .read()
+        .expect("plugin module registry lock poisoned");
+    let mut ids: Vec<String> = module_registry.keys().map(|id| id.to_string()).collect();
+    ids.sort();
+    ids
+}
+
+/// Resolves a plugin module and includes the loaded ids in any error.
+fn require_plugin(plugin_id: &PluginId) -> Result<Arc<PluginModuleRef>> {
+    find_plugin(plugin_id).ok_or_else(|| {
+        streamling_user_err!(
+            "plugin '{}' is not available; check that the plugin type is correct and that the plugin bundle is installed. Registered plugin ids: [{}]",
+            plugin_id,
+            registered_plugin_ids().join(", ")
+        )
+    })
+}
+
 fn create_plugin_async_runtime(handle: Handle) -> PluginAsyncRuntimeObj {
     // `TD_Opaque` chooses `RBox<()>` for the erased-pointer parameter
     PluginAsyncRuntime_TO::from_value(PluginTokioWrapper { inner: handle }, TD_Opaque)
@@ -315,18 +310,45 @@ fn create_channels_with_caps(input: usize, output: usize, metrics: usize) -> Plu
     }
 }
 
+/// Default capacity for the plugin→host metrics channel.
+/// Distinct from `plugin.channel_capacity` (data-plane backpressure, default 50).
+/// Plugins emit with non-blocking `try_send`; a full channel drops the sample
+/// (`Encountered error dispatching metrics`) rather than applying backpressure.
+/// A `0` metrics cap used to fall back to that 50 and dropped samples on
+/// high-rate plugins; this default is the metrics fallback instead.
+pub const DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY: usize = 4096;
+
+/// Resolve per-plugin channel sizes. A `0` cap means "use the default":
+/// input/output fall back to the data-plane default, metrics fall back to
+/// the metrics default so a tight output buffer (e.g. Solana's 1) does not
+/// also shrink the metrics channel.
+fn resolve_channel_caps(
+    data_default: usize,
+    metrics_default: usize,
+    caps: Option<PluginChannelCaps>,
+) -> (usize, usize, usize) {
+    let Some(caps) = caps else {
+        return (data_default, data_default, metrics_default);
+    };
+    let to_sz = |v: u32, fallback: usize| {
+        if v == 0 { fallback } else { v as usize }
+    };
+    (
+        to_sz(caps.input, data_default),
+        to_sz(caps.output, data_default),
+        to_sz(caps.metrics, metrics_default),
+    )
+}
+
 fn create_channels_for_plugin(app_config: &AppConfig, plugin_type: &PluginId) -> PluginChannels {
     let default = app_config.plugin.channel_capacity as usize;
     let caps_registry = PLUGIN_DEFAULT_CAPS.read().unwrap();
-    if let Some(caps) = caps_registry.get(plugin_type) {
-        let to_sz = |v: u32| if v == 0 { default } else { v as usize };
-        return create_channels_with_caps(
-            to_sz(caps.input),
-            to_sz(caps.output),
-            to_sz(caps.metrics),
-        );
-    }
-    create_channels_with_caps(default, default, default)
+    let (input, output, metrics) = resolve_channel_caps(
+        default,
+        DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY,
+        caps_registry.get(plugin_type).copied(),
+    );
+    create_channels_with_caps(input, output, metrics)
 }
 
 fn create_logging(app_config: &AppConfig) -> PluginLogging {
@@ -386,8 +408,7 @@ pub fn create_source_plugin(
     options: HashMap<String, String>,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -403,32 +424,33 @@ pub fn create_source_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            start_shutdown_watcher_once();
-            register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-            merge_metadata_tags(
-                &metric_key(&app_config.application_id, &reference_name),
-                collect_labels(result.labels),
-            );
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin::new(
-                plugin_type.to_string(),
-                Box::pin(mapped_future),
-                plugin_channels,
-                Some(
-                    result
-                        .output_schema
-                        .expect("Source plugin must provide an output schema")
-                        .into(),
-                ),
-            )
-            .unwrap()
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    // Validate schema before registering so a missing/invalid output schema does
+    // not leave a half-initialized entry in the plugin instance registry.
+    let output_schema = result.output_schema.into_option().ok_or_else(|| {
+        streamling_err!(
+            "source plugin '{}' must provide an output schema (plugin invariant)",
+            plugin_type
+        )
+    })?;
+    let labels = collect_labels(result.labels);
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let initialized = InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels.clone(),
+        Some(output_schema.into()),
+    )?;
+    register_plugin_instance(reference_name.as_str(), plugin_channels);
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        labels,
+    );
+    Ok(initialized)
 }
 
 pub fn create_transform_plugin(
@@ -439,8 +461,7 @@ pub fn create_transform_plugin(
     input_schema: SchemaRef,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -456,32 +477,33 @@ pub fn create_transform_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            start_shutdown_watcher_once();
-            register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-            merge_metadata_tags(
-                &metric_key(&app_config.application_id, &reference_name),
-                collect_labels(result.labels),
-            );
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin::new(
-                plugin_type.to_string(),
-                Box::pin(mapped_future),
-                plugin_channels,
-                Some(
-                    result
-                        .output_schema
-                        .expect("Transform plugin must provide an output schema")
-                        .into(),
-                ),
-            )
-            .unwrap()
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    // Validate schema before registering so a missing/invalid output schema does
+    // not leave a half-initialized entry in the plugin instance registry.
+    let output_schema = result.output_schema.into_option().ok_or_else(|| {
+        streamling_err!(
+            "transform plugin '{}' must provide an output schema (plugin invariant)",
+            plugin_type
+        )
+    })?;
+    let labels = collect_labels(result.labels);
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let initialized = InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels.clone(),
+        Some(output_schema.into()),
+    )?;
+    register_plugin_instance(reference_name.as_str(), plugin_channels);
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        labels,
+    );
+    Ok(initialized)
 }
 
 pub fn create_sink_plugin(
@@ -492,8 +514,7 @@ pub fn create_sink_plugin(
     input_schema: SchemaRef,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -509,27 +530,27 @@ pub fn create_sink_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            start_shutdown_watcher_once();
-            register_plugin_instance(reference_name.as_str(), plugin_channels.clone());
-            merge_metadata_tags(
-                &metric_key(&app_config.application_id, &reference_name),
-                collect_labels(result.labels),
-            );
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin::new(
-                plugin_type.to_string(),
-                Box::pin(mapped_future),
-                plugin_channels,
-                None,
-            )
-            .unwrap()
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    // Match source/transform: only register after InitializedPlugin::new succeeds
+    // so a future sink-schema invariant cannot leave a half-initialized registry entry.
+    let labels = collect_labels(result.labels);
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let initialized = InitializedPlugin::new(
+        plugin_type.to_string(),
+        Box::pin(mapped_future),
+        plugin_channels.clone(),
+        None,
+    )?;
+    register_plugin_instance(reference_name.as_str(), plugin_channels);
+    merge_metadata_tags(
+        &metric_key(&app_config.application_id, &reference_name),
+        labels,
+    );
+    Ok(initialized)
 }
 
 pub fn create_preprocessor_plugin(
@@ -539,8 +560,7 @@ pub fn create_preprocessor_plugin(
     options: HashMap<String, String>,
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
-    let plugin_module =
-        find_plugin(&plugin_type).unwrap_or_else(|| panic!("Plugin {} not found!", &plugin_type));
+    let plugin_module = require_plugin(&plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -556,34 +576,180 @@ pub fn create_preprocessor_plugin(
         plugin_channels.clone(),
     );
 
-    create_result
+    // Preprocessors are short-lived helpers: they are not registered in
+    // PLUGIN_INSTANCE_REGISTRY and do not start the process-wide shutdown watcher
+    // (unlike source/transform/sink). FFI create failures are internal/platform.
+    // Construct the struct directly (no InitializedPlugin::new): preprocessors have
+    // no output schema, so the op-column check in `new` does not apply and init
+    // remains infallible after a successful FFI create.
+    let result = create_result
         .into_rust()
-        .map(|result| {
-            let mapped_future = result
-                .execution_future
-                .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
-            InitializedPlugin {
-                plugin_id: plugin_type.to_string(),
-                execution_future: Box::pin(mapped_future),
-                channels: plugin_channels,
-                output_schema: None,
-            }
-        })
-        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))
+        .map_err(|e| streamling_err!("Plugin creation failed: {:?}", e))?;
+    let mapped_future = result
+        .execution_future
+        .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    Ok(InitializedPlugin {
+        plugin_id: plugin_type.to_string(),
+        execution_future: Box::pin(mapped_future),
+        channels: plugin_channels,
+        output_schema: None,
+    })
 }
 
 pub fn terminate_plugins(plugins: Vec<(String, PluginChannels)>) -> Result<()> {
+    // Bound the send so a plugin whose input channel is full (a wedged
+    // dispatcher) cannot park this call — and thus the whole shutdown path —
+    // forever on a blocking crossbeam send. A failure to signal one plugin must
+    // not stop us from terminating the rest, so warn and continue rather than
+    // bailing; the host awaits the dispatchers afterwards and the shutdown
+    // watchdog is the final backstop.
+    const TERMINATE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
     for (plugin_id, channels) in plugins {
         info!("Terminating plugin {}", plugin_id);
 
-        if let Err(e) = channels
-            .input
-            .sender
-            .send(NonExhaustive::new(PluginMsg::Terminate))
-        {
-            streamling_bail!("Failed to send termination message: {}", e);
+        if let Err(e) = channels.input.sender.send_timeout(
+            NonExhaustive::new(PluginMsg::Terminate),
+            TERMINATE_SEND_TIMEOUT,
+        ) {
+            warn!(
+                "Failed to send termination message to plugin {} within {:?}: {}. \
+                 Continuing to terminate remaining plugins.",
+                plugin_id, TERMINATE_SEND_TIMEOUT, e
+            );
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::StreamlingError;
+    use arrow_schema::Schema;
+
+    /// Unused name that will not be present in the empty default plugin registry.
+    const UNKNOWN_PLUGIN: &str = "definitely_not_a_real_plugin";
+
+    fn assert_unknown_plugin_user_error(err: StreamlingError) {
+        assert!(
+            !err.is_internal(),
+            "missing plugin must be a user-facing error"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(UNKNOWN_PLUGIN),
+            "error should name the plugin: {msg}"
+        );
+        assert!(
+            msg.contains("is not available"),
+            "error should say plugin is not available: {msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "Registered plugin ids: [{}]",
+                registered_plugin_ids().join(", ")
+            )),
+            "error should name what is actually loaded: {msg}"
+        );
+    }
+
+    /// Regression: unknown plugins used to `panic!("Plugin {} not found!")`.
+    /// They must now return a structured user error (never a panic).
+    #[test]
+    fn create_source_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        match create_source_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    #[test]
+    fn create_transform_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        let empty_schema = Arc::new(Schema::empty());
+        match create_transform_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+            empty_schema,
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    #[test]
+    fn create_sink_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        let empty_schema = Arc::new(Schema::empty());
+        match create_sink_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+            empty_schema,
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    #[test]
+    fn create_preprocessor_plugin_unknown_is_user_error_not_panic() {
+        let app_config = AppConfig::load().expect("embedded config must load");
+        match create_preprocessor_plugin(
+            &app_config,
+            "ref".to_string(),
+            UNKNOWN_PLUGIN.to_string(),
+            HashMap::new(),
+        ) {
+            Ok(_) => panic!("expected Err for unknown plugin"),
+            Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    /// Regression: a `0` metrics cap (every plugin today) used the data-plane
+    /// default of 50, so high-rate plugins overflowed the metrics channel.
+    #[test]
+    fn resolve_channel_caps_uses_metrics_default_when_unset() {
+        assert_eq!(
+            resolve_channel_caps(50, 4096, None),
+            (50, 50, 4096),
+            "no plugin caps: data channels stay at 50, metrics use 4096"
+        );
+        assert_eq!(
+            resolve_channel_caps(
+                50,
+                4096,
+                Some(PluginChannelCaps {
+                    input: 0,
+                    output: 1,
+                    metrics: 0,
+                }),
+            ),
+            (50, 1, 4096),
+            "Solana-style output=1 must not shrink the metrics channel to 50"
+        );
+        assert_eq!(
+            resolve_channel_caps(
+                50,
+                4096,
+                Some(PluginChannelCaps {
+                    input: 8,
+                    output: 8,
+                    metrics: 16,
+                }),
+            ),
+            (8, 8, 16),
+            "an explicit metrics cap must win"
+        );
+    }
 }
