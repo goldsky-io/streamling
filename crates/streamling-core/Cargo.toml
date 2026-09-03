@@ -46,6 +46,7 @@ async-stream.workspace = true
 dashmap.workspace = true
 fixed_deque.workspace = true
 indexmap.workspace = true
+hashbrown.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -90,3 +91,4 @@ paste.workspace = true
 rand.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 serial_test.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

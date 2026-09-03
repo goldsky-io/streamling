@@ -251,3 +251,184 @@ sinks:
     ids.sort();
     assert_eq!(ids, vec![1, 2, 3]);
 }
+
+/// A Kafka source with `parallelism: N` runs N consumer instances in one shared
+/// group, so the broker splits the topic's partitions between them.
+///
+/// The property under test is that nothing is lost or duplicated by the split:
+/// every produced row must arrive exactly once, no matter which instance read it.
+#[tokio::test]
+async fn kafka_source_parallelism_reads_every_partition_exactly_once() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    // Four partitions so a `parallelism: 2` source gets two apiece; keyed
+    // production spreads the records instead of piling them onto partition 0.
+    let topic = ctx
+        .create_kafka_topic_with_partitions("parallel_src", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+
+    let records: Vec<JsonRecord> = (1..=40)
+        .map(|i| JsonRecord {
+            id: i,
+            name: format!("row_{i}"),
+            amount: i as f64,
+            active: i % 2 == 0,
+        })
+        .collect();
+
+    topic
+        .produce_json_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce JSON records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 2
+    starting_offsets: earliest
+    primary_key: id
+    data_format: json
+    schema:
+      id: int64
+      name: string
+      amount: float64
+      active: boolean
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: kafka_source
+    sample_every: 1
+"#,
+        topic = topic.topic,
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records.len() as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    let mut ids: Vec<i64> = output
+        .column_values("id")
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        (1..=40).collect::<Vec<i64>>(),
+        "every row must be delivered exactly once across the two consumer instances"
+    );
+}
+
+/// A Kafka source is `UnknownPartitioning`, never `Hash`: Kafka places records
+/// by murmur2 over the message key, which is unrelated to the hash a keyed sink
+/// needs. A parallel source feeding a keyed sink must therefore still get a
+/// sink-edge exchange, and the sink must see each key on exactly one stream.
+#[tokio::test]
+async fn kafka_source_parallelism_keeps_keys_together_at_a_keyed_sink() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("parallel_keyed", 4)
+        .await
+        .expect("Failed to create multi-partition topic");
+
+    // Ten keys, each updated three times. Keep-last dedup at the sink is only
+    // correct if all three updates of a key travel one stream in order.
+    let records: Vec<JsonRecord> = (0..30)
+        .map(|i| JsonRecord {
+            id: i % 10,
+            name: format!("v{}", i / 10),
+            amount: i as f64,
+            active: true,
+        })
+        .collect();
+
+    topic
+        .produce_json_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce JSON records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 2
+    starting_offsets: earliest
+    primary_key: id
+    data_format: json
+    schema:
+      id: int64
+      name: string
+      amount: float64
+      active: boolean
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: kafka_source
+    sample_every: 1
+"#,
+        topic = topic.topic,
+    );
+
+    let output = ctx
+        .run_pipeline_with_capture(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records.len() as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Pipeline execution failed");
+
+    assert_eq!(
+        output.len(),
+        30,
+        "no rows may be lost or duplicated by the exchange"
+    );
+    for key in 0..10i64 {
+        let versions: Vec<String> = output
+            .rows()
+            .iter()
+            .filter(|r| r.data.get("id").and_then(|v| v.as_i64()) == Some(key))
+            .filter_map(|r| {
+                r.data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["v0", "v1", "v2"],
+            "key {key} must arrive in produced order on a single stream"
+        );
+    }
+}

@@ -153,6 +153,11 @@ impl HybridOffsetTable {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct KafkaSource {
     pub topic: String,
+    /// Number of concurrent consumer instances. All instances share one consumer
+    /// group, so the broker assigns each a disjoint slice of the topic's
+    /// partitions. Defaults to 1. Values above the topic's partition count leave
+    /// the surplus instances idle.
+    pub parallelism: Option<usize>,
     pub starting_offsets: Option<String>,
     pub include_metadata: Option<bool>,
     pub filter: Option<String>,
@@ -244,6 +249,11 @@ pub struct FileSource {
     pub format: FileSourceFormat,
     #[serde(default)]
     pub mode: FileSourceMode,
+    /// Number of concurrent scan partitions the discovered files are split
+    /// across. Bounded mode only; defaults to the session's target partitions.
+    /// A continuous file source is single-stream (one watermark cursor) and
+    /// rejects any value above 1.
+    pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
 }
@@ -477,6 +487,17 @@ impl Source {
             Source::plugin(s) => s.telemetry.as_ref(),
         }
     }
+
+    /// Requested number of concurrent instances for this source, if the source
+    /// type supports more than one. Sources not listed here are structurally
+    /// single-stream and have no field to set.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Source::kafka(s) => s.parallelism,
+            Source::file(s) => s.parallelism,
+            Source::clickhouse(_) | Source::hybrid(_) | Source::plugin(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -488,6 +509,23 @@ pub struct DynamicTableTransform {
     pub schema: Option<String>,
     pub column: Option<String>,
     pub time_column: Option<String>,
+    /// Opt-in caching for this dynamic table. When omitted, falls back to the
+    /// global `dynamic_table_backend.postgres.cache_enabled` config. Caching is
+    /// only ever active when `time_column` is set.
+    #[serde(default)]
+    pub cache: Option<bool>,
+    /// How long to trust the in-memory cache before re-checking the table's
+    /// freshness (`SELECT MAX(<time_column>)`). When omitted, falls back to the
+    /// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms`
+    /// config; when neither is set,
+    /// `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (1000ms) applies. Set 0 explicitly
+    /// (here or globally) to re-check on every batch.
+    ///
+    /// Raising this trades staleness for round trips: lookups may miss rows
+    /// written by OTHER writers for up to this long. This pipeline's own writes
+    /// stay visible immediately (see `append`).
+    #[serde(default)]
+    pub cache_refresh_debounce_ms: Option<u64>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -496,6 +534,10 @@ pub struct DynamicTableTransform {
 pub struct SqlTransform {
     pub primary_key: String,
     pub sql: String,
+    /// Width of this transform's output: the rows are hash-partitioned by
+    /// `primary_key` into this many streams, letting a narrow source feed wider
+    /// downstream compute. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -510,6 +552,11 @@ pub struct HandlerTransform {
     pub one_row_per_request: Option<bool>,
     pub payload_version: Option<u32>,
     pub schema_override: Option<BTreeMap<String, Option<String>>>,
+    /// Number of concurrent request streams, hash-partitioned by `primary_key`
+    /// so a key is never in flight against the endpoint twice at once.
+    /// Each stream runs its own HTTP client, so in-flight requests multiply by
+    /// this. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -523,11 +570,11 @@ pub struct ScriptTransform {
     pub language: String,
     pub script: String,
     pub schema: Option<BTreeMap<String, String>>,
-    /// Number of WASM plugin instances for parallel processing.
-    /// Overrides the global wasm_script.parallelism if specified.
+    /// Number of concurrent WASM execution streams, hash-partitioned by
+    /// `primary_key`. Each stream owns one WASM instance. Defaults to the input
+    /// width.
     pub parallelism: Option<usize>,
-    /// Minimum rows to accumulate before processing.
-    /// Overrides the global wasm_script.batch_size if specified.
+    /// Rows accumulated per execution stream before invoking WASM.
     pub batch_size: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
@@ -568,6 +615,18 @@ impl Transform {
             Transform::plugin(t) => t.telemetry.as_ref(),
         }
     }
+
+    /// Requested output width for this transform.
+    ///
+    /// `plugin` and `dynamic_table` are `SinglePartition` operators.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Transform::sql(t) => t.parallelism,
+            Transform::handler(t) => t.parallelism,
+            Transform::script(t) => t.parallelism,
+            Transform::dynamic_table(_) | Transform::plugin(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -581,6 +640,12 @@ pub struct WebhookSink {
     pub payload_version: Option<u32>,
     pub skip_on_error: Option<bool>,
     pub primary_key: Option<String>,
+    /// Number of concurrent write streams, keyed by `primary_key` so a key is
+    /// never delivered by two streams at once — the payload carries a per-row
+    /// op, so a receiver applying upserts and deletes depends on that ordering.
+    /// In-flight HTTP requests against the endpoint multiply by this. Defaults
+    /// to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -590,6 +655,11 @@ pub struct WebhookSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PrintSink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink neither dedupes nor depends on ordering,
+    /// so it needs no primary key to parallelize. Output from the streams
+    /// interleaves.
+    pub parallelism: Option<usize>,
     pub sample_every: Option<u32>,
     pub num_records_before_stop: Option<u64>,
     pub primary_key: Option<String>,
@@ -602,6 +672,10 @@ pub struct PrintSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct BlackholeSink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink discards everything, so it needs no
+    /// primary key to parallelize.
+    pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
@@ -612,6 +686,11 @@ pub struct BlackholeSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MemorySink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink appends into a shared store and neither
+    /// dedupes nor depends on ordering, so it needs no primary key to
+    /// parallelize. Batch order in the store becomes nondeterministic.
+    pub parallelism: Option<usize>,
     pub exclude_gs_op: Option<bool>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
@@ -626,13 +705,16 @@ pub struct PostgresSink {
     pub table: String,
     pub schema: String,
     pub batch_flush_interval: Option<String>,
+    /// Rows accumulated per write stream before a write is issued, so a sink
+    /// with `parallelism: N` buffers up to `N * batch_size` rows.
     pub batch_size: Option<u32>,
     pub primary_key: Option<String>,
     #[serde(default = "default_on_conflict")]
     pub on_conflict: String,
     pub update_where: Option<std::collections::BTreeMap<String, String>>,
-    /// Number of parallel tasks for writing to PostgreSQL. Each task processes
-    /// a slice of the accumulated batch concurrently. Defaults to 1.
+    /// Number of concurrent write streams into the table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    /// Also sizes the connection pool. Defaults to 1.
     pub parallelism: Option<usize>,
     /// When true (default), each batch is collapsed to the latest row per
     /// `primary_key` before it is written.
@@ -676,6 +758,13 @@ pub struct AggregateColumn {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PostgresAggregateSink {
     pub from: String,
+    /// Number of concurrent write streams into the landing table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    ///
+    /// Note this parallelizes the *insert*, not the aggregation: the aggregate
+    /// table is maintained by a Postgres trigger, and concurrent inserts whose
+    /// rows fall in the same `group_by` bucket contend on that row.
+    pub parallelism: Option<usize>,
     pub schema: String,
     pub landing_table: String,
     pub agg_table: String,
@@ -725,9 +814,14 @@ pub struct ClickhouseSink {
     pub from: String,
     pub table: String,
     pub batch_flush_interval: Option<String>,
+    /// Rows accumulated per write stream before an INSERT is issued, so a sink
+    /// with `parallelism: N` buffers up to `N * batch_size` rows.
     pub batch_size: Option<u32>,
     pub primary_key: String,
     pub version_column_name: Option<String>,
+    /// Number of concurrent write streams into the table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    /// Defaults to 1.
     pub parallelism: Option<usize>,
     /// When true (default), uses ReplacingMergeTree(insert_time, is_deleted) with
     /// automatic is_deleted/insert_time columns derived from _gs_op.
@@ -797,6 +891,21 @@ impl Sink {
             Sink::kafka(s) => s.telemetry.as_ref(),
             Sink::clickhouse(s) => s.telemetry.as_ref(),
             Sink::plugin(s) => s.telemetry.as_ref(),
+        }
+    }
+
+    /// Requested number of concurrent write streams for this sink.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Sink::postgres(s) => s.parallelism,
+            Sink::kafka(s) => s.parallelism,
+            Sink::clickhouse(s) => s.parallelism,
+            Sink::postgres_aggregate(s) => s.parallelism,
+            Sink::print(s) => s.parallelism,
+            Sink::blackhole(s) => s.parallelism,
+            Sink::memory(s) => s.parallelism,
+            Sink::webhook(s) => s.parallelism,
+            Sink::plugin(_) => None,
         }
     }
 }
@@ -1085,6 +1194,67 @@ data_format: avro
 {extra}
 "#
         )
+    }
+
+    #[test]
+    fn dynamic_table_cache_and_debounce_parse_and_default() {
+        // Fields omitted -> None (falls back to global config at runtime).
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  dt_omitted:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    time_column: updated_at
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.transforms.get("dt_omitted").unwrap() {
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, None);
+                assert_eq!(dt.cache_refresh_debounce_ms, None);
+            }
+            _ => panic!("expected dynamic_table transform"),
+        }
+
+        // Explicit topology-level values are preserved.
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  dt_on:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    time_column: updated_at
+    cache: true
+    cache_refresh_debounce_ms: 5000
+  dt_off:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl2
+    time_column: updated_at
+    cache: false
+    cache_refresh_debounce_ms: 0
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        match topology.transforms.get("dt_on").unwrap() {
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, Some(true));
+                assert_eq!(dt.cache_refresh_debounce_ms, Some(5000));
+            }
+            _ => panic!("expected dynamic_table transform"),
+        }
+        match topology.transforms.get("dt_off").unwrap() {
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, Some(false));
+                assert_eq!(dt.cache_refresh_debounce_ms, Some(0));
+            }
+            _ => panic!("expected dynamic_table transform"),
+        }
     }
 
     #[test]

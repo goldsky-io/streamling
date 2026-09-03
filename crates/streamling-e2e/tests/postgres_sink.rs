@@ -1192,12 +1192,21 @@ sinks:
     primary_key: id
     on_conflict: update
     parallelism: 3
-    batch_size: 5
+    batch_size: 1
     batch_flush_interval: 100ms
 "#,
         topic = ctx.kafka_topic,
     );
 
+    // `batch_size: 1` (was 5) so no two rows share a batch. `parallelism` now
+    // hash-partitions on the primary key, which puts both copies of an id on one
+    // write stream — with a larger batch they would land in the same batch and be
+    // collapsed by in-batch dedup, so fewer than 10 rows would ever be written and
+    // the record limit would be unreachable.
+    //
+    // One row per batch also makes this a sharper test of the exchange: with no
+    // in-batch dedup to mask it, a key whose two rows reached different streams
+    // would race and could leave `original_i` as the final value.
     let status = ctx
         .run_pipeline_with_opts(
             &pipeline,
@@ -1300,12 +1309,18 @@ sinks:
     primary_key: id
     on_conflict: update
     parallelism: 3
-    batch_size: 5
+    batch_size: 1
     batch_flush_interval: 100ms
 "#,
         topic = ctx.kafka_topic,
     );
 
+    // `batch_size: 1` (was 5) so an id's insert and its delete never share a
+    // batch: `parallelism` hash-partitions on the primary key, so both land on
+    // one write stream and in-batch dedup would collapse them, making the record
+    // limit below unreachable. Keeping them as separate writes also means the
+    // delete has to actually follow the insert on that stream — which is the
+    // ordering guarantee the exchange exists to provide.
     // 10 inserts + 5 deletes = 15 total records
     let status = ctx
         .run_pipeline_with_opts(
@@ -1600,4 +1615,116 @@ sinks:
         .await
         .expect("Failed to query count after recovery");
     assert_eq!(count, 50, "All 50 records should be written after recovery");
+}
+
+// ============================================================================
+// Scenario 11: Narrowing a parallel source at a keyed sink
+// ============================================================================
+
+/// A sink narrower than its source: the exchange re-places rows from 4 streams
+/// onto 2, keyed on the primary key.
+///
+/// Row-count completeness is covered by the `parallelism` suite; what this pins
+/// is *ordering* through a narrowing exchange. Every id is produced twice, and
+/// the second version may only win if both copies landed on the same write
+/// stream in order — if a key's two rows reached different streams they would
+/// race, and `original_i` could survive as the final value.
+#[tokio::test]
+async fn test_keyed_sink_narrows_a_parallel_source() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    // More topic partitions than consumer instances, so the 4 instances really
+    // do read disjoint slices and the sink genuinely narrows 4 -> 2.
+    let topic = ctx
+        .create_kafka_topic_with_partitions("narrowing", 8)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    const KEYS: i64 = 20;
+    let mut records: Vec<TestRecord> = (1..=KEYS)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("original_{i}"),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    records.extend((1..=KEYS).map(|i| TestRecord {
+        id: i,
+        value: format!("updated_{i}"),
+        timestamp: 2000 + i,
+    }));
+    // Keyed by `id`, so both copies of a key share a Kafka partition and reach
+    // one consumer instance in order. Streamling preserves per-key ordering from
+    // the source onward but cannot restore an order the source never had: with
+    // the default empty key, librdkafka partitions randomly and a key's two rows
+    // can arrive on unrelated streams with no defined relative order.
+    topic
+        .produce_avro_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    parallelism: 4
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: test_narrowing_sink
+    schema: public
+    primary_key: id
+    on_conflict: update
+    parallelism: 2
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        topic = topic.topic,
+    );
+
+    // `batch_size: 1` so both copies of an id are written rather than collapsed
+    // by in-batch dedup — which would both hide the ordering property and make
+    // the record limit unreachable.
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records.len() as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let rows: Vec<(i64, String)> = ctx
+        .postgres
+        .query("SELECT id, value FROM public.test_narrowing_sink ORDER BY id")
+        .await
+        .expect("Failed to query rows");
+
+    assert_eq!(rows.len(), KEYS as usize, "one row per key");
+    for (id, value) in &rows {
+        assert_eq!(
+            value,
+            &format!("updated_{id}"),
+            "id={id} kept the wrong version, so its two rows did not share a write stream"
+        );
+    }
 }
