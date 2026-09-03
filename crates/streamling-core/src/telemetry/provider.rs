@@ -374,8 +374,45 @@ pub fn metric_key(app_id: &str, id: &str) -> String {
     format!("{}::{}", app_id, id)
 }
 
+/// Recover the plain topology node name from a `metric_key`-form identifier.
+///
+/// Keys take three shapes:
+///   - `<app_id>::<node>`                 (regular node)
+///   - `<app_id>::<node>::unbounded`      (hybrid source, unbounded phase)
+///   - `<app_id>::<node>::bounded::<idx>` (hybrid source, bounded phase)
+///
+/// The hybrid phase suffix is stripped first; otherwise a hybrid key would yield
+/// `unbounded` or the partition index instead of the node, mis-stamping
+/// `downstream_id` and breaking PromQL joins.
 pub fn get_reference_name_from_metric_key(metric_key: &str) -> String {
-    metric_key.split("::").last().unwrap().to_string()
+    let base = strip_hybrid_phase_suffix(metric_key);
+    base.rsplit("::").next().unwrap_or(base).to_string()
+}
+
+/// Strip a hybrid-source phase suffix (`::unbounded` or `::bounded::<idx>`),
+/// leaving `<app_id>::<node>`; returns the key unchanged otherwise.
+///
+/// A phase suffix is only appended to a full `<app_id>::<node>` key, so the base
+/// must still contain `::`. That guard keeps a regular node literally named
+/// `unbounded`/`bounded` (key `<app_id>::unbounded`) from being stripped to the
+/// app id. (Assumes a single `::`-free `app_id`; a multi-segment app id with a
+/// node named `unbounded` is not distinguishable here.)
+fn strip_hybrid_phase_suffix(metric_key: &str) -> &str {
+    if let Some(base) = metric_key.strip_suffix("::unbounded") {
+        // Phase suffix only when the base is still `<app_id>::<node>`; else this
+        // is a regular node literally named `unbounded`.
+        if base.contains("::") {
+            return base;
+        }
+    }
+    if let Some((base, idx)) = metric_key.rsplit_once("::bounded::") {
+        // Bounded-phase suffix only when the base is `<app_id>::<node>` and the
+        // trailing segment is a partition index, so a node named `bounded` is safe.
+        if base.contains("::") && !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) {
+            return base;
+        }
+    }
+    metric_key
 }
 
 pub fn metric_key_hybrid_src_unbounded(app_id: &str, id: &str) -> String {
@@ -405,6 +442,84 @@ pub fn get_delta_meter() -> opentelemetry::metrics::Meter {
 mod tests {
     use super::*;
     use opentelemetry_sdk::metrics::InMemoryMetricExporterBuilder;
+
+    /// Must recover the plain node name for every key shape, including hybrid
+    /// phase keys. Taking only the last `::` segment would yield `unbounded` or
+    /// the partition index for hybrid keys, breaking `downstream_id`/PromQL joins.
+    #[test]
+    fn reference_name_recovers_plain_node_for_all_key_shapes() {
+        let app = "app-7f3c";
+
+        // Regular node key: `<app>::<node>`.
+        assert_eq!(
+            get_reference_name_from_metric_key(&metric_key(app, "kafka_source")),
+            "kafka_source"
+        );
+
+        // Hybrid unbounded phase: `<app>::<node>::unbounded`.
+        assert_eq!(
+            get_reference_name_from_metric_key(&metric_key_hybrid_src_unbounded(app, "evm_blocks")),
+            "evm_blocks"
+        );
+
+        // Hybrid bounded phase: `<app>::<node>::bounded::<idx>` — must return the
+        // node name, never the partition index.
+        assert_eq!(
+            get_reference_name_from_metric_key(&metric_key_hybrid_src_bounded(
+                app,
+                "evm_blocks",
+                0
+            )),
+            "evm_blocks"
+        );
+        assert_eq!(
+            get_reference_name_from_metric_key(&metric_key_hybrid_src_bounded(
+                app,
+                "evm_blocks",
+                12
+            )),
+            "evm_blocks"
+        );
+
+        // Robust even when the app id itself contains `::` separators.
+        assert_eq!(
+            get_reference_name_from_metric_key("tenant::app::evm_blocks::bounded::3"),
+            "evm_blocks"
+        );
+    }
+
+    /// A regular node named like a phase marker (`unbounded`/`bounded`) must
+    /// still recover its own name. Its key is `<app>::<node>`, so the suffix is
+    /// only stripped when the base still contains `::`; otherwise the app id
+    /// would leak in as the node name.
+    #[test]
+    fn reference_name_does_not_strip_regular_node_named_like_phase_marker() {
+        let app = "app-7f3c";
+
+        assert_eq!(
+            get_reference_name_from_metric_key(&metric_key(app, "unbounded")),
+            "unbounded"
+        );
+        assert_eq!(
+            get_reference_name_from_metric_key(&metric_key(app, "bounded")),
+            "bounded"
+        );
+    }
+
+    /// Boundary of the single-`::`-free-`app_id` assumption. For `app::bounded::42`
+    /// the base (`app`) has no `::`, so the guard reads `::bounded::` as node data
+    /// rather than a phase suffix and leaves the key unchanged; reference-name
+    /// extraction then yields the trailing `42`, not `bounded::42`. This is a known
+    /// limitation (a real bounded key is `<app>::<node>::bounded::<idx>`); the test
+    /// pins the behavior so a future refactor can't silently change it.
+    #[test]
+    fn strip_hybrid_phase_suffix_untouched_for_single_segment_app_bounded_key() {
+        assert_eq!(
+            strip_hybrid_phase_suffix("app::bounded::42"),
+            "app::bounded::42"
+        );
+        assert_eq!(get_reference_name_from_metric_key("app::bounded::42"), "42");
+    }
 
     /// Regression test for short-lived jobs losing billing counts: delta
     /// measurements recorded after the last PeriodicReader tick must still be
