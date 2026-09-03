@@ -37,10 +37,6 @@ impl InMemoryDynamicTableBackend {
 
 #[async_trait]
 impl DynamicTableBackend for InMemoryDynamicTableBackend {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError> {
         let values = extract_string_values(values)?;
 

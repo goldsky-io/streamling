@@ -59,9 +59,27 @@ impl From<DynamicTableBackendError> for crate::error::StreamlingError {
 pub trait DynamicTableBackend: Debug + Sync + Send {
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError>;
     async fn contains(&self, values: ArrayRef) -> Result<ArrayRef, DynamicTableBackendError>;
+}
 
-    /// Downcast support (e.g. to inspect backend-specific configuration in tests).
-    fn as_any(&self) -> &dyn std::any::Any;
+/// Resolves the cache freshness-check debounce window for a dynamic table.
+///
+/// Precedence: the topology (per-table) value wins when present; otherwise the
+/// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms`; when
+/// neither is set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` applies. An explicit 0
+/// either way disables the window. The bool reports whether the default was
+/// applied (drives debug-vs-warn logging in `create`).
+fn resolve_cache_refresh_debounce_ms(
+    override_ms: Option<u64>,
+    global_ms: Option<u64>,
+) -> (u64, bool) {
+    match (override_ms, global_ms) {
+        (Some(v), _) => (v, false),
+        (None, Some(v)) => (v, false),
+        (None, None) => (
+            streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS,
+            true,
+        ),
+    }
 }
 
 pub struct DynamicTableBackendFactory {
@@ -113,21 +131,11 @@ impl DynamicTableBackendFactory {
                     )
                 })?;
 
-                // Topology value wins; otherwise fall back to the global
-                // `dynamic_table_backend.postgres.cache_refresh_debounce_ms`;
-                // when neither is set, DEFAULT_CACHE_REFRESH_DEBOUNCE_MS
-                // applies. An explicit 0 either way disables the window.
-                let (cache_refresh_debounce_ms, debounce_is_default) = match (
-                    cache_refresh_debounce_ms_override,
-                    postgres_config.cache_refresh_debounce_ms,
-                ) {
-                    (Some(v), _) => (v, false),
-                    (None, Some(v)) => (v, false),
-                    (None, None) => (
-                        streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS,
-                        true,
-                    ),
-                };
+                let (cache_refresh_debounce_ms, debounce_is_default) =
+                    resolve_cache_refresh_debounce_ms(
+                        cache_refresh_debounce_ms_override,
+                        postgres_config.cache_refresh_debounce_ms,
+                    );
                 // The default window is a sane background choice, not an
                 // operator decision, so it logs at debug; an explicitly chosen
                 // non-zero window is an operator decision and stays a warn.
@@ -558,108 +566,33 @@ pub fn extract_string_values(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn debounce_resolution_prefers_topology_then_global_then_default_1000() {
-        use streamling_config::app_config::{
-            DynamicTableBackendConfig, DynamicTableBackendType, PostgresDynamicTableBackendConfig,
-        };
-
-        let make_config = |global_ms: Option<u64>| DynamicTableBackendConfig {
-            postgres: Some(PostgresDynamicTableBackendConfig {
-                host: "localhost".to_string(),
-                port: 5432,
-                db: "postgres".to_string(),
-                user: "postgres".to_string(),
-                password: "postgres".to_string(),
-                sslmode: "disable".to_string(),
-                max_connections: None,
-                dt_schema_name: None,
-                cache_enabled: false,
-                cache_refresh_debounce_ms: global_ms,
-            }),
-            max_batch_size: None,
-        };
+    #[test]
+    fn debounce_resolution_prefers_topology_then_global_then_default_1000() {
+        use streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS;
 
         // Topology value wins over the global default.
-        let factory = DynamicTableBackendFactory::new(make_config(Some(9999)));
-        let backend = factory
-            .create(
-                DynamicTableBackendType::Postgres,
-                "debounce_topology_wins".to_string(),
-                None,
-                None,
-                Some("updated_at".to_string()),
-                Some(7),
-                None,
-            )
-            .await
-            .expect("backend should be valid");
-        let pg = backend
-            .as_any()
-            .downcast_ref::<PostgresDynamicTableBackend>()
-            .expect("postgres backend");
-        assert_eq!(pg.cache_refresh_debounce_ms, 7);
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(Some(7), Some(9999)),
+            (7, false)
+        );
 
         // No topology value: falls back to the global default.
-        let backend = factory
-            .create(
-                DynamicTableBackendType::Postgres,
-                "debounce_global_fallback".to_string(),
-                None,
-                None,
-                Some("updated_at".to_string()),
-                None,
-                None,
-            )
-            .await
-            .expect("backend should be valid");
-        let pg = backend
-            .as_any()
-            .downcast_ref::<PostgresDynamicTableBackend>()
-            .expect("postgres backend");
-        assert_eq!(pg.cache_refresh_debounce_ms, 9999);
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(None, Some(9999)),
+            (9999, false)
+        );
 
         // Neither set: DEFAULT_CACHE_REFRESH_DEBOUNCE_MS (1000ms) applies.
-        let factory = DynamicTableBackendFactory::new(make_config(None));
-        let backend = factory
-            .create(
-                DynamicTableBackendType::Postgres,
-                "debounce_default_1000".to_string(),
-                None,
-                None,
-                Some("updated_at".to_string()),
-                None,
-                None,
-            )
-            .await
-            .expect("backend should be valid");
-        let pg = backend
-            .as_any()
-            .downcast_ref::<PostgresDynamicTableBackend>()
-            .expect("postgres backend");
         assert_eq!(
-            pg.cache_refresh_debounce_ms,
-            streamling_config::app_config::DEFAULT_CACHE_REFRESH_DEBOUNCE_MS
+            resolve_cache_refresh_debounce_ms(None, None),
+            (DEFAULT_CACHE_REFRESH_DEBOUNCE_MS, true)
         );
 
         // Explicit zero still wins: 0 disables the debounce window entirely.
-        let backend = factory
-            .create(
-                DynamicTableBackendType::Postgres,
-                "debounce_explicit_zero".to_string(),
-                None,
-                None,
-                Some("updated_at".to_string()),
-                Some(0),
-                None,
-            )
-            .await
-            .expect("backend should be valid");
-        let pg = backend
-            .as_any()
-            .downcast_ref::<PostgresDynamicTableBackend>()
-            .expect("postgres backend");
-        assert_eq!(pg.cache_refresh_debounce_ms, 0);
+        assert_eq!(
+            resolve_cache_refresh_debounce_ms(Some(0), Some(9999)),
+            (0, false)
+        );
     }
     use crate::side_output::SourceSideOutput;
     use datafusion::arrow::array::StringArray;

@@ -7,7 +7,7 @@ use crate::retry::{retry_forever_with_backoff_async_returning, retry_if_retriabl
 use crate::streamling_user_err;
 use async_trait::async_trait;
 use datafusion::arrow::array::builder::{BooleanBuilder, LargeStringBuilder};
-use datafusion::arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, LargeStringArray, StringArray};
 use futures::future::join_all;
 use regex::Regex;
 use sqlx::pool::PoolOptions;
@@ -1061,10 +1061,6 @@ fn deduplicate_value_indices(value_indices: Vec<(usize, String)>) -> Vec<(usize,
 
 #[async_trait]
 impl DynamicTableBackend for PostgresDynamicTableBackend {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     async fn append(&self, values: ArrayRef) -> Result<(), DynamicTableBackendError> {
         trace!("append() called for table: {}", self.full_table_name);
         let pool = self.get_pool().await.map_err(|e| {
@@ -1088,7 +1084,7 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
         // this can never produce a false positive. `updated_at` is deliberately
         // left untouched, so the next real refresh still fetches everything since
         // the old watermark (re-fetching our own rows is idempotent — `extend_from`
-        // dedups).
+        // probes before extending, so re-fetched keys add no bytes).
         let appended_keys = self
             .cache
             .as_ref()
@@ -1163,7 +1159,7 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
         // heartbeat (~117x more round trips than the uncached path in a live
         // A/B at debounce=0).
         if string_array.null_count() == string_array.len() {
-            return Ok(self.build_contains_result(string_array, &HashSet::new()));
+            return Ok(Arc::new(BooleanArray::new_null(string_array.len())));
         }
 
         let pool = self.get_pool().await.map_err(|e| {
