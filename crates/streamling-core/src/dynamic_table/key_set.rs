@@ -1,5 +1,7 @@
-use arrow::array::{Array, BooleanArray, BooleanBuilder, LargeStringArray, StringArray};
-use arrow::compute::concat;
+use arrow::array::{
+    Array, ArrayAccessor, BooleanArray, BooleanBuilder, LargeStringArray, StringArray,
+};
+use arrow::compute::{concat, filter};
 use datafusion::common::hash_utils::{RandomState, with_hashes};
 use hashbrown::HashTable;
 
@@ -44,14 +46,39 @@ impl ArrowKeySet {
             return Ok(());
         }
 
+        // Probe before concat. The append-path cache mirror re-offers this
+        // pipeline's own committed keys on every batch, and refresh deltas
+        // re-fetch rows that may already be buffered; the hash table dedups
+        // those, but the backing buffer would still accumulate a copy of every
+        // re-offered byte. Only genuinely-new keys (never nulls — they are not
+        // table entries) may reach `concat`.
+        let present = self.probe(&extra)?;
+        if !present.iter().any(|v| v == Some(false)) {
+            return Ok(());
+        }
+        // `filter` keeps slots where the predicate is true, and `present` is
+        // true for keys the set already holds — build the keep-mask (misses
+        // only; null needles are not table entries, so they never keep).
+        let mut keep = BooleanBuilder::with_capacity(present.len());
+        for i in 0..present.len() {
+            keep.append_value(!present.is_null(i) && !present.value(i));
+        }
+        let misses = filter(&extra, &keep.finish())
+            .map_err(|e| e.to_string())?
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .ok_or_else(|| "filter did not produce LargeStringArray".to_string())?
+            .clone();
+
         let start = self.keys.len();
         // `concat` is append-only: existing indices stay valid, so incremental
         // refresh only needs to hash/insert the newly appended slice — no full rebuild.
-        // NOTE: concat copies the whole key buffer, so a refresh is O(total bytes).
-        // Fine while refreshes are rare (the read-mostly case this set exists for); if
-        // they get frequent, keep a Vec of chunks and pack (chunk, row) into the index.
-        let concatenated =
-            concat(&[&self.keys as &dyn Array, &extra as &dyn Array]).map_err(|e| e.to_string())?;
+        // NOTE: concat copies the whole key buffer, so an extend with genuinely-new
+        // keys is O(total bytes). Fine while such extends are rare (the read-mostly
+        // case this set exists for); if they get frequent, keep a Vec of chunks and
+        // pack (chunk, row) into the index.
+        let concatenated = concat(&[&self.keys as &dyn Array, &misses as &dyn Array])
+            .map_err(|e| e.to_string())?;
         self.keys = concatenated
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -62,15 +89,19 @@ impl ArrowKeySet {
         self.hash_and_insert_range(start)?;
         Ok(())
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.table.len()
+    pub(crate) fn contains_array(&self, needles: &StringArray) -> Result<BooleanArray, String> {
+        self.probe(needles)
     }
 
-    pub(crate) fn contains_array(&self, needles: &StringArray) -> Result<BooleanArray, String> {
-        // Haystack is LargeUtf8, needle is Utf8 — hashes match for equal `&str`
-        // content (see struct-level comment).
-        with_hashes([needles as &dyn Array], &self.state, |hashes| {
+    /// Probes any string array whose `hash_array` path yields `&str` items
+    /// (`Utf8`, `LargeUtf8`): identical content hashes identically under
+    /// `self.state` (see struct-level comment).
+    fn probe<'a, A>(&self, needles: A) -> Result<BooleanArray, String>
+    where
+        A: ArrayAccessor<Item = &'a str>,
+    {
+        let any_needles: &dyn Array = &needles;
+        with_hashes([any_needles], &self.state, |hashes| {
             let mut builder = BooleanBuilder::with_capacity(needles.len());
             for (i, &hash) in hashes.iter().enumerate() {
                 if needles.is_null(i) {
@@ -88,6 +119,10 @@ impl ArrowKeySet {
             Ok(builder.finish())
         })
         .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.table.len()
     }
 
     fn hash_and_insert_range(&mut self, start: usize) -> Result<(), String> {
@@ -260,6 +295,44 @@ mod tests {
         assert_eq!(set.len(), 1);
         let needles = utf8_needles([Some("a")]);
         assert!(set.contains_array(&needles).expect("probe").value(0));
+    }
+
+    #[test]
+    fn extend_from_reoffered_keys_do_not_grow_buffer() {
+        let mut set = ArrowKeySet::from_keys(large_keys([Some("a"), Some("b")])).expect("build");
+        let buffer_rows = set.keys.len();
+        assert_eq!(set.len(), 2);
+
+        // The append-path cache mirror re-offers this pipeline's own committed
+        // keys on every batch, and refresh deltas re-fetch rows already
+        // buffered. Re-offered keys must not accumulate a buffer copy each
+        // time: the table would dedup them but the backing array would grow
+        // without bound.
+        for _ in 0..100 {
+            set.extend_from(large_keys([Some("a"), Some("b")]))
+                .expect("extend");
+        }
+        assert_eq!(set.keys.len(), buffer_rows);
+        assert_eq!(set.len(), 2);
+
+        // A mixed extend grows the buffer by exactly the genuinely-new keys.
+        set.extend_from(large_keys([Some("b"), Some("c")]))
+            .expect("extend");
+        assert_eq!(set.keys.len(), buffer_rows + 1);
+        assert_eq!(set.len(), 3);
+
+        // Nulls are never table entries, so they never enter the buffer either.
+        set.extend_from(large_keys([None, None])).expect("extend");
+        assert_eq!(set.keys.len(), buffer_rows + 1);
+
+        // Membership stays exact through all of it.
+        let out = set
+            .contains_array(&utf8_needles([Some("a"), Some("b"), Some("c"), Some("d")]))
+            .expect("probe");
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(out.value(2));
+        assert!(!out.value(3));
     }
 
     #[test]
@@ -455,8 +528,8 @@ mod bench {
         )
     }
 
-    /// Exact replica of the deleted `PostgresDynamicTableBackend::build_contains_result`
-    /// (minus the per-row `trace!`).
+    /// Replica of `PostgresDynamicTableBackend::build_contains_result` (minus the
+    /// per-row `trace!`).
     fn build_contains_result(
         string_array: &StringArray,
         existing_set: &HashSet<Box<str>>,
