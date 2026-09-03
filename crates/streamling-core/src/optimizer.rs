@@ -283,19 +283,13 @@ fn attribute_downstream(
     // emit; DataSinkExec remains for MemTable / non-streamling sinks.
     // Name is extracted before the recurse so the downcast borrow ends before
     // `node` is moved into `with_new_children`.
-    let sink_downstream = if let Some(dse) = node.downcast_ref::<DataSinkExec>() {
-        Some(named_downstream_from_wrapping_sink(
-            dse.sink(),
-            named_downstream,
-        ))
-    } else if let Some(pse) = node.downcast_ref::<ParallelSinkExec>() {
-        Some(named_downstream_from_wrapping_sink(
-            pse.sink(),
-            named_downstream,
-        ))
-    } else {
-        None
-    };
+    let sink_downstream = node
+        .downcast_ref::<DataSinkExec>()
+        .map(|dse| named_downstream_from_wrapping_sink(dse.sink(), named_downstream))
+        .or_else(|| {
+            node.downcast_ref::<ParallelSinkExec>()
+                .map(|pse| named_downstream_from_wrapping_sink(pse.sink(), named_downstream))
+        });
     if let Some(sink_downstream) = sink_downstream {
         let new_children = node
             .children()
