@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use streamling_config::AppConfig;
 use streamling_core::checkpoints::channels::{subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointControl, CheckpointMessage,
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointControl, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
 };
 use streamling_core::data::COLUMN_NAME_OP;
@@ -704,8 +703,14 @@ impl HybridTableProvider {
     }
 
     async fn save_state(&self) -> DataFusionResult<()> {
-        let state = self.state.read().await;
-        info!("Saving hybrid source state: {:?}", *state);
+        let snapshot = self.state.read().await.clone();
+        self.save_state_snapshot(&snapshot).await
+    }
+
+    /// Write `state`, which is not necessarily the live state (see
+    /// `persist_phase_state`).
+    async fn save_state_snapshot(&self, state: &HybridSourceState) -> DataFusionResult<()> {
+        info!("Saving hybrid source state: {:?}", state);
 
         let key = StateKey(format!("hybrid_source_{}_v1", self.reference_name));
         let backoffs = [
@@ -841,21 +846,24 @@ impl HybridTableProvider {
         Ok(())
     }
 
-    /// Durably record the current phase state plus the Kafka seed offsets
-    /// handed over at the last transition. Only call once a checkpoint that
-    /// covers everything emitted before the transition has finalized.
-    pub async fn persist_phase_state(&self) -> DataFusionResult<()> {
-        if let Some(wrapping_provider) = self
-            .config
-            .unbounded_source
-            .downcast_ref::<WrappingSourceTableProvider>()
+    /// Durably record `snapshot` (the phase state as of a transition) plus
+    /// the Kafka seed offsets it carries. Only call once a checkpoint that
+    /// covers everything emitted before that transition has finalized. Takes
+    /// a snapshot rather than reading the live state because a later
+    /// transition may already have advanced it without being covered.
+    pub async fn persist_phase_state(&self, snapshot: &HybridSourceState) -> DataFusionResult<()> {
+        if let Some(offsets) = &snapshot.unbounded_offsets
+            && let Some(wrapping_provider) = self
+                .config
+                .unbounded_source
+                .downcast_ref::<WrappingSourceTableProvider>()
             && let Some(kafka_provider) = wrapping_provider
                 .get_inner()
                 .downcast_ref::<KafkaSourceTableProvider>()
         {
-            kafka_provider.persist_seeded_offsets().await?;
+            kafka_provider.persist_offsets_if_absent(offsets).await?;
         }
-        self.save_state().await
+        self.save_state_snapshot(snapshot).await
     }
 
     pub async fn get_current_execution_stream(
@@ -1319,8 +1327,10 @@ impl ExecutionPlan for HybridSourceExec {
                             &reference_name_for_spawn,
                         )
                         .await;
-                        if finalized && let Some(token) = gate.covering_terminal() {
-                            persist_covered_phase_state(&provider, &gate, token, u64::MAX).await;
+                        if let Some(terminal) = finalized
+                            && let Some(token) = gate.covering_terminal()
+                        {
+                            persist_covered_phase_state(&provider, &gate, token, terminal.0).await;
                         }
                     }
                     break 'outer;
@@ -1345,8 +1355,10 @@ impl ExecutionPlan for HybridSourceExec {
                             &reference_name_for_spawn,
                         )
                         .await;
-                        if finalized && let Some(token) = gate.covering_terminal() {
-                            persist_covered_phase_state(&provider, &gate, token, u64::MAX).await;
+                        if let Some(terminal) = finalized
+                            && let Some(token) = gate.covering_terminal()
+                        {
+                            persist_covered_phase_state(&provider, &gate, token, terminal.0).await;
                         }
                     }
                     break 'outer;
@@ -1356,8 +1368,8 @@ impl ExecutionPlan for HybridSourceExec {
                     Ok(()) => {
                         // Arm the deferred persist: only a Marker created from
                         // now on proves the finished phase is durable.
-                        gate.arm(now_ms());
                         let state = provider.state.read().await;
+                        gate.arm(now_ms(), state.clone());
                         let now_unbounded =
                             state.current_phase >= provider.config.bounded_sources.len();
                         drop(state);
@@ -1380,9 +1392,13 @@ impl ExecutionPlan for HybridSourceExec {
                                     &reference_name_for_spawn,
                                 )
                                 .await;
-                                if finalized && let Some(token) = gate.covering_terminal() {
-                                    persist_covered_phase_state(&provider, &gate, token, u64::MAX)
-                                        .await;
+                                if let Some(terminal) = finalized
+                                    && let Some(token) = gate.covering_terminal()
+                                {
+                                    persist_covered_phase_state(
+                                        &provider, &gate, token, terminal.0,
+                                    )
+                                    .await;
                                 }
                             }
                             provider.shutdown();
@@ -1571,111 +1587,117 @@ fn terminal_checkpoint_finalize_timeout() -> Duration {
 /// completion path that ends the stream immediately after this returns, and
 /// the only way the receiver is gone is that downstream already tore down —
 /// there is no caller decision an error could change.
-/// Decides when the in-memory phase advance made by
-/// `advance_to_next_phase` may be persisted.
+/// Decides when, and with what payload, the in-memory phase advance made
+/// by `advance_to_next_phase` may be persisted.
 ///
-/// `arm(now)` is called after an advance completes, i.e. after every batch
-/// of the finished phase was sent downstream. A coordinator Marker created
-/// after that instant travels behind those batches, so its Finalizer proves
-/// every sink durably wrote the finished phase; the first such Marker names
-/// the earliest covering epoch. `disarm` uses compare-exchange so a persist
-/// that completes after a newer arm cannot clobber it.
+/// `arm` is called right after an advance with a snapshot of the state that
+/// advance produced, i.e. after every batch of the finished phase was sent
+/// downstream. A coordinator Marker created after the arm travels behind
+/// those batches, so its Finalizer proves every sink durably wrote the
+/// finished phase; the first such Marker names the earliest covering epoch.
+///
+/// The persist writes the SNAPSHOT, never the live state: with several
+/// bounded phases the next phase may already have advanced in memory while
+/// the persist for the previous one is in flight, and writing that would
+/// mark rows durable that no checkpoint has covered yet. One mutex guards
+/// arm/observe/disarm so no interleaving pairs a fresh arm with a stale
+/// eligible epoch, and `disarm` clears only the generation it was issued
+/// for.
 #[derive(Debug, Default)]
-struct DeferredPersistGate {
-    /// Wall-clock ms of the last arm; 0 = not armed.
-    transition_at_ms: AtomicU64,
-    /// Earliest epoch whose Marker was created after `transition_at_ms`;
-    /// `u64::MAX` = none seen yet.
-    min_eligible_epoch: AtomicU64,
+struct DeferredPersistGate(Mutex<GateInner>);
+
+#[derive(Debug, Default)]
+struct GateInner {
+    /// Monotonic across arms; never reused, so a stale token can never
+    /// disarm a later arm.
+    generation: u64,
+    armed: Option<ArmedTransition>,
 }
 
-/// Snapshot handed from `covering_*` to `disarm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GateToken {
+#[derive(Debug, Clone)]
+struct ArmedTransition {
+    generation: u64,
     transition_at_ms: u64,
+    /// Earliest epoch whose Marker was created after `transition_at_ms`;
+    /// `u64::MAX` = none seen yet.
     min_eligible_epoch: u64,
+    /// State to persist once covered.
+    snapshot: HybridSourceState,
 }
 
 impl DeferredPersistGate {
-    fn arm(&self, now_ms: u64) {
-        // Eligible first, then the stamp: a concurrent `disarm` for an older
-        // arm compares against the stamp, so it can never leave a stale
-        // eligible epoch behind a fresh stamp.
-        self.min_eligible_epoch.store(u64::MAX, Ordering::SeqCst);
-        self.transition_at_ms.store(now_ms, Ordering::SeqCst);
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateInner> {
+        self.0.lock().expect("deferred persist gate mutex poisoned")
+    }
+
+    fn arm(&self, now_ms: u64, snapshot: HybridSourceState) {
+        let mut inner = self.lock();
+        inner.generation += 1;
+        inner.armed = Some(ArmedTransition {
+            generation: inner.generation,
+            transition_at_ms: now_ms,
+            min_eligible_epoch: u64::MAX,
+            snapshot,
+        });
     }
 
     #[cfg(test)]
     fn is_armed(&self) -> bool {
-        self.transition_at_ms.load(Ordering::SeqCst) != 0
+        self.lock().armed.is_some()
     }
 
     fn observe_marker(&self, epoch: u64, created_at_ms: u64) {
-        let t = self.transition_at_ms.load(Ordering::SeqCst);
-        if t != 0 && created_at_ms > t {
-            self.min_eligible_epoch.fetch_min(epoch, Ordering::SeqCst);
+        if let Some(armed) = self.lock().armed.as_mut()
+            && created_at_ms > armed.transition_at_ms
+        {
+            armed.min_eligible_epoch = armed.min_eligible_epoch.min(epoch);
         }
     }
 
     /// `Some` if a Finalizer for `epoch` proves the armed transition durable.
-    fn covering_finalizer(&self, epoch: u64) -> Option<GateToken> {
-        let transition_at_ms = self.transition_at_ms.load(Ordering::SeqCst);
-        let min_eligible_epoch = self.min_eligible_epoch.load(Ordering::SeqCst);
-        (transition_at_ms != 0 && epoch >= min_eligible_epoch).then_some(GateToken {
-            transition_at_ms,
-            min_eligible_epoch,
-        })
+    fn covering_finalizer(&self, epoch: u64) -> Option<ArmedTransition> {
+        self.lock()
+            .armed
+            .as_ref()
+            .filter(|armed| epoch >= armed.min_eligible_epoch)
+            .cloned()
     }
 
     /// A finalized terminal checkpoint always covers an armed transition:
     /// its Marker is pushed inline after every row (it never travels on the
     /// coordinator channel, so `observe_marker` never sees it).
-    fn covering_terminal(&self) -> Option<GateToken> {
-        let transition_at_ms = self.transition_at_ms.load(Ordering::SeqCst);
-        (transition_at_ms != 0).then_some(GateToken {
-            transition_at_ms,
-            min_eligible_epoch: self.min_eligible_epoch.load(Ordering::SeqCst),
-        })
+    fn covering_terminal(&self) -> Option<ArmedTransition> {
+        self.lock().armed.clone()
     }
 
-    /// Disarm only if no newer `arm` happened since `token` was taken.
-    fn disarm(&self, token: GateToken) {
-        if self
-            .transition_at_ms
-            .compare_exchange(
-                token.transition_at_ms,
-                0,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
+    /// Disarm only if `armed` is still the current arm.
+    fn disarm(&self, armed: &ArmedTransition) {
+        let mut inner = self.lock();
+        if inner
+            .armed
+            .as_ref()
+            .is_some_and(|current| current.generation == armed.generation)
         {
-            let _ = self.min_eligible_epoch.compare_exchange(
-                token.min_eligible_epoch,
-                u64::MAX,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            inner.armed = None;
         }
     }
 }
 
-/// Persist the phase advance guarded by `gate` using `token`, logging the
-/// outcome. On failure the gate stays armed so the next covering Finalizer
-/// retries.
+/// Persist the snapshot carried by `armed`, logging the outcome. On failure
+/// the gate stays armed so the next covering Finalizer retries.
 async fn persist_covered_phase_state(
     provider: &HybridTableProvider,
     gate: &DeferredPersistGate,
-    token: GateToken,
+    armed: ArmedTransition,
     epoch: u64,
 ) {
-    match provider.persist_phase_state().await {
+    match provider.persist_phase_state(&armed.snapshot).await {
         Ok(()) => {
             info!(
                 "Hybrid source '{}': phase state persisted after epoch {} finalized",
                 provider.reference_name, epoch
             );
-            gate.disarm(token);
+            gate.disarm(&armed);
         }
         Err(e) => warn!(
             "Hybrid source '{}': deferred phase-state persist failed after epoch {}; \
@@ -1685,15 +1707,15 @@ async fn persist_covered_phase_state(
     }
 }
 
-/// Returns whether the terminal epoch finalized (and its Finalizer was
-/// emitted).
+/// Returns the terminal epoch if it finalized (and its Finalizer was
+/// emitted), `None` otherwise.
 async fn emit_terminal_checkpoint(
     control: &CheckpointControl,
     pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
     schema_for_synth: &SchemaRef,
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
     reference_name: &str,
-) -> bool {
+) -> Option<CheckpointEpoch> {
     let terminal = control.begin_terminal_checkpoint();
 
     pending
@@ -1759,15 +1781,15 @@ async fn emit_terminal_checkpoint(
             "checkpoint_coordinator",
         )
         .record_count("checkpoint_terminal_finalizer_skipped", 1);
-        return false;
+        return None;
     }
 
     pending
         .lock()
         .expect("pending markers mutex poisoned")
-        .push(CheckpointMessage::Finalizer(terminal));
+        .push(CheckpointMessage::Finalizer(terminal.clone()));
     flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
-    true
+    Some(terminal)
 }
 
 /// Flush any markers currently buffered in `pending` to the downstream
@@ -3063,7 +3085,9 @@ mod tests {
         .unwrap();
 
         hybrid_provider.advance_to_next_phase().await.unwrap();
-        let result = hybrid_provider.persist_phase_state().await;
+        let result = hybrid_provider
+            .persist_phase_state(&hybrid_provider.state.read().await.clone())
+            .await;
         assert!(
             result.is_err(),
             "save_state should fail due to injected fault"
@@ -3154,7 +3178,10 @@ mod tests {
             "phase advance must not be durable before a finalized checkpoint"
         );
 
-        hybrid_provider.persist_phase_state().await.unwrap();
+        hybrid_provider
+            .persist_phase_state(&hybrid_provider.state.read().await.clone())
+            .await
+            .unwrap();
         let persisted = state_backend
             .get(StateKey("hybrid_source_test_hybrid_v1".to_string()))
             .await
@@ -3169,13 +3196,21 @@ mod tests {
     }
 
     // ========================================================================
-    // DeferredPersistGate: which Finalizer may persist the phase advance
+    // DeferredPersistGate: which Finalizer may persist which snapshot
     // ========================================================================
+
+    fn snap(phase: usize) -> HybridSourceState {
+        HybridSourceState {
+            current_phase: phase,
+            completed_phases: vec![true; phase],
+            unbounded_offsets: None,
+        }
+    }
 
     #[test]
     fn gate_ignores_markers_created_before_the_transition() {
         let gate = DeferredPersistGate::default();
-        gate.arm(1_000);
+        gate.arm(1_000, snap(1));
         // Marker minted before (or at) the stamp may have been attached to a
         // mid-phase batch: its Finalizer proves nothing about the tail.
         gate.observe_marker(7, 900);
@@ -3190,7 +3225,7 @@ mod tests {
             gate.covering_finalizer(10).is_some(),
             "later epochs cover too"
         );
-        gate.disarm(token);
+        gate.disarm(&token);
         assert!(!gate.is_armed());
         assert!(gate.covering_finalizer(10).is_none());
     }
@@ -3205,14 +3240,14 @@ mod tests {
 
     #[test]
     fn gate_disarm_does_not_clobber_a_newer_arm() {
-        // Multi-bounded-phase race: the Finalizer for phase-0→1 is being
+        // Multi-bounded-phase race: the Finalizer for phase 0→1 is being
         // persisted when phase 1 ends and re-arms for 1→2.
         let gate = DeferredPersistGate::default();
-        gate.arm(1_000);
+        gate.arm(1_000, snap(1));
         gate.observe_marker(5, 1_500);
         let token = gate.covering_finalizer(5).expect("covers");
-        gate.arm(2_000); // persist still in flight
-        gate.disarm(token);
+        gate.arm(2_000, snap(2)); // persist still in flight
+        gate.disarm(&token);
         assert!(gate.is_armed(), "newer arm must survive the stale disarm");
         assert!(
             gate.covering_finalizer(5).is_none(),
@@ -3223,14 +3258,46 @@ mod tests {
     }
 
     #[test]
+    fn gate_token_carries_the_snapshot_of_its_own_transition() {
+        // Same race: the in-flight persist must write phase 1, not the live
+        // phase 2 that no checkpoint has covered yet.
+        let gate = DeferredPersistGate::default();
+        gate.arm(1_000, snap(1));
+        gate.observe_marker(5, 1_500);
+        let token = gate.covering_finalizer(5).expect("covers");
+        gate.arm(2_000, snap(2));
+        assert_eq!(token.snapshot.current_phase, 1);
+        assert_eq!(
+            gate.covering_terminal()
+                .expect("armed")
+                .snapshot
+                .current_phase,
+            2
+        );
+    }
+
+    #[test]
+    fn gate_generation_is_never_reused() {
+        // arm → disarm → arm again: a token from the first arm must not be
+        // able to disarm the second one.
+        let gate = DeferredPersistGate::default();
+        gate.arm(1_000, snap(1));
+        let stale = gate.covering_terminal().expect("armed");
+        gate.disarm(&stale);
+        gate.arm(2_000, snap(1));
+        gate.disarm(&stale);
+        assert!(gate.is_armed());
+    }
+
+    #[test]
     fn gate_terminal_covers_whenever_armed() {
         let gate = DeferredPersistGate::default();
-        gate.arm(1_000);
+        gate.arm(1_000, snap(1));
         // No channel Marker seen at all (terminal Marker travels inline).
         let token = gate
             .covering_terminal()
             .expect("terminal covers an armed gate");
-        gate.disarm(token);
+        gate.disarm(&token);
         assert!(!gate.is_armed());
     }
 
@@ -3264,7 +3331,10 @@ mod tests {
         // Advance through bounded to unbounded, then persist (as the execute
         // loop does once the covering checkpoint finalizes)
         hybrid_provider.advance_to_next_phase().await.unwrap();
-        hybrid_provider.persist_phase_state().await.unwrap();
+        hybrid_provider
+            .persist_phase_state(&hybrid_provider.state.read().await.clone())
+            .await
+            .unwrap();
         let state = hybrid_provider.state.read().await;
         assert_eq!(state.current_phase, 1, "should be in unbounded phase");
         drop(state);
@@ -3359,7 +3429,9 @@ mod tests {
 
         hybrid_provider.advance_to_next_phase().await.unwrap();
         // persist_phase_state should succeed because retry recovers
-        let result = hybrid_provider.persist_phase_state().await;
+        let result = hybrid_provider
+            .persist_phase_state(&hybrid_provider.state.read().await.clone())
+            .await;
         assert!(
             result.is_ok(),
             "should succeed after retry: {:?}",
@@ -3415,7 +3487,9 @@ mod tests {
         .unwrap();
 
         hybrid_provider.advance_to_next_phase().await.unwrap();
-        let result = hybrid_provider.persist_phase_state().await;
+        let result = hybrid_provider
+            .persist_phase_state(&hybrid_provider.state.read().await.clone())
+            .await;
         assert!(
             result.is_err(),
             "should fail after all retry attempts exhausted"

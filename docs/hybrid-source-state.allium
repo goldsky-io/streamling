@@ -256,15 +256,21 @@ rule PersistPhaseStateOnFirstCoveringFinalizer {
         or exists marker: MarkerObserved(hybrid, marker)
             and marker.epoch <= epoch
             and marker.created_at > hybrid.transition_at
-    ensures: HybridPhaseStatePersisted(hybrid)
-    ensures:
-        for offset in hybrid.seeded_offsets
+    -- Writes the snapshot captured when the transition armed, never the
+    -- live state: with several bounded phases the next phase may already
+    -- have advanced in memory without any checkpoint covering it.
+    let covered = state_as_of(hybrid.transition_at)
+    ensures: persist_succeeded implies HybridPhaseStatePersisted(hybrid, covered)
+    ensures: persist_succeeded implies
+        for offset in covered.seeded_offsets
             where UnboundedPersistedOffset(hybrid.unbounded_phase, offset.partition) = null:
                 UnboundedPartitionOffsetPersisted(
                     source: hybrid.unbounded_phase,
                     offset: offset
                 )
-    ensures: hybrid.transition_at = null
+    -- On failure transition_at stays set; the next covering Finalizer
+    -- retries. A disarm applies only to the arm it was issued for.
+    ensures: persist_succeeded implies hybrid.transition_at = null
 }
 
 -- When advancing OUT of the last bounded phase, fetch unbounded

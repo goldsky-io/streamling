@@ -1876,7 +1876,7 @@ pub struct KafkaSourceTableProvider {
     extracted_primary_key: Option<String>,
     parallelism: usize,
     /// Start offsets handed over by the hybrid source at the bounded→unbounded
-    /// transition. Held in memory; persisted only by `persist_seeded_offsets`
+    /// transition. Held in memory; persisted only by `persist_offsets_if_absent`
     /// once a checkpoint covering the bounded phase has finalized.
     seeded_offsets: Arc<std::sync::Mutex<HashMap<i32, u32>>>,
 }
@@ -2126,7 +2126,7 @@ impl KafkaSourceTableProvider {
     /// only: the consumer seeks to them for partitions without a committed
     /// offset. Nothing is written to the state backend here — a position may
     /// only become durable once a checkpoint covering everything emitted
-    /// before it has finalized (see `persist_seeded_offsets`).
+    /// before it has finalized (see `persist_offsets_if_absent`).
     pub async fn seed_offsets(&self, offsets: &HashMap<i32, u32>) -> Result<()> {
         *self.seeded_offsets.lock().unwrap() = offsets.clone();
         debug!(
@@ -2137,13 +2137,15 @@ impl KafkaSourceTableProvider {
         Ok(())
     }
 
-    /// Persist the seeded offsets for every partition that does not already
-    /// have a committed offset in the state backend. Called by the hybrid
-    /// source once the first checkpoint after the transition has finalized;
-    /// partitions the consumer has since committed keep their (newer) offset.
-    pub async fn persist_seeded_offsets(&self) -> Result<()> {
-        let seeds = self.seeded_offsets.lock().unwrap().clone();
-        if seeds.is_empty() {
+    /// Persist `offsets` for every partition that does not already have a
+    /// committed offset in the state backend. Called by the hybrid source
+    /// with the seeds of a transition once a checkpoint covering it has
+    /// finalized; partitions the consumer has since committed keep their
+    /// (newer) offset. The get→put is not atomic against the commit path
+    /// running on the same Finalizer, so a seed can land over a fresher
+    /// commit; that only replays up to one epoch of that partition.
+    pub async fn persist_offsets_if_absent(&self, offsets: &HashMap<i32, u32>) -> Result<()> {
+        if offsets.is_empty() {
             return Ok(());
         }
         let now = SystemTime::now()
@@ -2152,7 +2154,7 @@ impl KafkaSourceTableProvider {
             .as_millis() as u64;
 
         let mut written = 0usize;
-        for (partition, offset) in &seeds {
+        for (partition, offset) in offsets {
             let state_key = StateKey::from(format!(
                 "{}:{}:{}",
                 self.reference_name, self.topic, partition
@@ -2186,9 +2188,9 @@ impl KafkaSourceTableProvider {
             written += 1;
         }
         debug!(
-            "Persisted {} of {} seeded Kafka partition offset(s) for topic '{}' (rest already committed)",
+            "Persisted {} of {} handed-over Kafka partition offset(s) for topic '{}' (rest already committed)",
             written,
-            seeds.len(),
+            offsets.len(),
             self.topic
         );
         Ok(())
@@ -3212,7 +3214,7 @@ mod tests {
     use super::*;
 
     /// Hybrid handover seeds must not become durable on their own: only a
-    /// finalized checkpoint may persist a position. `persist_seeded_offsets`
+    /// finalized checkpoint may persist a position. `persist_offsets_if_absent`
     /// then writes only partitions the commit path has not already covered.
     #[tokio::test]
     async fn seed_offsets_stay_in_memory_until_persist_seeded_offsets() {
@@ -3255,10 +3257,8 @@ mod tests {
 
         let key = |p: i32| StateKey::from(format!("src:test-topic:{p}"));
 
-        provider
-            .seed_offsets(&HashMap::from([(0, 100), (1, 200)]))
-            .await
-            .unwrap();
+        let seeds = HashMap::from([(0, 100), (1, 200)]);
+        provider.seed_offsets(&seeds).await.unwrap();
         assert!(
             state_backend.get(key(0)).await.unwrap().is_none()
                 && state_backend.get(key(1)).await.unwrap().is_none(),
@@ -3277,7 +3277,7 @@ mod tests {
             .await
             .unwrap();
 
-        provider.persist_seeded_offsets().await.unwrap();
+        provider.persist_offsets_if_absent(&seeds).await.unwrap();
         assert_eq!(
             state_backend.get(key(0)).await.unwrap().unwrap().offset,
             100,
