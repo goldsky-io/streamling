@@ -499,4 +499,12 @@ pub enum PluginMsg {
     Error {
         message: RString,
     },
+    /// Sent by a source dispatcher on its output channel when the plugin has
+    /// finished on its own (graceful `is_running() == false` exit, e.g. a
+    /// bounded source reaching its end bound). The host ends the source's
+    /// stream on receipt so job-mode pipelines can drain and complete;
+    /// without it the host cannot distinguish "plugin idle" from "plugin
+    /// done". Appended last for NonExhaustive ABI compatibility: an older
+    /// host gets an unknown-variant error from `into_enum()` and ignores it.
+    Complete,
 }

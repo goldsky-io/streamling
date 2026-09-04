@@ -282,6 +282,17 @@ impl ExecutionPlan for PluginSourceExec {
                                         CheckpointEpoch(epoch.0),
                                     ));
                                 }
+                                Ok(PluginMsg::Complete) => {
+                                    // The source finished on its own (bounded
+                                    // completion). End the stream so sinks can
+                                    // drain and a job-mode pipeline completes;
+                                    // the flush below still delivers any
+                                    // pending checkpoint messages to sinks.
+                                    info!(
+                                        "PluginSourceExec: source plugin reported completion; ending stream"
+                                    );
+                                    break 'outer;
+                                }
                                 _ => {}
                             }
                         }
@@ -856,5 +867,61 @@ mod tests {
 
         unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, coordinator_sub_id);
         fake_plugin.join().expect("test plugin thread panicked");
+    }
+
+    /// Regression for the job-mode hang (FOU-1166): a bounded plugin source
+    /// that finishes on its own announces `PluginMsg::Complete`, and the
+    /// exec node must END its stream on it. Before the fix the forwarding
+    /// loop's only exit was the process-wide shutdown signal, so the stream
+    /// never ended, sinks never drained, and job-mode pipelines cycled
+    /// checkpoint epochs into 300s timeouts forever.
+    ///
+    /// `#[serial]`: `execute()` subscribes to the process-wide coordinator
+    /// channel.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_source_stream_ends_when_plugin_reports_complete() {
+        use futures::StreamExt as _;
+
+        let channels = test_channels();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let exec = PluginSourceExec::new(
+            schema.clone(),
+            None,
+            channels.clone(),
+            8,
+            "plugin::complete_source".to_string(),
+        );
+        let stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute failed");
+
+        // Fake plugin: one data batch, then graceful completion.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![7_i64]))],
+        )
+        .expect("failed to build test batch");
+        channels
+            .output
+            .sender
+            .send(NonExhaustive::new(PluginMsg::NextBatch {
+                data: batch.into(),
+            }))
+            .expect("failed to send test batch");
+        channels
+            .output
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Complete))
+            .expect("failed to send Complete");
+
+        let batches = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+            .await
+            .expect("stream must end once the plugin reports completion");
+        let rows: usize = batches
+            .into_iter()
+            .map(|b| b.expect("stream yielded an error").num_rows())
+            .sum();
+        assert_eq!(rows, 1, "the data batch sent before Complete must be delivered");
     }
 }
