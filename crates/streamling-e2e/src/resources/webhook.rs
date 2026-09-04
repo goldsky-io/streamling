@@ -11,6 +11,7 @@ use axum::routing::post;
 use axum::Router;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::info;
 
@@ -27,6 +28,10 @@ struct WebhookState {
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     response_plan: Arc<Mutex<Vec<StatusCode>>>,
     next_response_index: Arc<Mutex<usize>>,
+    /// Artificial per-request delay applied before responding. Used by tests to
+    /// make this a deliberately slow sink so downstream backpressure can be
+    /// exercised. Defaults to zero (no delay).
+    response_delay: Arc<Mutex<Duration>>,
 }
 
 impl WebhookState {
@@ -35,7 +40,12 @@ impl WebhookState {
             requests: Arc::new(Mutex::new(Vec::new())),
             response_plan: Arc::new(Mutex::new(response_plan)),
             next_response_index: Arc::new(Mutex::new(0)),
+            response_delay: Arc::new(Mutex::new(Duration::ZERO)),
         }
+    }
+
+    fn delay(&self) -> Duration {
+        *self.response_delay.lock().unwrap()
     }
 
     fn add_request(&self, body: Vec<u8>) {
@@ -132,6 +142,14 @@ impl WebhookResource {
         })
     }
 
+    /// Set an artificial per-request processing delay. Makes this a
+    /// deliberately slow sink so tests can exercise downstream backpressure.
+    /// Takes effect immediately for subsequent requests (the server shares the
+    /// same delay cell via `Arc`).
+    pub fn set_delay(&self, delay: Duration) {
+        *self.state.response_delay.lock().unwrap() = delay;
+    }
+
     /// Get the URL for the webhook endpoint
     pub fn webhook_url(&self) -> String {
         format!("{}/webhook", self.url)
@@ -179,6 +197,12 @@ impl WebhookResource {
 
 /// Handler for webhook requests - captures the body and returns 200 OK
 async fn handle_webhook(State(state): State<WebhookState>, body: Bytes) -> StatusCode {
+    // Optional artificial delay so the webhook can act as a slow sink in
+    // backpressure tests. Zero by default (no-op).
+    let delay = state.delay();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     state.add_request(body.to_vec());
     state.next_status()
 }
