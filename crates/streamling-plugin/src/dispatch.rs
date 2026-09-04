@@ -112,7 +112,10 @@ async fn handle_control_messages(
                 ));
             }
             Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
-                debug!("Source dispatcher received CheckpointMarker epoch={}", epoch.0);
+                debug!(
+                    "Source dispatcher received CheckpointMarker epoch={}",
+                    epoch.0
+                );
                 source_plugin
                     .process_checkpoint_marker(epoch.into())
                     .await?;

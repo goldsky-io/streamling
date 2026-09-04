@@ -922,6 +922,9 @@ mod tests {
             .into_iter()
             .map(|b| b.expect("stream yielded an error").num_rows())
             .sum();
-        assert_eq!(rows, 1, "the data batch sent before Complete must be delivered");
+        assert_eq!(
+            rows, 1,
+            "the data batch sent before Complete must be delivered"
+        );
     }
 }
