@@ -679,7 +679,7 @@ sinks:
 
 /// Job-mode pipelines with a bounded FFI plugin SOURCE must terminate once
 /// the source has served everything (FOU-1166). The source's dispatcher
-/// announces `PluginMsg::Complete` when the plugin stops running, and the
+/// announces `PluginMsg::Terminate` when the plugin stops running, and the
 /// host ends the source's stream on receipt — without that handshake the
 /// engine cannot distinguish "plugin idle" from "plugin done", and the job
 /// hangs minting checkpoint epochs into 300s timeouts forever.

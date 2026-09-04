@@ -256,17 +256,19 @@ impl SourcePluginDispatcher {
         Ok(())
     }
 
-    /// Announce graceful completion to the host. A bounded source that
-    /// stops producing looks identical to an idle one from the host's side
-    /// of the output channel; this message is what lets the host end the
-    /// source's stream (and thereby complete a job-mode pipeline) instead
-    /// of waiting for process shutdown.
+    /// Announce graceful completion to the host by sending `Terminate` on
+    /// the OUTPUT channel (the plugin→host direction — see the variant's doc
+    /// in `ffi.rs` for why the existing variant is reused rather than adding
+    /// a new one). A bounded source that stops producing looks identical to
+    /// an idle one from the host's side of the output channel; this message
+    /// is what lets the host end the source's stream (and thereby complete a
+    /// job-mode pipeline) instead of waiting for process shutdown.
     async fn send_complete(&self, runtime: &PluginAsyncRuntimeObj) -> Result<(), PluginError> {
         info!("Source dispatcher announcing completion to host");
         self.channels
             .output
             .send_with_retry(runtime, "Source complete", || {
-                NonExhaustive::new(PluginMsg::Complete)
+                NonExhaustive::new(PluginMsg::Terminate)
             })
             .await
     }
@@ -944,7 +946,7 @@ mod tests {
 
     /// Regression for the job-mode hang (FOU-1166): when a bounded source
     /// stops running on its own, the dispatcher must announce
-    /// `PluginMsg::Complete` as its final output message so the host can end
+    /// `PluginMsg::Terminate` as its final output message so the host can end
     /// the source's stream. Without it the host cannot distinguish "plugin
     /// idle" from "plugin done" and job-mode pipelines never terminate.
     #[tokio::test]
@@ -965,7 +967,7 @@ mod tests {
         let mut saw_complete = false;
         while let Ok(msg) = channels.output.receiver.try_recv() {
             match msg.into_enum() {
-                Ok(PluginMsg::Complete) => saw_complete = true,
+                Ok(PluginMsg::Terminate) => saw_complete = true,
                 Ok(PluginMsg::NextBatch { .. }) => {
                     assert!(!saw_complete, "no batches may follow Complete")
                 }
@@ -1041,7 +1043,7 @@ mod tests {
             .try_recv()
             .expect("output channel must contain Complete even on an error exit");
         assert!(
-            matches!(msg.into_enum(), Ok(PluginMsg::Complete)),
+            matches!(msg.into_enum(), Ok(PluginMsg::Terminate)),
             "an error exit must still announce Complete so the host ends the stream"
         );
     }
@@ -1077,7 +1079,7 @@ mod tests {
             .try_recv()
             .expect("output channel must contain Complete");
         assert!(
-            matches!(msg.into_enum(), Ok(PluginMsg::Complete)),
+            matches!(msg.into_enum(), Ok(PluginMsg::Terminate)),
             "the only output of a never-running source is Complete"
         );
     }

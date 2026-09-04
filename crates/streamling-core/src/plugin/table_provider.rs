@@ -282,14 +282,16 @@ impl ExecutionPlan for PluginSourceExec {
                                         CheckpointEpoch(epoch.0),
                                     ));
                                 }
-                                Ok(PluginMsg::Complete) => {
-                                    // The source finished on its own (bounded
-                                    // completion). End the stream so sinks can
-                                    // drain and a job-mode pipeline completes;
-                                    // the flush below still delivers any
-                                    // pending checkpoint messages to sinks.
+                                Ok(PluginMsg::Terminate) => {
+                                    // Output-direction Terminate: the source
+                                    // finished on its own (bounded work
+                                    // complete) — see the variant's doc. End
+                                    // the stream so sinks can drain and a
+                                    // job-mode pipeline completes; the flush
+                                    // below still delivers any pending
+                                    // checkpoint messages to sinks.
                                     info!(
-                                        "PluginSourceExec: source plugin reported completion; ending stream"
+                                        "PluginSourceExec: source reported completion; ending its record-batch stream"
                                     );
                                     break 'outer;
                                 }
@@ -870,7 +872,7 @@ mod tests {
     }
 
     /// Regression for the job-mode hang (FOU-1166): a bounded plugin source
-    /// that finishes on its own announces `PluginMsg::Complete`, and the
+    /// that finishes on its own announces `PluginMsg::Terminate`, and the
     /// exec node must END its stream on it. Before the fix the forwarding
     /// loop's only exit was the process-wide shutdown signal, so the stream
     /// never ended, sinks never drained, and job-mode pipelines cycled
@@ -912,7 +914,7 @@ mod tests {
         channels
             .output
             .sender
-            .send(NonExhaustive::new(PluginMsg::Complete))
+            .send(NonExhaustive::new(PluginMsg::Terminate))
             .expect("failed to send Complete");
 
         let batches = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
