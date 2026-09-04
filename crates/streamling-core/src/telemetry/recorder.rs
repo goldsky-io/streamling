@@ -920,11 +920,11 @@ pub fn initialize_metrics_recorder(
             let mut reg_lock = existing
                 .metric_metadata_registry
                 .lock()
-                .expect("metric_metadata_registry lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut tags_lock = existing
                 .metric_metadata_tags_registry
                 .lock()
-                .expect("metric_metadata_tags_registry lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (id, meta) in metric_metadata_registry.into_iter() {
                 reg_lock.insert(id.clone(), meta.clone());
                 tags_lock.insert(id, meta.to_tags());
