@@ -395,8 +395,9 @@ pub fn get_reference_name_from_metric_key(metric_key: &str) -> String {
 /// A phase suffix is only appended to a full `<app_id>::<node>` key, so the base
 /// must still contain `::`. That guard keeps a regular node literally named
 /// `unbounded`/`bounded` (key `<app_id>::unbounded`) from being stripped to the
-/// app id. (Assumes a single `::`-free `app_id`; a multi-segment app id with a
-/// node named `unbounded` is not distinguishable here.)
+/// app id. (Assumes `app_id` itself contains no `::`; otherwise a multi-segment
+/// app id with a node named `unbounded` is not distinguishable from a hybrid
+/// phase key.)
 fn strip_hybrid_phase_suffix(metric_key: &str) -> &str {
     if let Some(base) = metric_key.strip_suffix("::unbounded") {
         // Phase suffix only when the base is still `<app_id>::<node>`; else this
