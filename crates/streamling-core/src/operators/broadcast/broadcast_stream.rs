@@ -182,7 +182,7 @@ impl BroadcastStream {
                                         blocked_ms,
                                         vec![
                                             ("state", "blocked"),
-                                            ("downstream_id", downstream_id.as_str()),
+                                            ("downstream_id", downstream_id.as_ref()),
                                         ],
                                         metadata_id,
                                     );
