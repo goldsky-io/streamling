@@ -661,6 +661,8 @@ impl ExecutionPlan for WrappingExec {
                 // (`Some(Ok)`) counts; a `None` poll is EOF and a `Some(Err)`
                 // is an upstream failure — attribute nothing for either.
                 starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
+                // After a successful drain only a <1ms remainder remains; EOF/error polls
+                // add zero, so they cannot emit a carried whole millisecond.
                 let starved_ms = starved.take_whole_millis();
                 if starved_ms > 0 {
                     metrics_recorder.record_count_w_tags(
