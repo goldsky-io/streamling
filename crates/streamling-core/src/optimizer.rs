@@ -345,6 +345,7 @@ fn named_downstream_from_wrapping_sink(
 /// per-consumer edges are emitted by the `BroadcastStream` — so it is preserved,
 /// while every upstream `WrappingExec` gets an `Edge(<nearest named downstream>)`
 /// stamp (the producer for the immediate source, and so on up the chain).
+/// DataFusion plan-rewrite errors propagate as scan/plan construction failures.
 pub(crate) fn attribute_scan_shared_producer_base_exec(
     base_exec: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
