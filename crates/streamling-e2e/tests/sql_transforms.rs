@@ -586,7 +586,10 @@ async fn test_sql_unnest_emits_df_prefixed_subtree_metrics() {
         .await
         .expect("Failed to register schema");
 
-    let records = create_test_records(10);
+    // Same CPU-ish projection as `test_sql_transform_elapsed_compute_emitted`:
+    // a cheap unnest alone can stay at the 1ms series seed on fast runners
+    // (CI flake: Timeout waiting for elapsed_compute to reach 2).
+    let records = create_test_records(50);
     ctx.kafka
         .produce_avro_records(&records)
         .await
@@ -603,7 +606,7 @@ sources:
 transforms:
   sql_unnest:
     type: sql
-    sql: "SELECT id, item, _gs_op FROM (SELECT id, unnest(make_array(data, data)) AS item, _gs_op FROM kafka_source WHERE block > 0) t"
+    sql: "SELECT id, md5(repeat(item, 8000)) AS h, _gs_op FROM (SELECT id, unnest(make_array(data, data)) AS item, _gs_op FROM kafka_source WHERE block > 0) t"
     primary_key: id
 
 sinks:
@@ -614,13 +617,13 @@ sinks:
         topic = ctx.kafka_topic
     );
 
-    // 10 source rows × 2 unnest elements; RECORD_BATCH_SIZE=1 so UnnestExec
+    // 50 source rows × 2 unnest elements; RECORD_BATCH_SIZE=1 so UnnestExec
     // records per-row Count metrics instead of one fat batch.
     let _status = ctx
         .run_pipeline_with_opts(
             &pipeline,
             PipelineOpts::new()
-                .record_limit(20)
+                .record_limit(100)
                 .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
         )
         .await

@@ -35,6 +35,8 @@ dynamic_table_backend:
     password: ""
     sslmode: "require"
     cache_enabled: false
+    # cache_refresh_debounce_ms: omitted = built-in default (1000ms); 0 = re-check
+    # every batch. Overridable per dynamic_table transform via cache_refresh_debounce_ms.
 external_http_handler:
   trigger_max_count: "2000"
   operator_timeout_sec: "300"

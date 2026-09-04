@@ -66,8 +66,8 @@ use streamling_core::plugin::side_output::{
 };
 use streamling_core::plugin::table_provider::{PluginSinkProvider, PluginSourceProvider};
 use streamling_core::plugin::{
-    InitializedPlugin, create_sink_plugin, create_source_plugin, create_transform_plugin,
-    terminate_all_plugins,
+    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, InitializedPlugin, create_sink_plugin,
+    create_source_plugin, create_transform_plugin, terminate_all_plugins,
 };
 use streamling_core::side_output::SupportsSideOutputs;
 use streamling_core::sql_parse::extract_table_references_from_sql;
@@ -1373,7 +1373,7 @@ impl Streamling {
                 &source_schemas,
                 &app_config.plugin.side_output_options,
                 &application_id,
-                app_config.plugin.channel_capacity as usize,
+                DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY,
                 &shutdown_controller.scope_at(
                     "plugin-side-outputs",
                     streamling_core::shutdown::DrainStage::PostPlugin,
@@ -1427,6 +1427,7 @@ impl Streamling {
                     let schema = dt.schema.clone();
                     let column = dt.column.clone();
                     let time_column = dt.time_column.clone();
+                    let cache_refresh_debounce_ms = dt.cache_refresh_debounce_ms;
                     let dynamic_table_backend = dynamic_table_backend_factory
                         .create(
                             backend_type,
@@ -1434,6 +1435,8 @@ impl Streamling {
                             schema,
                             column,
                             time_column,
+                            cache_refresh_debounce_ms,
+                            dt.cache,
                         )
                         .await
                         .map_err(|e| {

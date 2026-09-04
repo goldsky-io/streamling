@@ -126,6 +126,7 @@ enum-display = "0.1.4"
 dashmap = "6.1.0"
 fixed_deque = "1.4.0"
 indexmap = { version = "2.7.0", features = ["serde"] }
+hashbrown = "0.15"
 
 # Telemetry dependencies
 opentelemetry_sdk = "0.30.0"
