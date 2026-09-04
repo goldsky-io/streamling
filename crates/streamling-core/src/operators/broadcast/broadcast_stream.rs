@@ -46,7 +46,7 @@ struct BroadcastState {
 /// doesn't apply (the passthrough output and scan-sharing fan-out).
 #[derive(Clone, Debug)]
 struct BroadcastSender {
-    downstream_id: String,
+    downstream_id: Arc<str>,
     tx: Sender<DFResult<RecordBatch>>,
 }
 
@@ -122,7 +122,7 @@ impl BroadcastStream {
         let upstream_metadata_id = self.upstream_metadata_id.clone();
         // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
         // into whole milliseconds instead of each truncating to zero.
-        let mut blocked_accumulators: HashMap<String, MillisAccumulator> = HashMap::new();
+        let mut blocked_accumulators: HashMap<Arc<str>, MillisAccumulator> = HashMap::new();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 break;
@@ -235,7 +235,10 @@ impl BroadcastStream {
         let (tx, rx) = channel(self.channel_capacity);
 
         let mut consumers = self.inner.consumers.lock().unwrap();
-        consumers.push(BroadcastSender { downstream_id, tx });
+        consumers.push(BroadcastSender {
+            downstream_id: Arc::from(downstream_id),
+            tx,
+        });
 
         BroadcastConsumer {
             schema: self.inner.schema.clone(),
@@ -655,7 +658,8 @@ mod tests {
                 "the closed consumer must be pruned after its first failed send"
             );
             assert_eq!(
-                remaining[0].downstream_id, "live",
+                remaining[0].downstream_id.as_ref(),
+                "live",
                 "the surviving consumer is the live one"
             );
         }
