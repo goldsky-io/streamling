@@ -672,3 +672,77 @@ sinks:
          checkpoint finalizes"
     );
 }
+
+// ============================================================================
+// Job mode: bounded plugin SOURCE completion must terminate the pipeline
+// ============================================================================
+
+/// Job-mode pipelines with a bounded FFI plugin SOURCE must terminate once
+/// the source has served everything (FOU-1166). The source's dispatcher
+/// announces `PluginMsg::Complete` when the plugin stops running, and the
+/// host ends the source's stream on receipt — without that handshake the
+/// engine cannot distinguish "plugin idle" from "plugin done", and the job
+/// hangs minting checkpoint epochs into 300s timeouts forever.
+///
+/// `random_source` with `stop_when_exhausted` flips `is_running()` on
+/// serve-completion WITHOUT waiting for a checkpoint finalizer — the
+/// sequential_source family's timing, which is harder than the Solana
+/// source's finalize-gated exit: the source can complete before the terminal
+/// epoch round-trips, so this also exercises the synthetic-final-batch flush
+/// that delivers still-pending checkpoint messages to the sinks after the
+/// source stream ends.
+#[tokio::test]
+async fn test_job_mode_bounded_plugin_source_completes() {
+    init_tracing();
+
+    let plugin_lib = build_basic_example_plugin().await;
+
+    // No external infra: bounded plugin source straight into a plugin sink.
+    let ctx = TestContext::with_options(TestContextOptions::new())
+        .await
+        .expect("Failed to create test context");
+
+    let application_id = format!("plugin_source_complete_{}", ctx.test_id);
+
+    let pipeline = r#"
+sources:
+  source_a:
+    type: basic_plugin.random_source
+    max_rows: "50"
+    record_batch_size: "10"
+    batch_sleep_ms: "10"
+    stop_when_exhausted: "true"
+
+transforms: {}
+
+sinks:
+  sink_a:
+    type: print_sink
+    from: source_a
+"#;
+
+    // A regression wedges the process exactly like the original bug (the
+    // fetch completes in well under a second; the hang was unbounded), so
+    // the harness timeout is the failure detector — keep it well below the
+    // suite timeout so a hang fails fast instead of stalling CI.
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .timeout(std::time::Duration::from_secs(120))
+                .env("STREAMLING__JOB_MODE", "true")
+                .env("STREAMLING__APPLICATION_ID", &application_id)
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+                .env(
+                    "STREAMLING__PLUGIN__PATH",
+                    plugin_lib.to_string_lossy().as_ref(),
+                ),
+        )
+        .await
+        .expect("Pipeline execution failed (hang on bounded-source completion, or crash)");
+    assert!(
+        status.success(),
+        "job-mode pipeline with a bounded plugin source must exit 0 once the \
+         source completes and the terminal checkpoint finalizes"
+    );
+}

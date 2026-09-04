@@ -172,11 +172,27 @@ impl SourcePluginDispatcher {
             }
             InitOutcome::Init => {}
         }
+
+        // Announce completion on EVERY exit from the run loop — error exits
+        // included. The host's forwarding loop cannot tell an idle plugin
+        // from a gone one, so a dispatcher that exits without announcing
+        // would leave the source stream (and a job-mode pipeline) waiting
+        // forever. On the error path the announce is best-effort: the error
+        // is what `start()` must surface.
+        let result = self.run(&runtime).await;
+        if let Err(send_err) = self.send_complete(&runtime).await {
+            error!(
+                "Failed to announce source completion to host: {:?}",
+                send_err
+            );
+            result?;
+            return Err(send_err);
+        }
+        result
+    }
+
+    async fn run(&self, runtime: &PluginAsyncRuntimeObj) -> Result<(), PluginError> {
         if !self.source_plugin.is_running() {
-            // Still announce completion: the host's forwarding loop cannot
-            // otherwise tell a never-started plugin from an idle one, and
-            // would wait on its stream forever.
-            self.send_complete(&runtime).await?;
             return Ok(());
         }
         self.source_plugin.initialize().await?;
@@ -234,10 +250,9 @@ impl SourcePluginDispatcher {
 
             runtime.spawn(generate_batch_future).await;
 
-            handle_control_messages(&self.channels, &self.source_plugin, &runtime).await?;
+            handle_control_messages(&self.channels, &self.source_plugin, runtime).await?;
         }
 
-        self.send_complete(&runtime).await?;
         Ok(())
     }
 
@@ -960,6 +975,74 @@ mod tests {
         assert!(
             saw_complete,
             "a graceful dispatcher exit must announce Complete to the host"
+        );
+    }
+
+    /// A source whose run loop ERRORS must still announce Complete before
+    /// `start()` propagates the error — otherwise the host's forwarding loop
+    /// waits on the stream forever and the job-mode hang returns on unhappy
+    /// paths.
+    #[tokio::test]
+    async fn source_dispatcher_announces_complete_on_error_exit() {
+        struct FailingInitSource;
+
+        #[async_trait]
+        impl SupportsGracefulShutdown for FailingInitSource {
+            fn is_running(&self) -> bool {
+                true
+            }
+            async fn terminate(&self) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl SourcePlugin for FailingInitSource {
+            async fn initialize(&self) -> Result<(), PluginError> {
+                Err(PluginError::Execution("init blew up".to_string()))
+            }
+            fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+                Ok(empty_schema())
+            }
+            async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+                Ok(RecordBatch::new_empty(empty_schema()))
+            }
+            async fn process_checkpoint_marker(
+                &self,
+                _epoch: crate::api::CheckpointEpoch,
+            ) -> Result<(), PluginError> {
+                Ok(())
+            }
+            async fn process_checkpoint_finalizer(
+                &self,
+                _epoch: crate::api::CheckpointEpoch,
+            ) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        let channels = make_channels();
+        let plugin: Arc<dyn SourcePlugin> = Arc::new(FailingInitSource);
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), plugin);
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let result = dispatcher.start(runtime).await;
+
+        assert!(result.is_err(), "the plugin error must still propagate");
+        let msg = channels
+            .output
+            .receiver
+            .try_recv()
+            .expect("output channel must contain Complete even on an error exit");
+        assert!(
+            matches!(msg.into_enum(), Ok(PluginMsg::Complete)),
+            "an error exit must still announce Complete so the host ends the stream"
         );
     }
 

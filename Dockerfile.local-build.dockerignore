@@ -1,8 +1,0 @@
-# Per-Dockerfile ignore for Dockerfile.local-build (BuildKit picks this over
-# .dockerignore). Unlike the release flow, this build compiles from source
-# inside the container, so it needs the source tree — just not build output.
-target/
-.git/
-docs/
-bench/
-skills/

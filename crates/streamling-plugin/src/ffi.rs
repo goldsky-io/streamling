@@ -505,6 +505,8 @@ pub enum PluginMsg {
     /// stream on receipt so job-mode pipelines can drain and complete;
     /// without it the host cannot distinguish "plugin idle" from "plugin
     /// done". Appended last for NonExhaustive ABI compatibility: an older
-    /// host gets an unknown-variant error from `into_enum()` and ignores it.
+    /// host gets an unknown-variant error from `into_enum()` and silently
+    /// discards the message — no crash, but the job-mode hang persists in a
+    /// mixed-version deployment until the host is updated too.
     Complete,
 }
