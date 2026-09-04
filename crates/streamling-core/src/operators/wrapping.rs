@@ -926,6 +926,7 @@ impl ExecutionPlan for WrappingExec {
                     }
                     Err(e) => {
                         debug!("WrappingExec [{}]: Error from input stream, stream will terminate: {}", metric_metadata_id, e);
+                        // Intentionally do not set last_yield: terminal error yields are not blocked time.
                         yield Err(e);
                         return;
                     }
