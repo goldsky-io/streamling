@@ -13,6 +13,7 @@ too_many_arguments = "allow"
 [dependencies]
 # Internal dependencies
 streamling-common = { workspace = true }
+streamling-retry = { workspace = true }
 streamling-config = { workspace = true }
 streamling-plugin = { workspace = true }
 streamling-flink-compat = { workspace = true }
@@ -24,6 +25,7 @@ arrow-schema.workspace = true
 
 # Async runtime
 tokio.workspace = true
+tokio-util.workspace = true
 
 # Database
 sqlx.workspace = true
@@ -88,7 +90,7 @@ tonic.workspace = true
 paste.workspace = true
 
 [dev-dependencies]
-rand.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+rand.workspace = true
 serial_test.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -798,12 +798,11 @@ impl ExecutionPlan for FileSourceExec {
 
             debug!("Current watermark: {:?}", watermark);
 
-            // Caught once and held across iterations so a SIGTERM that arrives
-            // while sleeping is not missed (a freshly created handler would not
-            // observe a signal delivered before it existed).
-            #[cfg(unix)]
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            // Process-wide shutdown signal (the single top-level SIGTERM/SIGINT
+            // handler flips it; record-limit sinks flip it too, §5.1 Decision
+            // 3A). Held across iterations so a flip during the sleep is not
+            // missed.
+            let mut global_shutdown_rx = streamling_core::shutdown::subscribe();
 
             loop {
                 // Drain coordinator messages that arrived during the sleep. Each
@@ -938,6 +937,7 @@ impl ExecutionPlan for FileSourceExec {
                         }
                         total_emitted += rows;
                         if source_complete
+                            || *global_shutdown_rx.borrow()
                             || num_records_before_stop.is_some_and(|limit| total_emitted >= limit)
                         {
                             return Ok(());
@@ -980,24 +980,11 @@ impl ExecutionPlan for FileSourceExec {
                         }
                     }
                     _ = sleep(poll_interval) => {}
-                    // SIGTERM (unix) / Ctrl-C (otherwise): exit the poll loop so
-                    // the stream ends and downstream sinks complete. The wait is
-                    // bound to a `let` so neither cfg branch sits in a
-                    // (feature-gated) trailing-expression position.
-                    _ = async {
-                        #[cfg(unix)]
-                        let _: () = match sigterm.as_mut() {
-                            Some(stream) => {
-                                stream.recv().await;
-                            }
-                            None => std::future::pending::<()>().await,
-                        };
-                        #[cfg(not(unix))]
-                        let _: () = {
-                            let _ = tokio::signal::ctrl_c().await;
-                        };
-                    } => {
-                        info!("[{}] file source received termination signal", reference_name);
+                    // Process shutdown (SIGTERM/SIGINT via the top-level
+                    // handler, or a record-limit sink): exit the poll loop so
+                    // the stream ends and downstream sinks complete.
+                    _ = global_shutdown_rx.wait_for(|stopping| *stopping) => {
+                        info!("[{}] file source observed process shutdown; ending stream", reference_name);
                         return Ok(());
                     }
                 }

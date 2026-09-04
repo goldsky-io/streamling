@@ -4,6 +4,7 @@ members = [
     "crates/streamling-config",
     "crates/streamling-common",
     "crates/streamling-core",
+    "crates/streamling-retry",
     "crates/streamling-connectors",
     "crates/streamling-plugin",
     "crates/streamling-plugin/streamling-plugin-derive",
@@ -33,9 +34,10 @@ streamling-config        = { path = "crates/streamling-config", version = "0.3.1
 streamling-common        = { path = "crates/streamling-common", version = "0.3.1" }
 streamling-state         = { path = "crates/streamling-state", version = "0.3.1" }
 streamling-core          = { path = "crates/streamling-core", version = "0.3.1" }
+streamling-retry         = { path = "crates/streamling-retry", version = "0.3.1" }
 streamling-connectors    = { path = "crates/streamling-connectors", version = "0.3.1" }
 streamling-flink-compat  = { path = "crates/streamling-flink-compat", version = "0.3.1" }
-streamling-plugin        = { path = "crates/streamling-plugin", version = "0.2.1" }
+streamling-plugin        = { path = "crates/streamling-plugin", version = "0.2.2" }
 streamling-plugin-derive = { path = "crates/streamling-plugin/streamling-plugin-derive", version = "0.3.1" }
 streamling-e2e           = { path = "crates/streamling-e2e", version = "0.3.1" }
 
@@ -52,6 +54,9 @@ object_store = { version = "0.13", features = ["aws", "gcp"] }
 
 tokio = { version = "1.0", features = ["rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+# CancellationToken + TaskTracker for the shutdown controller (was already a
+# transitive dep; promoted to direct for structured shutdown).
+tokio-util = { version = "0.7", features = ["rt"] }
 
 sqlx = { version = "0.8.5", features = ["runtime-tokio", "postgres", "json", "sqlite", "tls-rustls"] }
 

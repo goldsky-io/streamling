@@ -819,9 +819,13 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
         #udf_descriptors_fn
         #side_output_descriptors_fn
 
+        extern "C" fn set_shutdown_signal(signal: streamling_plugin::shutdown::ShutdownSignalObj) {
+            streamling_plugin::shutdown::install_shutdown_signal(signal);
+        }
+
         #[export_root_module]
         pub fn get_module() -> PluginModuleRef {
-            PluginModule { init, create, udf_descriptors, side_output_descriptors }.leak_into_prefix()
+            PluginModule { init, create, udf_descriptors, side_output_descriptors, set_shutdown_signal }.leak_into_prefix()
         }
     };
 

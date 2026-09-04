@@ -238,6 +238,13 @@ pub struct PluginSource {
     pub telemetry: Option<Telemetry>,
 }
 
+impl PluginSource {
+    /// Must list exactly this struct's fields (see `merge_plugin_options`).
+    /// Anything listed here is invisible to the plugin as an option;
+    /// anything missing leaks a typed field into the plugin's options map.
+    const TYPED_FIELDS: &'static [&'static str] = &["type", "primary_key", "telemetry"];
+}
+
 /// Source that reads files from `path` in the given `format`. `path` may be a
 /// local path or a remote object store URL (`s3://`, `gs://`); remote
 /// credentials come from the environment. The `mode` selects between a
@@ -320,27 +327,23 @@ pub enum FileSourceFormat {
 /// into a single `options:` mapping for `serde_yaml` to bind to the
 /// plugin's typed `options: HashMap<String, Value>` field.
 ///
-/// Fields in `EXCLUDED_FIELDS` are typed on the node struct itself (e.g.
+/// `typed_fields` are the fields typed on THAT node struct (e.g.
 /// `telemetry`, `primary_key`) and must not leak into the plugin's options
 /// map. They are stripped from BOTH the flat-top-level sweep AND any
 /// nested `options:` block — plugin authors sometimes place typed fields
 /// inside `options:` by mistake, and silent leakage would make
 /// `telemetry.labels` or `telemetry.event_time` invisible to the host
 /// while the plugin received a stray options entry it doesn't understand.
-fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping) {
+///
+/// The list is per node struct on purpose: a single shared list once
+/// stripped `batch_size`/`batch_flush_interval` from plugin SOURCES too —
+/// where no typed field exists to bind them — so a source option by either
+/// name silently vanished before reaching the plugin. Only exclude a key
+/// for a node when the node struct actually has that typed field.
+fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping, typed_fields: &[&str]) {
     const OPTIONS_FIELD: &str = "options";
-    // Nested options are kept, but the `options` field itself is removed.
-    // `telemetry` is excluded so it binds to the typed `PluginSource`
-    // field instead of getting swept into the plugin's options map.
-    const EXCLUDED_FIELDS: &[&str] = &[
-        "type",
-        "from",
-        "primary_key",
-        "telemetry",
-        "batch_size",
-        "batch_flush_interval",
-        OPTIONS_FIELD,
-    ];
+
+    let excluded = |key: &str| key == OPTIONS_FIELD || typed_fields.contains(&key);
 
     let mut merged_options = serde_yaml::Mapping::new();
 
@@ -352,7 +355,7 @@ fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping) {
     {
         for (k, v) in options_mapping.iter() {
             if let Some(key_str) = k.as_str()
-                && !EXCLUDED_FIELDS.contains(&key_str)
+                && !excluded(key_str)
             {
                 merged_options.insert(serde_yaml::Value::String(key_str.to_string()), v.clone());
             }
@@ -362,7 +365,7 @@ fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping) {
     // Then, collect flattened top-level fields of any type (these will overwrite nested options)
     for (k, v) in inner_mapping.iter() {
         if let Some(key_str) = k.as_str()
-            && !EXCLUDED_FIELDS.contains(&key_str)
+            && !excluded(key_str)
         {
             merged_options.insert(serde_yaml::Value::String(key_str.to_string()), v.clone());
         }
@@ -443,9 +446,11 @@ macro_rules! define_typed_enum {
                             }
                         )*
                         _ => {
-                            // Plugin type: merge flattened options and keep the type field
+                            // Plugin type: merge flattened options and keep the type field.
+                            // The exclusion list is the node struct's own typed
+                            // fields — per node, not shared (see merge_plugin_options).
                             if let serde_yaml::Value::Mapping(ref mut map) = value {
-                                merge_plugin_options(map);
+                                merge_plugin_options(map, [<Plugin $enum_name>]::TYPED_FIELDS);
                             }
                             serde_yaml::from_value::<[<Plugin $enum_name>]>(value)
                                 .map($enum_name::plugin)
@@ -589,6 +594,18 @@ pub struct PluginTransform {
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
+}
+
+impl PluginTransform {
+    /// See `PluginSource::TYPED_FIELDS`.
+    const TYPED_FIELDS: &'static [&'static str] = &[
+        "type",
+        "from",
+        "primary_key",
+        "telemetry",
+        "batch_size",
+        "batch_flush_interval",
+    ];
 }
 
 define_typed_enum!(
@@ -859,6 +876,18 @@ pub struct PluginSink {
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
+}
+
+impl PluginSink {
+    /// See `PluginSource::TYPED_FIELDS`.
+    const TYPED_FIELDS: &'static [&'static str] = &[
+        "type",
+        "from",
+        "primary_key",
+        "telemetry",
+        "batch_size",
+        "batch_flush_interval",
+    ];
 }
 
 define_typed_enum!(
@@ -1443,6 +1472,48 @@ sinks:
             assert_eq!(plugin.batch_flush_interval.as_deref(), Some("1s"));
         } else {
             panic!("Expected plugin sink");
+        }
+    }
+
+    // PluginSource has NO typed batch fields, so `batch_size` /
+    // `batch_flush_interval` on a plugin source are ordinary plugin options
+    // and must reach the plugin. A shared exclusion list once stripped them
+    // here too — the option silently vanished (nothing typed existed to bind
+    // it) while sibling keys passed, which is invisible until the plugin
+    // misbehaves in the field.
+    #[test]
+    fn test_plugin_source_keeps_batch_options() {
+        let yaml = r#"
+sources:
+  bounded_source:
+    type: test_source_plugin
+    options:
+      start_block: "100"
+      end_block: "200"
+      batch_size: "1000"
+    batch_flush_interval: "500ms"
+transforms: {}
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        if let Source::plugin(plugin) = topology.sources.get("bounded_source").unwrap() {
+            let opts = plugin.options.as_ref().unwrap();
+            assert_eq!(
+                opts.get("batch_size").and_then(|v| v.as_str()),
+                Some("1000"),
+                "nested batch_size must reach the plugin's options"
+            );
+            assert_eq!(
+                opts.get("batch_flush_interval").and_then(|v| v.as_str()),
+                Some("500ms"),
+                "flattened batch_flush_interval must reach the plugin's options"
+            );
+            assert_eq!(
+                opts.get("start_block").and_then(|v| v.as_str()),
+                Some("100")
+            );
+        } else {
+            panic!("Expected plugin source");
         }
     }
 

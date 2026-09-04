@@ -267,6 +267,20 @@ pub enum PluginMetric {
     },
 }
 
+/// Dispatcher liveness metric names. The SDK dispatchers emit these on the
+/// plugin metrics channel (a throttled heartbeat while the dispatch loop
+/// spins, and enter/exit breadcrumbs around the checkpoint-marker hook); the
+/// host intercepts them for shutdown liveness attribution instead of
+/// forwarding them to telemetry. Shared as consts so the two sides cannot
+/// drift. Emission is `try_send` (see [`PluginMetricsRecorder::dispatch_metric`]),
+/// so a full metrics channel drops a marker rather than ever blocking the
+/// dispatcher.
+pub const DISPATCHER_HEARTBEAT_METRIC: &str = "dispatcher.heartbeat";
+pub const DISPATCHER_HOOK_ENTER_METRIC: &str = "dispatcher.hook.enter";
+pub const DISPATCHER_HOOK_EXIT_METRIC: &str = "dispatcher.hook.exit";
+/// Tag key carrying the hook name on [`DISPATCHER_HOOK_ENTER_METRIC`].
+pub const DISPATCHER_HOOK_TAG: &str = "hook";
+
 #[repr(C)]
 #[derive(StableAbi, Clone, Debug)]
 pub struct PluginMetricsRecorder {
@@ -368,6 +382,39 @@ pub struct PluginChannel {
     pub receiver: RReceiver<PluginMsg_NE>,
 }
 
+/// Budget left untouched when a control-message send gives up, so the host
+/// still has time to notice the dispatcher exited and drain it.
+const DRAIN_SEND_RESERVE: Duration = Duration::from_secs(2);
+
+/// Retry policy for control-message sends (source completion, checkpoint
+/// marker/finalizer/ack).
+///
+/// While the pipeline is running a full channel is ordinary backpressure and
+/// the host is still reading, so retry indefinitely — giving up there would
+/// drop a checkpoint message for no reason.
+///
+/// Once a drain starts that stops being true. The host's source forwarder
+/// stops reading this channel for good after it has forwarded the batches it
+/// snapshotted, so a retry against a full channel can never succeed. Without a
+/// bound the dispatcher spins at 50ms forever, `start()` never returns, and the
+/// host's plugin drain waits out its whole budget on a dispatcher that has
+/// nothing left to do — reporting it as unflushed when in fact it had already
+/// flushed.
+///
+/// This bounds the *wait*, not the outcome. Callers treat the resulting error
+/// as a failed best-effort send, and every checkpoint path that can surface it
+/// leaves the epoch unacked — so offsets stay uncommitted and the tail replays
+/// rather than being falsely reported durable.
+fn stop_retrying_once_the_drain_needs_us_gone()
+-> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+    Box::pin(async move {
+        if !crate::shutdown::is_shutting_down() {
+            return true;
+        }
+        crate::shutdown::remaining_budget() > DRAIN_SEND_RESERVE
+    })
+}
+
 impl PluginChannel {
     pub fn new(channels: (RSender<PluginMsg_NE>, RReceiver<PluginMsg_NE>)) -> Self {
         let (sender, receiver) = channels;
@@ -387,7 +434,7 @@ impl PluginChannel {
             runtime,
             op_name,
             create_payload,
-            None::<fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>>,
+            Some(stop_retrying_once_the_drain_needs_us_gone),
             Duration::from_millis(50),
         )
         .await
@@ -492,6 +539,20 @@ pub enum PluginMsg {
     CheckpointFinalizer {
         epoch: PluginCheckpointEpoch,
     },
+    /// Host → plugin (input channel): stop and clean up.
+    ///
+    /// Plugin → host (a SOURCE dispatcher's OUTPUT channel): the source
+    /// stopped on its own (bounded work complete) — the host ends the
+    /// source's record-batch stream on receipt so downstream sinks see
+    /// end-of-stream and a job-mode pipeline can finish. Without the signal,
+    /// a self-terminating plugin source leaves its stream open forever. The
+    /// reverse direction reuses this existing variant ON PURPOSE: adding a
+    /// new variant is rejected by abi_stable's layout check when the host
+    /// expects more variants than an older library carries (the same
+    /// asymmetry as prefix fields), which would break loading every existing
+    /// plugin dylib. A host predating this meaning ignores output-direction
+    /// Terminate (its match falls through), which is exactly the old
+    /// behavior; no plugin has ever sent Terminate host-ward before this.
     Terminate,
     Topology {
         config: RString,

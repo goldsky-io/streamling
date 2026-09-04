@@ -32,6 +32,12 @@ pub struct PostgresStateBackendConfig {
     pub max_connections: Option<u32>,
     pub state_schema_name: Option<String>,
     pub state_table_name: Option<String>,
+    /// Ceiling on waiting for a pool connection, in seconds. When unset, the
+    /// engine derives it from the shutdown budget at startup (see the state
+    /// backend construction in `streamling`) so a state-backend outage is
+    /// always reportable inside the drain window — sqlx's own 30s default
+    /// out-waits every budget below ~42s of grace.
+    pub acquire_timeout_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresStateBackendConfig {
@@ -889,6 +895,40 @@ pub struct AppConfig {
     /// Set via STREAMLING__JOB_MODE env var by streamling-agent when `job: true`.
     #[serde(default)]
     pub job_mode: bool,
+    /// How a graceful shutdown treats in-flight data. Set via
+    /// STREAMLING__DRAIN_POLICY (`auto` | `drain` | `fast`).
+    #[serde(default)]
+    pub drain_policy: DrainPolicy,
+}
+
+/// Shutdown drain policy: whether a graceful shutdown fully drains and
+/// durably checkpoints the in-flight tail, or exits fast and lets the tail
+/// replay on restart.
+///
+/// The trade-off is duplicate-vs-latency, and it splits cleanly by topology:
+/// bounded work (job mode, hybrid backfills, bounded table/file scans) never
+/// restarts after completing, so its tail has no replay to recover it — it
+/// MUST drain. Plain streaming restarts by definition, so at-least-once
+/// replay covers its tail and the operator may prefer a fast exit (the
+/// duplicate window equals the drained tail, visible only on non-idempotent
+/// sinks).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DrainPolicy {
+    /// Derive from the topology: drain when the pipeline has bounded work
+    /// (job mode, or any hybrid / ClickHouse / bounded file source),
+    /// fast-exit for plain streaming.
+    #[default]
+    Auto,
+    /// Always drain: on shutdown, mint a terminal checkpoint so the drained
+    /// tail's offsets commit before exit and a restart does not replay it.
+    Drain,
+    /// Exit fast: skip the terminal checkpoint (source offsets stay
+    /// uncommitted; the drained tail replays on restart) and cap the plugin
+    /// flush wait. Sinks still flush what they consumed, scopes still drain,
+    /// and the consumer still unsubscribes — this is a clean exit 0, not a
+    /// kill. Ignored (with a warning) when the pipeline has bounded work.
+    Fast,
 }
 
 impl AppConfig {

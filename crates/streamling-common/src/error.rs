@@ -670,6 +670,23 @@ pub fn strip_backtrace(msg: &str) -> String {
 // Tests
 // =============================================================================
 
+/// Lets the shared retry policy in `streamling-retry` annotate its logs with
+/// the same structured fields the rest of the pipeline uses.
+///
+/// This impl lives here rather than in `streamling-core` because the orphan
+/// rule requires it: `StreamlingError` is defined in this crate, and
+/// `RetryError` comes from another, so `streamling-core` may implement neither
+/// for the other.
+impl streamling_retry::RetryError for StreamlingError {
+    fn is_internal(&self) -> bool {
+        StreamlingError::is_internal(self)
+    }
+
+    fn is_retriable(&self) -> bool {
+        StreamlingError::is_retriable(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

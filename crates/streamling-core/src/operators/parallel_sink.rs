@@ -230,6 +230,11 @@ impl ExecutionPlan for ParallelSinkExec {
             for data in streams {
                 let sink = Arc::clone(&sink);
                 let context = Arc::clone(&context);
+                // Sanctioned: structured concurrency — every task is joined
+                // via `join_next` below before this stream completes, and the
+                // JoinSet's abort-on-drop is the intended first-error
+                // behavior (cancel the sibling writes when one fails).
+                #[allow(clippy::disallowed_methods)]
                 writes.spawn(async move { sink.write_all(data, &context).await });
             }
             let mut total_count: u64 = 0;

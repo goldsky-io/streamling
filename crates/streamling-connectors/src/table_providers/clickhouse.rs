@@ -28,7 +28,7 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::executor::block_on;
 use reqwest;
-use streamling_core::checkpoints::channels::{send, subscribe_with_id, unsubscribe};
+use streamling_core::checkpoints::channels::{subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
     extract_checkpoint_messages, now_ms, process_checkpoint_acks,
@@ -315,6 +315,10 @@ pub struct ClickHouseTableProvider {
     source_params: Option<SourceParams>,
     sink_params: Option<SinkParams>,
     metric_metadata_id: String,
+    /// The run loop's shutdown scope: the source exec's checkpointing task
+    /// spawns through it so the teardown drain ladder tracks it. `None` in
+    /// tests (direct construction).
+    scope: Arc<streamling_core::shutdown::ComponentScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -344,7 +348,6 @@ struct SourceParams {
 #[derive(Clone, Debug)]
 struct SinkParams {
     table_name: String,
-    source_name: String,
     reference_name: String,
     num_records_before_stop: Option<u64>,
     primary_keys: Vec<String>,
@@ -626,7 +629,16 @@ impl ClickHouseTableProvider {
             source_params: Some(source_params),
             sink_params: None,
             metric_metadata_id,
+            scope: streamling_core::shutdown::ComponentScope::detached("clickhouse"),
         })
+    }
+
+    /// Attach the run loop's shutdown scope so the source exec's checkpointing
+    /// task is tracked by the teardown drain ladder. Builder-style, applied
+    /// before the provider is wrapped in an `Arc`.
+    pub fn with_scope(mut self, scope: Arc<streamling_core::shutdown::ComponentScope>) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Creates a projection expression for a single field, applying schema override if needed
@@ -669,7 +681,10 @@ impl ClickHouseTableProvider {
         config: ClickHouseConfig,
         num_records_before_stop: Option<u64>,
         primary_key: String,
-        source_name: String,
+        // Neither a per-sink write parallelism nor a source name survives
+        // the parallel-execution merge: write concurrency now comes from the
+        // plan's partitioning (ParallelSinkExec), and record-limit stop goes
+        // through request_shutdown(), not SourceComplete.
         append_only_mode: Option<bool>,
         deduplicate: Option<bool>,
         version_column_name: Option<String>,
@@ -697,7 +712,6 @@ impl ClickHouseTableProvider {
 
         let sink_params = SinkParams {
             table_name: table_name.to_string(),
-            source_name,
             reference_name: reference_name.clone(),
             num_records_before_stop,
             primary_keys,
@@ -714,6 +728,7 @@ impl ClickHouseTableProvider {
             source_params: None,
             sink_params: Some(sink_params),
             metric_metadata_id,
+            scope: streamling_core::shutdown::ComponentScope::detached("clickhouse"),
         })
     }
 
@@ -891,7 +906,6 @@ impl TableProvider for ClickHouseTableProvider {
             client: self.client.clone(),
             table_name: sink_params.table_name.clone(),
             num_records_before_stop: sink_params.num_records_before_stop,
-            source_name: sink_params.source_name.clone(),
             reference_name: sink_params.reference_name.clone(),
             schema,
             primary_keys: Arc::new(sink_params.primary_keys.clone()),
@@ -988,7 +1002,6 @@ pub struct ClickHouseSinkExec {
     client: ClickHouseClient,
     table_name: String,
     num_records_before_stop: Option<u64>,
-    source_name: String,
     reference_name: String,
     schema: SchemaRef,
     primary_keys: Arc<Vec<String>>,
@@ -1102,7 +1115,6 @@ impl DataSink for ClickHouseSinkExec {
         };
         let primary_keys = self.primary_keys.clone();
         let append_only_mode = self.append_only_mode;
-        let source_name = self.source_name.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
         let metrics_recorder = get_metrics_recorder().clone();
         let mut row_count: usize = 0;
@@ -1301,11 +1313,10 @@ impl DataSink for ClickHouseSinkExec {
                 );
 
                 if records_processed >= limit {
-                    // Notify the coordinator (and sources) that the sink has received the expected rows
-                    let _ = send(
-                        CHECKPOINT_COORDINATOR_CHANNEL,
-                        CheckpointMessage::SourceComplete(source_name),
-                    );
+                    // Record-limit reached: request process-wide graceful
+                    // shutdown so every source drains and ends its stream —
+                    // the same path SIGTERM takes (test-only mode).
+                    streamling_core::shutdown::request_shutdown();
                     break;
                 }
             }
@@ -1424,8 +1435,9 @@ impl ExecutionPlan for ClickHouseSourceExec {
         let checkpoint_buffer_for_checkpointing = checkpoint_buffer.clone();
         let checkpoint_buffer_for_data = checkpoint_buffer.clone();
 
+        let scope_for_checkpointing = self.provider.scope.clone();
         builder.spawn(async move {
-            let checkpointing_task = tokio::spawn({
+            let checkpointing_task = scope_for_checkpointing.spawn({
                 let reference_name = reference_name.clone();
                 let split_for_checkpointing = split.clone();
                 let state_store_for_checkpointing = state_store.clone();
@@ -2124,6 +2136,12 @@ impl ClickHouseClient {
             .tcp_keepalive(Duration::from_secs(60))
             // Enable TCP nodelay to reduce latency for small requests
             .tcp_nodelay(true)
+            // Client-wide bounds so NO request against a black-holed endpoint
+            // can hang forever, even from a call path that forgets a
+            // per-request .timeout(). The
+            // per-request timeouts below override the total-request bound.
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
             .build()
             .expect("Failed to build HTTP client for ClickHouse");
 
@@ -4868,6 +4886,7 @@ mod tests {
             }),
             sink_params: None,
             metric_metadata_id: "test_metric".to_string(),
+            scope: streamling_core::shutdown::ComponentScope::detached("clickhouse"),
         };
 
         let session = SessionContext::new();

@@ -1,6 +1,6 @@
 [package]
 name = "streamling-plugin"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Plugin SDK and FFI for extending Streamling."
@@ -12,6 +12,7 @@ too_many_arguments = "allow"
 
 [dependencies]
 streamling-plugin-derive = { workspace = true }
+streamling-retry = { workspace = true }
 streamling-common = { workspace = true }
 streamling-config = { workspace = true }
 streamling-state = { workspace = true }
@@ -23,6 +24,8 @@ async-trait.workspace = true
 crossbeam-channel.workspace = true
 
 tokio.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
