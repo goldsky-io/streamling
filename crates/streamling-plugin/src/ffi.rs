@@ -492,6 +492,24 @@ pub enum PluginMsg {
     CheckpointFinalizer {
         epoch: PluginCheckpointEpoch,
     },
+    /// Host → plugin (input channel): stop and clean up.
+    ///
+    /// Plugin → host (a SOURCE dispatcher's OUTPUT channel): the source
+    /// finished on its own (graceful `is_running() == false` exit, e.g. a
+    /// bounded source reaching its end bound). The host ends the source's
+    /// record-batch stream on receipt so downstream sinks see end-of-stream
+    /// and a job-mode pipeline can complete; without the signal the host
+    /// cannot distinguish "plugin idle" from "plugin done" and a
+    /// self-terminating source leaves its stream open forever.
+    ///
+    /// The reverse direction reuses this existing variant ON PURPOSE: adding
+    /// a new variant is rejected by abi_stable's nonexhaustive layout check
+    /// when the loading side expects more variants than the loaded library
+    /// carries (`TooManyVariants`), which would make a new engine refuse to
+    /// load every plugin dylib built against an older SDK. A host predating
+    /// this meaning ignores output-direction Terminate (its match falls
+    /// through) — the old hang persists there, but nothing breaks — and no
+    /// plugin has ever sent Terminate host-ward before this.
     Terminate,
     Topology {
         config: RString,

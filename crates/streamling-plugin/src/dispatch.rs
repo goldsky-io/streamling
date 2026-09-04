@@ -13,7 +13,7 @@ use async_ffi::FutureExt;
 use crossbeam_channel::TryRecvError;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error;
+use tracing::{debug, error, info};
 
 use crate::ffi::IDLE_POLL_INTERVAL;
 
@@ -112,12 +112,20 @@ async fn handle_control_messages(
                 ));
             }
             Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
+                debug!(
+                    "Source dispatcher received CheckpointMarker epoch={}",
+                    epoch.0
+                );
                 source_plugin
                     .process_checkpoint_marker(epoch.into())
                     .await?;
                 handle_checkpoint_marker(channels, epoch, runtime).await?;
             }
             Ok(Ok(PluginMsg::CheckpointFinalizer { epoch })) => {
+                debug!(
+                    "Source dispatcher received CheckpointFinalizer epoch={}",
+                    epoch.0
+                );
                 source_plugin
                     .process_checkpoint_finalizer(epoch.into())
                     .await?;
@@ -164,6 +172,26 @@ impl SourcePluginDispatcher {
             }
             InitOutcome::Init => {}
         }
+
+        // Announce completion on EVERY exit from the run loop — error exits
+        // included. The host's forwarding loop cannot tell an idle plugin
+        // from a gone one, so a dispatcher that exits without announcing
+        // would leave the source stream (and a job-mode pipeline) waiting
+        // forever. On the error path the announce is best-effort: the error
+        // is what `start()` must surface.
+        let result = self.run(&runtime).await;
+        if let Err(send_err) = self.send_complete(&runtime).await {
+            error!(
+                "Failed to announce source completion to host: {:?}",
+                send_err
+            );
+            result?;
+            return Err(send_err);
+        }
+        result
+    }
+
+    async fn run(&self, runtime: &PluginAsyncRuntimeObj) -> Result<(), PluginError> {
         if !self.source_plugin.is_running() {
             return Ok(());
         }
@@ -178,6 +206,7 @@ impl SourcePluginDispatcher {
             let source_plugin = self.source_plugin.clone();
 
             if !source_plugin.is_running() {
+                info!("Source plugin stopped running; exiting dispatcher loop");
                 break;
             }
 
@@ -221,10 +250,27 @@ impl SourcePluginDispatcher {
 
             runtime.spawn(generate_batch_future).await;
 
-            handle_control_messages(&self.channels, &self.source_plugin, &runtime).await?;
+            handle_control_messages(&self.channels, &self.source_plugin, runtime).await?;
         }
 
         Ok(())
+    }
+
+    /// Announce graceful completion to the host by sending `Terminate` on
+    /// the OUTPUT channel (the plugin→host direction — see the variant's doc
+    /// in `ffi.rs` for why the existing variant is reused rather than adding
+    /// a new one). A bounded source that stops producing looks identical to
+    /// an idle one from the host's side of the output channel; this message
+    /// is what lets the host end the source's stream (and thereby complete a
+    /// job-mode pipeline) instead of waiting for process shutdown.
+    async fn send_complete(&self, runtime: &PluginAsyncRuntimeObj) -> Result<(), PluginError> {
+        info!("Source dispatcher announcing completion to host");
+        self.channels
+            .output
+            .send_with_retry(runtime, "Source complete", || {
+                NonExhaustive::new(PluginMsg::Terminate)
+            })
+            .await
     }
 }
 
@@ -841,6 +887,201 @@ mod tests {
         ) -> Result<(), PluginError> {
             Ok(())
         }
+    }
+
+    /// A source that serves a fixed number of batches and then flips its
+    /// `running` flag — modelling a bounded source reaching its end bound.
+    struct SelfStoppingSource {
+        remaining: AtomicUsize,
+        running: AtomicBool,
+    }
+
+    impl SelfStoppingSource {
+        fn new(batches: usize) -> Self {
+            Self {
+                remaining: AtomicUsize::new(batches),
+                running: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for SelfStoppingSource {
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourcePlugin for SelfStoppingSource {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(empty_schema())
+        }
+        async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+            if self.remaining.fetch_sub(1, Ordering::SeqCst) <= 1 {
+                self.running.store(false, Ordering::SeqCst);
+            }
+            Ok(RecordBatch::new_empty(empty_schema()))
+        }
+        async fn process_checkpoint_marker(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    /// Regression for the job-mode hang (FOU-1166): when a bounded source
+    /// stops running on its own, the dispatcher must announce
+    /// `PluginMsg::Terminate` as its final output message so the host can end
+    /// the source's stream. Without it the host cannot distinguish "plugin
+    /// idle" from "plugin done" and job-mode pipelines never terminate.
+    #[tokio::test]
+    async fn source_dispatcher_announces_complete_on_graceful_exit() {
+        let channels = make_channels();
+        let plugin: Arc<dyn SourcePlugin> = Arc::new(SelfStoppingSource::new(2));
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), plugin);
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        dispatcher.start(runtime).await.expect("start must succeed");
+
+        let mut saw_complete = false;
+        while let Ok(msg) = channels.output.receiver.try_recv() {
+            match msg.into_enum() {
+                Ok(PluginMsg::Terminate) => saw_complete = true,
+                Ok(PluginMsg::NextBatch { .. }) => {
+                    assert!(!saw_complete, "no batches may follow Complete")
+                }
+                other => panic!("unexpected output message: {:?}", other),
+            }
+        }
+        assert!(
+            saw_complete,
+            "a graceful dispatcher exit must announce Complete to the host"
+        );
+    }
+
+    /// A source whose run loop ERRORS must still announce Complete before
+    /// `start()` propagates the error — otherwise the host's forwarding loop
+    /// waits on the stream forever and the job-mode hang returns on unhappy
+    /// paths.
+    #[tokio::test]
+    async fn source_dispatcher_announces_complete_on_error_exit() {
+        struct FailingInitSource;
+
+        #[async_trait]
+        impl SupportsGracefulShutdown for FailingInitSource {
+            fn is_running(&self) -> bool {
+                true
+            }
+            async fn terminate(&self) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl SourcePlugin for FailingInitSource {
+            async fn initialize(&self) -> Result<(), PluginError> {
+                Err(PluginError::Execution("init blew up".to_string()))
+            }
+            fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+                Ok(empty_schema())
+            }
+            async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+                Ok(RecordBatch::new_empty(empty_schema()))
+            }
+            async fn process_checkpoint_marker(
+                &self,
+                _epoch: crate::api::CheckpointEpoch,
+            ) -> Result<(), PluginError> {
+                Ok(())
+            }
+            async fn process_checkpoint_finalizer(
+                &self,
+                _epoch: crate::api::CheckpointEpoch,
+            ) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        let channels = make_channels();
+        let plugin: Arc<dyn SourcePlugin> = Arc::new(FailingInitSource);
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), plugin);
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let result = dispatcher.start(runtime).await;
+
+        assert!(result.is_err(), "the plugin error must still propagate");
+        let msg = channels
+            .output
+            .receiver
+            .try_recv()
+            .expect("output channel must contain Complete even on an error exit");
+        assert!(
+            matches!(msg.into_enum(), Ok(PluginMsg::Terminate)),
+            "an error exit must still announce Complete so the host ends the stream"
+        );
+    }
+
+    /// A source that is already stopped when `Init` arrives must still
+    /// announce Complete — otherwise the host waits on its stream forever.
+    #[tokio::test]
+    async fn source_dispatcher_announces_complete_when_never_running() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin: Arc<dyn SourcePlugin> = Arc::new(RecordingSource {
+            recorder: recorder.clone(),
+            running: AtomicBool::new(false),
+        });
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), plugin);
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        dispatcher.start(runtime).await.expect("start must succeed");
+
+        assert!(
+            !recorder.was_initialized(),
+            "initialize() must not run for a source that is already stopped"
+        );
+        let msg = channels
+            .output
+            .receiver
+            .try_recv()
+            .expect("output channel must contain Complete");
+        assert!(
+            matches!(msg.into_enum(), Ok(PluginMsg::Terminate)),
+            "the only output of a never-running source is Complete"
+        );
     }
 
     #[tokio::test]
