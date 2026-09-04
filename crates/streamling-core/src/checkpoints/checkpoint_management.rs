@@ -702,7 +702,20 @@ impl CheckpointCoordinator {
             let metrics_recorder = get_checkpoint_metrics_recorder();
 
             while running.load(Ordering::SeqCst) {
-                match receiver.recv_timeout(Duration::from_millis(100)) {
+                let receiver = receiver.clone();
+                let received = match tokio::task::spawn_blocking(move || {
+                    receiver.recv_timeout(Duration::from_millis(100))
+                })
+                .await
+                {
+                    Ok(received) => received,
+                    Err(error) => {
+                        error!("Checkpoint subscriber receive task failed: {error}");
+                        break;
+                    }
+                };
+
+                match received {
                     Ok(CheckpointMessage::Ack { epoch, sink_id }) => {
                         debug!(
                             "[CheckpointCoordinator] Received checkpoint ACK for epoch: {} from sink: {}",
@@ -1368,6 +1381,24 @@ mod tests {
                 .contains_key(CHECKPOINT_MESSAGES_KEY)
         );
         assert_eq!(stripped.num_rows(), 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_coordinator_subscriber_does_not_block_async_runtime() {
+        let mut coordinator = CheckpointCoordinator::with_timeout(300);
+        coordinator.start(3600, vec![]);
+
+        let yield_started = Instant::now();
+        tokio::task::yield_now().await;
+        let yield_elapsed = yield_started.elapsed();
+
+        coordinator.stop().await;
+
+        assert!(
+            yield_elapsed < Duration::from_millis(50),
+            "checkpoint subscriber blocked the single-threaded async runtime for {yield_elapsed:?}"
+        );
     }
 
     #[tokio::test]
