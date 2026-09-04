@@ -8,7 +8,9 @@ use datafusion::{
 use futures::StreamExt;
 use futures::future;
 use futures::stream::Stream;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
@@ -17,17 +19,35 @@ use std::{
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use tracing::{info, warn};
 
+use crate::telemetry::MillisAccumulator;
+
 #[derive(Clone, Debug)]
 pub struct BroadcastStream {
     inner: Arc<BroadcastState>,
     stopped: Arc<AtomicBool>,
     channel_capacity: usize,
+    /// `metric_metadata_id` (metric_key form `"{app}::{name}"`) of the producer
+    /// feeding this broadcast. Per-consumer blocked-send time is emitted as
+    /// `node_wait{state="blocked"}` carrying `id=<producer>` and
+    /// `downstream_id=<consumer>`. Always threaded through in production; `None`
+    /// (tests only) means blocked-send is not attributed.
+    upstream_metadata_id: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
 struct BroadcastState {
     schema: SchemaRef,
-    consumers: Mutex<Vec<Sender<DFResult<RecordBatch>>>>,
+    consumers: Mutex<Vec<BroadcastSender>>,
+}
+
+/// A broadcast consumer's sending half plus the downstream node it feeds.
+/// `downstream_id` is the sink's reference name for multi-sink fan-out (to
+/// attribute blocked-send time to the slow sink), or empty when attribution
+/// doesn't apply (the passthrough output and scan-sharing fan-out).
+#[derive(Clone, Debug)]
+struct BroadcastSender {
+    downstream_id: String,
+    tx: Sender<DFResult<RecordBatch>>,
 }
 
 impl BroadcastStream {
@@ -41,7 +61,15 @@ impl BroadcastStream {
             }),
             stopped: Arc::new(AtomicBool::new(false)),
             channel_capacity,
+            upstream_metadata_id: None,
         }
+    }
+
+    /// Set the producing node's `metric_metadata_id` so per-consumer blocked-send
+    /// time is attributed to that node (data-plane). See `upstream_metadata_id`.
+    pub fn with_upstream_metadata_id(mut self, upstream_metadata_id: Option<Arc<str>>) -> Self {
+        self.upstream_metadata_id = upstream_metadata_id;
+        self
     }
 
     /// Start the background broadcasting task.
@@ -54,10 +82,17 @@ impl BroadcastStream {
     }
 
     /// Retry sending with fixed delay until success or channel closed.
+    ///
+    /// Returns the time spent blocked on a full consumer channel (the
+    /// backpressure that consumer exerted for this batch): ~zero on immediate
+    /// success, growing by the retry delay while full. Returning the `Duration`
+    /// (rather than only emitting a metric) keeps the blocking behavior
+    /// unit-testable by value, independent of the recorder.
     async fn try_send_batch_with_retry_forever(
         tx: &Sender<DFResult<RecordBatch>>,
         batch_result: &DFResult<RecordBatch>,
-    ) -> Result<(), ()> {
+    ) -> Result<Duration, ()> {
+        let start = Instant::now();
         loop {
             let to_send = match batch_result {
                 Ok(batch) => Ok(batch.clone()),
@@ -65,7 +100,7 @@ impl BroadcastStream {
             };
 
             match tx.try_send(to_send) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(start.elapsed()),
                 Err(TrySendError::Full(_)) => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
@@ -78,6 +113,16 @@ impl BroadcastStream {
 
     /// The task that reads from the single source stream and broadcasts to all active consumers.
     async fn run_broadcast(&self, mut source_stream: SendableRecordBatchStream) {
+        // Per-consumer blocked-send time is emitted as `node_wait{state="blocked"}`
+        // carrying `id=<producer>` and `downstream_id=<consumer>`. In production
+        // `upstream_metadata_id` is always set; consumers with an empty
+        // `downstream_id` (passthrough output, or a fan-out edge the rule couldn't
+        // reach) are not attributed.
+        let data_plane_recorder = crate::telemetry::recorder::get_metrics_recorder();
+        let upstream_metadata_id = self.upstream_metadata_id.clone();
+        // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
+        // into whole milliseconds instead of each truncating to zero.
+        let mut blocked_accumulators: HashMap<String, MillisAccumulator> = HashMap::new();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 break;
@@ -85,20 +130,87 @@ impl BroadcastStream {
 
             match source_stream.next().await {
                 Some(batch_result) => {
-                    // Concurrent retry sends to avoid deadlocks during consumer startup
+                    // Concurrent retry sends (avoids deadlocks during consumer
+                    // startup). The sends race, so each consumer's blocked span is
+                    // timed independently and they overlap in wall-clock: the
+                    // producer's real block on this batch is the slowest edge
+                    // (join_all == max), not the sum. Per-edge blocked is therefore
+                    // correct for attribution (which consumer is slow), but
+                    // `sum by (id)` over a fan-out can exceed wall-clock (up to N×);
+                    // use `max by (id)` for a wall-clock producer-block signal.
                     let consumers = self.inner.consumers.lock().unwrap().clone();
                     let send_futures: Vec<_> = consumers
                         .iter()
-                        .map(|tx| Self::try_send_batch_with_retry_forever(tx, &batch_result))
+                        .map(|consumer| {
+                            let downstream_id = consumer.downstream_id.clone();
+                            let tx = consumer.tx.clone();
+                            let batch_result = &batch_result;
+                            async move {
+                                let result =
+                                    Self::try_send_batch_with_retry_forever(&tx, batch_result)
+                                        .await;
+                                (downstream_id, tx, result)
+                            }
+                        })
                         .collect();
 
                     let results = future::join_all(send_futures).await;
-                    for result in results {
-                        if result.is_err() {
-                            warn!(
-                                "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
-                            );
+                    // Consumers whose channel closed (receiver dropped) are removed
+                    // below so later batches don't re-schedule doomed sends to them.
+                    let mut closed_txs: Vec<Sender<DFResult<RecordBatch>>> = Vec::new();
+                    for (downstream_id, tx, result) in results {
+                        match result {
+                            Ok(blocked) => {
+                                // Not attributed: no producer id (tests only) or
+                                // an empty downstream id (passthrough output,
+                                // scan-sharing fan-out).
+                                let Some(metadata_id) = upstream_metadata_id.as_deref() else {
+                                    continue;
+                                };
+                                if downstream_id.is_empty() {
+                                    continue;
+                                }
+                                let acc = blocked_accumulators
+                                    .entry(downstream_id.clone())
+                                    .or_default();
+                                acc.add(blocked);
+                                let blocked_ms = acc.take_whole_millis();
+                                if blocked_ms > 0 {
+                                    // Data-plane: id=<producer> + full tags + downstream_id.
+                                    data_plane_recorder.record_count_w_tags(
+                                        "node_wait",
+                                        blocked_ms,
+                                        vec![
+                                            ("state", "blocked"),
+                                            ("downstream_id", downstream_id.as_str()),
+                                        ],
+                                        metadata_id,
+                                    );
+                                }
+                            }
+                            Err(()) => {
+                                warn!(
+                                    "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
+                                );
+                                closed_txs.push(tx);
+                            }
                         }
+                    }
+
+                    // Actually drop the closed consumers from the shared list so we
+                    // stop retrying dead channels every batch. Identity is compared
+                    // by channel (not `downstream_id`, which need not be unique).
+                    if !closed_txs.is_empty() {
+                        let mut guard = self
+                            .inner
+                            .consumers
+                            .lock()
+                            .expect("broadcast consumers mutex poisoned");
+                        guard.retain(|consumer| {
+                            !closed_txs
+                                .iter()
+                                .any(|closed| closed.same_channel(&consumer.tx))
+                        });
                     }
                 }
                 None => {
@@ -113,12 +225,17 @@ impl BroadcastStream {
     }
 
     /// Add a new consumer. Returns a handle that can receive from this broadcast.
-    pub fn add_consumer(&self) -> BroadcastConsumer {
+    ///
+    /// `downstream_id` names the node this consumer feeds, so blocked-send time
+    /// on its full channel is attributed to it (multi-sink passes the slow sink's
+    /// reference name). Empty string opts out (passthrough output, scan-sharing
+    /// fan-out).
+    pub fn add_consumer(&self, downstream_id: String) -> BroadcastConsumer {
         // Each consumer gets its own bounded receiver
         let (tx, rx) = channel(self.channel_capacity);
 
         let mut consumers = self.inner.consumers.lock().unwrap();
-        consumers.push(tx);
+        consumers.push(BroadcastSender { downstream_id, tx });
 
         BroadcastConsumer {
             schema: self.inner.schema.clone(),
@@ -326,5 +443,223 @@ mod tests {
             "retriable flag should survive clone"
         );
         assert_eq!(recovered.to_string(), "bad input");
+    }
+
+    fn one_row_batch() -> RecordBatch {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap()
+    }
+
+    /// `upstream_metadata_id` drives attribution in `run_broadcast`: when set,
+    /// blocked-send time is attributed to the producer via the data-plane
+    /// recorder; when unset (tests only) blocked-send is not attributed.
+    #[test]
+    fn with_upstream_metadata_id_sets_producer_attribution() {
+        let schema = one_row_batch().schema();
+        let broadcast = BroadcastStream::new(schema, 4);
+        assert!(
+            broadcast.upstream_metadata_id.is_none(),
+            "default leaves blocked-send unattributed"
+        );
+        let broadcast = broadcast.with_upstream_metadata_id(Some(Arc::from("app::producer")));
+        assert_eq!(
+            broadcast.upstream_metadata_id.as_deref(),
+            Some("app::producer")
+        );
+    }
+
+    /// A consumer that drains promptly imposes ~no backpressure: the retry
+    /// helper returns near-zero blocked time. This is the control case for the
+    /// attribution guarantee — fast sinks must not be charged.
+    #[tokio::test]
+    async fn blocked_send_is_near_zero_for_fast_consumer() {
+        let batch_result: DFResult<RecordBatch> = Ok(one_row_batch());
+        let (tx, mut rx) = channel::<DFResult<RecordBatch>>(4);
+
+        let blocked = BroadcastStream::try_send_batch_with_retry_forever(&tx, &batch_result)
+            .await
+            .expect("send to open channel must succeed");
+        let _ = rx.recv().await;
+
+        assert!(
+            blocked < Duration::from_millis(5),
+            "fast consumer should not block, got {blocked:?}"
+        );
+    }
+
+    /// When a consumer's channel is full, the broadcast producer blocks on it.
+    /// The helper returns the time spent blocked, which is the per-edge signal
+    /// `run_broadcast` attributes to the slow sink via its `downstream_id`. A
+    /// slow consumer must accrue materially more blocked time than a fast one.
+    #[tokio::test]
+    async fn blocked_send_time_attributed_to_slow_consumer() {
+        let batch_result: DFResult<RecordBatch> = Ok(one_row_batch());
+
+        // Fast consumer: open channel, returns immediately.
+        let (fast_tx, mut fast_rx) = channel::<DFResult<RecordBatch>>(4);
+        let fast_blocked =
+            BroadcastStream::try_send_batch_with_retry_forever(&fast_tx, &batch_result)
+                .await
+                .expect("fast send must succeed");
+        let _ = fast_rx.recv().await;
+
+        // Slow consumer: capacity 1, pre-filled so the next send blocks until a
+        // slot is freed ~30ms later by a concurrent drain.
+        let (slow_tx, mut slow_rx) = channel::<DFResult<RecordBatch>>(1);
+        slow_tx
+            .try_send(Ok(one_row_batch()))
+            .expect("pre-fill the single slot");
+
+        let sender = BroadcastStream::try_send_batch_with_retry_forever(&slow_tx, &batch_result);
+        let drainer = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            slow_rx.recv().await
+        };
+        let (slow_result, _drained) = tokio::join!(sender, drainer);
+        let slow_blocked = slow_result.expect("slow send eventually succeeds after drain");
+
+        assert!(
+            slow_blocked >= Duration::from_millis(20),
+            "slow consumer should block until the slot frees (~30ms), got {slow_blocked:?}"
+        );
+        assert!(
+            slow_blocked > fast_blocked,
+            "slow consumer ({slow_blocked:?}) must accrue more blocked time than fast ({fast_blocked:?})"
+        );
+    }
+
+    /// End-to-end runtime proof that `run_broadcast` emits
+    /// `node_wait{state="blocked"}` tagged `id=<producer>` +
+    /// `downstream_id=<consumer>`, attributing blocked-send time to the *slow*
+    /// consumer and materially less to the fast one. Complements the
+    /// helper-level `blocked_send_time_attributed_to_slow_consumer` (which
+    /// checks the returned `Duration`) by asserting the emitted counter tags.
+    // The std `TEST_LOCK` is held across await to serialize against every other
+    // test mutating the global recorder singleton. Safe here: this
+    // `#[tokio::test]` owns its single-threaded runtime and neither the spawned
+    // broadcast task nor the drainer task ever contends this lock.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_broadcast_emits_blocked_tagged_to_slow_consumer() {
+        use crate::telemetry::recorder::test_support;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let producer_id = "bcast_producer_unit";
+        test_support::init_recorder_with_node(producer_id);
+
+        let schema = one_row_batch().schema();
+        // Capacity 1 so a slow consumer's channel fills after one batch and the
+        // producer blocks on subsequent sends.
+        let broadcast = BroadcastStream::new(schema.clone(), 1)
+            .with_upstream_metadata_id(Some(Arc::from(producer_id)));
+        let mut slow_consumer = broadcast.add_consumer("slow_consumer".to_string());
+        let mut fast_consumer = broadcast.add_consumer("fast_consumer".to_string());
+
+        // Source yields several batches back-to-back; the backpressure comes
+        // from the slow consumer, not the source.
+        let batches: Vec<DFResult<RecordBatch>> = (0..6).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source);
+
+        // Slow consumer: drains with a delay so its bounded channel stays full
+        // and the producer accrues blocked-send time on this edge.
+        let slow_drainer = tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Some(_batch) = slow_consumer.next().await {
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            n
+        });
+        // Fast consumer: drain promptly.
+        let mut fast_n = 0usize;
+        while let Some(_batch) = fast_consumer.next().await {
+            fast_n += 1;
+        }
+        let slow_n = slow_drainer.await.expect("slow drainer task panicked");
+
+        assert_eq!(slow_n, 6, "slow consumer must receive every batch");
+        assert_eq!(fast_n, 6, "fast consumer must receive every batch");
+
+        let slow_blocked =
+            test_support::node_wait_ms(producer_id, "blocked", Some("slow_consumer"));
+        let fast_blocked =
+            test_support::node_wait_ms(producer_id, "blocked", Some("fast_consumer"));
+        assert!(
+            slow_blocked >= 3,
+            "producer must accrue blocked-send time on the slow edge, got {slow_blocked}ms"
+        );
+        assert!(
+            slow_blocked > fast_blocked,
+            "slow edge ({slow_blocked}ms) must be charged more than fast edge ({fast_blocked}ms)"
+        );
+    }
+
+    /// A closed consumer channel surfaces as `Err`, which `run_broadcast` logs
+    /// (typically during shutdown) rather than attributing as backpressure.
+    #[tokio::test]
+    async fn blocked_send_returns_err_when_channel_closed() {
+        let batch_result: DFResult<RecordBatch> = Ok(one_row_batch());
+        let (tx, rx) = channel::<DFResult<RecordBatch>>(1);
+        drop(rx);
+        let result = BroadcastStream::try_send_batch_with_retry_forever(&tx, &batch_result).await;
+        assert!(result.is_err(), "closed channel must return Err");
+    }
+
+    /// A consumer whose receiver has been dropped (closed channel) must be
+    /// pruned from the shared consumer list after its first failed send, so the
+    /// producer stops re-scheduling doomed sends to it on every later batch.
+    #[tokio::test]
+    async fn run_broadcast_prunes_closed_consumer() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = one_row_batch().schema();
+        // Capacity 1: after the first batch the live consumer's channel is full,
+        // so the producer parks on it and never reaches end-of-stream (which
+        // would otherwise clear all consumers), keeping the assertion stable.
+        let broadcast = BroadcastStream::new(schema.clone(), 1);
+        // Live consumer we keep in scope (but never drain), plus a dead one whose
+        // receiver we drop to close its channel.
+        let _live_consumer = broadcast.add_consumer("live".to_string());
+        let dead_consumer = broadcast.add_consumer("dead".to_string());
+        drop(dead_consumer);
+
+        assert_eq!(
+            broadcast.inner.consumers.lock().unwrap().len(),
+            2,
+            "both consumers are registered before broadcasting starts"
+        );
+
+        let batches: Vec<DFResult<RecordBatch>> = (0..5).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source);
+
+        // Give the background task time to send the first batch (Err to the dead
+        // consumer) and prune it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        {
+            let remaining = broadcast.inner.consumers.lock().unwrap();
+            assert_eq!(
+                remaining.len(),
+                1,
+                "the closed consumer must be pruned after its first failed send"
+            );
+            assert_eq!(
+                remaining[0].downstream_id, "live",
+                "the surviving consumer is the live one"
+            );
+        }
+
+        broadcast.stop();
     }
 }
