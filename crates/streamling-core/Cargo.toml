@@ -89,6 +89,13 @@ paste.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `experimental_metrics_custom_reader` exposes `ManualReader` + the `reader`
+# module so unit tests can install a collectable in-process meter provider and
+# read back emitted counters (e.g. `node_wait`). Test-only: enabling it here
+# does not affect the production build, which never compiles dev-dependencies.
+opentelemetry_sdk = { workspace = true, features = [
+    "experimental_metrics_custom_reader",
+    "testing",
+] }
 serial_test.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

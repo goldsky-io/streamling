@@ -154,6 +154,25 @@ Label constraints (enforced at config load):
 
 **Hybrid sources:** `telemetry.labels` on a hybrid source automatically propagate to both the bounded and unbounded phase-child metric series — declare them once on the parent.
 
+### Node-wait metric (starved)
+
+A node's idle time waiting on upstream is exported as
+
+```
+streamling_node_wait_milliseconds_total{id=<node>, state="starved", downstream_id=""}
+```
+
+Paired with `elapsed_compute` (**busy**), this starts the utilization triad. A follow-up PR adds `state="blocked"` (held back by a specific downstream) on the same counter.
+
+| State | Series | Meaning |
+|-------|--------|---------|
+| **starved** | `node_wait{state="starved"}` | waiting on upstream for input (slow source, or backpressure arriving from below) |
+| **busy** | `elapsed_compute - node_wait{state="starved"}` | this node is the CPU/service bottleneck |
+
+> **`elapsed_compute` compatibility.** For backward compatibility, a `WrappingExec` node's input-wait (`data.next().await`) is *still folded into* `elapsed_compute` in addition to being emitted as `node_wait{state="starved"}`. So `elapsed_compute` retains its historical (input-wait + compute) meaning — existing dashboards/alerts are unchanged — and pure compute is `elapsed_compute - node_wait{state="starved"}`. The double-fold is deprecated; a future release will drop the `elapsed_compute` input-wait contribution so it means compute only. (Sink `elapsed_compute` is connector-recorded service time and is unaffected either way.)
+
+`starved` is node-local: it is the `WrappingExec`'s time in `data.next().await`. For a source it is upstream I/O wait; for a channel-decoupled SQL transform it is input starvation. End-of-stream and upstream-error polls are not counted. Emission uses the remainder-carrying `MillisAccumulator` (`telemetry/accumulator.rs`) so sub-millisecond spans are not truncated to zero at high throughput. Every series already carries `state` and `downstream_id` (empty for `starved`) so a later `blocked` state can share the same label key set.
+
 ## Key Architecture Concepts
 
 - **Arrow RecordBatches** flow between operators as the internal data format.
