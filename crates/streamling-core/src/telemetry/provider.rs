@@ -386,6 +386,7 @@ pub fn metric_key(app_id: &str, id: &str) -> String {
 /// `downstream_id` and breaking PromQL joins.
 pub fn get_reference_name_from_metric_key(metric_key: &str) -> String {
     let base = strip_hybrid_phase_suffix(metric_key);
+    // rsplit().next() is always Some; keep the fallback defensive for malformed keys.
     base.rsplit("::").next().unwrap_or(base).to_string()
 }
 

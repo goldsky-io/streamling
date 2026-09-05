@@ -944,251 +944,251 @@ pub fn initialize_metrics_recorder(
 fn build_metrics_recorder(
     metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
 ) -> MetricsRecorder {
-    {
-        let meter = get_meter();
-        let delta_meter = crate::telemetry::get_delta_meter();
-        let mut count_registry: HashMap<String, Counter<u64>> = HashMap::new();
-        let mut gauge_registry: HashMap<String, Gauge<u64>> = HashMap::new();
-        let mut histogram_registry: HashMap<String, Histogram<u64>> = HashMap::new();
+    let meter = get_meter();
+    let delta_meter = crate::telemetry::get_delta_meter();
+    let mut count_registry: HashMap<String, Counter<u64>> = HashMap::new();
+    let mut gauge_registry: HashMap<String, Gauge<u64>> = HashMap::new();
+    let mut histogram_registry: HashMap<String, Histogram<u64>> = HashMap::new();
 
-        let output_rows_name = add_service_prefix("output_rows");
-        count_registry.insert(String::from("output_rows"), meter
+    let output_rows_name = add_service_prefix("output_rows");
+    count_registry.insert(
+        String::from("output_rows"),
+        meter
             .u64_counter(output_rows_name)
             .with_description(
                 "Indicates the number of rows produced as output from a specific query execution.",
             )
-            .build());
+            .build(),
+    );
 
-        let output_rows_delta_name = add_service_prefix("output_rows_delta");
-        debug!("Creating output_rows_delta counter with delta meter");
-        count_registry.insert(String::from("output_rows_delta"), delta_meter
-            .u64_counter(output_rows_delta_name)
-            .with_description(
-                "Indicates the number of rows produced as output from a specific query execution (Delta temporality).",
-            )
-            .build());
+    let output_rows_delta_name = add_service_prefix("output_rows_delta");
+    debug!("Creating output_rows_delta counter with delta meter");
+    count_registry.insert(String::from("output_rows_delta"), delta_meter
+        .u64_counter(output_rows_delta_name)
+        .with_description(
+            "Indicates the number of rows produced as output from a specific query execution (Delta temporality).",
+        )
+        .build());
 
-        let input_rows_name = add_service_prefix("input_rows");
-        count_registry.insert(String::from("input_rows"), meter
+    let input_rows_name = add_service_prefix("input_rows");
+    count_registry.insert(
+        String::from("input_rows"),
+        meter
             .u64_counter(input_rows_name)
             .with_description(
                 "Indicates the number of rows produced as output from a specific query execution.",
             )
-            .build());
+            .build(),
+    );
 
-        let elapsed_compute_name = add_service_prefix("elapsed_compute");
-        histogram_registry.insert(
-            String::from("elapsed_compute"),
-            meter
-                .u64_histogram(elapsed_compute_name)
-                .with_description(
-                    "Total time taken to execute the query execution plan on the data",
-                )
-                .with_unit("ms")
-                .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
-                .build(),
-        );
+    let elapsed_compute_name = add_service_prefix("elapsed_compute");
+    histogram_registry.insert(
+        String::from("elapsed_compute"),
+        meter
+            .u64_histogram(elapsed_compute_name)
+            .with_description("Total time taken to execute the query execution plan on the data")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
+            .build(),
+    );
 
-        count_registry.insert(
-            String::from("http_requests"),
-            meter
-                .u64_counter(add_service_prefix("http_requests"))
-                .with_description(
-                    "Number of outbound HTTP request attempts by handler or webhook node",
-                )
-                .build(),
-        );
-        count_registry.insert(
-            String::from("http_retries"),
-            meter
-                .u64_counter(add_service_prefix("http_retries"))
-                .with_description("Number of outbound HTTP request attempts that will be retried")
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("http_request_latency"),
-            meter
-                .u64_histogram(add_service_prefix("http_request_latency"))
-                .with_description("Latency of each outbound HTTP request attempt")
-                .with_unit("ms")
-                .with_boundaries(vec![
-                    10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
-                    30_000.0, 60_000.0, 120_000.0, 300_000.0,
-                ])
-                .build(),
-        );
+    count_registry.insert(
+        String::from("http_requests"),
+        meter
+            .u64_counter(add_service_prefix("http_requests"))
+            .with_description("Number of outbound HTTP request attempts by handler or webhook node")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("http_retries"),
+        meter
+            .u64_counter(add_service_prefix("http_retries"))
+            .with_description("Number of outbound HTTP request attempts that will be retried")
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("http_request_latency"),
+        meter
+            .u64_histogram(add_service_prefix("http_request_latency"))
+            .with_description("Latency of each outbound HTTP request attempt")
+            .with_unit("ms")
+            .with_boundaries(vec![
+                10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+                30_000.0, 60_000.0, 120_000.0, 300_000.0,
+            ])
+            .build(),
+    );
 
-        // Checkpoint metrics - Counters
-        count_registry.insert(
-            String::from("checkpoint_epochs_succeeded"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_epochs_succeeded"))
-                .with_description("Number of checkpoint epochs that completed successfully")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_epochs_failed"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_epochs_failed"))
-                .with_description("Number of checkpoint epochs that failed due to timeout")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_markers_sent"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_markers_sent"))
-                .with_description("Number of checkpoint markers broadcast by coordinator")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_acks_received"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_acks_received"))
-                .with_description("Number of checkpoint acknowledgments received by coordinator")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_finalizers_sent"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_finalizers_sent"))
-                .with_description("Number of checkpoint finalizers broadcast by coordinator")
-                .build(),
-        );
-        // Checkpoint metrics - Gauges
-        gauge_registry.insert(
-            String::from("checkpoint_epochs_in_flight"),
-            meter
-                .u64_gauge(add_service_prefix("checkpoint_epochs_in_flight"))
-                .with_description("Number of checkpoint epochs currently in progress")
-                .build(),
-        );
+    // Checkpoint metrics - Counters
+    count_registry.insert(
+        String::from("checkpoint_epochs_succeeded"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_epochs_succeeded"))
+            .with_description("Number of checkpoint epochs that completed successfully")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_epochs_failed"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_epochs_failed"))
+            .with_description("Number of checkpoint epochs that failed due to timeout")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_markers_sent"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_markers_sent"))
+            .with_description("Number of checkpoint markers broadcast by coordinator")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_acks_received"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_acks_received"))
+            .with_description("Number of checkpoint acknowledgments received by coordinator")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_finalizers_sent"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_finalizers_sent"))
+            .with_description("Number of checkpoint finalizers broadcast by coordinator")
+            .build(),
+    );
+    // Checkpoint metrics - Gauges
+    gauge_registry.insert(
+        String::from("checkpoint_epochs_in_flight"),
+        meter
+            .u64_gauge(add_service_prefix("checkpoint_epochs_in_flight"))
+            .with_description("Number of checkpoint epochs currently in progress")
+            .build(),
+    );
 
-        // Checkpoint metrics - Histograms
-        // Note: OTel Prometheus exporter appends the unit as a suffix (e.g., "_milliseconds"),
-        // so we use .with_unit("ms") and omit "_ms" from the metric name.
-        //
-        // Explicit boundaries in ms: 100ms to 1 hour.
-        // Default OTel boundaries max out at 10s, which is too low for checkpoint metrics
-        // that can take minutes or hours.
-        let duration_boundaries_ms: Vec<f64> = DURATION_MS_BOUNDARIES.to_vec();
+    // Checkpoint metrics - Histograms
+    // Note: OTel Prometheus exporter appends the unit as a suffix (e.g., "_milliseconds"),
+    // so we use .with_unit("ms") and omit "_ms" from the metric name.
+    //
+    // Explicit boundaries in ms: 100ms to 1 hour.
+    // Default OTel boundaries max out at 10s, which is too low for checkpoint metrics
+    // that can take minutes or hours.
+    let duration_boundaries_ms: Vec<f64> = DURATION_MS_BOUNDARIES.to_vec();
 
-        histogram_registry.insert(
-            String::from("checkpoint_epoch_duration"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_epoch_duration"))
-                .with_description("Time between consecutive epoch finalizations")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_marker_arrival"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_marker_arrival"))
-                .with_description("Time from checkpoint marker creation to arrival at a node")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_sink_flush"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_sink_flush"))
-                .with_description("Time from sink receiving checkpoint marker to completing flush and sending ack")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_finalization_wait"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_finalization_wait"))
-                .with_description(
-                    "Time producer spends blocked waiting for previous epoch to finalize",
-                )
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_per_sink_ack_latency"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_per_sink_ack_latency"))
-                .with_description("Per-sink time from epoch creation to ack arrival")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
+    histogram_registry.insert(
+        String::from("checkpoint_epoch_duration"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_epoch_duration"))
+            .with_description("Time between consecutive epoch finalizations")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_marker_arrival"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_marker_arrival"))
+            .with_description("Time from checkpoint marker creation to arrival at a node")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_sink_flush"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_sink_flush"))
+            .with_description(
+                "Time from sink receiving checkpoint marker to completing flush and sending ack",
+            )
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_finalization_wait"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_finalization_wait"))
+            .with_description("Time producer spends blocked waiting for previous epoch to finalize")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_per_sink_ack_latency"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_per_sink_ack_latency"))
+            .with_description("Per-sink time from epoch creation to ack arrival")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
 
-        // Event-time freshness metrics — gauge of running max event_time per
-        // source, plus per-row lag (t_emit - event_time). Reuses the
-        // checkpoint duration boundaries; tune in a follow-up after
-        // observing real-data distribution.
-        gauge_registry.insert(
-            String::from("event_time_watermark"),
-            meter
-                .u64_gauge(add_service_prefix("event_time_watermark"))
-                .with_description("Running max event_time observed by source, unix milliseconds")
-                .with_unit("ms")
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("event_time_lag"),
-            meter
-                .u64_histogram(add_service_prefix("event_time_lag"))
-                .with_description("Per-row t_emit - event_time, milliseconds")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
+    // Event-time freshness metrics — gauge of running max event_time per
+    // source, plus per-row lag (t_emit - event_time). Reuses the
+    // checkpoint duration boundaries; tune in a follow-up after
+    // observing real-data distribution.
+    gauge_registry.insert(
+        String::from("event_time_watermark"),
+        meter
+            .u64_gauge(add_service_prefix("event_time_watermark"))
+            .with_description("Running max event_time observed by source, unix milliseconds")
+            .with_unit("ms")
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("event_time_lag"),
+        meter
+            .u64_histogram(add_service_prefix("event_time_lag"))
+            .with_description("Per-row t_emit - event_time, milliseconds")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
 
-        // Node-wait metric — a monotonic ms counter for time a node is idle
-        // (not doing useful work), split by the `state` tag into the two idle
-        // states of the starved/busy/blocked triad (`busy` = `elapsed_compute`):
-        //  - `state="blocked"` — held back by a downstream consumer; an edge
-        //    property, so it also carries `downstream_id` (or "" when unresolved).
-        //    Exactly one emitter per edge: a single-downstream `WrappingExec`
-        //    emits its edge (yield->resume suspension), or a fan-out producer's
-        //    is suppressed while the `BroadcastStream` emits one edge per consumer
-        //    (blocked-send time). The two layers never coexist for a node, so
-        //    `sum`/`max by (id)` and `... by (downstream_id)` don't double count.
-        //  - `state="starved"` — waiting on upstream (`data.next().await`);
-        //    node-local, so `downstream_id` is "".
-        // Both states share an identical label key set. The OTel Prometheus
-        // exporter appends unit/`_total`, giving
-        // `streamling_node_wait_milliseconds_total`.
-        count_registry.insert(
-            String::from("node_wait"),
-            meter
-                .u64_counter(add_service_prefix("node_wait"))
-                .with_description(
-                    "Time a node is idle rather than doing useful work, split by the state tag: blocked (held back by a downstream consumer, attributed via downstream_id) or starved (waiting on upstream for input), milliseconds",
-                )
-                .with_unit("ms")
-                .build(),
-        );
-        let mut metric_metadata_tags_registry = HashMap::new();
-        // caching tags for each metric metadata so that we don't have to compute them everytime metric is recorded
-        for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
-            metric_metadata_tags_registry.insert(metric_metadata_id, metric_metadata.to_tags());
-        }
-        let service_instance_id = metric_metadata_registry
-            .values()
-            .next()
-            .expect("expect at least one metric metadata to be available")
-            .service_instance_id
-            .clone();
-        // Series seeding happens later, via `seed_elapsed_compute_series`,
-        // once plugin-declared identity labels have been merged.
-        MetricsRecorder {
-            service_instance_id,
-            metric_metadata_registry: Mutex::new(metric_metadata_registry),
-            metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
-            count_registry: Mutex::new(count_registry),
-            gauge_registry: Mutex::new(gauge_registry),
-            histogram_registry: Mutex::new(histogram_registry),
-            ..Default::default()
-        }
+    // Node-wait metric — a monotonic ms counter for time a node is idle
+    // (not doing useful work), split by the `state` tag into the two idle
+    // states of the starved/busy/blocked triad (`busy` = `elapsed_compute`):
+    //  - `state="blocked"` — held back by a downstream consumer; an edge
+    //    property, so it also carries `downstream_id` (or "" when unresolved).
+    //    Exactly one emitter per edge: a single-downstream `WrappingExec`
+    //    emits its edge (yield->resume suspension), or a fan-out producer's
+    //    is suppressed while the `BroadcastStream` emits one edge per consumer
+    //    (blocked-send time). The two layers never coexist for a node, so
+    //    `sum`/`max by (id)` and `... by (downstream_id)` don't double count.
+    //  - `state="starved"` — waiting on upstream (`data.next().await`);
+    //    node-local, so `downstream_id` is "".
+    // Both states share an identical label key set. The OTel Prometheus
+    // exporter appends unit/`_total`, giving
+    // `streamling_node_wait_milliseconds_total`.
+    count_registry.insert(
+        String::from("node_wait"),
+        meter
+            .u64_counter(add_service_prefix("node_wait"))
+            .with_description(
+                "Time a node is idle rather than doing useful work, split by the state tag: blocked (held back by a downstream consumer, attributed via downstream_id) or starved (waiting on upstream for input), milliseconds",
+            )
+            .with_unit("ms")
+            .build(),
+    );
+    let mut metric_metadata_tags_registry = HashMap::new();
+    // caching tags for each metric metadata so that we don't have to compute them everytime metric is recorded
+    for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
+        metric_metadata_tags_registry.insert(metric_metadata_id, metric_metadata.to_tags());
+    }
+    let service_instance_id = metric_metadata_registry
+        .values()
+        .next()
+        .expect("expect at least one metric metadata to be available")
+        .service_instance_id
+        .clone();
+    // Series seeding happens later, via `seed_elapsed_compute_series`,
+    // once plugin-declared identity labels have been merged.
+    MetricsRecorder {
+        service_instance_id,
+        metric_metadata_registry: Mutex::new(metric_metadata_registry),
+        metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
+        count_registry: Mutex::new(count_registry),
+        gauge_registry: Mutex::new(gauge_registry),
+        histogram_registry: Mutex::new(histogram_registry),
+        ..Default::default()
     }
 }
 
