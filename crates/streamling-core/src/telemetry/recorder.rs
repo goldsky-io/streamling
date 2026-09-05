@@ -1171,12 +1171,15 @@ fn build_metrics_recorder(
     let mut histogram_registry: HashMap<String, Histogram<u64>> = HashMap::new();
 
     let output_rows_name = add_service_prefix("output_rows");
-    count_registry.insert(String::from("output_rows"), meter
-        .u64_counter(output_rows_name)
-        .with_description(
-            "Indicates the number of rows produced as output from a specific query execution.",
-        )
-        .build());
+    count_registry.insert(
+        String::from("output_rows"),
+        meter
+            .u64_counter(output_rows_name)
+            .with_description(
+                "Indicates the number of rows produced as output from a specific query execution.",
+            )
+            .build(),
+    );
 
     let output_rows_delta_name = add_service_prefix("output_rows_delta");
     debug!("Creating output_rows_delta counter with delta meter");
@@ -1225,9 +1228,7 @@ fn build_metrics_recorder(
         String::from("elapsed_compute"),
         meter
             .u64_histogram(elapsed_compute_name)
-            .with_description(
-                "Total time taken to execute the query execution plan on the data",
-            )
+            .with_description("Total time taken to execute the query execution plan on the data")
             .with_unit("ms")
             .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
             .build(),
@@ -1237,9 +1238,7 @@ fn build_metrics_recorder(
         String::from("http_requests"),
         meter
             .u64_counter(add_service_prefix("http_requests"))
-            .with_description(
-                "Number of outbound HTTP request attempts by handler or webhook node",
-            )
+            .with_description("Number of outbound HTTP request attempts by handler or webhook node")
             .build(),
     );
     count_registry.insert(
@@ -1351,7 +1350,9 @@ fn build_metrics_recorder(
         String::from("checkpoint_sink_flush"),
         meter
             .u64_histogram(add_service_prefix("checkpoint_sink_flush"))
-            .with_description("Time from sink receiving checkpoint marker to completing flush and sending ack")
+            .with_description(
+                "Time from sink receiving checkpoint marker to completing flush and sending ack",
+            )
             .with_unit("ms")
             .with_boundaries(duration_boundaries_ms.clone())
             .build(),
@@ -1360,9 +1361,7 @@ fn build_metrics_recorder(
         String::from("checkpoint_finalization_wait"),
         meter
             .u64_histogram(add_service_prefix("checkpoint_finalization_wait"))
-            .with_description(
-                "Time producer spends blocked waiting for previous epoch to finalize",
-            )
+            .with_description("Time producer spends blocked waiting for previous epoch to finalize")
             .with_unit("ms")
             .with_boundaries(duration_boundaries_ms.clone())
             .build(),
