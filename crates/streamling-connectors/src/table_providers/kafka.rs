@@ -2059,6 +2059,13 @@ impl KafkaSourceTableProvider {
         }
     }
 
+    /// Consumer instances this source will run — the requested `parallelism`
+    /// after clamping to the topic's partition count. The hybrid source reads
+    /// it to size its own plan, which must serve exactly this many partitions.
+    pub fn parallelism(&self) -> usize {
+        self.parallelism
+    }
+
     /// Get the payload schema (data columns only, without _gs_op or __kafka_* metadata)
     pub fn payload_schema(&self) -> SchemaRef {
         self.payload_schema.clone()
