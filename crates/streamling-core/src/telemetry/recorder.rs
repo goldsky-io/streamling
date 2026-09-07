@@ -936,11 +936,17 @@ pub fn initialize_metrics_recorder(
 /// Construct a fully-initialized [`MetricsRecorder`] with every metric
 /// pre-registered against the current global meter provider.
 ///
-/// Split out of [`initialize_metrics_recorder`] (pure refactor — the
-/// production build path is unchanged) so tests can atomically replace the
-/// singleton with a freshly built recorder whose counters are bound to a
-/// test-controlled meter provider, without ever exposing a `None` singleton
-/// (see `test_support`).
+/// Split out of [`initialize_metrics_recorder`] as a pure builder-extraction
+/// refactor so tests can atomically replace the singleton with a freshly built
+/// recorder whose counters are bound to a test-controlled meter provider,
+/// without ever exposing a `None` singleton (see `test_support`).
+///
+/// # Compatibility
+///
+/// This helper registers both `node_wait` and `elapsed_compute`. The deprecated
+/// input-wait fold into `elapsed_compute` is implemented in `WrappingExec` for
+/// dashboard compatibility; keep that runtime behavior separate from this
+/// registration helper.
 fn build_metrics_recorder(
     metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
 ) -> MetricsRecorder {
