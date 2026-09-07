@@ -151,18 +151,12 @@ async fn test_source_starved_on_slow_upstream() {
 
     let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     ctx.kafka
