@@ -295,11 +295,8 @@ fn attribute_downstream(
             .children()
             .into_iter()
             .map(|child| {
-                attribute_downstream(
-                    Arc::clone(child),
-                    sink_downstream.as_deref(),
-                    suppress_next_wrapping,
-                )
+                // Only MultiSinkExec suppresses the next wrapping producer; sink boundaries start normal sink-edge attribution.
+                attribute_downstream(Arc::clone(child), sink_downstream.as_deref(), false)
             })
             .collect::<Result<Vec<_>>>()?;
         return node.with_new_children(new_children);
@@ -597,6 +594,10 @@ mod attribution_tests {
             .unwrap()
     }
 
+    fn run_with_suppression(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        attribute_downstream(plan, None, true).unwrap()
+    }
+
     /// A linear `source -> transform -> sink` chain stamps each `WrappingExec`
     /// with its immediate downstream's plain name (metric_key prefix stripped).
     #[test]
@@ -637,6 +638,24 @@ mod attribution_tests {
         );
         let w_src = child(&w_sql, 0);
         assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
+    }
+
+    /// A stale multi-sink suppression flag must not cross a sink boundary:
+    /// sink children start regular sink-edge attribution.
+    #[test]
+    fn sink_boundaries_clear_suppression_flag() {
+        let data_sink = run_with_suppression(sink(wrap(leaf(), "app::sql"), "app::pg_sink"));
+        assert_eq!(
+            role_of(&child(&data_sink, 0)),
+            BackpressureRole::Edge("pg_sink".to_string())
+        );
+
+        let parallel =
+            run_with_suppression(parallel_sink(wrap(leaf(), "app::sql"), "app::pg_sink"));
+        assert_eq!(
+            role_of(&child(&parallel, 0)),
+            BackpressureRole::Edge("pg_sink".to_string())
+        );
     }
 
     /// Regression: two `WrappingExec`s directly adjacent (no compute node between,
