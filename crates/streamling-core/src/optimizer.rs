@@ -285,10 +285,10 @@ fn attribute_downstream(
     // `node` is moved into `with_new_children`.
     let sink_downstream = node
         .downcast_ref::<DataSinkExec>()
-        .map(|dse| named_downstream_from_wrapping_sink(dse.sink(), named_downstream))
+        .map(|dse| wrapping_downstream_name(dse.sink(), named_downstream))
         .or_else(|| {
             node.downcast_ref::<ParallelSinkExec>()
-                .map(|pse| named_downstream_from_wrapping_sink(pse.sink(), named_downstream))
+                .map(|pse| wrapping_downstream_name(pse.sink(), named_downstream))
         });
     if let Some(sink_downstream) = sink_downstream {
         let new_children = node
@@ -320,10 +320,7 @@ fn attribute_downstream(
 /// Recover the sink's plain name from a `WrappingDataSink`, falling back to the
 /// inherited `named_downstream` (same fallback as the pre-#96 `DataSinkExec`
 /// branch). Shared by `DataSinkExec` and `ParallelSinkExec` roots.
-fn named_downstream_from_wrapping_sink(
-    sink: &dyn DataSink,
-    named_downstream: Option<&str>,
-) -> Option<String> {
+fn wrapping_downstream_name(sink: &dyn DataSink, named_downstream: Option<&str>) -> Option<String> {
     sink.downcast_ref::<WrappingDataSink>()
         .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
         .or_else(|| named_downstream.map(str::to_string))
