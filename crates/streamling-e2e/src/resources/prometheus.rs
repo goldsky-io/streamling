@@ -128,6 +128,8 @@ impl PrometheusResource {
     }
 
     /// Build `streamling_node_wait_milliseconds_total{state="<state>",<label>="<value>"[,instance="..."]}`.
+    /// `state`, `label_key`, `label_value`, and `instance_id` are trusted Prometheus
+    /// label fragments/values and must not contain unescaped quote characters.
     fn build_node_wait_query(
         state: &str,
         label_key: &str,
@@ -165,6 +167,8 @@ impl PrometheusResource {
     /// Build `metric{label_key="label_value"[,instance="..."]}`. Centralizes the
     /// PromQL label-selector construction so callers (whether matching on `id`,
     /// `downstream_id`, etc.) don't hand-assemble selector strings.
+    /// `label_key`, `label_value`, and `instance_id` are trusted Prometheus label
+    /// fragments/values and must not contain unescaped quote characters.
     fn build_metric_query_by_label(
         metric_name: &str,
         label_key: &str,
