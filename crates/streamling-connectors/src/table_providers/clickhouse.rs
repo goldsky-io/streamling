@@ -2087,6 +2087,35 @@ impl ClickHouseSourceExec {
     }
 }
 
+/// The one `reqwest::Client` behind every [`ClickHouseClient`] in the process.
+///
+/// Building a `reqwest::Client` is not cheap: the TLS backend parses the
+/// system CA bundle (twice, via openssl) on every build, roughly tens of
+/// milliseconds each. A pipeline used to build one per `ClickHouseClient` — a
+/// hybrid source alone constructs three (schema adapter, bounded source,
+/// offset provider) — which on a wide topology added up to over a second of
+/// pure CPU at startup and dominated `--validate` time. The pool settings below
+/// carry no per-connection state, and credentials, database and compression
+/// stay per `ClickHouseClient`, so one shared client (and connection pool) is
+/// equivalent and `Clone` on it is an `Arc` bump.
+static SHARED_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    // Configure HTTP client with optimized connection pooling settings
+    // These settings improve connection reuse and reduce latency for high-throughput workloads
+    reqwest::Client::builder()
+        // Keep idle connections in the pool for 90 seconds (default is also 90s, but explicit)
+        .pool_idle_timeout(Duration::from_secs(90))
+        // Limit max idle connections per host to prevent unbounded resource growth
+        // while still allowing good parallelism for batch inserts
+        .pool_max_idle_per_host(32)
+        // Enable TCP keepalive to maintain connections through load balancers/proxies
+        // that might close idle connections prematurely
+        .tcp_keepalive(Duration::from_secs(60))
+        // Enable TCP nodelay to reduce latency for small requests
+        .tcp_nodelay(true)
+        .build()
+        .expect("Failed to build HTTP client for ClickHouse")
+});
+
 #[derive(Clone, Debug)]
 pub struct ClickHouseClient {
     creds: ClickHouseConfig,
@@ -2111,25 +2140,9 @@ impl ClickHouseClient {
         compression: ClickHouseCompression,
         compression_level: GzipCompressionLevel,
     ) -> Self {
-        // Configure HTTP client with optimized connection pooling settings
-        // These settings improve connection reuse and reduce latency for high-throughput workloads
-        let http_client = reqwest::Client::builder()
-            // Keep idle connections in the pool for 90 seconds (default is also 90s, but explicit)
-            .pool_idle_timeout(Duration::from_secs(90))
-            // Limit max idle connections per host to prevent unbounded resource growth
-            // while still allowing good parallelism for batch inserts
-            .pool_max_idle_per_host(32)
-            // Enable TCP keepalive to maintain connections through load balancers/proxies
-            // that might close idle connections prematurely
-            .tcp_keepalive(Duration::from_secs(60))
-            // Enable TCP nodelay to reduce latency for small requests
-            .tcp_nodelay(true)
-            .build()
-            .expect("Failed to build HTTP client for ClickHouse");
-
         ClickHouseClient {
             creds,
-            http_client,
+            http_client: SHARED_HTTP_CLIENT.clone(),
             compression,
             compression_level,
         }

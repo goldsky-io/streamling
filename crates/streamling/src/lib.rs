@@ -7,6 +7,8 @@ use datafusion::datasource::{ViewTable, provider_as_source};
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, dml::InsertOp};
 use datafusion::physical_plan::{collect, displayable};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use streamling_config::AppConfig;
@@ -22,7 +24,9 @@ use streamling_connectors::table_providers::memory::MemoryTableProvider;
 use streamling_connectors::table_providers::postgres::PostgresSinkTableProvider;
 use streamling_connectors::table_providers::postgres::query_builder::validate_update_where;
 use streamling_connectors::table_providers::print::PrintTableProvider;
-use streamling_core::checkpoints::checkpoint_management::CheckpointCoordinator;
+use streamling_core::checkpoints::checkpoint_management::{
+    CheckpointControl, CheckpointCoordinator,
+};
 use streamling_core::error::{Result, ResultExt};
 use streamling_core::node_context::{NodeContext, TopologyNodeType, init_node_registry};
 use streamling_core::operators::broadcast::{MultiSinkEntry, MultiSinkLogicalNode};
@@ -395,6 +399,292 @@ fn merge_secret_into_headers(
 /// may not have access to the env vars that are mounted for the runtime pipeline pod.
 fn secret_name_to_resolve(secret_name: Option<&str>, dry_run: bool) -> Option<&str> {
     if dry_run { None } else { secret_name }
+}
+
+/// Upper bound on source providers built concurrently by
+/// [`build_source_providers`]. Bounds the burst of schema-registry fetches and
+/// ClickHouse probes a wide topology fires at startup.
+const MAX_CONCURRENT_SOURCE_BUILDS: usize = 8;
+
+/// A source table provider built ahead of registration by
+/// [`build_source_providers`]. Plugin sources are not prepared: their
+/// construction is a fast FFI call that touches process-wide registries, so it
+/// stays on the sequential registration path.
+enum PreparedSource {
+    Kafka(Arc<KafkaSourceTableProvider>),
+    Clickhouse(Arc<ClickHouseTableProvider>),
+    Hybrid(Arc<HybridTableProvider>),
+    File(Arc<dyn TableProvider>),
+}
+
+impl PreparedSource {
+    fn into_kafka(self) -> Option<Arc<KafkaSourceTableProvider>> {
+        match self {
+            PreparedSource::Kafka(provider) => Some(provider),
+            _ => None,
+        }
+    }
+
+    fn into_clickhouse(self) -> Option<Arc<ClickHouseTableProvider>> {
+        match self {
+            PreparedSource::Clickhouse(provider) => Some(provider),
+            _ => None,
+        }
+    }
+
+    fn into_hybrid(self) -> Option<Arc<HybridTableProvider>> {
+        match self {
+            PreparedSource::Hybrid(provider) => Some(provider),
+            _ => None,
+        }
+    }
+
+    fn into_file(self) -> Option<Arc<dyn TableProvider>> {
+        match self {
+            PreparedSource::File(provider) => Some(provider),
+            _ => None,
+        }
+    }
+}
+
+/// Runs a synchronous source constructor on the blocking pool.
+///
+/// The Kafka, ClickHouse and hybrid constructors block internally
+/// (`block_in_place` + `block_on` around the schema-registry fetch,
+/// `futures::executor::block_on` around the ClickHouse probes). On a blocking
+/// thread that is harmless and keeps them off the runtime workers.
+async fn build_source_blocking<F>(ctx: String, build: F) -> Result<PreparedSource>
+where
+    F: FnOnce() -> Result<PreparedSource> + Send + 'static,
+{
+    tokio::task::spawn_blocking(build)
+        .await
+        .map_err(|e| streamling_err!("{}: source construction task failed: {}", ctx, e))?
+}
+
+/// Builds the non-plugin source providers of `topology` concurrently.
+///
+/// Constructing a Kafka, ClickHouse or hybrid source is where startup talks to
+/// the outside world: one schema-registry fetch per Kafka phase and several
+/// ClickHouse probes per bounded phase, each a blocking round trip. Built one
+/// source after another, a six-source pipeline paid for ~30 sequential round
+/// trips before planning even started; built here, it pays for the slowest
+/// source. Synchronous constructors run on the blocking pool, the async file
+/// builders run inline, at most [`MAX_CONCURRENT_SOURCE_BUILDS`] at a time.
+///
+/// Results are reported in source-name order, so the error a failing topology
+/// surfaces does not depend on scheduling.
+#[allow(clippy::too_many_arguments)]
+async fn build_source_providers(
+    topology: &PipelineTopology,
+    node_contexts: &HashMap<String, NodeContext>,
+    app_config: &AppConfig,
+    application_id: &str,
+    state_backend_factory: &Arc<StateBackendFactories>,
+    session_manager: &SessionManager,
+    checkpoint_control: &CheckpointControl,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> Result<HashMap<String, PreparedSource>> {
+    use futures::StreamExt as _;
+
+    type BuildFuture = Pin<Box<dyn Future<Output = Result<PreparedSource>>>>;
+
+    // Name order, so the cheap synchronous validation below also fails
+    // deterministically.
+    let mut source_names: Vec<&String> = topology.sources.keys().collect();
+    source_names.sort();
+
+    let mut builds: Vec<(String, BuildFuture)> = Vec::new();
+    for reference_name in source_names {
+        let source = &topology.sources[reference_name];
+        let ctx = node_contexts
+            .get(reference_name)
+            .expect("node context must exist")
+            .format();
+        let name = reference_name.clone();
+        let build: BuildFuture = match source {
+            topology::Source::kafka(kafka) => {
+                let record_batch_interval_ms =
+                    parse_batch_flush_interval(&kafka.batch_flush_interval, reference_name)?
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(app_config.record_batch_interval_ms);
+                let record_batch_size = kafka.batch_size.unwrap_or(app_config.record_batch_size);
+                let data_format: KafkaFormat =
+                    kafka.data_format.as_deref().unwrap_or("avro").parse()?;
+                let kafka = kafka.clone();
+                let metric_id = metric_key(application_id, reference_name.as_str());
+                let kafka_config = app_config.kafka_source.clone();
+                let state_backend =
+                    state_backend_factory.create(app_config.state_backend_namespace());
+                let session_manager = session_manager.clone();
+                let internal_buffer_size = app_config.internal_buffer_size;
+                let num_records_before_stop = app_config.num_records_before_stop;
+                Box::pin(build_source_blocking(ctx.clone(), move || {
+                    KafkaSourceTableProvider::new(
+                        name,
+                        metric_id,
+                        kafka_config,
+                        kafka.topic,
+                        kafka.starting_offsets,
+                        kafka.filter,
+                        record_batch_interval_ms,
+                        record_batch_size,
+                        internal_buffer_size,
+                        kafka.include_metadata.unwrap_or(false),
+                        state_backend,
+                        session_manager,
+                        num_records_before_stop,
+                        kafka.validate_writer_schema_ordering.unwrap_or(true),
+                        kafka.schema_id_overrides.unwrap_or_default(),
+                        kafka.skip_schema_resolution.unwrap_or(false),
+                        kafka
+                            .skip_schema_resolution_for_reader_schema_ids
+                            .unwrap_or_default(),
+                        data_format,
+                        kafka.schema,
+                        kafka.parallelism.unwrap_or(1),
+                    )
+                    // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                    // so a user-facing schema error (e.g. unsupported JSON dtype) is
+                    // recovered from the `DataFusionError::External` wrapper and stays
+                    // user-facing. Otherwise `--validate` would misreport it as internal.
+                    .map_err(|e| {
+                        streamling_core::error::StreamlingError::from(e)
+                            .context(format!("{}: failed to create Kafka source", ctx))
+                    })
+                    .map(|provider| PreparedSource::Kafka(Arc::new(provider)))
+                }))
+            }
+            topology::Source::clickhouse(clickhouse) => {
+                let start_at: Option<Vec<ScalarValue>> = clickhouse
+                    .start_at
+                    .clone()
+                    .map(|start_at| start_at.split(',').map(ScalarValue::from).collect());
+                let columns: Option<Vec<String>> = clickhouse
+                    .columns
+                    .clone()
+                    .map(|columns| columns.split(',').map(|s| s.to_string()).collect());
+                let table_name = clickhouse.table_name.clone();
+                let filter = clickhouse.filter.clone();
+                let metric_id = metric_key(application_id, reference_name.as_str());
+                let config = app_config.clickhouse_source.clone();
+                let state_backend =
+                    state_backend_factory.create(app_config.state_backend_namespace());
+                let internal_buffer_size = app_config.internal_buffer_size.as_usize();
+                let record_batch_size = app_config.record_batch_size as usize;
+                Box::pin(build_source_blocking(ctx, move || {
+                    let provider = ClickHouseTableProvider::new_source(
+                        name,
+                        metric_id,
+                        table_name.as_str(),
+                        config,
+                        start_at,
+                        filter,
+                        columns,
+                        state_backend,
+                        internal_buffer_size,
+                        record_batch_size,
+                    )?;
+                    Ok(PreparedSource::Clickhouse(Arc::new(provider)))
+                }))
+            }
+            topology::Source::hybrid(hybrid) => {
+                let hybrid = hybrid.clone();
+                let app_config = app_config.clone();
+                let state_backend_factory = Arc::clone(state_backend_factory);
+                let session_manager = session_manager.clone();
+                let checkpoint_control = checkpoint_control.clone();
+                let shutdown_rx = shutdown_rx.clone();
+                Box::pin(build_source_blocking(ctx, move || {
+                    let provider = HybridTableProvider::new_from_topology(
+                        name,
+                        hybrid.bounded_sources,
+                        hybrid.unbounded_source,
+                        hybrid.offset_table,
+                        &app_config,
+                        state_backend_factory.as_ref(),
+                        session_manager,
+                        // Per-phase event-time config flows directly to the
+                        // inner WrappingSourceTableProviders (one per bounded
+                        // phase + one for unbounded), each carrying its own
+                        // `metric_key_hybrid_src_*` suffix. R9 falls out.
+                        hybrid.telemetry.as_ref(),
+                    )?
+                    // In job mode this source emits the terminal checkpoint
+                    // when its bounded phases complete; in streaming mode it
+                    // does so on shutdown. Give it the control handle (to gate
+                    // teardown on that epoch finalizing) and the shutdown
+                    // signal (to drain rather than drop on SIGTERM).
+                    .with_checkpoint_control(checkpoint_control)
+                    .with_shutdown(shutdown_rx);
+                    Ok(PreparedSource::Hybrid(Arc::new(provider)))
+                }))
+            }
+            topology::Source::file(file) => {
+                let file = file.clone();
+                let session_manager = session_manager.clone();
+                let state_backend_factory = Arc::clone(state_backend_factory);
+                let namespace = app_config.state_backend_namespace().to_string();
+                let num_records_before_stop = app_config.num_records_before_stop;
+                let internal_buffer_size = app_config.internal_buffer_size;
+                Box::pin(async move {
+                    let provider: Arc<dyn TableProvider> = match &file.mode {
+                        topology::FileSourceMode::Bounded => build_bounded_file_source_provider(
+                            &name,
+                            &file.path,
+                            file.format,
+                            &session_manager,
+                            file.parallelism,
+                        )
+                        .await
+                        .map_err(|e| e.context(format!("{}: failed to create file source", ctx)))?,
+                        topology::FileSourceMode::Continuous { poll_interval } => {
+                            let interval =
+                                humantime::parse_duration(poll_interval).map_err(|e| {
+                                    streamling_user_err!(
+                                        "{}: invalid poll_interval '{}': {}",
+                                        ctx,
+                                        poll_interval,
+                                        e
+                                    )
+                                })?;
+                            FileSourceTableProvider::try_new(
+                                &name,
+                                &file.path,
+                                file.format,
+                                interval,
+                                &session_manager,
+                                state_backend_factory.create(&namespace),
+                                num_records_before_stop,
+                                internal_buffer_size,
+                            )
+                            .await
+                            .map_err(|e| {
+                                e.context(format!("{}: failed to create file source", ctx))
+                            })?
+                        }
+                    };
+                    Ok(PreparedSource::File(provider))
+                })
+            }
+            topology::Source::plugin(_) => continue,
+        };
+        builds.push((reference_name.clone(), build));
+    }
+
+    let mut results: Vec<(String, Result<PreparedSource>)> = futures::stream::iter(builds)
+        .map(|(name, build)| async move { (name, build.await) })
+        .buffer_unordered(MAX_CONCURRENT_SOURCE_BUILDS)
+        .collect()
+        .await;
+
+    // Report the first failure in name order, not in completion order.
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut prepared = HashMap::with_capacity(results.len());
+    for (name, result) in results {
+        prepared.insert(name, result?);
+    }
+    Ok(prepared)
 }
 
 /// Parse an optional human-readable duration string (e.g. "1s", "500ms") into `Option<Duration>`.
@@ -814,9 +1104,12 @@ impl Streamling {
         let node_consumers = Self::find_source_consumers(&pipeline_topology);
         debug!("Node consumer analysis: {:?}", node_consumers);
 
-        let state_backend_factory =
+        // Shared with the concurrent source builders (`build_source_providers`),
+        // hence the `Arc`.
+        let state_backend_factory = Arc::new(
             StateBackendFactories::new(app_config.clone().state_backend.clone())
-                .map_err(|e| streamling_err!("failed to create state backend factory: {:?}", e))?;
+                .map_err(|e| streamling_err!("failed to create state backend factory: {:?}", e))?,
+        );
 
         let dynamic_table_backend_factory =
             DynamicTableBackendFactory::new(app_config.dynamic_table_backend.clone());
@@ -869,7 +1162,29 @@ impl Streamling {
         )> = Vec::new();
 
         let pipeline_topology_clone = pipeline_topology.clone();
-        for (reference_name, source) in &pipeline_topology_clone.sources {
+
+        // Build the network-touching source providers concurrently (schema
+        // registry fetches, ClickHouse schema probes, file listings), then
+        // register them below in name order. Registration mutates shared state
+        // (session catalog, primary-key registry, side outputs) and is cheap,
+        // so it stays sequential and deterministic; only the slow, independent
+        // construction runs in parallel.
+        let mut prepared_sources = build_source_providers(
+            &pipeline_topology_clone,
+            &node_contexts,
+            &app_config,
+            &application_id,
+            &state_backend_factory,
+            &session_manager,
+            &checkpoint_control,
+            &shutdown_rx,
+        )
+        .await?;
+
+        let mut source_names: Vec<&String> = pipeline_topology_clone.sources.keys().collect();
+        source_names.sort();
+        for reference_name in source_names {
+            let source = &pipeline_topology_clone.sources[reference_name];
             // MultiSink already accounted for in consumer count
             let consumer_count = node_consumers.get(reference_name).copied().unwrap_or(0);
             let scan_sharing = if consumer_count > 1 {
@@ -889,55 +1204,14 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let topic = &kafka.topic;
-                    let starting_offsets = &kafka.starting_offsets;
-                    let include_metadata = kafka.include_metadata;
-                    let filter = &kafka.filter;
                     let primary_key_opt = &kafka.primary_key;
 
-                    let record_batch_interval_ms =
-                        parse_batch_flush_interval(&kafka.batch_flush_interval, reference_name)?
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(app_config.record_batch_interval_ms);
-                    let record_batch_size =
-                        kafka.batch_size.unwrap_or(app_config.record_batch_size);
-                    let data_format: KafkaFormat =
-                        kafka.data_format.as_deref().unwrap_or("avro").parse()?;
-                    let kafka_source_provider = Arc::new(
-                        KafkaSourceTableProvider::new(
-                            reference_name.clone(),
-                            metric_key(&application_id, reference_name.as_str()),
-                            app_config.kafka_source.clone(),
-                            topic.clone(),
-                            starting_offsets.clone(),
-                            filter.clone(),
-                            record_batch_interval_ms,
-                            record_batch_size,
-                            app_config.internal_buffer_size,
-                            include_metadata.unwrap_or(false),
-                            state_backend_factory.create(app_config.state_backend_namespace()),
-                            session_manager.clone(),
-                            app_config.num_records_before_stop,
-                            kafka.validate_writer_schema_ordering.unwrap_or(true),
-                            kafka.schema_id_overrides.clone().unwrap_or_default(),
-                            kafka.skip_schema_resolution.unwrap_or(false),
-                            kafka
-                                .skip_schema_resolution_for_reader_schema_ids
-                                .clone()
-                                .unwrap_or_default(),
-                            data_format,
-                            kafka.schema.clone(),
-                            kafka.parallelism.unwrap_or(1),
-                        )
-                        // Convert via `StreamlingError::from` (not `streamling_with_context`)
-                        // so a user-facing schema error (e.g. unsupported JSON dtype) is
-                        // recovered from the `DataFusionError::External` wrapper and stays
-                        // user-facing. Otherwise `--validate` would misreport it as internal.
-                        .map_err(|e| {
-                            streamling_core::error::StreamlingError::from(e)
-                                .context(format!("{}: failed to create Kafka source", ctx.format()))
-                        })?,
-                    );
+                    let kafka_source_provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_kafka)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: Kafka source was not prepared", ctx.format())
+                        })?;
                     let extracted_pk = kafka_source_provider.get_extracted_primary_key();
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
@@ -992,30 +1266,14 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let table_name = &clickhouse.table_name;
-                    let filter = &clickhouse.filter;
-                    let start_at = &clickhouse.start_at;
-                    let columns = &clickhouse.columns;
                     let primary_key_opt = &clickhouse.primary_key;
 
-                    let start_at = start_at
-                        .clone()
-                        .map(|start_at| start_at.split(',').map(ScalarValue::from).collect());
-                    let columns = columns
-                        .clone()
-                        .map(|columns| columns.split(",").map(|s| s.to_string()).collect());
-                    let clickhouse_source_provider = Arc::new(ClickHouseTableProvider::new_source(
-                        reference_name.clone(),
-                        metric_key(&application_id, reference_name.as_str()),
-                        table_name.as_str(),
-                        app_config.clickhouse_source.clone(),
-                        start_at,
-                        filter.clone(),
-                        columns,
-                        state_backend_factory.create(app_config.state_backend_namespace()),
-                        app_config.internal_buffer_size.as_usize(),
-                        app_config.record_batch_size as usize,
-                    )?);
+                    let clickhouse_source_provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_clickhouse)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: ClickHouse source was not prepared", ctx.format())
+                        })?;
                     let extracted_pk = clickhouse_source_provider.get_extracted_primary_key();
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
@@ -1070,34 +1328,14 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let bounded_sources = &hybrid.bounded_sources;
-                    let unbounded_source = &hybrid.unbounded_source;
-                    let offset_table = &hybrid.offset_table;
                     let primary_key_opt = &hybrid.primary_key;
 
-                    let hybrid_source_provider = Arc::new(
-                        HybridTableProvider::new_from_topology(
-                            reference_name.clone(),
-                            bounded_sources.clone(),
-                            unbounded_source.clone(),
-                            offset_table.clone(),
-                            &app_config,
-                            &state_backend_factory,
-                            session_manager.clone(),
-                            // Per-phase event-time config flows directly to the
-                            // inner WrappingSourceTableProviders (one per bounded
-                            // phase + one for unbounded), each carrying its own
-                            // `metric_key_hybrid_src_*` suffix. R9 falls out.
-                            hybrid.telemetry.as_ref(),
-                        )?
-                        // In job mode this source emits the terminal checkpoint
-                        // when its bounded phases complete; in streaming mode it
-                        // does so on shutdown. Give it the control handle (to gate
-                        // teardown on that epoch finalizing) and the shutdown
-                        // signal (to drain rather than drop on SIGTERM).
-                        .with_checkpoint_control(checkpoint_control.clone())
-                        .with_shutdown(shutdown_rx.clone()),
-                    );
+                    let hybrid_source_provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_hybrid)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: hybrid source was not prepared", ctx.format())
+                        })?;
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         hybrid_source_provider.clone(),
@@ -1144,44 +1382,12 @@ impl Streamling {
                         .get(reference_name)
                         .expect("node context must exist");
 
-                    let provider: Arc<dyn TableProvider> = match &file.mode {
-                        topology::FileSourceMode::Bounded => build_bounded_file_source_provider(
-                            reference_name,
-                            &file.path,
-                            file.format,
-                            &session_manager,
-                            file.parallelism,
-                        )
-                        .await
-                        .map_err(|e| {
-                            e.context(format!("{}: failed to create file source", ctx.format()))
-                        })?,
-                        topology::FileSourceMode::Continuous { poll_interval } => {
-                            let interval =
-                                humantime::parse_duration(poll_interval).map_err(|e| {
-                                    streamling_user_err!(
-                                        "{}: invalid poll_interval '{}': {}",
-                                        ctx.format(),
-                                        poll_interval,
-                                        e
-                                    )
-                                })?;
-                            FileSourceTableProvider::try_new(
-                                reference_name,
-                                &file.path,
-                                file.format,
-                                interval,
-                                &session_manager,
-                                state_backend_factory.create(app_config.state_backend_namespace()),
-                                app_config.num_records_before_stop,
-                                app_config.internal_buffer_size,
-                            )
-                            .await
-                            .map_err(|e| {
-                                e.context(format!("{}: failed to create file source", ctx.format()))
-                            })?
-                        }
-                    };
+                    let provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_file)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: file source was not prepared", ctx.format())
+                        })?;
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         provider,
@@ -4344,5 +4550,116 @@ sinks: {}
             .expect("propagated primary key should be accepted");
         assert_eq!(pk.columns, vec!["id".to_string()]);
         assert_eq!(pk.source, PrimaryKeySource::Propagated);
+    }
+}
+
+#[cfg(test)]
+mod source_build_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use streamling_config::StateBackendConfig;
+
+    static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "streamling-source-build-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_csv(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "id,num").unwrap();
+        writeln!(file, "1,10").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn bounded_file_source(path: &str) -> String {
+        format!(
+            "    type: file\n    path: {path}\n    format: csv\n    mode:\n      type: bounded\n    primary_key: id\n"
+        )
+    }
+
+    async fn build(topology_yaml: &str) -> Result<HashMap<String, PreparedSource>> {
+        let topology = PipelineTopology::load_from_string(topology_yaml).unwrap();
+        let mut app_config = AppConfig::load().expect("embedded config must load");
+        app_config.state_backend = StateBackendConfig::default();
+        let node_contexts = Streamling::build_node_contexts(&topology);
+        let state_backend_factory =
+            Arc::new(StateBackendFactories::new(app_config.state_backend.clone()).unwrap());
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        let checkpoint_control = CheckpointCoordinator::new().control();
+        let shutdown_rx = streamling_core::shutdown::subscribe();
+        build_source_providers(
+            &topology,
+            &node_contexts,
+            &app_config,
+            "test_app",
+            &state_backend_factory,
+            &session_manager,
+            &checkpoint_control,
+            &shutdown_rx,
+        )
+        .await
+    }
+
+    /// Every non-plugin source comes back prepared, keyed by reference name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepares_every_non_plugin_source() {
+        let dir = scratch_dir();
+        let a = write_csv(&dir, "a.csv");
+        let b = write_csv(&dir, "b.csv");
+        let yaml = format!(
+            "sources:\n  b_second:\n{}  a_first:\n{}transforms: {{}}\nsinks:\n  out_a:\n    type: print\n    from: a_first\n  out_b:\n    type: print\n    from: b_second\n",
+            bounded_file_source(&b),
+            bounded_file_source(&a),
+        );
+
+        let prepared = build(&yaml).await.expect("both file sources must build");
+
+        assert_eq!(prepared.len(), 2);
+        assert!(matches!(
+            prepared.get("a_first"),
+            Some(PreparedSource::File(_))
+        ));
+        assert!(matches!(
+            prepared.get("b_second"),
+            Some(PreparedSource::File(_))
+        ));
+    }
+
+    /// With several failing sources the reported error is the first one in
+    /// name order, not whichever build happened to finish first. `a_bad`
+    /// fails only after async I/O (missing file); `b_bad` fails synchronously
+    /// on its poll interval, so without the ordering it would win the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reports_the_first_failure_in_name_order() {
+        let dir = scratch_dir();
+        let missing = dir.join("does-not-exist.csv");
+        let yaml = format!(
+            "sources:\n  b_bad:\n    type: file\n    path: {}\n    format: csv\n    mode:\n      type: continuous\n      poll_interval: not-a-duration\n    primary_key: id\n  a_bad:\n{}transforms: {{}}\nsinks:\n  out_a:\n    type: print\n    from: a_bad\n  out_b:\n    type: print\n    from: b_bad\n",
+            missing.display(),
+            bounded_file_source(&missing.to_string_lossy()),
+        );
+
+        let message = match build(&yaml).await {
+            Ok(_) => panic!("both sources must fail to build"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("a_bad"),
+            "expected the first source in name order to be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("not-a-duration"),
+            "the later source's error must not be the one reported, got: {message}"
+        );
     }
 }

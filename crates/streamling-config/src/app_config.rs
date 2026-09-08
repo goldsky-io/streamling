@@ -7,6 +7,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Formatter;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 fn default_sslmode() -> String {
@@ -303,8 +304,31 @@ impl std::fmt::Debug for KafkaConfig {
 impl KafkaConfig {
     /// Returns schema registry settings if a schema registry URL is configured.
     /// Returns None if no schema registry URL is set (e.g., when using JSON format).
+    ///
+    /// Settings are built once per (url, username, password) and cached for the
+    /// life of the process: building them constructs a `reqwest::Client`, which
+    /// parses the system CA bundle, and every Kafka source (plus each hybrid
+    /// source's Kafka phase) asks for one at startup. `SrSettings` is `Clone`
+    /// around an `Arc`'d client, so the clones share one connection pool too.
     pub fn get_schema_registry_settings(&self) -> Option<SrSettings> {
         let url = self.schema_registry_url.as_ref()?;
+        let key = (
+            url.clone(),
+            self.schema_registry_username.clone(),
+            self.schema_registry_password.clone(),
+        );
+
+        // The lock is held across the build on purpose: sources are constructed
+        // concurrently at startup, and a check-then-insert would let every one
+        // of them miss the cache at once and build its own client.
+        let mut cache = SCHEMA_REGISTRY_SETTINGS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(settings) = cache.get(&key) {
+            return Some(settings.clone());
+        }
+
         let mut builder = SrSettings::new_builder(url.clone());
 
         if let (Some(username), Some(password)) = (
@@ -314,13 +338,19 @@ impl KafkaConfig {
             builder.set_basic_authorization(username, Some(password.as_str()));
         }
 
-        Some(
-            builder
-                .build()
-                .expect("failed to build schema registry settings from KafkaConfig"),
-        )
+        let settings = builder
+            .build()
+            .expect("failed to build schema registry settings from KafkaConfig");
+        cache.insert(key, settings.clone());
+        Some(settings)
     }
 }
+
+/// Process-wide cache behind [`KafkaConfig::get_schema_registry_settings`],
+/// keyed by (url, username, password).
+type SchemaRegistryKey = (String, Option<String>, Option<String>);
+static SCHEMA_REGISTRY_SETTINGS: OnceLock<Mutex<HashMap<SchemaRegistryKey, SrSettings>>> =
+    OnceLock::new();
 
 /// Compression codec applied by the Kafka sink's producer (librdkafka
 /// `compression.type`). Defaults to `lz4`, which is the historical built-in
