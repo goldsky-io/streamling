@@ -102,6 +102,16 @@ pub struct HybridUnboundedSource {
     pub topic: String,
     pub filter: Option<String>,
     pub start_at: Option<String>,
+    /// Number of concurrent Kafka consumer instances the unbounded phase runs,
+    /// mirroring `KafkaSource::parallelism`. Defaults to 1.
+    ///
+    /// This is the width of the WHOLE hybrid source: the plan's partition count
+    /// is fixed for the pipeline's lifetime, so it cannot change at the
+    /// bounded→unbounded handoff. The bounded (ClickHouse) phase stays
+    /// single-stream regardless — it replays on partition 0 while the other
+    /// partitions idle and only carry checkpoint markers — so this widens the
+    /// tail, not the replay.
+    pub parallelism: Option<usize>,
     /// Mirrors `KafkaSource::validate_writer_schema_ordering` for the hybrid path.
     /// Defaults to true when omitted.
     pub validate_writer_schema_ordering: Option<bool>,
@@ -495,7 +505,10 @@ impl Source {
         match self {
             Source::kafka(s) => s.parallelism,
             Source::file(s) => s.parallelism,
-            Source::clickhouse(_) | Source::hybrid(_) | Source::plugin(_) => None,
+            // A hybrid's width is its unbounded (Kafka) phase's; the bounded
+            // ClickHouse replay is single-stream either way.
+            Source::hybrid(s) => s.unbounded_source.parallelism,
+            Source::clickhouse(_) | Source::plugin(_) => None,
         }
     }
 }
@@ -3236,6 +3249,74 @@ sinks: {}
                 .skip_schema_resolution_for_reader_schema_ids
                 .as_deref(),
             Some(&[99u32][..])
+        );
+    }
+    /// `parallelism` belongs on the unbounded phase — the only phase that can
+    /// honor it — and the source reports it as its own width so the session's
+    /// `target_partitions` is raised to match and `0` is rejected.
+    #[test]
+    fn hybrid_parallelism_is_declared_on_the_unbounded_source() {
+        let with_parallelism = |line: &str| {
+            format!(
+                r#"
+sources:
+  my_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: my_table
+    unbounded_source:
+      source_type: kafka
+      topic: my_topic
+{line}
+transforms: {{}}
+sinks: {{}}
+"#
+            )
+        };
+
+        let topology =
+            PipelineTopology::load_from_string(&with_parallelism("      parallelism: 4"))
+                .expect("hybrid unbounded sources accept parallelism");
+        let source = topology.sources.get("my_source").unwrap();
+        let Source::hybrid(hybrid) = source else {
+            panic!("Expected hybrid source");
+        };
+        assert_eq!(hybrid.unbounded_source.parallelism, Some(4));
+        assert_eq!(
+            source.parallelism(),
+            Some(4),
+            "a hybrid's width is its unbounded phase's"
+        );
+
+        let default = PipelineTopology::load_from_string(&with_parallelism("")).unwrap();
+        assert_eq!(
+            default.sources.get("my_source").unwrap().parallelism(),
+            None,
+            "omitting parallelism leaves the source single-stream"
+        );
+
+        // The bounded (ClickHouse) phase replays through one cursor and has no
+        // such field; putting it there must not look like it took effect.
+        let on_bounded = PipelineTopology::load_from_string(
+            r#"
+sources:
+  my_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: my_table
+        parallelism: 4
+    unbounded_source:
+      source_type: kafka
+      topic: my_topic
+transforms: {}
+sinks: {}
+"#,
+        );
+        assert!(
+            on_bounded.is_err(),
+            "parallelism on a bounded source must be rejected, not silently ignored"
         );
     }
 }

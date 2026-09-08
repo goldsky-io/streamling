@@ -322,11 +322,11 @@ serialization. It's implemented as a custom DataFusion Table Provider (`TablePro
   - Tombstone records (null/empty payloads, e.g. CDC deletes-as-tombstones) are **not supported** in any format
     and fail the source. Represent deletes with a non-empty payload plus a `dbz.op=d` header instead.
 
-Kafka Source uses
-high-level [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html) which handles
-everything related to partition assignment, rebalancing, etc. As a result, it doesn't support any parallelism (meaning
-one partition from the DataFusion perspective). So, in order to scale, increase the number of pods in the Kubernetes
-deployment (which will coordinate using the same consumer group name).
+Kafka Source uses the
+high-level [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html), which handles
+partition assignment and rebalancing. `parallelism: N` (default `1`) runs N consumer instances in one consumer group,
+so the broker hands each a disjoint slice of the topic's partitions; N is clamped to the topic's partition count. The
+same consumer group also coordinates across pods, so adding replicas still scales a `parallelism: 1` source.
 
 **Reliability**:
 
@@ -399,10 +399,16 @@ sources:
       source_type: kafka
       topic: orders_live
       start_at: earliest
+      parallelism: 4
     primary_key: id
 ```
 
 Connection settings for each phase come from the same environment variables as the standalone [ClickHouse Source](#clickhouse-source) (bounded phases) and [Kafka Source](#kafka-source) (unbounded phase).
+
+`parallelism` is declared on `unbounded_source` and sets the width of the whole source: the plan is that many
+partitions wide for its lifetime, because a plan cannot be repartitioned at the bounded→unbounded handoff. The
+bounded phases replay on partition 0 while the others idle (carrying checkpoint markers only), then every partition
+becomes a Kafka consumer instance when the unbounded phase starts. `bounded_sources` accept no `parallelism`.
 
 #### ClickHouse Source
 
