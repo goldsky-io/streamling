@@ -12,6 +12,9 @@ name: streamling-release
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: streamling-release
   cancel-in-progress: false
@@ -37,13 +40,14 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "10G"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
         with:
+          toolchain: 1.90.0
           components: clippy, rustfmt
       - name: Install sccache
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: sccache
       - name: Set SCCACHE_DIR env
@@ -51,14 +55,14 @@ jobs:
       - name: Prepare sccache dir
         run: mkdir -p "$SCCACHE_DIR"
       - name: Cache sccache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-release-${{ runner.os }}-1.90.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             sccache-release-${{ runner.os }}-1.90.0-
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "streamling-release-test"
           cache-targets: true
@@ -67,7 +71,7 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets --all-features -- -D warnings --A clippy::result_large_err
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: nextest
       - name: Run unit tests
@@ -88,9 +92,11 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Resolve version from Cargo metadata
         id: resolve
         run: |
@@ -138,19 +144,21 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Cache release-optimized binary
         id: bin-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release-optimized/streamling
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Install sccache
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: sccache
       - name: Set SCCACHE_DIR env
@@ -161,7 +169,7 @@ jobs:
         run: mkdir -p "$SCCACHE_DIR"
       - name: Cache sccache
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-${{ hashFiles('Cargo.lock') }}
@@ -169,7 +177,7 @@ jobs:
             sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.90.0-
       - name: Setup rust cache
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "v0-release-opt-${{ matrix.os }}-${{ matrix.arch }}"
           cache-targets: true
@@ -187,7 +195,7 @@ jobs:
         if: steps.bin-cache.outputs.cache-hit != 'true'
         run: sccache --show-stats || true
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release-optimized/streamling
@@ -210,19 +218,21 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Cache release-optimized binary
         id: bin-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release-optimized/streamling
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Setup rust cache
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "v0-release-opt-darwin-${{ matrix.arch }}"
           cache-targets: true
@@ -233,7 +243,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release-optimized/streamling
@@ -253,19 +263,21 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Cache release-optimized binary
         id: bin-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release-optimized/streamling.exe
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Setup rust cache
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "v0-release-opt-windows-${{ matrix.arch }}"
           cache-targets: true
@@ -276,7 +288,7 @@ jobs:
       # cmake and Strawberry perl ship on the windows-2025 image; nasm does not.
       - name: Install NASM
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
       - name: Verify native build tools
         if: steps.bin-cache.outputs.cache-hit != 'true'
         run: |
@@ -289,7 +301,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release-optimized/streamling.exe
@@ -306,9 +318,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-binary-*-*
           path: release-artifacts/
@@ -341,7 +353,7 @@ jobs:
           done
           ls -la release-assets/
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
@@ -364,11 +376,13 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "streamling-release-publish"
           cache-targets: true

@@ -4317,6 +4317,7 @@ dependencies = [
  "async-trait",
  "config",
  "futures",
+ "humantime",
  "percent-encoding",
  "schema_registry_converter",
  "serde",
