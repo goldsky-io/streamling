@@ -757,7 +757,7 @@ impl TableProvider for ClickHouseTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -766,13 +766,25 @@ impl TableProvider for ClickHouseTableProvider {
             .as_ref()
             .ok_or_else(|| streamling_err!("ClickHouseTableProvider is not a source"))?;
 
+        // Honor the pushed-down projection. DataFusion pairs the parent
+        // projection's column exprs against this plan's declared schema by
+        // index, so the exec must declare — and emit — exactly the projected
+        // schema (the same contract the Kafka and file sources uphold). The
+        // indices are relative to the external `self.schema`; the scan itself
+        // keeps reading its full column set (version-aware dedup needs the
+        // sorting keys, version column and `_gs_op`) and projects at the emit
+        // point, after the dedup-only version column is stripped.
+        let output_schema = datafusion::physical_plan::project_schema(&self.schema, projection)?;
+
         let clickhouse_source_exec = Arc::new(ClickHouseSourceExec {
             cached_properties: Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(self.schema.clone()),
+                EquivalenceProperties::new(output_schema.clone()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             )),
+            projection: projection.cloned(),
+            output_schema,
             provider: (*self).clone(),
             split: ClickHouseSourceSplit {
                 sorting_keys: source_params.sorting_keys.clone(),
@@ -1329,6 +1341,13 @@ impl DisplayAs for ClickHouseSinkExec {
 #[derive(Debug)]
 pub struct ClickHouseSourceExec {
     cached_properties: Arc<PlanProperties>,
+    /// Pushed-down projection, relative to the provider's external schema.
+    /// Applied at the emit point (after the dedup-only version column is
+    /// stripped) so the emitted batches match `output_schema`.
+    projection: Option<Vec<usize>>,
+    /// The provider's external schema with `projection` applied — what this
+    /// exec declares and emits.
+    output_schema: SchemaRef,
     provider: ClickHouseTableProvider,
     split: ClickHouseSourceSplit,
 }
@@ -1346,6 +1365,10 @@ impl DisplayAs for ClickHouseSourceExec {
 impl ExecutionPlan for ClickHouseSourceExec {
     fn name(&self) -> &str {
         "ClickHouseSourceExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.output_schema.clone()
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1367,7 +1390,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // `schema` is the provider's full external schema — the shape of a
+        // scan batch once the dedup-only version column is stripped, and the
+        // index space of `projection`. `output_schema` is what this exec
+        // declares and emits: `schema` with `projection` applied.
         let schema = self.provider.schema.clone();
+        let output_schema = self.output_schema.clone();
+        let projection = self.projection.clone();
 
         let source_params = self
             .provider
@@ -1376,7 +1405,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .ok_or_else(|| streamling_err!("ClickHouseSourceExec is not a source"))?;
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
-            schema.clone(),
+            output_schema.clone(),
             source_params.datafusion_buffer_size,
         );
         let tx = builder.tx();
@@ -1417,7 +1446,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
         let dedup_version_column = source_params.dedup_version_column.clone();
         let dedup_key = source_params.sorting_keys.join(",");
         let project_out_version_index = source_params.project_out_version_index;
-        let empty_batch_schema = schema.clone();
+        let empty_batch_schema = output_schema.clone();
 
         // Shared checkpoint buffer for metadata propagation
         let checkpoint_buffer = Arc::new(Mutex::new(Vec::<CheckpointMessage>::new()));
@@ -1852,6 +1881,26 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                         .map(|b| {
                                             project_out_column(b, drop_idx, schema.clone())
                                         })
+                                        .collect::<Result<Vec<_>>>()
+                                    {
+                                        Ok(p) => emit_batches = p,
+                                        Err(e) => {
+                                            let _ = tx.send(Err(e)).await;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Apply the pushed-down projection. Indices are
+                                // relative to the external schema, so this must
+                                // run after the version column is stripped and
+                                // before checkpoint metadata is attached (so it
+                                // rides the final shape). `RecordBatch::project`
+                                // keeps the row count, so a projection that
+                                // prunes every column still emits its rows.
+                                if let Some(indices) = &projection {
+                                    match emit_batches
+                                        .into_iter()
+                                        .map(|b| b.project(indices).map_err(DataFusionError::from))
                                         .collect::<Result<Vec<_>>>()
                                     {
                                         Ok(p) => emit_batches = p,
@@ -4885,6 +4934,106 @@ mod tests {
             source_exec.split.args, initial_split_args,
             "scan should seed execution split with initial start args"
         );
+    }
+
+    /// The scan must honor a pushed-down projection: DataFusion pairs a parent
+    /// projection's column exprs against this plan's declared schema by index,
+    /// so declaring the full schema while a projection is in force fails
+    /// planning ("Input field name X does not match with the projection
+    /// expression Y") for any non-prefix subset. Both schema surfaces DataFusion
+    /// consults must be projected. `scan()` does no I/O, so no server is needed.
+    #[tokio::test]
+    async fn test_source_scan_reports_projected_schema() {
+        use datafusion::execution::context::SessionContext;
+        use streamling_state::StateOperatorBackendFactory;
+        use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
+
+        let pagination_config = ClickHousePaginationConfig {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            page_size: 1000,
+        };
+        let query_builder = ClickHouseQueryBuilder::of(
+            "test_table".to_string(),
+            vec![
+                "block_number".to_string(),
+                "id".to_string(),
+                "payload".to_string(),
+            ],
+            None,
+            Some(pagination_config),
+        );
+        let state_backend_factory = InMemoryStateOperatorBackendFactory::new()
+            .expect("failed to create in-memory state backend factory");
+        let state_store = Arc::new(ClickHouseSourceStateStore {
+            reference_name: "test_source".to_string(),
+            state_backend: state_backend_factory.create::<ClickHouseSourceSplit>("test_ns_proj"),
+        });
+        let full_schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::Int64, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        let provider = ClickHouseTableProvider {
+            reference_name: "test_source".to_string(),
+            schema: full_schema.clone(),
+            client: ClickHouseClient::new(ClickHouseConfig {
+                url: "http://localhost:8123".to_string(),
+                database: "default".to_string(),
+                user: "default".to_string(),
+                password: "".to_string(),
+                compression: ClickHouseCompression::None,
+                compression_level: GzipCompressionLevel::default(),
+            }),
+            source_params: Some(SourceParams {
+                query_builder,
+                sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+                initial_split_args: vec![ScalarValue::Int64(Some(0))],
+                state_store,
+                datafusion_buffer_size: 16,
+                record_batch_size: 1000,
+                sort_key_range: 1_000_000,
+                table_name: "test_table".to_string(),
+                has_persisted_split: false,
+                dedup_version_column: None,
+                project_out_version_index: None,
+            }),
+            sink_params: None,
+            metric_metadata_id: "test_metric".to_string(),
+        };
+
+        let session = SessionContext::new();
+        let session_state = session.state();
+
+        // Non-prefix, reordered subset: [payload, block_number].
+        let projection = vec![2usize, 0];
+        let plan = provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+        let expected = Arc::new(full_schema.project(&projection).unwrap());
+        assert_eq!(plan.schema(), expected, "schema() must be projected");
+        assert_eq!(
+            plan.properties().eq_properties.schema(),
+            &expected,
+            "PlanProperties must carry the projected schema"
+        );
+        let names: Vec<_> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["payload".to_string(), "block_number".to_string()]
+        );
+
+        // No projection: unchanged full schema.
+        let plan = provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+        assert_eq!(plan.schema(), full_schema);
     }
 
     #[tokio::test]
