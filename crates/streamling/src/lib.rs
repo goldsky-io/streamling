@@ -2501,7 +2501,7 @@ impl Streamling {
 
         let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 
-        for (_, (source_plan, mut sinks)) in sources_to_sinks.into_iter() {
+        for (producer_name, (source_plan, mut sinks)) in sources_to_sinks.into_iter() {
             let future_name = sinks
                 .iter()
                 .map(|e| e.name.as_str())
@@ -2528,8 +2528,19 @@ impl Streamling {
                         rebatch_config: e.rebatch_config,
                     })
                     .collect();
+                // The map key is the producer's `from` reference name; its
+                // metric_key is the BroadcastStream's upstream_metadata_id so
+                // per-sink blocked-send is attributed to the producer node.
+                let upstream_metadata_id: Option<Arc<str>> = Some(Arc::from(metric_key(
+                    &application_id,
+                    producer_name.as_str(),
+                )));
                 LogicalPlan::Extension(Extension {
-                    node: Arc::new(MultiSinkLogicalNode::new(partitioned_plan, entries)),
+                    node: Arc::new(MultiSinkLogicalNode::new(
+                        partitioned_plan,
+                        entries,
+                        upstream_metadata_id,
+                    )),
                 })
             } else {
                 // Single sink: wrap once at the logical level with this
