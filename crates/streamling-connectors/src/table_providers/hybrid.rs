@@ -7,7 +7,7 @@ use crate::table_providers::clickhouse::{ClickHouseClient, ClickHouseTableProvid
 use crate::table_providers::kafka::KafkaSourceTableProvider;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{RecordBatch, RecordBatchOptions};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -844,11 +844,63 @@ impl HybridTableProvider {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let current_source = self.get_current_source().await?;
         let session_state = self.session_manager.session_state();
+        let inner_projection = translate_projection(
+            &self.reference_name,
+            &self.schema,
+            &current_source.schema(),
+            projection.as_ref(),
+        )?;
         let plan = current_source
-            .scan(&session_state, projection.as_ref(), filters, limit)
+            .scan(&session_state, inner_projection.as_ref(), filters, limit)
             .await?;
         plan.execute(partition, context)
     }
+}
+
+/// Re-express a projection pushed against the hybrid schema in an inner
+/// phase's own index space, matching columns by name.
+///
+/// Phase schemas are validated against the hybrid schema by NAME only
+/// (`validate_schemas`), so a phase may be a permutation of it: the ClickHouse
+/// SELECT always appends `_gs_op` last, while a Kafka payload that carries its
+/// own `_gs_op` keeps it in place. Pushing hybrid indices through untranslated
+/// would make any phase that honors the projection select the wrong columns.
+fn translate_projection(
+    reference_name: &str,
+    hybrid_schema: &Schema,
+    inner_schema: &Schema,
+    projection: Option<&Vec<usize>>,
+) -> DataFusionResult<Option<Vec<usize>>> {
+    let Some(indices) = projection else {
+        return Ok(None);
+    };
+    indices
+        .iter()
+        .map(|&i| {
+            let name = hybrid_schema.fields().get(i).map(|f| f.name()).ok_or_else(|| {
+                DataFusionError::from(streamling_err!(
+                    "hybrid source '{}': projection index {} is out of range for a {}-column schema",
+                    reference_name,
+                    i,
+                    hybrid_schema.fields().len()
+                ))
+            })?;
+            inner_schema.index_of(name).map_err(|_| {
+                DataFusionError::from(streamling_err!(
+                    "hybrid source '{}': column '{}' is missing from the current phase schema \
+                     (phase columns: {:?})",
+                    reference_name,
+                    name,
+                    inner_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                ))
+            })
+        })
+        .collect::<DataFusionResult<Vec<usize>>>()
+        .map(Some)
 }
 
 #[async_trait]
@@ -871,8 +923,14 @@ impl TableProvider for HybridTableProvider {
         self.load_state().await?;
 
         let current_source = self.get_current_source().await?;
+        let inner_projection = translate_projection(
+            &self.reference_name,
+            &self.schema,
+            &current_source.schema(),
+            projection,
+        )?;
         let inner_plan = current_source
-            .scan(state, projection, filters, limit)
+            .scan(state, inner_projection.as_ref(), filters, limit)
             .await?;
 
         Ok(Arc::new(HybridSourceExec::new(
@@ -937,12 +995,25 @@ impl HybridSourceExec {
 
 /// Align a batch to `target` by selecting the target's columns by NAME.
 ///
-/// Inner phase plans do not reliably honor the projection pushed into the
-/// hybrid scan (the bounded ClickHouse provider ignores it entirely and emits
-/// every column, in ClickHouse DESCRIBE order rather than the hybrid/Kafka
-/// schema order), so the hybrid exec — which declares `target` as its output
-/// schema — must reshape each batch itself. Name-based selection is
-/// deliberately insensitive to both column order and extra columns.
+/// The hybrid exec declares `target` (the hybrid schema with the pushed-down
+/// projection applied) as its output, but inner phases are only validated
+/// against the hybrid schema by name, so a phase batch may legitimately be a
+/// permutation or a superset of it:
+///
+/// - the ClickHouse SELECT is generated from the Kafka schema but always moves
+///   `_gs_op` last, while a Kafka payload that carries its own `_gs_op` keeps
+///   it in place — so even with `projection == None` the two phases can
+///   disagree on column order;
+/// - a phase that does not honor the pushed-down projection emits its full
+///   column set, i.e. a superset of `target`;
+/// - a pushed projection need not be a prefix, so positional pairing against a
+///   full-width batch reads the wrong arrays.
+///
+/// Name-based selection is insensitive to all three. Only names and order are
+/// normalized: each column keeps the phase's own `Field` (nullability, List
+/// child names, u256 metadata) — the u256 normalizer downstream pairs by name
+/// and tolerates those differences on purpose. `RecordBatch::project` preserves
+/// schema metadata, so checkpoint markers riding on the batch survive.
 fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> DataFusionResult<RecordBatch> {
     let batch_schema = batch.schema();
     // Fast path: already the exact target shape (names, in order).
@@ -1252,11 +1323,10 @@ impl ExecutionPlan for HybridSourceExec {
                     };
                     match batch_result {
                         Ok(batch) => {
-                            // Inner phases do not reliably honor the pushed-down
-                            // projection (the bounded ClickHouse scan ignores it
-                            // and emits every column, in ClickHouse order), so
-                            // align each batch to the declared (projected)
-                            // schema by name before anything downstream sees it.
+                            // Phase batches may be a permutation or superset of
+                            // the declared (projected) schema — see
+                            // `align_batch_to_schema` — so align each batch by
+                            // name before anything downstream sees it.
                             let batch = match align_batch_to_schema(&batch, &schema_for_main) {
                                 Ok(b) => b,
                                 Err(e) => {
@@ -1510,7 +1580,12 @@ fn merge_pending_markers(
         batch.schema().fields().clone(),
         md,
     ));
-    match RecordBatch::try_new(new_schema, batch.columns().to_vec()) {
+    // Carry the row count explicitly: a projection that prunes every column
+    // (e.g. a literal-only transform) yields batches with rows but no columns,
+    // and `try_new` cannot infer a row count from zero columns — it would fail
+    // on every data batch and strand the buffered markers until phase end.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    match RecordBatch::try_new_with_options(new_schema, batch.columns().to_vec(), &options) {
         Ok(merged) => merged,
         Err(e) => {
             // Re-queue the drained markers so the next merge or the final
@@ -2858,9 +2933,13 @@ mod tests {
         );
     }
 
-    /// A bounded phase that behaves like the real ClickHouse provider: its
-    /// scan IGNORES the pushed-down projection and emits one full-width batch
-    /// whose column order differs from the hybrid (unbounded/Kafka) schema.
+    /// A bounded phase that declares the hybrid's columns in a different ORDER
+    /// (`[name, id]` vs the hybrid's `[id, name]`), IGNORES the pushed-down
+    /// projection, and emits one full-width batch in its own order. Phase
+    /// schemas are validated by name only, so this is a legal phase — it is
+    /// the shape the ClickHouse phase takes when the Kafka payload carries its
+    /// own `_gs_op` (the ClickHouse SELECT always moves `_gs_op` last), and a
+    /// stricter stand-in for a phase that emits a column superset.
     #[derive(Debug)]
     struct ReorderedBatchMockProvider {
         schema: SchemaRef,
@@ -2996,12 +3075,31 @@ mod tests {
             expected,
             "plan must report the projected schema, not the full provider schema"
         );
+        // DataFusion derives a parent's output properties from the child's
+        // equivalence properties, so that schema surface must be projected too.
+        assert_eq!(
+            plan.properties().eq_properties.schema(),
+            &expected,
+            "PlanProperties must carry the projected schema as well"
+        );
+        // Building a projection over the scan runs ProjectionMapping::try_new —
+        // the code that raised the production assertion when the child still
+        // declared the full schema (`name` is index 0 of the projected schema
+        // but index 1 of the full one).
+        let exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = vec![(
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                "name", 0,
+            )),
+            "name".to_string(),
+        )];
+        datafusion::physical_plan::projection::ProjectionExec::try_new(exprs, plan)
+            .expect("a projection over the projected scan must plan");
     }
 
-    /// The bounded ClickHouse provider ignores the pushed-down projection and
-    /// emits full-width batches in ITS OWN column order. The hybrid exec must
-    /// still deliver batches shaped exactly like its declared (projected)
-    /// schema, aligning columns by name.
+    /// A bounded phase that ignores the pushed-down projection and emits
+    /// full-width batches in its own column order. The hybrid exec must still
+    /// deliver batches whose columns are those of its declared (projected)
+    /// schema, in that order, aligning by name.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_with_projection_aligns_reordered_phase_batches() {
         let config = HybridSourceConfig {
@@ -3053,6 +3151,565 @@ mod tests {
             assert_eq!(names.value(1), "b");
         }
         assert!(saw_data, "the bounded phase's batch must be forwarded");
+    }
+
+    // ---- Projection-pushdown regression tests beyond the two above: real
+    // DataFusion SQL planning, checkpoint-metadata survival through the
+    // per-batch align, zero-column projections, and the missing-column path.
+
+    /// Bounded mock that IGNORES the pushed-down projection and emits exactly
+    /// one 2-row batch shaped like `emit_schema` (which may carry schema
+    /// metadata, the way checkpoint markers do), while declaring `emit_schema`
+    /// as its own schema.
+    #[derive(Debug)]
+    struct ShapedMockProvider {
+        /// What the provider CLAIMS (passes HybridTableProvider::new validation).
+        declared_schema: SchemaRef,
+        /// What its batches actually look like.
+        emit_schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for ShapedMockProvider {
+        fn schema(&self) -> SchemaRef {
+            self.declared_schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ShapedMockExec {
+                schema: self.emit_schema.clone(),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(self.emit_schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ShapedMockExec {
+        schema: SchemaRef,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ShapedMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ShapedMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ShapedMockExec {
+        fn name(&self) -> &str {
+            "ShapedMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
+            let columns: Vec<ArrayRef> = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Int32 => Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                    DataType::Utf8 => Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                    other => panic!("mock: unsupported type {other:?}"),
+                })
+                .collect();
+            let batch = RecordBatch::try_new(self.schema.clone(), columns).expect("mock batch");
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::once(async move { Ok(batch) }),
+                ),
+            ))
+        }
+    }
+
+    async fn job_mode_hybrid(name: &str, bounded: Arc<dyn TableProvider>) -> HybridTableProvider {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![bounded],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend(name).await;
+        HybridTableProvider::new(
+            name.to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+    }
+
+    /// Go through REAL DataFusion SQL planning, not just `provider.scan()`.
+    /// `upper(name)` keeps a ProjectionExec above the scan, so the projection
+    /// `[1]` is pushed into `scan()` AND `ProjectionMapping::try_new` runs
+    /// against the hybrid exec's declared schema — the production failure
+    /// path. Pre-fix this fails with `Input field name id does not match with
+    /// the projection expression name`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_datafusion_sql_projection_plans_and_executes_through_hybrid() {
+        let reordered = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let provider = job_mode_hybrid(
+            "test_df_sql_projection",
+            Arc::new(ShapedMockProvider {
+                declared_schema: reordered.clone(),
+                emit_schema: reordered,
+            }),
+        )
+        .await;
+        let ctx = SESSION_MANAGER.session_context();
+        ctx.register_table("test_df_sql_projection", Arc::new(provider))
+            .expect("register");
+        let df = ctx
+            .sql("SELECT upper(name) AS n FROM test_df_sql_projection")
+            .await
+            .expect("logical plan");
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("physical plan must build");
+        let names: Vec<_> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, vec!["n".to_string()]);
+
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let batches: Vec<_> = stream.collect().await;
+        let mut values = Vec::new();
+        for b in batches {
+            let b = b.expect("batch ok");
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("utf8");
+            for i in 0..b.num_rows() {
+                values.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(values, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    /// Schema metadata on inner batches (where checkpoint Markers/Finalizers
+    /// ride) must survive `align_batch_to_schema`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_align_preserves_batch_schema_metadata() {
+        let mut md = HashMap::new();
+        md.insert("test.marker".to_string(), "epoch-7".to_string());
+        let reordered_with_md = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("id", DataType::Int32, false),
+            ],
+            md,
+        ));
+        let provider = job_mode_hybrid(
+            "test_align_metadata",
+            Arc::new(ShapedMockProvider {
+                declared_schema: reordered_with_md.clone(),
+                emit_schema: reordered_with_md,
+            }),
+        )
+        .await;
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize];
+        let plan = provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan");
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let batches: Vec<_> = stream.collect().await;
+        let mut saw = false;
+        for b in batches {
+            let b = b.expect("batch ok");
+            if b.num_rows() == 0 {
+                continue;
+            }
+            saw = true;
+            assert_eq!(b.num_columns(), 1);
+            assert_eq!(b.schema().field(0).name(), "name");
+            assert_eq!(
+                b.schema().metadata().get("test.marker").map(String::as_str),
+                Some("epoch-7"),
+                "schema metadata must survive align (checkpoint markers live there)"
+            );
+        }
+        assert!(saw);
+    }
+
+    /// Zero-column projection (`Some(vec![])`): the declared schema has no
+    /// fields and the aligned batch must keep its row count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_empty_projection_keeps_row_count() {
+        let reordered = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let provider = job_mode_hybrid(
+            "test_empty_projection",
+            Arc::new(ShapedMockProvider {
+                declared_schema: reordered.clone(),
+                emit_schema: reordered,
+            }),
+        )
+        .await;
+        let session_state = SESSION_MANAGER.session_state();
+        let projection: Vec<usize> = vec![];
+        let plan = provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(plan.schema().fields().len(), 0);
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let batches: Vec<_> = stream.collect().await;
+        let mut saw = false;
+        for b in batches {
+            let b = b.expect("batch ok");
+            if b.num_rows() == 0 {
+                continue;
+            }
+            saw = true;
+            assert_eq!(b.num_columns(), 0);
+            assert_eq!(b.num_rows(), 2);
+        }
+        assert!(saw, "the 2-row batch must be forwarded with zero columns");
+    }
+
+    /// A bounded phase whose batches carry FEWER columns than its declared
+    /// schema must surface a clear error and end the stream, not hang.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_missing_column_in_phase_batch_errors_and_terminates() {
+        let narrow = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let provider = job_mode_hybrid(
+            "test_missing_column",
+            Arc::new(ShapedMockProvider {
+                declared_schema: create_test_schema(),
+                emit_schema: narrow,
+            }),
+        )
+        .await;
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan");
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let batches = tokio::time::timeout(Duration::from_secs(15), stream.collect::<Vec<_>>())
+            .await
+            .expect("stream must terminate after the align error");
+        let errs: Vec<String> = batches
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+            .collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("column 'id'") && e.contains("missing")),
+            "expected a clear missing-column error, got: {errs:?}"
+        );
+    }
+
+    /// An unbounded phase that HONORS the pushed-down projection (like the real
+    /// Kafka source): it declares the projected schema and emits one batch
+    /// shaped exactly like it.
+    #[derive(Debug)]
+    struct ProjectingMockProvider {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for ProjectingMockProvider {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = datafusion::physical_plan::project_schema(&self.schema, projection)?;
+            Ok(Arc::new(ShapedMockExec {
+                schema: schema.clone(),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }))
+        }
+    }
+
+    /// Production phase shape under a projection: a bounded phase that ignores
+    /// the projection and emits full-width, reordered batches, followed
+    /// (job_mode=false) by an unbounded phase that honors it and emits
+    /// already-projected batches. Both must reach the consumer shaped like
+    /// the declared projected schema — the first through the by-name path,
+    /// the second through the fast path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_with_projection_across_ignoring_and_honoring_phases() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(ReorderedBatchMockProvider::new())],
+            unbounded_source: Arc::new(ProjectingMockProvider {
+                schema: create_test_schema(),
+            }),
+            offset_provider: None,
+            job_mode: false,
+        };
+        let state_backend = create_state_backend("test_execute_projection_two_phases").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_execute_projection_two_phases".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+        let batches: Vec<_> = stream.collect().await;
+
+        let expected_names = vec!["name".to_string()];
+        let mut data_batches = 0;
+        for batch in batches {
+            let batch = batch.expect("stream batch should not be an error");
+            if batch.num_rows() == 0 {
+                continue; // synthetic marker-flush batches
+            }
+            data_batches += 1;
+            let names: Vec<_> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(names, expected_names);
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("projected column must be the utf8 'name' column");
+            assert_eq!(col.value(0), "a");
+            assert_eq!(col.value(1), "b");
+        }
+        assert_eq!(
+            data_batches, 2,
+            "one data batch from the bounded phase and one from the unbounded phase"
+        );
+        let state = hybrid_provider.state.read().await;
+        assert!(
+            state.current_phase >= hybrid_provider.config.bounded_sources.len(),
+            "should have reached the unbounded phase"
+        );
+    }
+
+    /// With NO projection in force, a phase whose column order is a
+    /// permutation of the hybrid schema (the `_gs_op`-mid-schema case) must
+    /// still be delivered in hybrid order — pre-alignment the batch was
+    /// forwarded as-is and every positional consumer read swapped arrays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_without_projection_reorders_permuted_phase_batch() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(ReorderedBatchMockProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend("test_execute_no_projection_reorder").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_execute_no_projection_reorder".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+        let batches: Vec<_> = stream.collect().await;
+
+        let mut saw_data = false;
+        for batch in batches {
+            let batch = batch.expect("stream batch should not be an error");
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            saw_data = true;
+            let names: Vec<_> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(names, vec!["id".to_string(), "name".to_string()]);
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .expect("column 0 must be the Int32 'id' column, not the swapped 'name'");
+            assert_eq!(ids.values().to_vec(), vec![1, 2]);
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("column 1 must be the utf8 'name' column");
+            assert_eq!(names.value(0), "a");
+            assert_eq!(names.value(1), "b");
+        }
+        assert!(saw_data);
+    }
+
+    /// Hybrid-schema indices must be re-expressed in each phase's own index
+    /// space by name: the ClickHouse SELECT moves `_gs_op` last, so a Kafka
+    /// payload that carries `_gs_op` mid-schema makes the phases permutations
+    /// of each other.
+    #[test]
+    fn test_translate_projection_maps_hybrid_indices_to_phase_indices_by_name() {
+        let hybrid = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let clickhouse_phase = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+        ]);
+
+        // [name, _gs_op] in hybrid space is [2, 1]; in the phase it is [1, 2].
+        let translated = translate_projection("src", &hybrid, &clickhouse_phase, Some(&vec![2, 1]))
+            .expect("translation should succeed");
+        assert_eq!(translated, Some(vec![1, 2]));
+
+        // Identity phase (Kafka == hybrid) is a no-op mapping.
+        let identity = translate_projection("src", &hybrid, &hybrid, Some(&vec![2, 0]))
+            .expect("translation should succeed");
+        assert_eq!(identity, Some(vec![2, 0]));
+
+        // No projection stays None.
+        assert_eq!(
+            translate_projection("src", &hybrid, &clickhouse_phase, None).unwrap(),
+            None
+        );
+
+        // A phase missing a projected column is a clear error, not a wrong index.
+        let narrow = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let err = translate_projection("src", &hybrid, &narrow, Some(&vec![2]))
+            .expect_err("missing column must error")
+            .to_string();
+        assert!(
+            err.contains("'name'"),
+            "error should name the column, got: {err}"
+        );
+
+        // Out-of-range hybrid index is a clear error too.
+        let err = translate_projection("src", &hybrid, &clickhouse_phase, Some(&vec![7]))
+            .expect_err("out-of-range index must error")
+            .to_string();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    /// A projection that prunes every column yields batches with rows but no
+    /// columns. Hybrid-buffered markers must still attach to them (and not be
+    /// requeued until phase end), so the merge must carry the row count
+    /// explicitly.
+    #[test]
+    fn test_merge_pending_markers_attaches_to_zero_column_batch() {
+        use streamling_core::checkpoints::checkpoint_management::{CheckpointEpoch, now_ms};
+
+        let zero_col = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(2)),
+        )
+        .expect("zero-column batch with a row count");
+        let pending: Arc<Mutex<Vec<CheckpointMessage>>> =
+            Arc::new(Mutex::new(vec![CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(7),
+                created_at_ms: now_ms(),
+            }]));
+
+        let merged = merge_pending_markers(zero_col, &pending);
+
+        assert_eq!(merged.num_rows(), 2, "row count must survive the re-tag");
+        assert_eq!(merged.num_columns(), 0);
+        let attached = extract_checkpoint_messages(merged.schema().metadata());
+        assert!(
+            matches!(attached.as_slice(), [CheckpointMessage::Marker { epoch, .. }] if epoch.0 == 7),
+            "marker must ride the zero-column batch, got {attached:?}"
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "marker must not be requeued"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1812,3 +1812,158 @@ sinks:
         by_id.get("null")
     );
 }
+
+// ============================================================================
+// Scenario: non-prefix projection through a hybrid source
+// ============================================================================
+
+/// A transform that selects a strict, REORDERED, non-prefix subset of the
+/// hybrid source's columns (`timestamp`, `id` out of `block, id, data,
+/// timestamp`). Regression for the planner assertion ("Input field name X does
+/// not match with the projection expression Y") hit by raw_traces-derived
+/// datasets: DataFusion pushes the projection into the hybrid scan, the
+/// bounded ClickHouse phase and the unbounded Kafka phase must both emit
+/// batches shaped like it, and — because the projection is not a prefix — a
+/// positional mismatch would silently swap columns rather than fail. Both
+/// phases run (job_mode=false), so both the by-name and fast-path alignments
+/// are exercised against real ClickHouse + Kafka.
+#[tokio::test]
+async fn test_hybrid_non_prefix_projection_selects_correct_columns() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_proj_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    // Distinct per-row timestamps so a swapped column is detectable.
+    clickhouse
+        .execute(
+            "INSERT INTO hybrid_proj_test VALUES
+            (1, 'Alice', 'A', 1001, 0),
+            (2, 'Bob', 'B', 1002, 0),
+            (3, 'Charlie', 'C', 1003, 0)",
+        )
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let kafka_records: Vec<TestRecord> = (1..=3)
+        .map(|i| TestRecord {
+            block: 100 + i,
+            id: format!("kafka_user_{}", i),
+            data: format!("kafka_data_{}", i),
+            timestamp: 2000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&kafka_records)
+        .await
+        .expect("Failed to produce Kafka records");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_proj (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_proj_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_proj
+    primary_key: id
+
+transforms:
+  narrow:
+    type: sql
+    primary_key: id
+    sql: "SELECT timestamp AS ts, id FROM hybrid_source"
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: narrow
+    table: hybrid_proj_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(6) // 3 from ClickHouse + 3 from Kafka
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let rows: Vec<(String, i64)> = ctx
+        .postgres
+        .query("SELECT id, ts FROM public.hybrid_proj_results ORDER BY id")
+        .await
+        .expect("Failed to query results");
+    let by_id: std::collections::HashMap<String, i64> = rows.into_iter().collect();
+
+    // Bounded (ClickHouse) phase: values must land under the right ids.
+    assert_eq!(by_id.get("Alice"), Some(&1001), "got {:?}", by_id);
+    assert_eq!(by_id.get("Bob"), Some(&1002), "got {:?}", by_id);
+    assert_eq!(by_id.get("Charlie"), Some(&1003), "got {:?}", by_id);
+    // Unbounded (Kafka) phase.
+    assert_eq!(by_id.get("kafka_user_1"), Some(&2001), "got {:?}", by_id);
+    assert_eq!(by_id.get("kafka_user_2"), Some(&2002), "got {:?}", by_id);
+    assert_eq!(by_id.get("kafka_user_3"), Some(&2003), "got {:?}", by_id);
+
+    // The pruned columns must not reach the sink.
+    let cols = ctx
+        .postgres
+        .get_column_names("hybrid_proj_results")
+        .await
+        .expect("Failed to read column names");
+    for pruned in ["block", "data", "timestamp"] {
+        assert!(
+            !cols.iter().any(|c| c == pruned),
+            "column '{pruned}' should have been pruned by the projection (got columns: {cols:?})"
+        );
+    }
+}
