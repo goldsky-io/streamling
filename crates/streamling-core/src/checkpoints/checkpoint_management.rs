@@ -32,10 +32,11 @@ pub struct CheckpointEpoch(pub u64);
 /// Every Finalizer consumer MUST be idempotent and non-blocking, and MUST
 /// NEVER gate progress on receiving the Finalizer for one specific epoch:
 /// - Finalizers can be delivered more than once for the same epoch.
-/// - Finalizers can be SKIPPED entirely: the coordinator drops non-finalized
-///   timer epochs when a terminal checkpoint begins
-///   (`CheckpointControl::begin_terminal_checkpoint`), and a terminal epoch
-///   that never finalizes has its Finalizer withheld deliberately.
+/// - Finalizers can be SKIPPED entirely: a timer epoch still in flight when a
+///   terminal checkpoint begins is retained but may never collect its
+///   remaining acks (a completed source can no longer carry its marker), and
+///   a terminal epoch that never finalizes has its Finalizer withheld
+///   deliberately.
 /// - Commit/cleanup semantics must therefore be cumulative (offsets, current
 ///   state snapshots) or range-based (`<= N-1` truncation), so a later
 ///   Finalizer covers any skipped one.
@@ -432,13 +433,14 @@ impl CheckpointControl {
     ///
     /// Known trade-off (multi-source completion): the FIRST completing source
     /// stops the timer producer for the whole pipeline, so branches that are
-    /// still producing get no further periodic checkpoints — their tail's
-    /// durability rides entirely on the shared terminal epoch. A crash in that
-    /// window replays those branches from their last finalized epoch
-    /// (at-least-once preserved; the window is bounded by job length). Keeping
-    /// per-branch timer checkpoints alive would require per-branch epoch
-    /// tracking in the coordinator — a larger redesign deliberately out of
-    /// scope here (see shutdown-investigation.md §5.4).
+    /// still producing get no further NEW periodic checkpoints — their tail's
+    /// durability rides on the last in-flight timer epoch (retained below so
+    /// it can still finalize off late acks) and then the shared terminal
+    /// epoch. A crash in that window replays those branches from their last
+    /// finalized epoch (at-least-once preserved; the window is bounded by job
+    /// length). Keeping per-branch timer checkpoints alive would require
+    /// per-branch epoch tracking in the coordinator — a larger redesign
+    /// deliberately out of scope here.
     pub fn begin_terminal_checkpoint(&self) -> CheckpointEpoch {
         self.terminal_started.store(true, Ordering::SeqCst);
 
@@ -451,20 +453,26 @@ impl CheckpointControl {
         if let Some(existing) = self.terminal_epoch.lock().clone() {
             return existing;
         }
-        // Drop any in-flight timer epochs. The source is done producing data,
-        // so their markers can no longer reach the sinks and they would never
-        // finalize. The terminal epoch is the only one that matters now.
+        // In-flight timer epochs are RETAINED alongside the terminal epoch
+        // (they used to be dropped here). Their markers were broadcast before
+        // terminal began and are still riding batches through the pipeline,
+        // so acks for them keep arriving — the subscriber's ack arm handles
+        // any epoch in this map, so a late-acked timer epoch still finalizes
+        // and its Finalizer still commits durable state (Kafka offsets,
+        // ClickHouse split state) for branches that are still producing.
+        // Dropping them threw that last periodic checkpoint away and widened
+        // the §5.4 replay window by up to one checkpoint interval per branch
+        // for no benefit.
         //
-        // Dropping a non-finalized epoch without broadcasting its Finalizer is
-        // safe: no consumer blocks waiting for a Finalizer — sinks ack Markers
-        // and treat Finalizers as best-effort commit/truncate signals, and the
-        // work those dropped epochs would have committed is re-covered by the
-        // terminal epoch's Finalizer. This also mirrors the timer producer,
-        // which has always cleared the previous epoch before inserting a new
-        // one.
+        // An epoch whose remaining markers can no longer reach a sink (the
+        // sink is fed only by the completed source) simply never finalizes:
+        // nothing waits on timer epochs — the run loop awaits only the
+        // terminal epoch — so the cost is a `checkpoint_epochs_failed` metric
+        // from the timeout checker, and `stop()` clears the map at teardown.
         //
-        // Audited consumers (all fire-and-forget; none matches an exact epoch
-        // in a way that can stall):
+        // Skipped Finalizers remain safe for every audited consumer (all
+        // fire-and-forget; none matches an exact epoch in a way that can
+        // stall):
         // - Kafka source: exact-match offset lookup with a silent no-op on
         //   miss; commits are cumulative, so the next finalized epoch covers
         //   any skipped one (bounded replay, never a wait).
@@ -475,7 +483,6 @@ impl CheckpointControl {
         //   whose contract requires idempotent, non-blocking handling.
         // Any FUTURE consumer must follow the same rule: never gate progress
         // on receiving the Finalizer for one specific epoch.
-        epochs.clear();
         let epoch_num = self.next_epoch.fetch_add(1, Ordering::SeqCst);
         let terminal = CheckpointEpoch(epoch_num);
         epochs.insert(
@@ -698,6 +705,9 @@ impl CheckpointCoordinator {
         let expected_sinks_sub = Arc::clone(&expected_sinks);
         let finalized_notify_sub = Arc::clone(&self.finalized_notify);
 
+        // Sanctioned: structured concurrency — the handle is stored on self
+        // and joined by `stop()`, which the run loop awaits under the budget.
+        #[allow(clippy::disallowed_methods)]
         let subscriber_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
 
@@ -853,6 +863,9 @@ impl CheckpointCoordinator {
         let expected_sinks_prod = Arc::clone(&expected_sinks);
         let terminal_started_prod = Arc::clone(&self.terminal_started);
 
+        // Sanctioned: structured concurrency — the handle is stored on self
+        // and joined by `stop()`, which the run loop awaits under the budget.
+        #[allow(clippy::disallowed_methods)]
         let producer_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
 
@@ -977,9 +990,10 @@ impl CheckpointCoordinator {
                 let created_at_ms = now_ms();
                 // Mint and insert under the epochs lock, re-checking the terminal
                 // flag inside that same critical section. `begin_terminal_checkpoint`
-                // clears the map and inserts its own epoch under this lock, so this
-                // re-check guarantees we never clear the terminal epoch by racing a
-                // fresh timer epoch over it.
+                // sets the flag and inserts its epoch under this same lock
+                // (in-flight timer epochs are RETAINED, not cleared — late acks
+                // still finalize them), so this re-check guarantees a fresh
+                // timer epoch can never race in after the terminal epoch began.
                 let new_epoch = {
                     let mut epochs_guard = epochs.lock();
                     if terminal_started_prod.load(Ordering::SeqCst) {
@@ -1061,6 +1075,9 @@ impl CheckpointCoordinator {
         // construct the coordinator with a small timeout.
         let check_interval = Duration::from_secs((self.timeout_sec / 2).clamp(1, 30));
 
+        // Sanctioned: structured concurrency — the handle is stored on self
+        // and joined by `stop()`, which the run loop awaits under the budget.
+        #[allow(clippy::disallowed_methods)]
         let timeout_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
             let poll_interval = Duration::from_millis(500); // Poll for shutdown frequently
@@ -1128,6 +1145,29 @@ impl CheckpointCoordinator {
 
         for handle in std::mem::take(&mut self.handles) {
             let _ = handle.await;
+        }
+
+        // A terminal epoch that never finalized is a broken drain contract —
+        // its offsets were not committed and the drained tail replays on
+        // restart. It is exempt from the timeout checker (by design), so
+        // without this sweep it failed without ever touching
+        // `checkpoint_epochs_failed`: on a fleet monitored through metrics, a
+        // shutdown that lost its tail looked purely successful. Only the
+        // terminal epoch is counted — ordinary in-flight timer epochs at
+        // teardown are routine (fast-exit leaves them uncommitted on purpose;
+        // the replayed tail covers them). The final flush in main() exports
+        // this before the process exits. Lock discipline: bind and drop the
+        // terminal_epoch guard BEFORE locking epochs (see
+        // is_terminal_finalized for why).
+        let terminal = self.terminal_epoch.lock().clone();
+        if let Some(epoch) = terminal
+            && !matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized))
+        {
+            warn!(
+                "Terminal checkpoint epoch {} never finalized before coordinator stop; recording it as failed (offsets stay uncommitted; the tail replays on restart)",
+                epoch.0
+            );
+            get_checkpoint_metrics_recorder().record_count("checkpoint_epochs_failed", 1);
         }
 
         // The subscriber task has exited and dropped its receiver; remove the
@@ -1652,6 +1692,59 @@ mod tests {
             epochs.len(),
             1,
             "only the single terminal epoch should exist"
+        );
+    }
+
+    /// Regression: beginning the
+    /// terminal checkpoint used to CLEAR in-flight timer epochs, throwing away
+    /// the last periodic checkpoint of every still-running branch — late acks
+    /// hit "unknown epoch" and the epoch's Finalizer (which commits Kafka
+    /// offsets / ClickHouse split state) was never sent, widening the
+    /// crash-replay window by up to one checkpoint interval per branch.
+    /// In-flight epochs must survive terminal begin and still finalize.
+    #[test]
+    #[serial]
+    fn test_terminal_begin_retains_in_flight_timer_epochs() {
+        let coordinator = CheckpointCoordinator::with_timeout(300);
+        let timer_epoch = CheckpointEpoch(2042);
+
+        {
+            let mut expected = coordinator.expected_sinks.lock();
+            expected.insert("sink_a_retain".to_string());
+            expected.insert("sink_b_retain".to_string());
+        }
+        {
+            let mut epochs = coordinator.epochs.lock();
+            let mut acked_sinks = HashSet::new();
+            acked_sinks.insert("sink_b_retain".to_string());
+            epochs.insert(
+                timer_epoch.clone(),
+                EpochState::InProgress {
+                    acked_sinks,
+                    created_at: Instant::now(),
+                },
+            );
+        }
+
+        let control = coordinator.control();
+        let terminal = control.begin_terminal_checkpoint();
+
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                epochs.contains_key(&timer_epoch),
+                "in-flight timer epoch must survive terminal begin"
+            );
+            assert!(epochs.contains_key(&terminal), "terminal epoch must exist");
+        }
+
+        // The retained epoch still finalizes when its outstanding sink
+        // completes (same for a late ack via the subscriber).
+        control.sink_completed("sink_a_retain");
+        let epochs = coordinator.epochs.lock();
+        assert!(
+            matches!(epochs.get(&timer_epoch), Some(EpochState::Finalized)),
+            "retained timer epoch must still finalize after terminal begin"
         );
     }
 

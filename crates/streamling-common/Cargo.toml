@@ -19,6 +19,8 @@ arrow-json.workspace = true
 arrow-avro.workspace = true
 
 # Logging
+streamling-retry.workspace = true
+
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

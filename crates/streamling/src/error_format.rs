@@ -1,5 +1,5 @@
 use std::fmt::{Display, Write as _};
-use streamling_core::plugin::terminate_all_plugins;
+use streamling_core::plugin::terminate_all_plugins_nonblocking;
 use streamling_core::utils::arrow::should_suppress_panic_logging;
 
 pub fn format_pretty_error(message: impl Display) -> String {
@@ -23,7 +23,10 @@ pub fn install_global_panic_hook() {
             return;
         }
 
-        let _ = terminate_all_plugins();
+        // MUST stay non-blocking: a blocking send here while a plugin channel
+        // is full would wedge the panicking thread — the process then neither
+        // crashes nor exits.
+        terminate_all_plugins_nonblocking();
         let location = panic_info
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))

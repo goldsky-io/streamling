@@ -1,0 +1,22 @@
+[package]
+name = "streamling-retry"
+version = "0.3.1"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Cancellable retry policy shared by the Streamling engine and the plugin SDK."
+license-file.workspace = true
+repository.workspace = true
+
+# Deliberately minimal: this crate exists so the plugin SDK can share one retry
+# policy with the engine WITHOUT depending on streamling-core (which would drag
+# DataFusion into every plugin dylib). Adding a heavier dependency here defeats
+# the purpose — keep it to tokio + tracing.
+[dependencies]
+tokio = { workspace = true, features = ["time", "sync", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time", "sync", "macros", "rt", "test-util"] }
+
+[lints]
+workspace = true

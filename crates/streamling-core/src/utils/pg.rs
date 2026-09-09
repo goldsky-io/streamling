@@ -364,6 +364,24 @@ pub fn postgres_type_to_arrow_type(pg_type: &str) -> Result<DataType> {
     }
 }
 
+/// True when `e` is Postgres reporting a lost `CREATE ... IF NOT EXISTS` race.
+///
+/// `IF NOT EXISTS` is not atomic against concurrent creation: two sessions can
+/// both pass the existence check, and the loser surfaces either a
+/// duplicate-object error (42P06 duplicate_schema / 42P07 duplicate_table /
+/// 42710 duplicate_object) or a unique violation on a system catalog index
+/// (23505, e.g. `pg_namespace_nspname_index`). For a CREATE statement those
+/// all mean the same thing — the object exists, which is the caller's desired
+/// postcondition. Any multi-sink pipeline sharing a schema can lose this race
+/// on first deploy, so callers must treat it as success. Only meaningful for
+/// errors returned by CREATE statements: 23505 from anything else is a real
+/// conflict.
+pub fn creation_race_lost(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| matches!(code.as_ref(), "23505" | "42P06" | "42P07" | "42710"))
+}
+
 /// Create schema and table if they don't exist
 pub async fn create_schema_and_table_if_needed(
     pool: &PgPool,
@@ -376,9 +394,21 @@ pub async fn create_schema_and_table_if_needed(
 ) -> Result<()> {
     // Create schema if needed
     let schema_sql = format!(r#"CREATE SCHEMA IF NOT EXISTS "{}""#, schema);
-    sqlx::query(&schema_sql).execute(pool).await.map_err(|e| {
-        StreamlingError::retriable_with_cause(format!("failed to create schema '{}'", schema), e)
-    })?;
+    match sqlx::query(&schema_sql).execute(pool).await {
+        Ok(_) => {}
+        Err(e) if creation_race_lost(&e) => {
+            debug!(
+                "schema '{}' already exists (lost a concurrent creation race); continuing",
+                schema
+            );
+        }
+        Err(e) => {
+            return Err(StreamlingError::retriable_with_cause(
+                format!("failed to create schema '{}'", schema),
+                e,
+            ));
+        }
+    }
 
     // Create table if needed
     let mut cols: Vec<String> = Vec::new();
@@ -431,15 +461,21 @@ pub async fn create_schema_and_table_if_needed(
 
     debug!("Creating PostgreSQL table: {}", create_table_sql);
 
-    sqlx::query(&create_table_sql)
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            StreamlingError::retriable_with_cause(
+    match sqlx::query(&create_table_sql).execute(pool).await {
+        Ok(_) => {}
+        Err(e) if creation_race_lost(&e) => {
+            debug!(
+                "table '{}.{}' already exists (lost a concurrent creation race); continuing",
+                schema, table
+            );
+        }
+        Err(e) => {
+            return Err(StreamlingError::retriable_with_cause(
                 format!("failed to create table '{}.{}'", schema, table),
                 e,
-            )
-        })?;
+            ));
+        }
+    }
 
     // Create index on _gs_checkpoint_epoch for efficient truncation
     if checkpoint_truncation {
@@ -451,18 +487,24 @@ pub async fn create_schema_and_table_if_needed(
 
         debug!("Creating checkpoint epoch index: {}", create_index_sql);
 
-        sqlx::query(&create_index_sql)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                StreamlingError::retriable_with_cause(
+        match sqlx::query(&create_index_sql).execute(pool).await {
+            Ok(_) => {}
+            Err(e) if creation_race_lost(&e) => {
+                debug!(
+                    "index '{}' on '{}.{}' already exists (lost a concurrent creation race); continuing",
+                    index_name, schema, table
+                );
+            }
+            Err(e) => {
+                return Err(StreamlingError::retriable_with_cause(
                     format!(
                         "failed to create index '{}' on table '{}.{}'",
                         index_name, schema, table
                     ),
                     e,
-                )
-            })?;
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -736,6 +778,8 @@ mod tests {
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = connections.clone();
 
+        // Sanctioned: test-only fake server; dies with the test runtime.
+        #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -743,6 +787,7 @@ mod tests {
                 };
                 accepted.fetch_add(1, Ordering::SeqCst);
 
+                #[allow(clippy::disallowed_methods)]
                 tokio::spawn(async move {
                     // Read the client's StartupMessage (length-prefixed, no type byte).
                     let mut len_buf = [0u8; 4];
