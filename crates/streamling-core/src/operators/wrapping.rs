@@ -702,7 +702,20 @@ impl ExecutionPlan for WrappingExec {
                     }
                     Err(e) => {
                         debug!("WrappingExec [{}]: Error from input stream, stream will terminate: {}", metric_metadata_id, e);
-                        yield Err(e);
+                        // Attribute the failure to its topology node. `with_node`
+                        // is first-tag-wins, so the innermost WrappingExec (the
+                        // node the error actually came from) sticks and the
+                        // downstream nodes that re-observe the same error pass
+                        // it through unchanged.
+                        let tagged = crate::error::StreamlingError::from(e).with_node(
+                            // Strip the `{app_id}::` prefix so the tag matches
+                            // the topology_node_key values that /admin/live-data
+                            // serves to clients.
+                            crate::telemetry::provider::get_reference_name_from_metric_key(
+                                &metric_metadata_id,
+                            ),
+                        );
+                        yield Err(DataFusionError::from(tagged));
                         return;
                     }
                 }

@@ -41,6 +41,9 @@ pub struct StreamlingError {
     retriable: bool,
     internal: bool,
     backtrace: Option<Backtrace>,
+    /// Reference name of the pipeline topology node the error originated in,
+    /// tagged once by the innermost `WrappingExec` that observes it.
+    node: Option<String>,
 }
 
 impl StreamlingError {
@@ -58,6 +61,7 @@ impl StreamlingError {
             retriable: false,
             internal: true,
             backtrace: Some(Backtrace::force_capture()),
+            node: None,
         }
     }
 
@@ -74,6 +78,7 @@ impl StreamlingError {
             retriable: false,
             internal: true,
             backtrace: None,
+            node: None,
         }
     }
 
@@ -90,6 +95,7 @@ impl StreamlingError {
             retriable: false,
             internal: false,
             backtrace: Some(Backtrace::force_capture()),
+            node: None,
         }
     }
 
@@ -106,6 +112,7 @@ impl StreamlingError {
             retriable: true,
             internal: true,
             backtrace: None,
+            node: None,
         }
     }
 
@@ -119,6 +126,7 @@ impl StreamlingError {
             retriable,
             internal,
             backtrace: capture_backtrace(retriable),
+            node: None,
         }
     }
 
@@ -137,6 +145,7 @@ impl StreamlingError {
             retriable: false,
             internal: true,
             backtrace: Some(Backtrace::force_capture()),
+            node: None,
         }
     }
 
@@ -151,6 +160,7 @@ impl StreamlingError {
             retriable: false,
             internal: false,
             backtrace: Some(Backtrace::force_capture()),
+            node: None,
         }
     }
 
@@ -166,6 +176,7 @@ impl StreamlingError {
             retriable: true,
             internal: true,
             backtrace: None,
+            node: None,
         }
     }
 
@@ -215,6 +226,7 @@ impl StreamlingError {
             retriable: self.retriable,
             internal: self.internal,
             backtrace: None,
+            node: self.node.clone(),
         }
     }
 
@@ -229,6 +241,7 @@ impl StreamlingError {
             retriable: self.retriable,
             internal: self.internal,
             backtrace: self.backtrace,
+            node: self.node,
         }
     }
 
@@ -255,6 +268,23 @@ impl StreamlingError {
     /// Non-retriable errors always have a backtrace; retriable errors do not.
     pub fn backtrace(&self) -> Option<&Backtrace> {
         self.backtrace.as_ref()
+    }
+
+    /// Tag this error with the topology node it originated in. First tag
+    /// wins: every downstream `WrappingExec` sees the same error on its own
+    /// `Err` branch, and only the innermost (closest to the failure) knows
+    /// the true origin.
+    #[must_use]
+    pub fn with_node<N: Into<String>>(mut self, node: N) -> Self {
+        if self.node.is_none() {
+            self.node = Some(node.into());
+        }
+        self
+    }
+
+    /// Reference name of the topology node this error originated in, if known.
+    pub fn node(&self) -> Option<&str> {
+        self.node.as_deref()
     }
 }
 
@@ -317,6 +347,7 @@ impl From<anyhow::Error> for StreamlingError {
             retriable: false,
             internal: true,
             backtrace: Some(Backtrace::force_capture()),
+            node: None,
         }
     }
 }
@@ -339,6 +370,7 @@ impl From<std::io::Error> for StreamlingError {
             retriable,
             internal: true,
             backtrace: capture_backtrace(retriable),
+            node: None,
         }
     }
 }
@@ -355,6 +387,7 @@ impl From<arrow_schema::ArrowError> for StreamlingError {
             retriable: false,
             internal: true,
             backtrace: Some(Backtrace::force_capture()),
+            node: None,
         }
     }
 }
@@ -380,6 +413,7 @@ impl From<DataFusionError> for StreamlingError {
                     retriable: false,
                     internal,
                     backtrace: Some(Backtrace::force_capture()),
+                    node: None,
                 }
             }
         }
@@ -452,6 +486,7 @@ pub trait ResultExt<T> {
 trait ExtractFlags: Any {
     fn extract_flags(&self) -> Option<(bool, bool)>;
     fn take_backtrace(&mut self) -> Option<Backtrace>;
+    fn take_node(&mut self) -> Option<String>;
     fn take_inner_anyhow(&mut self) -> Option<anyhow::Error>;
 }
 
@@ -466,6 +501,12 @@ impl<E: std::error::Error + 'static> ExtractFlags for E {
         (self as &mut dyn Any)
             .downcast_mut::<StreamlingError>()
             .and_then(|e| e.backtrace.take())
+    }
+
+    fn take_node(&mut self) -> Option<String> {
+        (self as &mut dyn Any)
+            .downcast_mut::<StreamlingError>()
+            .and_then(|e| e.node.take())
     }
 
     fn take_inner_anyhow(&mut self) -> Option<anyhow::Error> {
@@ -502,6 +543,7 @@ where
         self.map_err(|mut e| {
             let (retriable, internal) = e.extract_flags().unwrap_or((false, true));
             let backtrace = e.take_backtrace().or_else(|| capture_backtrace(retriable));
+            let node = e.take_node();
             let inner = match e.take_inner_anyhow() {
                 Some(inner_anyhow) => inner_anyhow.context(context),
                 None if has_duplicate_source(&e) => anyhow::anyhow!("{}", e).context(context),
@@ -512,6 +554,7 @@ where
                 retriable,
                 internal,
                 backtrace,
+                node,
             }
         })
     }
@@ -524,6 +567,7 @@ where
         self.map_err(|mut e| {
             let (retriable, internal) = e.extract_flags().unwrap_or((false, true));
             let backtrace = e.take_backtrace().or_else(|| capture_backtrace(retriable));
+            let node = e.take_node();
             let inner = match e.take_inner_anyhow() {
                 Some(inner_anyhow) => inner_anyhow.context(f()),
                 None if has_duplicate_source(&e) => anyhow::anyhow!("{}", e).context(f()),
@@ -534,6 +578,7 @@ where
                 retriable,
                 internal,
                 backtrace,
+                node,
             }
         })
     }
@@ -1448,5 +1493,26 @@ mod tests {
             "Expected 'connection refused' exactly once, but found {} times in:\n{}",
             count, msg
         );
+    }
+
+    #[test]
+    fn test_node_tag_first_wins_and_survives_datafusion_roundtrip() {
+        let e = StreamlingError::user("boom")
+            .with_node("script_1")
+            .with_node("sink_1");
+        assert_eq!(e.node(), Some("script_1"), "first tag must win");
+
+        let df: DataFusionError = e.into();
+        let recovered = StreamlingError::from(df);
+        assert_eq!(
+            recovered.node(),
+            Some("script_1"),
+            "node tag must survive the DataFusionError round-trip"
+        );
+        assert!(!recovered.is_internal());
+
+        // Context helpers must preserve the tag too.
+        let with_ctx: Result<()> = Err(recovered).streamling_context("while sinking");
+        assert_eq!(with_ctx.unwrap_err().node(), Some("script_1"));
     }
 }

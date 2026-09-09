@@ -2684,6 +2684,12 @@ impl Streamling {
         // finish flushing — all bounded by the watchdog), and the error is
         // propagated once every sink has wound down. No epoch a failed sink
         // touched is ever acked, so at-least-once is preserved either way.
+        // In preview tolerant mode the process must outlive a component
+        // failure (it keeps serving the admin API until the preview TTL),
+        // so the hard-exit shutdown watchdog must not be armed on the
+        // failure path. The drain still happens; it's just not bounded by
+        // a forced process exit.
+        let tolerant = self.app_config.preview_tolerant_mode;
         let app_result: Result<()> = {
             use futures::StreamExt as _;
             let mut sink_set: futures::stream::FuturesUnordered<_> =
@@ -2700,7 +2706,9 @@ impl Streamling {
                             err
                         );
                         streamling_core::shutdown::request_shutdown();
-                        Self::arm_shutdown_watchdog(Self::shutdown_budget());
+                        if !tolerant {
+                            Self::arm_shutdown_watchdog(Self::shutdown_budget());
+                        }
                     }
                     *first_error = Some(err);
                 }
@@ -2741,7 +2749,9 @@ impl Streamling {
         // instead of overrunning into the hard exit. A 2s margin keeps these
         // waits expiring before the watchdog fires. Dry runs never arm the
         // watchdog (there is nothing to drain).
-        let deadline = if dry_run {
+        let deadline = if dry_run || (tolerant && app_result.is_err()) {
+            // Tolerant-mode failures must not arm the hard-exit watchdog:
+            // the process stays up to serve the admin API after teardown.
             std::time::Instant::now() + Self::shutdown_budget()
         } else {
             let watchdog_deadline = Self::arm_shutdown_watchdog(Self::shutdown_budget());

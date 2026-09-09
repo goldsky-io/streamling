@@ -864,6 +864,15 @@ pub struct AppConfig {
     pub live_data_inspect_enabled: bool,
     pub live_data_inspect: LiveDataInspectConfig,
     pub admin_api_port: u16,
+    /// Preview-only "tolerant mode": on a fatal pipeline error, keep the
+    /// process and the admin API alive (serving the pre-crash live-data
+    /// buffers plus the node-attributed error) instead of exiting. The
+    /// process no longer processes data — it is a terminal
+    /// "failed but inspectable" state, bounded by the preview TTL. Never
+    /// set this on production pipelines: it deliberately trades fail-fast
+    /// restarts for inspectability.
+    #[serde(default)]
+    pub preview_tolerant_mode: bool,
     /// HTTP header names for named secrets injected by the cloud deployment system.
     ///
     /// Populated from `STREAMLING__HTTP_SECRET_HEADER__<NAME>` environment variables (the config

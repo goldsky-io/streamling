@@ -119,3 +119,4 @@ live_data_inspect:
   refresh_in_secs: 30
 admin_api_port: 3000
 # job_mode: false  # When true, hybrid sources terminate after bounded phases complete
+preview_tolerant_mode: false

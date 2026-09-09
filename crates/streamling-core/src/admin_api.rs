@@ -11,9 +11,10 @@ use axum::{
     routing::get,
 };
 use futures::stream::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
@@ -122,12 +123,42 @@ async fn live_data_handler(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
+/// Terminal pipeline error surfaced through the admin API in preview
+/// tolerant mode: the process stays alive after a fatal component failure
+/// purely to serve the pre-crash live-data buffers plus this record.
+#[derive(Serialize, Clone, Debug)]
+pub struct PipelineErrorRecord {
+    /// Topology node the error was attributed to (`StreamlingError::node`),
+    /// matching the `topology_node_key` values used by /admin/live-data.
+    pub node: Option<String>,
+    pub message: String,
+    pub internal: bool,
+    pub retriable: bool,
+}
+
+static PIPELINE_ERROR: OnceLock<PipelineErrorRecord> = OnceLock::new();
+
+/// Record the terminal pipeline error (first write wins).
+pub fn record_pipeline_error(record: PipelineErrorRecord) {
+    let _ = PIPELINE_ERROR.set(record);
+}
+
+/// Handler for /admin/error: 204 while the pipeline is healthy, the terminal
+/// error as JSON once one has been recorded.
+async fn error_handler() -> axum::response::Response {
+    match PIPELINE_ERROR.get() {
+        Some(record) => axum::Json(record.clone()).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
 /// Create and configure the admin API router
 pub fn create_admin_router(live_data_inspect: &'static LiveDataInspect) -> Router {
     let state = AdminApiState::new(live_data_inspect);
 
     Router::new()
         .route("/admin/live-data", get(live_data_handler))
+        .route("/admin/error", get(error_handler))
         .with_state(state)
 }
 

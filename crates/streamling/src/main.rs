@@ -180,11 +180,44 @@ async fn run_pipeline(
         None
     };
 
+    let preview_tolerant_mode = app_config.preview_tolerant_mode;
     let streamling = Streamling::new(app_config, pipeline_topology);
 
     let result = streamling.start_with(dry_run).await;
 
     terminate_all_plugins().unwrap();
+
+    // Preview tolerant mode: a fatal component error does not kill the pod.
+    // The DAG has already stopped (the failure drain above ran to completion);
+    // record the node-attributed error for /admin/error and keep the process
+    // — and with it the admin API's pre-crash live-data buffers — alive until
+    // the preview TTL deletes the deployment (SIGTERM).
+    if preview_tolerant_mode
+        && !dry_run
+        && admin_api_handle.is_some()
+        && let Err(ref e) = result
+    {
+        streamling_core::admin_api::record_pipeline_error(
+            streamling_core::admin_api::PipelineErrorRecord {
+                node: e.node().map(str::to_string),
+                // Secret hygiene: internal errors may embed implementation
+                // details; only user-facing errors are exposed verbatim.
+                message: if e.is_internal() {
+                    "internal error".to_string()
+                } else {
+                    e.to_string()
+                },
+                internal: e.is_internal(),
+                retriable: e.is_retriable(),
+            },
+        );
+        tracing::warn!(
+            error.node = e.node().unwrap_or(""),
+            "Preview tolerant mode: pipeline failed; holding the process alive \
+             to serve the admin API until terminated"
+        );
+        wait_for_termination_signal().await;
+    }
 
     if let Some(handle) = admin_api_handle {
         info!("Shutting down Admin API server");
@@ -204,6 +237,32 @@ async fn run_pipeline(
     streamling_core::telemetry::shutdown_delta_meter_provider();
 
     result
+}
+
+/// Await SIGTERM / SIGINT / Ctrl-C for the tolerant-mode hold.
+async fn wait_for_termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn emit_validation_json(run_error: Option<&StreamlingError>, logs: &[CapturedLog]) -> ExitCode {
@@ -253,6 +312,7 @@ async fn main() -> ExitCode {
             target = "streamling",
             error.internal = e.is_internal(),
             error.retriable = e.is_retriable(),
+            error.node = e.node().unwrap_or(""),
             "{}",
             format_pretty_error(e),
         );
