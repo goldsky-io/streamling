@@ -3,7 +3,7 @@ use crate::dynamic_table::{DynamicTableBackend, DynamicTableBackendError, extrac
 use crate::error::Result as StreamlingResult;
 use crate::error::ResultExt;
 use crate::error::StreamlingError;
-use crate::retry::{retry_forever_with_backoff_async_returning, retry_if_retriable};
+use crate::retry::{retry_forever_with_backoff_until_cancelled_returning, retry_if_retriable};
 use crate::streamling_user_err;
 use async_trait::async_trait;
 use datafusion::arrow::array::builder::{BooleanBuilder, LargeStringBuilder};
@@ -123,6 +123,16 @@ impl PostgresDynamicTableBackendFactory {
         match result {
             Ok(_) => {
                 trace!("Schema {} initialized successfully", dt_schema_name);
+                Ok(())
+            }
+            // See `creation_race_lost`: two backends initializing the same
+            // schema concurrently is normal; the loser's duplicate error means
+            // the schema exists.
+            Err(e) if crate::utils::pg::creation_race_lost(&e) => {
+                trace!(
+                    "Schema {} already exists (lost a concurrent creation race)",
+                    dt_schema_name
+                );
                 Ok(())
             }
             Err(e) => {
@@ -343,7 +353,12 @@ impl PostgresDynamicTableBackend {
         }
     }
 
-    async fn latest_update(&self, pool: Arc<PgPool>) -> Option<String> {
+    /// Retries with backoff until it succeeds or shutdown is requested (same drain
+    /// rationale as `contains_batch`).
+    async fn latest_update(
+        &self,
+        pool: Arc<PgPool>,
+    ) -> Result<Option<String>, DynamicTableBackendError> {
         let query: Arc<str> = format!(
             r#"SELECT MAX("{}")::TEXT FROM {}"#,
             self.time_column_name, self.full_table_name
@@ -351,8 +366,9 @@ impl PostgresDynamicTableBackend {
         .into();
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable latest_update ({})", self.full_table_name);
+        let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_async_returning(
+        retry_forever_with_backoff_until_cancelled_returning(
             || {
                 let pool = pool.clone();
                 let query = query.clone();
@@ -367,15 +383,21 @@ impl PostgresDynamicTableBackend {
                 }
             },
             &operation_name,
+            &mut shutdown,
         )
         .await
+        .ok_or_else(|| {
+            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
+        })
     }
 
+    /// Retries with backoff until it succeeds or shutdown is requested (same drain
+    /// rationale as `contains_batch`).
     async fn load_cache(
         &self,
         pool: Arc<PgPool>,
         updated_since: Option<&str>,
-    ) -> (Option<String>, LargeStringArray, usize) {
+    ) -> Result<(Option<String>, LargeStringArray, usize), DynamicTableBackendError> {
         // Serialized append-only writers assign CLOCK_TIMESTAMP after taking the
         // table lock; use a dedicated version cursor if that contract changes.
         let max_query: Arc<str> = format!(
@@ -410,8 +432,9 @@ impl PostgresDynamicTableBackend {
         let updated_since = updated_since.map(str::to_owned);
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
+        let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_async_returning(
+        retry_forever_with_backoff_until_cancelled_returning(
             || {
                 let pool = pool.clone();
                 let max_query = max_query.clone();
@@ -475,8 +498,12 @@ impl PostgresDynamicTableBackend {
                 }
             },
             &operation_name,
+            &mut shutdown,
         )
         .await
+        .ok_or_else(|| {
+            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
+        })
     }
 
     /// Returns true when the caller should run the freshness check now.
@@ -524,7 +551,7 @@ impl PostgresDynamicTableBackend {
             return Ok(());
         }
         let freshness_check_started_at = Instant::now();
-        let updated_at = self.latest_update(pool.clone()).await;
+        let updated_at = self.latest_update(pool.clone()).await?;
         let freshness_check_ms = freshness_check_started_at.elapsed().as_millis() as u64;
         if freshness_check_ms >= 200 {
             warn!(
@@ -554,7 +581,7 @@ impl PostgresDynamicTableBackend {
             .map(str::to_owned);
         let load_started_at = Instant::now();
         let (updated_at, keys, pages_loaded) =
-            self.load_cache(pool, updated_since.as_deref()).await;
+            self.load_cache(pool, updated_since.as_deref()).await?;
         let elapsed_ms = load_started_at.elapsed().as_millis();
         let added_entries = keys.len();
 
@@ -632,15 +659,17 @@ impl PostgresDynamicTableBackend {
     }
 
     /// Check if a batch of values exist in the table (internal method that doesn't split batches)
-    /// Retries forever with exponential backoff. Statement timeout prevents individual queries from hanging.
+    /// Retries with exponential backoff until it succeeds or shutdown is requested — SQL
+    /// transforms reach this through the dynamic-table UDF via `block_in_place`, so an
+    /// uncancellable retry loop here used to pin the drain forever against a sick backend. Statement timeout bounds individual queries.
     /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
     async fn contains_batch(
         &self,
         pool: Arc<PgPool>,
         value_indices: Vec<(usize, String)>,
-    ) -> HashSet<Box<str>> {
+    ) -> Result<HashSet<Box<str>>, DynamicTableBackendError> {
         if value_indices.is_empty() {
-            return HashSet::new();
+            return Ok(HashSet::new());
         }
 
         // Wrap in Arc once before the retry loop to avoid cloning Vec on each retry
@@ -648,8 +677,9 @@ impl PostgresDynamicTableBackend {
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let column_name: Arc<str> = Arc::from(self.column_name.as_str());
         let operation_name = format!("DynamicTable contains_batch ({})", self.full_table_name);
+        let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_async_returning(
+        retry_forever_with_backoff_until_cancelled_returning(
             || {
                 // Arc clones are cheap (just incrementing reference counts)
                 let pool = pool.clone();
@@ -695,8 +725,12 @@ impl PostgresDynamicTableBackend {
                 }
             },
             &operation_name,
+            &mut shutdown,
         )
         .await
+        .ok_or_else(|| {
+            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
+        })
     }
 
     /// Append a batch of values to the table (internal method that doesn't split
@@ -706,9 +740,13 @@ impl PostgresDynamicTableBackend {
     /// into the in-memory cache. Statement timeout prevents individual queries
     /// from hanging. Uses Arc to wrap values so retry clones are cheap
     /// (reference count increment only).
-    async fn append_batch(&self, pool: Arc<PgPool>, values: Vec<String>) {
+    async fn append_batch(
+        &self,
+        pool: Arc<PgPool>,
+        values: Vec<String>,
+    ) -> Result<(), DynamicTableBackendError> {
         if values.is_empty() {
-            return;
+            return Ok(());
         }
 
         let values_len = values.len();
@@ -719,8 +757,9 @@ impl PostgresDynamicTableBackend {
         let time_column_name: Arc<str> = Arc::from(self.time_column_name.as_str());
         let serialize_write = self.cache.is_some();
         let operation_name = format!("DynamicTable append_batch ({})", self.full_table_name);
+        let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_async_returning(
+        retry_forever_with_backoff_until_cancelled_returning(
             || {
                 // Arc clones are cheap (just incrementing reference counts)
                 let pool = pool.clone();
@@ -806,13 +845,18 @@ impl PostgresDynamicTableBackend {
                 }
             },
             &operation_name,
+            &mut shutdown,
         )
-        .await;
+        .await
+        .ok_or_else(|| {
+            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
+        })?;
 
         trace!(
             "[append_batch] for table name '{}' with {} values",
             self.full_table_name, values_len
         );
+        Ok(())
     }
     /// Ensure the pool is initialized and table exists. Called lazily on first use.
     ///
@@ -1091,7 +1135,7 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             .map(|_| LargeStringArray::from_iter(values.iter().map(|v| Some(v.as_str()))));
         if values_len <= self.max_batch_size {
             // Single batch - process directly
-            self.append_batch(pool, values).await;
+            self.append_batch(pool, values).await?;
         } else {
             // Split into multiple batches and process concurrently
             let chunks: Vec<Vec<String>> = values
@@ -1115,7 +1159,9 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
                 .collect();
 
             // Wait for all batches to complete
-            join_all(futures).await;
+            for result in join_all(futures).await {
+                result?;
+            }
         }
 
         trace!(
@@ -1200,7 +1246,7 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
         let existing_set = if value_indices.len() <= self.max_batch_size {
             // Single batch - process directly
-            self.contains_batch(pool, value_indices).await
+            self.contains_batch(pool, value_indices).await?
         } else {
             // Split into multiple batches and process concurrently
             let chunks: Vec<Vec<(usize, String)>> = value_indices
@@ -1228,7 +1274,7 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             let results = join_all(futures).await;
             let mut combined_set = HashSet::new();
             for chunk_set in results {
-                combined_set.extend(chunk_set);
+                combined_set.extend(chunk_set?);
             }
             combined_set
         };

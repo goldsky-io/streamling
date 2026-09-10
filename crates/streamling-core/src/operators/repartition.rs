@@ -197,6 +197,13 @@ impl StreamingRepartitionExec {
             )?;
             let exchange = self.exchange.clone();
             let schema = Arc::clone(&schema);
+            // Sanctioned: the router lives exactly as long as its input
+            // stream — shutdown forces source streams to end, the router
+            // drains what it read, drops its senders, and downstream sees
+            // end-of-stream; a dropped receiver ends it from the other side.
+            // Threading a ComponentScope through RepartitionExec is tracked
+            // follow-up alongside the drain-under-parallelism validation.
+            #[allow(clippy::disallowed_methods)]
             tokio::spawn(route_input_partition(
                 stream,
                 txs,

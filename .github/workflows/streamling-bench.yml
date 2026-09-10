@@ -27,6 +27,9 @@ on:
         required: false
         default: "1"
 
+permissions:
+  contents: read
+
 concurrency:
   group: streamling-bench
   cancel-in-progress: false
@@ -38,11 +41,13 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       BENCH_RUNNER_LABEL: blacksmith-8vcpu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        with:
+          toolchain: 1.90.0
       - name: Setup rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
           shared-key: "v0-streamling-bench"
           cache-targets: true
@@ -56,9 +61,9 @@ jobs:
 
       # Infrastructure setup (mirrors the e2e job).
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Set up Docker Builder
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682 # v1
       - name: Pre-pull benchmark images
         run: |
           set -euo pipefail
@@ -109,7 +114,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-results
           path: bench-results/

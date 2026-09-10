@@ -101,6 +101,21 @@ where
 {
     async fn get(&self, key: StateKey) -> Result<Option<V>, StateBackendError>;
     async fn put(&self, key: StateKey, value: V) -> Result<(), StateBackendError>;
+    /// Persist many key/value pairs. The default is sequential `put`s;
+    /// backends that can batch should override it with a single round trip.
+    /// This is on the hot path of checkpoint finalization: a Kafka source
+    /// persists one offset per partition on EVERY finalize, and per-row round
+    /// trips measured ~0.18s/partition against a remote Postgres — an
+    /// 80-partition topic spent ~14.5s of its terminal commit here.
+    async fn put_many(&self, entries: Vec<(StateKey, V)>) -> Result<(), StateBackendError>
+    where
+        V: Send + 'static,
+    {
+        for (key, value) in entries {
+            self.put(key, value).await?;
+        }
+        Ok(())
+    }
     async fn remove(&self, key: StateKey) -> Result<(), StateBackendError>;
     async fn clear(&self) -> Result<(), StateBackendError>;
 }
@@ -128,6 +143,9 @@ impl StateBackendFactories {
                             postgres_config.max_connections,
                             postgres_config.state_schema_name,
                             postgres_config.state_table_name,
+                            postgres_config
+                                .acquire_timeout_secs
+                                .map(std::time::Duration::from_secs),
                         )
                         .await?,
                     ))

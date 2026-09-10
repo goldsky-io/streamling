@@ -30,13 +30,30 @@ static EXPECTED_CONSUMERS: Lazy<Mutex<HashMap<String, usize>>> =
 #[derive(Clone, Debug)]
 pub struct SharedSourceRegistry {
     pub(crate) sources: Arc<RwLock<HashMap<String, Arc<SharedSourceHandle>>>>,
+    /// DataPath-stage scope the broadcast driver tasks spawn through. Set by
+    /// the run loop right after construction; the detached fallback covers
+    /// direct-construction tests (equivalent to the raw spawn it replaced).
+    scope: Arc<std::sync::OnceLock<Arc<crate::shutdown::ComponentScope>>>,
 }
 
 impl SharedSourceRegistry {
     pub fn new() -> Self {
         Self {
             sources: Arc::new(RwLock::new(HashMap::new())),
+            scope: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Attach the run loop's scope for shared-scan broadcast drivers. First
+    /// caller wins; later calls are no-ops (the registry is cloned freely).
+    pub fn set_scope(&self, scope: Arc<crate::shutdown::ComponentScope>) {
+        let _ = self.scope.set(scope);
+    }
+
+    pub(crate) fn scope(&self) -> Arc<crate::shutdown::ComponentScope> {
+        self.scope
+            .get_or_init(|| crate::shutdown::ComponentScope::detached("shared-scans"))
+            .clone()
     }
 
     /// Pre-register expected consumer count during topology analysis (before scans).
@@ -85,6 +102,7 @@ pub struct SharedSourceHandle {
     /// Number of consumer plans. Each executes every partition, so this is also
     /// the count a single partition waits for.
     expected_consumers: AtomicUsize,
+    scope: Arc<crate::shutdown::ComponentScope>,
 }
 
 impl Debug for SharedSourceHandle {
@@ -104,6 +122,7 @@ impl SharedSourceHandle {
         base_exec: Arc<dyn ExecutionPlan>,
         channel_capacity: usize,
         expected_consumers: usize,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let base_partitions = base_exec.output_partitioning().partition_count().max(1);
         Self {
@@ -116,6 +135,7 @@ impl SharedSourceHandle {
             ),
             channel_capacity,
             expected_consumers: AtomicUsize::new(expected_consumers),
+            scope,
         }
     }
 
@@ -174,7 +194,7 @@ impl SharedSourceHandle {
                 expected, partition
             );
             let source_stream = self.base_exec.execute(partition, context)?;
-            broadcast.start(source_stream);
+            broadcast.start(source_stream, &self.scope);
         } else {
             debug!(
                 "Shared-source partition {}: {}/{} consumers registered",
@@ -341,7 +361,13 @@ mod tests {
     #[tokio::test]
     async fn a_partition_opens_only_once_its_own_consumers_registered() {
         let base = two_partition_source();
-        let handle = Arc::new(SharedSourceHandle::new(base.schema(), base, 10, 2));
+        let handle = Arc::new(SharedSourceHandle::new(
+            base.schema(),
+            base,
+            10,
+            2,
+            crate::shutdown::ComponentScope::detached("test"),
+        ));
         let first = BroadcastingExec::new(handle.clone(), None).unwrap();
         let second = BroadcastingExec::new(handle.clone(), None).unwrap();
         let ctx = SessionContext::new();
@@ -378,7 +404,13 @@ mod tests {
     #[tokio::test]
     async fn every_consumer_receives_every_partition() {
         let base = two_partition_source();
-        let handle = Arc::new(SharedSourceHandle::new(base.schema(), base, 10, 2));
+        let handle = Arc::new(SharedSourceHandle::new(
+            base.schema(),
+            base,
+            10,
+            2,
+            crate::shutdown::ComponentScope::detached("test"),
+        ));
         let first = BroadcastingExec::new(handle.clone(), None).unwrap();
         let second = BroadcastingExec::new(handle, None).unwrap();
         assert_eq!(

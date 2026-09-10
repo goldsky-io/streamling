@@ -148,6 +148,10 @@ pub struct HybridTableProvider {
     /// current phase, emits the terminal checkpoint, and ends its stream
     /// instead of advancing to the next phase. `None` in tests.
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The run loop's shutdown scope: the hybrid driver, marker forwarder,
+    /// and shutdown watcher spawn through it so the teardown drain ladder
+    /// tracks them. `None` in tests (direct construction).
+    scope: Arc<streamling_core::shutdown::ComponentScope>,
 }
 impl Debug for HybridTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -214,6 +218,7 @@ impl HybridTableProvider {
             session_manager,
             checkpoint_control: None,
             shutdown_rx: None,
+            scope: streamling_core::shutdown::ComponentScope::detached("hybrid-source"),
         };
 
         Ok(provider)
@@ -234,6 +239,14 @@ impl HybridTableProvider {
         self
     }
 
+    /// Attach the run loop's shutdown scope so the hybrid's helper tasks are
+    /// tracked by the teardown drain ladder. Builder-style, applied before the
+    /// provider is wrapped in an `Arc`.
+    pub fn with_scope(mut self, scope: Arc<streamling_core::shutdown::ComponentScope>) -> Self {
+        self.scope = scope;
+        self
+    }
+
     pub fn new_from_topology(
         reference_name: String,
         bounded_sources: Vec<HybridBoundedSource>,
@@ -250,6 +263,10 @@ impl HybridTableProvider {
         // phase emits under its own `metric_key_hybrid_src_*` suffix (R9),
         // so bounded vs unbounded series are tag-distinguishable downstream.
         telemetry: Option<&Telemetry>,
+        // One scope covers the hybrid's own helper tasks and both inner
+        // phases' background tasks (Kafka lag reporter, ClickHouse
+        // checkpointing) — all drain together at teardown.
+        scope: Arc<streamling_core::shutdown::ComponentScope>,
     ) -> DataFusionResult<Self> {
         use crate::table_providers::clickhouse::ClickHouseTableProvider;
         use crate::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -277,7 +294,6 @@ impl HybridTableProvider {
                             false,
                             state_backend_factory.create(application_id.as_str()),
                             session_manager.clone(),
-                            app_config.num_records_before_stop,
                             unbounded_source
                                 .validate_writer_schema_ordering
                                 .unwrap_or(true),
@@ -300,7 +316,8 @@ impl HybridTableProvider {
                                 "hybrid source '{}': failed to create Kafka source",
                                 reference_name
                             )
-                        })?,
+                        })?
+                        .with_scope(scope.clone()),
                     );
                     Arc::new(WrappingSourceTableProvider::new(
                         kafka_table_provider,
@@ -346,18 +363,21 @@ impl HybridTableProvider {
                         schema_adapter
                             .get_columns(bounded_source.table_name.as_str(), &unbounded_schema)?,
                     );
-                    let clickhouse_provider = Arc::new(ClickHouseTableProvider::new_source(
-                        reference_name.clone(),
-                        metric_key(&application_id, &reference_name),
-                        bounded_source.table_name.as_str(),
-                        app_config.clickhouse_source.clone(),
-                        start_at,
-                        bounded_source.filter,
-                        columns,
-                        state_backend_factory.create(application_id.as_str()),
-                        app_config.internal_buffer_size as usize,
-                        app_config.record_batch_size as usize,
-                    )?);
+                    let clickhouse_provider = Arc::new(
+                        ClickHouseTableProvider::new_source(
+                            reference_name.clone(),
+                            metric_key(&application_id, &reference_name),
+                            bounded_source.table_name.as_str(),
+                            app_config.clickhouse_source.clone(),
+                            start_at,
+                            bounded_source.filter,
+                            columns,
+                            state_backend_factory.create(application_id.as_str()),
+                            app_config.internal_buffer_size as usize,
+                            app_config.record_batch_size as usize,
+                        )?
+                        .with_scope(scope.clone()),
+                    );
                     debug!(
                         "Clickhouse schema for bounded source: {:?}",
                         clickhouse_provider.schema()
@@ -410,7 +430,8 @@ impl HybridTableProvider {
             schema,
             state_backend,
             session_manager,
-        )?;
+        )?
+        .with_scope(scope);
         debug!("Created HybridTableProvider: {:?}", provider);
 
         Ok(provider)
@@ -881,7 +902,7 @@ impl TableProvider for HybridTableProvider {
             projection.cloned(),
             filters.to_vec(),
             limit,
-        )))
+        )?))
     }
 }
 
@@ -890,6 +911,12 @@ pub struct HybridSourceExec {
     inner: Arc<dyn ExecutionPlan>,
     provider: HybridTableProvider,
     cached_properties: Arc<PlanProperties>,
+    /// The schema this exec actually emits: the provider schema with the
+    /// pushed-down projection applied. Reporting the full provider schema
+    /// while a projection is in force makes DataFusion pair projection
+    /// expressions against full-schema fields by index and fail planning
+    /// ("Input field name X does not match with the projection expression Y").
+    schema: SchemaRef,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -902,9 +929,14 @@ impl HybridSourceExec {
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
         limit: Option<usize>,
-    ) -> Self {
+    ) -> DataFusionResult<Self> {
+        let schema: SchemaRef = match projection.as_ref() {
+            Some(indices) => Arc::new(provider.schema.project(indices)?),
+            None => provider.schema.clone(),
+        };
+
         let cached_properties = PlanProperties::new(
-            EquivalenceProperties::new(provider.schema.clone()),
+            EquivalenceProperties::new(schema.clone()),
             inner.properties().partitioning.clone(),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Unbounded {
@@ -912,15 +944,59 @@ impl HybridSourceExec {
             },
         );
 
-        Self {
+        Ok(Self {
             inner,
             provider,
             cached_properties: Arc::new(cached_properties),
+            schema,
             projection,
             filters,
             limit,
-        }
+        })
     }
+}
+
+/// Align a batch to `target` by selecting the target's columns by NAME.
+///
+/// Inner phase plans do not reliably honor the projection pushed into the
+/// hybrid scan (the bounded ClickHouse provider ignores it entirely and emits
+/// every column, in ClickHouse DESCRIBE order rather than the hybrid/Kafka
+/// schema order), so the hybrid exec — which declares `target` as its output
+/// schema — must reshape each batch itself. Name-based selection is
+/// deliberately insensitive to both column order and extra columns.
+fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> DataFusionResult<RecordBatch> {
+    let batch_schema = batch.schema();
+    // Fast path: already the exact target shape (names, in order).
+    if batch_schema.fields().len() == target.fields().len()
+        && batch_schema
+            .fields()
+            .iter()
+            .zip(target.fields())
+            .all(|(a, b)| a.name() == b.name())
+    {
+        return Ok(batch.clone());
+    }
+
+    let indices = target
+        .fields()
+        .iter()
+        .map(|field| {
+            batch_schema.index_of(field.name()).map_err(|_| {
+                DataFusionError::from(streamling_err!(
+                    "hybrid source: column '{}' required by the query is missing from an \
+                     inner phase batch (batch columns: {:?})",
+                    field.name(),
+                    batch_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                ))
+            })
+        })
+        .collect::<DataFusionResult<Vec<usize>>>()?;
+
+    batch.project(&indices).map_err(Into::into)
 }
 
 impl DisplayAs for HybridSourceExec {
@@ -941,7 +1017,7 @@ impl ExecutionPlan for HybridSourceExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.provider.schema.clone()
+        self.schema.clone()
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -965,7 +1041,7 @@ impl ExecutionPlan for HybridSourceExec {
             self.projection.clone(),
             self.filters.clone(),
             self.limit,
-        )))
+        )?))
     }
 
     fn execute(
@@ -1024,7 +1100,8 @@ impl ExecutionPlan for HybridSourceExec {
         // to stay responsive to shutdown (same pattern as
         // `ClickHouseSourceExec::execute`'s `checkpointing_task`).
         let pending_for_drain = pending_markers.clone();
-        let forwarder_handle = tokio::spawn(async move {
+        let scope = provider.scope.clone();
+        let forwarder_handle = scope.spawn(async move {
             loop {
                 let rx = hybrid_marker_rx.clone();
                 let recv = tokio::task::spawn_blocking(move || {
@@ -1096,7 +1173,7 @@ impl ExecutionPlan for HybridSourceExec {
         let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
             let provider_for_shutdown = provider.clone();
             let ref_name = reference_name_for_spawn.clone();
-            tokio::spawn(async move {
+            scope.spawn(async move {
                 while !*sd.borrow() {
                     if sd.changed().await.is_err() {
                         return;
@@ -1110,7 +1187,7 @@ impl ExecutionPlan for HybridSourceExec {
             })
         });
 
-        tokio::spawn(async move {
+        scope.spawn(async move {
             // Every exit path from the loop falls through to the
             // post-loop teardown below — `break 'outer` is used uniformly
             // (instead of `return`) so the forwarder is signalled to
@@ -1197,6 +1274,18 @@ impl ExecutionPlan for HybridSourceExec {
                     };
                     match batch_result {
                         Ok(batch) => {
+                            // Inner phases do not reliably honor the pushed-down
+                            // projection (the bounded ClickHouse scan ignores it
+                            // and emits every column, in ClickHouse order), so
+                            // align each batch to the declared (projected)
+                            // schema by name before anything downstream sees it.
+                            let batch = match align_batch_to_schema(&batch, &schema_for_main) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    break 'outer;
+                                }
+                            };
                             // Bounded sources (ClickHouse) emit u256/i256 columns as
                             // FixedSizeBinary(32) without extension metadata and in
                             // little-endian. Reverse the bytes and adopt the target
@@ -1466,25 +1555,10 @@ fn merge_pending_markers(
     }
 }
 
-/// The bound on how long a completing source waits for the terminal checkpoint
-/// to finalize. On timeout the terminal Finalizer is SKIPPED (never emitted
-/// for an unconfirmed epoch — see `emit_terminal_checkpoint`); this bound only
-/// keeps a sink that never acks from hanging the source task.
-///
-/// Derived from the run loop's shared shutdown budget
-/// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
-/// is armed with), minus a margin so this wait always expires BEFORE the
-/// watchdog hard-exits the process. The minimum-floor is itself capped at
-/// budget − 2s so a deliberately tiny budget can never invert the invariant:
-/// for budgets ≤ 2s the timeout collapses to zero, which expires immediately
-/// and takes the safe branch (Finalizer skipped).
-fn terminal_checkpoint_finalize_timeout() -> Duration {
-    const MARGIN_SECS: u64 = 10;
-    const MIN_TIMEOUT_SECS: u64 = 5;
-    let budget = streamling_core::shutdown::shutdown_budget().as_secs();
-    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2));
-    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(capped_floor))
-}
+// The finalize-timeout bound lives in `streamling_core::shutdown`
+// (`terminal_checkpoint_finalize_timeout`) so every terminal-checkpoint
+// emitter (this source and the Kafka streaming shutdown path) shares it.
+use streamling_core::shutdown::terminal_checkpoint_finalize_timeout;
 
 /// Emit the terminal checkpoint round-trip inline on the data stream, so both
 /// the marker and the finalizer keep a consistent cut and reach inline
@@ -1619,7 +1693,10 @@ async fn flush_pending_to_synth_batch(
     // Finalizer twice (once forwarded from the checkpoint channel by the
     // forwarder task, once pushed inline by `emit_terminal_checkpoint`).
     // Consumers are idempotent for duplicate Finalizers, but there is no
-    // reason to make them exercise that property.
+    // reason to make them exercise that property. Note the dedup is
+    // PER-CALL only — a marker flushed here and again by a later call is
+    // not caught, so consumer idempotency stays the contract; this filter
+    // is a courtesy, not a delivery guarantee.
     let mut seen_marker = HashSet::new();
     let mut seen_finalizer = HashSet::new();
     let to_flush: Vec<CheckpointMessage> = drained
@@ -2789,6 +2866,203 @@ mod tests {
             state.completed_phases.iter().all(|&c| c),
             "All bounded phases should be marked complete"
         );
+    }
+
+    /// A bounded phase that behaves like the real ClickHouse provider: its
+    /// scan IGNORES the pushed-down projection and emits one full-width batch
+    /// whose column order differs from the hybrid (unbounded/Kafka) schema.
+    #[derive(Debug)]
+    struct ReorderedBatchMockProvider {
+        schema: SchemaRef,
+    }
+
+    impl ReorderedBatchMockProvider {
+        /// Schema is create_test_schema() reversed: [name, id] vs [id, name].
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![
+                    Field::new("name", DataType::Utf8, false),
+                    Field::new("id", DataType::Int32, false),
+                ])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for ReorderedBatchMockProvider {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ReorderedBatchMockExec {
+                schema: self.schema.clone(),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(self.schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }))
+        }
+    }
+
+    /// Emits exactly one [name, id] batch, then ends.
+    #[derive(Debug)]
+    struct ReorderedBatchMockExec {
+        schema: SchemaRef,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ReorderedBatchMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ReorderedBatchMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ReorderedBatchMockExec {
+        fn name(&self) -> &str {
+            "ReorderedBatchMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            use datafusion::arrow::array::{Int32Array, StringArray};
+            let batch = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "b"])),
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                ],
+            )
+            .expect("mock batch must build");
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::once(async move { Ok(batch) }),
+                ),
+            ))
+        }
+    }
+
+    /// Reproduces the production planner assertion ("Input field name
+    /// reward_type does not match with the projection expression
+    /// block_timestamp"): a scan given a projection must report the PROJECTED
+    /// schema. Reporting the provider's full schema makes DataFusion pair
+    /// projection expressions against full-schema fields by index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_with_projection_reports_projected_schema() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend("test_scan_projection_schema").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_scan_projection_schema".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let expected = Arc::new(create_test_schema().project(&projection).unwrap());
+        assert_eq!(
+            plan.schema(),
+            expected,
+            "plan must report the projected schema, not the full provider schema"
+        );
+    }
+
+    /// The bounded ClickHouse provider ignores the pushed-down projection and
+    /// emits full-width batches in ITS OWN column order. The hybrid exec must
+    /// still deliver batches shaped exactly like its declared (projected)
+    /// schema, aligning columns by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_with_projection_aligns_reordered_phase_batches() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(ReorderedBatchMockProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend("test_execute_projection_align").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_execute_projection_align".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let context = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        let batches: Vec<_> = stream.collect().await;
+
+        let expected_schema = Arc::new(create_test_schema().project(&projection).unwrap());
+        let mut saw_data = false;
+        for batch in batches {
+            let batch = batch.expect("stream batch should not be an error");
+            if batch.num_rows() == 0 {
+                continue; // synthetic marker-flush batches are empty
+            }
+            saw_data = true;
+            assert_eq!(
+                batch.schema(),
+                expected_schema,
+                "batches must match the declared projected schema"
+            );
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("projected column must be the utf8 'name' column");
+            assert_eq!(names.value(0), "a");
+            assert_eq!(names.value(1), "b");
+        }
+        assert!(saw_data, "the bounded phase's batch must be forwarded");
     }
 
     #[tokio::test(flavor = "multi_thread")]

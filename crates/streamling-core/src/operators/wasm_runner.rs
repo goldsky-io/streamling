@@ -439,7 +439,17 @@ impl WasmRunnerExec {
             Some(path) => Wasm::file(path),
             None => Wasm::data(EMBEDDED_RUNTIME_WASM),
         };
-        let manifest = Manifest::new([wasm]).with_config_key("code", transpiled_code);
+        // Per-call deadline for WASM plugin invocations, enforced by extism /
+        // wasmtime epoch interruption. Without it a plugin stuck in a loop
+        // blocks a worker thread with NO possible cancellation — `abort()`
+        // cannot interrupt synchronous WASM compute, so only the
+        // end-of-budget watchdog `process::exit` could end it. A healthy
+        // per-batch transform completes in milliseconds; 60s is orders of
+        // magnitude above any legitimate call.
+        const WASM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let manifest = Manifest::new([wasm])
+            .with_config_key("code", transpiled_code)
+            .with_timeout(WASM_CALL_TIMEOUT);
         Plugin::new(&manifest, [], true).map_err(|error| {
             DataFusionError::from(crate::streamling_err!(
                 "failed to create WASM instance: {}",
