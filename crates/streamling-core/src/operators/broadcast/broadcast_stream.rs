@@ -17,6 +17,13 @@ use std::{
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use tracing::{info, warn};
 
+/// How long a full consumer channel keeps being retried after shutdown has
+/// been requested before the broadcast drops that consumer. Sized like the
+/// Kafka sink's QueueFull window: long enough for a healthy consumer to drain
+/// mid-drain, short enough to stay inside the shutdown watchdog budget.
+const SHUTDOWN_STALLED_CONSUMER_WINDOW: tokio::time::Duration =
+    tokio::time::Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct BroadcastStream {
     inner: Arc<BroadcastState>,
@@ -27,7 +34,24 @@ pub struct BroadcastStream {
 #[derive(Debug)]
 struct BroadcastState {
     schema: SchemaRef,
-    consumers: Mutex<Vec<Sender<DFResult<RecordBatch>>>>,
+    consumers: Mutex<Vec<ConsumerSlot>>,
+}
+
+/// A registered consumer plus the flag that poisons its stream when the
+/// broadcast abandons it (see `run_broadcast`'s failure handling).
+#[derive(Clone, Debug)]
+struct ConsumerSlot {
+    tx: Sender<DFResult<RecordBatch>>,
+    abandoned: Arc<AtomicBool>,
+}
+
+/// Why a send to one consumer gave up.
+enum SendFailure {
+    /// The consumer's receiver is gone — routine at teardown.
+    Closed,
+    /// The consumer stayed full through the post-shutdown stalled window; at
+    /// least one batch was never delivered to it.
+    Stalled,
 }
 
 impl BroadcastStream {
@@ -45,19 +69,37 @@ impl BroadcastStream {
     }
 
     /// Start the background broadcasting task.
-    /// Should be called after all consumers have been added.
-    pub fn start(&self, source_stream: SendableRecordBatchStream) {
+    /// Should be called after all consumers have been added. The driver task
+    /// is tracked by `scope` (DataPath stage): `run_broadcast` ends when the
+    /// source stream ends — which shutdown forces — or when every consumer is
+    /// gone, so the drain ladder observes its wind-down without needing to
+    /// cancel it.
+    pub fn start(
+        &self,
+        source_stream: SendableRecordBatchStream,
+        scope: &crate::shutdown::ComponentScope,
+    ) {
         let clone_for_task = self.clone();
-        tokio::spawn(async move {
+        scope.spawn(async move {
             clone_for_task.run_broadcast(source_stream).await;
         });
     }
 
     /// Retry sending with fixed delay until success or channel closed.
+    ///
+    /// Once shutdown is requested the retry window becomes bounded: a consumer
+    /// that is alive-but-stalled (e.g. a sink wedged against a sick backend)
+    /// used to pin the broadcast — and with it every OTHER consumer of the
+    /// shared scan — forever. A healthy
+    /// consumer drains its channel well within the window, so the tail keeps
+    /// flowing during a normal drain; only the stalled one gets dropped.
     async fn try_send_batch_with_retry_forever(
         tx: &Sender<DFResult<RecordBatch>>,
         batch_result: &DFResult<RecordBatch>,
-    ) -> Result<(), ()> {
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+        stalled_window: tokio::time::Duration,
+    ) -> Result<(), SendFailure> {
+        let mut full_since: Option<tokio::time::Instant> = None;
         loop {
             let to_send = match batch_result {
                 Ok(batch) => Ok(batch.clone()),
@@ -67,10 +109,19 @@ impl BroadcastStream {
             match tx.try_send(to_send) {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(_)) => {
+                    let since = *full_since.get_or_insert_with(tokio::time::Instant::now);
+                    if *shutdown.borrow() && since.elapsed() >= stalled_window {
+                        warn!(
+                            "Broadcast consumer still full {:?} after shutdown was requested; \
+                             dropping it so the drain can proceed",
+                            since.elapsed()
+                        );
+                        return Err(SendFailure::Stalled);
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
                 Err(TrySendError::Closed(_)) => {
-                    return Err(());
+                    return Err(SendFailure::Closed);
                 }
             }
         }
@@ -78,6 +129,7 @@ impl BroadcastStream {
 
     /// The task that reads from the single source stream and broadcasts to all active consumers.
     async fn run_broadcast(&self, mut source_stream: SendableRecordBatchStream) {
+        let shutdown = crate::shutdown::subscribe();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 break;
@@ -89,16 +141,52 @@ impl BroadcastStream {
                     let consumers = self.inner.consumers.lock().unwrap().clone();
                     let send_futures: Vec<_> = consumers
                         .iter()
-                        .map(|tx| Self::try_send_batch_with_retry_forever(tx, &batch_result))
+                        .map(|slot| {
+                            Self::try_send_batch_with_retry_forever(
+                                &slot.tx,
+                                &batch_result,
+                                &shutdown,
+                                SHUTDOWN_STALLED_CONSUMER_WINDOW,
+                            )
+                        })
                         .collect();
 
                     let results = future::join_all(send_futures).await;
-                    for result in results {
-                        if result.is_err() {
-                            warn!(
-                                "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
-                            );
+                    // A failed consumer must actually be REMOVED, in both
+                    // arms. Leaving it registered meant every subsequent
+                    // batch paid the full stalled window again (one wedged
+                    // sink × N queued batches could out-wait the whole
+                    // shutdown budget), and — worse — a sink that unwedged
+                    // AFTER a batch was skipped could drain the later
+                    // batches plus the terminal marker, ack the terminal
+                    // epoch, and let offsets commit over the gap it never
+                    // received. The abandoned flag is set BEFORE the sender
+                    // is dropped so the consumer's stream ends in an error
+                    // (see BroadcastConsumer::poll_next): a failed sink is
+                    // never deregistered, so its missing ack keeps the
+                    // epoch from finalizing and the gap replays on restart.
+                    let mut failed: Vec<ConsumerSlot> = Vec::new();
+                    for (slot, result) in consumers.iter().zip(results) {
+                        match result {
+                            Ok(()) => {}
+                            Err(SendFailure::Closed) => {
+                                warn!(
+                                    "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
+                                );
+                                failed.push(slot.clone());
+                            }
+                            Err(SendFailure::Stalled) => {
+                                slot.abandoned.store(true, Ordering::SeqCst);
+                                warn!(
+                                    "Abandoning the stalled broadcast consumer: its stream will end in an error so its epochs cannot finalize over the missed batch(es); the tail replays on restart"
+                                );
+                                failed.push(slot.clone());
+                            }
                         }
+                    }
+                    if !failed.is_empty() {
+                        let mut guard = self.inner.consumers.lock().unwrap();
+                        guard.retain(|live| !failed.iter().any(|f| f.tx.same_channel(&live.tx)));
                     }
                 }
                 None => {
@@ -116,13 +204,19 @@ impl BroadcastStream {
     pub fn add_consumer(&self) -> BroadcastConsumer {
         // Each consumer gets its own bounded receiver
         let (tx, rx) = channel(self.channel_capacity);
+        let abandoned = Arc::new(AtomicBool::new(false));
 
         let mut consumers = self.inner.consumers.lock().unwrap();
-        consumers.push(tx);
+        consumers.push(ConsumerSlot {
+            tx,
+            abandoned: abandoned.clone(),
+        });
 
         BroadcastConsumer {
             schema: self.inner.schema.clone(),
             receiver: rx,
+            abandoned,
+            abandonment_reported: false,
         }
     }
 
@@ -180,14 +274,41 @@ impl BroadcastStream {
 pub struct BroadcastConsumer {
     schema: SchemaRef,
     receiver: Receiver<DFResult<RecordBatch>>,
+    /// Set by the broadcast BEFORE it drops this consumer's sender when it
+    /// gives up on a stalled channel: at least one batch was never delivered,
+    /// so the stream must end in an ERROR, never cleanly. A clean end would
+    /// let the sink flush, complete Ok, and be deregistered from the
+    /// expected-ack set — after which the terminal epoch could finalize and
+    /// commit offsets over the batch this consumer never received. Failing
+    /// the stream keeps the sink's future erroring instead: failed sinks are
+    /// never deregistered, their missing acks stall the epoch, offsets stay
+    /// uncommitted, and the gap replays on restart (at-least-once holds).
+    abandoned: Arc<AtomicBool>,
+    abandonment_reported: bool,
 }
 
 impl Stream for BroadcastConsumer {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Forward poll to the underlying mpsc receiver
-        Pin::new(&mut self.receiver).poll_recv(cx)
+        // Forward poll to the underlying mpsc receiver. On end-of-channel,
+        // surface the abandonment (exactly once) instead of a clean end —
+        // see the `abandoned` field for why this is load-bearing.
+        match Pin::new(&mut self.receiver).poll_recv(cx) {
+            Poll::Ready(None)
+                if self.abandoned.load(Ordering::SeqCst) && !self.abandonment_reported =>
+            {
+                self.abandonment_reported = true;
+                Poll::Ready(Some(Err(DataFusionError::Execution(
+                    "broadcast abandoned this consumer: it stayed stalled through the \
+                     post-shutdown window, so at least one batch was never delivered; \
+                     failing the stream so its epochs cannot finalize over the gap \
+                     (the missed tail replays on restart)"
+                        .to_string(),
+                ))))
+            }
+            other => other,
+        }
     }
 }
 
@@ -200,6 +321,122 @@ impl RecordBatchStream for BroadcastConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_batch() -> DFResult<RecordBatch> {
+        let schema = Arc::new(arrow_schema::Schema::empty());
+        Ok(RecordBatch::new_empty(schema))
+    }
+
+    /// The abandonment contract: a consumer the broadcast gave up on must
+    /// still receive everything that WAS queued, and then end in an ERROR —
+    /// never cleanly. A clean end would let the sink complete Ok, be
+    /// deregistered, and the terminal epoch commit offsets over the batch
+    /// this consumer never received.
+    #[tokio::test]
+    async fn abandoned_consumer_drains_queue_then_errors() {
+        let schema = Arc::new(arrow_schema::Schema::empty());
+        let bs = BroadcastStream::new(schema, 1);
+        let mut consumer = bs.add_consumer();
+
+        {
+            let slots = bs.inner.consumers.lock().unwrap();
+            slots[0]
+                .tx
+                .try_send(empty_batch())
+                .expect("queue one batch");
+            // Order matters: flag BEFORE the sender drops, exactly as
+            // run_broadcast does it.
+            slots[0].abandoned.store(true, Ordering::SeqCst);
+        }
+        bs.inner.consumers.lock().unwrap().clear(); // drop the sender
+
+        let first = consumer.next().await;
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "the queued batch must still be delivered: {first:?}"
+        );
+        let second = consumer.next().await;
+        match second {
+            Some(Err(e)) => assert!(
+                e.to_string().contains("broadcast abandoned this consumer"),
+                "unexpected error: {e}"
+            ),
+            other => panic!("abandoned consumer must end in an error, got {other:?}"),
+        }
+        assert!(
+            consumer.next().await.is_none(),
+            "after the abandonment error the stream ends"
+        );
+    }
+
+    /// Without abandonment, end-of-channel stays a clean end (healthy drain).
+    #[tokio::test]
+    async fn non_abandoned_consumer_ends_cleanly() {
+        let schema = Arc::new(arrow_schema::Schema::empty());
+        let bs = BroadcastStream::new(schema, 1);
+        let mut consumer = bs.add_consumer();
+        bs.inner.consumers.lock().unwrap().clear();
+        assert!(consumer.next().await.is_none());
+    }
+
+    /// Regression: a consumer that is
+    /// alive-but-stalled pinned the broadcast retry loop forever — and with it
+    /// every other consumer of the shared scan. Once shutdown is requested and
+    /// the window elapses, the stalled consumer must be dropped.
+    #[tokio::test]
+    async fn stalled_consumer_dropped_after_shutdown_window() {
+        let (tx, _rx) = channel::<DFResult<RecordBatch>>(1);
+        tx.try_send(empty_batch()).expect("fills the channel");
+        // Receiver kept alive but never drained: alive-but-stalled.
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let batch = empty_batch();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            BroadcastStream::try_send_batch_with_retry_forever(
+                &tx,
+                &batch,
+                &shutdown_rx,
+                tokio::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("stalled consumer must be given up on, not retried forever");
+        assert!(result.is_err(), "the stalled consumer must be dropped");
+    }
+
+    /// Without shutdown the loop keeps retrying and delivers once the consumer
+    /// drains — the bounded window applies only to the drain.
+    #[tokio::test]
+    async fn stalled_consumer_recovers_without_shutdown() {
+        let (tx, mut rx) = channel::<DFResult<RecordBatch>>(1);
+        tx.try_send(empty_batch()).expect("fills the channel");
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Free a slot after a while, well past the (irrelevant) window.
+        // Test task; not part of any pipeline drain.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = rx.recv().await;
+            // Keep the receiver alive so the channel doesn't close.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+
+        let batch = empty_batch();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            BroadcastStream::try_send_batch_with_retry_forever(
+                &tx,
+                &batch,
+                &shutdown_rx,
+                tokio::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("send must complete once the consumer drains");
+        assert!(result.is_ok(), "no shutdown => keep retrying until it fits");
+    }
 
     #[test]
     fn clone_df_error_preserves_execution_message() {

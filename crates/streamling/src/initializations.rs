@@ -12,6 +12,10 @@ pub fn start_admin_api_server(
 ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
     info!("Starting Admin API server on port {}", port);
 
+    // Process-lifetime task: the admin server serves until the process exits
+    // and holds no data needing a drain. Tracking it in a scope would only
+    // make the DataPath drain wait on a server that never stops.
+    #[allow(clippy::disallowed_methods)]
     tokio::spawn(async move {
         match admin_api::start_admin_server(port, live_data_inspect).await {
             Ok(()) => Ok(()),

@@ -410,6 +410,7 @@ impl TableProvider for WrappingSourceTableProvider {
                         wrapped_exec,
                         internal_buffer_size,
                         expected_count,
+                        registry.scope(),
                     ));
                     sources.insert(reference_name.clone(), handle.clone());
                     handle
@@ -1135,6 +1136,13 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             exec.clone(),
                             internal_buffer_size,
                             expected_count,
+                            // Transform scan sharing goes through the global
+                            // SCAN_SHARING_REGISTRY, which no run loop owns, so
+                            // there is no controller scope to thread here yet.
+                            // Detached = the pre-port behavior (driver ends when
+                            // the transform stream ends); thread a real scope
+                            // when this registry moves off the global.
+                            crate::shutdown::ComponentScope::detached("shared-scans:transform"),
                         ));
                         registry.insert(reference_name.clone(), handle.clone());
 
