@@ -2,6 +2,65 @@
 //! This module defines the API that can be used for implementing plugins.
 //! NOTE: this API is NOT FFI-safe and is intended for use in the plugin AFTER the FFI layer.
 //! See `plugin_interface::ffi` for the FFI-safe types and traits.
+//!
+//! # Shutdown and durability lifecycle (what a plugin must implement)
+//!
+//! Plugins do NOT observe process signals and there is no separate shutdown
+//! API to implement. SIGTERM is handled once, by the host; what a plugin sees
+//! is the same message protocol it already handles in steady state, delivered
+//! in a guaranteed order. Handling that protocol correctly IS handling
+//! shutdown:
+//!
+//! ```text
+//! steady state:   NextBatch* → CheckpointMarker → [Finalizer] → NextBatch* → …
+//! shutdown:       NextBatch* → CheckpointMarker → Finalizer → Terminate
+//!                 (the last marker is the TERMINAL checkpoint — it looks
+//!                  exactly like every other marker on purpose)
+//! ```
+//!
+//! The rules, per hook:
+//!
+//! - **`process_checkpoint_marker` is the durability point — the only one.**
+//!   For a sink, returning `Ok` acks the epoch, which tells the host that
+//!   everything received up to this marker survives a crash. Flush buffered
+//!   data durably BEFORE returning. Do not defer durability to `terminate()`:
+//!   on graceful shutdown the terminal marker arrives after the last batch,
+//!   so a plugin that flushes on markers never has unflushed acked data at
+//!   exit. A plugin does not need to know (and is not told) whether a marker
+//!   is terminal — treat every marker identically.
+//! - **`process_checkpoint_finalizer` must be idempotent, non-blocking, and
+//!   must never wait for a specific epoch** (see the method docs). Use it for
+//!   commit-on-finalize bookkeeping only.
+//! - **`terminate` / `is_running`** (`SupportsGracefulShutdown`): `terminate`
+//!   flips your running flag and releases what is WORTH releasing (see
+//!   below); the dispatcher then exits its loop. Data flushing should already
+//!   have happened on the last marker — a best-effort flush here is cheap
+//!   insurance, not the contract.
+//! - **Never retry forever.** Any network call inside a handler needs a
+//!   bounded retry budget or an `is_running()` check between attempts. The
+//!   host bounds you regardless — after shutdown it abandons sends to a
+//!   plugin that stops consuming (≈5s grace) and a watchdog hard-exits the
+//!   process at the shutdown budget — but a plugin that wedges forfeits its
+//!   own drain window.
+//!
+//! ## Does resource cleanup matter if the process is exiting anyway?
+//!
+//! Split resources in two:
+//!
+//! - **Local resources (memory, threads, file handles): no.** Process exit
+//!   reclaims them; spending shutdown-budget seconds on them competes with
+//!   the flush that actually matters. Do nothing.
+//! - **Resources with REMOTE state: yes, close them if it is fast.** A
+//!   connection pool with server-side sessions, a consumer-group membership,
+//!   a lease, or an open transaction outlives the process on the remote end
+//!   until it times out — which slows down the replacement pod (rebalance
+//!   delays, held locks, connection-count pressure). A graceful close on
+//!   `terminate()` releases them immediately. If closing is slow or flaky,
+//!   skip it: the watchdog treats a slow `terminate()` the same as a hang.
+//!
+//! Priority order inside the shutdown budget: durability (marker acks) →
+//! fast remote releases → exit. Anything slower than a second or two in
+//! `terminate()` is usually a bug.
 
 use crate::{PluginLabel, PluginStateBackendConfig};
 use abi_stable::traits::IntoReprRust;

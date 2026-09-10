@@ -8,6 +8,10 @@ use streamling_core::utils::pg::execute_bounded;
 
 use crate::table_providers::postgres::value_binding;
 
+/// Upper bound for a single INSERT/DELETE attempt. Attempts are retried (with
+/// shutdown-aware backoff) on timeout; both operations are idempotent.
+const PER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Context for sink operations, providing identifying information for error messages
 #[derive(Clone)]
 pub struct SinkContext {
@@ -62,9 +66,21 @@ pub async fn execute_batch_insert(
                         q = q.bind(epoch as i64);
                     }
                 }
-                execute_bounded(&pool, q, client_statement_timeout)
-                    .await
-                    .streamling_context("failed to execute INSERT query")?;
+                // Bound each attempt so a hung connection cannot silently eat
+                // the whole shutdown budget: cancellation is only checked
+                // BETWEEN attempts, so an unbounded in-flight attempt would
+                // leave the watchdog as the only way out. The configured
+                // client-side statement timeout wins when set; otherwise a
+                // fixed per-attempt bound applies. A timed-out attempt
+                // discards its connection and is retried; the upsert is
+                // idempotent.
+                execute_bounded(
+                    &pool,
+                    q,
+                    Some(client_statement_timeout.unwrap_or(PER_ATTEMPT_TIMEOUT)),
+                )
+                .await
+                .streamling_context("failed to execute INSERT query")?;
                 Ok(())
             }
         },
@@ -122,9 +138,16 @@ pub async fn execute_batch_delete(
                             .streamling_context("failed to bind Arrow value to query")?;
                     }
                 }
-                execute_bounded(&pool, q, client_statement_timeout)
-                    .await
-                    .streamling_context("failed to execute DELETE query")?;
+                // See the INSERT path: bound each attempt so a hung connection
+                // can't eat the shutdown budget. Deletes by primary key are
+                // idempotent, so a timed-out attempt is safely retried.
+                execute_bounded(
+                    &pool,
+                    q,
+                    Some(client_statement_timeout.unwrap_or(PER_ATTEMPT_TIMEOUT)),
+                )
+                .await
+                .streamling_context("failed to execute DELETE query")?;
                 Ok(())
             }
         },

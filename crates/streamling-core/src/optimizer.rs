@@ -701,6 +701,7 @@ mod attribution_tests {
             vec![],
             1,
             Some(Arc::from("app::sql")),
+            crate::shutdown::ComponentScope::detached("test"),
         ));
         let optimized = run(multi);
 
@@ -720,6 +721,7 @@ mod attribution_tests {
             1,
             1,
             Some(Arc::from("app::kafka_source")),
+            crate::shutdown::ComponentScope::detached("test"),
         ));
         let broadcasting: Arc<dyn ExecutionPlan> = Arc::new(
             BroadcastingExec::new(handle, None).expect("broadcasting plan should be valid"),
@@ -747,6 +749,7 @@ mod attribution_tests {
             1,
             1,
             Some(Arc::from("app::kafka_source")),
+            crate::shutdown::ComponentScope::detached("test"),
         ));
         let exec = BroadcastingExec::new(handle, None).expect("broadcasting plan should be valid");
         match downstream_id {

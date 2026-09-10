@@ -13,10 +13,8 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
 use std::fmt;
 use std::fmt::Debug;
-use streamling_core::checkpoints::channels::send;
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
-    process_checkpoint_acks,
+    extract_checkpoint_messages, now_ms, process_checkpoint_acks,
 };
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 
@@ -34,7 +32,6 @@ struct BlackholeSink {
     /// Global `num_records_before_stop` progress across the concurrent
     /// per-partition `write_all` streams (`ParallelSinkExec`).
     rows_received: AtomicU64,
-    source_name: String,
     metric_metadata_id: String,
 }
 
@@ -42,14 +39,12 @@ impl BlackholeSink {
     fn new(
         schema: SchemaRef,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         metric_metadata_id: String,
     ) -> Self {
         Self {
             schema,
             num_records_before_stop,
             rows_received: AtomicU64::new(0),
-            source_name,
             metric_metadata_id,
         }
     }
@@ -106,11 +101,10 @@ impl DataSink for BlackholeSink {
                 && total_received >= num_records_before_stop
                 && !(num_records_before_stop == 0 && total_received == 0)
             {
-                // Notify the coordinator (and sources) that the sink has received the expected rows
-                let _ = send(
-                    CHECKPOINT_COORDINATOR_CHANNEL,
-                    CheckpointMessage::SourceComplete(self.source_name.clone()),
-                );
+                // Record-limit reached: request process-wide graceful shutdown
+                // so every source drains and ends its stream — the same path
+                // SIGTERM takes (test-only mode).
+                streamling_core::shutdown::request_shutdown();
                 break;
             }
         }
@@ -141,7 +135,6 @@ impl DisplayAs for BlackholeSink {
 pub struct BlackholeTableProvider {
     schema: SchemaRef,
     num_records_before_stop: Option<u64>,
-    source_name: String,
     metric_metadata_id: String,
     telemetry: Option<Telemetry>,
 }
@@ -150,14 +143,12 @@ impl BlackholeTableProvider {
     pub fn new(
         schema: SchemaRef,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         metric_metadata_id: String,
         telemetry: Option<Telemetry>,
     ) -> Self {
         Self {
             schema,
             num_records_before_stop,
-            source_name,
             metric_metadata_id,
             telemetry,
         }
@@ -193,7 +184,6 @@ impl TableProvider for BlackholeTableProvider {
         let blackhole_sink = Arc::new(BlackholeSink::new(
             self.schema.clone(),
             self.num_records_before_stop,
-            self.source_name.clone(),
             self.metric_metadata_id.clone(),
         ));
         let telemetry_data_sink = Arc::new(WrappingDataSink::new(
@@ -230,7 +220,6 @@ mod tests {
         let sink = Arc::new(BlackholeSink::new(
             schema.clone(),
             Some(4),
-            "src".to_string(),
             "app::sink".to_string(),
         ));
 

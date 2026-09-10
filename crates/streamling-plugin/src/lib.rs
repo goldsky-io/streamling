@@ -4,6 +4,7 @@ pub mod api;
 pub mod r#async;
 mod dispatch;
 pub mod ffi;
+pub mod shutdown;
 
 use crate::api::PluginStateBackendFactory;
 pub use crate::api::{
@@ -36,8 +37,11 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, TypeSignature,
 };
+use futures::FutureExt as _;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, OnceLock};
 pub use streamling_plugin_derive::*;
 pub use streamling_state::{StateKey, StateOperatorBackend};
 use tracing::{error, info};
@@ -232,8 +236,61 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     } else if let Ok(s) = payload.downcast::<String>() {
         *s
     } else {
-        "unknown panic during plugin creation".to_string()
+        "unknown panic in plugin code".to_string()
     }
+}
+
+/// Drives a plugin dispatcher on the plugin async runtime and reports its outcome
+/// through the returned FFI execution future.
+///
+/// A dispatcher error (e.g. a sink whose backend is unreachable) must resolve the
+/// execution future with `RErr` so the host fails the pipeline and drains it —
+/// never `panic!`: unwinding across the `extern "C"` poll boundary of an
+/// `async_ffi` future aborts the process before the host's signal handling or
+/// shutdown watchdog can react. Panics from plugin code are caught and reported
+/// the same way; as with the factory `catch_unwind` above, the payload is only
+/// converted to a string and no plugin state is observed after a panic.
+fn spawn_dispatcher_worker<Fut>(
+    id: RString,
+    runtime: &PluginAsyncRuntimeObj,
+    start: Fut,
+) -> FfiFuture<RResult<(), RString>>
+where
+    Fut: Future<Output = Result<(), PluginError>> + Send + 'static,
+{
+    let worker_error: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+    let worker_error_writer = worker_error.clone();
+
+    let worker = async move {
+        match AssertUnwindSafe(start).catch_unwind().await {
+            Ok(Ok(())) => (),
+            Ok(Err(e)) => {
+                let msg = format!("Plugin error {id}: {e:?}");
+                error!("{msg}");
+                let _ = worker_error_writer.set(msg);
+            }
+            Err(panic_payload) => {
+                let msg = format!(
+                    "Plugin panic {id}: {}",
+                    panic_payload_to_string(panic_payload)
+                );
+                error!("{msg}");
+                let _ = worker_error_writer.set(msg);
+            }
+        }
+    }
+    .into_ffi();
+
+    let spawned = runtime.spawn(worker);
+
+    async move {
+        spawned.await;
+        match worker_error.get() {
+            Some(err) => RResult::RErr(RString::from(err.as_str())),
+            None => RResult::ROk(()),
+        }
+    }
+    .into_ffi()
 }
 
 pub fn source_generator<F>(
@@ -287,24 +344,8 @@ where
     let dispatcher = SourcePluginDispatcher::new(message_channels, source);
 
     let rt = runtime.clone();
-    let worker = async move {
-        match dispatcher.start(rt).await {
-            Ok(()) => (),
-            Err(e) => {
-                error!("Plugin error {}: {:?}", id, e);
-                panic!("Plugin error {}: {:?}", id, e);
-            }
-        }
-    }
-    .into_ffi();
-
-    let spawned = runtime.spawn(worker);
-
-    let dispatcher_future = async move {
-        spawned.await;
-        RResult::ROk(())
-    }
-    .into_ffi();
+    let dispatcher_future =
+        spawn_dispatcher_worker(id, &runtime, async move { dispatcher.start(rt).await });
 
     Ok(PluginResult::new(dispatcher_future, RSome(output_schema.into())).with_labels(labels))
         .into_c()
@@ -365,24 +406,8 @@ where
     let dispatcher = TransformPluginDispatcher::new(message_channels, transform);
 
     let rt = runtime.clone();
-    let worker = async move {
-        match dispatcher.start(rt).await {
-            Ok(()) => (),
-            Err(e) => {
-                error!("Plugin error {}: {:?}", id, e);
-                panic!("Plugin error {}: {:?}", id, e);
-            }
-        }
-    }
-    .into_ffi();
-
-    let spawned = runtime.spawn(worker);
-
-    let dispatcher_future = async move {
-        spawned.await;
-        RResult::ROk(())
-    }
-    .into_ffi();
+    let dispatcher_future =
+        spawn_dispatcher_worker(id, &runtime, async move { dispatcher.start(rt).await });
 
     Ok(PluginResult::new(dispatcher_future, RSome(output_schema.into())).with_labels(labels))
         .into_c()
@@ -432,25 +457,10 @@ where
     let labels = sink.labels();
 
     let rt = runtime.clone();
-    let worker = async move {
+    let dispatcher_future = spawn_dispatcher_worker(id, &runtime, async move {
         let dispatcher = SinkPluginDispatcher::new(message_channels, sink);
-        match dispatcher.start(rt).await {
-            Ok(()) => (),
-            Err(e) => {
-                error!("Plugin error {}: {:?}", id, e);
-                panic!("Plugin error {}: {:?}", id, e);
-            }
-        }
-    }
-    .into_ffi();
-
-    let spawned = runtime.spawn(worker);
-
-    let dispatcher_future = async move {
-        spawned.await;
-        RResult::ROk(())
-    }
-    .into_ffi();
+        dispatcher.start(rt).await
+    });
 
     Ok(PluginResult::new(dispatcher_future, RNone).with_labels(labels)).into_c()
 }
@@ -475,27 +485,8 @@ where
     };
     let dispatcher = PreprocessorPluginDispatcher::new(message_channels, preprocessor);
 
-    let worker_error: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
-    let worker_error_writer = worker_error.clone();
-
-    let worker = async move {
-        if let Err(e) = dispatcher.start().await {
-            error!("Preprocessor plugin error {}: {:?}", id, e);
-            let _ = worker_error_writer.set(format!("{e}"));
-        }
-    }
-    .into_ffi();
-
-    let spawned = runtime.spawn(worker);
-
-    let dispatcher_future = async move {
-        spawned.await;
-        match worker_error.get() {
-            Some(err) => RResult::RErr(RString::from(err.clone())),
-            None => RResult::ROk(()),
-        }
-    }
-    .into_ffi();
+    let dispatcher_future =
+        spawn_dispatcher_worker(id, &runtime, async move { dispatcher.start().await });
 
     Ok(PluginResult::new(dispatcher_future, RNone)).into_c()
 }
@@ -726,6 +717,61 @@ mod safe_udf_arg_tests {
     }
 }
 
+#[cfg(test)]
+mod dispatcher_worker_tests {
+    use super::*;
+    use crate::r#async::DirectTokioProxy;
+
+    // A dispatcher error must resolve the execution future with RErr — never
+    // panic. A panic here unwinds through the extern "C" poll of the FFI
+    // future and aborts the whole pipeline process, leaving it deaf to
+    // SIGTERM (the sink-precheck failure mode this guards against).
+    #[tokio::test]
+    async fn dispatcher_error_resolves_execution_future_with_rerr() {
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let execution_future =
+            spawn_dispatcher_worker(RString::from("tinybird"), &runtime, async {
+                Err(PluginError::Internal(
+                    "failed to check if datasource exists".to_string(),
+                ))
+            });
+        match execution_future.await {
+            RResult::RErr(msg) => {
+                assert!(msg.as_str().contains("Plugin error tinybird"), "{msg}");
+                assert!(
+                    msg.as_str()
+                        .contains("failed to check if datasource exists"),
+                    "{msg}"
+                );
+            }
+            RResult::ROk(()) => panic!("dispatcher error must surface as RErr"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_panic_resolves_execution_future_with_rerr() {
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let execution_future = spawn_dispatcher_worker(RString::from("panicky"), &runtime, async {
+            panic!("boom in plugin code");
+        });
+        match execution_future.await {
+            RResult::RErr(msg) => {
+                assert!(msg.as_str().contains("Plugin panic panicky"), "{msg}");
+                assert!(msg.as_str().contains("boom in plugin code"), "{msg}");
+            }
+            RResult::ROk(()) => panic!("plugin panic must surface as RErr"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_success_resolves_execution_future_with_rok() {
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let execution_future =
+            spawn_dispatcher_worker(RString::from("clean"), &runtime, async { Ok(()) });
+        assert!(matches!(execution_future.await, RResult::ROk(())));
+    }
+}
+
 // New functions can be added to the end of the struct
 #[repr(C)]
 #[derive(StableAbi)]
@@ -759,6 +805,21 @@ pub struct PluginModule {
     /// Returns side output descriptors provided by this plugin. Can return an empty vector.
     pub side_output_descriptors:
         extern "C" fn() -> RResult<RVec<PluginSideOutputDescriptor>, PluginInitializationError>,
+
+    /// Hands the plugin an out-of-band shutdown signal, called once by the
+    /// host right after load, before any `create`. Appended after
+    /// `last_prefix_field`; the suffix accessor reports it as absent (`None`)
+    /// for a library built before this field existed, and the host then skips
+    /// the call — the SDK falls back to finite defaults
+    /// (`shutdown::FALLBACK_BUDGET`).
+    ///
+    /// NOTE: abi_stable's load-time layout check rejects a library whose
+    /// module has FEWER fields than the host expects, even for suffix fields
+    /// (the tolerance is one-directional; only extra fields on the library
+    /// side pass). Loaders must therefore fall back to probing with
+    /// [`compat::PluginModuleRef`] before trusting the suffix accessors —
+    /// see `compat` for the contract.
+    pub set_shutdown_signal: extern "C" fn(crate::shutdown::ShutdownSignalObj),
 }
 
 impl RootModule for PluginModuleRef {
@@ -769,5 +830,112 @@ impl RootModule for PluginModuleRef {
 
     fn initialization(self) -> Result<Self, LibraryError> {
         Ok(self)
+    }
+}
+
+/// Compatibility probe for plugin libraries built against an SDK older than
+/// the newest module field (the frozen four-field module shape).
+///
+/// abi_stable's layout check only tolerates a field-count difference in one
+/// direction: a library may have MORE module fields than the host expects
+/// (they are ignored), but a host expecting more fields than the library has
+/// is rejected with a `FieldCountMismatch` — even when the extra fields sit
+/// after `last_prefix_field`. The runtime suffix accessors (which return
+/// `Option` guarded by the library's own recorded field count) never get a
+/// chance to run.
+///
+/// This module carries a byte-identical twin of the original four-field
+/// [`PluginModule`] under the same type name, so its layout matches what
+/// pre-`set_shutdown_signal` libraries embed. A loader that fails the primary
+/// layout check can validate the library against this frozen shape; success
+/// proves the shared prefix (and the two original suffix fields) are intact,
+/// after which obtaining the primary [`super::PluginModuleRef`] with the
+/// layout check skipped is sound: every accessor past the library's field
+/// count returns `None` via abi_stable's runtime field guard.
+///
+/// Do not add fields here, ever — this is a fossil, not a live type.
+pub mod compat {
+    use super::*;
+
+    /// Frozen four-field twin of [`super::PluginModule`]. See the module docs.
+    #[repr(C)]
+    #[derive(StableAbi)]
+    #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
+    pub struct PluginModule {
+        /// See [`super::PluginModule::init`].
+        pub init: extern "C" fn(
+            logging: PluginLogging,
+        )
+            -> RResult<PluginRuntimeConfiguration, PluginInitializationError>,
+
+        // Same prefix boundary as the live type; moving it would desync the
+        // two layouts and break the probe.
+        #[sabi(last_prefix_field)]
+        /// See [`super::PluginModule::create`].
+        pub create: extern "C" fn(
+            plugin_id: RString,
+            input_schema: ROption<SafeArrowSchema>,
+            options: PluginOptions,
+            runtime: PluginAsyncRuntimeObj,
+            state_backend_config: PluginStateBackendConfig,
+            message_channels: PluginChannels,
+        ) -> RResult<PluginResult, PluginInitializationError>,
+
+        /// See [`super::PluginModule::udf_descriptors`].
+        pub udf_descriptors:
+            extern "C" fn() -> RResult<RVec<PluginUdfDescriptor>, PluginInitializationError>,
+
+        /// See [`super::PluginModule::side_output_descriptors`].
+        pub side_output_descriptors:
+            extern "C" fn() -> RResult<RVec<PluginSideOutputDescriptor>, PluginInitializationError>,
+    }
+
+    impl RootModule for PluginModuleRef {
+        declare_root_module_statics! {PluginModuleRef}
+        const BASE_NAME: &'static str = "streamling_plugin";
+        const NAME: &'static str = "streamling_plugin";
+        const VERSION_STRINGS: VersionStrings = package_version_strings!();
+
+        fn initialization(self) -> Result<Self, LibraryError> {
+            Ok(self)
+        }
+    }
+}
+
+#[cfg(test)]
+mod compat_layout_tests {
+    use super::*;
+    use abi_stable::StableAbi;
+    use abi_stable::abi_stability::abi_checking::check_layout_compatibility;
+
+    /// The frozen twin must stay a loadable prefix of the live module type:
+    /// a host expecting the twin's four fields accepts a library exporting
+    /// the live (larger) module. This is the direction the compatibility
+    /// probe relies on; it breaks if the live type's prefix drifts or if a
+    /// field is ever added to `compat`.
+    #[test]
+    fn frozen_twin_accepts_live_module() {
+        check_layout_compatibility(
+            <compat::PluginModuleRef as StableAbi>::LAYOUT,
+            <PluginModuleRef as StableAbi>::LAYOUT,
+        )
+        .unwrap_or_else(|e| panic!("frozen twin no longer a prefix of the live module: {e}"));
+    }
+
+    /// Documents the asymmetry that makes the loader fallback necessary: the
+    /// live module (more fields) does NOT accept a four-field library, even
+    /// though the missing field is a suffix field. If a future abi_stable
+    /// upgrade makes this pass, the compatibility probe (and this test) can
+    /// be retired.
+    #[test]
+    fn live_module_still_rejects_smaller_library() {
+        assert!(
+            check_layout_compatibility(
+                <PluginModuleRef as StableAbi>::LAYOUT,
+                <compat::PluginModuleRef as StableAbi>::LAYOUT,
+            )
+            .is_err(),
+            "abi_stable now tolerates missing suffix fields; the compat probe is obsolete"
+        );
     }
 }
