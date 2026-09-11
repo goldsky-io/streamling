@@ -108,12 +108,34 @@ static KAFKA_HEADER_OPERATION: &str = "dbz.op";
 /// can fail on the next `check_error()` call.
 struct KafkaProducerContext {
     first_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Previous stats sample, so the periodic log can report *rates* rather
+    /// than librdkafka's monotonically growing counters.
+    prev_stats: Arc<std::sync::Mutex<Option<ProducerStatsSample>>>,
+}
+
+/// The cumulative counters we diff between two `stats()` callbacks.
+#[derive(Clone)]
+struct ProducerStatsSample {
+    ts_us: i64,
+    txmsgs: i64,
+    txmsg_bytes: i64,
+    /// Keyed by broker name (`HOSTNAME:PORT/ID`).
+    brokers: std::collections::HashMap<String, BrokerStatsSample>,
+}
+
+#[derive(Clone, Copy)]
+struct BrokerStatsSample {
+    tx: u64,
+    txbytes: u64,
+    req_timeouts: u64,
+    txretries: u64,
 }
 
 impl KafkaProducerContext {
     fn new() -> Self {
         Self {
             first_error: Arc::new(std::sync::Mutex::new(None)),
+            prev_stats: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -127,7 +149,159 @@ impl KafkaProducerContext {
     }
 }
 
-impl ClientContext for KafkaProducerContext {}
+impl ClientContext for KafkaProducerContext {
+    /// Periodic librdkafka producer statistics, flattened into one log line per
+    /// broker plus one producer-wide line.
+    ///
+    /// This exists to answer a single question when a Kafka sink is slow: is the
+    /// pipeline failing to feed the producer, or is the broker/network failing
+    /// to drain it? The two look identical from the outside and have opposite
+    /// fixes.
+    ///
+    /// - `queue_used_pct` near 100 means the sink is the bottleneck: rows are
+    ///   piling up locally because the broker cannot absorb them. Near 0 means
+    ///   the producer is starved and the bottleneck is upstream (source,
+    ///   transform, or Avro encoding).
+    /// - `rtt_p99_ms` is the broker round trip. A WAN-distance broker shows tens
+    ///   to low hundreds of ms; seconds means the broker or the path is sick.
+    /// - `throttle_max_ms` is the broker's own `throttle_time_ms` from the
+    ///   ProduceResponse, i.e. a *deliberate* Kafka quota. Non-zero here is a
+    ///   definitive answer: the broker is rate limiting us on purpose.
+    /// - `wire_kbps` is what we actually achieve on the socket, and
+    ///   `avg_req_kb` the mean ProduceRequest size. A small `wire_kbps` with a
+    ///   healthy `rtt` and a full queue points at bandwidth or a middlebox
+    ///   rather than at the broker's own latency.
+    /// - `in_flight` pinned at a low number while the queue is full means we are
+    ///   pipelining-limited (bandwidth-delay product), which is the one failure
+    ///   mode a client-side config change can fix.
+    fn stats(&self, statistics: rdkafka::Statistics) {
+        let now_us = statistics.ts;
+        let mut guard = self.prev_stats.lock().unwrap();
+        let prev = guard.clone();
+
+        let mut brokers = std::collections::HashMap::new();
+        for (name, broker) in &statistics.brokers {
+            brokers.insert(
+                name.clone(),
+                BrokerStatsSample {
+                    tx: broker.tx,
+                    txbytes: broker.txbytes,
+                    req_timeouts: broker.req_timeouts,
+                    txretries: broker.txretries,
+                },
+            );
+        }
+        *guard = Some(ProducerStatsSample {
+            ts_us: now_us,
+            txmsgs: statistics.txmsgs,
+            txmsg_bytes: statistics.txmsg_bytes,
+            brokers,
+        });
+        drop(guard);
+
+        // librdkafka's clock is monotonic microseconds; guard against the first
+        // sample and against a non-advancing clock.
+        let elapsed_s = prev
+            .as_ref()
+            .map(|p| (now_us - p.ts_us) as f64 / 1_000_000.0)
+            .filter(|s| *s > 0.0);
+
+        let queue_used_pct = if statistics.msg_size_max > 0 {
+            (statistics.msg_size as f64 / statistics.msg_size_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let queue_msgs_pct = if statistics.msg_max > 0 {
+            (statistics.msg_cnt as f64 / statistics.msg_max as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let (msgs_per_s, produced_kbps) = match (&prev, elapsed_s) {
+            (Some(p), Some(secs)) => (
+                (statistics.txmsgs - p.txmsgs) as f64 / secs,
+                (statistics.txmsg_bytes - p.txmsg_bytes) as f64 / 1024.0 / secs,
+            ),
+            _ => (0.0, 0.0),
+        };
+
+        info!(
+            "kafka producer stats: queue_used_pct={:.1} ({} / {} bytes), queue_msgs_pct={:.1} ({} / {} msgs), produced={:.0} msg/s {:.1} KiB/s",
+            queue_used_pct,
+            statistics.msg_size,
+            statistics.msg_size_max,
+            queue_msgs_pct,
+            statistics.msg_cnt,
+            statistics.msg_max,
+            msgs_per_s,
+            produced_kbps,
+        );
+
+        for (name, broker) in &statistics.brokers {
+            // Bootstrap/logical handles carry no produce traffic; skip the noise.
+            if broker.nodeid < 0 && broker.tx == 0 {
+                continue;
+            }
+
+            let prev_broker = prev.as_ref().and_then(|p| p.brokers.get(name).copied());
+            let (wire_kbps, reqs_per_s, avg_req_kb) = match (prev_broker, elapsed_s) {
+                (Some(pb), Some(secs)) => {
+                    let d_bytes = broker.txbytes.saturating_sub(pb.txbytes) as f64;
+                    let d_reqs = broker.tx.saturating_sub(pb.tx) as f64;
+                    (
+                        d_bytes / 1024.0 / secs,
+                        d_reqs / secs,
+                        if d_reqs > 0.0 {
+                            d_bytes / d_reqs / 1024.0
+                        } else {
+                            0.0
+                        },
+                    )
+                }
+                _ => (0.0, 0.0, 0.0),
+            };
+            let d_timeouts = prev_broker
+                .map(|pb| broker.req_timeouts.saturating_sub(pb.req_timeouts))
+                .unwrap_or(0);
+            let d_retries = prev_broker
+                .map(|pb| broker.txretries.saturating_sub(pb.txretries))
+                .unwrap_or(0);
+
+            let win_ms = |w: &Option<rdkafka::statistics::Window>,
+                          field: fn(&rdkafka::statistics::Window) -> i64| {
+                w.as_ref().map(|w| field(w) as f64 / 1000.0).unwrap_or(0.0)
+            };
+            // `rtt`, `int_latency` and `outbuf_latency` are microseconds;
+            // `throttle` is already milliseconds.
+            let throttle_avg = broker.throttle.as_ref().map(|w| w.avg).unwrap_or(0);
+            let throttle_max = broker.throttle.as_ref().map(|w| w.max).unwrap_or(0);
+
+            info!(
+                "kafka broker stats: broker={} state={} rtt_avg_ms={:.1} rtt_p99_ms={:.1} throttle_avg_ms={} throttle_max_ms={} wire_kbps={:.1} reqs_per_s={:.1} avg_req_kb={:.1} in_flight={} outbuf_reqs={} outbuf_msgs={} int_latency_avg_ms={:.1} outbuf_latency_avg_ms={:.1} req_timeouts_delta={} retries_delta={} txerrs={} connects={:?} disconnects={:?} produce_reqs={}",
+                broker.name,
+                broker.state,
+                win_ms(&broker.rtt, |w| w.avg),
+                win_ms(&broker.rtt, |w| w.p99),
+                throttle_avg,
+                throttle_max,
+                wire_kbps,
+                reqs_per_s,
+                avg_req_kb,
+                broker.waitresp_cnt,
+                broker.outbuf_cnt,
+                broker.outbuf_msg_cnt,
+                win_ms(&broker.int_latency, |w| w.avg),
+                win_ms(&broker.outbuf_latency, |w| w.avg),
+                d_timeouts,
+                d_retries,
+                broker.txerrs,
+                broker.connects,
+                broker.disconnects,
+                broker.req.get("Produce").copied().unwrap_or(0),
+            );
+        }
+    }
+}
 
 impl rdkafka::producer::ProducerContext for KafkaProducerContext {
     type DeliveryOpaque = ();
@@ -2987,7 +3161,49 @@ impl KafkaSink {
         // Applied last so the per-sink setting wins over the optimizer default.
         builder.set("compression.type", compression.as_str());
 
+        if let Some(interval) = &config.statistics_interval_ms {
+            builder.set("statistics.interval.ms", interval);
+        }
+
+        // The escape hatch outranks everything above it on purpose: it exists so
+        // a broker-specific tuning experiment does not need a new image.
+        for (key, value) in Self::parse_producer_overrides(config.producer_overrides.as_deref()) {
+            info!("Kafka producer override: {}={}", key, value);
+            builder.set(key, value);
+        }
+
         builder
+    }
+
+    /// Parse the `producer_overrides` escape hatch: a comma-separated
+    /// `key=value` list. Malformed entries are skipped with a warning rather
+    /// than failing the pipeline, so a typo in a debugging knob cannot take a
+    /// sink down.
+    fn parse_producer_overrides(raw: Option<&str>) -> Vec<(String, String)> {
+        let Some(raw) = raw else {
+            return Vec::new();
+        };
+        raw.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| match entry.split_once('=') {
+                Some((key, value)) => {
+                    let (key, value) = (key.trim(), value.trim());
+                    if key.is_empty() {
+                        warn!("ignoring Kafka producer override with empty key: '{entry}'");
+                        None
+                    } else {
+                        Some((key.to_string(), value.to_string()))
+                    }
+                }
+                None => {
+                    warn!(
+                        "ignoring malformed Kafka producer override (expected key=value): '{entry}'"
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 
     /// One producer per sink, shared by every concurrent write stream.
@@ -3788,6 +4004,8 @@ mod tests {
             consumer_group_id: None,
             client_id: None,
             lag_report_interval_ms: None,
+            statistics_interval_ms: None,
+            producer_overrides: None,
         }
     }
 
@@ -3811,6 +4029,69 @@ mod tests {
                 "compression {compression:?} should reach the producer config"
             );
         }
+    }
+
+    #[test]
+    fn producer_overrides_are_parsed_and_win_over_everything_else() {
+        let mut config = test_kafka_config();
+        // Deliberately fight both the optimizer default (lz4) and a per-sink
+        // setting (linger.ms from batch_flush_interval).
+        config.producer_overrides = Some(
+            "max.in.flight.requests.per.connection=5, linger.ms=5 ,compression.type=zstd".into(),
+        );
+        config.statistics_interval_ms = Some("10000".into());
+
+        let cfg = KafkaSink::build_producer_config(
+            &config,
+            Some(200),
+            Some(200),
+            None,
+            KafkaCompression::Lz4,
+        );
+
+        assert_eq!(
+            cfg.get("max.in.flight.requests.per.connection"),
+            Some("5"),
+            "override should reach the producer config"
+        );
+        assert_eq!(
+            cfg.get("linger.ms"),
+            Some("5"),
+            "override is applied after the per-sink batch_flush_interval"
+        );
+        assert_eq!(
+            cfg.get("compression.type"),
+            Some("zstd"),
+            "override is applied after the per-sink compression"
+        );
+        assert_eq!(cfg.get("statistics.interval.ms"), Some("10000"));
+    }
+
+    #[test]
+    fn malformed_producer_overrides_are_skipped_not_fatal() {
+        let parsed = KafkaSink::parse_producer_overrides(Some(
+            "good.key=1,,no-equals-sign,  =emptykey, spaced.key = 2 ",
+        ));
+        assert_eq!(
+            parsed,
+            vec![
+                ("good.key".to_string(), "1".to_string()),
+                ("spaced.key".to_string(), "2".to_string()),
+            ],
+        );
+        assert!(KafkaSink::parse_producer_overrides(None).is_empty());
+    }
+
+    #[test]
+    fn statistics_are_off_unless_explicitly_configured() {
+        let cfg = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            None,
+            KafkaCompression::None,
+        );
+        assert_eq!(cfg.get("statistics.interval.ms"), None);
     }
 
     #[test]
