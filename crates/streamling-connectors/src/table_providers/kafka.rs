@@ -121,6 +121,9 @@ struct ProducerStatsSample {
     txmsg_bytes: i64,
     /// Keyed by broker name (`HOSTNAME:PORT/ID`).
     brokers: std::collections::HashMap<String, BrokerStatsSample>,
+    /// Transmitted-message counters keyed by `topic/partition`, so a partition
+    /// that holds a backlog while making no progress can be spotted.
+    partitions: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,7 +132,26 @@ struct BrokerStatsSample {
     txbytes: u64,
     req_timeouts: u64,
     txretries: u64,
+    connects: i64,
+    disconnects: i64,
 }
+
+/// One partition's producer-side backlog, flattened from librdkafka's stats.
+struct PartInfo {
+    key: String,
+    backlog: i64,
+    progressed: bool,
+    leader: i32,
+}
+
+/// A partition is "stalled" when it is holding this many queued messages and
+/// transmitted none since the previous sample. Per-partition ordering means one
+/// such partition throttles the whole sink while every broker-level aggregate
+/// still looks healthy, so this is the case the summary line exists to catch.
+const PARTITION_STALL_BACKLOG: i64 = 100;
+/// Cap on individually logged stalled partitions, so a broker-wide outage
+/// cannot turn one stats tick into hundreds of log lines.
+const MAX_STALLED_PARTITIONS_LOGGED: usize = 5;
 
 impl KafkaProducerContext {
     fn new() -> Self {
@@ -188,14 +210,23 @@ impl ClientContext for KafkaProducerContext {
                     txbytes: broker.txbytes,
                     req_timeouts: broker.req_timeouts,
                     txretries: broker.txretries,
+                    connects: broker.connects.unwrap_or(0),
+                    disconnects: broker.disconnects.unwrap_or(0),
                 },
             );
+        }
+        let mut partitions = std::collections::HashMap::new();
+        for topic in statistics.topics.values() {
+            for part in topic.partitions.values() {
+                partitions.insert(format!("{}/{}", topic.topic, part.partition), part.txmsgs);
+            }
         }
         *guard = Some(ProducerStatsSample {
             ts_us: now_us,
             txmsgs: statistics.txmsgs,
             txmsg_bytes: statistics.txmsg_bytes,
             brokers,
+            partitions,
         });
         drop(guard);
 
@@ -266,6 +297,19 @@ impl ClientContext for KafkaProducerContext {
             let d_retries = prev_broker
                 .map(|pb| broker.txretries.saturating_sub(pb.txretries))
                 .unwrap_or(0);
+            // Deltas, not the cumulative counters: reconnect thrash is visible
+            // in one line instead of requiring a diff across two.
+            let d_connects = prev_broker
+                .map(|pb| broker.connects.unwrap_or(0).saturating_sub(pb.connects))
+                .unwrap_or(0);
+            let d_disconnects = prev_broker
+                .map(|pb| {
+                    broker
+                        .disconnects
+                        .unwrap_or(0)
+                        .saturating_sub(pb.disconnects)
+                })
+                .unwrap_or(0);
 
             let win_ms = |w: &Option<rdkafka::statistics::Window>,
                           field: fn(&rdkafka::statistics::Window) -> i64| {
@@ -277,7 +321,7 @@ impl ClientContext for KafkaProducerContext {
             let throttle_max = broker.throttle.as_ref().map(|w| w.max).unwrap_or(0);
 
             info!(
-                "kafka broker stats: broker={} state={} rtt_avg_ms={:.1} rtt_p99_ms={:.1} throttle_avg_ms={} throttle_max_ms={} wire_kbps={:.1} reqs_per_s={:.1} avg_req_kb={:.1} in_flight={} outbuf_reqs={} outbuf_msgs={} int_latency_avg_ms={:.1} outbuf_latency_avg_ms={:.1} req_timeouts_delta={} retries_delta={} txerrs={} connects={:?} disconnects={:?} produce_reqs={}",
+                "kafka broker stats: broker={} state={} rtt_avg_ms={:.1} rtt_p99_ms={:.1} throttle_avg_ms={} throttle_max_ms={} wire_kbps={:.1} reqs_per_s={:.1} avg_req_kb={:.1} in_flight={} outbuf_reqs={} outbuf_msgs={} int_latency_avg_ms={:.1} outbuf_latency_avg_ms={:.1} req_timeouts_delta={} retries_delta={} txerrs={} connects_delta={} disconnects_delta={} connects_total={} produce_reqs={}",
                 broker.name,
                 broker.state,
                 win_ms(&broker.rtt, |w| w.avg),
@@ -295,9 +339,103 @@ impl ClientContext for KafkaProducerContext {
                 d_timeouts,
                 d_retries,
                 broker.txerrs,
-                broker.connects,
-                broker.disconnects,
+                d_connects,
+                d_disconnects,
+                broker.connects.unwrap_or(0),
                 broker.req.get("Produce").copied().unwrap_or(0),
+            );
+        }
+
+        Self::log_partition_backlog(&statistics, prev.as_ref(), elapsed_s.is_some());
+    }
+}
+
+impl KafkaProducerContext {
+    /// Flatten librdkafka's per-topic/per-partition stats into the few fields
+    /// the backlog summary needs. Pure, so the stall rule can be tested without
+    /// a live producer.
+    fn collect_partition_info(
+        statistics: &rdkafka::Statistics,
+        prev: Option<&ProducerStatsSample>,
+    ) -> Vec<PartInfo> {
+        let mut parts = Vec::new();
+        for topic in statistics.topics.values() {
+            for part in topic.partitions.values() {
+                // librdkafka reports an internal partition -1 for messages not
+                // yet assigned to a real partition; it has no leader and would
+                // otherwise look like a permanently stalled partition.
+                if part.partition < 0 {
+                    continue;
+                }
+                let key = format!("{}/{}", topic.topic, part.partition);
+                let progressed = prev
+                    .and_then(|p| p.partitions.get(&key))
+                    .map(|prev_tx| part.txmsgs > *prev_tx)
+                    // No previous sample for this partition: assume progress
+                    // rather than reporting a spurious stall on the first tick.
+                    .unwrap_or(true);
+                parts.push(PartInfo {
+                    backlog: part.msgq_cnt + part.xmit_msgq_cnt,
+                    progressed,
+                    leader: part.leader,
+                    key,
+                });
+            }
+        }
+        parts
+    }
+
+    /// Per-partition backlog, summarised.
+    ///
+    /// Every broker-level number in the line above is an aggregate, and Kafka
+    /// preserves ordering per partition — so a single partition that stops
+    /// draining (lost leader, a batch stuck in retry) throttles the whole sink
+    /// while `queue_used_pct`, `rtt` and `wire_kbps` all still look reasonable.
+    /// One summary line per tick makes that visible; individual partitions are
+    /// logged only when they are actually stalled, so a healthy sink stays quiet.
+    fn log_partition_backlog(
+        statistics: &rdkafka::Statistics,
+        prev: Option<&ProducerStatsSample>,
+        have_prev_window: bool,
+    ) {
+        let parts = Self::collect_partition_info(statistics, prev);
+        if parts.is_empty() {
+            return;
+        }
+
+        let total_backlog: i64 = parts.iter().map(|p| p.backlog).sum();
+        let with_backlog = parts.iter().filter(|p| p.backlog > 0).count();
+        let max = parts.iter().max_by_key(|p| p.backlog).expect("non-empty");
+        // Only meaningful once a previous sample exists to diff against.
+        let stalled: Vec<&PartInfo> = if have_prev_window {
+            parts
+                .iter()
+                .filter(|p| p.backlog >= PARTITION_STALL_BACKLOG && !p.progressed)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        info!(
+            "kafka partition backlog: partitions={} with_backlog={} total_backlog={} max_backlog={} (on {}) stalled={}",
+            parts.len(),
+            with_backlog,
+            total_backlog,
+            max.backlog,
+            max.key,
+            stalled.len(),
+        );
+
+        for p in stalled.iter().take(MAX_STALLED_PARTITIONS_LOGGED) {
+            warn!(
+                "kafka partition stalled: {} holding {} queued message(s) with no transmission since the last sample (leader broker {})",
+                p.key, p.backlog, p.leader,
+            );
+        }
+        if stalled.len() > MAX_STALLED_PARTITIONS_LOGGED {
+            warn!(
+                "kafka partition stalled: {} further stalled partition(s) not listed",
+                stalled.len() - MAX_STALLED_PARTITIONS_LOGGED,
             );
         }
     }
@@ -4029,6 +4167,77 @@ mod tests {
                 "compression {compression:?} should reach the producer config"
             );
         }
+    }
+
+    fn stats_with_partitions(parts: &[(i32, i64, i64, u64)]) -> rdkafka::Statistics {
+        use rdkafka::statistics::{Partition, Topic};
+        let mut topic = Topic {
+            topic: "t".to_string(),
+            ..Default::default()
+        };
+        for (id, msgq, xmit, txmsgs) in parts {
+            topic.partitions.insert(
+                *id,
+                Partition {
+                    partition: *id,
+                    msgq_cnt: *msgq,
+                    xmit_msgq_cnt: *xmit,
+                    txmsgs: *txmsgs,
+                    leader: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut stats = rdkafka::Statistics::default();
+        stats.topics.insert("t".to_string(), topic);
+        stats
+    }
+
+    fn prev_sample(parts: &[(&str, u64)]) -> ProducerStatsSample {
+        ProducerStatsSample {
+            ts_us: 0,
+            txmsgs: 0,
+            txmsg_bytes: 0,
+            brokers: std::collections::HashMap::new(),
+            partitions: parts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        }
+    }
+
+    #[test]
+    fn partition_with_backlog_and_no_transmission_is_stalled() {
+        // p0 holds a backlog and its txmsgs did not move; p1 holds the same
+        // backlog but is draining. Only p0 is a stall.
+        let stats = stats_with_partitions(&[(0, 500, 0, 1_000), (1, 500, 0, 2_500)]);
+        let prev = prev_sample(&[("t/0", 1_000), ("t/1", 2_000)]);
+        let parts = KafkaProducerContext::collect_partition_info(&stats, Some(&prev));
+
+        let stalled: Vec<&str> = parts
+            .iter()
+            .filter(|p| p.backlog >= PARTITION_STALL_BACKLOG && !p.progressed)
+            .map(|p| p.key.as_str())
+            .collect();
+        assert_eq!(stalled, vec!["t/0"]);
+        assert!(parts.iter().all(|p| p.leader == 1));
+    }
+
+    #[test]
+    fn internal_unassigned_partition_is_not_reported_as_stalled() {
+        // librdkafka's partition -1 holds not-yet-assigned messages and never
+        // transmits; without the filter it would look stalled forever.
+        let stats = stats_with_partitions(&[(-1, 5_000, 0, 0), (0, 10, 0, 5)]);
+        let parts = KafkaProducerContext::collect_partition_info(&stats, None);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].key, "t/0");
+    }
+
+    #[test]
+    fn first_sample_does_not_report_spurious_stalls() {
+        // No previous sample: every partition must count as progressing, or the
+        // first stats tick after startup would warn about every partition.
+        let stats = stats_with_partitions(&[(0, 9_000, 500, 0), (1, 9_000, 0, 0)]);
+        let parts = KafkaProducerContext::collect_partition_info(&stats, None);
+        assert!(parts.iter().all(|p| p.progressed));
+        assert_eq!(parts.iter().map(|p| p.backlog).sum::<i64>(), 18_500);
     }
 
     #[test]
