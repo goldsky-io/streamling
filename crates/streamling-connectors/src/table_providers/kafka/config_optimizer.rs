@@ -4,10 +4,19 @@ use reqwest_retry::policies::ExponentialBackoff;
 use std::time::Duration;
 use streamling_config::KafkaConfig;
 use streamling_core::error::ResultExt;
-use tracing::debug;
+use tracing::{debug, info};
 
 const IMDS_TOKEN_ENDPOINT: &str = "http://169.254.169.254/latest/api/token";
 const AZ_ENDPOINT: &str = "http://169.254.169.254/latest/meta-data/placement/availability-zone/";
+
+/// Look up an already-assembled config value, for logging what actually took
+/// effect.
+fn get<'a>(config: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    config
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
 
 pub struct KafkaConfigOptimizer {
     kafka_config: KafkaConfig,
@@ -37,21 +46,61 @@ impl KafkaConfigOptimizer {
 
             let mut config = self.to_string_vec(config);
 
-            let az = tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current().block_on(async move { self.load_az().await })
-            });
-
-            if let Ok(az) = az {
-                debug!("Detected AZ: {}", az);
-                config.push(("client.id".to_string(), format!("warpstream_az={}", az)));
-            } else {
-                debug!("Failed to detect AZ");
+            if let Some(backoff) = &self.kafka_config.fetch_queue_backoff_ms {
+                config.push(("fetch.queue.backoff.ms".to_string(), backoff.clone()));
             }
+
+            if let Some(client_id) = self.warpstream_client_id() {
+                config.push(("client.id".to_string(), client_id));
+            }
+
+            info!(
+                "WarpStream consumer tuning: fetch.queue.backoff.ms={:?}, client.id={:?}",
+                get(&config, "fetch.queue.backoff.ms"),
+                get(&config, "client.id"),
+            );
 
             config
         } else {
-            vec![]
+            let mut config = vec![];
+
+            if let Some(backoff) = &self.kafka_config.fetch_queue_backoff_ms {
+                config.push(("fetch.queue.backoff.ms".to_string(), backoff.clone()));
+            }
+
+            config
         }
+    }
+
+    /// Assemble the WarpStream `client.id`, which WarpStream parses as a
+    /// comma-separated flag list. The auto-detected AZ comes first (when
+    /// detection succeeds) and any configured extra flags are appended, so a
+    /// flag override never costs us AZ-aware fetching.
+    fn warpstream_client_id(&self) -> Option<String> {
+        let az = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { self.load_az().await })
+        });
+
+        let mut parts = Vec::new();
+        match az {
+            Ok(az) => {
+                debug!("Detected AZ: {}", az);
+                parts.push(format!("warpstream_az={}", az));
+            }
+            Err(_) => debug!("Failed to detect AZ"),
+        }
+
+        if let Some(flags) = &self.kafka_config.warpstream_client_id_flags {
+            parts.extend(
+                flags
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string),
+            );
+        }
+
+        (!parts.is_empty()).then(|| parts.join(","))
     }
 
     pub fn optimized_producer_config(&self) -> Vec<(String, String)> {
@@ -79,15 +128,8 @@ impl KafkaConfigOptimizer {
 
             let mut config = self.to_string_vec(config);
 
-            let az = tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current().block_on(async move { self.load_az().await })
-            });
-
-            if let Ok(az) = az {
-                debug!("Detected AZ: {}", az);
-                config.push(("client.id".to_string(), format!("warpstream_az={}", az)));
-            } else {
-                debug!("Failed to detect AZ");
+            if let Some(client_id) = self.warpstream_client_id() {
+                config.push(("client.id".to_string(), client_id));
             }
 
             config
@@ -152,5 +194,72 @@ impl KafkaConfigOptimizer {
             .streamling_context("failed to read AZ")?;
 
         Ok(az)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(brokers: &str) -> KafkaConfig {
+        KafkaConfig {
+            brokers: brokers.to_string(),
+            security_protocol: "plaintext".to_string(),
+            sasl_mechanism: None,
+            sasl_username: None,
+            sasl_password: None,
+            schema_registry_url: None,
+            schema_registry_username: None,
+            schema_registry_password: None,
+            consumer_group_id: None,
+            client_id: None,
+            lag_report_interval_ms: None,
+            fetch_queue_backoff_ms: None,
+            warpstream_client_id_flags: None,
+        }
+    }
+
+    #[test]
+    fn fetch_queue_backoff_is_unset_by_default() {
+        let optimizer = KafkaConfigOptimizer::new(&config("localhost:9092"));
+        let consumer = optimizer.optimized_consumer_config();
+        assert_eq!(get(&consumer, "fetch.queue.backoff.ms"), None);
+    }
+
+    #[test]
+    fn fetch_queue_backoff_applies_to_non_warpstream_brokers() {
+        let mut cfg = config("localhost:9092");
+        cfg.fetch_queue_backoff_ms = Some("100".to_string());
+
+        let optimizer = KafkaConfigOptimizer::new(&cfg);
+        let consumer = optimizer.optimized_consumer_config();
+        assert_eq!(get(&consumer, "fetch.queue.backoff.ms"), Some("100"));
+    }
+
+    #[test]
+    fn client_id_flags_are_split_trimmed_and_joined() {
+        let mut cfg = config("localhost:9092");
+        cfg.warpstream_client_id_flags =
+            Some(" warpstream_disable_fetch_auto_tune=true , , other=1 ".to_string());
+
+        let optimizer = KafkaConfigOptimizer::new(&cfg);
+        // AZ detection is skipped here; only the configured flags remain.
+        let flags: Vec<&str> = cfg
+            .warpstream_client_id_flags
+            .as_ref()
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert_eq!(
+            flags,
+            vec!["warpstream_disable_fetch_auto_tune=true", "other=1"]
+        );
+        // Non-WarpStream brokers never emit a client.id.
+        assert_eq!(
+            get(&optimizer.optimized_consumer_config(), "client.id"),
+            None
+        );
     }
 }

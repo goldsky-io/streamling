@@ -3788,6 +3788,8 @@ mod tests {
             consumer_group_id: None,
             client_id: None,
             lag_report_interval_ms: None,
+            fetch_queue_backoff_ms: None,
+            warpstream_client_id_flags: None,
         }
     }
 

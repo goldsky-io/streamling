@@ -275,6 +275,13 @@ pub struct KafkaConfig {
     pub consumer_group_id: Option<String>, // Source only property
     pub client_id: Option<String>,
     pub lag_report_interval_ms: Option<u64>,
+    /// librdkafka `fetch.queue.backoff.ms` for the consumer. Left unset,
+    /// librdkafka's own default applies.
+    pub fetch_queue_backoff_ms: Option<String>,
+    /// Extra comma-separated flags appended to the WarpStream `client.id`
+    /// (e.g. `warpstream_disable_fetch_auto_tune=true`). Appended after the
+    /// auto-detected `warpstream_az=<az>` rather than replacing it.
+    pub warpstream_client_id_flags: Option<String>,
 }
 
 impl std::fmt::Debug for KafkaConfig {
@@ -302,6 +309,11 @@ impl std::fmt::Debug for KafkaConfig {
             )
             .field("consumer_group_id", &self.consumer_group_id)
             .field("client_id", &self.client_id)
+            .field("fetch_queue_backoff_ms", &self.fetch_queue_backoff_ms)
+            .field(
+                "warpstream_client_id_flags",
+                &self.warpstream_client_id_flags,
+            )
             .finish()
     }
 }
