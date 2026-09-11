@@ -304,7 +304,7 @@ jobs:
             os: linux
             arch: aarch64
             image_arch: arm64
-    steps:
+    steps: &image_push_steps
       - name: Mask AWS account ID
         env:
           AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
@@ -440,3 +440,73 @@ jobs:
           set -euo pipefail
           tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
           gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "$tag" --notes "Nightly prerelease from main @ $GITHUB_SHA. Linux binaries only; use the versioned releases for macOS/Windows." release-assets/*
+
+  # ==========================================================================
+  # Branch image publish, so a branch can be deployed for testing without
+  # landing on main first. Scoped to non-main refs; the main publish above is
+  # untouched.
+  # ==========================================================================
+  build-and-push-image-branch:
+    needs: [validate-and-test, build-release-main]
+    if: ${{ always() && github.ref_name != 'main' && needs.validate-and-test.result != 'failure' && needs.build-release-main.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            os: linux
+            arch: x86_64
+            image_arch: amd64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            os: linux
+            arch: aarch64
+            image_arch: arm64
+    steps: *image_push_steps
+
+  create-manifest-branch:
+    needs: [build-and-push-image-branch]
+    if: ${{ always() && github.ref_name != 'main' && needs.build-and-push-image-branch.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Mask AWS account ID
+        env:
+          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
+        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Create and push multi-arch manifest
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: streamling
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
+          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG
+          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest
+
+          docker manifest create $TAG_SHA \
+            $TAG_SHA-amd64 \
+            $TAG_SHA-arm64
+          docker manifest push $TAG_SHA
+
+          docker manifest create $TAG_LATEST \
+            $TAG_LATEST-amd64 \
+            $TAG_LATEST-arm64
+          docker manifest push $TAG_LATEST
+
+          echo "Created multi-arch manifests:"
+          echo "  - $TAG_SHA"
+          echo "  - $TAG_LATEST"
