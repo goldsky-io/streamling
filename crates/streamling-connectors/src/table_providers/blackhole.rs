@@ -20,11 +20,15 @@ use streamling_core::operators::parallel_sink::ParallelSinkExec;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
+use tracing::info;
+
+/// How often each blackhole writer reports its observed throughput.
+const THROUGHPUT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 struct BlackholeSink {
     schema: SchemaRef,
@@ -67,6 +71,12 @@ impl DataSink for BlackholeSink {
     ) -> Result<u64> {
         let mut row_count = 0;
 
+        // Throughput accounting for this writer task. The blackhole sink exists
+        // to measure how fast a topology can go, so report that rate in the
+        // logs rather than only through the metrics pipeline.
+        let mut last_log_at = Instant::now();
+        let mut rows_since_log: usize = 0;
+
         let metrics_recorder = get_metrics_recorder().clone();
         while let Some(batch) = data.next().await.transpose()? {
             let arrival_time_ms = now_ms();
@@ -82,6 +92,22 @@ impl DataSink for BlackholeSink {
                 self.metric_metadata_id.as_str(),
             );
             metrics_recorder.record_elapsed_compute(start_at.elapsed(), &self.metric_metadata_id);
+
+            rows_since_log += num_rows_in_batch;
+            let since_last_log = last_log_at.elapsed();
+            if since_last_log >= THROUGHPUT_LOG_INTERVAL {
+                info!(
+                    "[{}] blackhole throughput: {:.0} rows/s ({} rows in {:.1}s), {} rows this writer, {} rows all writers",
+                    self.metric_metadata_id,
+                    rows_since_log as f64 / since_last_log.as_secs_f64(),
+                    rows_since_log,
+                    since_last_log.as_secs_f64(),
+                    row_count,
+                    total_received,
+                );
+                rows_since_log = 0;
+                last_log_at = Instant::now();
+            }
 
             let ack_start = Instant::now();
             let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
