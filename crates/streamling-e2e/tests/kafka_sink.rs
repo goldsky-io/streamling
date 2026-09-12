@@ -525,6 +525,20 @@ sinks:
         producers_created, parallelism,
         "expected one producer per write stream, got {producers_created}.\nLogs:\n{logs}"
     );
+
+    // The sink sizes each producer's out-queue by this count, so a stale value
+    // would silently hand every stream the whole sink's buffer budget.
+    let budget_split_by = logs
+        .lines()
+        .filter(|line| {
+            line.contains("Creating Kafka producer for topic")
+                && line.contains(&format!("write_streams={parallelism}"))
+        })
+        .count();
+    assert_eq!(
+        budget_split_by, parallelism,
+        "every producer must be sized for {parallelism} write streams.\nLogs:\n{logs}"
+    );
 }
 
 // ============================================================================

@@ -36,8 +36,8 @@ use datafusion::physical_expr::expressions::col as physical_col;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
     execution_plan::{Boundedness, EmissionType},
     filter::FilterExec,
     project_schema,
@@ -2800,6 +2800,10 @@ pub struct KafkaSink {
     message_max_bytes: Option<u32>,
     /// Producer compression codec (maps to librdkafka's compression.type)
     compression: KafkaCompression,
+    /// Concurrent `write_all` streams `ParallelSinkExec` will run (the input's
+    /// partition count). Each one builds its own producer, so the out-queue
+    /// budget is divided by this — see `build_producer_config`.
+    write_streams: usize,
 }
 
 impl KafkaSink {
@@ -2816,6 +2820,7 @@ impl KafkaSink {
         batch_flush_interval_ms: Option<u64>,
         message_max_bytes: Option<u32>,
         compression: KafkaCompression,
+        write_streams: usize,
     ) -> Self {
         let subject_name_strategy = SubjectNameStrategy::TopicNameStrategy(topic.to_owned(), false);
         let topic_partitions = topic_partitions.unwrap_or(DEFAULT_NUM_PARTITIONS);
@@ -2836,6 +2841,7 @@ impl KafkaSink {
             batch_flush_interval_ms,
             message_max_bytes,
             compression,
+            write_streams,
         }
     }
 
@@ -2955,13 +2961,26 @@ impl KafkaSink {
         }
     }
 
+    /// librdkafka's own defaults, used when the optimizer leaves a knob unset.
+    const DEFAULT_QUEUE_MAX_MESSAGES: u64 = 100_000;
+    const DEFAULT_QUEUE_MAX_KBYTES: u64 = 1_048_576;
+    const DEFAULT_MESSAGE_MAX_BYTES: u64 = 1_000_000;
+
     /// Assemble the librdkafka producer configuration.
+    ///
+    /// `write_streams` is the number of producers the sink will build (one per
+    /// concurrent `write_all`), and the out-queue caps are divided by it: the
+    /// queue size is what bounds a checkpoint flush (`flush()` drains the whole
+    /// out-queue), so N full-size queues would both multiply resident memory by
+    /// N and let one stream's flush wait on N queues' worth of bytes competing
+    /// for the same broker bandwidth.
     fn build_producer_config(
         config: &KafkaConfig,
         batch_size: Option<u32>,
         batch_flush_interval_ms: Option<u64>,
         message_max_bytes: Option<u32>,
         compression: KafkaCompression,
+        write_streams: usize,
     ) -> ClientConfig {
         let mut builder = KafkaCommon::build_client(config);
 
@@ -2986,7 +3005,43 @@ impl KafkaSink {
         // Applied last so the per-sink setting wins over the optimizer default.
         builder.set("compression.type", compression.as_str());
 
+        Self::split_queue_budget_across_streams(&mut builder, write_streams);
+
         builder
+    }
+
+    /// Split the producer out-queue caps across the sink's write streams.
+    ///
+    /// `queue.buffering.max.kbytes` never drops below `message.max.bytes`, or a
+    /// single maximum-size message could not be enqueued at all.
+    fn split_queue_budget_across_streams(builder: &mut ClientConfig, write_streams: usize) {
+        let streams = write_streams.max(1) as u64;
+        if streams == 1 {
+            return;
+        }
+
+        let get = |key: &str, fallback: u64| -> u64 {
+            builder
+                .get(key)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(fallback)
+        };
+        let max_messages = get(
+            "queue.buffering.max.messages",
+            Self::DEFAULT_QUEUE_MAX_MESSAGES,
+        );
+        let max_kbytes = get("queue.buffering.max.kbytes", Self::DEFAULT_QUEUE_MAX_KBYTES);
+        let message_max_kbytes =
+            get("message.max.bytes", Self::DEFAULT_MESSAGE_MAX_BYTES).div_ceil(1024);
+
+        builder.set(
+            "queue.buffering.max.messages",
+            (max_messages / streams).max(1).to_string(),
+        );
+        builder.set(
+            "queue.buffering.max.kbytes",
+            (max_kbytes / streams).max(message_max_kbytes).to_string(),
+        );
     }
 
     /// One producer per concurrent write stream, created by `write_all`.
@@ -3003,12 +3058,13 @@ impl KafkaSink {
     /// stream, and librdkafka picks the topic partition from the message key.
     fn create_producer(&self) -> streamling_core::error::Result<KafkaThreadedProducer> {
         info!(
-            "Creating Kafka producer for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={})",
+            "Creating Kafka producer for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={}, write_streams={})",
             self.topic,
             self.batch_size,
             self.batch_flush_interval_ms,
             self.message_max_bytes,
             self.compression.as_str(),
+            self.write_streams,
         );
 
         Self::build_producer_config(
@@ -3017,6 +3073,7 @@ impl KafkaSink {
             self.batch_flush_interval_ms,
             self.message_max_bytes,
             self.compression,
+            self.write_streams,
         )
         .create_with_context(KafkaProducerContext::new())
         .streamling_context("failed to create Kafka producer")
@@ -3577,6 +3634,10 @@ impl TableProvider for KafkaSinkTableProvider {
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // `ParallelSinkExec` runs one `write_all` per input partition, and each
+        // of those builds its own producer — the sink needs the count to size
+        // each producer's out-queue.
+        let write_streams = input.output_partitioning().partition_count();
         let kafka_sink = Arc::new(KafkaSink::new(
             self.metric_metadata_id.clone(),
             self.schema.clone(),
@@ -3590,6 +3651,7 @@ impl TableProvider for KafkaSinkTableProvider {
             self.batch_flush_interval_ms,
             self.message_max_bytes,
             self.compression,
+            write_streams,
         ));
         let metric_metadata_id = self.metric_metadata_id.clone();
         let wrapper_data_sink = Arc::new(WrappingDataSink::new(
@@ -3790,6 +3852,7 @@ mod tests {
                 None,
                 None,
                 compression,
+                1,
             );
             assert_eq!(
                 cfg.get("compression.type"),
@@ -3809,6 +3872,7 @@ mod tests {
             None,
             None,
             KafkaCompression::Gzip,
+            1,
         );
         assert_eq!(cfg.get("compression.type"), Some("gzip"));
     }
@@ -3821,6 +3885,7 @@ mod tests {
             Some(250),
             Some(20_000_000),
             KafkaCompression::Lz4,
+            1,
         );
         assert_eq!(cfg.get("batch.num.messages"), Some("5000"));
         assert_eq!(cfg.get("linger.ms"), Some("250"));
@@ -3830,13 +3895,59 @@ mod tests {
         assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
     }
 
+    /// Per-stream producers each own a full out-queue, so the sink's queue
+    /// budget is divided by the number of write streams: a single stream's
+    /// flush must not have to drain the whole sink's worth of buffered rows,
+    /// and N full queues would also multiply resident memory by N.
+    #[test]
+    fn build_producer_config_splits_queue_budget_across_write_streams() {
+        let single = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            None,
+            KafkaCompression::Lz4,
+            1,
+        );
+        assert_eq!(single.get("queue.buffering.max.messages"), Some("10000"));
+        assert_eq!(single.get("queue.buffering.max.kbytes"), Some("131072"));
+
+        let parallel = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            None,
+            KafkaCompression::Lz4,
+            4,
+        );
+        assert_eq!(parallel.get("queue.buffering.max.messages"), Some("2500"));
+        assert_eq!(parallel.get("queue.buffering.max.kbytes"), Some("32768"));
+    }
+
+    /// The per-stream queue must always hold at least one maximum-size message,
+    /// otherwise a send can never succeed at high parallelism.
+    #[test]
+    fn build_producer_config_queue_budget_floors_at_message_max_bytes() {
+        let cfg = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            Some(20_971_520),
+            KafkaCompression::Lz4,
+            32,
+        );
+        // 131072 / 32 = 4096 KB, below the 20 MiB message cap.
+        assert_eq!(cfg.get("queue.buffering.max.kbytes"), Some("20480"));
+        assert_eq!(cfg.get("queue.buffering.max.messages"), Some("312"));
+    }
+
     fn unreachable_broker_producer(extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
         let mut config = test_kafka_config();
         // Port 1 never hosts a broker; producer creation is offline so this
         // still succeeds and everything sent just sits in the local queue.
         config.brokers = "127.0.0.1:1".to_string();
         let mut builder =
-            KafkaSink::build_producer_config(&config, None, None, None, KafkaCompression::None);
+            KafkaSink::build_producer_config(&config, None, None, None, KafkaCompression::None, 1);
         for (key, value) in extra_config {
             builder.set(*key, *value);
         }
