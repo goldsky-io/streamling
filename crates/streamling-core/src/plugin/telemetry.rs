@@ -69,7 +69,7 @@ pub fn record_plugin_metric(
 /// by then.
 pub async fn process_plugin_metrics(
     metrics_receiver: RReceiver<PluginMetric_NE>,
-    metrics_recorder: Arc<MetricsRecorder>,
+    metrics_recorder: Option<Arc<MetricsRecorder>>,
     metric_metadata_id: String,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -81,7 +81,6 @@ pub async fn process_plugin_metrics(
         crate::utils::metrics::metric_metadata_id_to_reference_name(&metric_metadata_id)
             .unwrap_or_else(|| metric_metadata_id.clone());
     loop {
-        let metrics_recorder = metrics_recorder.clone();
         match metrics_receiver.try_recv() {
             Ok(metric) => match metric.into_enum() {
                 Ok(metric_enum) => {
@@ -90,7 +89,15 @@ pub async fn process_plugin_metrics(
                     if crate::plugin::diagnostics::intercept_metric(&plugin_name, &metric_enum) {
                         continue;
                     }
-                    record_plugin_metric(metric_enum, metric_metadata_id.clone(), metrics_recorder);
+                    // Telemetry may not be initialized (tests, tooling); the
+                    // drain loop still runs so the channel does not back up.
+                    if let Some(metrics_recorder) = metrics_recorder.clone() {
+                        record_plugin_metric(
+                            metric_enum,
+                            metric_metadata_id.clone(),
+                            metrics_recorder,
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -156,7 +163,7 @@ mod tests {
 
         let handle = tokio::spawn(process_plugin_metrics(
             rx,
-            crate::telemetry::recorder::get_metrics_recorder(),
+            Some(crate::telemetry::recorder::get_metrics_recorder()),
             "test-forwarder".to_string(),
             cancel.clone(),
         ));
@@ -189,7 +196,7 @@ mod tests {
 
         let handle = scope.spawn(process_plugin_metrics(
             rx,
-            crate::telemetry::recorder::get_metrics_recorder(),
+            Some(crate::telemetry::recorder::get_metrics_recorder()),
             "test-stage-forwarder".to_string(),
             scope.stage_token().clone(),
         ));

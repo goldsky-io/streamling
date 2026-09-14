@@ -95,6 +95,12 @@ const DURATION_MS_BOUNDARIES: [f64; 14] = [
     3_600_000.0,
 ];
 
+/// Fine-grained low-end buckets prepended to [`DURATION_MS_BOUNDARIES`] for the
+/// backpressure histogram: channel sends are typically sub-100ms, so the shared
+/// layout (floor 100ms) gives no resolution at all. The high end still matches,
+/// since a slow sink can block for minutes.
+const BACKPRESSURE_LOW_MS_BOUNDARIES: [f64; 7] = [0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0];
+
 /// Gauges represent absolute state (e.g. "lag = 0"), so zero is meaningful
 /// and must be recorded. Additive metrics (counters) adding zero are no-ops.
 fn should_skip_zero_value_metric(metric_value: &MetricValue) -> bool {
@@ -217,6 +223,10 @@ fn should_accrue_elapsed_compute(cumulative_nanos: u64) -> bool {
 }
 
 impl MetricsRecorder {
+    pub fn application_id(&self) -> &str {
+        &self.service_instance_id
+    }
+
     /// Seed each non-sink node's `elapsed_compute` series with a single 1ms
     /// sample so the series exists (and dashboards can find it) even for
     /// nodes that stall before their first batch or never accrue a whole
@@ -345,6 +355,16 @@ impl MetricsRecorder {
         tags: Vec<(&str, &str)>,
         metadata_id: &str,
     ) {
+        self.record_count_w_tag_slice(name, value, &tags, metadata_id);
+    }
+
+    pub fn record_count_w_tag_slice(
+        &self,
+        name: &str,
+        value: u64,
+        tags: &[(&str, &str)],
+        metadata_id: &str,
+    ) {
         let metric_metadata_tags = self
             .metric_metadata_tags_registry
             .lock()
@@ -353,7 +373,7 @@ impl MetricsRecorder {
             .cloned();
         if metric_metadata_tags.is_none() {
             warn!(
-                "record_count_w_tags: metadata_id '{}' not found in registry, skipping metric '{}'",
+                "record_count_w_tag_slice: metadata_id '{}' not found in registry, skipping metric '{}'",
                 metadata_id, name
             );
             return;
@@ -364,7 +384,7 @@ impl MetricsRecorder {
             count: create_count_with_value(value as usize),
         };
         let mut all_tags = metric_metadata_tags.clone();
-        for (k, v) in tags {
+        for &(k, v) in tags {
             all_tags.insert(k.to_string(), v.to_string());
         }
         self.record_metric_data(MetricData::new_with_owned_tags(
@@ -380,6 +400,16 @@ impl MetricsRecorder {
         tags: Vec<(&str, &str)>,
         metadata_id: &str,
     ) {
+        self.record_gauge_w_tag_slice(name, value, &tags, metadata_id);
+    }
+
+    pub fn record_gauge_w_tag_slice(
+        &self,
+        name: &str,
+        value: u64,
+        tags: &[(&str, &str)],
+        metadata_id: &str,
+    ) {
         let metric_metadata_tags = self
             .metric_metadata_tags_registry
             .lock()
@@ -388,7 +418,7 @@ impl MetricsRecorder {
             .cloned();
         if metric_metadata_tags.is_none() {
             warn!(
-                "record_gauge_w_tags: metadata_id '{}' not found in registry, skipping metric '{}'",
+                "record_gauge_w_tag_slice: metadata_id '{}' not found in registry, skipping metric '{}'",
                 metadata_id, name
             );
             return;
@@ -399,7 +429,7 @@ impl MetricsRecorder {
             gauge: create_gauge_with_value(value as usize),
         };
         let mut all_tags = metric_metadata_tags.clone();
-        for (k, v) in tags {
+        for &(k, v) in tags {
             all_tags.insert(k.to_string(), v.to_string());
         }
         self.record_metric_data(MetricData::new_with_owned_tags(
@@ -415,6 +445,16 @@ impl MetricsRecorder {
         tags: Vec<(&str, &str)>,
         metadata_id: &str,
     ) {
+        self.record_time_w_tag_slice(name, duration, &tags, metadata_id);
+    }
+
+    pub fn record_time_w_tag_slice(
+        &self,
+        name: &str,
+        duration: Duration,
+        tags: &[(&str, &str)],
+        metadata_id: &str,
+    ) {
         if let Some(metric_metadata_tags) = self
             .metric_metadata_tags_registry
             .lock()
@@ -427,7 +467,7 @@ impl MetricsRecorder {
                 time: create_time_from_duration(duration),
             };
             let mut all_tags = metric_metadata_tags.clone();
-            for (k, v) in tags {
+            for &(k, v) in tags {
                 all_tags.insert(k.to_string(), v.to_string());
             }
             self.record_metric_data(MetricData::new_with_owned_tags(
@@ -436,7 +476,7 @@ impl MetricsRecorder {
             ));
         } else {
             warn!(
-                "record_time_w_tags: metadata_id '{}' not found in registry, skipping metric '{}'",
+                "record_time_w_tag_slice: metadata_id '{}' not found in registry, skipping metric '{}'",
                 metadata_id, name
             );
         }
@@ -1034,12 +1074,44 @@ pub fn initialize_metrics_recorder(
                 .with_description("Number of checkpoint finalizers broadcast by coordinator")
                 .build(),
         );
+        // Node flow metrics - Counters
+        count_registry.insert(
+            String::from("node_empty_batch"),
+            meter
+                .u64_counter(add_service_prefix("node_empty_batch"))
+                .with_description("Number of empty batches observed by a node")
+                .build(),
+        );
+        count_registry.insert(
+            String::from("node_backpressure_events"),
+            meter
+                .u64_counter(add_service_prefix("node_backpressure_events"))
+                .with_description(
+                    "Number of downstream waits that exceeded the configured backpressure threshold",
+                )
+                .build(),
+        );
         // Checkpoint metrics - Gauges
         gauge_registry.insert(
             String::from("checkpoint_epochs_in_flight"),
             meter
                 .u64_gauge(add_service_prefix("checkpoint_epochs_in_flight"))
                 .with_description("Number of checkpoint epochs currently in progress")
+                .build(),
+        );
+        // Node flow metrics - Gauges
+        gauge_registry.insert(
+            String::from("node_empty_streak"),
+            meter
+                .u64_gauge(add_service_prefix("node_empty_streak"))
+                .with_description("Current consecutive empty-batch streak per node")
+                .build(),
+        );
+        gauge_registry.insert(
+            String::from("node_inflight_buffered"),
+            meter
+                .u64_gauge(add_service_prefix("node_inflight_buffered"))
+                .with_description("Current buffered in-flight work for a node")
                 .build(),
         );
 
@@ -1119,6 +1191,30 @@ pub fn initialize_metrics_recorder(
                 .with_description("Per-row t_emit - event_time, milliseconds")
                 .with_unit("ms")
                 .with_boundaries(duration_boundaries_ms.clone())
+                .build(),
+        );
+        // Node flow metrics - Histograms
+        histogram_registry.insert(
+            String::from("node_idle_wait"),
+            meter
+                .u64_histogram(add_service_prefix("node_idle_wait"))
+                .with_description("Time spent waiting for next input or event at a node")
+                .with_unit("ms")
+                .with_boundaries(duration_boundaries_ms.clone())
+                .build(),
+        );
+        let backpressure_boundaries_ms: Vec<f64> = BACKPRESSURE_LOW_MS_BOUNDARIES
+            .iter()
+            .chain(duration_boundaries_ms.iter())
+            .copied()
+            .collect();
+        histogram_registry.insert(
+            String::from("node_backpressure_wait"),
+            meter
+                .u64_histogram(add_service_prefix("node_backpressure_wait"))
+                .with_description("Time spent blocked waiting on downstream capacity")
+                .with_unit("ms")
+                .with_boundaries(backpressure_boundaries_ms)
                 .build(),
         );
         let mut metric_metadata_tags_registry = HashMap::new();
@@ -1317,19 +1413,26 @@ fn validate_plugin_label(metadata_id: &str, key: &str, value: &str) -> bool {
 
 pub fn get_metrics_recorder() -> Arc<MetricsRecorder> {
     let mut instance = METRICS_RECORDER_INSTANCE.lock().unwrap();
-    if let Some(metrics_recorder) = instance.clone() {
-        metrics_recorder.clone()
-    } else {
-        warn!(
-            "get_metrics_recorder called before initialize_metrics_recorder; falling back to no-op implementation; no metrics will be recorded"
-        );
-        let recorder = Arc::new(MetricsRecorder {
-            service_instance_id: "default-service-instance-id".to_string(),
-            ..Default::default()
-        });
-        *instance = Some(recorder.clone());
-        recorder
+    if let Some(metrics_recorder) = instance.as_ref() {
+        return metrics_recorder.clone();
     }
+    warn!(
+        "get_metrics_recorder called before initialize_metrics_recorder; falling back to no-op implementation; no metrics will be recorded"
+    );
+    let recorder = Arc::new(MetricsRecorder {
+        service_instance_id: "default-service-instance-id".to_string(),
+        ..Default::default()
+    });
+    *instance = Some(recorder.clone());
+    recorder
+}
+
+/// Like [`get_metrics_recorder`], but returns `None` instead of installing a
+/// no-op recorder when telemetry has not been initialized. Use this on paths
+/// that may run outside a pipeline (tests, tooling) and should stay silent
+/// rather than warn.
+pub fn try_get_metrics_recorder() -> Option<Arc<MetricsRecorder>> {
+    METRICS_RECORDER_INSTANCE.lock().unwrap().clone()
 }
 
 /// A simplified metrics recorder for control-plane components (e.g., checkpoint coordinator).
