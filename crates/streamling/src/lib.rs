@@ -2499,7 +2499,7 @@ impl Streamling {
                     validate_sink_decimal_arb(
                         &source_schema,
                         streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
-                        app_config.clickhouse_sink.columns.as_deref(),
+                        app_config.clickhouse_sink.connection.columns.as_deref(),
                         &reference_name,
                     )?;
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(

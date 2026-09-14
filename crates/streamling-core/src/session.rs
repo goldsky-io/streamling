@@ -528,7 +528,7 @@ mod tests {
         use crate::types::decimal_arb::DecimalArbValue;
         use arrow::array::{Array, LargeBinaryArray};
 
-        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         register_decimal_arb_case_table(&sm);
 
         let sql = "SELECT id, CASE WHEN flag = 1 THEN amt ELSE alt END AS chosen FROM t";
@@ -564,7 +564,7 @@ mod tests {
     async fn case_over_decimal_arb_should_preserve_metadata() {
         use crate::types::decimal_arb::DecimalArbType;
 
-        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         register_decimal_arb_case_table(&sm);
 
         let sql = "SELECT id, CASE WHEN flag = 1 THEN amt ELSE alt END AS chosen FROM t";
@@ -614,7 +614,7 @@ mod tests {
         use arrow::array::{Array, LargeBinaryArray};
         use std::collections::HashMap;
 
-        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         register_decimal_arb_values(&sm, "t", &["5", "5.0", "05", "-3", "-3", "0", "-0"]);
 
         let sql = "SELECT amt, COUNT(*) AS n FROM t GROUP BY amt";
@@ -676,7 +676,7 @@ mod tests {
         use arrow::array::{Array, LargeBinaryArray};
         use std::collections::BTreeSet;
 
-        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
         register_decimal_arb_values(&sm, "t", &["5", "5.0", "-3", "-3", "0", "-0", "7"]);
 
         let sql = "SELECT DISTINCT amt FROM t";
@@ -736,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_aggregates_still_work_for_non_decimal_arb_columns() {
         let registry = DynamicTableRegistry::new();
-        let sm = SessionManager::new(1024, 64, registry).unwrap();
+        let sm = SessionManager::new(1024, 64, registry, 1).unwrap();
         let ctx = sm.session_context();
 
         let schema = Arc::new(Schema::new(vec![
