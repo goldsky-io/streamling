@@ -24,6 +24,8 @@ use crate::checkpoints::checkpoint_management::{
     CheckpointMessage, MarkerAligner, enrich_batch_metadata_with_checkpoints,
     extract_checkpoint_messages, strip_checkpoint_messages,
 };
+use crate::telemetry::node_flow::{record_backpressure_wait, send_batch_with_metrics};
+use crate::telemetry::recorder::try_get_metrics_recorder;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::error::Result;
@@ -34,6 +36,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 /// Operators that bound `CheckpointableExec` subtree metric aggregation.
@@ -69,7 +72,8 @@ pub(crate) fn marker_only_batch(schema: &SchemaRef, messages: &[CheckpointMessag
 /// Spawns a task on `builder` that forwards one input partition into the
 /// builder's output channel, re-attaching each batch's checkpoint-marker
 /// metadata onto the output schema. `label` identifies the forwarding operator
-/// in debug logs (e.g. a sql transform's reference name).
+/// in debug logs (e.g. a sql transform's reference name), and
+/// `metric_metadata_id` attributes this boundary's node-flow metrics.
 pub(crate) fn spawn_marker_preserving_forwarder(
     builder: &mut RecordBatchReceiverStreamBuilder,
     input: &Arc<dyn ExecutionPlan>,
@@ -77,6 +81,7 @@ pub(crate) fn spawn_marker_preserving_forwarder(
     output_schema: &SchemaRef,
     context: &Arc<TaskContext>,
     label: String,
+    metric_metadata_id: String,
 ) -> Result<()> {
     let data = execute_input_stream(
         Arc::clone(input),
@@ -86,9 +91,11 @@ pub(crate) fn spawn_marker_preserving_forwarder(
     )?;
     let tx = builder.tx();
     let output_schema = Arc::clone(output_schema);
+    let metrics_recorder = try_get_metrics_recorder();
 
     builder.spawn(async move {
         let mut stream = data;
+        let tags = [("execution_kind", "native")];
 
         while let Some(batch) = stream.next().await {
             match batch {
@@ -110,7 +117,17 @@ pub(crate) fn spawn_marker_preserving_forwarder(
                     };
 
                     // Forward the batch to the output stream
-                    if tx.send(Ok(output_batch)).await.is_err() {
+                    let num_rows = output_batch.num_rows() as u64;
+                    if !send_batch_with_metrics(
+                        &tx,
+                        Ok(output_batch),
+                        num_rows,
+                        metrics_recorder.as_deref(),
+                        &metric_metadata_id,
+                        &tags,
+                    )
+                    .await
+                    {
                         // The receiver was dropped, stop processing
                         break;
                     }
@@ -120,7 +137,14 @@ pub(crate) fn spawn_marker_preserving_forwarder(
                         "{} [partition {}]: error from input stream, stream will terminate: {}",
                         label, input_partition, e
                     );
+                    let send_start = Instant::now();
                     let _ = tx.send(Err(e)).await;
+                    record_backpressure_wait(
+                        metrics_recorder.as_deref(),
+                        &metric_metadata_id,
+                        &tags,
+                        send_start,
+                    );
                     break;
                 }
             }
