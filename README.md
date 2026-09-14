@@ -2266,6 +2266,25 @@ Streamling exports two variants of the `output_rows` metric with different tempo
 
 - **`output_rows_delta`** (Delta): Reports incremental rows since the last export interval. Use this for billing and aggregation use cases in time-series databases like ClickHouse, where you can simply `SUM()` the values without worrying about resets or lag compensation.
 
+### Node Flow Metrics
+
+Per-node flow metrics say *why* a node is not producing rows — waiting on its
+input, blocked on its output, or emitting empty batches:
+
+- `node_idle_wait` (histogram, ms) — waiting for the next input batch
+- `node_backpressure_wait` (histogram, ms) — blocked sending downstream
+- `node_backpressure_events` (counter) — one wait sample at or above the threshold
+- `node_empty_batch` (counter) — a batch with zero rows
+- `node_empty_streak` (gauge) — consecutive empty batches, reset by a non-empty one
+- `node_inflight_buffered` (gauge) — work buffered at this node boundary right now
+
+`node_backpressure_events` is emitted when a single `node_backpressure_wait`
+sample is at or above `STREAMLING__BACKPRESSURE_EVENT_THRESHOLD_MS` (default
+`100`).
+
+See [docs/node-flow-metrics.md](docs/node-flow-metrics.md) for emission sites
+and how to read `node_inflight_buffered`.
+
 ### Adding Telemetry to Custom Operators
 
 #### For Execution Plans (Sources and Transforms)

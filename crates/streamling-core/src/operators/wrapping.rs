@@ -8,6 +8,7 @@ use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, Share
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
+use crate::telemetry::node_flow::{record_batch_emptiness, record_idle_wait};
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::types::RowCountMeasurementType;
 use crate::topology::Telemetry;
@@ -631,6 +632,8 @@ impl ExecutionPlan for WrappingExec {
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
+            let mut empty_streak = 0u64;
+            let tags = [("execution_kind", "native")];
             loop {
                 let batch_start = Instant::now();
                 let batch_result = data.next().await;
@@ -640,6 +643,12 @@ impl ExecutionPlan for WrappingExec {
                     Some(r) => r,
                     None => break,
                 };
+                record_idle_wait(
+                    Some(metrics_recorder.as_ref()),
+                    &metric_metadata_id,
+                    &tags,
+                    batch_start,
+                );
 
                 match batch_result {
                     Ok(batch) => {
@@ -655,6 +664,13 @@ impl ExecutionPlan for WrappingExec {
                             batch.num_rows(),
                             RowCountMeasurementType::OutputRowCount,
                             metrics.as_ref(),
+                        );
+                        record_batch_emptiness(
+                            Some(metrics_recorder.as_ref()),
+                            &metric_metadata_id,
+                            &tags,
+                            batch.num_rows(),
+                            &mut empty_streak,
                         );
 
                         // Record checkpoint marker arrival time for transforms
@@ -790,9 +806,29 @@ impl DataSink for WrappingDataSink {
         let primary_key = self.primary_key.clone();
 
         let measured_stream = async_stream::stream! {
-            while let Some(batch_result) = data.next().await {
+            let mut empty_streak = 0u64;
+            let tags = [("execution_kind", "native")];
+            loop {
+                let idle_start = Instant::now();
+                let batch_result = match data.next().await {
+                    Some(r) => r,
+                    None => break,
+                };
+                record_idle_wait(
+                    Some(metrics_recorder.as_ref()),
+                    &metric_metadata_id,
+                    &tags,
+                    idle_start,
+                );
                 match batch_result {
                     Ok(batch) => {
+                        record_batch_emptiness(
+                            Some(metrics_recorder.as_ref()),
+                            &metric_metadata_id,
+                            &tags,
+                            batch.num_rows(),
+                            &mut empty_streak,
+                        );
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
                             batch.num_rows(),
