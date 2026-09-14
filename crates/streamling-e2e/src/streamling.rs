@@ -192,7 +192,7 @@ pub async fn run_streamling_with_sigterm(
     env_vars: &[(String, String)],
     signal_after: std::time::Duration,
     exit_deadline: std::time::Duration,
-) -> Result<ExitStatus> {
+) -> Result<(ExitStatus, String)> {
     let streamling_dir = find_streamling_dir();
     let (program, args) = construct_program_with_args(binary_path);
 
@@ -239,13 +239,19 @@ pub async fn run_streamling_with_sigterm(
             }
         })
     });
+    // Stderr is both streamed to the test log AND captured, so tests can
+    // assert on drain diagnostics (e.g. no scope blew its budget slice).
     let stderr_handle = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut captured = String::new();
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "streamling", "{}", line);
+                captured.push_str(&line);
+                captured.push('\n');
             }
+            captured
         })
     });
 
@@ -264,12 +270,13 @@ pub async fn run_streamling_with_sigterm(
     if let Some(handle) = stdout_handle {
         let _ = handle.await;
     }
-    if let Some(handle) = stderr_handle {
-        let _ = handle.await;
-    }
+    let stderr_output = match stderr_handle {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => String::new(),
+    };
 
     match waited {
-        Ok(status) => Ok(status?),
+        Ok(status) => Ok((status?, stderr_output)),
         Err(_) => {
             // Missed the deadline: this is exactly the hang-until-SIGKILL bug.
             // Kill the group so the test suite doesn't leak the process.

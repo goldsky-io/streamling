@@ -286,6 +286,10 @@ fn build_periodic_reader_exporter(
                 .with_http()
                 .with_protocol(protocol)
                 .with_endpoint(metrics_ingestion_endpoint.to_owned())
+                // Explicit request bound so a black-holed collector cannot
+                // stall the final flush/shutdown (the gRPC path gets the same
+                // bound from its channel timeout in build_grpc_channel).
+                .with_timeout(Duration::from_secs(10))
                 .build()
                 .context("failed to build HTTP metric exporter")?
         }
@@ -317,6 +321,8 @@ fn build_delta_periodic_reader_exporter(
                 .with_protocol(protocol)
                 .with_endpoint(metrics_ingestion_endpoint.to_owned())
                 .with_temporality(Temporality::Delta)
+                // Same request bound as the non-delta HTTP exporter above.
+                .with_timeout(Duration::from_secs(10))
                 .build()
                 .context("failed to build HTTP delta metric exporter")?
         }

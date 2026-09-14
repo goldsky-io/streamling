@@ -540,7 +540,7 @@ impl TestContext {
         opts: PipelineOpts,
         signal_after: std::time::Duration,
         exit_deadline: std::time::Duration,
-    ) -> Result<ExitStatus> {
+    ) -> Result<(ExitStatus, String)> {
         let pipeline_path = self.temp_dir.path().join("pipeline.yaml");
         std::fs::write(&pipeline_path, pipeline_yaml)?;
 

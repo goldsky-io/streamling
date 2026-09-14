@@ -32,6 +32,18 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 20;
 const DEFAULT_SCHEMA_NAME: &str = "streamling";
 const DEFAULT_TABLE_NAME: &str = "state";
 
+/// Ceiling on waiting for a pool connection (including establishing one).
+/// sqlx's default is 30s, which is LONGER than the engine's entire shutdown
+/// budget at the fleet-default grace (30s grace → 20s budget): with the
+/// default, an unreachable backend during the terminal offset commit could
+/// never surface its error before the watchdog force-exited — observed in
+/// the field as a silent drain ending in "shutdown budget exceeded" with
+/// only a sqlx pool WARN as a clue. 5s is orders of magnitude above a
+/// healthy acquire (sub-ms once warm) and small enough that every caller's
+/// error arm — checkpoint persistence, terminal commit, ClickHouse split
+/// state — reports within even the smallest (5s) budget's neighborhood.
+const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const IDENTIFIER_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_]*$";
 
 pub struct PostgresStateOperatorBackendFactory {
@@ -46,6 +58,7 @@ impl PostgresStateOperatorBackendFactory {
         max_connections: Option<u32>,
         state_schema_name: Option<String>,
         state_table_name: Option<String>,
+        acquire_timeout: Option<std::time::Duration>,
     ) -> Result<Self, StateBackendError> {
         let state_schema_name =
             state_schema_name.unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string());
@@ -62,6 +75,7 @@ impl PostgresStateOperatorBackendFactory {
         let pool_options: PoolOptions<Postgres> = PoolOptions::default()
             .max_connections(max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
             .min_connections(1)
+            .acquire_timeout(acquire_timeout.unwrap_or(DEFAULT_ACQUIRE_TIMEOUT))
             .test_before_acquire(true);
 
         let pool = pool_options
@@ -106,7 +120,20 @@ impl PostgresStateOperatorBackendFactory {
         state_schema_name: &str,
         state_table_name: &str,
     ) -> Result<(), StateBackendError> {
-        sqlx::query(
+        // Postgres's `CREATE ... IF NOT EXISTS` is not atomic against
+        // concurrent creation: two state backends initializing the same
+        // schema/table (e.g. several stateful operators of one pipeline
+        // starting together) can both pass the existence check, and the loser
+        // gets a duplicate-object error (42P06/42P07/42710) or a unique
+        // violation on a catalog index (23505). Either way the object exists,
+        // which is this function's postcondition — treat it as success.
+        fn creation_race_lost(e: &sqlx::Error) -> bool {
+            e.as_database_error()
+                .and_then(|db| db.code())
+                .is_some_and(|code| matches!(code.as_ref(), "23505" | "42P06" | "42P07" | "42710"))
+        }
+
+        match sqlx::query(
             format!(
                 r#"
                 CREATE SCHEMA IF NOT EXISTS {};
@@ -117,16 +144,19 @@ impl PostgresStateOperatorBackendFactory {
         )
         .execute(pool.as_ref())
         .await
-        .map(|_| ())
-        .map_err(|e| {
-            StateBackendError::with_source(
-                StateBackendErrorKind::Initialization,
-                "failed to create schema",
-                e,
-            )
-        })?;
+        {
+            Ok(_) => {}
+            Err(e) if creation_race_lost(&e) => {}
+            Err(e) => {
+                return Err(StateBackendError::with_source(
+                    StateBackendErrorKind::Initialization,
+                    "failed to create schema",
+                    e,
+                ));
+            }
+        }
 
-        sqlx::query(
+        match sqlx::query(
             format!(
                 r#"
                 CREATE TABLE IF NOT EXISTS {}.{} (
@@ -143,14 +173,15 @@ impl PostgresStateOperatorBackendFactory {
         )
         .execute(pool.as_ref())
         .await
-        .map(|_| ())
-        .map_err(|e| {
-            StateBackendError::with_source(
+        {
+            Ok(_) => Ok(()),
+            Err(e) if creation_race_lost(&e) => Ok(()),
+            Err(e) => Err(StateBackendError::with_source(
                 StateBackendErrorKind::Initialization,
                 "failed to create state table",
                 e,
-            )
-        })
+            )),
+        }
     }
 }
 
@@ -254,6 +285,57 @@ where
             StateBackendError::with_source(
                 StateBackendErrorKind::Query,
                 "failed to update state",
+                e,
+            )
+        })
+    }
+
+    /// One statement for the whole batch (UNNEST + upsert). The default
+    /// trait impl's sequential puts cost one network round trip per entry,
+    /// which dominated terminal-commit latency for high-partition-count
+    /// Kafka sources (~0.18s/partition observed).
+    async fn put_many(&self, entries: Vec<(StateKey, V)>) -> Result<(), StateBackendError>
+    where
+        V: Send + 'static,
+    {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut keys: Vec<String> = Vec::with_capacity(entries.len());
+        let mut values: Vec<Json<serde_json::Value>> = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            keys.push(key.0);
+            values.push(Json(serde_json::to_value(&value).map_err(|e| {
+                StateBackendError::with_source(
+                    StateBackendErrorKind::Query,
+                    "failed to serialize state value",
+                    e,
+                )
+            })?));
+        }
+        sqlx::query(
+            format!(
+                r#"
+                INSERT INTO {} ( namespace, key, data, created_at )
+                SELECT $1, k, d, NOW()
+                FROM UNNEST($2::text[], $3::jsonb[]) AS t(k, d)
+                ON CONFLICT (namespace, key) DO UPDATE
+                SET data = EXCLUDED.data
+            "#,
+                self.full_state_table_name
+            )
+            .as_str(),
+        )
+        .bind(self.namespace.clone())
+        .bind(keys)
+        .bind(values)
+        .execute(self.pool.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            StateBackendError::with_source(
+                StateBackendErrorKind::Query,
+                "failed to batch-update state",
                 e,
             )
         })

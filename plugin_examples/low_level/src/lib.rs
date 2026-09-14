@@ -92,6 +92,14 @@ extern "C" fn side_output_descriptors(
     RResult::ROk(RVec::new())
 }
 
+/// Receives the host's out-of-band shutdown signal at plugin load and
+/// installs it into the SDK's process-wide cell, so `shutdown::*` helpers
+/// (and any retry loops built on them) observe the host's drain. Mirrors
+/// what `init_plugin!` generates for high-level plugins.
+extern "C" fn set_shutdown_signal(signal: streamling_plugin::shutdown::ShutdownSignalObj) {
+    streamling_plugin::shutdown::install_shutdown_signal(signal);
+}
+
 #[export_root_module]
 pub fn get_module() -> PluginModuleRef {
     PluginModule {
@@ -99,6 +107,7 @@ pub fn get_module() -> PluginModuleRef {
         create,
         udf_descriptors,
         side_output_descriptors,
+        set_shutdown_signal,
     }
     .leak_into_prefix()
 }

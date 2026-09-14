@@ -143,11 +143,43 @@ pub struct MultiSinkEntry {
 pub struct MultiSinkLogicalNode {
     pub input: LogicalPlan,
     pub sinks: Vec<MultiSinkEntry>,
+    /// Key into [`MULTI_SINK_SCOPES`]. Logical nodes must be Hash/Eq, so the
+    /// non-comparable scope is smuggled by id (same idiom as `PluginNode`'s
+    /// channel registry).
+    scope_id: String,
+}
+
+lazy_static::lazy_static! {
+    static ref MULTI_SINK_SCOPES: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<crate::shutdown::ComponentScope>>,
+    > = std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
 impl MultiSinkLogicalNode {
-    pub fn new(input: LogicalPlan, sinks: Vec<MultiSinkEntry>) -> Self {
-        Self { input, sinks }
+    pub fn new(
+        input: LogicalPlan,
+        sinks: Vec<MultiSinkEntry>,
+        scope: Arc<crate::shutdown::ComponentScope>,
+    ) -> Self {
+        let scope_id = format!("multi_sink_scope_{}", uuid::Uuid::new_v4());
+        MULTI_SINK_SCOPES
+            .lock()
+            .unwrap()
+            .insert(scope_id.clone(), scope);
+        Self {
+            input,
+            sinks,
+            scope_id,
+        }
+    }
+
+    pub fn scope(&self) -> Arc<crate::shutdown::ComponentScope> {
+        MULTI_SINK_SCOPES
+            .lock()
+            .unwrap()
+            .get(&self.scope_id)
+            .expect("multi-sink scope registered at node construction")
+            .clone()
     }
 }
 
@@ -197,6 +229,7 @@ impl UserDefinedLogicalNodeCore for MultiSinkLogicalNode {
         Ok(Self {
             input: inputs.swap_remove(0),
             sinks,
+            scope_id: self.scope_id.clone(),
         })
     }
 
@@ -309,6 +342,7 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
                     sink_names,
                     sink_rebatch_configs,
                     internal_buffer_size,
+                    multi_sink_node.scope(),
                 ));
                 Some(exec)
             } else {
@@ -331,6 +365,10 @@ struct MultiSinkExec {
     sink_rebatch_configs: Vec<RebatchConfig>,
     cache: Arc<PlanProperties>,
     internal_buffer_size: usize,
+    /// DataPath-stage scope: the broadcast driver ends when the source stream
+    /// ends, which shutdown forces before the drain runs — the scope adds
+    /// drain-ladder tracking on top.
+    scope: Arc<crate::shutdown::ComponentScope>,
 }
 
 impl MultiSinkExec {
@@ -341,6 +379,7 @@ impl MultiSinkExec {
         sink_names: Vec<String>,
         sink_rebatch_configs: Vec<RebatchConfig>,
         internal_buffer_size: usize,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let cache = Self::compute_properties(input.schema());
         Self {
@@ -351,6 +390,7 @@ impl MultiSinkExec {
             sink_rebatch_configs,
             cache: Arc::new(cache),
             internal_buffer_size,
+            scope,
         }
     }
 
@@ -452,6 +492,7 @@ impl ExecutionPlan for MultiSinkExec {
             self.sink_names.clone(),
             self.sink_rebatch_configs.clone(),
             self.internal_buffer_size,
+            self.scope.clone(),
         )))
     }
 
@@ -524,6 +565,9 @@ impl ExecutionPlan for MultiSinkExec {
                 let stagger_index = input_partition * total_sinks + i;
                 let stagger_total = total_sinks * input_partitions;
 
+                // Sanctioned: structured concurrency — every handle lands in
+                // `sink_handles` and is joined before this method returns.
+                #[allow(clippy::disallowed_methods)]
                 let handle = tokio::spawn(async move {
                     let data_sink_exec = sink
                         .downcast_ref::<ParallelSinkExec>()
@@ -627,7 +671,7 @@ impl ExecutionPlan for MultiSinkExec {
             output_consumers.push(broadcast_stream.add_consumer());
 
             // Start broadcasting after all consumers (sinks + output) are registered
-            broadcast_stream.start(data);
+            broadcast_stream.start(data, &self.scope);
         }
 
         // Gate the plan's completion on every sink writer finishing: forward
@@ -812,6 +856,7 @@ mod tests {
             names.iter().map(|n| n.to_string()).collect(),
             names.iter().map(|_| RebatchConfig::default()).collect(),
             10,
+            crate::shutdown::ComponentScope::detached("test"),
         );
         (exec, collectors)
     }

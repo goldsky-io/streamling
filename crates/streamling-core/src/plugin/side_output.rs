@@ -89,6 +89,9 @@ pub fn register_plugin_side_outputs(
     options: &HashMap<String, HashMap<String, String>>,
     application_id: &str,
     channel_capacity: usize,
+    // PostPlugin-stage scope for the per-source metrics forwarders (they
+    // serve the side-output plugins, which terminate with the other plugins).
+    scope: &Arc<crate::shutdown::ComponentScope>,
 ) -> Result<()> {
     let registry = PLUGIN_SIDE_OUTPUT_DESCRIPTORS
         .read()
@@ -107,10 +110,13 @@ pub fn register_plugin_side_outputs(
             // Spawn metrics processing task with source-specific metric_metadata_id
             let metric_metadata_id = metric_key(application_id, source_name);
             let host_metrics_recorder = get_metrics_recorder();
-            tokio::spawn(process_plugin_metrics(
+            // Exits when the plugin's crossbeam channel disconnects at plugin
+            // teardown; the PostPlugin stage drains it after that.
+            scope.spawn(process_plugin_metrics(
                 metrics_channel.receiver,
                 host_metrics_recorder,
                 metric_metadata_id,
+                scope.stage_token().clone(),
             ));
 
             let init_result = (descriptor.initialize)(

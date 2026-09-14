@@ -2,7 +2,7 @@ use crate::data::RowKind;
 use crate::error::StreamlingError;
 use crate::formats::json::{FromArrowToJsonConverter, JsonToArrowConverter};
 use crate::formats::{FromArrowConverter, ToArrowConverter};
-use crate::retry::retry_if_retriable;
+use crate::retry::retry_if_retriable_until_cancelled;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -496,12 +496,16 @@ impl ExternalHandlerClient {
         self.client.post(&self.url).headers(headers.clone())
     }
 
-    /// Send an HTTP request with retry semantics via `retry_if_retriable`.
+    /// Send an HTTP request with retry semantics via
+    /// `retry_if_retriable_until_cancelled`.
     ///
     /// Retriable conditions (network errors, timeouts, 408, 429, 5xx) are retried
     /// indefinitely with exponential backoff unless `skip_on_error` is enabled.
     /// In skip mode, response errors are acknowledged immediately while transport
-    /// failures still retry.
+    /// failures still retry. Once process shutdown is requested the loop stops
+    /// between attempts instead — a down endpoint used to retry forever and pin
+    /// the drain; per-request timeouts bound
+    /// each individual attempt.
     async fn send_with_retry(
         &self,
         body: String,
@@ -512,7 +516,8 @@ impl ExternalHandlerClient {
             .as_ref()
             .map(|_| get_metrics_recorder());
         let pending_retry_status_class = parking_lot::Mutex::new(None::<&'static str>);
-        retry_if_retriable(
+        let mut shutdown = crate::shutdown::subscribe();
+        retry_if_retriable_until_cancelled(
             || {
                 let body = body.clone();
                 let metrics_recorder = metrics_recorder.clone();
@@ -621,6 +626,7 @@ impl ExternalHandlerClient {
                 }
             },
             operation_name,
+            &mut shutdown,
         )
         .await
     }
@@ -1053,6 +1059,8 @@ mod tests {
             let listener = tokio::net::TcpListener::bind(address.clone())
                 .await
                 .unwrap();
+            // Test task; not part of any pipeline drain.
+            #[allow(clippy::disallowed_methods)]
             tokio::spawn(async {
                 axum::serve(listener, app).await.unwrap();
             });

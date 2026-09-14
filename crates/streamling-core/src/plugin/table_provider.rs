@@ -38,6 +38,38 @@ use streamling_plugin::{PluginChannels, PluginCheckpointEpoch, PluginMsg};
 use tracing::log::trace;
 use tracing::{debug, error, info, warn};
 
+/// Flush buffered checkpoint messages downstream on a synthetic empty batch,
+/// clearing the buffer. Used when there is no data batch for them to ride —
+/// at end of stream, and whenever the plugin's output goes idle (an exhausted
+/// bounded source stops emitting, yet its final epoch can only finalize once
+/// the sinks see the marker). Callers must only invoke this when the plugin
+/// output channel has been drained: that is what guarantees every row the
+/// buffered markers cover has already been sent downstream, keeping the
+/// marker-after-covered-data ordering that at-least-once relies on.
+async fn flush_checkpoint_buffer_on_empty_batch(
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    schema: &SchemaRef,
+    checkpoint_buffer: &mut Vec<CheckpointMessage>,
+) {
+    let empty = RecordBatch::new_empty(schema.clone());
+    let mut metadata = schema.metadata().clone();
+    enrich_batch_metadata_with_checkpoints(&mut metadata, checkpoint_buffer);
+    match enrich_batch_with_metadata(empty, metadata) {
+        Ok(batch) => {
+            if tx.send(Ok(batch)).await.is_err() {
+                warn!(
+                    "PluginSourceExec: downstream closed before the synthetic checkpoint batch could be sent"
+                );
+            }
+            checkpoint_buffer.clear();
+        }
+        Err(e) => warn!(
+            "PluginSourceExec: failed to build synthetic checkpoint batch: {:?}",
+            e
+        ),
+    }
+}
+
 #[derive(Debug)]
 struct PluginSourceExec {
     schema: SchemaRef,
@@ -50,6 +82,7 @@ struct PluginSourceExec {
     cached_properties: Arc<PlanProperties>,
     internal_buffer_size: u32,
     metric_metadata_id: String,
+    scope: Arc<crate::shutdown::ComponentScope>,
 }
 
 impl PluginSourceExec {
@@ -59,6 +92,7 @@ impl PluginSourceExec {
         plugin_channels: Arc<PluginChannels>,
         internal_buffer_size: u32,
         metric_metadata_id: String,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let cached_properties = Self::compute_properties(schema.clone());
         Self {
@@ -68,6 +102,7 @@ impl PluginSourceExec {
             cached_properties: Arc::new(cached_properties),
             internal_buffer_size,
             metric_metadata_id,
+            scope,
         }
     }
 
@@ -119,19 +154,11 @@ impl ExecutionPlan for PluginSourceExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // A disconnected input channel means the plugin already exited (e.g.
-        // it died during startup): surface an execution error instead of
-        // panicking the executor thread.
-        self.plugin_channels
-            .input
-            .sender
-            .send(NonExhaustive::new(PluginMsg::Init))
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "plugin input channel closed before Init could be sent \
-                     (plugin exited early?): {e}"
-                ))
-            })?;
+        crate::plugin::send_to_plugin_blocking(
+            &self.plugin_channels.input.sender,
+            NonExhaustive::new(PluginMsg::Init),
+            &self.metric_metadata_id,
+        )?;
 
         let (checkpoint_receiver, checkpoint_subscriber_id) =
             subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
@@ -148,14 +175,20 @@ impl ExecutionPlan for PluginSourceExec {
         let metrics_receiver = self.plugin_channels.metrics.receiver.clone();
         let metrics_recorder = get_metrics_recorder();
         let metric_metadata_id = self.metric_metadata_id.clone();
+        let plugin_label = self.metric_metadata_id.clone();
+        let forwarder_scope = self.scope.clone();
         let projection = self.projection.clone();
         let schema_for_flush = self.schema.clone();
 
         builder.spawn(async move {
-            tokio::spawn(process_plugin_metrics(
+            // PostPlugin-stage scope: exits on channel disconnect at plugin
+            // teardown; the stage placement means the drain ladder awaits it
+            // AFTER the dispatcher flush it serves.
+            forwarder_scope.spawn(process_plugin_metrics(
                 metrics_receiver,
                 metrics_recorder,
                 metric_metadata_id,
+                forwarder_scope.stage_token().clone(),
             ));
 
             let mut checkpoint_buffer: Vec<CheckpointMessage> = Vec::new();
@@ -282,6 +315,21 @@ impl ExecutionPlan for PluginSourceExec {
                                         CheckpointEpoch(epoch.0),
                                     ));
                                 }
+                                Ok(PluginMsg::Terminate) => {
+                                    // Output-direction Terminate: the plugin
+                                    // source stopped on its own (bounded work
+                                    // complete) — see the variant's doc on
+                                    // `PluginMsg` for the reuse rationale. End
+                                    // the stream so downstream sinks see
+                                    // end-of-stream and a job-mode pipeline
+                                    // can finish; the flush after the loop
+                                    // carries any still-buffered markers to
+                                    // the sinks.
+                                    info!(
+                                        "PluginSourceExec: source reported completion; ending its record-batch stream"
+                                    );
+                                    break 'outer;
+                                }
                                 _ => {}
                             }
                         }
@@ -292,6 +340,44 @@ impl ExecutionPlan for PluginSourceExec {
                             break;
                         }
                     } else {
+                        // Plugin output idle. Two things must not starve
+                        // behind a quiet plugin (an exhausted bounded source,
+                        // a long fetch):
+                        //
+                        // 1. Round-tripped markers already sitting in
+                        //    `checkpoint_buffer`. There may never be another
+                        //    data batch to ride, and a bounded job's final
+                        //    epoch cannot finalize — so the job cannot end —
+                        //    until the sinks see its marker. Flush them on a
+                        //    synthetic empty batch now. Ordering stays
+                        //    correct: the plugin's output channel carries
+                        //    markers and batches in emission order and it is
+                        //    empty here, so every row the marker covers has
+                        //    already been forwarded downstream.
+                        //
+                        // 2. Coordinator messages waiting to be forwarded
+                        //    INTO the plugin — the round-trip cannot even
+                        //    start if servicing them requires plugin output
+                        //    first (this loop used to spin right here without
+                        //    ever reaching the coordinator arm below).
+                        if !checkpoint_buffer.is_empty() {
+                            info!(
+                                "PluginSourceExec: flushing {} pending checkpoint message(s) on a synthetic batch (plugin output idle)",
+                                checkpoint_buffer.len()
+                            );
+                            flush_checkpoint_buffer_on_empty_batch(
+                                &tx,
+                                &schema_for_flush,
+                                &mut checkpoint_buffer,
+                            )
+                            .await;
+                        }
+                        if !checkpoint_receiver.is_empty() {
+                            break;
+                        }
+                        // Sleep, don't yield: yield_now in this idle arm
+                        // busy-spun a worker at 100% CPU when the plugin
+                        // channels were empty (main's f356711).
                         tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
                     }
                 }
@@ -308,22 +394,28 @@ impl ExecutionPlan for PluginSourceExec {
                                 "PluginSourceExec: Received checkpoint Marker epoch {} from coordinator, forwarding to plugin (batch_count={}, pending_buffer={})",
                                 epoch.0, batch_count, checkpoint_buffer.len()
                             );
-                            plugin_input_sender
-                                .send(NonExhaustive::new(PluginMsg::CheckpointMarker {
+                            crate::plugin::send_to_plugin(
+                                &plugin_input_sender,
+                                NonExhaustive::new(PluginMsg::CheckpointMarker {
                                     epoch: PluginCheckpointEpoch(epoch.0),
-                                }))
-                                .unwrap();
+                                }),
+                                &plugin_label,
+                            )
+                            .await?;
                         }
                         Ok(CheckpointMessage::Finalizer(epoch)) => {
                             debug!(
                                 "Propagating checkpoint Finalizer with epoch {} to plugin",
                                 epoch.0
                             );
-                            plugin_input_sender
-                                .send(NonExhaustive::new(PluginMsg::CheckpointFinalizer {
+                            crate::plugin::send_to_plugin(
+                                &plugin_input_sender,
+                                NonExhaustive::new(PluginMsg::CheckpointFinalizer {
                                     epoch: PluginCheckpointEpoch(epoch.0),
-                                }))
-                                .unwrap();
+                                }),
+                                &plugin_label,
+                            )
+                            .await?;
                         }
                         Ok(_) => {
                             // ignore other messages
@@ -364,22 +456,8 @@ impl ExecutionPlan for PluginSourceExec {
                     "PluginSourceExec: flushing {} pending checkpoint message(s) on a synthetic final batch",
                     checkpoint_buffer.len()
                 );
-                let empty = RecordBatch::new_empty(schema_for_flush.clone());
-                let mut metadata = schema_for_flush.metadata().clone();
-                enrich_batch_metadata_with_checkpoints(&mut metadata, &checkpoint_buffer);
-                match enrich_batch_with_metadata(empty, metadata) {
-                    Ok(batch) => {
-                        if tx.send(Ok(batch)).await.is_err() {
-                            warn!(
-                                "PluginSourceExec: downstream closed before the synthetic final batch could be sent"
-                            );
-                        }
-                    }
-                    Err(e) => warn!(
-                        "PluginSourceExec: failed to build synthetic final batch: {:?}",
-                        e
-                    ),
-                }
+                flush_checkpoint_buffer_on_empty_batch(&tx, &schema_for_flush, &mut checkpoint_buffer)
+                    .await;
             }
             // Drop our coordinator subscription cleanly so later broadcasts
             // don't hit a dead sender.
@@ -398,6 +476,10 @@ pub struct PluginSourceProvider {
     plugin_channels: Arc<PluginChannels>,
     internal_buffer_size: u32,
     metric_metadata_id: String,
+    /// PostPlugin-stage scope: the metrics forwarder must outlive the plugin
+    /// dispatcher drain (it serves the dispatcher's flush), so it drains
+    /// between the dispatcher drain and coordinator stop.
+    scope: Arc<crate::shutdown::ComponentScope>,
 }
 
 impl PluginSourceProvider {
@@ -406,12 +488,14 @@ impl PluginSourceProvider {
         plugin_channels: Arc<PluginChannels>,
         internal_buffer_size: u32,
         metric_metadata_id: String,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         Self {
             schema,
             plugin_channels,
             internal_buffer_size,
             metric_metadata_id,
+            scope,
         }
     }
 
@@ -433,6 +517,7 @@ impl PluginSourceProvider {
             plugin_channels,
             internal_buffer_size,
             self.metric_metadata_id.clone(),
+            self.scope.clone(),
         )))
     }
 }
@@ -469,8 +554,11 @@ struct PluginSink {
     plugin_channels: Arc<PluginChannels>,
     num_records_before_stop: Option<u64>, // for integration tests only!
     metric_metadata_id: String,
-    /// One `PluginMsg::Init` and one metrics-forwarder task regardless of how
-    /// many partition streams `ParallelSinkExec` writes concurrently.
+    /// PostPlugin-stage scope for the metrics and ack forwarders: both serve
+    /// the plugin dispatcher's flush, so they drain after it.
+    scope: Arc<crate::shutdown::ComponentScope>,
+    /// One `PluginMsg::Init` and one metrics/ack-forwarder set regardless of
+    /// how many partition streams `ParallelSinkExec` writes concurrently.
     init: std::sync::Once,
 }
 
@@ -480,12 +568,14 @@ impl PluginSink {
         plugin_channels: Arc<PluginChannels>,
         num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         Self {
             schema,
             plugin_channels,
             num_records_before_stop,
             metric_metadata_id,
+            scope,
             init: std::sync::Once::new(),
         }
     }
@@ -507,11 +597,20 @@ impl DataSink for PluginSink {
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let metrics_recorder = get_metrics_recorder();
+
+        // One Init and ONE forwarder set for the whole sink, no matter how
+        // many partition streams ParallelSinkExec writes concurrently — a
+        // per-stream Init would be a protocol error, and duplicate ack
+        // forwarders would double-ack epochs.
+        let mut init_send: crate::error::Result<()> = Ok(());
         self.init.call_once(|| {
-            tokio::spawn(process_plugin_metrics(
+            // PostPlugin-stage scope: exits on channel disconnect at plugin
+            // teardown; drained after the dispatcher flush it serves.
+            self.scope.spawn(process_plugin_metrics(
                 self.plugin_channels.metrics.receiver.clone(),
                 metrics_recorder.clone(),
                 self.metric_metadata_id.clone(),
+                self.scope.stage_token().clone(),
             ));
 
             // Forward plugin checkpoint acks to the coordinator independently of
@@ -522,40 +621,78 @@ impl DataSink for PluginSink {
             // once the coordinator finalizes the terminal epoch, which needs this
             // very ack. A dedicated task breaks that cycle. Same polling pattern
             // as process_plugin_metrics (the channel is a sync crossbeam channel;
-            // a blocking recv() here would pin an executor thread); exits when the
-            // plugin output channel disconnects at plugin teardown.
+            // a blocking recv() here would pin an executor thread).
             let ack_receiver = self.plugin_channels.output.receiver.clone();
             let sink_id = metric_metadata_id_to_reference_name(&self.metric_metadata_id)
                 .unwrap_or_else(|| self.metric_metadata_id.clone());
-            tokio::spawn(async move {
+            // PostPlugin-stage scope: the ack forwarder MUST outlive the plugin
+            // dispatcher drain (acks still flow while the plugin flushes after
+            // Terminate); the stage placement guarantees it. Exits on scope
+            // cancellation once the queue is drained — the channel itself never
+            // disconnects (host and plugin each hold both ends for the process's
+            // life), so without watching the token this task can only ever blow
+            // its drain slice. By PostPlugin-cancel time the dispatcher's flush
+            // has run, so every ack it emitted has been forwarded.
+            let ack_cancel = self.scope.stage_token().clone();
+            self.scope.spawn(async move {
+                // Cancellation is checked on the BUSY path too, not only when
+                // the queue goes idle: a plugin acking faster than the 10ms
+                // idle poll would otherwise never let the Empty arm run,
+                // leaving the teardown-ordering invariant as the only
+                // protection. Once cancellation is observed, the drain is
+                // bounded to the acks queued at that moment — complete by
+                // PostPlugin-cancel, so none are lost — and a plugin
+                // misbehaving past Terminate cannot pin this task.
+                let mut remaining_after_cancel: Option<usize> = None;
                 loop {
+                    if remaining_after_cancel.is_none() && ack_cancel.is_cancelled() {
+                        remaining_after_cancel = Some(ack_receiver.len());
+                    }
+                    if remaining_after_cancel == Some(0) {
+                        debug!("Scope cancelled and queued acks forwarded; stopping ack forwarder");
+                        break;
+                    }
                     match ack_receiver.try_recv() {
-                        Ok(message) => match message.into_enum() {
-                            Ok(PluginMsg::CheckpointAck { epoch }) => {
-                                debug!(
-                                    "Propagating checkpoint Ack with epoch {} from plugin",
-                                    epoch.0
-                                );
-                                if let Err(e) = send(
-                                    CHECKPOINT_COORDINATOR_CHANNEL,
-                                    CheckpointMessage::Ack {
-                                        epoch: CheckpointEpoch(epoch.0),
-                                        sink_id: sink_id.clone(),
-                                    },
-                                ) {
-                                    warn!(
-                                        "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
-                                        epoch.0, e
+                        Ok(message) => {
+                            if let Some(n) = remaining_after_cancel.as_mut() {
+                                *n -= 1;
+                            }
+                            match message.into_enum() {
+                                Ok(PluginMsg::CheckpointAck { epoch }) => {
+                                    debug!(
+                                        "Propagating checkpoint Ack with epoch {} from plugin",
+                                        epoch.0
                                     );
-                                    break;
+                                    if let Err(e) = send(
+                                        CHECKPOINT_COORDINATOR_CHANNEL,
+                                        CheckpointMessage::Ack {
+                                            epoch: CheckpointEpoch(epoch.0),
+                                            sink_id: sink_id.clone(),
+                                        },
+                                    ) {
+                                        warn!(
+                                            "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
+                                            epoch.0, e
+                                        );
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    warn!("Received unexpected message from plugin channel");
                                 }
                             }
-                            _ => {
-                                warn!("Received unexpected message from plugin channel");
-                            }
-                        },
+                        }
                         Err(TryRecvError::Empty) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            if ack_cancel.is_cancelled() {
+                                debug!(
+                                    "Scope cancelled and queue drained; stopping ack forwarder"
+                                );
+                                break;
+                            }
+                            // Acks arrive at checkpoint cadence (seconds
+                            // apart); ~10ms keeps the idle poll cheap while
+                            // still negligible against checkpoint latency.
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                         Err(TryRecvError::Disconnected) => {
                             debug!("Plugin output channel disconnected, stopping ack forwarder");
@@ -565,12 +702,16 @@ impl DataSink for PluginSink {
                 }
             });
 
-            self.plugin_channels
-                .input
-                .sender
-                .send(NonExhaustive::new(PluginMsg::Init))
-                .unwrap();
+            // Sent through the shutdown-aware blocking facade (we are inside
+            // a sync Once closure): bounded, and a disconnected channel
+            // errors instead of panicking the writer.
+            init_send = crate::plugin::send_to_plugin_blocking(
+                &self.plugin_channels.input.sender,
+                NonExhaustive::new(PluginMsg::Init),
+                &self.metric_metadata_id,
+            );
         });
+        init_send?;
 
         let mut row_count = 0;
 
@@ -583,13 +724,12 @@ impl DataSink for PluginSink {
                 checkpoint_messages
             );
 
-            self.plugin_channels
-                .input
-                .sender
-                .send(NonExhaustive::new(PluginMsg::NextBatch {
-                    data: batch.into(),
-                }))
-                .unwrap();
+            crate::plugin::send_to_plugin(
+                &self.plugin_channels.input.sender,
+                NonExhaustive::new(PluginMsg::NextBatch { data: batch.into() }),
+                &self.metric_metadata_id,
+            )
+            .await?;
 
             // Send extracted checkpoint messages to plugin
             for message in checkpoint_messages {
@@ -599,13 +739,14 @@ impl DataSink for PluginSink {
                             "Sending extracted checkpoint Marker with epoch {} to plugin",
                             epoch.0
                         );
-                        self.plugin_channels
-                            .input
-                            .sender
-                            .send(NonExhaustive::new(PluginMsg::CheckpointMarker {
+                        crate::plugin::send_to_plugin(
+                            &self.plugin_channels.input.sender,
+                            NonExhaustive::new(PluginMsg::CheckpointMarker {
                                 epoch: PluginCheckpointEpoch(epoch.0),
-                            }))
-                            .unwrap();
+                            }),
+                            &self.metric_metadata_id,
+                        )
+                        .await?;
                     }
                     CheckpointMessage::Finalizer(epoch) => {
                         debug!(
@@ -622,13 +763,14 @@ impl DataSink for PluginSink {
                         // the run loop awaits under the shutdown budget before
                         // the watchdog hard-exits — it cannot wedge the process
                         // past the grace period.
-                        self.plugin_channels
-                            .input
-                            .sender
-                            .send(NonExhaustive::new(PluginMsg::CheckpointFinalizer {
+                        crate::plugin::send_to_plugin(
+                            &self.plugin_channels.input.sender,
+                            NonExhaustive::new(PluginMsg::CheckpointFinalizer {
                                 epoch: PluginCheckpointEpoch(epoch.0),
-                            }))
-                            .unwrap();
+                            }),
+                            &self.metric_metadata_id,
+                        )
+                        .await?;
                     }
                     _ => {
                         // ignore other messages
@@ -675,6 +817,8 @@ pub struct PluginSinkProvider {
     num_records_before_stop: Option<u64>,
     metric_metadata_id: String,
     telemetry: Option<Telemetry>,
+    /// See [`PluginSink::scope`].
+    scope: Arc<crate::shutdown::ComponentScope>,
 }
 
 impl PluginSinkProvider {
@@ -684,6 +828,7 @@ impl PluginSinkProvider {
         num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
         telemetry: Option<Telemetry>,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         Self {
             schema,
@@ -691,6 +836,7 @@ impl PluginSinkProvider {
             num_records_before_stop,
             metric_metadata_id,
             telemetry,
+            scope,
         }
     }
 }
@@ -726,6 +872,7 @@ impl TableProvider for PluginSinkProvider {
             self.plugin_channels.clone(),
             self.num_records_before_stop,
             self.metric_metadata_id.clone(),
+            self.scope.clone(),
         ));
         let telemetry_sink = Arc::new(WrappingDataSink::new(
             sink,
@@ -790,6 +937,9 @@ mod tests {
             while let Ok(msg) = plugin_input_rx.recv() {
                 if let Ok(PluginMsg::CheckpointMarker { epoch }) = msg.into_enum() {
                     std::thread::sleep(Duration::from_millis(200));
+                    // Plugin-SIDE send on a dedicated test thread — the lint
+                    // guards HOST-side async contexts, which this is not.
+                    #[allow(clippy::disallowed_methods)]
                     plugin_output_tx
                         .send(NonExhaustive::new(PluginMsg::CheckpointAck { epoch }))
                         .expect("test plugin failed to send ack");
@@ -826,6 +976,7 @@ mod tests {
             channels.clone(),
             None,
             "plugin::ack_after_last_batch_sink".to_string(),
+            crate::shutdown::ComponentScope::detached("test"),
         );
         let task_ctx = Arc::new(TaskContext::default());
         let rows = tokio::time::timeout(Duration::from_secs(10), sink.write_all(stream, &task_ctx))

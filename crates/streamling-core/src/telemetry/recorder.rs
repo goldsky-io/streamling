@@ -997,7 +997,20 @@ pub fn initialize_metrics_recorder(
             String::from("checkpoint_epochs_failed"),
             meter
                 .u64_counter(add_service_prefix("checkpoint_epochs_failed"))
-                .with_description("Number of checkpoint epochs that failed due to timeout")
+                .with_description(
+                    "Number of checkpoint epochs that failed: mid-flight timeout, or a \
+                     terminal epoch that never finalized before teardown (tail replays)",
+                )
+                .build(),
+        );
+        count_registry.insert(
+            String::from("shutdown_unflushed_plugin_dispatchers"),
+            meter
+                .u64_counter(add_service_prefix("shutdown_unflushed_plugin_dispatchers"))
+                .with_description(
+                    "Plugin dispatchers the shutdown drain gave up on before they confirmed \
+                     a flush; their unflushed tails replay on restart",
+                )
                 .build(),
         );
         count_registry.insert(
