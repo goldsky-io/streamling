@@ -111,6 +111,15 @@ struct KafkaProducerContext {
     /// Previous stats sample, so the periodic log can report *rates* rather
     /// than librdkafka's monotonically growing counters.
     prev_stats: Arc<std::sync::Mutex<Option<ProducerStatsSample>>>,
+    /// When the producer last got a delivery report from the broker.
+    ///
+    /// This is the sink's liveness signal. A delivery report — success or
+    /// failure — means the broker answered; a producer that has messages
+    /// queued and has heard nothing for a long time is wedged, not merely
+    /// slow. Without this the only thing that eventually surfaced a wedged
+    /// sink was `message.timeout.ms` expiring, which cannot tell the two
+    /// apart (see `stall_watchdog_timeout`).
+    last_delivery_at: Arc<std::sync::Mutex<Instant>>,
 }
 
 /// The cumulative counters we diff between two `stats()` callbacks.
@@ -158,7 +167,17 @@ impl KafkaProducerContext {
         Self {
             first_error: Arc::new(std::sync::Mutex::new(None)),
             prev_stats: Arc::new(std::sync::Mutex::new(None)),
+            last_delivery_at: Arc::new(std::sync::Mutex::new(Instant::now())),
         }
+    }
+
+    /// How long since the broker last answered with a delivery report.
+    fn since_last_delivery(&self) -> Duration {
+        self.last_delivery_at.lock().unwrap().elapsed()
+    }
+
+    fn note_delivery(&self) {
+        *self.last_delivery_at.lock().unwrap() = Instant::now();
     }
 
     fn check_error(&self) -> streamling_core::error::Result<()> {
@@ -449,6 +468,11 @@ impl rdkafka::producer::ProducerContext for KafkaProducerContext {
         result: &rdkafka::producer::DeliveryResult<'_>,
         _opaque: Self::DeliveryOpaque,
     ) {
+        // Any delivery report means the broker answered, so it counts as
+        // progress for the stall watchdog even when the delivery itself failed
+        // — a broker rejecting messages is a different (and self-reporting)
+        // problem from one that has stopped responding at all.
+        self.note_delivery();
         if let Err((e, msg)) = result {
             let topic = msg.topic();
             error!("Kafka delivery failed for topic {}: {}", topic, e);
@@ -461,6 +485,55 @@ impl rdkafka::producer::ProducerContext for KafkaProducerContext {
 }
 
 type KafkaThreadedProducer = ThreadedProducer<KafkaProducerContext>;
+
+/// How long a sink may hold queued messages without the broker answering a
+/// single delivery report before the pipeline gives up.
+///
+/// This exists so `message.timeout.ms` no longer has to double as a wedge
+/// detector. That conflation was the bug: `message.timeout.ms` bounds the TOTAL
+/// time a message spends in the producer *including time queued behind
+/// backpressure*, so a sink that was merely slower than its input for long
+/// enough failed the pipeline even though nothing was broken. This watchdog
+/// keys on whether the broker is ANSWERING rather than on how long a message
+/// has waited, so sustained backpressure degrades to lag and only an actually
+/// unresponsive broker fails.
+const DEFAULT_SINK_STALL_WATCHDOG_TIMEOUT_SEC: u64 = 300;
+
+fn sink_stall_watchdog_timeout() -> Option<Duration> {
+    static TIMEOUT: OnceCell<Option<Duration>> = OnceCell::new();
+    *TIMEOUT.get_or_init(|| {
+        let secs = std::env::var("STREAMLING__KAFKA_SINK__STALL_WATCHDOG_TIMEOUT_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SINK_STALL_WATCHDOG_TIMEOUT_SEC);
+        // 0 disables the watchdog, for an operator who would rather have a
+        // pipeline hang than exit.
+        (secs > 0).then(|| Duration::from_secs(secs))
+    })
+}
+
+/// librdkafka `message.timeout.ms`.
+///
+/// Defaults to 0 (infinite). A finite value here is a wall-clock deadline that
+/// runs while a message sits in a backpressured queue, which turns "the sink is
+/// slower than the source" into fatal delivery errors and a crash/replay loop.
+/// Wedges are the stall watchdog's job now; genuine non-retriable errors still
+/// surface immediately through the delivery callback regardless of this value.
+fn message_timeout_ms() -> String {
+    std::env::var("STREAMLING__KAFKA_SINK__MESSAGE_TIMEOUT_MS").unwrap_or_else(|_| "0".to_string())
+}
+
+/// The sink-stall rule, separated from the producer so it can be tested.
+///
+/// Both conditions are required, and the pairing is the whole point: queued
+/// messages alone are ordinary backpressure, and a quiet producer alone just
+/// means there is nothing to send.
+fn is_sink_stalled(queued: i32, silent_for: Duration, timeout: Option<Duration>) -> bool {
+    let Some(timeout) = timeout else {
+        return false;
+    };
+    queued > 0 && silent_for >= timeout
+}
 
 static CONSUMER_SEEK_TIMEOUT_SEC: u64 = 60;
 static CONSUMER_ASSIGNMENT_TIMEOUT_SEC: u64 = 60;
@@ -3208,6 +3281,11 @@ impl KafkaSink {
                         )
                         .mark_retriable());
                     }
+                    // A flush that never completes is the other place a wedged
+                    // sink spins; without this it would retry until the
+                    // shutdown watchdog killed the process with nothing naming
+                    // the cause.
+                    Self::check_sink_stalled(producer, topic)?;
                 }
             }
         }
@@ -3221,6 +3299,37 @@ impl KafkaSink {
     /// during a SIGTERM drain), while a wedged broker can no longer pin the
     /// drain forever. Outside shutdown the loop retries indefinitely, exactly
     /// as before.
+    /// Fail the sink when it is holding messages the broker will not accept.
+    ///
+    /// "Stalled" deliberately means *no delivery report at all* for the
+    /// watchdog window while messages are queued — not "the queue is full" and
+    /// not "a message has waited a long time". A sink that is simply slower
+    /// than its input keeps getting delivery reports and keeps backpressuring
+    /// upstream forever, which is the correct behaviour for a streaming
+    /// pipeline. Only a broker that has gone silent trips this.
+    fn check_sink_stalled(
+        producer: &KafkaThreadedProducer,
+        topic: &str,
+    ) -> streamling_core::error::Result<()> {
+        let timeout = sink_stall_watchdog_timeout();
+        let queued = producer.in_flight_count();
+        let silent_for = producer.context().since_last_delivery();
+        if !is_sink_stalled(queued, silent_for, timeout) {
+            return Ok(());
+        }
+        let timeout = timeout.expect("is_sink_stalled is false when the watchdog is disabled");
+        Err(streamling_core::streamling_err!(
+            "Kafka sink for topic {} is stalled: {} message(s) queued and the broker has not \
+             returned a delivery report for {:?} (watchdog timeout {:?}). The producer is not \
+             being drained — check broker reachability and the producer stats log \
+             (wire_kbps, in_flight, connects_delta) rather than pipeline throughput.",
+            topic,
+            queued,
+            silent_for,
+            timeout
+        ))
+    }
+
     fn send_record_absorbing_queue_full<K, P>(
         producer: &KafkaThreadedProducer,
         mut record: BaseRecord<'_, K, P>,
@@ -3250,6 +3359,12 @@ impl KafkaSink {
                         )
                         .mark_retriable());
                     }
+                    // A full queue is ordinary backpressure and must not fail
+                    // the pipeline. It is only a problem when the broker has
+                    // also stopped answering, which is what the watchdog keys
+                    // on — otherwise we would be right back to failing slow
+                    // sinks.
+                    Self::check_sink_stalled(producer, topic)?;
                     debug!(
                         "rdkafka queue full for topic: {}, polling and retrying",
                         topic
@@ -3279,7 +3394,7 @@ impl KafkaSink {
         let mut builder = KafkaCommon::build_client(config);
 
         builder
-            .set("message.timeout.ms", "600000")
+            .set("message.timeout.ms", message_timeout_ms())
             .set("acks", "all");
 
         let kafka_config_optimizer = KafkaConfigOptimizer::new(config);
@@ -4241,6 +4356,60 @@ mod tests {
     }
 
     #[test]
+    fn sink_stall_watchdog_tolerates_backpressure_while_the_broker_answers() {
+        // The regression this whole watchdog exists to avoid: a sink slower
+        // than its input sits with a full queue indefinitely and must NOT be
+        // failed, as long as deliveries keep coming back.
+        let timeout = Some(Duration::from_secs(300));
+        assert!(!is_sink_stalled(10_000, Duration::from_secs(0), timeout));
+        assert!(!is_sink_stalled(10_000, Duration::from_secs(299), timeout));
+    }
+
+    #[test]
+    fn sink_stall_watchdog_ignores_a_quiet_but_empty_producer() {
+        // Nothing queued means nothing to deliver, so silence is expected --
+        // an idle low-volume pipeline must not trip the watchdog.
+        let timeout = Some(Duration::from_secs(300));
+        assert!(!is_sink_stalled(0, Duration::from_secs(86_400), timeout));
+    }
+
+    #[test]
+    fn sink_stall_watchdog_fires_only_when_queued_and_silent() {
+        let timeout = Some(Duration::from_secs(300));
+        assert!(is_sink_stalled(1, Duration::from_secs(300), timeout));
+        assert!(is_sink_stalled(10_000, Duration::from_secs(600), timeout));
+    }
+
+    #[test]
+    fn sink_stall_watchdog_can_be_disabled() {
+        assert!(!is_sink_stalled(10_000, Duration::from_secs(86_400), None));
+    }
+
+    #[test]
+    fn delivery_reports_reset_the_stall_clock() {
+        let ctx = KafkaProducerContext::new();
+        *ctx.last_delivery_at.lock().unwrap() = Instant::now() - Duration::from_secs(600);
+        assert!(ctx.since_last_delivery() >= Duration::from_secs(600));
+        ctx.note_delivery();
+        assert!(ctx.since_last_delivery() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn message_timeout_defaults_to_infinite() {
+        // A finite message.timeout.ms bounds total time in the producer,
+        // INCLUDING time queued behind backpressure, so it fails sinks that are
+        // merely slow. Wedges are the stall watchdog's job instead.
+        let cfg = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            None,
+            KafkaCompression::None,
+        );
+        assert_eq!(cfg.get("message.timeout.ms"), Some("0"));
+    }
+
+    #[test]
     fn producer_overrides_are_parsed_and_win_over_everything_else() {
         let mut config = test_kafka_config();
         // Deliberately fight both the optimizer default (lz4) and a per-sink
@@ -4331,7 +4500,8 @@ mod tests {
         assert_eq!(cfg.get("message.max.bytes"), Some("20000000"));
         // Invariants that must always hold for the sink producer.
         assert_eq!(cfg.get("acks"), Some("all"));
-        assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
+        // Infinite by design — see `message_timeout_defaults_to_infinite`.
+        assert_eq!(cfg.get("message.timeout.ms"), Some("0"));
     }
 
     fn unreachable_broker_producer(extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
