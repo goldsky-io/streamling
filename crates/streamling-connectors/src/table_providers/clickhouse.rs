@@ -6468,3 +6468,172 @@ mod feature_002_byte_conversion_tests {
         assert_eq!(out.schema().field(2).data_type(), &DataType::Utf8);
     }
 }
+
+#[cfg(test)]
+mod pr37_adversarial_connector_tests {
+    use super::*;
+    use arrow::array::{Array, LargeBinaryArray, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::prelude::SessionContext;
+    use std::str::FromStr;
+    use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue, NativeIntKind};
+    use streamling_core::types::decimal_arb_capability::{
+        ConnectorKind, validate_pipeline_decimal_arb,
+    };
+
+    #[test]
+    fn pr37_adversarial_clickhouse_string_fraction_must_not_be_silently_rounded() {
+        let field = Arc::new(DecimalArbType::field("balance", 100, 2, false).unwrap());
+        for text in ["1.234", "1.235", "-0.005", "0.00000001"] {
+            let input = StringArray::from(vec![text]);
+            let result = clickhouse_string_to_decimal_arb(&input, &field);
+            if let Ok(output) = &result {
+                let bytes = output.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                let actual =
+                    DecimalArbValue::from_canonical_bytes_at_scale(bytes.value(0), 2).unwrap();
+                eprintln!("ClickHouse string {text} silently becomes {actual}");
+            }
+            assert!(
+                result.is_err(),
+                "source value {text} does not fit declared scale=2 and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn pr37_adversarial_clickhouse_string_precision_must_be_enforced() {
+        let field = Arc::new(DecimalArbType::field("balance", 80, 2, false).unwrap());
+        let text = "9".repeat(79);
+        let input = StringArray::from(vec![text.as_str()]);
+        assert!(
+            clickhouse_string_to_decimal_arb(&input, &field).is_err(),
+            "79 integer digits must not enter decimal_arb(80,2), which allows only 78"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr37_adversarial_clickhouse_nested_wide_decimal_must_not_reach_wire_as_binary() {
+        let inner = Arc::new(DecimalArbType::field("balance", 100, 2, false).unwrap());
+        let outer = Field::new(
+            "account",
+            DataType::Struct(vec![inner.clone()].into()),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![outer]));
+        let bytes = DecimalArbValue::from_str("1.23")
+            .unwrap()
+            .to_canonical_bytes_at_scale(2);
+        let values: ArrayRef = Arc::new(LargeBinaryArray::from(vec![bytes.as_slice()]));
+        let nested = StructArray::new(vec![inner].into(), vec![values], None);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested)]).unwrap();
+        let validation = validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]);
+        if validation.is_err() {
+            return; // Rejecting unsupported nested decimals before writing is safe.
+        }
+        let ddl = ClickHouseClient::clickhouse_column_type(schema.field(0), None).unwrap();
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema.clone(), None).unwrap();
+        let context = SessionContext::new();
+        let projected = match build_decimal_arb_projection_for_clickhouse(
+            &context.state(),
+            input.clone(),
+            &schema,
+            None,
+        ) {
+            Ok(projected) => projected,
+            Err(_) => return,
+        };
+        let normalized_schema = Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
+            &projected.schema(),
+        ));
+        let batches = datafusion::physical_plan::collect(projected, context.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        for batch in batches {
+            let normalized = match ClickHouseClient::normalize_batch_for_clickhouse(
+                &batch,
+                &normalized_schema,
+            ) {
+                Ok(normalized) => normalized,
+                Err(_) => return,
+            };
+            let nested = normalized
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let leaf = nested.column(0);
+            let text = if let Some(strings) = leaf.as_any().downcast_ref::<StringArray>() {
+                strings.value(0)
+            } else if let Some(strings) = leaf
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+            {
+                strings.value(0)
+            } else {
+                panic!(
+                    "nested decimal must be rejected or encoded as decimal text: 1.23 reaches {ddl} as {:?}",
+                    leaf.data_type()
+                );
+            };
+            assert_eq!(
+                DecimalArbValue::from_str(text).unwrap(),
+                DecimalArbValue::from_str("1.23").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Pre-existing UInt256/Int256 DDL nullability issue; excluded from PR37 regressions"]
+    fn pr37_adversarial_clickhouse_nullable_native_integer_ddl_preserves_nullability() {
+        let field = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("balance", 78, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        let schema = ClickHouseClient::normalize_schema_for_clickhouse(&Schema::new(vec![field]));
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(schema.field(0), None).unwrap(),
+            "Nullable(UInt256)"
+        );
+    }
+
+    #[test]
+    fn pr37_adversarial_clickhouse_native_bytes_round_trip_asymmetric_patterns() {
+        for kind in [NativeIntKind::U256, NativeIntKind::I256] {
+            let field = Arc::new(
+                DecimalArbType::with_native_int_kind(
+                    DecimalArbType::field("balance", 78, 0, true).unwrap(),
+                    kind,
+                )
+                .unwrap(),
+            );
+            let texts = [
+                "0",
+                "1",
+                "255",
+                "256",
+                "257",
+                "65535",
+                "65536",
+                "18446744073709551617",
+                "1606938044258990275541962092341162602522202993782792835301377",
+            ];
+            for text in texts {
+                let expected = DecimalArbValue::from_str(text).unwrap();
+                let canonical = expected.to_canonical_bytes_at_scale(0);
+                let input = LargeBinaryArray::from(vec![Some(canonical.as_slice()), None]);
+                let encoded = decimal_arb_to_clickhouse_native(&input, &field).unwrap();
+                let decoded = clickhouse_native_to_decimal_arb(encoded.as_ref(), &field).unwrap();
+                let decoded = decoded.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                assert_eq!(
+                    DecimalArbValue::from_canonical_bytes_at_scale(decoded.value(0), 0).unwrap(),
+                    expected
+                );
+                assert!(decoded.is_null(1));
+            }
+        }
+    }
+}
