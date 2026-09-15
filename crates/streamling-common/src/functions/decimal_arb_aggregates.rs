@@ -10,11 +10,12 @@
 //! `count` reuses the DataFusion built-in unchanged — it's `Any`-typed and
 //! returns `Int64` for any input.
 
+use crate::functions::decimal_arb_ops::exact_div_at_scale;
 use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION};
 use crate::{streamling_user_bail, streamling_user_err};
 use arrow::array::{Array, ArrayRef, Int64Array, LargeBinaryArray};
 use arrow_schema::{Field, FieldRef};
-use bigdecimal::{BigDecimal, RoundingMode};
+use bigdecimal::BigDecimal;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::functions_aggregate::{
@@ -801,8 +802,10 @@ impl Accumulator for AvgAccumulator {
         if self.count == 0 {
             return Ok(ScalarValue::LargeBinary(None));
         }
-        let avg = (&self.sum / BigDecimal::from(self.count))
-            .with_scale_round(self.output_scale as i64, RoundingMode::HalfEven);
+        // Exact quotient with a single half-even rounding at the output scale.
+        // `BigDecimal`'s `/` picks its own scale and truncates the fraction of a
+        // wide sum before the rounding below could ever see it.
+        let avg = exact_div_at_scale(&self.sum, &BigDecimal::from(self.count), self.output_scale);
         let v = DecimalArbValue::from_bigdecimal(avg);
         v.check_fits(self.output_precision, self.output_scale, "avg")?;
         let bytes = v.to_canonical_bytes_at_scale(self.output_scale);

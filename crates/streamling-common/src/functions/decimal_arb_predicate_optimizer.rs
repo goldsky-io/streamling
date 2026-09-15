@@ -29,15 +29,16 @@
 
 use crate::functions::decimal_arb_ops::{
     DecimalArbEqFunc, DecimalArbGtFunc, DecimalArbGteFunc, DecimalArbLtFunc, DecimalArbLteFunc,
-    DecimalArbNeqFunc, DecimalArbWithMetaFunc, ToDecimalArbFromDecimal128Func,
-    ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
+    DecimalArbNeqFunc, DecimalArbToStringFunc, DecimalArbWithMetaFunc,
+    ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
 };
 use crate::types::decimal_arb::DecimalArbType;
 use arrow_schema::DataType;
+use datafusion::common::ScalarValue;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, Result as DFResult};
-use datafusion::logical_expr::expr::{Between, InList, ScalarFunction};
+use datafusion::logical_expr::expr::{Between, Case, Cast, InList, ScalarFunction, TryCast};
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
 use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator, ScalarUDF, lit};
 use std::sync::Arc;
@@ -45,6 +46,19 @@ use std::sync::Arc;
 /// Precision used when coercing a 64-bit integer to decimal_arb at scale 0
 /// (matches the binary-op planner). 20 digits covers any `i64`/`u64`.
 const INT_COERCE_PRECISION: i64 = 20;
+
+/// Is `dt` one of the Arrow string types a SQL `VARCHAR`/`TEXT` cast can land on?
+fn is_text_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// Is `expr` a bare `NULL` literal (of any type)?
+fn is_null_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(v, _) if v.is_null())
+}
 
 /// Rewrites `BETWEEN` / `IN` over `decimal_arb` into decimal_arb comparison UDFs.
 #[derive(Debug)]
@@ -59,6 +73,7 @@ pub struct DecimalArbExprRewrite {
     cast_from_decimal128: Arc<ScalarUDF>,
     cast_from_decimal256: Arc<ScalarUDF>,
     with_meta: Arc<ScalarUDF>,
+    to_string: Arc<ScalarUDF>,
 }
 
 impl Default for DecimalArbExprRewrite {
@@ -80,6 +95,7 @@ impl DecimalArbExprRewrite {
             cast_from_decimal128: Arc::new(ScalarUDF::from(ToDecimalArbFromDecimal128Func::new())),
             cast_from_decimal256: Arc::new(ScalarUDF::from(ToDecimalArbFromDecimal256Func::new())),
             with_meta: Arc::new(ScalarUDF::from(DecimalArbWithMetaFunc::new())),
+            to_string: Arc::new(ScalarUDF::from(DecimalArbToStringFunc::new())),
         }
     }
 
@@ -160,11 +176,116 @@ impl DecimalArbExprRewrite {
         }
     }
 
+    /// `decimal_arb_to_string(expr)` — the canonical decimal text of a
+    /// decimal_arb value.
+    fn to_text(&self, expr: Expr) -> Expr {
+        Expr::ScalarFunction(ScalarFunction {
+            func: self.to_string.clone(),
+            args: vec![expr],
+        })
+    }
+
     fn cmp(&self, udf: &Arc<ScalarUDF>, left: Expr, right: Expr) -> Expr {
         Expr::ScalarFunction(ScalarFunction {
             func: udf.clone(),
             args: vec![left, right],
         })
+    }
+
+    /// The decimal_arb UDF implementing `op`, or `None` if `op` isn't an
+    /// ordering/equality comparison.
+    fn cmp_udf(&self, op: Operator) -> Option<&Arc<ScalarUDF>> {
+        Some(match op {
+            Operator::Eq => &self.eq,
+            Operator::NotEq => &self.neq,
+            Operator::Lt => &self.lt,
+            Operator::LtEq => &self.lte,
+            Operator::Gt => &self.gt,
+            Operator::GtEq => &self.gte,
+            _ => return None,
+        })
+    }
+
+    /// Stamp `(precision, scale)` back onto `expr` when every non-null branch in
+    /// `branches` agrees; otherwise return `expr` unchanged.
+    fn stamp_from_branches(&self, expr: Expr, branches: &[&Expr], schema: &DFSchema) -> Expr {
+        match self.decimal_arb_branches_meta(branches, schema) {
+            Some((p, s)) => self.stamp_meta(expr, p, s),
+            None => expr,
+        }
+    }
+
+    /// `CASE WHEN l IS NULL THEN r WHEN r IS NULL THEN l WHEN keep_left(l, r)
+    /// THEN l ELSE r END` — one step of a GREATEST/LEAST fold, matching those
+    /// functions' skip-nulls semantics.
+    fn extreme_step(&self, keep_left: &Arc<ScalarUDF>, left: Expr, right: Expr) -> Expr {
+        Expr::Case(Case {
+            expr: None,
+            when_then_expr: vec![
+                (
+                    Box::new(Expr::IsNull(Box::new(left.clone()))),
+                    Box::new(right.clone()),
+                ),
+                (
+                    Box::new(Expr::IsNull(Box::new(right.clone()))),
+                    Box::new(left.clone()),
+                ),
+                (
+                    Box::new(self.cmp(keep_left, left.clone(), right.clone())),
+                    Box::new(left),
+                ),
+            ],
+            else_expr: Some(Box::new(right)),
+        })
+    }
+
+    /// Fold `args` into nested comparison CASEs. `keep_left` is `gte` for
+    /// GREATEST / `array_max`, `lte` for LEAST / `array_min`.
+    ///
+    /// These functions pick a winner by comparing values, and DataFusion does
+    /// that on the physical `LargeBinary` — where sign/magnitude bytes put every
+    /// negative above every positive, and the same number at two scales has two
+    /// encodings. Comparing through the decimal_arb UDFs restores numeric order.
+    fn extreme_fold(
+        &self,
+        keep_left: &Arc<ScalarUDF>,
+        args: &[Expr],
+        schema: &DFSchema,
+    ) -> Option<Expr> {
+        let coerced = args
+            .iter()
+            .map(|a| self.coerce(a.clone(), schema))
+            .collect::<Option<Vec<_>>>()?;
+        let mut iter = coerced.into_iter();
+        let first = iter.next()?;
+        let folded = iter.fold(first, |acc, next| self.extreme_step(keep_left, acc, next));
+        let branches: Vec<&Expr> = args.iter().collect();
+        Some(self.stamp_from_branches(folded, &branches, schema))
+    }
+
+    /// Null-safe equality over decimal_arb:
+    /// `(l IS NULL AND r IS NULL) OR (l IS NOT NULL AND r IS NOT NULL AND eq(l, r))`.
+    fn null_safe_eq(&self, left: Expr, right: Expr) -> Expr {
+        let both_null = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::IsNull(Box::new(left.clone()))),
+            Operator::And,
+            Box::new(Expr::IsNull(Box::new(right.clone()))),
+        ));
+        let both_present = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::IsNotNull(Box::new(left.clone()))),
+            Operator::And,
+            Box::new(Expr::IsNotNull(Box::new(right.clone()))),
+        ));
+        let present_and_equal = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(both_present),
+            Operator::And,
+            Box::new(self.cmp(&self.eq, left, right)),
+        ));
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(both_null),
+            Operator::Or,
+            Box::new(present_and_equal),
+        ))
     }
 
     /// Rewrite a single expression node. Only `Between`/`InList` over a
@@ -227,9 +348,18 @@ impl DecimalArbExprRewrite {
                         negated,
                     })));
                 }
-                // Coerce every element; if any can't coerce, leave untouched.
+                // A NULL element contributes UNKNOWN, not a comparison:
+                // `x IN (a, NULL)` is `x = a OR NULL`, so it yields true when x
+                // matches and NULL otherwise (and the dual for NOT IN). Bailing
+                // out on the NULL — as this did — dropped the whole list back to
+                // byte comparison.
                 let mut coerced = Vec::with_capacity(list.len());
+                let mut saw_null = false;
                 for e in &list {
+                    if is_null_literal(e) {
+                        saw_null = true;
+                        continue;
+                    }
                     match self.coerce(e.clone(), schema) {
                         Some(c) => coerced.push(c),
                         None => {
@@ -247,21 +377,62 @@ impl DecimalArbExprRewrite {
                 } else {
                     (&self.eq, Operator::Or)
                 };
-                let mut iter = coerced.into_iter();
-                let first = self.cmp(per_elem_udf, (*subject).clone(), iter.next().unwrap());
-                let rewritten = iter.fold(first, |acc, elem| {
-                    Expr::BinaryExpr(BinaryExpr::new(
-                        Box::new(acc),
-                        combine,
-                        Box::new(self.cmp(per_elem_udf, (*subject).clone(), elem)),
-                    ))
+                let comparisons = coerced
+                    .into_iter()
+                    .map(|elem| self.cmp(per_elem_udf, (*subject).clone(), elem));
+                let folded = comparisons.reduce(|acc, next| {
+                    Expr::BinaryExpr(BinaryExpr::new(Box::new(acc), combine, Box::new(next)))
                 });
+                let rewritten = match (folded, saw_null) {
+                    // `true OR NULL` = true, `false OR NULL` = NULL (and dually
+                    // `false AND NULL` = false, `true AND NULL` = NULL).
+                    (Some(folded), true) => Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(folded),
+                        combine,
+                        Box::new(lit(ScalarValue::Boolean(None))),
+                    )),
+                    (Some(folded), false) => folded,
+                    // Every element was NULL: the result is UNKNOWN throughout.
+                    (None, _) => lit(ScalarValue::Boolean(None)),
+                };
                 Ok(Transformed::yes(rewritten))
             }
             // F2: CASE whose branches are decimal_arb loses the extension
             // metadata on its output field. Re-stamp it (when all branches share
             // a scale) so downstream sinks treat it as NUMERIC(p, s), not BYTEA.
             Expr::Case(case) => {
+                // A *simple* CASE (`CASE v WHEN w THEN …`) compares `v` against
+                // each WHEN on the physical bytes, so `1` never matches `1.00`.
+                // Desugar it into a searched CASE over decimal_arb equality.
+                let mut desugared = false;
+                let case = match &case.expr {
+                    Some(operand) if self.is_decimal_arb(operand, schema) => {
+                        let rewritten: Option<Vec<_>> = case
+                            .when_then_expr
+                            .iter()
+                            .map(|(when, then)| {
+                                let coerced = self.coerce((**when).clone(), schema)?;
+                                Some((
+                                    Box::new(self.cmp(&self.eq, (**operand).clone(), coerced)),
+                                    then.clone(),
+                                ))
+                            })
+                            .collect();
+                        match rewritten {
+                            Some(when_then_expr) => {
+                                desugared = true;
+                                Case {
+                                    expr: None,
+                                    when_then_expr,
+                                    else_expr: case.else_expr.clone(),
+                                }
+                            }
+                            None => case,
+                        }
+                    }
+                    _ => case,
+                };
+
                 let mut branches: Vec<&Expr> = case
                     .when_then_expr
                     .iter()
@@ -272,6 +443,7 @@ impl DecimalArbExprRewrite {
                 }
                 match self.decimal_arb_branches_meta(&branches, schema) {
                     Some((p, s)) => Ok(Transformed::yes(self.stamp_meta(Expr::Case(case), p, s))),
+                    None if desugared => Ok(Transformed::yes(Expr::Case(case))),
                     None => Ok(Transformed::no(Expr::Case(case))),
                 }
             }
@@ -286,6 +458,130 @@ impl DecimalArbExprRewrite {
                     ))),
                     None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
                 }
+            }
+            // R5: `nullif(a, b)` is an equality test, so it compared bytes and
+            // never matched across scales. `CASE WHEN eq(a, b) THEN NULL ELSE a END`.
+            Expr::ScalarFunction(sf)
+                if sf.func.name() == "nullif"
+                    && sf.args.len() == 2
+                    && self.is_decimal_arb(&sf.args[0], schema) =>
+            {
+                let Some(right) = self.coerce(sf.args[1].clone(), schema) else {
+                    return Ok(Transformed::no(Expr::ScalarFunction(sf)));
+                };
+                let left = sf.args[0].clone();
+                let case = Expr::Case(Case {
+                    expr: None,
+                    when_then_expr: vec![(
+                        Box::new(self.cmp(&self.eq, left.clone(), right)),
+                        Box::new(lit(ScalarValue::Null)),
+                    )],
+                    else_expr: Some(Box::new(left.clone())),
+                });
+                Ok(Transformed::yes(self.stamp_from_branches(
+                    case,
+                    &[&left],
+                    schema,
+                )))
+            }
+            // R5: GREATEST / LEAST and the two-argument-free `array_min` /
+            // `array_max` over a literal array pick their winner by comparison.
+            Expr::ScalarFunction(sf)
+                if matches!(sf.func.name(), "greatest" | "least")
+                    && sf.args.iter().any(|a| self.is_decimal_arb(a, schema)) =>
+            {
+                let keep_left = if sf.func.name() == "greatest" {
+                    &self.gte
+                } else {
+                    &self.lte
+                };
+                match self.extreme_fold(keep_left, &sf.args, schema) {
+                    Some(folded) => Ok(Transformed::yes(folded)),
+                    None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
+                }
+            }
+            Expr::ScalarFunction(sf)
+                if matches!(sf.func.name(), "array_min" | "array_max") && sf.args.len() == 1 =>
+            {
+                // Only the literal-array form (`array_min([a, b])`, which plans as
+                // `make_array`) can be folded here; a genuine list *column* of
+                // decimal_arb would need an element-wise UDF and is left alone.
+                let Expr::ScalarFunction(inner) = &sf.args[0] else {
+                    return Ok(Transformed::no(Expr::ScalarFunction(sf)));
+                };
+                if inner.func.name() != "make_array"
+                    || !inner.args.iter().any(|a| self.is_decimal_arb(a, schema))
+                {
+                    return Ok(Transformed::no(Expr::ScalarFunction(sf)));
+                }
+                let keep_left = if sf.func.name() == "array_max" {
+                    &self.gte
+                } else {
+                    &self.lte
+                };
+                match self.extreme_fold(keep_left, &inner.args, schema) {
+                    Some(folded) => Ok(Transformed::yes(folded)),
+                    None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
+                }
+            }
+            // R4/R5: a comparison the `DecimalArbExprPlanner` never saw, because
+            // at SQL-planning time the operand wasn't yet known to be decimal_arb
+            // — typically a CASE/COALESCE result, which only becomes decimal_arb
+            // once the arms above stamp it. Left alone it compares raw bytes.
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                if !self.is_decimal_arb(&left, schema) && !self.is_decimal_arb(&right, schema) {
+                    return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
+                        left,
+                        op,
+                        right,
+                    })));
+                }
+                let coerced = self
+                    .coerce((*left).clone(), schema)
+                    .zip(self.coerce((*right).clone(), schema));
+                let Some((l, r)) = coerced else {
+                    return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
+                        left,
+                        op,
+                        right,
+                    })));
+                };
+                match op {
+                    Operator::IsNotDistinctFrom => Ok(Transformed::yes(self.null_safe_eq(l, r))),
+                    Operator::IsDistinctFrom => Ok(Transformed::yes(Expr::Not(Box::new(
+                        self.null_safe_eq(l, r),
+                    )))),
+                    _ => match self.cmp_udf(op) {
+                        Some(udf) => Ok(Transformed::yes(self.cmp(udf, l, r))),
+                        // Arithmetic and everything else stays with the
+                        // `DecimalArbExprPlanner`.
+                        None => Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
+                            left,
+                            op,
+                            right,
+                        }))),
+                    },
+                }
+            }
+            // R7: `CAST(x AS VARCHAR)` on decimal_arb hands Arrow the canonical
+            // bytes, which render as control characters rather than the number.
+            Expr::Cast(Cast { expr: inner, field })
+                if is_text_type(field.data_type()) && self.is_decimal_arb(&inner, schema) =>
+            {
+                // Keep the cast so the column still has exactly the type the
+                // query asked for (VARCHAR plans as LargeUtf8 here).
+                Ok(Transformed::yes(Expr::Cast(Cast {
+                    expr: Box::new(self.to_text(*inner)),
+                    field,
+                })))
+            }
+            Expr::TryCast(TryCast { expr: inner, field })
+                if is_text_type(field.data_type()) && self.is_decimal_arb(&inner, schema) =>
+            {
+                Ok(Transformed::yes(Expr::TryCast(TryCast {
+                    expr: Box::new(self.to_text(*inner)),
+                    field,
+                })))
             }
             other => Ok(Transformed::no(other)),
         }

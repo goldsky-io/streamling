@@ -1,11 +1,14 @@
+use crate::formats::decimal_arb_text::{decimal_arb_leaves_to_text, field_contains_decimal_arb};
 use crate::formats::{FromArrowConverter, ToArrowConverter};
 use crate::streamling_err;
-use arrow_schema::{Field, Schema, SchemaRef};
-use datafusion::arrow::array::ArrayRef;
+use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use datafusion::arrow::ipc::{reader::FileReader, writer::FileWriter};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use std::io::Cursor;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct FromArrowToIpcConverter {}
@@ -16,11 +19,31 @@ impl FromArrowToIpcConverter {
     }
 
     fn to_ipc(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
-        // Feature 002 (Retire U256/I256): the previous U256/I256 → Utf8
-        // string-conversion at IPC write time is no longer needed — wide
-        // integers flow through decimal_arb (LargeBinary) which Arrow IPC
-        // serializes natively, preserving the field's extension metadata.
-        let transformed_batch = batch.clone();
+        // This converter feeds the script-transform boundary, where the other
+        // side is JavaScript. Wide numbers have always been exposed there as
+        // decimal strings (`row.amount === '0'`), and scripts depend on it.
+        // Retiring U256/I256 dropped that conversion along with them, so
+        // decimal_arb columns started arriving as opaque byte arrays. Convert
+        // every decimal_arb leaf — nested ones too — back to canonical decimal
+        // text; `convert_batch_to_original_schema` parses it on the way back.
+        let needs_transform = batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| field_contains_decimal_arb(f));
+
+        let transformed_batch = if needs_transform {
+            let mut new_fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
+            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+            for (idx, field) in batch.schema().fields().iter().enumerate() {
+                let (nf, na) = decimal_arb_leaves_to_text(field, batch.column(idx))?;
+                new_fields.push(nf);
+                new_columns.push(na);
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_columns)?
+        } else {
+            batch.clone()
+        };
 
         // Serialize to Arrow IPC file format
         let mut buf = Vec::new();
@@ -114,6 +137,118 @@ impl FromIpcToArrowConverter {
         self.convert_batch_to_original_schema(batch)
     }
 
+    /// Produce the `decimal_arb` column `target` describes from whatever the IPC
+    /// payload actually carried.
+    ///
+    /// Two shapes need real work rather than an Arrow `cast`:
+    ///
+    /// * **Utf8 → decimal_arb.** A JS transform that returns `{amount: "100"}`
+    ///   comes back as a string column. `cast(Utf8 → LargeBinary)` hands over the
+    ///   *UTF-8 bytes*, which the decimal_arb decoder then reads as canonical
+    ///   sign/magnitude — `"100"` became 12336. The text has to be parsed.
+    /// * **decimal_arb → decimal_arb at a different scale.** Both sides are
+    ///   `LargeBinary`, so the equality check upstream saw "same type" and passed
+    ///   the bytes through under the target's scale metadata: 12.34 read back as
+    ///   0.1234. The value has to be re-encoded at the target scale.
+    fn coerce_into_decimal_arb(
+        target: &Field,
+        source_field: &Field,
+        source: &ArrayRef,
+    ) -> Result<ArrayRef> {
+        let (precision, scale) =
+            DecimalArbType::precision_scale_from_field(target).ok_or_else(|| {
+                DataFusionError::from(streamling_err!(
+                    "decimal_arb field '{}' missing precision/scale metadata",
+                    target.name(),
+                ))
+            })?;
+
+        let mut builder =
+            DecimalArbArrayBuilder::with_capacity(source.len(), target.name(), precision, scale)?;
+
+        let parse_text = |text: &str| -> Result<DecimalArbValue> {
+            DecimalArbValue::from_str(text).map_err(|e| {
+                DataFusionError::from(streamling_err!(
+                    "field '{}': '{}' is not a decimal number: {}",
+                    target.name(),
+                    text,
+                    e,
+                ))
+            })
+        };
+
+        // Flechette hands strings back in whatever encoding it likes —
+        // plain Utf8, LargeUtf8, a view, or dictionary-encoded. Normalize to
+        // Utf8 first so the parse below is the only place that matters.
+        fn is_string_like(dt: &DataType) -> bool {
+            match dt {
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
+                DataType::Dictionary(_, values) => is_string_like(values),
+                _ => false,
+            }
+        }
+
+        if is_string_like(source.data_type()) {
+            use datafusion::arrow::compute::cast;
+            let utf8 = cast(source, &DataType::Utf8)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let arr = utf8
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cast to Utf8 yields a StringArray");
+            for row in 0..arr.len() {
+                if arr.is_null(row) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(&parse_text(arr.value(row))?)?;
+                }
+            }
+            let (raw, _, _) = builder.finish().into_inner();
+            return Ok(Arc::new(raw) as ArrayRef);
+        }
+
+        match source.data_type() {
+            DataType::LargeBinary => {
+                let source_scale = match DecimalArbType::precision_scale_from_field(source_field) {
+                    // Metadata survived IPC and already agrees — the bytes are
+                    // canonical at the target scale, nothing to do.
+                    Some((_, s)) if s == scale => return Ok(source.clone()),
+                    Some((_, s)) => s,
+                    // No metadata to disagree with: keep the long-standing
+                    // assumption that the bytes are already at the target scale.
+                    None => return Ok(source.clone()),
+                };
+                let arr = source
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .expect("LargeBinary array downcasts to LargeBinaryArray");
+                for row in 0..arr.len() {
+                    if arr.is_null(row) {
+                        builder.append_null();
+                    } else {
+                        let value = DecimalArbValue::from_canonical_bytes_at_scale(
+                            arr.value(row),
+                            source_scale,
+                        )?;
+                        builder.append_value(&value)?;
+                    }
+                }
+            }
+            other => {
+                return Err(DataFusionError::from(streamling_err!(
+                    "cannot convert column '{}' of type {:?} into decimal_arb({}, {})",
+                    target.name(),
+                    other,
+                    precision,
+                    scale,
+                )));
+            }
+        }
+
+        let (raw, _, _) = builder.finish().into_inner();
+        Ok(Arc::new(raw) as ArrayRef)
+    }
+
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
         // Feature 002: U256/I256 conversion no longer needed (those types
         // are retired in favor of decimal_arb, which Arrow IPC carries
@@ -156,7 +291,16 @@ impl FromIpcToArrowConverter {
                     Field::new(target_field.name(), source_col.data_type().clone(), true)
                 });
 
-                if source_field.data_type() == target_field.data_type() {
+                if DecimalArbType::is_decimal_arb_field(target_field) {
+                    // decimal_arb is LargeBinary underneath, so neither the
+                    // type-equality check nor Arrow's `cast` can tell a correct
+                    // conversion from a reinterpretation of raw bytes.
+                    new_columns.push(Self::coerce_into_decimal_arb(
+                        target_field,
+                        &source_field,
+                        source_col,
+                    )?);
+                } else if source_field.data_type() == target_field.data_type() {
                     // Types match, use as-is
                     new_columns.push(source_col.clone());
                 } else {

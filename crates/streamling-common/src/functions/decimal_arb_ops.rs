@@ -26,7 +26,8 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use num_traits::Zero;
+use num_bigint::BigInt;
+use num_traits::{Signed, Zero};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -136,6 +137,46 @@ fn build_output_field(name: &str, precision: u32, scale: u32) -> Result<FieldRef
 /// column scales, applies `op_fn`, encodes the result at the output scale
 /// (with half-to-even rounding for excess fractional digits), and emits a
 /// `LargeBinaryArray`.
+/// Exact `a / b` rounded half-even **once**, directly at `scale`.
+///
+/// `BigDecimal`'s `/` picks its own result scale, so the previous
+/// "round the dividend, divide, round the quotient" shape rounded twice and
+/// truncated the quotient before the second rounding ever saw it — a wide
+/// dividend over a small divisor lost every fractional digit, and a value one
+/// ulp past a half-even tie rounded the wrong way. Working in integers keeps
+/// the quotient exact until the single rounding at the output scale.
+///
+/// With `a = n·10⁻ˢᵃ` and `b = d·10⁻ˢᵇ`, the quotient at `scale` is
+/// `round(n·10^(scale + sb - sa) / d)`; the power of ten is applied to
+/// whichever side keeps both operands integral.
+pub fn exact_div_at_scale(a: &BigDecimal, b: &BigDecimal, scale: u32) -> BigDecimal {
+    let (mut n, sa) = a.as_bigint_and_exponent();
+    let (mut d, sb) = b.as_bigint_and_exponent();
+
+    let shift = i64::from(scale) + sb - sa;
+    if shift >= 0 {
+        n *= BigInt::from(10).pow(shift as u32);
+    } else {
+        d *= BigInt::from(10).pow((-shift) as u32);
+    }
+
+    let negative = n.is_negative() != d.is_negative();
+    let n = n.abs();
+    let d = d.abs();
+
+    let mut q = &n / &d;
+    // Half-even: round up when the remainder is past the midpoint, or exactly
+    // at it with an odd quotient.
+    let twice_remainder = (&n % &d) * 2;
+    if twice_remainder > d || (twice_remainder == d && q.bit(0)) {
+        q += 1;
+    }
+    if negative {
+        q = -q;
+    }
+    BigDecimal::new(q, i64::from(scale))
+}
+
 fn invoke_binary<O>(
     args: ScalarFunctionArgs,
     op_name: &'static str,
@@ -143,7 +184,7 @@ fn invoke_binary<O>(
     op_fn: O,
 ) -> Result<ColumnarValue>
 where
-    O: Fn(&BigDecimal, &BigDecimal) -> Result<BigDecimal>,
+    O: Fn(&BigDecimal, &BigDecimal, u32) -> Result<BigDecimal>,
 {
     if args.args.len() != 2 {
         streamling_user_bail!("{} requires two arguments", op_name);
@@ -154,6 +195,7 @@ where
     let (p1, s1) = require_decimal_arb_field(args.arg_fields[0].as_ref(), op_name)?;
     let (p2, s2) = require_decimal_arb_field(args.arg_fields[1].as_ref(), op_name)?;
     let (p_out, s_out) = output_precision_scale(kind, p1, s1, p2, s2);
+    let product_scale_capped = matches!(kind, BinaryOpKind::Mul) && s1 + s2 > s_out;
 
     let left = downcast_decimal_arb_array(&args.args[0], op_name, "left")?;
     let right = downcast_decimal_arb_array(&args.args[1], op_name, "right")?;
@@ -168,8 +210,23 @@ where
         let rhs = decode_value(&right, ri, s2)?;
         match (lhs, rhs) {
             (Some(a), Some(b)) => {
-                let result = op_fn(a.as_bigdecimal(), b.as_bigdecimal())?;
+                let result = op_fn(a.as_bigdecimal(), b.as_bigdecimal(), s_out)?;
                 let rounded = result.with_scale_round(s_out as i64, RoundingMode::HalfEven);
+                // A product's scale is exactly `s1 + s2`; it is only ever
+                // narrower because `MAX_PRECISION` capped it. Rounding to that
+                // cap is not a defined narrowing like division's output scale —
+                // it silently rewrites the value, and for a small enough product
+                // rewrites it to zero. Refuse instead of corrupting.
+                if product_scale_capped && rounded != result {
+                    streamling_user_bail!(
+                        "{}: product needs scale {} but decimal_arb caps precision at {} \
+                         (scale {}); the exact result is not representable",
+                        op_name,
+                        s1 + s2,
+                        MAX_PRECISION,
+                        s_out,
+                    );
+                }
                 builder.append_value(&DecimalArbValue::from_bigdecimal(rounded))?;
             }
             _ => builder.append_null(),
@@ -260,37 +317,36 @@ decimal_arb_binary_op!(
     DecimalArbAddFunc,
     "decimal_arb_add",
     BinaryOpKind::Add,
-    |a: &BigDecimal, b: &BigDecimal| Ok(a + b)
+    |a: &BigDecimal, b: &BigDecimal, _s_out: u32| Ok(a + b)
 );
 
 decimal_arb_binary_op!(
     DecimalArbSubFunc,
     "decimal_arb_sub",
     BinaryOpKind::Sub,
-    |a: &BigDecimal, b: &BigDecimal| Ok(a - b)
+    |a: &BigDecimal, b: &BigDecimal, _s_out: u32| Ok(a - b)
 );
 
 decimal_arb_binary_op!(
     DecimalArbMulFunc,
     "decimal_arb_mul",
     BinaryOpKind::Mul,
-    |a: &BigDecimal, b: &BigDecimal| Ok(a * b)
+    |a: &BigDecimal, b: &BigDecimal, _s_out: u32| Ok(a * b)
 );
 
 decimal_arb_binary_op!(
     DecimalArbDivFunc,
     "decimal_arb_div",
     BinaryOpKind::Div,
-    |a: &BigDecimal, b: &BigDecimal| {
+    |a: &BigDecimal, b: &BigDecimal, s_out: u32| {
         if b.is_zero() {
             return Err(datafusion::error::DataFusionError::from(
                 streamling_user_err!("decimal_arb_div: division by zero"),
             ));
         }
-        // Round to a generous intermediate scale; the outer invoke_binary then
-        // rounds again to the output scale via with_scale_round (idempotent).
-        let intermediate_scale = (DEFAULT_DIV_SCALE as i64) + (a.fractional_digit_count().max(0));
-        Ok(a.with_scale_round(intermediate_scale, RoundingMode::HalfEven) / b)
+        // Exact quotient, rounded half-even once at the output scale. The
+        // outer `with_scale_round(s_out)` in `invoke_binary` is then a no-op.
+        Ok(exact_div_at_scale(a, b, s_out))
     }
 );
 
@@ -298,7 +354,7 @@ decimal_arb_binary_op!(
     DecimalArbModFunc,
     "decimal_arb_mod",
     BinaryOpKind::Mod,
-    |a: &BigDecimal, b: &BigDecimal| {
+    |a: &BigDecimal, b: &BigDecimal, _s_out: u32| {
         if b.is_zero() {
             return Err(datafusion::error::DataFusionError::from(
                 streamling_user_err!("decimal_arb_mod: modulo by zero"),

@@ -290,6 +290,35 @@ impl fmt::Display for DecimalArbConfigErrors {
 /// from YAML should call this with the connector's resolved `Schema` and
 /// directive list, surfacing `DecimalArbConfigErrors` to abort startup.
 /// Non-decimal_arb fields are ignored.
+/// Connectors whose decimal_arb conversion covers only top-level columns.
+fn converts_only_top_level(kind: ConnectorKind) -> bool {
+    matches!(kind, ConnectorKind::ClickHouse | ConnectorKind::Hybrid)
+}
+
+/// Collect `(dotted path, precision, scale)` for every decimal_arb leaf *below*
+/// `field` — the top-level field itself is handled by the capability matrix.
+fn collect_nested_decimal_arb(
+    field: &arrow_schema::Field,
+    path: &str,
+    out: &mut Vec<(String, u32, u32)>,
+) {
+    let mut visit = |child: &arrow_schema::Field| {
+        let child_path = format!("{}.{}", path, child.name());
+        if let Some((p, s)) = DecimalArbType::precision_scale_from_field(child) {
+            out.push((child_path.clone(), p, s));
+        }
+        collect_nested_decimal_arb(child, &child_path, out);
+    };
+    match field.data_type() {
+        arrow_schema::DataType::Struct(children) => children.iter().for_each(|c| visit(c)),
+        arrow_schema::DataType::List(c)
+        | arrow_schema::DataType::LargeList(c)
+        | arrow_schema::DataType::FixedSizeList(c, _)
+        | arrow_schema::DataType::Map(c, _) => visit(c),
+        _ => {}
+    }
+}
+
 pub fn validate_pipeline_decimal_arb(
     schema: &Schema,
     kind: ConnectorKind,
@@ -297,6 +326,24 @@ pub fn validate_pipeline_decimal_arb(
 ) -> Result<(), DecimalArbConfigErrors> {
     let mut errors: Vec<crate::error::StreamlingError> = Vec::new();
     for field in schema.fields() {
+        // A decimal_arb *inside* a Struct / List / Map is never reached by the
+        // ClickHouse conversion, which projects top-level columns only — the
+        // leaf would be written as its raw canonical bytes. Reject it at config
+        // load instead of corrupting the column on the wire.
+        if converts_only_top_level(kind) {
+            let mut nested = Vec::new();
+            collect_nested_decimal_arb(field, field.name(), &mut nested);
+            for (path, precision, scale) in nested {
+                errors.push(config_load_error(
+                    &path,
+                    kind,
+                    precision,
+                    scale,
+                    "decimal_arb nested inside a struct/list/map is not supported by this                      connector (only top-level columns are converted); flatten the column                      or send it to a JSON/Avro sink",
+                ));
+            }
+        }
+
         let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) else {
             continue;
         };
