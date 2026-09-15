@@ -1,0 +1,114 @@
+{
+  "generator": "generate_parquet_fixtures.py",
+  "pyarrow": "21.0.0",
+  "files": [
+    {
+      "file": "arb_s0_id1.parquet",
+      "kind": "arb",
+      "scale": 0,
+      "id": 1,
+      "numeric_value": "1",
+      "metadata": {
+        "ARROW:extension:name": "streamling.decimal_arb",
+        "ARROW:extension:metadata": "{\"precision\":100,\"scale\":0}"
+      }
+    },
+    {
+      "file": "arb_s0_id2.parquet",
+      "kind": "arb",
+      "scale": 0,
+      "id": 2,
+      "numeric_value": "1",
+      "metadata": {
+        "ARROW:extension:name": "streamling.decimal_arb",
+        "ARROW:extension:metadata": "{\"precision\":100,\"scale\":0}"
+      }
+    },
+    {
+      "file": "arb_s2_id2.parquet",
+      "kind": "arb",
+      "scale": 2,
+      "id": 2,
+      "numeric_value": "1",
+      "metadata": {
+        "ARROW:extension:name": "streamling.decimal_arb",
+        "ARROW:extension:metadata": "{\"precision\":100,\"scale\":2}"
+      }
+    },
+    {
+      "file": "arb_s2_id1.parquet",
+      "kind": "arb",
+      "scale": 2,
+      "id": 1,
+      "numeric_value": "1",
+      "metadata": {
+        "ARROW:extension:name": "streamling.decimal_arb",
+        "ARROW:extension:metadata": "{\"precision\":100,\"scale\":2}"
+      }
+    },
+    {
+      "file": "native_s0_id1.parquet",
+      "kind": "native",
+      "scale": 0,
+      "id": 1,
+      "numeric_value": "1",
+      "metadata": {}
+    },
+    {
+      "file": "native_s0_id2.parquet",
+      "kind": "native",
+      "scale": 0,
+      "id": 2,
+      "numeric_value": "1",
+      "metadata": {}
+    },
+    {
+      "file": "native_s2_id2.parquet",
+      "kind": "native",
+      "scale": 2,
+      "id": 2,
+      "numeric_value": "1",
+      "metadata": {}
+    },
+    {
+      "file": "native_s2_id1.parquet",
+      "kind": "native",
+      "scale": 2,
+      "id": 1,
+      "numeric_value": "1",
+      "metadata": {}
+    },
+    {
+      "file": "binary_s0_id1.parquet",
+      "kind": "binary",
+      "scale": 0,
+      "id": 1,
+      "hex_bytes": "0001",
+      "metadata": {}
+    },
+    {
+      "file": "binary_s0_id2.parquet",
+      "kind": "binary",
+      "scale": 0,
+      "id": 2,
+      "hex_bytes": "0001",
+      "metadata": {}
+    },
+    {
+      "file": "binary_s2_id2.parquet",
+      "kind": "binary",
+      "scale": 2,
+      "id": 2,
+      "hex_bytes": "0064",
+      "metadata": {}
+    },
+    {
+      "file": "binary_s2_id1.parquet",
+      "kind": "binary",
+      "scale": 2,
+      "id": 1,
+      "hex_bytes": "0064",
+      "metadata": {}
+    }
+  ]
+}

@@ -1,0 +1,452 @@
+{
+  "reviewed_head": "6e6072c7da604aa85536df7fe61ebbd025adb1bc",
+  "results": [
+    {
+      "group": "streamling-common",
+      "target": "deep_v2_math_continuity",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-common",
+      "target": "deep_v2_serialization",
+      "passed": 3,
+      "failed": 7,
+      "ignored": 0,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-common",
+      "target": "deep_v3_legacy_wire",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-common",
+      "target": "deep_v3_math",
+      "passed": 10,
+      "failed": 3,
+      "ignored": 0,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-common",
+      "target": "deep_v3_parquet_options",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 1,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-common",
+      "target": "deep_v3_plugin_contract",
+      "passed": 0,
+      "failed": 2,
+      "ignored": 0,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-common",
+      "target": "deep_v3_wire",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 5,
+      "log": "final-streamling-common.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v2_aggregate_continuity",
+      "passed": 4,
+      "failed": 4,
+      "ignored": 2,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v2_setops",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 3,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v2_sql",
+      "passed": 8,
+      "failed": 47,
+      "ignored": 5,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v2_wasm",
+      "passed": 1,
+      "failed": 4,
+      "ignored": 0,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v3_relational",
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v3_sql",
+      "passed": 9,
+      "failed": 7,
+      "ignored": 2,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-core",
+      "target": "deep_v3_unnest_attribution",
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0,
+      "log": "final-streamling-core.log"
+    },
+    {
+      "group": "streamling-connectors",
+      "target": "deep_v2_connectors",
+      "passed": 5,
+      "failed": 6,
+      "ignored": 1,
+      "log": "final-streamling-connectors.log"
+    },
+    {
+      "group": "streamling-connectors",
+      "target": "deep_v2_union_sink",
+      "passed": 1,
+      "failed": 1,
+      "ignored": 0,
+      "log": "final-streamling-connectors.log"
+    },
+    {
+      "group": "streamling-connectors",
+      "target": "deep_v3_plugin_clickhouse",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 4,
+      "log": "final-streamling-connectors.log"
+    },
+    {
+      "group": "e2e",
+      "target": "deep_v3_arithmetic_pipeline",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-e2e.log"
+    },
+    {
+      "group": "e2e",
+      "target": "deep_v3_hybrid",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-e2e.log"
+    },
+    {
+      "group": "e2e",
+      "target": "deep_v3_literal_pipeline",
+      "passed": 1,
+      "failed": 1,
+      "ignored": 0,
+      "log": "final-e2e.log"
+    },
+    {
+      "group": "e2e",
+      "target": "deep_v3_null_key",
+      "passed": 4,
+      "failed": 1,
+      "ignored": 0,
+      "log": "final-e2e.log"
+    },
+    {
+      "group": "e2e",
+      "target": "deep_v3_parquet",
+      "passed": 5,
+      "failed": 7,
+      "ignored": 0,
+      "log": "final-parquet-rejection-hardening.log"
+    },
+    {
+      "group": "e2e",
+      "target": "deep_v3_pipeline",
+      "passed": 13,
+      "failed": 17,
+      "ignored": 0,
+      "log": "final-e2e.log"
+    },
+    {
+      "group": "plugin-live",
+      "target": "deep_v3_plugin_clickhouse",
+      "passed": 2,
+      "failed": 2,
+      "ignored": 0,
+      "log": "final-plugin-live.log"
+    }
+  ],
+  "existing_e2e": {
+    "decimal_arb_arithmetic": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "decimal_arb_casts": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "decimal_arb_clickhouse": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "decimal_arb_postgres": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "edge_boundary_sinks": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "edge_complex_decimal": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "edge_decimal_boundaries": {
+      "passed": 14,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "wide_int_cast_as_text": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "wide_int_clickhouse": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "wide_int_sort": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e.log"
+    },
+    "edge_avro_types": {
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_decimal_clickhouse": {
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_decimal_sql": {
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_pk_upsert_delete": {
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_robustness_misc": {
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_schema_evolution2": {
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_sql_runnable": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "edge_values_general": {
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-expanded.log"
+    },
+    "checkpoint": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "clickhouse_sink": {
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "clickhouse_source": {
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "dynamic_table": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "external_handlers": {
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-info-rerun.log"
+    },
+    "file_source": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-info-rerun.log"
+    },
+    "filters": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "hybrid_source": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "kafka_sink": {
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "kafka_source": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-info-rerun.log"
+    },
+    "metrics": {
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "multi_sink": {
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "parallelism": {
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-info-rerun.log"
+    },
+    "postgres_aggregate": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "postgres_sink": {
+      "passed": 14,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "postgres_sink_recovery": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "print_sink": {
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-info-rerun2.log"
+    },
+    "scan_sharing": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "schema_evolution": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "shutdown_drain": {
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log",
+      "rerun_log": "existing-shutdown-info-rerun.log"
+    },
+    "sql_transforms": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-info-rerun2.log"
+    },
+    "transforms": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "validation": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    },
+    "webhook_sink": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "existing-e2e-remaining.log"
+    }
+  }
+}
