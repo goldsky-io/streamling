@@ -28,6 +28,7 @@
 //!   decimal is lossy and requires an explicit cast at the call site.
 //!   The expression is left as-is.
 
+use crate::functions::decimal_arb_builtin_shim::DecimalArbBuiltinShim;
 use crate::functions::decimal_arb_ops::{
     DecimalArbAddFunc, DecimalArbDivFunc, DecimalArbEqFunc, DecimalArbGtFunc, DecimalArbGteFunc,
     DecimalArbLtFunc, DecimalArbLteFunc, DecimalArbModFunc, DecimalArbMulFunc, DecimalArbNeqFunc,
@@ -67,6 +68,7 @@ pub struct DecimalArbExprPlanner {
     cast_from_decimal128: Arc<ScalarUDF>,
     cast_from_decimal256: Arc<ScalarUDF>,
     cast_from_int: Arc<ScalarUDF>,
+    make_array: Arc<ScalarUDF>,
 }
 
 impl Default for DecimalArbExprPlanner {
@@ -92,6 +94,9 @@ impl DecimalArbExprPlanner {
             cast_from_decimal128: Arc::new(ScalarUDF::from(ToDecimalArbFromDecimal128Func::new())),
             cast_from_decimal256: Arc::new(ScalarUDF::from(ToDecimalArbFromDecimal256Func::new())),
             cast_from_int: Arc::new(ScalarUDF::from(ToDecimalArbFromIntFunc::new())),
+            make_array: Arc::new(DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::make_array::make_array_udf(),
+            )),
         }
     }
 
@@ -167,6 +172,33 @@ impl DecimalArbExprPlanner {
 }
 
 impl ExprPlanner for DecimalArbExprPlanner {
+    /// `[amount, 0]`: DataFusion's own array-literal planner calls
+    /// `make_array` directly, whose coercion has no common type for
+    /// `LargeBinary` and `Int64`, so the literal failed while the SQL was
+    /// still being planned. Route array literals with a decimal_arb element
+    /// through the shimmed `make_array`; the analyzer rewrite then unifies the
+    /// elements and relabels the list. This planner must be registered ahead
+    /// of the defaults for the hook to be reached.
+    fn plan_array_literal(
+        &self,
+        exprs: Vec<Expr>,
+        schema: &DFSchema,
+    ) -> DFResult<PlannerResult<Vec<Expr>>> {
+        let any_decimal_arb = exprs.iter().any(|e| {
+            e.to_field(schema)
+                .is_ok_and(|(_, f)| DecimalArbType::is_decimal_arb_field(f.as_ref()))
+        });
+        if !any_decimal_arb {
+            return Ok(PlannerResult::Original(exprs));
+        }
+        Ok(PlannerResult::Planned(Expr::ScalarFunction(
+            ScalarFunction {
+                func: self.make_array.clone(),
+                args: exprs,
+            },
+        )))
+    }
+
     fn plan_binary_op(
         &self,
         expr: RawBinaryExpr,

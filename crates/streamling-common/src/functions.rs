@@ -9,13 +9,15 @@ use crate::functions::coalesce_meta::CoalesceMetaUdf;
 use crate::functions::conv_base::ConvBaseFunc;
 use crate::functions::current_date::VolatileCurrentDateFunc;
 use crate::functions::current_time::VolatileCurrentTimeFunc;
+use crate::functions::decimal_arb_builtin_shim::DecimalArbBuiltinShim;
 use crate::functions::decimal_arb_ops::{
-    DecimalArbAbsFunc, DecimalArbAddFunc, DecimalArbDivFunc, DecimalArbEqFunc, DecimalArbGtFunc,
+    DecimalArbAbsFunc, DecimalArbAddFunc, DecimalArbArrayExtremeFunc, DecimalArbArraySortFunc,
+    DecimalArbDivFunc, DecimalArbEqFunc, DecimalArbExtremeFunc, DecimalArbGtFunc,
     DecimalArbGteFunc, DecimalArbLtFunc, DecimalArbLteFunc, DecimalArbModFunc, DecimalArbMulFunc,
-    DecimalArbNegFunc, DecimalArbNeqFunc, DecimalArbSortKeyFunc, DecimalArbSubFunc,
-    DecimalArbToDecimal128Func, DecimalArbToDecimal256Func, DecimalArbToStringFunc,
-    ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
-    ToDecimalArbFromStringFunc,
+    DecimalArbNegFunc, DecimalArbNeqFunc, DecimalArbRescaleFunc, DecimalArbRestampFunc,
+    DecimalArbSortKeyFunc, DecimalArbSubFunc, DecimalArbToDecimal128Func,
+    DecimalArbToDecimal256Func, DecimalArbToStringFunc, ToDecimalArbFromDecimal128Func,
+    ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc, ToDecimalArbFromStringFunc,
 };
 use crate::functions::from_base58::create_from_base58_udf;
 use crate::functions::generate_series::GenerateSeriesFunc;
@@ -46,9 +48,11 @@ pub mod conv_base;
 pub mod current_date;
 pub mod current_time;
 pub mod decimal_arb_aggregates;
+pub mod decimal_arb_builtin_shim;
 pub mod decimal_arb_coercion;
 pub mod decimal_arb_ops;
 pub mod decimal_arb_predicate_optimizer;
+pub mod decimal_arb_scale_unify;
 pub mod decimal_arb_sort_optimizer;
 pub mod from_base58;
 pub mod generate_series;
@@ -100,6 +104,14 @@ impl CommonFunctions {
             ScalarUDF::from(Uuid7Func::new()),
             // decimal_arb functions (US1 sink-side helper + US2 arithmetic)
             ScalarUDF::from(DecimalArbToStringFunc::new()),
+            ScalarUDF::from(DecimalArbRescaleFunc::new()),
+            ScalarUDF::from(DecimalArbRestampFunc::new()),
+            // numeric-order replacements for the bytewise builtins
+            ScalarUDF::from(DecimalArbExtremeFunc::greatest()),
+            ScalarUDF::from(DecimalArbExtremeFunc::least()),
+            ScalarUDF::from(DecimalArbArrayExtremeFunc::min()),
+            ScalarUDF::from(DecimalArbArrayExtremeFunc::max()),
+            ScalarUDF::from(DecimalArbArraySortFunc::new()),
             ScalarUDF::from(DecimalArbAddFunc::new()),
             ScalarUDF::from(DecimalArbSubFunc::new()),
             ScalarUDF::from(DecimalArbMulFunc::new()),
@@ -123,6 +135,44 @@ impl CommonFunctions {
             ScalarUDF::from(DecimalArbToDecimal128Func::new()),
             ScalarUDF::from(DecimalArbToDecimal256Func::new()),
             ScalarUDF::from(ToDecimalArbFromIntFunc::new()),
+            // Builtins whose argument coercion refuses decimal_arb mixed with
+            // other types; the shim lets them plan so the analyzer rewrite can
+            // coerce the arguments (see `decimal_arb_builtin_shim`).
+            DecimalArbBuiltinShim::wrap(datafusion::functions::core::greatest()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions::core::least()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions::core::coalesce()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions::core::nvl()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions::core::nvl2()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions::core::nullif()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions::math::abs()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::make_array::make_array_udf()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::array_has::array_has_udf()),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::array_has::array_has_all_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::array_has::array_has_any_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::position::array_position_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::position::array_positions_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::remove::array_remove_udf()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::remove::array_remove_n_udf()),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::remove::array_remove_all_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::replace::array_replace_udf()),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::replace::array_replace_n_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(
+                datafusion::functions_nested::replace::array_replace_all_udf(),
+            ),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::concat::array_append_udf()),
+            DecimalArbBuiltinShim::wrap(datafusion::functions_nested::concat::array_prepend_udf()),
         ]
     }
 }

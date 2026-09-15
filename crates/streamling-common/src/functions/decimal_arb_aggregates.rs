@@ -13,7 +13,7 @@
 use crate::functions::decimal_arb_ops::exact_div_at_scale;
 use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION};
 use crate::{streamling_user_bail, streamling_user_err};
-use arrow::array::{Array, ArrayRef, Int64Array, LargeBinaryArray};
+use arrow::array::{Array, ArrayRef, Int64Array, LargeBinaryArray, ListArray};
 use arrow_schema::{Field, FieldRef};
 use bigdecimal::BigDecimal;
 use datafusion::arrow::datatypes::DataType;
@@ -30,13 +30,14 @@ use datafusion::logical_expr::{
     SetMonotonicity, Signature, StatisticsArgs, Volatility,
 };
 use datafusion::scalar::ScalarValue;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Helper: read the input field from accumulator-style args and check whether
 /// it carries the decimal_arb extension metadata.
 fn input_is_decimal_arb(args: &AccumulatorArgs) -> Result<bool> {
     let field = args.exprs[0].return_field(args.schema)?;
-    Ok(DecimalArbType::is_decimal_arb_field(&field))
+    Ok(DecimalArbType::precision_scale_from_field(&field).is_some())
 }
 
 /// Spec rule (E6): SUM widens precision by 16 digits and preserves scale.
@@ -224,8 +225,48 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
             self.builtin.inner().return_type(arg_types)
         }
     }
+    /// The output field must carry the decimal_arb `(precision, scale)`.
+    ///
+    /// Everything downstream — the binary-op planner, the predicate rewrite,
+    /// the sort rule, `decimal_arb_to_string`, the JSON/Avro/IPC writers —
+    /// recognises decimal_arb by field metadata. Without this override the
+    /// default `return_field` built a bare `LargeBinary`, so `SUM(v)` rendered
+    /// as hex in JSON, `ORDER BY SUM(v)` sorted bytewise, and
+    /// `HAVING SUM(v) > 0` compared raw bytes.
+    fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
+        // `precision_scale_from_field`, not `is_decimal_arb_field`: a UNION of
+        // two scales carries the extension name but no `(p, s)` until the
+        // optimizer unifies its inputs, and the schema is recomputed then.
+        match arg_fields
+            .first()
+            .and_then(|f| DecimalArbType::precision_scale_from_field(f.as_ref()))
+        {
+            Some((p, s)) => {
+                let (p_out, s_out) = sum_output_precision_scale(p, s);
+                decimal_arb_field(self.name(), p_out, s_out)
+            }
+            // `LargeBinary` whose `(p, s)` is not known yet (see above): the
+            // built-in has no SUM for it, so declare the storage type and let
+            // the recomputed schema fill the metadata in.
+            _ if matches!(
+                arg_fields.first().map(|f| f.data_type()),
+                Some(DataType::LargeBinary)
+            ) =>
+            {
+                Ok(Arc::new(Field::new(
+                    self.name(),
+                    DataType::LargeBinary,
+                    true,
+                )))
+            }
+            _ => self.builtin.inner().return_field(arg_fields),
+        }
+    }
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        if DecimalArbType::is_decimal_arb_field(args.input_fields[0].as_ref()) {
+        if DecimalArbType::precision_scale_from_field(args.input_fields[0].as_ref()).is_some() {
+            if args.is_distinct {
+                return Ok(vec![distinct_state_field(args.name)]);
+            }
             let (p, s) = require_decimal_arb(args.input_fields[0].as_ref(), "decimal_arb sum")?;
             let (p_out, s_out) = sum_output_precision_scale(p, s);
             Ok(vec![decimal_arb_field(
@@ -244,6 +285,18 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
                 "decimal_arb sum",
             )?;
             let (p_out, s_out) = sum_output_precision_scale(p, s);
+            // `SUM(DISTINCT v)` reaches this accumulator whenever DataFusion's
+            // SingleDistinctToGroupBy rewrite does not apply (another aggregate
+            // in the same SELECT, FILTER, ORDER BY …). Ignoring `is_distinct`
+            // here returned the plain sum with no error.
+            if args.is_distinct {
+                return Ok(Box::new(DistinctSumAccumulator {
+                    values: DistinctValues::default(),
+                    input_scale: s,
+                    output_scale: s_out,
+                    output_precision: p_out,
+                }));
+            }
             Ok(Box::new(SumAccumulator {
                 sum: None,
                 input_scale: s,
@@ -304,6 +357,274 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
     }
     fn set_monotonicity(&self, data_type: &DataType) -> SetMonotonicity {
         self.builtin.inner().set_monotonicity(data_type)
+    }
+}
+
+/// `array_agg` over decimal_arb: DataFusion's accumulator collects the raw
+/// `LargeBinary` values as they are, which is exactly right — what it loses is
+/// the element field's `(precision, scale)`, because its `return_type` builds
+/// the list from the bare data type. Downstream that read as "a list of
+/// bytes": the JSON writer printed hex and a later `UNNEST` compared bytes.
+/// This wrapper re-declares the output list with the input's element metadata
+/// and delegates everything else (state, ordering, DISTINCT, grouping) to the
+/// built-in. Any `ORDER BY` inside the call is rewritten to a sort key by
+/// `DecimalArbExprRewrite`, so the order the built-in applies is numeric.
+pub struct DecimalArbArrayAggUdaf {
+    builtin: Arc<AggregateUDF>,
+}
+
+impl std::fmt::Debug for DecimalArbArrayAggUdaf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecimalArbArrayAggUdaf").finish()
+    }
+}
+
+impl PartialEq for DecimalArbArrayAggUdaf {
+    fn eq(&self, other: &Self) -> bool {
+        // Stateless wrapper around one built-in: same name, same function.
+        self.name() == other.name()
+    }
+}
+impl Eq for DecimalArbArrayAggUdaf {}
+impl std::hash::Hash for DecimalArbArrayAggUdaf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl Default for DecimalArbArrayAggUdaf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecimalArbArrayAggUdaf {
+    pub fn new() -> Self {
+        Self {
+            builtin: datafusion::functions_aggregate::array_agg::array_agg_udaf(),
+        }
+    }
+
+    pub fn into_udaf() -> AggregateUDF {
+        AggregateUDF::new_from_impl(Self::new())
+    }
+}
+
+impl AggregateUDFImpl for DecimalArbArrayAggUdaf {
+    fn name(&self) -> &str {
+        "array_agg"
+    }
+    fn signature(&self) -> &Signature {
+        self.builtin.inner().signature()
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        self.builtin.inner().coerce_types(arg_types)
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        self.builtin.inner().return_type(arg_types)
+    }
+    fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
+        let field = self.builtin.inner().return_field(arg_fields)?;
+        match arg_fields.first() {
+            Some(input) if DecimalArbType::is_decimal_arb_field(input.as_ref()) => {
+                let (p, s) = require_decimal_arb(input.as_ref(), "decimal_arb array_agg")?;
+                let element = match field.data_type() {
+                    DataType::List(e) | DataType::LargeList(e) => e,
+                    other => {
+                        return Err(datafusion::error::DataFusionError::from(
+                            streamling_user_err!(
+                                "array_agg over decimal_arb returned {:?}, expected a list",
+                                other
+                            ),
+                        ));
+                    }
+                };
+                let element = Arc::new(DecimalArbType::field(
+                    element.name(),
+                    p,
+                    s,
+                    element.is_nullable(),
+                )?);
+                let data_type = match field.data_type() {
+                    DataType::LargeList(_) => DataType::LargeList(element),
+                    _ => DataType::List(element),
+                };
+                Ok(Arc::new(
+                    Field::new(field.name(), data_type, field.is_nullable())
+                        .with_metadata(field.metadata().clone()),
+                ))
+            }
+            _ => Ok(field),
+        }
+    }
+    fn is_nullable(&self) -> bool {
+        self.builtin.inner().is_nullable()
+    }
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        self.builtin.inner().state_fields(args)
+    }
+    fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        let data_type = args.return_field.data_type().clone();
+        let inner = self.builtin.inner().accumulator(args)?;
+        Ok(Box::new(RetypedAccumulator { inner, data_type }))
+    }
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        self.builtin.inner().groups_accumulator_supported(args)
+    }
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        let data_type = args.return_field.data_type().clone();
+        let inner = self.builtin.inner().create_groups_accumulator(args)?;
+        Ok(Box::new(RetypedGroupsAccumulator { inner, data_type }))
+    }
+    fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        let data_type = args.return_field.data_type().clone();
+        let inner = self.builtin.inner().create_sliding_accumulator(args)?;
+        Ok(Box::new(RetypedAccumulator { inner, data_type }))
+    }
+    fn aliases(&self) -> &[String] {
+        self.builtin.inner().aliases()
+    }
+    fn order_sensitivity(&self) -> AggregateOrderSensitivity {
+        self.builtin.inner().order_sensitivity()
+    }
+    fn with_beneficial_ordering(
+        self: Arc<Self>,
+        beneficial_ordering: bool,
+    ) -> Result<Option<Arc<dyn AggregateUDFImpl>>> {
+        // The built-in re-creates itself with the ordering flag; wrap the
+        // result again so the metadata override survives.
+        let inner = Arc::clone(self.builtin.inner());
+        Ok(inner
+            .with_beneficial_ordering(beneficial_ordering)?
+            .map(|inner| {
+                Arc::new(DecimalArbArrayAggUdaf {
+                    builtin: Arc::new(AggregateUDF::new_from_shared_impl(inner)),
+                }) as Arc<dyn AggregateUDFImpl>
+            }))
+    }
+    fn reverse_expr(&self) -> ReversedUDAF {
+        match self.builtin.inner().reverse_expr() {
+            ReversedUDAF::Reversed(_) => ReversedUDAF::Reversed(Arc::new(Self::into_udaf())),
+            other => other,
+        }
+    }
+    fn supports_null_handling_clause(&self) -> bool {
+        self.builtin.inner().supports_null_handling_clause()
+    }
+    fn documentation(&self) -> Option<&Documentation> {
+        self.builtin.inner().documentation()
+    }
+}
+
+/// Same buffers, the declared type: the built-in `array_agg` accumulators
+/// build their list from the bare element data type, and DataFusion checks
+/// the produced batch against the declared schema with full type equality,
+/// element metadata included.
+fn retype_array(array: ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
+    if array.data_type() == data_type {
+        return Ok(array);
+    }
+    let data = array
+        .to_data()
+        .into_builder()
+        .data_type(data_type.clone())
+        .build()?;
+    Ok(arrow::array::make_array(data))
+}
+
+fn retype_scalar(value: ScalarValue, data_type: &DataType) -> Result<ScalarValue> {
+    if &value.data_type() == data_type {
+        return Ok(value);
+    }
+    let array = retype_array(value.to_array()?, data_type)?;
+    Ok(match value {
+        ScalarValue::List(_) => ScalarValue::List(Arc::new(ListArray::from(array.to_data()))),
+        ScalarValue::LargeList(_) => ScalarValue::LargeList(Arc::new(
+            arrow::array::LargeListArray::from(array.to_data()),
+        )),
+        other => other,
+    })
+}
+
+/// Delegating accumulator whose `evaluate` carries the declared output type.
+#[derive(Debug)]
+struct RetypedAccumulator {
+    inner: Box<dyn Accumulator>,
+    data_type: DataType,
+}
+
+impl Accumulator for RetypedAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.inner.update_batch(values)
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        retype_scalar(self.inner.evaluate()?, &self.data_type)
+    }
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        self.inner.state()
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.inner.merge_batch(states)
+    }
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.inner.retract_batch(values)
+    }
+    fn supports_retract_batch(&self) -> bool {
+        self.inner.supports_retract_batch()
+    }
+}
+
+/// Grouped counterpart of [`RetypedAccumulator`].
+struct RetypedGroupsAccumulator {
+    inner: Box<dyn GroupsAccumulator>,
+    data_type: DataType,
+}
+
+impl GroupsAccumulator for RetypedGroupsAccumulator {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&arrow::array::BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.inner
+            .update_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+    fn evaluate(&mut self, emit_to: datafusion::logical_expr::EmitTo) -> Result<ArrayRef> {
+        retype_array(self.inner.evaluate(emit_to)?, &self.data_type)
+    }
+    fn state(&mut self, emit_to: datafusion::logical_expr::EmitTo) -> Result<Vec<ArrayRef>> {
+        self.inner.state(emit_to)
+    }
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&arrow::array::BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.inner
+            .merge_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&arrow::array::BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        self.inner.convert_to_state(values, opt_filter)
+    }
+    fn supports_convert_to_state(&self) -> bool {
+        self.inner.supports_convert_to_state()
+    }
+    fn size(&self) -> usize {
+        self.inner.size()
     }
 }
 
@@ -377,6 +698,138 @@ impl Accumulator for SumAccumulator {
                 Ok(vec![ScalarValue::LargeBinary(Some(bytes))])
             }
         }
+    }
+}
+
+/// The state field for a `DISTINCT` decimal_arb SUM/AVG: one
+/// `List<LargeBinary>` row holding every distinct canonical encoding seen so
+/// far, so partitions can be merged. Mirrors DataFusion's own distinct-sum
+/// state shape.
+fn distinct_state_field(name: &str) -> FieldRef {
+    Arc::new(Field::new_list(
+        format!("{}_distinct", name),
+        Field::new_list_field(DataType::LargeBinary, true),
+        false,
+    ))
+}
+
+/// Distinct non-null values of one decimal_arb column, keyed by canonical
+/// bytes. One column has one scale, so one number has exactly one encoding
+/// and byte identity is value identity.
+#[derive(Debug, Default)]
+struct DistinctValues {
+    values: HashSet<Vec<u8>>,
+}
+
+impl DistinctValues {
+    fn update(&mut self, array: &LargeBinaryArray) {
+        for i in 0..array.len() {
+            if !array.is_null(i) {
+                self.values.insert(array.value(i).to_vec());
+            }
+        }
+    }
+
+    /// Fold another partition's serialised state into this one.
+    fn merge(&mut self, state: &ArrayRef, op_name: &str) -> Result<()> {
+        let lists = state.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            datafusion::error::DataFusionError::from(streamling_user_err!(
+                "decimal_arb {}: distinct state must be List<LargeBinary>",
+                op_name
+            ))
+        })?;
+        for inner in lists.iter().flatten() {
+            let array = inner
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::from(streamling_user_err!(
+                        "decimal_arb {}: distinct state items must be LargeBinary",
+                        op_name
+                    ))
+                })?;
+            self.update(array);
+        }
+        Ok(())
+    }
+
+    fn state(&self) -> ScalarValue {
+        let items: Vec<ScalarValue> = self
+            .values
+            .iter()
+            .map(|bytes| ScalarValue::LargeBinary(Some(bytes.clone())))
+            .collect();
+        ScalarValue::List(ScalarValue::new_list_nullable(
+            &items,
+            &DataType::LargeBinary,
+        ))
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Exact sum of the distinct values, decoded at `scale`.
+    fn sum(&self, scale: u32) -> Result<BigDecimal> {
+        let mut acc = BigDecimal::from(0i32);
+        for bytes in &self.values {
+            acc += DecimalArbValue::from_canonical_bytes_at_scale(bytes, scale)?.into_bigdecimal();
+        }
+        Ok(acc)
+    }
+
+    fn size(&self) -> usize {
+        self.values
+            .iter()
+            .map(|b| b.len() + std::mem::size_of::<Vec<u8>>())
+            .sum()
+    }
+}
+
+fn downcast_input<'a>(values: &'a [ArrayRef], op_name: &str) -> Result<&'a LargeBinaryArray> {
+    values[0]
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::from(streamling_user_err!(
+                "decimal_arb {}: expected LargeBinary input",
+                op_name
+            ))
+        })
+}
+
+/// `SUM(DISTINCT v)` over decimal_arb.
+#[derive(Debug)]
+struct DistinctSumAccumulator {
+    values: DistinctValues,
+    input_scale: u32,
+    output_scale: u32,
+    output_precision: u32,
+}
+
+impl Accumulator for DistinctSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.values.update(downcast_input(values, "sum distinct")?);
+        Ok(())
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.values.merge(&states[0], "sum distinct")
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        if self.values.len() == 0 {
+            return Ok(ScalarValue::LargeBinary(None));
+        }
+        let v = DecimalArbValue::from_bigdecimal(self.values.sum(self.input_scale)?);
+        v.check_fits(self.output_precision, self.output_scale, "sum")?;
+        Ok(ScalarValue::LargeBinary(Some(
+            v.to_canonical_bytes_at_scale(self.output_scale),
+        )))
+    }
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.values.size()
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![self.values.state()])
     }
 }
 
@@ -455,8 +908,22 @@ impl AggregateUDFImpl for DecimalArbExtremeUdaf {
             self.builtin.inner().return_type(arg_types)
         }
     }
+    /// Keep the input's `(precision, scale)` on the output field — see
+    /// `DecimalArbSumUdaf::return_field` for why the metadata matters. This is
+    /// also what lets a nested `MAX(MAX(v))` (DataFusion's
+    /// SingleDistinctToGroupBy rewrite produces those) recognise its input as
+    /// decimal_arb instead of falling back to the built-in bytewise extreme.
+    fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
+        match arg_fields
+            .first()
+            .and_then(|f| DecimalArbType::precision_scale_from_field(f.as_ref()))
+        {
+            Some((p, s)) => decimal_arb_field(self.name(), p, s),
+            _ => self.builtin.inner().return_field(arg_fields),
+        }
+    }
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        if DecimalArbType::is_decimal_arb_field(args.input_fields[0].as_ref()) {
+        if DecimalArbType::precision_scale_from_field(args.input_fields[0].as_ref()).is_some() {
             let (p, s) = require_decimal_arb(args.input_fields[0].as_ref(), self.name())?;
             Ok(vec![decimal_arb_field(
                 &format!("{}_state", args.name),
@@ -662,8 +1129,38 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
             self.builtin.inner().return_type(arg_types)
         }
     }
+    /// See `DecimalArbSumUdaf::return_field`.
+    fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
+        // `precision_scale_from_field`, not `is_decimal_arb_field`: a UNION of
+        // two scales carries the extension name but no `(p, s)` until the
+        // optimizer unifies its inputs, and the schema is recomputed then.
+        match arg_fields
+            .first()
+            .and_then(|f| DecimalArbType::precision_scale_from_field(f.as_ref()))
+        {
+            Some((p, s)) => {
+                let (p_out, s_out) = avg_output_precision_scale(p, s);
+                decimal_arb_field(self.name(), p_out, s_out)
+            }
+            _ if matches!(
+                arg_fields.first().map(|f| f.data_type()),
+                Some(DataType::LargeBinary)
+            ) =>
+            {
+                Ok(Arc::new(Field::new(
+                    self.name(),
+                    DataType::LargeBinary,
+                    true,
+                )))
+            }
+            _ => self.builtin.inner().return_field(arg_fields),
+        }
+    }
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        if DecimalArbType::is_decimal_arb_field(args.input_fields[0].as_ref()) {
+        if DecimalArbType::precision_scale_from_field(args.input_fields[0].as_ref()).is_some() {
+            if args.is_distinct {
+                return Ok(vec![distinct_state_field(args.name)]);
+            }
             let (p, s) = require_decimal_arb(args.input_fields[0].as_ref(), "decimal_arb avg")?;
             // AVG state = (running sum, count). We use the SUM-style headroom on
             // the running sum and an Int64 row counter.
@@ -688,6 +1185,16 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
             )?;
             let (out_p, out_s) = avg_output_precision_scale(p, s);
             let (sum_p, sum_s) = sum_output_precision_scale(p, s);
+            // See `DecimalArbSumUdaf::accumulator` for why DISTINCT must be
+            // honoured here.
+            if args.is_distinct {
+                return Ok(Box::new(DistinctAvgAccumulator {
+                    values: DistinctValues::default(),
+                    input_scale: s,
+                    output_precision: out_p,
+                    output_scale: out_s,
+                }));
+            }
             Ok(Box::new(AvgAccumulator {
                 sum: BigDecimal::from(0i32),
                 count: 0,
@@ -825,6 +1332,44 @@ impl Accumulator for AvgAccumulator {
             ScalarValue::LargeBinary(Some(bytes)),
             ScalarValue::Int64(Some(self.count)),
         ])
+    }
+}
+
+/// `AVG(DISTINCT v)` over decimal_arb.
+#[derive(Debug)]
+struct DistinctAvgAccumulator {
+    values: DistinctValues,
+    input_scale: u32,
+    output_precision: u32,
+    output_scale: u32,
+}
+
+impl Accumulator for DistinctAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.values.update(downcast_input(values, "avg distinct")?);
+        Ok(())
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.values.merge(&states[0], "avg distinct")
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let count = self.values.len();
+        if count == 0 {
+            return Ok(ScalarValue::LargeBinary(None));
+        }
+        let sum = self.values.sum(self.input_scale)?;
+        let avg = exact_div_at_scale(&sum, &BigDecimal::from(count as i64), self.output_scale);
+        let v = DecimalArbValue::from_bigdecimal(avg);
+        v.check_fits(self.output_precision, self.output_scale, "avg")?;
+        Ok(ScalarValue::LargeBinary(Some(
+            v.to_canonical_bytes_at_scale(self.output_scale),
+        )))
+    }
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.values.size()
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![self.values.state()])
     }
 }
 

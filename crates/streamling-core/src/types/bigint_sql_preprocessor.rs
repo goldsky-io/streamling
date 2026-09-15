@@ -11,6 +11,7 @@ use crate::streamling_user_err;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::sqlparser::ast::{
     DataType as SqlDataType, Expr as SqlExpr, SelectItem, SetExpr, Statement, TableFactor,
+    UnaryOperator, Value,
 };
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -472,18 +473,48 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         None
     }
 
-    /// Build `to_decimal_arb_from_string(CAST({inner} AS VARCHAR), {precision}, {scale})`
-    /// as an `SqlExpr`. Falls back to the inner cast-to-varchar (lossy) if
-    /// the function-call shape can't be parsed for some reason.
+    /// The source text of a numeric literal, looking through parentheses and
+    /// a leading sign: `18446744073709551617`, `(1e30)`, `-5`.
+    fn number_literal_text(expr: &SqlExpr) -> Option<String> {
+        match expr {
+            SqlExpr::Nested(inner) => number_literal_text(inner),
+            SqlExpr::Value(v) => match &v.value {
+                Value::Number(n, _) => Some(n.to_string()),
+                _ => None,
+            },
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => number_literal_text(expr).map(|t| format!("-{t}")),
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr,
+            } => number_literal_text(expr),
+            _ => None,
+        }
+    }
+
+    /// Build `to_decimal_arb_from_string(<text>, {precision}, {scale})` as an
+    /// `SqlExpr`, where `<text>` is `CAST({inner} AS VARCHAR)` — or, for a bare
+    /// numeric literal, the literal's own digits as a string. Falls back to the
+    /// inner cast-to-varchar (lossy) if the function-call shape can't be parsed
+    /// for some reason.
     fn parse_to_decimal_arb_from_string(
         inner: &SqlExpr,
         precision: u64,
         scale: u64,
     ) -> Option<SqlExpr> {
         let dialect = GenericDialect {};
-        let inner_sql = inner.to_string();
+        // An unquoted wide literal (`CAST(18446744073709551617 AS DECIMAL(77,0))`)
+        // has no SQL type of its own: DataFusion plans it as Float64 before the
+        // cast ever runs, so `CAST(... AS VARCHAR)` saw an approximation and the
+        // exact digits were gone. Quoting the token keeps them.
+        let inner_sql = match number_literal_text(inner) {
+            Some(text) => format!("'{text}'"),
+            None => format!("CAST({inner} AS VARCHAR)"),
+        };
         let call_sql = format!(
-            "SELECT to_decimal_arb_from_string(CAST({} AS VARCHAR), {}, {})",
+            "SELECT to_decimal_arb_from_string({}, {}, {})",
             inner_sql, precision, scale
         );
         let mut stmts = Parser::parse_sql(&dialect, call_sql.as_str()).ok()?;

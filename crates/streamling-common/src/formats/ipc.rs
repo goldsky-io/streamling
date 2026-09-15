@@ -1,14 +1,15 @@
-use crate::formats::decimal_arb_text::{decimal_arb_leaves_to_text, field_contains_decimal_arb};
+use crate::formats::decimal_arb_text::{
+    decimal_arb_leaves_as_text_field, decimal_arb_leaves_from_text, decimal_arb_leaves_to_text,
+    field_contains_decimal_arb, overlay_decimal_arb_metadata,
+};
 use crate::formats::{FromArrowConverter, ToArrowConverter};
 use crate::streamling_err;
-use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::array::{Array, ArrayRef, LargeBinaryArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef};
 use datafusion::arrow::ipc::{reader::FileReader, writer::FileWriter};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use std::io::Cursor;
-use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct FromArrowToIpcConverter {}
@@ -137,116 +138,186 @@ impl FromIpcToArrowConverter {
         self.convert_batch_to_original_schema(batch)
     }
 
-    /// Produce the `decimal_arb` column `target` describes from whatever the IPC
+    /// Rebuild the column `target` describes — a decimal_arb leaf, or a
+    /// container with decimal_arb leaves at any depth — from whatever the IPC
     /// payload actually carried.
     ///
-    /// Two shapes need real work rather than an Arrow `cast`:
+    /// Canonical decimal text is the value-preserving intermediate. Leaves that
+    /// arrive as decimal_arb bytes (their metadata survived; or bare
+    /// `LargeBinary` where `target` says decimal_arb, read at the target's
+    /// scale) are rendered to text; the column is shaped to the text form of
+    /// `target` — struct children paired by name, List ↔ LargeList, Utf8View /
+    /// dictionary strings and all-null columns converted with Arrow's `cast`;
+    /// and the leaves are parsed back at the target `(precision, scale)`,
+    /// which validates every value.
     ///
-    /// * **Utf8 → decimal_arb.** A JS transform that returns `{amount: "100"}`
-    ///   comes back as a string column. `cast(Utf8 → LargeBinary)` hands over the
-    ///   *UTF-8 bytes*, which the decimal_arb decoder then reads as canonical
-    ///   sign/magnitude — `"100"` became 12336. The text has to be parsed.
-    /// * **decimal_arb → decimal_arb at a different scale.** Both sides are
-    ///   `LargeBinary`, so the equality check upstream saw "same type" and passed
-    ///   the bytes through under the target's scale metadata: 12.34 read back as
-    ///   0.1234. The value has to be re-encoded at the target scale.
-    fn coerce_into_decimal_arb(
+    /// That covers the shapes a plain `cast` got wrong — `"100"` handed over as
+    /// UTF-8 bytes read as 12336, 12.34 relabelled under a scale-4 target read
+    /// as 0.1234, and every nested leaf, which the old top-level-only
+    /// conversion never reached — and, unlike a same-`DataType` passthrough,
+    /// it rejects a 1000 stored under `decimal_arb(80, 0)` when the target is
+    /// `decimal_arb(2, 0)`.
+    fn restore_decimal_arb(
         target: &Field,
         source_field: &Field,
         source: &ArrayRef,
     ) -> Result<ArrayRef> {
-        let (precision, scale) =
-            DecimalArbType::precision_scale_from_field(target).ok_or_else(|| {
-                DataFusionError::from(streamling_err!(
-                    "decimal_arb field '{}' missing precision/scale metadata",
-                    target.name(),
-                ))
-            })?;
+        // Identical declaration, metadata included: nothing to convert.
+        if source_field.data_type() == target.data_type()
+            && source_field.metadata() == target.metadata()
+        {
+            return Ok(source.clone());
+        }
+        let overlaid = overlay_decimal_arb_metadata(source_field, target);
+        let (_, text) = decimal_arb_leaves_to_text(&overlaid, source)?;
+        let text_target = decimal_arb_leaves_as_text_field(target);
+        let shaped = Self::shape_like(&text_target, &text)?;
+        decimal_arb_leaves_from_text(target, &shaped)
+    }
 
-        let mut builder =
-            DecimalArbArrayBuilder::with_capacity(source.len(), target.name(), precision, scale)?;
-
-        let parse_text = |text: &str| -> Result<DecimalArbValue> {
-            DecimalArbValue::from_str(text).map_err(|e| {
-                DataFusionError::from(streamling_err!(
-                    "field '{}': '{}' is not a decimal number: {}",
-                    target.name(),
-                    text,
-                    e,
-                ))
-            })
+    /// Bring `array` to `target.data_type()`: struct children are matched by
+    /// name (a child the payload lacks is all-null), list layouts are
+    /// converted, and every remaining difference goes through Arrow's `cast`.
+    fn shape_like(target: &Field, array: &ArrayRef) -> Result<ArrayRef> {
+        use datafusion::arrow::array::{
+            FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray, new_null_array,
         };
+        use datafusion::arrow::compute::cast;
 
-        // Flechette hands strings back in whatever encoding it likes —
-        // plain Utf8, LargeUtf8, a view, or dictionary-encoded. Normalize to
-        // Utf8 first so the parse below is the only place that matters.
-        fn is_string_like(dt: &DataType) -> bool {
-            match dt {
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
-                DataType::Dictionary(_, values) => is_string_like(values),
-                _ => false,
-            }
+        if array.data_type() == target.data_type() {
+            return Ok(array.clone());
         }
-
-        if is_string_like(source.data_type()) {
-            use datafusion::arrow::compute::cast;
-            let utf8 = cast(source, &DataType::Utf8)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let arr = utf8
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("cast to Utf8 yields a StringArray");
-            for row in 0..arr.len() {
-                if arr.is_null(row) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(&parse_text(arr.value(row))?)?;
-                }
-            }
-            let (raw, _, _) = builder.finish().into_inner();
-            return Ok(Arc::new(raw) as ArrayRef);
-        }
-
-        match source.data_type() {
-            DataType::LargeBinary => {
-                let source_scale = match DecimalArbType::precision_scale_from_field(source_field) {
-                    // Metadata survived IPC and already agrees — the bytes are
-                    // canonical at the target scale, nothing to do.
-                    Some((_, s)) if s == scale => return Ok(source.clone()),
-                    Some((_, s)) => s,
-                    // No metadata to disagree with: keep the long-standing
-                    // assumption that the bytes are already at the target scale.
-                    None => return Ok(source.clone()),
-                };
-                let arr = source
+        let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+        let downcast_err = |what: &str| {
+            DataFusionError::from(streamling_err!(
+                "expected {} for field '{}', got {:?}",
+                what,
+                target.name(),
+                array.data_type(),
+            ))
+        };
+        match (target.data_type(), array.data_type()) {
+            (DataType::Struct(tc), DataType::Struct(sc)) => {
+                let sa = array
                     .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .expect("LargeBinary array downcasts to LargeBinaryArray");
-                for row in 0..arr.len() {
-                    if arr.is_null(row) {
-                        builder.append_null();
-                    } else {
-                        let value = DecimalArbValue::from_canonical_bytes_at_scale(
-                            arr.value(row),
-                            source_scale,
-                        )?;
-                        builder.append_value(&value)?;
-                    }
-                }
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| downcast_err("StructArray"))?;
+                let columns = tc
+                    .iter()
+                    .map(|t| match sc.iter().position(|s| s.name() == t.name()) {
+                        Some(j) => Self::shape_like(t, sa.column(j)),
+                        None => Ok(new_null_array(t.data_type(), sa.len())),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(StructArray::new(
+                    tc.clone(),
+                    columns,
+                    sa.nulls().cloned(),
+                )))
             }
-            other => {
-                return Err(DataFusionError::from(streamling_err!(
-                    "cannot convert column '{}' of type {:?} into decimal_arb({}, {})",
-                    target.name(),
-                    other,
-                    precision,
-                    scale,
-                )));
+            (DataType::List(t), DataType::List(_)) => {
+                let la = array
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| downcast_err("ListArray"))?;
+                let values = Self::shape_like(t, la.values())?;
+                Ok(Arc::new(ListArray::new(
+                    t.clone(),
+                    la.offsets().clone(),
+                    values,
+                    la.nulls().cloned(),
+                )))
             }
+            (DataType::LargeList(t), DataType::LargeList(_)) => {
+                let la = array
+                    .as_any()
+                    .downcast_ref::<LargeListArray>()
+                    .ok_or_else(|| downcast_err("LargeListArray"))?;
+                let values = Self::shape_like(t, la.values())?;
+                Ok(Arc::new(LargeListArray::new(
+                    t.clone(),
+                    la.offsets().clone(),
+                    values,
+                    la.nulls().cloned(),
+                )))
+            }
+            (DataType::FixedSizeList(t, n), DataType::FixedSizeList(_, m)) if n == m => {
+                let fa = array
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .ok_or_else(|| downcast_err("FixedSizeListArray"))?;
+                let values = Self::shape_like(t, fa.values())?;
+                Ok(Arc::new(
+                    FixedSizeListArray::try_new_with_length(
+                        t.clone(),
+                        *n,
+                        values,
+                        fa.nulls().cloned(),
+                        fa.len(),
+                    )
+                    .map_err(arrow_err)?,
+                ))
+            }
+            (DataType::Map(t, sorted), DataType::Map(_, _)) => {
+                let ma = array
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .ok_or_else(|| downcast_err("MapArray"))?;
+                let entries: ArrayRef = Arc::new(ma.entries().clone());
+                let entries = Self::shape_like(t, &entries)?;
+                let entries = entries
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| downcast_err("StructArray (map entries)"))?
+                    .clone();
+                Ok(Arc::new(MapArray::new(
+                    t.clone(),
+                    ma.offsets().clone(),
+                    entries,
+                    ma.nulls().cloned(),
+                    *sorted,
+                )))
+            }
+            // Another list layout: convert the layout with the payload's own
+            // element type, then shape the elements.
+            (
+                DataType::List(_),
+                DataType::LargeList(s)
+                | DataType::FixedSizeList(s, _)
+                | DataType::ListView(s)
+                | DataType::LargeListView(s),
+            ) => {
+                let interim =
+                    cast(array.as_ref(), &DataType::List(s.clone())).map_err(arrow_err)?;
+                Self::shape_like(target, &interim)
+            }
+            (
+                DataType::LargeList(_),
+                DataType::List(s)
+                | DataType::FixedSizeList(s, _)
+                | DataType::ListView(s)
+                | DataType::LargeListView(s),
+            ) => {
+                let interim =
+                    cast(array.as_ref(), &DataType::LargeList(s.clone())).map_err(arrow_err)?;
+                Self::shape_like(target, &interim)
+            }
+            (DataType::FixedSizeList(_, n), DataType::List(s) | DataType::LargeList(s)) => {
+                let interim = cast(array.as_ref(), &DataType::FixedSizeList(s.clone(), *n))
+                    .map_err(arrow_err)?;
+                Self::shape_like(target, &interim)
+            }
+            // Encoded containers: unwrap to the value layout first.
+            (_, DataType::Dictionary(_, values)) => {
+                let interim = cast(array.as_ref(), values).map_err(arrow_err)?;
+                Self::shape_like(target, &interim)
+            }
+            (_, DataType::RunEndEncoded(_, values)) => {
+                let interim = cast(array.as_ref(), values.data_type()).map_err(arrow_err)?;
+                Self::shape_like(target, &interim)
+            }
+            _ => cast(array.as_ref(), target.data_type()).map_err(arrow_err),
         }
-
-        let (raw, _, _) = builder.finish().into_inner();
-        Ok(Arc::new(raw) as ArrayRef)
     }
 
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
@@ -291,11 +362,11 @@ impl FromIpcToArrowConverter {
                     Field::new(target_field.name(), source_col.data_type().clone(), true)
                 });
 
-                if DecimalArbType::is_decimal_arb_field(target_field) {
+                if field_contains_decimal_arb(target_field) {
                     // decimal_arb is LargeBinary underneath, so neither the
                     // type-equality check nor Arrow's `cast` can tell a correct
                     // conversion from a reinterpretation of raw bytes.
-                    new_columns.push(Self::coerce_into_decimal_arb(
+                    new_columns.push(Self::restore_decimal_arb(
                         target_field,
                         &source_field,
                         source_col,

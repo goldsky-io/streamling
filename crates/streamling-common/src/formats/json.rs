@@ -3,6 +3,7 @@ use crate::formats::decimal_arb_text::{
     field_contains_decimal_arb,
 };
 use crate::formats::{FromArrowConverter, ToArrowConverter};
+use crate::types::decimal_arb_legacy::upgrade_legacy_wide_int_batch;
 // Feature 002 (Retire U256/I256): U256/I256 imports removed — wide
 // integers flow through decimal_arb only.
 use arrow_json::reader::Decoder;
@@ -31,6 +32,12 @@ impl FromArrowToJsonConverter {
     }
 
     fn to_json(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
+        // A plugin source may still hand over the retired FixedSizeBinary(32)
+        // `streamling.u256` / `streamling.i256` columns; as decimal_arb they
+        // print their value below, where the raw bytes printed as hex.
+        let upgraded = upgrade_legacy_wide_int_batch(batch).map_err(DataFusionError::from)?;
+        let batch = upgraded.as_ref().unwrap_or(batch);
+
         // If the schema carries any decimal_arb extension field — at the top
         // level OR nested inside a Struct / List / Map — rewrite those leaves to
         // Utf8 (canonical decimal text) so the standard arrow-json writer emits
