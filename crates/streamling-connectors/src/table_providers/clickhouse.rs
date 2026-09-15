@@ -5850,7 +5850,7 @@ pub fn clickhouse_string_to_decimal_arb(
     use std::str::FromStr;
     use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
 
-    let (_precision, scale) =
+    let (precision, scale) =
         DecimalArbType::precision_scale_from_field(field).ok_or_else(|| {
             streamling_err!(
                 "field '{}' is not a decimal_arb field (missing extension metadata)",
@@ -5859,16 +5859,31 @@ pub fn clickhouse_string_to_decimal_arb(
         })?;
 
     let parse = |text: &str| -> std::result::Result<Vec<u8>, StreamlingError> {
-        DecimalArbValue::from_str(text)
-            .map(|v| v.to_canonical_bytes_at_scale(scale))
+        let value = DecimalArbValue::from_str(text).map_err(|e| {
+            streamling_err!(
+                "column '{}': cannot parse decimal_arb from ClickHouse text '{}': {}",
+                field.name(),
+                text,
+                e
+            )
+        })?;
+        // `to_canonical_bytes_at_scale` rounds half-even, so without this check a
+        // ClickHouse `String` column holding more precision than the pipeline
+        // declares is silently truncated on the way in — "1.234" became 1.23 at
+        // scale 2, and 79 integer digits fit themselves into a 78-digit column.
+        value
+            .check_fits(precision, scale, field.name())
             .map_err(|e| {
                 streamling_err!(
-                    "column '{}': cannot parse decimal_arb from ClickHouse text '{}': {}",
+                    "column '{}': ClickHouse value '{}' does not fit decimal_arb({}, {}): {}",
                     field.name(),
                     text,
+                    precision,
+                    scale,
                     e
                 )
-            })
+            })?;
+        Ok(value.to_canonical_bytes_at_scale(scale))
     };
 
     let mut builder = LargeBinaryBuilder::with_capacity(column.len(), 0);
