@@ -4,9 +4,12 @@ use datafusion::common::{Result, ToDFSchema};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use std::sync::Arc;
-use streamling_core::functions::decimal_arb_ops::DecimalArbToStringFunc;
+use streamling_core::functions::decimal_arb_ops::{
+    DecimalArbToStringFunc, LegacyWideIntToDecimalArbFunc,
+};
 use streamling_core::functions::json_string::JsonStringFunc;
 use streamling_core::types::decimal_arb::DecimalArbType;
+use streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind;
 // Feature 002 (Retire U256/I256): U256/I256 imports removed; only
 // decimal_arb and nested types need projection to Utf8 for PG insert.
 
@@ -24,6 +27,10 @@ pub fn build_projection_for_postgres(
 
     for f in input_schema.fields() {
         let is_decimal_arb = DecimalArbType::is_decimal_arb_field(f);
+        // Retired plugin wide-int columns are upgraded to decimal_arb first,
+        // then projected to text like any decimal_arb; left alone they bound
+        // their raw big-endian bytes into a BYTEA column.
+        let is_legacy_wide_int = legacy_wide_int_kind(f).is_some();
         let is_nested_json = matches!(
             f.data_type(),
             datafusion::arrow::datatypes::DataType::Struct(_)
@@ -33,16 +40,29 @@ pub fn build_projection_for_postgres(
                 | datafusion::arrow::datatypes::DataType::Map(_, _)
         );
 
-        let logical_expr: datafusion::logical_expr::Expr = if is_decimal_arb {
+        let logical_expr: datafusion::logical_expr::Expr = if is_decimal_arb || is_legacy_wide_int {
             needs_projection = true;
+            let column = datafusion::logical_expr::Expr::Column(
+                datafusion::common::Column::from_name(f.name()),
+            );
+            let decimal = if is_legacy_wide_int {
+                datafusion::logical_expr::Expr::ScalarFunction(
+                    datafusion::logical_expr::expr::ScalarFunction {
+                        func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
+                            LegacyWideIntToDecimalArbFunc::new(),
+                        )),
+                        args: vec![column],
+                    },
+                )
+            } else {
+                column
+            };
             datafusion::logical_expr::Expr::ScalarFunction(
                 datafusion::logical_expr::expr::ScalarFunction {
                     func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
                         DecimalArbToStringFunc::new(),
                     )),
-                    args: vec![datafusion::logical_expr::Expr::Column(
-                        datafusion::common::Column::from_name(f.name()),
-                    )],
+                    args: vec![decimal],
                 },
             )
             .alias(f.name())

@@ -1885,7 +1885,7 @@ impl ClickHouseSchemaAdapter {
                 streamling_core::types::decimal_arb::DecimalArbType::native_int_kind_from_field(
                     field,
                 );
-            return match capability_for_decimal_arb(
+            let ch_type = match capability_for_decimal_arb(
                 ConnectorKind::Hybrid,
                 precision,
                 scale,
@@ -1894,22 +1894,26 @@ impl ClickHouseSchemaAdapter {
             ) {
                 CapabilityResult::Native => match native_int_kind {
                     Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
-                        Ok("UInt256".to_string())
+                        "UInt256".to_string()
                     }
                     Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
-                        Ok("Int256".to_string())
+                        "Int256".to_string()
                     }
-                    _ => Ok(format!("Decimal({}, {})", precision, scale)),
+                    _ => format!("Decimal({}, {})", precision, scale),
                 },
-                CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
-                CapabilityResult::Reject(reason) => Err(config_load_error(
-                    field.name(),
-                    ConnectorKind::Hybrid,
-                    precision,
-                    scale,
-                    &reason,
-                )),
+                CapabilityResult::OptInOnly(_) => "String".to_string(),
+                CapabilityResult::Reject(reason) => {
+                    return Err(config_load_error(
+                        field.name(),
+                        ConnectorKind::Hybrid,
+                        precision,
+                        scale,
+                        &reason,
+                    ));
+                }
             };
+            // Same Nullable(...) rule as every other column type.
+            return Ok(ClickHouseClient::nullable_wrapped(field, ch_type));
         }
 
         // Non-decimal_arb fields: delegate to the existing ClickHouse
@@ -2251,6 +2255,17 @@ mod tests {
                 .unwrap();
         let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
         assert_eq!(out, "Decimal(50, 5)");
+    }
+
+    #[test]
+    fn hybrid_column_type_keeps_nullability_for_decimal_arb() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 50, 5, true)
+                .unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap(),
+            "Nullable(Decimal(50, 5))"
+        );
     }
 
     #[test]
