@@ -120,7 +120,7 @@ The complete source/SQL/sink process succeeds. Expected values and stored values
 
 ## Successful coverage and exclusions
 
-- **12,096 exact arithmetic result comparisons** through the actual binary: 672 distinct independently generated signed/null/boundary fixtures, six arithmetic/recovery expressions, and three paths (direct Postgres, Avro roundtrip, JavaScript identity). Seven scale pairs include 0,2,18,78,100. Python Fraction provides the independent reference with single half-even rounding; no float tolerance is used.
+- **12,096 exact arithmetic result comparisons** through the actual binary: 672 independently generated signed/null/boundary input rows (532 distinct scale/value pairs, including NULLs), six arithmetic/recovery expressions, and three paths (direct Postgres, Avro roundtrip, JavaScript identity). Seven scale pairs include 0,2,18,78,100. Python Fraction provides the independent reference with single half-even rounding; no float tolerance is used.
 - **234 exact hybrid-source values** matched across bounded ClickHouse and live Kafka phases. Six configurations cover String, Decimal(76,18), Decimal(76,38), UInt256 and Int256; signed extrema, nulls, unsigned boundaries and scale 100 fractions are included. The fixture is verified on ClickHouse before running the pipeline.
 - **2,844 framed Confluent records across 204 configurations** passed mixed writer-schema-id, defaults, order, nullable-reader-field, root-union and high-scale checks. Support probes rejected by both versions are excluded from numeric counts.
 - **1,200 mixed native/integer arithmetic result checks** and additional unsigned-max, null/scalar/empty-batch, negative-scale narrowing, modulo, precision-cap and rounding-carry controls passed.
