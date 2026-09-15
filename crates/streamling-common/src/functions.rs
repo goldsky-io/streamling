@@ -16,8 +16,9 @@ use crate::functions::decimal_arb_ops::{
     DecimalArbGteFunc, DecimalArbLtFunc, DecimalArbLteFunc, DecimalArbModFunc, DecimalArbMulFunc,
     DecimalArbNegFunc, DecimalArbNeqFunc, DecimalArbRescaleFunc, DecimalArbRestampFunc,
     DecimalArbSortKeyFunc, DecimalArbSubFunc, DecimalArbToDecimal128Func,
-    DecimalArbToDecimal256Func, DecimalArbToStringFunc, ToDecimalArbFromDecimal128Func,
-    ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc, ToDecimalArbFromStringFunc,
+    DecimalArbToDecimal256Func, DecimalArbToStringFunc, LegacyWideIntToDecimalArbFunc,
+    ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
+    ToDecimalArbFromStringFunc, TryToDecimalArbFromStringFunc,
 };
 use crate::functions::from_base58::create_from_base58_udf;
 use crate::functions::generate_series::GenerateSeriesFunc;
@@ -135,6 +136,10 @@ impl CommonFunctions {
             ScalarUDF::from(DecimalArbToDecimal128Func::new()),
             ScalarUDF::from(DecimalArbToDecimal256Func::new()),
             ScalarUDF::from(ToDecimalArbFromIntFunc::new()),
+            // TRY_CAST(... AS DECIMAL(p > 76, s)) — NULL instead of an error
+            ScalarUDF::from(TryToDecimalArbFromStringFunc::new()),
+            // retired streamling.u256 / streamling.i256 plugin columns
+            ScalarUDF::from(LegacyWideIntToDecimalArbFunc::new()),
             // Builtins whose argument coercion refuses decimal_arb mixed with
             // other types; the shim lets them plan so the analyzer rewrite can
             // coerce the arguments (see `decimal_arb_builtin_shim`).

@@ -10,8 +10,8 @@ use crate::error::{Result, ResultExt};
 use crate::streamling_user_err;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::sqlparser::ast::{
-    DataType as SqlDataType, Expr as SqlExpr, SelectItem, SetExpr, Statement, TableFactor,
-    UnaryOperator, Value,
+    CastKind, DataType as SqlDataType, Expr as SqlExpr, SelectItem, SetExpr, Statement,
+    TableFactor, UnaryOperator, Value,
 };
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -416,6 +416,10 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         static ref DECIMAL_TRY_RE: Regex = Regex::new(
             r"(?i)TRY_CAST\s*\(\s*(.+?)\s+AS\s+DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)"
         ).unwrap();
+        /// An unquoted SQL numeric literal (optionally signed, fractional,
+        /// exponent), as it appears inside `TRY_CAST(<literal> AS …)`.
+        static ref NUMERIC_LITERAL_RE: Regex =
+            Regex::new(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$").unwrap();
     }
     let sql = DECIMAL_TRY_RE
         .replace_all(sql, |caps: &regex::Captures| {
@@ -433,13 +437,20 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                 .unwrap_or(0);
             if precision > 76 && scale >= 0 {
                 // Feature 002 (Retire U256/I256): all wide-precision CASTs
-                // route through the decimal_arb cast UDF. The legacy
-                // `to_u256` fast path for (p ≤ 78, 0) is retired alongside
-                // the U256/I256 types — those values flow through
-                // decimal_arb end-to-end now.
+                // route through the decimal_arb cast UDFs. TRY_CAST is
+                // contractually non-throwing, so it takes the `try_` variant,
+                // which yields NULL for a value that does not parse or does
+                // not fit the declared type instead of failing the query.
+                // A bare numeric literal is quoted rather than cast to
+                // VARCHAR: planned as Float64 it would lose digits first.
+                let text = if NUMERIC_LITERAL_RE.is_match(expr.trim()) {
+                    format!("'{}'", expr.trim())
+                } else {
+                    format!("TRY_CAST({expr} AS VARCHAR)")
+                };
                 format!(
-                    "to_decimal_arb_from_string(TRY_CAST({} AS VARCHAR), {}, {})",
-                    expr, precision, scale
+                    "try_to_decimal_arb_from_string({}, {}, {})",
+                    text, precision, scale
                 )
             } else {
                 caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
@@ -503,8 +514,15 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         inner: &SqlExpr,
         precision: u64,
         scale: u64,
+        non_throwing: bool,
     ) -> Option<SqlExpr> {
         let dialect = GenericDialect {};
+        // TRY_CAST must yield NULL for a value that does not convert.
+        let function = if non_throwing {
+            "try_to_decimal_arb_from_string"
+        } else {
+            "to_decimal_arb_from_string"
+        };
         // An unquoted wide literal (`CAST(18446744073709551617 AS DECIMAL(77,0))`)
         // has no SQL type of its own: DataFusion plans it as Float64 before the
         // cast ever runs, so `CAST(... AS VARCHAR)` saw an approximation and the
@@ -514,8 +532,8 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
             None => format!("CAST({inner} AS VARCHAR)"),
         };
         let call_sql = format!(
-            "SELECT to_decimal_arb_from_string({}, {}, {})",
-            inner_sql, precision, scale
+            "SELECT {}({}, {}, {})",
+            function, inner_sql, precision, scale
         );
         let mut stmts = Parser::parse_sql(&dialect, call_sql.as_str()).ok()?;
         if stmts.len() != 1 {
@@ -539,10 +557,11 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
             SqlExpr::Cast {
                 expr: inner,
                 data_type,
-                kind: _,
+                kind,
                 format: _,
                 array: _,
             } => {
+                let non_throwing = matches!(kind, CastKind::TryCast | CastKind::SafeCast);
                 // Attempt to parse DECIMAL(p,s) from data_type.to_string()
                 let dt = data_type.to_string();
                 let dt_lower = dt.to_lowercase();
@@ -567,7 +586,9 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                         // legacy `to_u256` fast path for (p ≤ 78, 0) is
                         // retired alongside the U256/I256 types — those
                         // values now flow through decimal_arb end-to-end.
-                        if let Some(call) = parse_to_decimal_arb_from_string(inner, p, s as u64) {
+                        if let Some(call) =
+                            parse_to_decimal_arb_from_string(inner, p, s as u64, non_throwing)
+                        {
                             *expr = call;
                             return;
                         } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
@@ -704,9 +725,28 @@ mod tests {
         // Feature 002: TRY_CAST AS DECIMAL(78, 0) routes through decimal_arb.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
+        // TRY_CAST is non-throwing, so it takes the `try_` constructor.
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_try_cast_quotes_numeric_literal() {
+        // An unquoted wide literal must not pass through Float64 on its way
+        // to the constructor.
+        let sql = "SELECT TRY_CAST(18446744073709551617 AS DECIMAL(77, 0)) FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert_eq!(
+            result,
+            "SELECT try_to_decimal_arb_from_string('18446744073709551617', 77, 0) FROM t"
+        );
+        let sql = "SELECT CAST(18446744073709551617 AS DECIMAL(77, 0)) FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string('18446744073709551617', 77, 0) FROM t"
         );
     }
 
@@ -717,7 +757,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 100, 0) FROM accounts"
+            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 100, 0) FROM accounts"
         );
     }
 

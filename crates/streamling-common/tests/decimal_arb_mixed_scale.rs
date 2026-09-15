@@ -661,6 +661,35 @@ async fn like_and_string_functions_operate_on_decimal_text() {
 }
 
 #[tokio::test]
+async fn try_constructor_yields_null_instead_of_failing() {
+    let ctx = session();
+    table(
+        &ctx,
+        &[Some("1"), Some("2"), Some("3"), Some("4")],
+        &[Some("1"), Some("2"), Some("3"), Some("4")],
+        &["1.5", "abc", "123456", "-0.25"],
+    );
+    // TRY_CAST(s AS DECIMAL(77, 2)) is rewritten to this by the preprocessor:
+    // a value that does not parse or does not fit becomes NULL, the rest
+    // convert exactly.
+    let b = query(
+        &ctx,
+        "SELECT try_to_decimal_arb_from_string(s, 5, 2) FROM t ORDER BY id",
+    )
+    .await;
+    let (p, scale) = DecimalArbType::precision_scale_from_field(b[0].schema().field(0)).unwrap();
+    assert_eq!((p, scale), (5, 2));
+    assert_eq!(decimals(&b), vec![d("1.50"), None, None, d("-0.25")]);
+    // The throwing constructor keeps failing on the same input.
+    ctx.sql("SELECT to_decimal_arb_from_string(s, 5, 2) FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("plain CAST must still reject a non-numeric value");
+}
+
+#[tokio::test]
 async fn nvl_and_ifnull_are_unified_and_stamped() {
     let ctx = session();
     table(

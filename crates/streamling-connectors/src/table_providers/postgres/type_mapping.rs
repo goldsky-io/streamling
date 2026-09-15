@@ -1,6 +1,7 @@
 use arrow_schema::Field;
 use datafusion::arrow::datatypes::DataType;
 use streamling_core::types::decimal_arb::DecimalArbType;
+use streamling_core::types::decimal_arb_legacy::{LEGACY_WIDE_INT_PRECISION, legacy_wide_int_kind};
 // Feature 002 (Retire U256/I256): U256/I256 imports removed.
 
 /// PostgreSQL type information for an Arrow field
@@ -27,6 +28,16 @@ pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
         return PostgresTypeInfo {
             column_type: format!("NUMERIC({}, {})", precision, scale),
             string_cast_sql: Some(format!("numeric({},{})", precision, scale)),
+        };
+    }
+    // A retired `streamling.u256` / `streamling.i256` column from a plugin
+    // source: `build_projection_for_postgres` upgrades it to decimal_arb(78, 0)
+    // text, so it is a NUMERIC like any other wide integer — not the BYTEA the
+    // generic FixedSizeBinary arm below would pick.
+    if legacy_wide_int_kind(field).is_some() {
+        return PostgresTypeInfo {
+            column_type: format!("NUMERIC({}, 0)", LEGACY_WIDE_INT_PRECISION),
+            string_cast_sql: Some(format!("numeric({},0)", LEGACY_WIDE_INT_PRECISION)),
         };
     }
 
@@ -179,6 +190,21 @@ mod tests {
         let info = get_postgres_type_info(&field);
         assert_eq!(info.column_type, "NUMERIC(100, 18)");
         assert_eq!(info.string_cast_sql, Some("numeric(100,18)".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_wide_int_maps_to_numeric() {
+        // A retired plugin `streamling.u256` column is a NUMERIC(78, 0), not
+        // the BYTEA a bare FixedSizeBinary(32) would be.
+        let field = Field::new("balance", DataType::FixedSizeBinary(32), true).with_metadata(
+            std::collections::HashMap::from([(
+                "ARROW:extension:name".to_string(),
+                "streamling.u256".to_string(),
+            )]),
+        );
+        let info = get_postgres_type_info(&field);
+        assert_eq!(info.column_type, "NUMERIC(78, 0)");
+        assert_eq!(info.string_cast_sql, Some("numeric(78,0)".to_string()));
     }
 
     #[test]

@@ -3310,10 +3310,13 @@ impl ClickHouseClient {
         // contract of the column.
         if let Some(kind) = streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind(field)
         {
-            return Ok(match kind {
-                NativeIntKind::U256 => "UInt256".to_string(),
-                NativeIntKind::I256 => "Int256".to_string(),
-            });
+            return Ok(Self::nullable_wrapped(
+                field,
+                match kind {
+                    NativeIntKind::U256 => "UInt256".to_string(),
+                    NativeIntKind::I256 => "Int256".to_string(),
+                },
+            ));
         }
 
         // Feature 002: also recognize the normalized-FSB(32) shape from
@@ -3329,10 +3332,13 @@ impl ClickHouseClient {
             && let Some(kind) =
                 DecimalArbType::native_int_kind_from_field_metadata(field.metadata())
         {
-            return Ok(match kind {
-                NativeIntKind::U256 => "UInt256".to_string(),
-                NativeIntKind::I256 => "Int256".to_string(),
-            });
+            return Ok(Self::nullable_wrapped(
+                field,
+                match kind {
+                    NativeIntKind::U256 => "UInt256".to_string(),
+                    NativeIntKind::I256 => "Int256".to_string(),
+                },
+            ));
         }
         // Normalized FSB(32) without a hint should not happen — the
         // normalizer only converts when the hint is present. Falls through
@@ -3341,7 +3347,7 @@ impl ClickHouseClient {
         if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) {
             let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
             let native_int_kind = DecimalArbType::native_int_kind_from_field(field);
-            return match capability_for_decimal_arb(
+            let ch_type = match capability_for_decimal_arb(
                 ConnectorKind::ClickHouse,
                 precision,
                 scale,
@@ -3350,27 +3356,47 @@ impl ClickHouseClient {
             ) {
                 CapabilityResult::Native => match native_int_kind {
                     Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
-                        Ok("UInt256".to_string())
+                        "UInt256".to_string()
                     }
                     Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
-                        Ok("Int256".to_string())
+                        "Int256".to_string()
                     }
-                    _ => Ok(format!("Decimal({}, {})", precision, scale)),
+                    _ => format!("Decimal({}, {})", precision, scale),
                 },
-                CapabilityResult::OptInOnly(_) => Ok("String".to_string()),
-                CapabilityResult::Reject(reason) => Err(config_load_error(
-                    field.name(),
-                    ConnectorKind::ClickHouse,
-                    precision,
-                    scale,
-                    &reason,
-                )),
+                CapabilityResult::OptInOnly(_) => "String".to_string(),
+                CapabilityResult::Reject(reason) => {
+                    return Err(config_load_error(
+                        field.name(),
+                        ConnectorKind::ClickHouse,
+                        precision,
+                        scale,
+                        &reason,
+                    ));
+                }
             };
+            return Ok(Self::nullable_wrapped(field, ch_type));
         }
 
         // Non-decimal_arb fields: delegate to the existing mapping which
         // covers every Arrow type that ClickHouse supports.
         Ok(Self::arrow_field_to_clickhouse(field))
+    }
+
+    /// `Nullable(ch_type)` for a nullable field, the same rule
+    /// [`Self::arrow_field_to_clickhouse`] applies to every other type. The
+    /// decimal_arb branches above used to return the bare type, so a nullable
+    /// decimal column was created non-nullable and the first NULL row failed
+    /// the insert.
+    pub fn nullable_wrapped(field: &arrow::datatypes::Field, ch_type: String) -> String {
+        // ClickHouse doesn't support Nullable for Array, Tuple, and Map types
+        let is_non_nullable_type = ch_type.starts_with("Array(")
+            || ch_type.starts_with("Tuple(")
+            || ch_type.starts_with("Map(");
+        if field.is_nullable() && !is_non_nullable_type {
+            format!("Nullable({})", ch_type)
+        } else {
+            ch_type
+        }
     }
 
     pub fn arrow_field_to_clickhouse(field: &arrow::datatypes::Field) -> String {
@@ -4334,6 +4360,40 @@ mod tests {
                 .unwrap();
         let out = ClickHouseClient::clickhouse_column_type(&field, None).unwrap();
         assert_eq!(out, "Decimal(50, 5)");
+    }
+
+    #[test]
+    fn clickhouse_column_type_keeps_nullability_for_decimal_arb() {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        let field = DecimalArbType::field("amount", 50, 5, true).unwrap();
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(&field, None).unwrap(),
+            "Nullable(Decimal(50, 5))"
+        );
+        let wide = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        let directive = streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        };
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(&wide, Some(&directive)).unwrap(),
+            "Nullable(String)"
+        );
+        let hinted = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("balance", 78, 0, true).unwrap(),
+            NativeIntKind::I256,
+        )
+        .unwrap();
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(&hinted, None).unwrap(),
+            "Nullable(Int256)"
+        );
+        let normalized =
+            ClickHouseClient::normalize_schema_for_clickhouse(&Schema::new(vec![hinted]));
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(normalized.field(0), None).unwrap(),
+            "Nullable(Int256)"
+        );
     }
 
     #[test]

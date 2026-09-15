@@ -939,6 +939,174 @@ impl ScalarUDFImpl for ToDecimalArbFromStringFunc {
     }
 }
 
+/// `try_to_decimal_arb_from_string(text, precision_lit, scale_lit)` — the
+/// non-throwing twin of `to_decimal_arb_from_string`: a value that does not
+/// parse as a decimal, or does not fit the declared `(precision, scale)`,
+/// becomes NULL instead of failing the query. `TRY_CAST(x AS DECIMAL(p, s))`
+/// is rewritten to this; the throwing constructor stays behind plain `CAST`.
+/// A malformed *declaration* (non-literal or out-of-range precision/scale)
+/// still errors — that is a planning mistake, not a data value.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TryToDecimalArbFromStringFunc {
+    signature: Signature,
+}
+
+impl Default for TryToDecimalArbFromStringFunc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TryToDecimalArbFromStringFunc {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                ])],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TryToDecimalArbFromStringFunc {
+    fn name(&self) -> &str {
+        "try_to_decimal_arb_from_string"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let precision =
+            ToDecimalArbFromStringFunc::read_return_field_literal(&args, 1, "precision")?;
+        let scale = ToDecimalArbFromStringFunc::read_return_field_literal(&args, 2, "scale")?;
+        // Always nullable: any row may fail to convert.
+        build_output_field(self.name(), precision, scale)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() != 3 {
+            streamling_user_bail!(
+                "try_to_decimal_arb_from_string requires (text, precision, scale)"
+            );
+        }
+        let precision = ToDecimalArbFromStringFunc::read_literal_arg(&args, 1, "precision")?;
+        let scale = ToDecimalArbFromStringFunc::read_literal_arg(&args, 2, "scale")?;
+
+        let array = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
+        };
+        let strings = array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::from(streamling_user_err!(
+                    "try_to_decimal_arb_from_string: text input must be Utf8 (got {:?})",
+                    array.data_type()
+                ))
+            })?;
+
+        let column = args.return_field.name();
+        let mut builder =
+            DecimalArbArrayBuilder::with_capacity(strings.len(), column, precision, scale)?;
+        for i in 0..strings.len() {
+            if strings.is_null(i) {
+                builder.append_null();
+                continue;
+            }
+            // Parse and range-check the value; either failure is a NULL row.
+            match <DecimalArbValue as std::str::FromStr>::from_str(strings.value(i).trim()) {
+                Ok(value) if value.check_fits(precision, scale, column).is_ok() => {
+                    builder.append_value(&value)?;
+                }
+                _ => builder.append_null(),
+            }
+        }
+        let (raw, _, _) = builder.finish().into_inner();
+        Ok(ColumnarValue::Array(Arc::new(raw)))
+    }
+}
+
+/// `legacy_wide_int_to_decimal_arb(col)` — upgrade a retired
+/// `streamling.u256` / `streamling.i256` `FixedSizeBinary(32)` column (as the
+/// companion plugins still emit) to a hinted `decimal_arb(78, 0)` inside a
+/// plan, so sinks that project decimal_arb to text (Postgres) can carry the
+/// value instead of writing the raw bytes.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LegacyWideIntToDecimalArbFunc {
+    signature: Signature,
+}
+
+impl Default for LegacyWideIntToDecimalArbFunc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LegacyWideIntToDecimalArbFunc {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![DataType::FixedSizeBinary(32)])],
+                Volatility::Immutable,
+            ),
+        }
+    }
+
+    fn kind(field: &arrow_schema::Field) -> Result<crate::types::decimal_arb::NativeIntKind> {
+        crate::types::decimal_arb_legacy::legacy_wide_int_kind(field).ok_or_else(|| {
+            datafusion::error::DataFusionError::from(streamling_user_err!(
+                "legacy_wide_int_to_decimal_arb: field '{}' is not a legacy streamling.u256 / \
+                 streamling.i256 column",
+                field.name(),
+            ))
+        })
+    }
+}
+
+impl ScalarUDFImpl for LegacyWideIntToDecimalArbFunc {
+    fn name(&self) -> &str {
+        "legacy_wide_int_to_decimal_arb"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let field = args.arg_fields[0].as_ref();
+        let kind = Self::kind(field)?;
+        let upgraded =
+            crate::types::decimal_arb_legacy::legacy_wide_int_as_decimal_arb_field(field, kind)?;
+        Ok(Arc::new(upgraded.with_name(self.name())))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() != 1 || args.arg_fields.is_empty() {
+            streamling_user_bail!("legacy_wide_int_to_decimal_arb requires one argument");
+        }
+        let field = args.arg_fields[0].as_ref();
+        let kind = Self::kind(field)?;
+        let array = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+        };
+        Ok(ColumnarValue::Array(
+            crate::types::decimal_arb_legacy::legacy_wide_int_to_decimal_arb(
+                array.as_ref(),
+                field,
+                kind,
+            )?,
+        ))
+    }
+}
+
 // ---------- Widening: from_decimal128 / from_decimal256 ----------
 
 #[derive(Debug, PartialEq, Eq, Hash)]
