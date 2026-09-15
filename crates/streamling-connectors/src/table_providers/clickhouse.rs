@@ -2655,6 +2655,9 @@ impl ClickHouseClient {
     ) -> arrow::datatypes::Schema {
         use arrow::datatypes::{DataType, Field};
         use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        use streamling_core::types::decimal_arb_legacy::{
+            legacy_wide_int_as_decimal_arb_field, legacy_wide_int_kind,
+        };
 
         let normalized_fields: Vec<arrow::datatypes::FieldRef> = schema
             .fields()
@@ -2673,6 +2676,27 @@ impl ClickHouseClient {
                 // emission from the hint. `is_decimal_arb_field` requires
                 // LargeBinary so it returns false on the normalized field —
                 // the CREATE TABLE path must inspect the hint independently.
+                // A plugin source may still emit the retired FixedSizeBinary(32)
+                // `streamling.u256` / `streamling.i256` fields (big-endian).
+                // They are hinted decimal_arb(78, 0) columns in everything but
+                // encoding, so describe them as such — same FSB(32) wire shape,
+                // decimal_arb metadata + hint — and let
+                // `normalize_batch_for_clickhouse` re-encode the bytes. Passing
+                // the field through unchanged wrote the big-endian bytes into a
+                // little-endian UInt256: `1` arrived as 2^248.
+                if let Some(kind) = legacy_wide_int_kind(field)
+                    && let Ok(upgraded) = legacy_wide_int_as_decimal_arb_field(field, kind)
+                {
+                    return Arc::new(
+                        Field::new(
+                            field.name(),
+                            DataType::FixedSizeBinary(32),
+                            field.is_nullable(),
+                        )
+                        .with_metadata(upgraded.metadata().clone()),
+                    );
+                }
+
                 if DecimalArbType::is_decimal_arb_field(field)
                     && let (Some((precision, scale)), Some(kind)) = (
                         DecimalArbType::precision_scale_from_field(field),
@@ -2730,6 +2754,7 @@ impl ClickHouseClient {
     ) -> Result<RecordBatch, DataFusionError> {
         use arrow::compute::cast;
         use arrow::datatypes::DataType;
+        use streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind;
 
         let original_schema = batch.schema();
 
@@ -2794,6 +2819,28 @@ impl ClickHouseClient {
                     // magnitude) into 32-byte little-endian for ClickHouse.
                     (DataType::LargeBinary, DataType::FixedSizeBinary(32)) => {
                         decimal_arb_to_clickhouse_native(column.as_ref(), original_field)
+                            .map_err(DataFusionError::from)
+                    }
+                    // Retired big-endian `streamling.u256` / `streamling.i256`
+                    // from a plugin source: decode through decimal_arb, then
+                    // emit ClickHouse's little-endian UInt256 / Int256 bytes
+                    // with the same range checks every hinted column gets.
+                    (DataType::FixedSizeBinary(32), DataType::FixedSizeBinary(32))
+                        if legacy_wide_int_kind(original_field).is_some() =>
+                    {
+                        use streamling_core::types::decimal_arb_legacy::{
+                            legacy_wide_int_as_decimal_arb_field, legacy_wide_int_to_decimal_arb,
+                        };
+                        let kind =
+                            legacy_wide_int_kind(original_field).expect("guarded by the match arm");
+                        let upgraded = Arc::new(
+                            legacy_wide_int_as_decimal_arb_field(original_field, kind)
+                                .map_err(DataFusionError::from)?,
+                        );
+                        let canonical =
+                            legacy_wide_int_to_decimal_arb(column.as_ref(), original_field, kind)
+                                .map_err(DataFusionError::from)?;
+                        decimal_arb_to_clickhouse_native(canonical.as_ref(), &upgraded)
                             .map_err(DataFusionError::from)
                     }
                     _ => Ok(column.clone()),
@@ -3255,6 +3302,19 @@ impl ClickHouseClient {
         use streamling_core::types::decimal_arb_capability::{
             CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
         };
+
+        // A retired `streamling.u256` / `streamling.i256` field straight from
+        // a plugin source (before `normalize_schema_for_clickhouse` relabels
+        // it): the same native column type its decimal_arb upgrade gets.
+        // Falling through picked `FixedString(32)`, which loses the numeric
+        // contract of the column.
+        if let Some(kind) = streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind(field)
+        {
+            return Ok(match kind {
+                NativeIntKind::U256 => "UInt256".to_string(),
+                NativeIntKind::I256 => "Int256".to_string(),
+            });
+        }
 
         // Feature 002: also recognize the normalized-FSB(32) shape from
         // `normalize_schema_for_clickhouse`. Those fields carry the
@@ -5922,8 +5982,10 @@ pub fn clickhouse_native_to_decimal_arb(
     column: &dyn arrow::array::Array,
     field: &arrow_schema::FieldRef,
 ) -> std::result::Result<arrow::array::ArrayRef, StreamlingError> {
-    use arrow::array::{Array, FixedSizeBinaryArray, LargeBinaryBuilder};
-    use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
+    use arrow::array::{Array, FixedSizeBinaryArray};
+    use streamling_core::types::decimal_arb::{
+        DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue,
+    };
 
     let kind = DecimalArbType::native_int_kind_from_field(field).ok_or_else(|| {
         streamling_err!(
@@ -5932,7 +5994,7 @@ pub fn clickhouse_native_to_decimal_arb(
             field.name(),
         )
     })?;
-    let (_precision, scale) =
+    let (precision, scale) =
         DecimalArbType::precision_scale_from_field(field).ok_or_else(|| {
             streamling_err!(
                 "field '{}' is not a decimal_arb field (missing extension metadata)",
@@ -5950,7 +6012,11 @@ pub fn clickhouse_native_to_decimal_arb(
             )
         })?;
 
-    let mut builder = LargeBinaryBuilder::with_capacity(fsb.len(), 0);
+    // The builder validates every value against the declared `(precision,
+    // scale)`: a UInt256 holds 78 digits, a `decimal_arb(77, 0)` target does
+    // not, and reading 10^77 into it must fail rather than pass through.
+    let mut builder =
+        DecimalArbArrayBuilder::with_capacity(fsb.len(), field.name(), precision, scale)?;
     for row_idx in 0..fsb.len() {
         if fsb.is_null(row_idx) {
             builder.append_null();
@@ -5966,9 +6032,12 @@ pub fn clickhouse_native_to_decimal_arb(
         let canonical = clickhouse_be_to_canonical(&be, kind);
         let value = DecimalArbValue::from_canonical_bytes_at_scale(&canonical, scale)
             .map_err(|e| streamling_err!("column '{}' row {}: {}", field.name(), row_idx, e))?;
-        builder.append_value(value.to_canonical_bytes_at_scale(scale));
+        builder
+            .append_value(&value)
+            .map_err(|e| streamling_err!("column '{}' row {}: {}", field.name(), row_idx, e))?;
     }
-    Ok(Arc::new(builder.finish()))
+    let (raw, _, _) = builder.finish().into_inner();
+    Ok(Arc::new(raw))
 }
 
 /// Turn a 32-byte big-endian ClickHouse wide-int buffer into the `decimal_arb`

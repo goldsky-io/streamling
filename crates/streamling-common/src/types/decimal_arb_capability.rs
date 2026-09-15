@@ -282,30 +282,46 @@ impl fmt::Display for DecimalArbConfigErrors {
     }
 }
 
-/// Walk an Arrow `Schema`'s decimal_arb fields and confirm the connector
-/// (`kind`) can carry each one — Native, OptInOnly with the user's
-/// `coerce_to: string` directive, or Reject (collected into the result).
-///
-/// Pipeline-startup wiring: every place that builds a sink (or source)
-/// from YAML should call this with the connector's resolved `Schema` and
-/// directive list, surfacing `DecimalArbConfigErrors` to abort startup.
-/// Non-decimal_arb fields are ignored.
 /// Connectors whose decimal_arb conversion covers only top-level columns.
 fn converts_only_top_level(kind: ConnectorKind) -> bool {
     matches!(kind, ConnectorKind::ClickHouse | ConnectorKind::Hybrid)
 }
 
-/// Collect `(dotted path, precision, scale)` for every decimal_arb leaf *below*
-/// `field` — the top-level field itself is handled by the capability matrix.
+/// `(precision, scale, native_int_kind)` of a decimal_arb field — or of a
+/// legacy `streamling.u256` / `streamling.i256` field, which every sink
+/// upgrades to a hinted `decimal_arb(78, 0)` on the way in and must therefore
+/// be able to carry as such.
+fn decimal_arb_view(
+    field: &arrow_schema::Field,
+) -> Option<(u32, u32, Option<crate::types::decimal_arb::NativeIntKind>)> {
+    if let Some((p, s)) = DecimalArbType::precision_scale_from_field(field) {
+        return Some((p, s, DecimalArbType::native_int_kind_from_field(field)));
+    }
+    crate::types::decimal_arb_legacy::legacy_wide_int_kind(field).map(|kind| {
+        (
+            crate::types::decimal_arb_legacy::LEGACY_WIDE_INT_PRECISION,
+            0,
+            Some(kind),
+        )
+    })
+}
+
+/// Collect `(dotted path, precision, scale, hint)` for every decimal_arb leaf
+/// *below* `field` — the top-level field itself is handled by the caller.
 fn collect_nested_decimal_arb(
     field: &arrow_schema::Field,
     path: &str,
-    out: &mut Vec<(String, u32, u32)>,
+    out: &mut Vec<(
+        String,
+        u32,
+        u32,
+        Option<crate::types::decimal_arb::NativeIntKind>,
+    )>,
 ) {
     let mut visit = |child: &arrow_schema::Field| {
         let child_path = format!("{}.{}", path, child.name());
-        if let Some((p, s)) = DecimalArbType::precision_scale_from_field(child) {
-            out.push((child_path.clone(), p, s));
+        if let Some((p, s, hint)) = decimal_arb_view(child) {
+            out.push((child_path.clone(), p, s, hint));
         }
         collect_nested_decimal_arb(child, &child_path, out);
     };
@@ -319,6 +335,24 @@ fn collect_nested_decimal_arb(
     }
 }
 
+/// Walk an Arrow `Schema`'s decimal_arb fields and confirm the connector
+/// (`kind`) can carry each one — Native, OptInOnly with the user's
+/// `coerce_to: string` directive, or Reject (collected into the result).
+///
+/// Pipeline-startup wiring: every place that builds a sink (or source)
+/// from YAML should call this with the connector's resolved `Schema` and
+/// directive list, surfacing `DecimalArbConfigErrors` to abort startup.
+/// Non-decimal_arb fields are ignored.
+///
+/// Leaves nested inside a Struct / List / Map get the same decision as a
+/// top-level column would, under the column's directive: the connectors that
+/// serialise whole containers (JSON, Avro, …) carry the leaf exactly when they
+/// would carry the column, and a plugin that does not advertise decimal_arb
+/// support rejects the leaf as it rejects the column — before, only the
+/// top-level field was checked, so a plugin sink accepted `struct<amount>` and
+/// serialised the leaf as something else. ClickHouse / Hybrid convert
+/// top-level columns only, so a nested leaf is rejected outright there rather
+/// than written as raw bytes.
 pub fn validate_pipeline_decimal_arb(
     schema: &Schema,
     kind: ConnectorKind,
@@ -326,44 +360,36 @@ pub fn validate_pipeline_decimal_arb(
 ) -> Result<(), DecimalArbConfigErrors> {
     let mut errors: Vec<crate::error::StreamlingError> = Vec::new();
     for field in schema.fields() {
-        // A decimal_arb *inside* a Struct / List / Map is never reached by the
-        // ClickHouse conversion, which projects top-level columns only — the
-        // leaf would be written as its raw canonical bytes. Reject it at config
-        // load instead of corrupting the column on the wire.
-        if converts_only_top_level(kind) {
-            let mut nested = Vec::new();
-            collect_nested_decimal_arb(field, field.name(), &mut nested);
-            for (path, precision, scale) in nested {
-                errors.push(config_load_error(
-                    &path,
-                    kind,
-                    precision,
-                    scale,
-                    "decimal_arb nested inside a struct/list/map is not supported by this                      connector (only top-level columns are converted); flatten the column                      or send it to a JSON/Avro sink",
-                ));
-            }
-        }
-
-        let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(field) else {
-            continue;
-        };
         let coerce_to_string = directives
             .iter()
             .find(|d| d.name == field.name())
             .map(|d| d.coerce_to_string)
             .unwrap_or(false);
-        let native_int_kind = DecimalArbType::native_int_kind_from_field(field);
-        match capability_for_decimal_arb(kind, precision, scale, coerce_to_string, native_int_kind)
-        {
-            CapabilityResult::Native | CapabilityResult::OptInOnly(_) => {}
-            CapabilityResult::Reject(reason) => {
+
+        let mut leaves = Vec::new();
+        if let Some((precision, scale, hint)) = decimal_arb_view(field) {
+            leaves.push((field.name().clone(), precision, scale, hint));
+        }
+        let top_level = leaves.len();
+        collect_nested_decimal_arb(field, field.name(), &mut leaves);
+
+        for (i, (path, precision, scale, hint)) in leaves.into_iter().enumerate() {
+            if i >= top_level && converts_only_top_level(kind) {
                 errors.push(config_load_error(
-                    field.name(),
+                    &path,
                     kind,
                     precision,
                     scale,
-                    &reason,
+                    "decimal_arb nested inside a struct/list/map is not supported by this \
+                     connector (only top-level columns are converted); flatten the column \
+                     or send it to a JSON/Avro sink",
                 ));
+                continue;
+            }
+            if let CapabilityResult::Reject(reason) =
+                capability_for_decimal_arb(kind, precision, scale, coerce_to_string, hint)
+            {
+                errors.push(config_load_error(&path, kind, precision, scale, &reason));
             }
         }
     }

@@ -17,7 +17,9 @@ use crate::types::decimal_arb::{
     DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue, MAX_PRECISION,
 };
 use crate::{streamling_user_bail, streamling_user_err};
-use arrow::array::{Array, BooleanBuilder, LargeBinaryArray, LargeBinaryBuilder, StringBuilder};
+use arrow::array::{
+    Array, ArrayRef, BooleanBuilder, LargeBinaryArray, LargeBinaryBuilder, StringBuilder,
+};
 use arrow_schema::FieldRef;
 use bigdecimal::{BigDecimal, RoundingMode};
 use datafusion::arrow::datatypes::DataType;
@@ -837,6 +839,16 @@ impl ToDecimalArbFromStringFunc {
                 ));
             }
         };
+        Self::literal_to_u32(v, name)
+    }
+
+    /// Narrow a declared `precision`/`scale` literal to `u32` without wrapping.
+    ///
+    /// `v as u32` silently reduced `4294967396` to `100`, so a nonsensical
+    /// declaration planned as a perfectly ordinary `(100, s)` type. Anything
+    /// outside `0..=MAX_PRECISION` is rejected here; the builder re-validates
+    /// the pair (`scale <= precision`) on construction.
+    fn literal_to_u32(v: i64, name: &str) -> Result<u32> {
         if v < 0 {
             return Err(datafusion::error::DataFusionError::from(
                 streamling_user_err!(
@@ -846,7 +858,17 @@ impl ToDecimalArbFromStringFunc {
                 ),
             ));
         }
-        Ok(v as u32)
+        match u32::try_from(v) {
+            Ok(v) if v <= MAX_PRECISION => Ok(v),
+            _ => Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!(
+                    "to_decimal_arb_from_string: {} {} exceeds maximum {}",
+                    name,
+                    v,
+                    MAX_PRECISION
+                ),
+            )),
+        }
     }
 
     fn read_literal_arg(args: &ScalarFunctionArgs, idx: usize, name: &str) -> Result<u32> {
@@ -855,19 +877,7 @@ impl ToDecimalArbFromStringFunc {
 
     fn read_return_field_literal(args: &ReturnFieldArgs, idx: usize, name: &str) -> Result<u32> {
         match args.scalar_arguments.get(idx).copied().flatten() {
-            Some(datafusion::scalar::ScalarValue::Int64(Some(v))) => {
-                if *v < 0 {
-                    Err(datafusion::error::DataFusionError::from(
-                        streamling_user_err!(
-                            "to_decimal_arb_from_string: {} must be non-negative (got {})",
-                            name,
-                            v
-                        ),
-                    ))
-                } else {
-                    Ok(*v as u32)
-                }
-            }
+            Some(datafusion::scalar::ScalarValue::Int64(Some(v))) => Self::literal_to_u32(*v, name),
             _ => Err(datafusion::error::DataFusionError::from(
                 streamling_user_err!(
                     "to_decimal_arb_from_string: {} must be a non-negative Int64 literal at planning time",
@@ -1323,6 +1333,968 @@ impl ScalarUDFImpl for DecimalArbWithMetaFunc {
         match &args.args[0] {
             ColumnarValue::Array(arr) => Ok(ColumnarValue::Array(arr.clone())),
             ColumnarValue::Scalar(scalar) => Ok(ColumnarValue::Array(scalar.to_array()?)),
+        }
+    }
+}
+
+// ---------- Value-preserving rescale: decimal_arb_rescale ----------
+
+/// `decimal_arb_rescale(value, precision_lit, scale_lit)` — re-encode a
+/// decimal_arb column at a different `(precision, scale)` **without changing
+/// its numeric value**.
+///
+/// This is the counterpart `decimal_arb_with_meta` deliberately is not: that
+/// function only relabels the field, so it is correct only when the bytes
+/// already sit at the target scale. Here every row is decoded at the *input*
+/// field's scale and rebuilt at the target. Widening the scale is exact; a
+/// value that would not fit the target — too many integer digits, or more
+/// significant fractional digits than the target scale — is rejected by
+/// `check_fits` instead of being rounded.
+///
+/// The planner uses it to bring the branches of CASE / COALESCE / GREATEST /
+/// LEAST / `array_min` / `array_max` to one common scale before stamping a
+/// single `(precision, scale)` on the result.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbRescaleFunc {
+    signature: Signature,
+}
+
+impl Default for DecimalArbRescaleFunc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecimalArbRescaleFunc {
+    pub fn new() -> Self {
+        Self {
+            // `coerce_types` admits a decimal_arb leaf or a list of them; the
+            // field-metadata check happens where the field is available.
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+}
+
+/// The element field of a `List` / `LargeList` / `FixedSizeList` type.
+fn list_element_field(data_type: &DataType) -> Option<&FieldRef> {
+    match data_type {
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => Some(f),
+        _ => None,
+    }
+}
+
+/// `data_type` with its list element field replaced (same list kind).
+fn with_list_element(data_type: &DataType, element: FieldRef) -> DataType {
+    match data_type {
+        DataType::List(_) => DataType::List(element),
+        DataType::LargeList(_) => DataType::LargeList(element),
+        DataType::FixedSizeList(_, n) => DataType::FixedSizeList(element, *n),
+        other => other.clone(),
+    }
+}
+
+/// Rebuild a list array around new element values (same offsets and nulls).
+fn rebuild_list(
+    array: &ArrayRef,
+    element: FieldRef,
+    values: ArrayRef,
+    op_name: &str,
+) -> Result<ArrayRef> {
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+    let downcast_err = |what: &str| {
+        datafusion::error::DataFusionError::from(streamling_user_err!(
+            "{}: expected {} (got {:?})",
+            op_name,
+            what,
+            array.data_type()
+        ))
+    };
+    Ok(match array.data_type() {
+        DataType::List(_) => {
+            let la = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| downcast_err("ListArray"))?;
+            Arc::new(ListArray::new(
+                element,
+                la.offsets().clone(),
+                values,
+                la.nulls().cloned(),
+            ))
+        }
+        DataType::LargeList(_) => {
+            let la = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| downcast_err("LargeListArray"))?;
+            Arc::new(LargeListArray::new(
+                element,
+                la.offsets().clone(),
+                values,
+                la.nulls().cloned(),
+            ))
+        }
+        DataType::FixedSizeList(_, n) => {
+            let fa = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| downcast_err("FixedSizeListArray"))?;
+            Arc::new(FixedSizeListArray::try_new_with_length(
+                element,
+                *n,
+                values,
+                fa.nulls().cloned(),
+                fa.len(),
+            )?)
+        }
+        _ => return Err(downcast_err("a list array")),
+    })
+}
+
+/// Re-encode every value of a decimal_arb `LargeBinaryArray` from
+/// `source_scale` to `(precision, scale)`, validating that it fits.
+fn rescale_values(
+    input: &LargeBinaryArray,
+    source_scale: u32,
+    column: &str,
+    precision: u32,
+    scale: u32,
+) -> Result<LargeBinaryArray> {
+    let mut builder = DecimalArbArrayBuilder::with_capacity(input.len(), column, precision, scale)?;
+    for i in 0..input.len() {
+        match decode_value(input, i, source_scale)? {
+            Some(value) => builder.append_value(&value)?,
+            None => builder.append_null(),
+        }
+    }
+    let (raw, _, _) = builder.finish().into_inner();
+    Ok(raw)
+}
+
+impl ScalarUDFImpl for DecimalArbRescaleFunc {
+    fn name(&self) -> &str {
+        "decimal_arb_rescale"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let leaf_ok = |dt: &DataType| matches!(dt, DataType::LargeBinary);
+        match arg_types {
+            [value, _, _]
+                if leaf_ok(value)
+                    || list_element_field(value).is_some_and(|f| leaf_ok(f.data_type())) =>
+            {
+                Ok(vec![value.clone(), DataType::Int64, DataType::Int64])
+            }
+            _ => Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!(
+                    "decimal_arb_rescale expects (decimal_arb value or list, precision, scale), got {:?}",
+                    arg_types
+                ),
+            )),
+        }
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let precision =
+            ToDecimalArbFromStringFunc::read_return_field_literal(&args, 1, self.name())?;
+        let scale = ToDecimalArbFromStringFunc::read_return_field_literal(&args, 2, self.name())?;
+        let input = &args.arg_fields[0];
+        // A list of decimal_arb: the elements are re-encoded, the list keeps
+        // its shape.
+        if let Some(element) = list_element_field(input.data_type()) {
+            require_decimal_arb_field(element.as_ref(), self.name())?;
+            let element = Arc::new(DecimalArbType::field(
+                element.name(),
+                precision,
+                scale,
+                element.is_nullable(),
+            )?);
+            return Ok(Arc::new(
+                arrow_schema::Field::new(
+                    self.name(),
+                    with_list_element(input.data_type(), element),
+                    input.is_nullable(),
+                )
+                .with_metadata(input.metadata().clone()),
+            ));
+        }
+        Ok(Arc::new(DecimalArbType::field(
+            self.name(),
+            precision,
+            scale,
+            input.is_nullable(),
+        )?))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() != 3 || args.arg_fields.is_empty() {
+            streamling_user_bail!("decimal_arb_rescale requires (value, precision, scale)");
+        }
+        let precision = ToDecimalArbFromStringFunc::read_literal_arg(&args, 1, "precision")?;
+        let scale = ToDecimalArbFromStringFunc::read_literal_arg(&args, 2, "scale")?;
+        let input_field = args.arg_fields[0].as_ref();
+
+        if let Some(source_element) = list_element_field(input_field.data_type()) {
+            let (_, source_scale) =
+                require_decimal_arb_field(source_element.as_ref(), self.name())?;
+            let array = match &args.args[0] {
+                ColumnarValue::Array(arr) => arr.clone(),
+                ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+            };
+            let values = list_values(&array, self.name())?;
+            let values = values
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::from(streamling_user_err!(
+                        "decimal_arb_rescale expects LargeBinary list elements (got {:?})",
+                        values.data_type()
+                    ))
+                })?;
+            let rescaled = rescale_values(values, source_scale, self.name(), precision, scale)?;
+            let element = list_element_field(args.return_field.data_type())
+                .cloned()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::from(streamling_user_err!(
+                        "decimal_arb_rescale: return field is not a list"
+                    ))
+                })?;
+            return Ok(ColumnarValue::Array(rebuild_list(
+                &array,
+                element,
+                Arc::new(rescaled),
+                self.name(),
+            )?));
+        }
+
+        let (_, source_scale) = require_decimal_arb_field(input_field, self.name())?;
+        let input = downcast_decimal_arb_array(&args.args[0], self.name(), "value")?;
+        let raw = rescale_values(
+            &input,
+            source_scale,
+            args.return_field.name(),
+            precision,
+            scale,
+        )?;
+        Ok(ColumnarValue::Array(Arc::new(raw)))
+    }
+}
+
+/// The flattened element values of a list array of any offset width.
+fn list_values(array: &ArrayRef, op_name: &str) -> Result<ArrayRef> {
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+    let values = match array.data_type() {
+        DataType::List(_) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|a| a.values().clone()),
+        DataType::LargeList(_) => array
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .map(|a| a.values().clone()),
+        DataType::FixedSizeList(_, _) => array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .map(|a| a.values().clone()),
+        _ => None,
+    };
+    values.ok_or_else(|| {
+        datafusion::error::DataFusionError::from(streamling_user_err!(
+            "{}: expected a list array (got {:?})",
+            op_name,
+            array.data_type()
+        ))
+    })
+}
+
+/// `(start, end)` value ranges of each list row, for any list layout.
+fn list_ranges(array: &ArrayRef, op_name: &str) -> Result<Vec<Option<(usize, usize)>>> {
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+    let mut ranges = Vec::with_capacity(array.len());
+    match array.data_type() {
+        DataType::List(_) => {
+            let la = array.as_any().downcast_ref::<ListArray>().unwrap();
+            for i in 0..la.len() {
+                ranges.push((!la.is_null(i)).then(|| {
+                    let o = la.value_offsets();
+                    (o[i] as usize, o[i + 1] as usize)
+                }));
+            }
+        }
+        DataType::LargeList(_) => {
+            let la = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+            for i in 0..la.len() {
+                ranges.push((!la.is_null(i)).then(|| {
+                    let o = la.value_offsets();
+                    (o[i] as usize, o[i + 1] as usize)
+                }));
+            }
+        }
+        DataType::FixedSizeList(_, n) => {
+            let fa = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let n = *n as usize;
+            for i in 0..fa.len() {
+                ranges.push((!fa.is_null(i)).then(|| {
+                    let start = fa.value_offset(i) as usize;
+                    (start, start + n)
+                }));
+            }
+        }
+        other => streamling_user_bail!("{}: expected a list array (got {:?})", op_name, other),
+    }
+    Ok(ranges)
+}
+
+// ---------- Variadic extremes: decimal_arb_greatest / decimal_arb_least ----------
+
+/// Which end of the numeric order an extreme function keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtremeKind {
+    Greatest,
+    Least,
+}
+
+impl ExtremeKind {
+    fn keep(self, candidate: &DecimalArbValue, current: &DecimalArbValue) -> bool {
+        match self {
+            ExtremeKind::Greatest => candidate > current,
+            ExtremeKind::Least => candidate < current,
+        }
+    }
+}
+
+/// Common `(precision, scale)` for a set of decimal_arb fields: the widest
+/// scale present, with enough integer digits for every member.
+fn common_precision_scale(metas: &[(u32, u32)]) -> (u32, u32) {
+    let s_out = metas.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let int_max = metas
+        .iter()
+        .map(|(p, s)| p.saturating_sub(*s))
+        .max()
+        .unwrap_or(0);
+    ((int_max + s_out).clamp(1, MAX_PRECISION), s_out)
+}
+
+/// `decimal_arb_greatest(a, b, …)` / `decimal_arb_least(a, b, …)` — the
+/// numerically largest / smallest non-NULL argument, NULL only when every
+/// argument is NULL (SQL `GREATEST` / `LEAST` semantics).
+///
+/// DataFusion's builtins pick their winner on the physical `LargeBinary`, where
+/// sign/magnitude bytes put every negative above every positive and the same
+/// number at two scales has two encodings. Arguments may sit at different
+/// scales; each is decoded at its own and the result is encoded once, at the
+/// common `(precision, scale)`, so every argument is evaluated exactly once.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbExtremeFunc {
+    kind: ExtremeKind,
+    signature: Signature,
+}
+
+impl DecimalArbExtremeFunc {
+    pub fn new(kind: ExtremeKind) -> Self {
+        Self {
+            kind,
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+    pub fn greatest() -> Self {
+        Self::new(ExtremeKind::Greatest)
+    }
+    pub fn least() -> Self {
+        Self::new(ExtremeKind::Least)
+    }
+
+    fn output_precision_scale(&self, arg_fields: &[FieldRef]) -> Result<(u32, u32)> {
+        let metas = arg_fields
+            .iter()
+            .map(|f| require_decimal_arb_field(f.as_ref(), self.name()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(common_precision_scale(&metas))
+    }
+}
+
+impl ScalarUDFImpl for DecimalArbExtremeFunc {
+    fn name(&self) -> &str {
+        match self.kind {
+            ExtremeKind::Greatest => "decimal_arb_greatest",
+            ExtremeKind::Least => "decimal_arb_least",
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        if arg_types.is_empty() || arg_types.iter().any(|t| *t != DataType::LargeBinary) {
+            return Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!(
+                    "{} expects one or more decimal_arb arguments, got {:?}",
+                    self.name(),
+                    arg_types
+                ),
+            ));
+        }
+        Ok(arg_types.to_vec())
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let (p, s) = self.output_precision_scale(args.arg_fields)?;
+        // NULL only when every argument can be NULL.
+        let nullable = args.arg_fields.iter().all(|f| f.is_nullable());
+        Ok(Arc::new(DecimalArbType::field(
+            self.name(),
+            p,
+            s,
+            nullable,
+        )?))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.is_empty() {
+            streamling_user_bail!("{} requires at least one argument", self.name());
+        }
+        let (precision, scale) = DecimalArbType::precision_scale_from_field(&args.return_field)
+            .map(Ok)
+            .unwrap_or_else(|| self.output_precision_scale(&args.arg_fields))?;
+        let mut columns = Vec::with_capacity(args.args.len());
+        for (cv, field) in args.args.iter().zip(&args.arg_fields) {
+            let (_, s) = require_decimal_arb_field(field.as_ref(), self.name())?;
+            let array = match cv {
+                ColumnarValue::Array(arr) => arr.clone(),
+                ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+            };
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .cloned()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::from(streamling_user_err!(
+                        "{} expects LargeBinary arguments (got {:?})",
+                        self.name(),
+                        array.data_type()
+                    ))
+                })?;
+            columns.push((array, s));
+        }
+        let mut builder = DecimalArbArrayBuilder::with_capacity(
+            args.number_rows,
+            args.return_field.name(),
+            precision,
+            scale,
+        )?;
+        for row in 0..args.number_rows {
+            let mut current: Option<DecimalArbValue> = None;
+            for (array, s) in &columns {
+                if let Some(value) = decode_value(array, row, *s)? {
+                    let keep = current.as_ref().is_none_or(|c| self.kind.keep(&value, c));
+                    if keep {
+                        current = Some(value);
+                    }
+                }
+            }
+            match current {
+                Some(value) => builder.append_value(&value)?,
+                None => builder.append_null(),
+            }
+        }
+        let (raw, _, _) = builder.finish().into_inner();
+        Ok(ColumnarValue::Array(Arc::new(raw)))
+    }
+}
+
+// ---------- List helpers: decimal_arb_array_min / max / sort ----------
+
+/// `decimal_arb_array_min(list)` / `decimal_arb_array_max(list)` — the
+/// numerically smallest / largest non-NULL element of each list of
+/// decimal_arb, NULL for an empty, NULL or all-NULL list. The result carries
+/// the element's `(precision, scale)`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbArrayExtremeFunc {
+    kind: ExtremeKind,
+    signature: Signature,
+}
+
+impl DecimalArbArrayExtremeFunc {
+    pub fn new(kind: ExtremeKind) -> Self {
+        Self {
+            kind,
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+    pub fn min() -> Self {
+        Self::new(ExtremeKind::Least)
+    }
+    pub fn max() -> Self {
+        Self::new(ExtremeKind::Greatest)
+    }
+}
+
+impl ScalarUDFImpl for DecimalArbArrayExtremeFunc {
+    fn name(&self) -> &str {
+        match self.kind {
+            ExtremeKind::Greatest => "decimal_arb_array_max",
+            ExtremeKind::Least => "decimal_arb_array_min",
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        match arg_types {
+            [list]
+                if list_element_field(list)
+                    .is_some_and(|f| f.data_type() == &DataType::LargeBinary) =>
+            {
+                Ok(arg_types.to_vec())
+            }
+            _ => Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!(
+                    "{} expects one list of decimal_arb, got {:?}",
+                    self.name(),
+                    arg_types
+                ),
+            )),
+        }
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let element = list_element_field(args.arg_fields[0].data_type()).ok_or_else(|| {
+            datafusion::error::DataFusionError::from(streamling_user_err!(
+                "{} expects a list argument",
+                self.name()
+            ))
+        })?;
+        let (p, s) = require_decimal_arb_field(element.as_ref(), self.name())?;
+        Ok(Arc::new(DecimalArbType::field(self.name(), p, s, true)?))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let element = list_element_field(args.arg_fields[0].data_type()).ok_or_else(|| {
+            datafusion::error::DataFusionError::from(streamling_user_err!(
+                "{} expects a list argument",
+                self.name()
+            ))
+        })?;
+        let (precision, scale) = require_decimal_arb_field(element.as_ref(), self.name())?;
+        let array = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+        };
+        let values = list_values(&array, self.name())?;
+        let values = values
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::from(streamling_user_err!(
+                    "{} expects LargeBinary list elements (got {:?})",
+                    self.name(),
+                    values.data_type()
+                ))
+            })?;
+        let mut builder = DecimalArbArrayBuilder::with_capacity(
+            array.len(),
+            args.return_field.name(),
+            precision,
+            scale,
+        )?;
+        for range in list_ranges(&array, self.name())? {
+            let mut current: Option<DecimalArbValue> = None;
+            if let Some((start, end)) = range {
+                for i in start..end {
+                    if let Some(value) = decode_value(values, i, scale)? {
+                        let keep = current.as_ref().is_none_or(|c| self.kind.keep(&value, c));
+                        if keep {
+                            current = Some(value);
+                        }
+                    }
+                }
+            }
+            match current {
+                Some(value) => builder.append_value(&value)?,
+                None => builder.append_null(),
+            }
+        }
+        let (raw, _, _) = builder.finish().into_inner();
+        Ok(ColumnarValue::Array(Arc::new(raw)))
+    }
+}
+
+/// `decimal_arb_array_sort(list [, order [, nulls]])` — each list of
+/// decimal_arb sorted in numeric order. `order` is `'ASC'` (default) or
+/// `'DESC'`, `nulls` is `'NULLS FIRST'` (default) or `'NULLS LAST'`, matching
+/// DataFusion's `array_sort`, whose bytewise order this replaces. Elements are
+/// moved, never re-encoded, so the list keeps its element type.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbArraySortFunc {
+    signature: Signature,
+}
+
+impl Default for DecimalArbArraySortFunc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecimalArbArraySortFunc {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+
+    fn option_text(cv: &ColumnarValue, what: &str) -> Result<Option<String>> {
+        match cv {
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(v))
+            | ColumnarValue::Scalar(datafusion::scalar::ScalarValue::LargeUtf8(v))
+            | ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8View(v)) => Ok(v.clone()),
+            other => Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!(
+                    "decimal_arb_array_sort: {} must be a string literal (got {:?})",
+                    what,
+                    other
+                ),
+            )),
+        }
+    }
+}
+
+impl ScalarUDFImpl for DecimalArbArraySortFunc {
+    fn name(&self) -> &str {
+        "decimal_arb_array_sort"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let list_ok = arg_types.first().is_some_and(|list| {
+            matches!(list, DataType::List(_) | DataType::LargeList(_))
+                && list_element_field(list).is_some_and(|f| f.data_type() == &DataType::LargeBinary)
+        });
+        if !list_ok || arg_types.len() > 3 {
+            return Err(datafusion::error::DataFusionError::from(
+                streamling_user_err!(
+                    "decimal_arb_array_sort expects (list of decimal_arb [, order [, nulls]]), got {:?}",
+                    arg_types
+                ),
+            ));
+        }
+        let mut out = vec![arg_types[0].clone()];
+        out.extend(arg_types[1..].iter().map(|_| DataType::Utf8));
+        Ok(out)
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let input = &args.arg_fields[0];
+        let element = list_element_field(input.data_type()).ok_or_else(|| {
+            datafusion::error::DataFusionError::from(streamling_user_err!(
+                "decimal_arb_array_sort expects a list argument"
+            ))
+        })?;
+        require_decimal_arb_field(element.as_ref(), self.name())?;
+        Ok(Arc::new(
+            arrow_schema::Field::new(self.name(), input.data_type().clone(), input.is_nullable())
+                .with_metadata(input.metadata().clone()),
+        ))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        use arrow::array::UInt32Array;
+        use arrow::compute::take;
+
+        let element = list_element_field(args.arg_fields[0].data_type())
+            .cloned()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::from(streamling_user_err!(
+                    "decimal_arb_array_sort expects a list argument"
+                ))
+            })?;
+        let (_, scale) = require_decimal_arb_field(element.as_ref(), self.name())?;
+        let descending = match args.args.get(1).map(|a| Self::option_text(a, "order")) {
+            None => false,
+            Some(text) => match text?.as_deref().map(str::to_ascii_uppercase).as_deref() {
+                None => {
+                    // A NULL option makes the whole result NULL, as array_sort does.
+                    return Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::try_new_null(
+                            args.return_field.data_type(),
+                        )?,
+                    ));
+                }
+                Some("ASC") => false,
+                Some("DESC") => true,
+                Some(other) => streamling_user_bail!(
+                    "decimal_arb_array_sort: order must be 'ASC' or 'DESC' (got '{}')",
+                    other
+                ),
+            },
+        };
+        let nulls_first = match args.args.get(2).map(|a| Self::option_text(a, "nulls")) {
+            None => true,
+            Some(text) => match text?.as_deref().map(str::to_ascii_uppercase).as_deref() {
+                None => {
+                    return Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::try_new_null(
+                            args.return_field.data_type(),
+                        )?,
+                    ));
+                }
+                Some("NULLS FIRST") => true,
+                Some("NULLS LAST") => false,
+                Some(other) => streamling_user_bail!(
+                    "decimal_arb_array_sort: nulls must be 'NULLS FIRST' or 'NULLS LAST' (got '{}')",
+                    other
+                ),
+            },
+        };
+
+        let array = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+        };
+        let values = list_values(&array, self.name())?;
+        let binary = values
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::from(streamling_user_err!(
+                    "decimal_arb_array_sort expects LargeBinary list elements (got {:?})",
+                    values.data_type()
+                ))
+            })?;
+        // Permute the element indices per row; the bytes themselves move
+        // untouched through `take`.
+        let mut order: Vec<u32> = Vec::with_capacity(binary.len());
+        for range in list_ranges(&array, self.name())? {
+            let Some((start, end)) = range else { continue };
+            let mut decoded = Vec::with_capacity(end - start);
+            for i in start..end {
+                decoded.push((i as u32, decode_value(binary, i, scale)?));
+            }
+            decoded.sort_by(|(_, a), (_, b)| match (a, b) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => {
+                    if nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (Some(_), None) => {
+                    if nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (Some(a), Some(b)) => {
+                    if descending {
+                        b.cmp(a)
+                    } else {
+                        a.cmp(b)
+                    }
+                }
+            });
+            order.extend(decoded.into_iter().map(|(i, _)| i));
+        }
+        // `take` needs every element position exactly once, including those
+        // under NULL rows (which the loop above skipped); their ranges are
+        // still part of the value buffer, so fill them in unchanged.
+        if order.len() != binary.len() {
+            let mut covered = vec![false; binary.len()];
+            for &i in &order {
+                covered[i as usize] = true;
+            }
+            let mut full: Vec<u32> = Vec::with_capacity(binary.len());
+            let mut sorted = order.iter().copied();
+            for (i, seen) in covered.iter().enumerate() {
+                if *seen {
+                    full.push(sorted.next().expect("covered positions are in order"));
+                } else {
+                    full.push(i as u32);
+                }
+            }
+            order = full;
+        }
+        let permuted = take(binary, &UInt32Array::from(order), None)?;
+        Ok(ColumnarValue::Array(rebuild_list(
+            &array,
+            element,
+            permuted,
+            self.name(),
+        )?))
+    }
+}
+
+// ---------- Metadata relabel for containers: decimal_arb_restamp ----------
+
+/// A container scalar with its one-row array retyped to `target` (same
+/// buffers; only field metadata differs). Non-container scalars carry their
+/// metadata on the field, not the type, and pass through.
+fn retype_scalar(
+    scalar: datafusion::scalar::ScalarValue,
+    target: &DataType,
+) -> Result<datafusion::scalar::ScalarValue> {
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray};
+    use datafusion::scalar::ScalarValue;
+    let retyped = |array: &dyn Array| {
+        array
+            .to_data()
+            .into_builder()
+            .data_type(target.clone())
+            .build()
+    };
+    Ok(match scalar {
+        ScalarValue::List(a) => ScalarValue::List(Arc::new(ListArray::from(retyped(a.as_ref())?))),
+        ScalarValue::LargeList(a) => {
+            ScalarValue::LargeList(Arc::new(LargeListArray::from(retyped(a.as_ref())?)))
+        }
+        ScalarValue::FixedSizeList(a) => {
+            ScalarValue::FixedSizeList(Arc::new(FixedSizeListArray::from(retyped(a.as_ref())?)))
+        }
+        ScalarValue::Struct(a) => {
+            ScalarValue::Struct(Arc::new(StructArray::from(retyped(a.as_ref())?)))
+        }
+        ScalarValue::Map(a) => ScalarValue::Map(Arc::new(MapArray::from(retyped(a.as_ref())?))),
+        other => other,
+    })
+}
+
+/// `decimal_arb_restamp(expr, template)` — `expr` unchanged, with the
+/// decimal_arb field metadata of `template`'s type stamped onto the matching
+/// `LargeBinary` leaves of its own type.
+///
+/// DataFusion's container constructors (`make_array`, `named_struct`, …) and
+/// accessors (`array_element`, …) rebuild their output field from bare data
+/// types, so a decimal_arb element loses its `(precision, scale)` and the JSON
+/// writer printed hex. This is a pure relabel: the caller must already have
+/// brought every element to the scale the template declares. `template` is a
+/// typed NULL literal whose data type carries the wanted metadata; only its
+/// type is read.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbRestampFunc {
+    signature: Signature,
+}
+
+impl Default for DecimalArbRestampFunc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecimalArbRestampFunc {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+
+    /// `actual` with metadata from `template` at every position where the
+    /// template's field is decimal_arb and the actual leaf is `LargeBinary`.
+    /// Names, nullability and layout come from `actual`; containers are paired
+    /// by position, so the template only has to match in shape.
+    fn merge(actual: &arrow_schema::Field, template: &arrow_schema::Field) -> arrow_schema::Field {
+        if DecimalArbType::is_decimal_arb_field(template)
+            && actual.data_type() == &DataType::LargeBinary
+        {
+            return arrow_schema::Field::new(
+                actual.name(),
+                DataType::LargeBinary,
+                actual.is_nullable(),
+            )
+            .with_metadata(template.metadata().clone());
+        }
+        let retype = |dt: DataType| {
+            arrow_schema::Field::new(actual.name(), dt, actual.is_nullable())
+                .with_metadata(actual.metadata().clone())
+        };
+        let child = |a: &FieldRef, t: &FieldRef| Arc::new(Self::merge(a, t));
+        match (actual.data_type(), template.data_type()) {
+            (DataType::Struct(ac), DataType::Struct(tc)) => retype(DataType::Struct(
+                ac.iter()
+                    .enumerate()
+                    .map(|(i, a)| match tc.get(i) {
+                        Some(t) => child(a, t),
+                        None => Arc::clone(a),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            )),
+            (
+                DataType::List(a),
+                DataType::List(t) | DataType::LargeList(t) | DataType::FixedSizeList(t, _),
+            ) => retype(DataType::List(child(a, t))),
+            (
+                DataType::LargeList(a),
+                DataType::List(t) | DataType::LargeList(t) | DataType::FixedSizeList(t, _),
+            ) => retype(DataType::LargeList(child(a, t))),
+            (
+                DataType::FixedSizeList(a, n),
+                DataType::List(t) | DataType::LargeList(t) | DataType::FixedSizeList(t, _),
+            ) => retype(DataType::FixedSizeList(child(a, t), *n)),
+            (DataType::Map(a, sorted), DataType::Map(t, _)) => {
+                retype(DataType::Map(child(a, t), *sorted))
+            }
+            _ => actual.clone(),
+        }
+    }
+}
+
+impl ScalarUDFImpl for DecimalArbRestampFunc {
+    fn name(&self) -> &str {
+        "decimal_arb_restamp"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        if arg_types.len() != 2 {
+            streamling_user_bail!(
+                "decimal_arb_restamp expects (value, template), got {} arguments",
+                arg_types.len()
+            );
+        }
+        Ok(arg_types.to_vec())
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let merged = Self::merge(args.arg_fields[0].as_ref(), args.arg_fields[1].as_ref());
+        Ok(Arc::new(merged.with_name(self.name())))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        use arrow::array::make_array;
+        if args.args.len() != 2 {
+            streamling_user_bail!("decimal_arb_restamp requires (value, template)");
+        }
+        let target = args.return_field.data_type().clone();
+        // Same buffers, new type: only field metadata differs, which the
+        // Arrow data layout does not encode.
+        let retype = |array: &ArrayRef| -> Result<ArrayRef> {
+            let data = array
+                .to_data()
+                .into_builder()
+                .data_type(target.clone())
+                .build()?;
+            Ok(make_array(data))
+        };
+        match &args.args[0] {
+            ColumnarValue::Array(array) => Ok(ColumnarValue::Array(retype(array)?)),
+            ColumnarValue::Scalar(scalar) => {
+                // `ScalarValue::try_from_array` rebuilds a container scalar
+                // with a fresh element field, dropping the metadata again, so
+                // the scalar's own one-row array is retyped afterwards.
+                let scalar = datafusion::scalar::ScalarValue::try_from_array(
+                    scalar.to_array()?.as_ref(),
+                    0,
+                )?;
+                Ok(ColumnarValue::Scalar(retype_scalar(scalar, &target)?))
+            }
         }
     }
 }

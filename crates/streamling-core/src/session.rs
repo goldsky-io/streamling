@@ -8,23 +8,34 @@ use datafusion::catalog::memory::MemorySchemaProvider;
 use datafusion::catalog::{SchemaProvider, Session, TableProvider};
 use datafusion::common::{config::ConfigExtension, extensions_options};
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::SessionStateDefaults;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{FunctionRegistry, SessionState, SessionStateBuilder};
 use datafusion::logical_expr::lit;
+use datafusion::logical_expr::planner::ExprPlanner;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
 use streamling_common::functions::decimal_arb_aggregates::{
-    DecimalArbAvgUdaf, DecimalArbExtremeUdaf, DecimalArbSumUdaf,
+    DecimalArbArrayAggUdaf, DecimalArbAvgUdaf, DecimalArbExtremeUdaf, DecimalArbSumUdaf,
 };
 use streamling_common::functions::decimal_arb_coercion::DecimalArbExprPlanner;
 use streamling_common::functions::decimal_arb_predicate_optimizer::DecimalArbExprRewrite;
+use streamling_common::functions::decimal_arb_scale_unify::DecimalArbScaleUnifyRule;
 use streamling_common::functions::decimal_arb_sort_optimizer::DecimalArbSortRewriteRule;
 use streamling_flink_compat::{register_json_functions, register_string_aliases};
 
 pub static DEFAULT_CATALOG_NAME: &str = "default";
 pub static DEFAULT_SCHEMA_NAME: &str = "default";
+
+/// Expression planners for a streamling session: the decimal_arb planner
+/// first, then DataFusion's defaults.
+fn decimal_arb_expr_planners() -> Vec<Arc<dyn ExprPlanner>> {
+    let mut planners: Vec<Arc<dyn ExprPlanner>> = vec![Arc::new(DecimalArbExprPlanner::new())];
+    planners.extend(SessionStateDefaults::default_expr_planners());
+    planners
+}
 
 /// SessionManager is a thin wrapper around a DataFusion SessionContext that provides
 /// catalog DDL methods and other functionality.
@@ -156,12 +167,22 @@ impl SessionManager {
             .with_config(config)
             .with_runtime_env(runtime)
             .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
+            // The decimal_arb ExprPlanner goes ahead of DataFusion's own so
+            // its array-literal hook is reached (planners are consulted in
+            // order and the first to plan wins); it also auto-binds native
+            // +/-/*/`/`%/=/!=/</<=/>/`>=` to the decimal_arb ScalarUDFs when
+            // an operand is decimal_arb (T007/T005 spikes confirmed the wiring).
+            .with_expr_planners(decimal_arb_expr_planners())
             .with_physical_optimizer_rules(StreamlingPhysicalOptimizerRules::rules())
             // T046: rewrite ORDER BY decimal_arb_col -> ORDER BY
             // decimal_arb_to_sort_key(...) so DataFusion's bytewise
             // sort over the canonical encoding produces correct
             // numeric ordering across signs (FR-005).
             .with_optimizer_rule(Arc::new(DecimalArbSortRewriteRule::new()))
+            // Bring decimal_arb columns to one scale where DataFusion matches
+            // rows on raw bytes: UNION branches and JOIN keys (incl. the
+            // semi/anti joins `IN (SELECT …)` decorrelates into).
+            .with_optimizer_rule(Arc::new(DecimalArbScaleUnifyRule::new()))
             .build();
 
         let mut ctx = SessionContext::new_with_state(state);
@@ -175,17 +196,15 @@ impl SessionManager {
         }
 
         // T047: register decimal_arb aggregate UDAFs (override built-in
-        // sum/min/max/avg for decimal_arb input columns) and the
-        // ExprPlanner (auto-bind native +/-/*/`/`%/=/!=/</<=/>/`>=` to
-        // decimal_arb_<op> ScalarUDFs when both operands are decimal_arb).
-        // The T007 spike confirmed register_udaf overrides the built-in
-        // for that name; the T005 spike confirmed register_expr_planner
-        // wires the planner into SQL frontend planning.
+        // sum/min/max/avg for decimal_arb input columns). The T007 spike
+        // confirmed register_udaf overrides the built-in for that name.
         ctx.register_udaf(DecimalArbSumUdaf::into_udaf());
         ctx.register_udaf(DecimalArbExtremeUdaf::min_udaf());
         ctx.register_udaf(DecimalArbExtremeUdaf::max_udaf());
         ctx.register_udaf(DecimalArbAvgUdaf::into_udaf());
-        ctx.register_expr_planner(Arc::new(DecimalArbExprPlanner::new()))?;
+        // array_agg keeps the built-in's collection but declares the element
+        // metadata, so the list is a list of decimals rather than of bytes.
+        ctx.register_udaf(DecimalArbArrayAggUdaf::into_udaf());
         // Rewrite `BETWEEN` / `IN` over decimal_arb into the decimal_arb
         // comparison UDFs (F1b). Registered as a FunctionRewrite so it runs in
         // the analyzer *before* TypeCoercion — which would otherwise fail to
