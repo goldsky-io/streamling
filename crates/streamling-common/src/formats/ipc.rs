@@ -4,6 +4,10 @@ use crate::formats::decimal_arb_text::{
 };
 use crate::formats::{FromArrowConverter, ToArrowConverter};
 use crate::streamling_err;
+use crate::types::decimal_arb_legacy::{
+    downgrade_legacy_wide_ints, field_contains_legacy_wide_int, upgrade_legacy_wide_int_batch,
+    upgrade_legacy_wide_int_field,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{Array, ArrayRef};
 use datafusion::arrow::ipc::{reader::FileReader, writer::FileWriter};
@@ -27,6 +31,13 @@ impl FromArrowToIpcConverter {
         // decimal_arb columns started arriving as opaque byte arrays. Convert
         // every decimal_arb leaf — nested ones too — back to canonical decimal
         // text; `convert_batch_to_original_schema` parses it on the way back.
+        //
+        // A companion plugin may still hand over the retired FixedSizeBinary(32)
+        // `streamling.u256` / `streamling.i256` columns. Scripts always saw those
+        // as decimal strings too, so upgrade them to decimal_arb first and let
+        // the same text bridge carry them.
+        let upgraded = upgrade_legacy_wide_int_batch(batch).map_err(DataFusionError::from)?;
+        let batch = upgraded.as_ref().unwrap_or(batch);
         let needs_transform = batch
             .schema()
             .fields()
@@ -321,9 +332,14 @@ impl FromIpcToArrowConverter {
     }
 
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // Feature 002: U256/I256 conversion no longer needed (those types
-        // are retired in favor of decimal_arb, which Arrow IPC carries
-        // natively).
+        // A script (or a Rust plugin) may return the retired FixedSizeBinary(32)
+        // `streamling.u256` / `streamling.i256` columns verbatim; as decimal_arb
+        // they take the value-checked restoration path below instead of being
+        // reinterpreted byte-for-byte.
+        let batch = match upgrade_legacy_wide_int_batch(&batch).map_err(DataFusionError::from)? {
+            Some(upgraded) => upgraded,
+            None => batch,
+        };
         let needs_conversion = batch.schema() != self.schema;
 
         if !needs_conversion {
@@ -371,6 +387,25 @@ impl FromIpcToArrowConverter {
                         &source_field,
                         source_col,
                     )?);
+                } else if field_contains_legacy_wide_int(target_field) {
+                    // The pipeline still declares the retired wire type (a script
+                    // with no output schema inherits its plugin input's). Restore
+                    // through the decimal_arb form it upgrades to — text parsed and
+                    // range-checked — then re-encode the legacy bytes.
+                    let upgraded_target = upgrade_legacy_wide_int_field(target_field)
+                        .map_err(DataFusionError::from)?
+                        .ok_or_else(|| {
+                            DataFusionError::from(streamling_err!(
+                                "field '{}' has a legacy wide-int leaf but no upgraded form",
+                                target_field.name(),
+                            ))
+                        })?;
+                    let restored =
+                        Self::restore_decimal_arb(&upgraded_target, &source_field, source_col)?;
+                    let downgraded = downgrade_legacy_wide_ints(target_field, &restored)
+                        .map_err(DataFusionError::from)?
+                        .unwrap_or(restored);
+                    new_columns.push(downgraded);
                 } else if source_field.data_type() == target_field.data_type() {
                     // Types match, use as-is
                     new_columns.push(source_col.clone());
@@ -655,5 +690,194 @@ mod tests {
         assert!(restored.is_null(1));
         let v2 = DecimalArbValue::from_canonical_bytes_at_scale(restored.value(2), 18).unwrap();
         assert_eq!(v2, DecimalArbValue::from_str("-99.5").unwrap());
+    }
+
+    /// A companion plugin still emits the retired `streamling.u256` /
+    /// `streamling.i256` columns (big-endian FixedSizeBinary(32)). Scripts
+    /// must keep seeing them as decimal strings, and a script whose output
+    /// schema inherits the legacy type must get the legacy bytes back —
+    /// value-checked, not reinterpreted.
+    #[test]
+    fn test_legacy_wide_int_columns_cross_the_script_boundary_as_decimal_text() {
+        use crate::types::decimal_arb_legacy::{
+            LEGACY_I256_EXTENSION_NAME, LEGACY_U256_EXTENSION_NAME,
+        };
+        use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
+        use datafusion::arrow::array::{
+            FixedSizeBinaryArray, Int32Array, StringArray, StructArray,
+        };
+        use datafusion::arrow::ipc::reader::FileReader;
+        use std::collections::HashMap;
+
+        let legacy = |name: &str, ext: &str| {
+            Field::new(name, DataType::FixedSizeBinary(32), true).with_metadata(HashMap::from([(
+                EXTENSION_TYPE_NAME_KEY.to_string(),
+                ext.to_string(),
+            )]))
+        };
+        let be32 = |v: i128| {
+            let mut b = if v < 0 { [0xff_u8; 32] } else { [0_u8; 32] };
+            b[16..].copy_from_slice(&v.to_be_bytes());
+            b
+        };
+        let mut two_248 = [0_u8; 32];
+        two_248[0] = 1;
+        let u_max = [0xff_u8; 32];
+
+        let amount = legacy("amount", LEGACY_U256_EXTENSION_NAME);
+        let delta = Arc::new(legacy("delta", LEGACY_I256_EXTENSION_NAME));
+        let nested = Field::new(
+            "nested",
+            DataType::Struct(vec![Arc::clone(&delta)].into()),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            amount,
+            nested,
+        ]));
+        let amounts: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(be32(1)), None, Some(two_248), Some(u_max)].into_iter(),
+                32,
+            )
+            .unwrap(),
+        );
+        let deltas: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(
+                [
+                    be32(-1),
+                    be32(0),
+                    be32(-170141183460469231731687303715884105728),
+                    be32(42),
+                ]
+                .iter()
+                .map(|b| b.as_slice()),
+            )
+            .unwrap(),
+        );
+        let nested_array: ArrayRef =
+            Arc::new(StructArray::new(vec![delta].into(), vec![deltas], None));
+        let original = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                amounts,
+                nested_array,
+            ],
+        )
+        .unwrap();
+
+        // Arrow -> IPC: what the script receives.
+        let ipc_bytes = FromArrowToIpcConverter::new()
+            .convert_from_batch(&original)
+            .unwrap()
+            .remove(0);
+        let wire = FileReader::try_new(Cursor::new(ipc_bytes.as_slice()), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire.schema().field(1).data_type(), &DataType::Utf8);
+        let amount_text = wire
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(amount_text.value(0), "1");
+        assert!(amount_text.is_null(1));
+        assert_eq!(
+            amount_text.value(2),
+            "452312848583266388373324160190187140051835877600158453279131187530910662656"
+        );
+        assert_eq!(
+            amount_text.value(3),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        let delta_text = wire
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(delta_text.value(0), "-1");
+        assert_eq!(delta_text.value(1), "0");
+        assert_eq!(
+            delta_text.value(2),
+            "-170141183460469231731687303715884105728"
+        );
+        assert_eq!(delta_text.value(3), "42");
+
+        // IPC -> Arrow under the inherited legacy schema: identical bytes.
+        let mut from_ipc = FromIpcToArrowConverter::new(schema.clone());
+        from_ipc.buffer(ipc_bytes);
+        let restored = from_ipc.convert_to_batch().unwrap();
+        assert_eq!(restored.schema(), schema);
+        assert_eq!(restored, original);
+
+        // A script that writes new values hands text back; it is parsed and
+        // range-checked against the legacy type, never copied as bytes.
+        let text_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Utf8, true),
+            Field::new(
+                "nested",
+                DataType::Struct(vec![Arc::new(Field::new("delta", DataType::Utf8, true))].into()),
+                true,
+            ),
+        ]));
+        let script_output = |amount: &str, delta: &str| {
+            let deltas: ArrayRef = Arc::new(StringArray::from(vec![delta]));
+            let nested: ArrayRef = Arc::new(StructArray::new(
+                vec![Arc::new(Field::new("delta", DataType::Utf8, true))].into(),
+                vec![deltas],
+                None,
+            ));
+            let batch = RecordBatch::try_new(
+                text_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![9])),
+                    Arc::new(StringArray::from(vec![amount])),
+                    nested,
+                ],
+            )
+            .unwrap();
+            FromArrowToIpcConverter::new()
+                .convert_from_batch(&batch)
+                .unwrap()
+                .remove(0)
+        };
+        let mut from_ipc = FromIpcToArrowConverter::new(schema.clone());
+        from_ipc.buffer(script_output("100", "-100"));
+        let restored = from_ipc.convert_to_batch().unwrap();
+        let amount = restored
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(amount.value(0), be32(100).as_slice());
+        let delta = restored
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(delta.value(0), be32(-100).as_slice());
+
+        for (amount, delta) in [("-1", "0"), ("1.5", "0"), ("abc", "0"), ("1", "1e80")] {
+            let mut from_ipc = FromIpcToArrowConverter::new(schema.clone());
+            from_ipc.buffer(script_output(amount, delta));
+            from_ipc
+                .convert_to_batch()
+                .expect_err("a value the legacy wire type cannot hold must fail loudly");
+        }
     }
 }

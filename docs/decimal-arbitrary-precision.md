@@ -33,7 +33,13 @@ FROM src
 WHERE amount > 0
 GROUP BY entity_id;
 
--- Build decimal_arb literals from text:
+-- Literals next to a decimal_arb column are exact, however wide or
+-- fractional: the SQL preprocessor quotes a bare numeric literal that
+-- DataFusion would otherwise plan as Float64, and the planner parses the
+-- digits. A quoted literal works the same way anywhere.
+SELECT * FROM src WHERE amount > 1000000000000000000000000 AND amount * 1.5 < '1e30';
+
+-- Build decimal_arb literals from text at an explicit (precision, scale):
 SELECT to_decimal_arb_from_string('1234567890.987654321098765432109876543210', 80, 30);
 
 -- Sort with explicit signed-correct key (auto-rewrite is a follow-up):

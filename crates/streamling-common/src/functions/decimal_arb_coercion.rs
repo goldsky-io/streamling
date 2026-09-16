@@ -33,15 +33,17 @@ use crate::functions::decimal_arb_ops::{
     DecimalArbAddFunc, DecimalArbDivFunc, DecimalArbEqFunc, DecimalArbGtFunc, DecimalArbGteFunc,
     DecimalArbLtFunc, DecimalArbLteFunc, DecimalArbModFunc, DecimalArbMulFunc, DecimalArbNeqFunc,
     DecimalArbSubFunc, ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func,
-    ToDecimalArbFromIntFunc,
+    ToDecimalArbFromIntFunc, ToDecimalArbFromStringFunc,
 };
-use crate::types::decimal_arb::DecimalArbType;
+use crate::functions::decimal_arb_predicate_optimizer::{exact_precision_scale, text_literal};
+use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue};
 use arrow_schema::DataType;
-use datafusion::common::{DFSchema, Result as DFResult};
+use datafusion::common::{DFSchema, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::sqlparser::ast::BinaryOperator;
 use datafusion::logical_expr::{Expr, ExprSchemable, ScalarUDF, lit};
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Precision used when coercing a 64-bit integer to decimal_arb at scale 0.
@@ -68,6 +70,7 @@ pub struct DecimalArbExprPlanner {
     cast_from_decimal128: Arc<ScalarUDF>,
     cast_from_decimal256: Arc<ScalarUDF>,
     cast_from_int: Arc<ScalarUDF>,
+    cast_from_string: Arc<ScalarUDF>,
     make_array: Arc<ScalarUDF>,
 }
 
@@ -94,6 +97,7 @@ impl DecimalArbExprPlanner {
             cast_from_decimal128: Arc::new(ScalarUDF::from(ToDecimalArbFromDecimal128Func::new())),
             cast_from_decimal256: Arc::new(ScalarUDF::from(ToDecimalArbFromDecimal256Func::new())),
             cast_from_int: Arc::new(ScalarUDF::from(ToDecimalArbFromIntFunc::new())),
+            cast_from_string: Arc::new(ScalarUDF::from(ToDecimalArbFromStringFunc::new())),
             make_array: Arc::new(DecimalArbBuiltinShim::wrap(
                 datafusion::functions_nested::make_array::make_array_udf(),
             )),
@@ -244,20 +248,39 @@ impl ExprPlanner for DecimalArbExprPlanner {
         } else {
             left_field.data_type()
         };
-        if !Self::is_coercible(narrow_dtype) {
+        let narrow_expr = if left_is_arb { &expr.right } else { &expr.left };
+        // A string literal carries its digits exactly (`amount * '1.5'`; the
+        // SQL preprocessor quotes a wide or fractional numeric literal for the
+        // same reason), so it joins the coercible set — parsed here, at its
+        // own exact `(precision, scale)`.
+        let text_literal = text_literal(narrow_expr).map(str::to_owned);
+        if !Self::is_coercible(narrow_dtype) && text_literal.is_none() {
             return Ok(PlannerResult::Original(expr));
         }
 
         let RawBinaryExpr { op: _, left, right } = expr;
+        let coerce = |operand: Expr| -> DFResult<Expr> {
+            if let Some(text) = &text_literal {
+                let value = DecimalArbValue::from_str(text).map_err(|e| {
+                    DataFusionError::Plan(format!(
+                        "decimal_arb: string literal '{text}' is not a decimal number: {e}"
+                    ))
+                })?;
+                let (p, s) = exact_precision_scale(&value);
+                return Ok(Expr::ScalarFunction(ScalarFunction {
+                    func: self.cast_from_string.clone(),
+                    args: vec![operand, lit(p as i64), lit(s as i64)],
+                }));
+            }
+            Ok(self
+                .coerce_to_decimal_arb(operand, narrow_dtype)
+                .expect("is_coercible checked narrow_dtype"))
+        };
         let (coerced_left, coerced_right) = if left_is_arb {
-            let coerced = self
-                .coerce_to_decimal_arb(right, narrow_dtype)
-                .expect("is_coercible checked narrow_dtype");
+            let coerced = coerce(right)?;
             (left, coerced)
         } else {
-            let coerced = self
-                .coerce_to_decimal_arb(left, narrow_dtype)
-                .expect("is_coercible checked narrow_dtype");
+            let coerced = coerce(left)?;
             (coerced, right)
         };
 

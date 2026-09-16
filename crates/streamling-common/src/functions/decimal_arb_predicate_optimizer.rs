@@ -105,7 +105,7 @@ fn is_null_literal(expr: &Expr) -> bool {
 }
 
 /// The text of a non-null string literal, if `expr` is one.
-fn text_literal(expr: &Expr) -> Option<&str> {
+pub(crate) fn text_literal(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _)
         | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _)
@@ -115,7 +115,7 @@ fn text_literal(expr: &Expr) -> Option<&str> {
 }
 
 /// The smallest `(precision, scale)` that holds `value` exactly.
-fn exact_precision_scale(value: &DecimalArbValue) -> (u32, u32) {
+pub(crate) fn exact_precision_scale(value: &DecimalArbValue) -> (u32, u32) {
     let scale = value.fractional_digit_count() as u32;
     let int_digits = value.integer_digit_count() as u32;
     ((int_digits + scale).max(1), scale)
