@@ -1,13 +1,12 @@
 //! ClickHouse decimal_arb e2e tests.
 //!
-//! Validates the pipeline-startup config-load wiring landed in T033/T064/T062:
-//! a Kafka source with an Avro `decimal(p>76, s>0)` field auto-promotes to
-//! `decimal_arb(p, s)`. Routing that column to ClickHouse must:
+//! Validates the pipeline-startup config-load wiring: a Kafka source with an
+//! Avro `decimal(p>76, s>0)` field auto-promotes to `decimal_arb(p, s)`.
+//! Routing that column to ClickHouse must:
 //!
-//! - **T055**: reject at config load if the sink has no `coerce_to: string`
-//!   directive (ClickHouse Decimal caps at 76 digits — FR-011 / FR-012).
-//! - **T056**: succeed with the directive, emitting the column as ClickHouse
-//!   `String` (FR-019 explicit opt-in).
+//! - reject at config load if the sink has no `coerce_to: string` directive
+//!   (ClickHouse Decimal caps at 76 digits);
+//! - succeed with the directive, emitting the column as ClickHouse `String`.
 
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
 
@@ -56,12 +55,12 @@ fn clickhouse_env(ctx: &TestContext) -> Vec<(String, String)> {
 }
 
 // ============================================================================
-// T055: ClickHouse rejects wide decimal_arb without coerce_to: string
+// ClickHouse rejects wide decimal_arb without coerce_to: string
 // ============================================================================
 
 /// A pipeline with a Kafka source carrying a `decimal_arb(100, 18)` column
 /// must fail at config load when routed to ClickHouse with no
-/// `coerce_to: string` directive (FR-011 / FR-012).
+/// `coerce_to: string` directive.
 #[tokio::test]
 async fn test_clickhouse_rejects_wide_decimal_arb_at_config_load() {
     init_tracing();
@@ -128,16 +127,16 @@ sinks:
     );
     assert!(
         combined.contains("coerce_to: string"),
-        "error suggests the FR-019 opt-in: {}",
+        "error suggests the coerce_to opt-in: {}",
         combined
     );
 }
 
 // ============================================================================
-// T056: ClickHouse accepts wide decimal_arb with coerce_to: string
+// ClickHouse accepts wide decimal_arb with coerce_to: string
 // ============================================================================
 
-/// The same pipeline as T055, but with `coerce_to: string` on the wide
+/// The same pipeline as the rejection test, but with `coerce_to: string` on the wide
 /// decimal_arb column. CREATE TABLE should emit `String`, the pipeline
 /// runs successfully, and the column carries canonical decimal text.
 #[tokio::test]
@@ -185,7 +184,7 @@ sinks:
     for (k, v) in clickhouse_env(&ctx) {
         opts = opts.env(&k, &v);
     }
-    // FR-019 opt-in via JSON-encoded column directive list (the env-var
+    // Opt-in via JSON-encoded column directive list (the env-var
     // shape — see `deserialize_optional_column_directives`).
     opts = opts.env(
         "STREAMLING__CLICKHOUSE_SINK__COLUMNS",

@@ -1,11 +1,9 @@
 //! Aggregate UDFs for the `streamling.decimal_arb` extension type.
 //!
-//! See `contracts/aggregate-udf-signatures.md` (`data-model.md` E6) for the
-//! signatures and widening rules. Each UDAF is registered with the
-//! standard SQL aggregate name (`sum`, `min`, `max`, `avg`) — the T007
-//! spike confirmed that `register_udaf` with a built-in name overrides
-//! the DataFusion default, so authors get the spec's "no transform
-//! rewrites" property (FR-007 / FR-020 / SC-006) directly.
+//! Each UDAF is registered with the standard SQL aggregate name (`sum`,
+//! `min`, `max`, `avg`): `register_udaf` with a built-in name overrides the
+//! DataFusion default, so `sum(decimal_arb_col)` aggregates losslessly with
+//! no transform or rewrite needed at the call site.
 //!
 //! `count` reuses the DataFusion built-in unchanged — it's `Any`-typed and
 //! returns `Int64` for any input.
@@ -40,9 +38,9 @@ fn input_is_decimal_arb(args: &AccumulatorArgs) -> Result<bool> {
     Ok(DecimalArbType::precision_scale_from_field(&field).is_some())
 }
 
-/// Spec rule (E6): SUM widens precision by 16 digits and preserves scale.
-/// 16 extra digits supports up to ~10^16 rows in the worst case before
-/// hitting MAX_PRECISION; further widening gates on FR-013 overflow.
+/// SUM widens precision by 16 digits and preserves scale. 16 extra digits
+/// supports up to ~10^16 rows in the worst case before hitting
+/// MAX_PRECISION; beyond that, accumulation raises an overflow error.
 const SUM_PRECISION_HEADROOM: u32 = 16;
 
 fn sum_output_precision_scale(p: u32, s: u32) -> (u32, u32) {

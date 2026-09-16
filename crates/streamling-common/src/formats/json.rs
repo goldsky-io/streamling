@@ -4,8 +4,7 @@ use crate::formats::decimal_arb_text::{
 };
 use crate::formats::{FromArrowConverter, ToArrowConverter};
 use crate::types::decimal_arb_legacy::upgrade_legacy_wide_int_batch;
-// Feature 002 (Retire U256/I256): U256/I256 imports removed — wide
-// integers flow through decimal_arb only.
+// U256/I256 are retired — wide integers flow through decimal_arb only.
 use arrow_json::reader::Decoder;
 use arrow_json::writer::JsonFormat;
 use arrow_json::{ReaderBuilder, WriterBuilder};
@@ -110,8 +109,8 @@ impl JsonToArrowConverter {
     /// `single_row_mode` - if true, each JSON string represents a single row, otherwise a JSON array of objects is expected
     /// `field_to_extract` - if set, the field to extract from the JSON object. This allows to "unwrap" a JSON object, e.g. an envelope
     pub fn new(schema: SchemaRef, single_row_mode: bool, field_to_extract: Option<String>) -> Self {
-        // Feature 002: only decimal_arb fields need Utf8 transformation for
-        // JSON decoding now — U256/I256 are retired. The rewrite is recursive:
+        // Only decimal_arb fields need Utf8 transformation for JSON
+        // decoding — U256/I256 are retired. The rewrite is recursive:
         // a decimal_arb nested in a struct/list/map needs it just as much as a
         // top-level one (see `decimal_arb_leaves_as_utf8`).
         let needs_transform = schema
@@ -150,8 +149,8 @@ impl JsonToArrowConverter {
     }
 
     /// Convert a decoded batch back to the original schema, converting Utf8
-    /// fields back to decimal_arb where applicable. (Feature 002 retired
-    /// U256/I256 — those conversions are gone.)
+    /// fields back to decimal_arb where applicable. (U256/I256 are retired —
+    /// those conversions are gone.)
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let needs_transform = self
             .schema
@@ -419,7 +418,7 @@ mod tests {
         assert_from_json_to_arrow_conversion(batch);
     }
 
-    // ------- decimal_arb JSON round-trip (T030 / T019) -------
+    // ------- decimal_arb JSON round-trip -------
 
     #[test]
     fn test_from_arrow_to_json_with_decimal_arb() {
@@ -594,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_json_to_arrow_decimal_arb_rejects_value_exceeding_declared_precision() {
-        // (precision, scale) = (5, 0); a 6-digit value must surface FR-013 error.
+        // (precision, scale) = (5, 0); a 6-digit value must be rejected.
         let field = DecimalArbType::field("x", 5, 0, true).unwrap();
         let schema = Arc::new(Schema::new(vec![field]));
         let mut converter = JsonToArrowConverter::new(schema, true, None);

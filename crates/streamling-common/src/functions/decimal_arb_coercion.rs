@@ -2,9 +2,8 @@
 //! `%`, `=`, `!=`, `<`, `<=`, `>`, `>=`) to the `decimal_arb` ScalarUDFs
 //! when at least one operand is a `streamling.decimal_arb` column.
 //!
-//! See `specs/001-decimal-arbitrary-precision/research.md` (R3) for the API
-//! choice — confirmed by the T005 spike. Once the planner is registered
-//! via `SessionContext::register_expr_planner`, an author can write:
+//! Once the planner is registered via
+//! `SessionContext::register_expr_planner`, an author can write:
 //!
 //! ```text
 //! SELECT a + b FROM src;
@@ -15,7 +14,7 @@
 //! call. The fallback (`PlannerResult::Original`) lets DataFusion handle
 //! everything else unchanged.
 //!
-//! Mixed-operand handling (FR-016, data-model.md E5):
+//! Mixed-operand handling:
 //! - `decimal_arb × Decimal128(p, s)` and `decimal_arb × Decimal256(p, s)`:
 //!   the planner inserts a `to_decimal_arb_from_decimal128/256` cast on the
 //!   narrow side and dispatches to the matching `decimal_arb_<op>` UDF.
@@ -23,8 +22,8 @@
 //!   `WHERE amount > 0`, `BETWEEN 0 AND 100`): the planner inserts a
 //!   `to_decimal_arb_from_int` cast (at scale 0) on the integer side and
 //!   dispatches to the matching `decimal_arb_<op>` UDF. Without this, DataFusion
-//!   cannot coerce `LargeBinary` vs `Int64` and planning fails (was F1).
-//! - `decimal_arb × Float*`: per FR-013 / E5 floats are rejected — float ↔
+//!   cannot coerce `LargeBinary` vs `Int64` and planning fails.
+//! - `decimal_arb × Float*`: floats are rejected — float ↔
 //!   decimal is lossy and requires an explicit cast at the call site.
 //!   The expression is left as-is.
 
@@ -457,7 +456,7 @@ mod tests {
         assert_eq!(int_arr.value(2), 33);
     }
 
-    // ---------- Mixed-operand coercion (FR-016) ----------
+    // ---------- Mixed-operand coercion ----------
 
     /// Build a session that exposes:
     /// - `t.a` : decimal_arb(30, 4) with values {12.5, 100, -3}
@@ -525,7 +524,7 @@ mod tests {
         let batch = &batches[0];
 
         // After coercion, both operands are decimal_arb. The decimal_arb_add
-        // output type is widened per E5 add rule; the field carries the
+        // output type is widened per the add rule; the field carries the
         // decimal_arb extension metadata. Verify by decoding at scale 4.
         let out_field = batch.schema().field(0).clone();
         assert!(

@@ -6,16 +6,12 @@ user-declared and not bounded by the 76-digit ceiling of Arrow's
 `NUMERIC(76, *)` can hold — for example, very large token balances,
 long-window accumulators, or any Postgres `NUMERIC(p, s)` with `p > 76`.
 
-The type is **opt-in by precision**: declare `precision > 76` on a
-column anywhere — at the source, in YAML, in a CAST — and streamling
-auto-promotes it to `decimal_arb`. Columns at or below 76 keep using
-`Decimal128`/`Decimal256` exactly as they do today; nothing about
-existing pipelines changes.
-
-> **Spec, plan, and contracts** live under
-> [`specs/001-decimal-arbitrary-precision/`](../specs/001-decimal-arbitrary-precision/),
-> with worked examples in
-> [`quickstart.md`](../specs/001-decimal-arbitrary-precision/quickstart.md).
+The type is **opt-in by precision**: where a column is declared with
+`precision > 76` — a Postgres `NUMERIC(p, s)` column, an Avro
+`decimal(p, s)` logical type, or a `CAST(… AS DECIMAL(p, s))` in a SQL
+transform — streamling auto-promotes it to `decimal_arb`. Columns at or
+below 76 keep using `Decimal128`/`Decimal256` exactly as they do today;
+nothing about existing pipelines changes.
 
 ## What you can write today
 
@@ -42,8 +38,11 @@ SELECT * FROM src WHERE amount > 1000000000000000000000000 AND amount * 1.5 < '1
 -- Build decimal_arb literals from text at an explicit (precision, scale):
 SELECT to_decimal_arb_from_string('1234567890.987654321098765432109876543210', 80, 30);
 
--- Sort with explicit signed-correct key (auto-rewrite is a follow-up):
-SELECT * FROM src ORDER BY decimal_arb_to_sort_key(amount);
+-- ORDER BY is sign-correct automatically (an optimizer rule rewrites it
+-- to an order-preserving key; canonical bytes alone would sort every
+-- negative above every positive). The key function is also callable
+-- directly if you need it in an expression:
+SELECT * FROM src ORDER BY amount;
 ```
 
 The native `+`/`-`/`*`/`/`/`%`/`=`/`!=`/`<`/`<=`/`>`/`>=` surface is
@@ -58,9 +57,10 @@ Where the column's declared precision lives drives the routing:
 
 | Source of declaration               | What happens for `precision > 76`                                    |
 |-------------------------------------|----------------------------------------------------------------------|
-| Postgres `NUMERIC(p, s)` (sink-side type override) | Auto-promoted to `decimal_arb` (FR-018 — fixes a prior mis-mapping bug). For `NUMERIC(78, 0)` specifically, the `u256` native-int hint is set so a downstream ClickHouse sink can emit `UInt256` storage. |
-| Avro `decimal(p, s)` logical type   | Auto-promoted. `decimal(p, 0)` with `p` in `77..=78` gets the `u256` hint (matching the pre-feature-002 routing — there is no native Avro convention for signed vs. unsigned wide decimals). Signed `Int256` round-trip from Avro requires a future YAML opt-in. |
-| Kafka JSON digit-string             | Uses YAML schema's declared `precision`; auto-promoted.              |
+| Postgres `NUMERIC(p, s)`            | Auto-promoted to `decimal_arb`. For `NUMERIC(78, 0)` specifically, the `u256` native-int hint is set so a downstream ClickHouse sink can emit `UInt256` storage. |
+| Avro `decimal(p, s)` logical type   | Auto-promoted. `decimal(p, 0)` with `p` in `77..=78` gets the `u256` hint (there is no native Avro convention for signed vs. unsigned wide decimals). Signed `Int256` round-trip from Avro requires a future opt-in. |
+| `CAST(… AS DECIMAL(p, s))` in SQL   | Auto-promoted for `p > 76`; `TRY_CAST` yields NULL for a value that does not convert. |
+| Kafka JSON, via a source `schema:` map | **Not** auto-promoted — see "Known limitations". Declare the column as `string` and convert in SQL. |
 | Arrow IPC                           | Round-trips natively via the extension-type metadata (including the `native_int_kind` hint). |
 
 `precision <= 76` keeps using the existing `Decimal128(p, s)` (≤38) or
@@ -71,8 +71,8 @@ Where the column's declared precision lives drives the routing:
 If you've worked with blockchain data, you've seen 256-bit unsigned
 (`uint256`) and signed (`int256`) integers — gas, balances, token
 amounts. There used to be dedicated `u256` / `i256` extension types
-for these; those were **retired in favor of `decimal_arb`** (feature
-002). What changed for you as a pipeline author:
+for these; those were **retired in favor of `decimal_arb`**. What
+changed for you as a pipeline author:
 
 - **Nothing in your YAML or your SQL.** An Avro `decimal(78, 0)`
   source column still works the same way. A Postgres `NUMERIC(78, 0)`
@@ -103,9 +103,9 @@ for these; those were **retired in favor of `decimal_arb`** (feature
 |-------------------------------------|--------------------------------------|---------------------------------------|
 | Postgres source / sink              | `NUMERIC(p, s)` up to 1000 digits    | Native                                |
 | Kafka JSON                          | digit-string                         | Native                                |
-| Kafka Avro                          | `decimal(p, s)` if declared bytes fit | `Reject` (or `OptInOnly` in future)   |
+| Kafka Avro                          | `decimal(p, s)` if declared bytes fit | `Reject` unless `coerce_to: string`   |
 | Kafka Protobuf                      | (no native decimal)                  | `Reject` until `coerce_to: string`    |
-| ClickHouse / Hybrid                 | `Decimal(p, s)` up to 76 digits; `UInt256`/`Int256` for hinted `(≤78, 0)` decimal_arb | Hard reject without `coerce_to: string` (silent String fallback retired in feature 001 / 002) |
+| ClickHouse / Hybrid                 | `Decimal(p, s)` up to 76 digits; `UInt256`/`Int256` for hinted `(≤78, 0)` decimal_arb | Hard reject without `coerce_to: string` (the silent String fallback was retired) |
 | SQS / webhook (JSON)                | digit-string                         | Native                                |
 | Plugins                             | per plugin                           | `Reject` unless plugin advertises    |
 
@@ -119,8 +119,7 @@ error naming the offending column and connector.
 
 ## Known limitations
 
-After features 001 and 002 landed, most of the earlier limitations
-shipped. What remains:
+What is not supported today:
 
 - **ClickHouse-source-side native-int annotation** — when a pipeline
   reads from a ClickHouse `UInt256` / `Int256` source column, the
@@ -129,9 +128,18 @@ shipped. What remains:
   doesn't tell us the underlying ClickHouse type). The hint is set
   for Avro and Postgres sources. Adding ClickHouse-source-side
   annotation is straightforward — a `system.columns` lookup after
-  the schema probe — but is out of scope for feature 002. Workaround:
+  the schema probe — but is not implemented. Workaround:
   pair ClickHouse `UInt256` sources with a Kafka/Postgres source
   if you need the hint to propagate to a downstream ClickHouse sink.
+- **A source `schema:` map cannot declare a `decimal_arb` column** —
+  a Kafka JSON source's `schema:` block maps a column name to an Arrow
+  type string, and that grammar only produces `Decimal128(p, s)` or
+  `Decimal256(p, s)`; there is no `decimal_arb` spelling, and a
+  declared precision above the Arrow maximum (38 for `Decimal128`, 76
+  for `Decimal256`) is not rejected at config load. Declare such a
+  column as `string` and convert it in the SQL transform with
+  `to_decimal_arb_from_string(col, p, s)` — that path is exact and
+  validated per value.
 - **In-pipeline SQL aggregates require `postgres_aggregate` sink** —
   streamling's streaming SQL transforms reject bare `Aggregate` /
   `WindowAggr` plan nodes (this is a general streamling constraint,
@@ -162,10 +170,10 @@ shipped. What remains:
         balance: "Decimal(78, 0)"
   ```
 
-## Migration runbook (feature 002 — for operators)
+## Migration runbook (for operators)
 
-If you're upgrading a pipeline from a pre-feature-002 streamling, the
-type identity for wide-integer columns changes from `u256`/`i256` to
+If you're upgrading a pipeline from a streamling that still had the
+`u256` / `i256` types, the type identity for wide-integer columns changes from `u256`/`i256` to
 `decimal_arb(p, 0) + native_int_kind=u256/i256`. The wire formats are
 unchanged (Avro decimal bytes, Postgres NUMERIC, ClickHouse
 UInt256/Int256), so your tables and your Kafka topics don't need any
@@ -180,9 +188,8 @@ bytes / NUMERIC text / UInt256 bytes haven't changed), and the new
 code routes those records through `decimal_arb` instead of `u256` /
 `i256`. The downstream sink emits the same wire bytes either way.
 
-If you're keeping a deploy-time rollback option in case feature 002
-surprises you in production, the rollback is also clean — pre-002 and
-post-002 streamling read the same checkpoints because checkpoints
+If you're keeping a deploy-time rollback option, the rollback is also
+clean — both versions read the same checkpoints, because checkpoints
 only carry offsets.
 
 ### What's *not* breaking
@@ -198,8 +205,8 @@ only carry offsets.
 
 ## Performance
 
-Per the spec's Assumptions: arithmetic on `decimal_arb` values pays an
-inherent cost proportional to the declared precision. Expect:
+Arithmetic on `decimal_arb` values pays an inherent cost proportional
+to the declared precision. Expect:
 
 - For values that would have fit `Decimal128` or `Decimal256`, prefer
   declaring the smaller types — they take a fast Arrow primitive path.
@@ -207,26 +214,4 @@ inherent cost proportional to the declared precision. Expect:
   precision 100–200 and typical pipeline volumes this is fast enough
   that it's rarely the bottleneck; for thousands of digits it can
   dominate. Profile before assuming.
-- Pipelines that don't reference `decimal_arb` at all are unchanged
-  (SC-003).
-
-## Implementation entry points
-
-For deeper reading:
-
-- [`spec.md`](../specs/001-decimal-arbitrary-precision/spec.md) — the
-  user-visible requirements (FR-001 through FR-020).
-- [`plan.md`](../specs/001-decimal-arbitrary-precision/plan.md) — the
-  technical approach (Arrow extension type + UDFs + ExprPlanner).
-- [`research.md`](../specs/001-decimal-arbitrary-precision/research.md)
-  — Decision/Rationale/Alternatives for each technical choice.
-- [`data-model.md`](../specs/001-decimal-arbitrary-precision/data-model.md)
-  — `DecimalArbType`, `DecimalArbValue`, the capability matrix.
-- [`contracts/`](../specs/001-decimal-arbitrary-precision/contracts/)
-  — wire format, UDF/UDAF signatures, connector capability surface,
-  YAML schema additions.
-- [`quickstart.md`](../specs/001-decimal-arbitrary-precision/quickstart.md)
-  — three runnable end-to-end pipelines.
-- [`tasks.md`](../specs/001-decimal-arbitrary-precision/tasks.md) —
-  the per-task implementation status, including everything still
-  marked `[-]` deferred with acceptance criteria.
+- Pipelines that don't reference `decimal_arb` at all are unchanged.

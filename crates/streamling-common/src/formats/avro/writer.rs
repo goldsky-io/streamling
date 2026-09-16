@@ -70,7 +70,7 @@ pub fn to_avro(name: &str, fields: &Fields) -> Schema {
 
 fn field_to_avro(name: &str, field: &Field) -> serde_json::value::Value {
     let next_name = format!("{}_{}", name, &field.name());
-    // T060: decimal_arb fields are LargeBinary at the DataType level but
+    // decimal_arb fields are LargeBinary at the DataType level but
     // carry extension metadata that promotes them to Avro's `decimal`
     // logical type with the user-declared (precision, scale). Detect and
     // route here before falling through to the generic LargeBinary →
@@ -226,10 +226,9 @@ fn sanitize_field(s: &str) -> String {
     re.replace_all(s, "_").replace('.', "__")
 }
 
-/// Convert canonical decimal_arb bytes (`[sign][big-endian unsigned magnitude]`,
-/// per `contracts/arrow-extension-type.md` §3) into Avro's signed two's-complement
-/// big-endian representation of the unscaled integer (`value × 10^scale`),
-/// which the Avro `decimal` logical type expects under §9.
+/// Convert canonical decimal_arb bytes (`[sign][big-endian unsigned magnitude]`)
+/// into Avro's signed two's-complement big-endian representation of the unscaled
+/// integer (`value × 10^scale`), which the Avro `decimal` logical type expects.
 ///
 /// Canonical bytes already store the value at the column's declared scale,
 /// so the BigInt decoded here is exactly the unscaled magnitude that Avro
@@ -262,8 +261,8 @@ fn serialize_column<T: SerializeTarget>(
     nullable: bool,
     field: Option<&Field>,
 ) {
-    // T060: decimal_arb columns store canonical bytes in a LargeBinary
-    // array but must surface as Avro's `decimal` logical type (§9). We
+    // decimal_arb columns store canonical bytes in a LargeBinary
+    // array but must surface as Avro's `decimal` logical type. We
     // detect via the field's extension metadata before falling through
     // to the generic LargeBinary → Bytes mapping below.
     if let Some(f) = field
@@ -1321,7 +1320,7 @@ mod tests {
         );
     }
 
-    // ------- T060: decimal_arb Avro schema generation -------
+    // ------- decimal_arb Avro schema generation -------
 
     #[test]
     fn decimal_arb_field_emits_avro_decimal_logical_type() {
@@ -1375,7 +1374,7 @@ mod tests {
         assert_eq!(nested_type.get("type").unwrap(), "bytes");
     }
 
-    // ------- T060: decimal_arb Avro value serialization -------
+    // ------- decimal_arb Avro value serialization -------
 
     use std::str::FromStr;
 
@@ -1383,8 +1382,7 @@ mod tests {
     /// decimal_arb byte payload at `scale`. Mirrors
     /// `arrow_array_reader::resolve_decimal_arb_canonical_bytes` so these
     /// writer tests stay self-contained while still exercising the
-    /// symmetric encoder/decoder contract from
-    /// `contracts/arrow-extension-type.md` §3 + §9.
+    /// symmetric encoder/decoder contract.
     fn avro_decimal_value_to_canonical_bytes(v: &Value, scale: u32) -> Vec<u8> {
         use crate::types::decimal_arb::DecimalArbValue;
         let inner = if let Value::Union(_, b) = v { b } else { v };

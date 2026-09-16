@@ -679,7 +679,7 @@ sinks:
     );
 }
 
-// boolean-predicate regression test removed in feature 002: the bug class
+// boolean-predicate regression test removed with the u256/i256 retirement: the bug class
 // (bigint SQL preprocessor wrapping non-u256 operands with `to_u256()` on
 // boolean / comparison expressions) is structurally impossible after the
 // BigIntKind machinery and the `to_u256` / `to_i256` UDFs were deleted.

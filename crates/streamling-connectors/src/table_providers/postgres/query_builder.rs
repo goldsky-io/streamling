@@ -503,7 +503,7 @@ mod tests {
         assert_eq!(cast_map.get("id"), Some(&None));
     }
 
-    // Feature 002 (Retire U256/I256): U256/I256 cast_map test deleted with
+    // The U256/I256 cast_map test was deleted with
     // the retired types. Wide-int columns now route via decimal_arb +
     // native_int_kind; the cast_map for decimal_arb is covered by
     // test_build_cast_map_decimal256 (the decimal_arb branch is identical).

@@ -1,6 +1,6 @@
 //! Bridge for the retired `streamling.u256` / `streamling.i256` wire types.
 //!
-//! Feature 002 replaced the fixed-width `FixedSizeBinary(32)` integer types
+//! Streamling replaced the fixed-width `FixedSizeBinary(32)` integer types
 //! with `decimal_arb`, but the companion plugins still produce them: 32
 //! big-endian bytes, two's complement for the signed variant. Everything that
 //! understood those bytes was removed together with the types, so a legacy

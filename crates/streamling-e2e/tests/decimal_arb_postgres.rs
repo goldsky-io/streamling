@@ -5,11 +5,10 @@
 //! precision in the supported range natively, so no `coerce_to: string`
 //! directive is required.
 //!
-//! - **T022** (Kafka Avro ingest): Avro `decimal(100, 18)` is auto-promoted
-//!   to `decimal_arb(100, 18)` (FR-015) and decoded losslessly.
-//! - **T054** (Postgres sink): `decimal_arb(100, 18)` writes into Postgres
-//!   `NUMERIC(100, 18)` byte-for-byte, completing quickstart Example 2 in
-//!   one round-trip.
+//! - Kafka Avro ingest: Avro `decimal(100, 18)` is auto-promoted to
+//!   `decimal_arb(100, 18)` and decoded losslessly.
+//! - Postgres sink: `decimal_arb(100, 18)` writes into Postgres
+//!   `NUMERIC(100, 18)` byte-for-byte.
 
 use serde::Deserialize;
 use sqlx::FromRow;
@@ -48,7 +47,7 @@ fn base_opts() -> PipelineOpts {
         .env("STREAMLING__PLUGIN__SIDE_OUTPUT_IDS", "")
 }
 
-/// T022 + T054: Kafka Avro decimal(100, 18) → Postgres NUMERIC(100, 18).
+/// Kafka Avro decimal(100, 18) → Postgres NUMERIC(100, 18).
 /// Round-trip preserves the unscaled BigInt byte-for-byte.
 #[tokio::test]
 async fn test_kafka_avro_decimal_arb_to_postgres_numeric() {

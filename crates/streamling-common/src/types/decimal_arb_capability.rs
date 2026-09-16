@@ -1,9 +1,5 @@
 //! Connector capability matrix for the `streamling.decimal_arb` extension type.
 //!
-//! Implements the design from
-//! `specs/001-decimal-arbitrary-precision/contracts/connector-capability.md`
-//! (data-model.md E4 — `ConnectorCapabilityMatrix`).
-//!
 //! At pipeline configuration load, the validator must decide for each
 //! `(decimal_arb column, connector)` pair whether the connector can carry
 //! the column. There are three outcomes:
@@ -17,11 +13,10 @@
 //!   is rejected at config load with an error that names the column,
 //!   connector, declared `(precision, scale)`, and an actionable hint.
 //!
-//! This module provides the per-connector decision logic. The pipeline-
-//! startup wiring (walking the configured pipeline DAG, extracting the
-//! `(column, connector)` pairs, and consulting this module) is **T033** in
-//! the spec's task list — that piece needs the pipeline-build infrastructure
-//! and is left as a follow-up.
+//! This module provides the per-connector decision logic, plus
+//! `validate_pipeline_decimal_arb`, which walks a connector's schema
+//! (including nested leaves) and applies that logic to every decimal_arb
+//! column it finds.
 
 use crate::streamling_user_err;
 use crate::types::decimal_arb::DecimalArbType;
@@ -61,7 +56,7 @@ pub enum ConnectorKind {
     SqsJson,
     /// Plugin-provided connector. The capability is whatever the plugin
     /// advertises; this module returns Reject by default for plugins that
-    /// don't override (FR-019: opt-in must be explicit).
+    /// don't override — the opt-in must be explicit.
     Plugin,
 }
 
@@ -80,8 +75,8 @@ impl fmt::Display for ConnectorKind {
     }
 }
 
-/// Per-column user opt-in directive. Today only `string` exists;
-/// `contracts/yaml-schema.md` reserves the surface for future variants.
+/// Per-column user opt-in directive. Today only `string` exists; the enum
+/// reserves the surface for future variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoercionDirective {
     /// `coerce_to: string` — emit the column as a string field on the
@@ -141,8 +136,8 @@ pub fn avro_bytes_required(precision: u32) -> u32 {
 /// Decide whether a sink (`kind`) can carry a `decimal_arb` column with
 /// declared `(precision, scale)`, given the user's `coerce_to_string`
 /// opt-in (`true` if `coerce_to: string` is set on the sink column) and an
-/// optional `native_int_kind` origin hint (feature 002 — set when the
-/// column originated as a fixed-width native integer like ClickHouse
+/// optional `native_int_kind` origin hint (set when the column
+/// originated as a fixed-width native integer like ClickHouse
 /// `UInt256` / `Int256`).
 ///
 /// The same decision applies on the source side: a source advertises this
@@ -170,7 +165,7 @@ pub fn capability_for_decimal_arb(
             }
         }
         ConnectorKind::ClickHouse | ConnectorKind::Hybrid => {
-            // Feature 002: a native_int_kind hint at (≤78, 0) routes the
+            // A native_int_kind hint at (≤78, 0) routes the
             // column through ClickHouse's first-class fixed-width
             // UInt256 / Int256 types — Native without coerce_to: string.
             // Preserves storage compactness for existing wide-int tables.
@@ -683,7 +678,7 @@ mod tests {
         assert!(msg.contains("capped at 76"));
     }
 
-    // ---- T033 / T064: pipeline-startup validator ----
+    // ---- pipeline-startup validator ----
 
     use crate::types::decimal_arb::DecimalArbType;
     use arrow_schema::{DataType, Field, Schema};
@@ -783,7 +778,7 @@ mod tests {
         assert!(!msg.contains("`amount`"));
     }
 
-    // ------- T006: native_int_kind hint affects ClickHouse / Hybrid matrix -------
+    // ------- native_int_kind hint affects ClickHouse / Hybrid matrix -------
 
     #[test]
     fn clickhouse_native_for_decimal_arb_78_0_with_u256_hint() {
@@ -849,7 +844,7 @@ mod tests {
     #[test]
     fn clickhouse_existing_coerce_to_path_unaffected_by_absent_hint() {
         // No hint, p > 76, coerce_to=string: still OptInOnly. Regression
-        // guard for feature 001 behavior.
+        // guard for the pre-hint behavior.
         let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, true, None);
         assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
     }

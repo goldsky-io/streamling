@@ -1,6 +1,6 @@
 //! ClickHouse UInt256 / Int256 round-trip e2e tests.
 //!
-//! After feature 002, an Avro `decimal(p, 0)` source field with `p > 76`
+//! An Avro `decimal(p, 0)` source field with `p > 76`
 //! auto-promotes to `decimal_arb(p, 0) + native_int_kind=u256/i256`. The
 //! ClickHouse sink consumes the hint and:
 //!   1. CREATE TABLE emits `UInt256` / `Int256` for the column.
