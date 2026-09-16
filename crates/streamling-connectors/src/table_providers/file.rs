@@ -76,7 +76,15 @@ use streamling_state::{StateKey, StateOperatorBackend};
 /// bounded and continuous builders.
 fn file_format_for(format: FileSourceFormat) -> Arc<dyn FileFormat> {
     match format {
-        FileSourceFormat::Parquet => Arc::new(ParquetFormat::default()),
+        // Keep Arrow field metadata (the decimal_arb extension keys) and the
+        // plain Utf8/Binary types the files were written with. The defaults
+        // dropped the metadata, so decimal_arb columns came back as bare
+        // LargeBinary and every consumer read them as opaque bytes.
+        FileSourceFormat::Parquet => Arc::new(
+            ParquetFormat::default()
+                .with_skip_metadata(false)
+                .with_force_view_types(false),
+        ),
         FileSourceFormat::Csv => Arc::new(CsvFormat::default()),
         FileSourceFormat::Json => Arc::new(JsonFormat::default()),
         FileSourceFormat::Avro => Arc::new(AvroFormat),

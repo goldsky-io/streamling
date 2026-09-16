@@ -1,0 +1,851 @@
+//! Connector capability matrix for the `streamling.decimal_arb` extension type.
+//!
+//! At pipeline configuration load, the validator must decide for each
+//! `(decimal_arb column, connector)` pair whether the connector can carry
+//! the column. There are three outcomes:
+//!
+//! - `Native` — the underlying store / wire encoding handles the declared
+//!   `(precision, scale)` losslessly.
+//! - `OptInOnly(directive)` — the connector cannot natively hold the column
+//!   but the user has explicitly opted in to a coercion (e.g.
+//!   `coerce_to: string`). Carries the directive the connector will apply.
+//! - `Reject(reason)` — the connector cannot carry the column. The pipeline
+//!   is rejected at config load with an error that names the column,
+//!   connector, declared `(precision, scale)`, and an actionable hint.
+//!
+//! This module provides the per-connector decision logic, plus
+//! `validate_pipeline_decimal_arb`, which walks a connector's schema
+//! (including nested leaves) and applies that logic to every decimal_arb
+//! column it finds.
+
+use crate::streamling_user_err;
+use crate::types::decimal_arb::DecimalArbType;
+use arrow_schema::Schema;
+use std::fmt;
+
+/// Identifies the connector kind being evaluated. Matches the YAML `type:`
+/// value on a sink/source. Variants correspond to the connectors that
+/// today handle decimals (Postgres, ClickHouse, Kafka with various
+/// encodings, and webhook/SQS — JSON-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectorKind {
+    /// Postgres source/sink (`type: postgres`). Native arbitrary-precision
+    /// `NUMERIC` (capped at the documented Postgres ~1000-digit limit).
+    Postgres,
+    /// ClickHouse source/sink (`type: clickhouse`). Native `Decimal(p, s)`
+    /// is capped at 76 digits — wider columns require `coerce_to: string`.
+    ClickHouse,
+    /// ClickHouse-backed hybrid source/sink (`type: hybrid`). Same caps as
+    /// ClickHouse.
+    Hybrid,
+    /// Kafka source/sink with JSON encoding. Carries digit-strings
+    /// natively at any precision.
+    KafkaJson,
+    /// Kafka source/sink with Avro encoding. Native iff the Avro
+    /// `decimal` field's declared byte width can hold the precision; see
+    /// [`avro_bytes_required`].
+    KafkaAvro {
+        /// Declared `bytes` width of the Avro `decimal` field (`None` for
+        /// `bytes` logical decimals which are unbounded).
+        declared_bytes: Option<u32>,
+    },
+    /// Kafka source/sink with Protobuf encoding. No native decimal in
+    /// proto3; requires `coerce_to: string`.
+    KafkaProtobuf,
+    /// SQS or webhook (JSON-encoded payload). Same as KafkaJson.
+    SqsJson,
+    /// Plugin-provided connector. The capability is whatever the plugin
+    /// advertises; this module returns Reject by default for plugins that
+    /// don't override — the opt-in must be explicit.
+    Plugin,
+}
+
+impl fmt::Display for ConnectorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectorKind::Postgres => f.write_str("postgres"),
+            ConnectorKind::ClickHouse => f.write_str("clickhouse"),
+            ConnectorKind::Hybrid => f.write_str("hybrid"),
+            ConnectorKind::KafkaJson => f.write_str("kafka (json encoding)"),
+            ConnectorKind::KafkaAvro { .. } => f.write_str("kafka (avro encoding)"),
+            ConnectorKind::KafkaProtobuf => f.write_str("kafka (protobuf encoding)"),
+            ConnectorKind::SqsJson => f.write_str("sqs/webhook (json encoding)"),
+            ConnectorKind::Plugin => f.write_str("plugin"),
+        }
+    }
+}
+
+/// Per-column user opt-in directive. Today only `string` exists; the enum
+/// reserves the surface for future variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoercionDirective {
+    /// `coerce_to: string` — emit the column as a string field on the
+    /// destination, encoded as canonical decimal text.
+    String,
+}
+
+/// Outcome of asking a connector whether it can carry a `decimal_arb`
+/// column with given `(precision, scale)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityResult {
+    /// Connector handles the column natively at the declared
+    /// `(precision, scale)` with no loss.
+    Native,
+    /// Connector cannot natively hold the column, but a user-supplied
+    /// `coerce_to` directive lets it transmit the value as a string.
+    OptInOnly(CoercionDirective),
+    /// Connector cannot carry this column and there is no opt-in path.
+    /// The pipeline must be rejected at config load with the supplied
+    /// human-readable reason.
+    Reject(String),
+}
+
+/// Postgres NUMERIC's documented practical maximum precision.
+/// Per the Postgres docs (recent versions), `NUMERIC` supports
+/// "up to 131072 digits before the decimal point [and] up to 16383 digits
+/// after" but the safe, widely-deployed practical cap is much lower.
+/// We use 1000 as a conservative ceiling that all supported server
+/// versions accept; pipelines declaring more should be rejected with a
+/// clear hint pointing at this constant.
+pub const MAX_POSTGRES_NUMERIC_PRECISION: u32 = 1000;
+
+/// ClickHouse native `Decimal(p, s)` precision ceiling.
+pub const MAX_CLICKHOUSE_DECIMAL_PRECISION: u32 = 76;
+
+/// The smallest `fixed` size (in bytes) that can hold every Avro `decimal`
+/// of the given precision.
+///
+/// Avro stores a decimal's unscaled value as a two's-complement big-endian
+/// integer, so the sign costs one *bit*, not a byte: a `fixed(n)` holds
+/// precision `p` iff `10^p <= 2^(8n - 1)` (the spec's
+/// `floor(log10(2^(8n-1) - 1)) >= p`). Computed exactly — a `+1` byte for
+/// the sign would reject `decimal(38)` in `fixed(16)`, the layout most
+/// producers emit.
+pub fn avro_bytes_required(precision: u32) -> u32 {
+    use num_bigint::BigUint;
+    use num_traits::Pow;
+    // `bits(10^p)` = floor(p·log2 10) + 1; `10^p` is never a power of two,
+    // so `10^p <= 2^k` exactly when `bits(10^p) <= k`. One more bit for the
+    // sign, rounded up to whole bytes.
+    let bits = BigUint::from(10_u32).pow(precision).bits();
+    u32::try_from((bits + 1).div_ceil(8))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// Decide whether a sink (`kind`) can carry a `decimal_arb` column with
+/// declared `(precision, scale)`, given the user's `coerce_to_string`
+/// opt-in (`true` if `coerce_to: string` is set on the sink column) and an
+/// optional `native_int_kind` origin hint (set when the column
+/// originated as a fixed-width native integer like ClickHouse
+/// `UInt256` / `Int256`).
+///
+/// The same decision applies on the source side: a source advertises this
+/// capability for the column it produces, and the validator rejects
+/// mismatches there too.
+pub fn capability_for_decimal_arb(
+    kind: ConnectorKind,
+    precision: u32,
+    scale: u32,
+    coerce_to_string: bool,
+    native_int_kind: Option<crate::types::decimal_arb::NativeIntKind>,
+) -> CapabilityResult {
+    match kind {
+        ConnectorKind::Postgres => {
+            if precision <= MAX_POSTGRES_NUMERIC_PRECISION {
+                CapabilityResult::Native
+            } else if coerce_to_string {
+                CapabilityResult::OptInOnly(CoercionDirective::String)
+            } else {
+                CapabilityResult::Reject(format!(
+                    "Postgres NUMERIC supports up to {} digits; declared precision {} exceeds the cap. \
+                     Reduce declared precision, or set `coerce_to: string` to emit as TEXT.",
+                    MAX_POSTGRES_NUMERIC_PRECISION, precision,
+                ))
+            }
+        }
+        ConnectorKind::ClickHouse | ConnectorKind::Hybrid => {
+            // A native_int_kind hint at (≤78, 0) routes the
+            // column through ClickHouse's first-class fixed-width
+            // UInt256 / Int256 types — Native without coerce_to: string.
+            // Preserves storage compactness for existing wide-int tables.
+            use crate::types::decimal_arb::NativeIntKind;
+            if scale == 0
+                && precision <= 78
+                && matches!(
+                    native_int_kind,
+                    Some(NativeIntKind::U256) | Some(NativeIntKind::I256)
+                )
+            {
+                return CapabilityResult::Native;
+            }
+            if precision <= MAX_CLICKHOUSE_DECIMAL_PRECISION {
+                CapabilityResult::Native
+            } else if coerce_to_string {
+                CapabilityResult::OptInOnly(CoercionDirective::String)
+            } else {
+                CapabilityResult::Reject(format!(
+                    "ClickHouse Decimal precision is capped at {} digits; declared precision {} exceeds the cap. \
+                     Add `coerce_to: string` under this column in the sink YAML to emit as a String column, \
+                     or reduce declared precision to ≤{} if the source data fits.",
+                    MAX_CLICKHOUSE_DECIMAL_PRECISION, precision, MAX_CLICKHOUSE_DECIMAL_PRECISION,
+                ))
+            }
+        }
+        ConnectorKind::KafkaJson | ConnectorKind::SqsJson => CapabilityResult::Native,
+        ConnectorKind::KafkaAvro { declared_bytes } => {
+            let needed = avro_bytes_required(precision);
+            match declared_bytes {
+                None => CapabilityResult::Native, // unbounded `bytes` decimal
+                Some(b) if b >= needed => CapabilityResult::Native,
+                Some(b) if coerce_to_string => {
+                    let _ = b;
+                    CapabilityResult::OptInOnly(CoercionDirective::String)
+                }
+                Some(b) => CapabilityResult::Reject(format!(
+                    "Avro decimal field declares {} byte(s); declared precision {} requires \
+                     {} byte(s). Widen the Avro `bytes` declaration or set `coerce_to: string` \
+                     to encode as an Avro string.",
+                    b, precision, needed,
+                )),
+            }
+        }
+        ConnectorKind::KafkaProtobuf => {
+            if coerce_to_string {
+                CapabilityResult::OptInOnly(CoercionDirective::String)
+            } else {
+                CapabilityResult::Reject(format!(
+                    "Protobuf has no native decimal type; declared precision {} cannot be carried as a numeric. \
+                     Set `coerce_to: string` to encode as a string field.",
+                    precision,
+                ))
+            }
+        }
+        ConnectorKind::Plugin => CapabilityResult::Reject(format!(
+            "Plugin connector does not advertise streamling.decimal_arb support \
+             (declared precision {}, scale {}). Implement `supports_decimal_arb` in \
+             the plugin to override.",
+            precision, scale,
+        )),
+    }
+}
+
+/// Build the user-facing config-load error string for a given Reject result.
+/// Centralizes the error format so every connector emits a consistent shape:
+/// column, connector, declared (p, s), reason, hint.
+pub fn config_load_error(
+    column: &str,
+    kind: ConnectorKind,
+    precision: u32,
+    scale: u32,
+    reason: &str,
+) -> crate::error::StreamlingError {
+    streamling_user_err!(
+        "config error: column `{}` (declared decimal_arb({}, {})) cannot be carried by {}: {}",
+        column,
+        precision,
+        scale,
+        kind,
+        reason,
+    )
+}
+
+/// Minimal per-column directive view used by the pipeline-startup validator.
+/// Connectors can either pass their own `ColumnDirective` slice or build
+/// these from whatever directive shape they expose (Postgres / ClickHouse
+/// configs both reduce to `(name, coerce_to_string?)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDirectiveView<'a> {
+    pub name: &'a str,
+    pub coerce_to_string: bool,
+}
+
+/// All `Reject` outcomes from a single pipeline-startup validation pass.
+/// Carrying them together lets the validator surface every misconfiguration
+/// at once instead of failing on the first bad column.
+#[derive(Debug)]
+pub struct DecimalArbConfigErrors(pub Vec<crate::error::StreamlingError>);
+
+impl DecimalArbConfigErrors {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn into_inner(self) -> Vec<crate::error::StreamlingError> {
+        self.0
+    }
+}
+
+impl fmt::Display for DecimalArbConfigErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, err) in self.0.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{}", err)?;
+        }
+        Ok(())
+    }
+}
+
+/// Connectors whose decimal_arb conversion covers only top-level columns.
+fn converts_only_top_level(kind: ConnectorKind) -> bool {
+    matches!(kind, ConnectorKind::ClickHouse | ConnectorKind::Hybrid)
+}
+
+/// `(precision, scale, native_int_kind)` of a decimal_arb field — or of a
+/// legacy `streamling.u256` / `streamling.i256` field, which every sink
+/// upgrades to a hinted `decimal_arb(78, 0)` on the way in and must therefore
+/// be able to carry as such.
+fn decimal_arb_view(
+    field: &arrow_schema::Field,
+) -> Option<(u32, u32, Option<crate::types::decimal_arb::NativeIntKind>)> {
+    if let Some((p, s)) = DecimalArbType::precision_scale_from_field(field) {
+        return Some((p, s, DecimalArbType::native_int_kind_from_field(field)));
+    }
+    crate::types::decimal_arb_legacy::legacy_wide_int_kind(field).map(|kind| {
+        (
+            crate::types::decimal_arb_legacy::LEGACY_WIDE_INT_PRECISION,
+            0,
+            Some(kind),
+        )
+    })
+}
+
+/// Collect `(dotted path, precision, scale, hint)` for every decimal_arb leaf
+/// *below* `field` — the top-level field itself is handled by the caller.
+fn collect_nested_decimal_arb(
+    field: &arrow_schema::Field,
+    path: &str,
+    out: &mut Vec<(
+        String,
+        u32,
+        u32,
+        Option<crate::types::decimal_arb::NativeIntKind>,
+    )>,
+) {
+    let mut visit = |child: &arrow_schema::Field| {
+        let child_path = format!("{}.{}", path, child.name());
+        if let Some((p, s, hint)) = decimal_arb_view(child) {
+            out.push((child_path.clone(), p, s, hint));
+        }
+        collect_nested_decimal_arb(child, &child_path, out);
+    };
+    match field.data_type() {
+        arrow_schema::DataType::Struct(children) => children.iter().for_each(|c| visit(c)),
+        arrow_schema::DataType::List(c)
+        | arrow_schema::DataType::LargeList(c)
+        | arrow_schema::DataType::FixedSizeList(c, _)
+        | arrow_schema::DataType::Map(c, _) => visit(c),
+        _ => {}
+    }
+}
+
+/// Walk an Arrow `Schema`'s decimal_arb fields and confirm the connector
+/// (`kind`) can carry each one — Native, OptInOnly with the user's
+/// `coerce_to: string` directive, or Reject (collected into the result).
+///
+/// Pipeline-startup wiring: every place that builds a sink (or source)
+/// from YAML should call this with the connector's resolved `Schema` and
+/// directive list, surfacing `DecimalArbConfigErrors` to abort startup.
+/// Non-decimal_arb fields are ignored.
+///
+/// Leaves nested inside a Struct / List / Map get the same decision as a
+/// top-level column would, under the column's directive: the connectors that
+/// serialise whole containers (JSON, Avro, …) carry the leaf exactly when they
+/// would carry the column, and a plugin that does not advertise decimal_arb
+/// support rejects the leaf as it rejects the column — before, only the
+/// top-level field was checked, so a plugin sink accepted `struct<amount>` and
+/// serialised the leaf as something else. ClickHouse / Hybrid convert
+/// top-level columns only, so a nested leaf is rejected outright there rather
+/// than written as raw bytes.
+pub fn validate_pipeline_decimal_arb(
+    schema: &Schema,
+    kind: ConnectorKind,
+    directives: &[ColumnDirectiveView<'_>],
+) -> Result<(), DecimalArbConfigErrors> {
+    let mut errors: Vec<crate::error::StreamlingError> = Vec::new();
+    for field in schema.fields() {
+        let coerce_to_string = directives
+            .iter()
+            .find(|d| d.name == field.name())
+            .map(|d| d.coerce_to_string)
+            .unwrap_or(false);
+
+        let mut leaves = Vec::new();
+        if let Some((precision, scale, hint)) = decimal_arb_view(field) {
+            leaves.push((field.name().clone(), precision, scale, hint));
+        }
+        let top_level = leaves.len();
+        collect_nested_decimal_arb(field, field.name(), &mut leaves);
+
+        for (i, (path, precision, scale, hint)) in leaves.into_iter().enumerate() {
+            if i >= top_level && converts_only_top_level(kind) {
+                errors.push(config_load_error(
+                    &path,
+                    kind,
+                    precision,
+                    scale,
+                    "decimal_arb nested inside a struct/list/map is not supported by this \
+                     connector (only top-level columns are converted); flatten the column \
+                     or send it to a JSON/Avro sink",
+                ));
+                continue;
+            }
+            if let CapabilityResult::Reject(reason) =
+                capability_for_decimal_arb(kind, precision, scale, coerce_to_string, hint)
+            {
+                errors.push(config_load_error(&path, kind, precision, scale, &reason));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DecimalArbConfigErrors(errors))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Postgres ----
+
+    #[test]
+    fn postgres_native_within_cap() {
+        let r = capability_for_decimal_arb(ConnectorKind::Postgres, 100, 18, false, None);
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn postgres_at_documented_cap_is_native() {
+        let r = capability_for_decimal_arb(
+            ConnectorKind::Postgres,
+            MAX_POSTGRES_NUMERIC_PRECISION,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn postgres_above_cap_rejects_without_opt_in() {
+        let r = capability_for_decimal_arb(
+            ConnectorKind::Postgres,
+            MAX_POSTGRES_NUMERIC_PRECISION + 1,
+            0,
+            false,
+            None,
+        );
+        match r {
+            CapabilityResult::Reject(msg) => {
+                assert!(msg.contains("Postgres"));
+                assert!(msg.contains("1000"));
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn postgres_above_cap_with_opt_in_routes_to_string() {
+        let r = capability_for_decimal_arb(
+            ConnectorKind::Postgres,
+            MAX_POSTGRES_NUMERIC_PRECISION + 1,
+            0,
+            true,
+            None,
+        );
+        assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
+    }
+
+    // ---- ClickHouse ----
+
+    #[test]
+    fn clickhouse_native_at_or_below_76() {
+        for p in [38, 50, 76] {
+            assert_eq!(
+                capability_for_decimal_arb(ConnectorKind::ClickHouse, p, 0, false, None),
+                CapabilityResult::Native,
+                "precision {} should be Native",
+                p,
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_above_76_rejects_without_opt_in() {
+        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, false, None);
+        match r {
+            CapabilityResult::Reject(msg) => {
+                assert!(msg.contains("ClickHouse"));
+                assert!(msg.contains("76"));
+                assert!(msg.contains("coerce_to: string"));
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn clickhouse_above_76_with_opt_in_routes_to_string() {
+        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, true, None);
+        assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
+    }
+
+    #[test]
+    fn hybrid_mirrors_clickhouse() {
+        // Hybrid is ClickHouse-backed; same rules.
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::Hybrid, 76, 0, false, None),
+            CapabilityResult::Native,
+        );
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::Hybrid, 100, 18, true, None),
+            CapabilityResult::OptInOnly(CoercionDirective::String),
+        );
+    }
+
+    // ---- Kafka encodings ----
+
+    #[test]
+    fn kafka_json_native_at_any_precision() {
+        for p in [1, 76, 1000, 65_535] {
+            assert_eq!(
+                capability_for_decimal_arb(ConnectorKind::KafkaJson, p, 0, false, None),
+                CapabilityResult::Native,
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_avro_unbounded_bytes_is_native() {
+        assert_eq!(
+            capability_for_decimal_arb(
+                ConnectorKind::KafkaAvro {
+                    declared_bytes: None
+                },
+                1000,
+                18,
+                false,
+                None,
+            ),
+            CapabilityResult::Native,
+        );
+    }
+
+    #[test]
+    fn kafka_avro_sufficient_bytes_is_native() {
+        // Precision 38 needs exactly 16 bytes (Decimal128 in `fixed(16)`).
+        let needed = avro_bytes_required(38);
+        assert_eq!(needed, 16);
+        assert_eq!(
+            capability_for_decimal_arb(
+                ConnectorKind::KafkaAvro {
+                    declared_bytes: Some(needed)
+                },
+                38,
+                10,
+                false,
+                None,
+            ),
+            CapabilityResult::Native,
+        );
+    }
+
+    #[test]
+    fn kafka_avro_insufficient_bytes_rejects() {
+        let too_small = avro_bytes_required(38) - 1;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::KafkaAvro {
+                declared_bytes: Some(too_small),
+            },
+            38,
+            10,
+            false,
+            None,
+        );
+        match r {
+            CapabilityResult::Reject(msg) => {
+                assert!(msg.contains("Avro decimal"));
+                assert!(msg.contains("byte"));
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn kafka_avro_insufficient_bytes_with_opt_in_routes_to_string() {
+        let too_small = avro_bytes_required(38) - 1;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::KafkaAvro {
+                declared_bytes: Some(too_small),
+            },
+            38,
+            10,
+            true,
+            None,
+        );
+        assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
+    }
+
+    #[test]
+    fn kafka_protobuf_rejects_without_opt_in() {
+        let r = capability_for_decimal_arb(ConnectorKind::KafkaProtobuf, 38, 10, false, None);
+        match r {
+            CapabilityResult::Reject(msg) => {
+                assert!(msg.contains("Protobuf"));
+                assert!(msg.contains("coerce_to: string"));
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn kafka_protobuf_with_opt_in_routes_to_string() {
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::KafkaProtobuf, 38, 10, true, None),
+            CapabilityResult::OptInOnly(CoercionDirective::String),
+        );
+    }
+
+    // ---- Plugins / SQS ----
+
+    #[test]
+    fn plugin_default_rejects() {
+        let r = capability_for_decimal_arb(ConnectorKind::Plugin, 100, 18, false, None);
+        match r {
+            CapabilityResult::Reject(msg) => {
+                assert!(msg.contains("Plugin"));
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sqs_json_is_native() {
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::SqsJson, 100, 18, false, None),
+            CapabilityResult::Native,
+        );
+    }
+
+    // ---- Helpers ----
+
+    #[test]
+    fn avro_bytes_required_matches_documented_examples() {
+        // Exact, per the Avro spec (`floor(log10(2^(8n-1) - 1)) >= p`):
+        // the sign is one bit of the two's-complement magnitude, not a byte.
+        assert_eq!(avro_bytes_required(1), 1); // 10 < 2^7
+        assert_eq!(avro_bytes_required(2), 1); // 100 < 2^7 = 128
+        assert_eq!(avro_bytes_required(3), 2); // 1000 > 127
+        assert_eq!(avro_bytes_required(18), 8); // Decimal64 in fixed(8)
+        assert_eq!(avro_bytes_required(38), 16); // Decimal128 in fixed(16)
+        assert_eq!(avro_bytes_required(76), 32); // 10^76 < 2^255 ≈ 5.79e76
+        assert_eq!(avro_bytes_required(77), 33); // 10^77 > 2^255
+        assert_eq!(avro_bytes_required(100), 42);
+        // Every result really holds 10^p - 1 and does not with one byte less.
+        for p in 1..=200_u32 {
+            let n = avro_bytes_required(p);
+            let limit = |bytes: u32| num_bigint::BigUint::from(2_u32).pow(8 * bytes - 1);
+            let max_value = num_bigint::BigUint::from(10_u32).pow(p) - 1_u32;
+            assert!(max_value < limit(n), "precision {p} does not fit {n} bytes");
+            if n > 1 {
+                assert!(
+                    max_value >= limit(n - 1),
+                    "precision {p} fits {} bytes",
+                    n - 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_load_error_contains_diagnostic_fields() {
+        let err = config_load_error(
+            "pipeline.sinks.analytics.amount",
+            ConnectorKind::ClickHouse,
+            100,
+            18,
+            "ClickHouse Decimal precision is capped at 76 digits",
+        );
+        let msg = format!("{}", err);
+        assert!(msg.contains("pipeline.sinks.analytics.amount"));
+        assert!(msg.contains("decimal_arb(100, 18)"));
+        assert!(msg.contains("clickhouse"));
+        assert!(msg.contains("capped at 76"));
+    }
+
+    // ---- pipeline-startup validator ----
+
+    use crate::types::decimal_arb::DecimalArbType;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn schema_with_amount_column(precision: u32, scale: u32) -> Schema {
+        let amount = DecimalArbType::field("amount", precision, scale, true).unwrap();
+        let id = Field::new("id", DataType::Int64, false);
+        Schema::new(vec![id, amount])
+    }
+
+    #[test]
+    fn validator_passes_for_native_only_pipeline() {
+        // ClickHouse can natively carry decimal_arb(50, 5) (≤76).
+        let schema = schema_with_amount_column(50, 5);
+        let result = validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validator_rejects_clickhouse_without_opt_in() {
+        let schema = schema_with_amount_column(100, 18);
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let msg = format!("{}", errs);
+        assert!(msg.contains("amount"));
+        assert!(msg.contains("clickhouse"));
+        assert!(msg.contains("76"));
+        assert!(msg.contains("coerce_to: string"));
+    }
+
+    #[test]
+    fn validator_passes_clickhouse_with_opt_in() {
+        let schema = schema_with_amount_column(100, 18);
+        let directives = vec![ColumnDirectiveView {
+            name: "amount",
+            coerce_to_string: true,
+        }];
+        let result = validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &directives);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validator_passes_for_postgres_at_any_supported_precision() {
+        let schema = schema_with_amount_column(500, 100);
+        let result = validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validator_collects_all_errors_at_once() {
+        // Three columns, two violate ClickHouse's cap, one is fine.
+        let bad_a = DecimalArbType::field("balance", 100, 18, true).unwrap();
+        let ok = DecimalArbType::field("rate", 50, 5, true).unwrap();
+        let bad_b = DecimalArbType::field("supply", 200, 0, true).unwrap();
+        let schema = Schema::new(vec![bad_a, ok, bad_b]);
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        assert_eq!(errs.len(), 2, "should surface BOTH offending columns");
+        let msg = format!("{}", errs);
+        assert!(msg.contains("balance"));
+        assert!(msg.contains("supply"));
+        assert!(
+            !msg.contains("rate"),
+            "the in-bounds column must not appear in the error list"
+        );
+    }
+
+    #[test]
+    fn validator_ignores_non_decimal_arb_fields() {
+        // Pure Int64 / Decimal128 schema → no decimal_arb columns →
+        // validator is a no-op even when targeting a strict connector.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Decimal128(20, 5), false),
+        ]);
+        let result = validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validator_directive_lookup_is_per_column() {
+        // Two wide-precision columns; only one has the opt-in. The other
+        // must still surface a Reject.
+        let amount = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        let supply = DecimalArbType::field("supply", 100, 0, true).unwrap();
+        let schema = Schema::new(vec![amount, supply]);
+        let directives = vec![ColumnDirectiveView {
+            name: "amount",
+            coerce_to_string: true,
+        }];
+        let errs = validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &directives)
+            .unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let msg = format!("{}", errs);
+        assert!(msg.contains("supply"));
+        assert!(!msg.contains("`amount`"));
+    }
+
+    // ------- native_int_kind hint affects ClickHouse / Hybrid matrix -------
+
+    #[test]
+    fn clickhouse_native_for_decimal_arb_78_0_with_u256_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::ClickHouse,
+            78,
+            0,
+            false,
+            Some(NativeIntKind::U256),
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn clickhouse_native_for_decimal_arb_78_0_with_i256_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::ClickHouse,
+            78,
+            0,
+            false,
+            Some(NativeIntKind::I256),
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn hybrid_native_for_decimal_arb_with_native_int_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let r = capability_for_decimal_arb(
+            ConnectorKind::Hybrid,
+            78,
+            0,
+            false,
+            Some(NativeIntKind::U256),
+        );
+        assert_eq!(r, CapabilityResult::Native);
+    }
+
+    #[test]
+    fn clickhouse_native_int_hint_does_not_bypass_precision_cap_for_fractional_scale() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // (100, 18) is wide and fractional — the hint is set but should be
+        // ignored (the matrix only honors the hint at scale 0, ≤78).
+        // Without coerce_to: string, this stays Reject.
+        let r = capability_for_decimal_arb(
+            ConnectorKind::ClickHouse,
+            100,
+            18,
+            false,
+            Some(NativeIntKind::U256),
+        );
+        match r {
+            CapabilityResult::Reject(_) => {}
+            other => panic!(
+                "expected Reject (hint should not apply for scale>0); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn clickhouse_existing_coerce_to_path_unaffected_by_absent_hint() {
+        // No hint, p > 76, coerce_to=string: still OptInOnly. Regression
+        // guard for the pre-hint behavior.
+        let r = capability_for_decimal_arb(ConnectorKind::ClickHouse, 100, 18, true, None);
+        assert_eq!(r, CapabilityResult::OptInOnly(CoercionDirective::String));
+    }
+}
