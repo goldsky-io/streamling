@@ -10,14 +10,16 @@ use crate::error::{Result, ResultExt};
 use crate::streamling_user_err;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::sqlparser::ast::{
-    CastKind, DataType as SqlDataType, Expr as SqlExpr, SelectItem, SetExpr, Statement,
-    TableFactor, UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, UnaryOperator, Value, Visit, Visitor, visit_expressions_mut,
 };
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 // ---------------- Shared helpers ----------------
 
@@ -240,6 +242,23 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
             decimal_arb_cols.insert(field.name().to_string());
         }
     }
+    // Joined tables contribute their decimal_arb columns too; one that
+    // cannot be resolved here is left for DataFusion to report.
+    for table in tables.iter().skip(1) {
+        let (schema_name, table_name) =
+            crate::session::SessionManager::extract_schema_and_table_names(table);
+        let Some(schema) = catalog.schema(schema_name) else {
+            continue;
+        };
+        let Ok(Some(provider)) = schema.table(table_name).await else {
+            continue;
+        };
+        for field in provider.schema().fields() {
+            if crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(field) {
+                decimal_arb_cols.insert(field.name().to_string());
+            }
+        }
+    }
 
     // Walk the SQL AST and apply the decimal_arb CAST-to-string rewrite.
     // DataFusion has no native cast from LargeBinary
@@ -295,6 +314,9 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         }
         rewrite_setexpr(&mut query.body, &decimal_arb_cols);
     }
+
+    let names = DecimalArbNames::collect(&stmt, decimal_arb_cols);
+    quote_inexact_literals_near_decimal_arb(&mut stmt, &names);
 
     Ok(stmt.to_string())
 }
@@ -410,6 +432,427 @@ fn build_decimal_arb_to_string_call(inner: SqlExpr) -> SqlExpr {
     })
 }
 
+/// The digits of a bare numeric literal — optionally signed, possibly
+/// parenthesised — exactly as written.
+fn number_literal_text(expr: &SqlExpr) -> Option<String> {
+    match expr {
+        SqlExpr::Nested(inner) => number_literal_text(inner),
+        SqlExpr::Value(v) => match &v.value {
+            Value::Number(n, _) => Some(n.to_string()),
+            _ => None,
+        },
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => number_literal_text(expr).map(|t| format!("-{t}")),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => number_literal_text(expr),
+        _ => None,
+    }
+}
+
+// ---------------- Exact numeric literals next to decimal_arb ----------------
+//
+// DataFusion types a numeric literal that fits neither i64 nor u64, or that
+// has a fractional part or an exponent, as Float64 — its digits are gone
+// before any decimal_arb rule runs (`1000000000000000000000000` plans as
+// 999999999999999983222784, and `amount > 1000000000000000000000000` then
+// fails coercion outright). Where such a literal is an operand of a
+// decimal_arb expression the preprocessor quotes it: the decimal_arb planner
+// and rewrite parse string literals exactly. An operand that is not
+// decimal_arb is never touched, so other columns keep DataFusion's typing.
+
+/// Would DataFusion plan this numeric token as Float64?
+fn is_inexact_number(text: &str) -> bool {
+    if text.contains(['.', 'e', 'E']) {
+        return true;
+    }
+    if text.starts_with('-') {
+        text.parse::<i64>().is_err()
+    } else {
+        text.parse::<i64>().is_err() && text.parse::<u64>().is_err()
+    }
+}
+
+/// Replace a bare numeric literal DataFusion would plan as Float64 with a
+/// string literal carrying the same digits.
+fn quote_inexact_literal(expr: &mut SqlExpr) {
+    if let Some(text) = number_literal_text(expr)
+        && is_inexact_number(&text)
+    {
+        *expr = SqlExpr::Value(Value::SingleQuotedString(text).into());
+    }
+}
+
+fn is_arithmetic(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+    )
+}
+
+fn is_comparison(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
+    )
+}
+
+fn function_name(func: &Function) -> Option<String> {
+    func.name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_ascii_lowercase())
+}
+
+fn function_args(func: &Function) -> Vec<&SqlExpr> {
+    match &func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .filter_map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn function_args_mut(func: &mut Function) -> Vec<&mut SqlExpr> {
+    match &mut func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter_mut()
+            .filter_map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// UDFs that produce decimal_arb whatever their arguments.
+const DECIMAL_ARB_CONSTRUCTORS: &[&str] = &[
+    "to_decimal_arb_from_string",
+    "try_to_decimal_arb_from_string",
+    "to_decimal_arb_from_int",
+    "to_decimal_arb_from_decimal128",
+    "to_decimal_arb_from_decimal256",
+    "legacy_wide_int_to_decimal_arb",
+    "decimal_arb_add",
+    "decimal_arb_sub",
+    "decimal_arb_mul",
+    "decimal_arb_div",
+    "decimal_arb_mod",
+    "decimal_arb_neg",
+    "decimal_arb_abs",
+    "decimal_arb_rescale",
+    "decimal_arb_with_meta",
+    "decimal_arb_restamp",
+    "decimal_arb_greatest",
+    "decimal_arb_least",
+    "decimal_arb_array_min",
+    "decimal_arb_array_max",
+];
+
+/// Functions whose result is decimal_arb when a decimal_arb argument goes in.
+const DECIMAL_ARB_PRESERVING: &[&str] = &[
+    "coalesce",
+    "nvl",
+    "nvl2",
+    "ifnull",
+    "nullif",
+    "greatest",
+    "least",
+    "abs",
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "first_value",
+    "last_value",
+    "lag",
+    "lead",
+    "nth_value",
+    "any_value",
+    "array_element",
+    "array_extract",
+    "list_element",
+    "list_extract",
+    "array_min",
+    "array_max",
+];
+
+/// Functions whose arguments are compared or combined with each other, so a
+/// numeric literal among them meets the decimal_arb argument.
+const DECIMAL_ARB_ARGUMENT_FUNCTIONS: &[&str] = &[
+    "coalesce",
+    "nvl",
+    "nvl2",
+    "ifnull",
+    "nullif",
+    "greatest",
+    "least",
+    "decimal_arb_greatest",
+    "decimal_arb_least",
+    "make_array",
+    "make_list",
+    "array_has",
+    "array_has_any",
+    "array_has_all",
+    "array_position",
+    "array_positions",
+    "array_remove",
+    "array_remove_n",
+    "array_remove_all",
+    "array_replace",
+    "array_replace_n",
+    "array_replace_all",
+    "array_append",
+    "array_prepend",
+    "list_append",
+    "list_prepend",
+];
+
+/// Column names known to hold decimal_arb: the referenced tables' columns
+/// plus every projection alias (in CTEs and derived tables too) whose
+/// expression is decimal_arb-valued.
+struct DecimalArbNames(HashSet<String>);
+
+impl DecimalArbNames {
+    fn collect(stmt: &Statement, seed: HashSet<String>) -> Self {
+        let mut names = Self(seed);
+        // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
+        // FROM a)`), so collect until nothing new appears.
+        loop {
+            let before = names.0.len();
+            let mut collector = AliasCollector { names: &mut names };
+            let _ = stmt.visit(&mut collector);
+            if names.0.len() == before {
+                break;
+            }
+        }
+        names
+    }
+
+    /// Is `expr` decimal_arb-valued, as far as names and shapes can tell?
+    fn is_decimal(&self, expr: &SqlExpr) -> bool {
+        match expr {
+            SqlExpr::Identifier(ident) => self.0.contains(&ident.value),
+            SqlExpr::CompoundIdentifier(parts) => {
+                parts.last().is_some_and(|p| self.0.contains(&p.value))
+            }
+            SqlExpr::Nested(inner) => self.is_decimal(inner),
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                expr,
+            } => self.is_decimal(expr),
+            SqlExpr::BinaryOp { left, op, right } if is_arithmetic(op) => {
+                self.is_decimal(left) || self.is_decimal(right)
+            }
+            SqlExpr::Cast { data_type, .. } => is_wide_decimal_type(data_type),
+            SqlExpr::Case {
+                conditions,
+                else_result,
+                ..
+            } => {
+                conditions.iter().any(|c| self.is_decimal(&c.result))
+                    || else_result.as_deref().is_some_and(|e| self.is_decimal(e))
+            }
+            SqlExpr::Function(func) => match function_name(func) {
+                Some(name) if DECIMAL_ARB_CONSTRUCTORS.contains(&name.as_str()) => true,
+                Some(name) if DECIMAL_ARB_PRESERVING.contains(&name.as_str()) => {
+                    function_args(func).into_iter().any(|a| self.is_decimal(a))
+                }
+                _ => false,
+            },
+            SqlExpr::Array(array) => array.elem.iter().any(|e| self.is_decimal(e)),
+            SqlExpr::Subquery(query) => first_projection(query).is_some_and(|e| self.is_decimal(e)),
+            _ => false,
+        }
+    }
+
+    /// Record the output columns of `select` that are decimal_arb-valued:
+    /// explicit aliases, and positional aliases from `alias(c1, c2, …)`.
+    fn record_select(&mut self, select: &Select, positional: Option<&TableAlias>) {
+        for (i, item) in select.projection.iter().enumerate() {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr) => expr,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if self.is_decimal(expr) {
+                        self.0.insert(alias.value.clone());
+                    }
+                    expr
+                }
+                _ => continue,
+            };
+            if let Some(alias) = positional
+                && let Some(column) = alias.columns.get(i)
+                && self.is_decimal(expr)
+            {
+                self.0.insert(column.name.value.clone());
+            }
+        }
+    }
+}
+
+/// `CAST(… AS DECIMAL(p[, s]))` beyond DataFusion's native precision routes
+/// to decimal_arb.
+fn is_wide_decimal_type(data_type: &SqlDataType) -> bool {
+    let info = match data_type {
+        SqlDataType::Decimal(info)
+        | SqlDataType::Numeric(info)
+        | SqlDataType::Dec(info)
+        | SqlDataType::BigNumeric(info)
+        | SqlDataType::BigDecimal(info) => info,
+        _ => return false,
+    };
+    match info {
+        ExactNumberInfo::Precision(p) | ExactNumberInfo::PrecisionAndScale(p, _) => *p > 76,
+        ExactNumberInfo::None => false,
+    }
+}
+
+/// The left-most `SELECT` of a query body (through set operations).
+fn leftmost_select(body: &SetExpr) -> Option<&Select> {
+    match body {
+        SetExpr::Select(select) => Some(select),
+        SetExpr::SetOperation { left, .. } => leftmost_select(left),
+        SetExpr::Query(query) => leftmost_select(&query.body),
+        _ => None,
+    }
+}
+
+fn first_projection(query: &Query) -> Option<&SqlExpr> {
+    match leftmost_select(&query.body)?.projection.first()? {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        _ => None,
+    }
+}
+
+struct AliasCollector<'a> {
+    names: &'a mut DecimalArbNames,
+}
+
+impl Visitor for AliasCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                if let Some(select) = leftmost_select(&cte.query.body) {
+                    self.names.record_select(select, Some(&cte.alias));
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } = table_factor
+            && let Some(select) = leftmost_select(&subquery.body)
+        {
+            self.names.record_select(select, Some(alias));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        self.names.record_select(select, None);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Quote every Float64-typed numeric literal that is compared, combined or
+/// listed together with a decimal_arb expression, anywhere in `stmt`.
+fn quote_inexact_literals_near_decimal_arb(stmt: &mut Statement, names: &DecimalArbNames) {
+    let quote_all = |exprs: Vec<&mut SqlExpr>| {
+        for e in exprs {
+            quote_inexact_literal(e);
+        }
+    };
+    let _ = visit_expressions_mut(stmt, |expr: &mut SqlExpr| {
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } if is_arithmetic(op) || is_comparison(op) => {
+                if names.is_decimal(left) {
+                    quote_inexact_literal(right);
+                } else if names.is_decimal(right) {
+                    quote_inexact_literal(left);
+                }
+            }
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                if names.is_decimal(expr) || names.is_decimal(low) || names.is_decimal(high) {
+                    quote_all(vec![expr, low, high]);
+                }
+            }
+            SqlExpr::InList { expr, list, .. } => {
+                if names.is_decimal(expr) || list.iter().any(|e| names.is_decimal(e)) {
+                    quote_inexact_literal(expr);
+                    quote_all(list.iter_mut().collect());
+                }
+            }
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand
+                    && (names.is_decimal(operand)
+                        || conditions.iter().any(|c| names.is_decimal(&c.condition)))
+                {
+                    quote_inexact_literal(operand);
+                    quote_all(conditions.iter_mut().map(|c| &mut c.condition).collect());
+                }
+                if conditions.iter().any(|c| names.is_decimal(&c.result))
+                    || else_result.as_deref().is_some_and(|e| names.is_decimal(e))
+                {
+                    quote_all(conditions.iter_mut().map(|c| &mut c.result).collect());
+                    if let Some(else_result) = else_result {
+                        quote_inexact_literal(else_result);
+                    }
+                }
+            }
+            SqlExpr::Array(array) => {
+                if array.elem.iter().any(|e| names.is_decimal(e)) {
+                    quote_all(array.elem.iter_mut().collect());
+                }
+            }
+            SqlExpr::Function(func) => {
+                if function_name(func)
+                    .is_some_and(|name| DECIMAL_ARB_ARGUMENT_FUNCTIONS.contains(&name.as_str()))
+                    && function_args(func).into_iter().any(|a| names.is_decimal(a))
+                {
+                    quote_all(function_args_mut(func));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
 pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     // First, normalize TRY_CAST DECIMAL via regex (AST may not have TryCast variant)
     lazy_static::lazy_static! {
@@ -486,25 +929,6 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
 
     /// The source text of a numeric literal, looking through parentheses and
     /// a leading sign: `18446744073709551617`, `(1e30)`, `-5`.
-    fn number_literal_text(expr: &SqlExpr) -> Option<String> {
-        match expr {
-            SqlExpr::Nested(inner) => number_literal_text(inner),
-            SqlExpr::Value(v) => match &v.value {
-                Value::Number(n, _) => Some(n.to_string()),
-                _ => None,
-            },
-            SqlExpr::UnaryOp {
-                op: UnaryOperator::Minus,
-                expr,
-            } => number_literal_text(expr).map(|t| format!("-{t}")),
-            SqlExpr::UnaryOp {
-                op: UnaryOperator::Plus,
-                expr,
-            } => number_literal_text(expr),
-            _ => None,
-        }
-    }
-
     /// Build `to_decimal_arb_from_string(<text>, {precision}, {scale})` as an
     /// `SqlExpr`, where `<text>` is `CAST({inner} AS VARCHAR)` — or, for a bare
     /// numeric literal, the literal's own digits as a string. Falls back to the
@@ -843,6 +1267,83 @@ mod tests {
         let schema = Arc::new(Schema::new(schema_fields));
         let table = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
         ctx.register_table(table_name, Arc::new(table)).unwrap();
+    }
+
+    // ---------------- Exact numeric literals next to decimal_arb ----------------
+
+    #[tokio::test]
+    async fn test_wide_and_fractional_literals_next_to_decimal_arb_are_quoted() {
+        let ctx = setup_session_context();
+        register_decimal_arb_table(&ctx, "transfers", vec![("amount", None), ("fee", None)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        ctx.register_table(
+            "meta",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+
+        let cases = [
+            (
+                "SELECT * FROM transfers WHERE amount > 1000000000000000000000000",
+                "SELECT * FROM transfers WHERE amount > '1000000000000000000000000'",
+            ),
+            (
+                "SELECT * FROM transfers WHERE 1000000000000000000000000 < transfers.amount",
+                "SELECT * FROM transfers WHERE '1000000000000000000000000' < transfers.amount",
+            ),
+            (
+                "SELECT amount * 1.5, amount + (-0.25) FROM transfers",
+                "SELECT amount * '1.5', amount + '-0.25' FROM transfers",
+            ),
+            (
+                "SELECT * FROM transfers WHERE amount BETWEEN 0.5 AND 1e24 OR amount IN (1, 2.5)",
+                "SELECT * FROM transfers WHERE amount BETWEEN '0.5' AND '1e24' OR amount IN (1, '2.5')",
+            ),
+            (
+                "SELECT coalesce(amount, 0.5), greatest(fee, 1.5, 2), CASE amount WHEN 1.5 THEN 1 ELSE 0.5 END FROM transfers",
+                "SELECT coalesce(amount, '0.5'), greatest(fee, '1.5', 2), CASE amount WHEN '1.5' THEN 1 ELSE 0.5 END FROM transfers",
+            ),
+            (
+                "SELECT CASE WHEN id = 1 THEN amount ELSE 0.5 END FROM transfers",
+                "SELECT CASE WHEN id = 1 THEN amount ELSE '0.5' END FROM transfers",
+            ),
+            // Aliases in CTEs and derived tables are tracked, positionally too.
+            (
+                "WITH c AS (SELECT amount AS a FROM transfers), d(b) AS (SELECT a FROM c) SELECT * FROM d WHERE b > 18446744073709551616",
+                "WITH c AS (SELECT amount AS a FROM transfers), d (b) AS (SELECT a FROM c) SELECT * FROM d WHERE b > '18446744073709551616'",
+            ),
+            (
+                "SELECT * FROM (SELECT amount + fee AS total FROM transfers) s WHERE s.total >= 0.001",
+                "SELECT * FROM (SELECT amount + fee AS total FROM transfers) s WHERE s.total >= '0.001'",
+            ),
+            (
+                "SELECT * FROM transfers WHERE sum(amount) > 1.5 AND (SELECT max(amount) FROM transfers) > 1e30",
+                "SELECT * FROM transfers WHERE sum(amount) > '1.5' AND (SELECT max(amount) FROM transfers) > '1e30'",
+            ),
+            // Integer literals keep DataFusion's exact integer typing.
+            (
+                "SELECT * FROM transfers WHERE amount > 9223372036854775808 AND amount < -5",
+                "SELECT * FROM transfers WHERE amount > 9223372036854775808 AND amount < -5",
+            ),
+            // Nothing changes for other columns.
+            (
+                "SELECT * FROM meta WHERE price > 1.5 AND id * 0.5 > 1e24 AND coalesce(price, 0.5) IN (1.5, 2)",
+                "SELECT * FROM meta WHERE price > 1.5 AND id * 0.5 > 1e24 AND coalesce(price, 0.5) IN (1.5, 2)",
+            ),
+            (
+                "SELECT * FROM transfers WHERE CAST(amount AS TEXT) = '1.5' AND length(CAST(amount AS TEXT)) > 1.5",
+                "SELECT * FROM transfers WHERE decimal_arb_to_string(amount) = '1.5' AND length(decimal_arb_to_string(amount)) > 1.5",
+            ),
+        ];
+        for (input, expected) in cases {
+            let result = preprocess_bigint_binary_ops_with_schema(&ctx, input)
+                .await
+                .unwrap();
+            assert_eq!(result, expected, "input: {input}");
+        }
     }
 
     // ---------------- Feature 002 (Retire U256/I256) — decimal_arb CAST AS TEXT ----------------

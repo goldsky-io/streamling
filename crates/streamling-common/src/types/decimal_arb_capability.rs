@@ -117,12 +117,25 @@ pub const MAX_POSTGRES_NUMERIC_PRECISION: u32 = 1000;
 /// ClickHouse native `Decimal(p, s)` precision ceiling.
 pub const MAX_CLICKHOUSE_DECIMAL_PRECISION: u32 = 76;
 
-/// Compute the number of bytes required for an Avro `decimal` field at
-/// the given precision, using the standard `ceil(precision * log2(10) / 8)`
-/// formula plus one byte for the sign.
+/// The smallest `fixed` size (in bytes) that can hold every Avro `decimal`
+/// of the given precision.
+///
+/// Avro stores a decimal's unscaled value as a two's-complement big-endian
+/// integer, so the sign costs one *bit*, not a byte: a `fixed(n)` holds
+/// precision `p` iff `10^p <= 2^(8n - 1)` (the spec's
+/// `floor(log10(2^(8n-1) - 1)) >= p`). Computed exactly — a `+1` byte for
+/// the sign would reject `decimal(38)` in `fixed(16)`, the layout most
+/// producers emit.
 pub fn avro_bytes_required(precision: u32) -> u32 {
-    let bits = (precision as f64) * std::f64::consts::LOG2_10;
-    (bits.ceil() as u32).div_ceil(8) + 1
+    use num_bigint::BigUint;
+    use num_traits::Pow;
+    // `bits(10^p)` = floor(p·log2 10) + 1; `10^p` is never a power of two,
+    // so `10^p <= 2^k` exactly when `bits(10^p) <= k`. One more bit for the
+    // sign, rounded up to whole bytes.
+    let bits = BigUint::from(10_u32).pow(precision).bits();
+    u32::try_from((bits + 1).div_ceil(8))
+        .unwrap_or(u32::MAX)
+        .max(1)
 }
 
 /// Decide whether a sink (`kind`) can carry a `decimal_arb` column with
@@ -530,8 +543,9 @@ mod tests {
 
     #[test]
     fn kafka_avro_sufficient_bytes_is_native() {
-        // For precision 38, ~16 bytes are required (ceil(38 * 3.32 / 8) + 1).
+        // Precision 38 needs exactly 16 bytes (Decimal128 in `fixed(16)`).
         let needed = avro_bytes_required(38);
+        assert_eq!(needed, 16);
         assert_eq!(
             capability_for_decimal_arb(
                 ConnectorKind::KafkaAvro {
@@ -627,13 +641,30 @@ mod tests {
 
     #[test]
     fn avro_bytes_required_matches_documented_examples() {
-        // 38-digit decimal: 38 * 3.32 / 8 = ~15.8, rounded up = 16, +1 sign = 17.
-        // (Avro stores both sign and magnitude in the same two's-complement bytes,
-        // so the +1 is conservative; we still want the conservative ceiling for the
-        // capability check to be safe.)
-        assert!(avro_bytes_required(38) >= 16);
-        assert!(avro_bytes_required(76) >= 32);
-        assert!(avro_bytes_required(100) >= 42);
+        // Exact, per the Avro spec (`floor(log10(2^(8n-1) - 1)) >= p`):
+        // the sign is one bit of the two's-complement magnitude, not a byte.
+        assert_eq!(avro_bytes_required(1), 1); // 10 < 2^7
+        assert_eq!(avro_bytes_required(2), 1); // 100 < 2^7 = 128
+        assert_eq!(avro_bytes_required(3), 2); // 1000 > 127
+        assert_eq!(avro_bytes_required(18), 8); // Decimal64 in fixed(8)
+        assert_eq!(avro_bytes_required(38), 16); // Decimal128 in fixed(16)
+        assert_eq!(avro_bytes_required(76), 32); // 10^76 < 2^255 ≈ 5.79e76
+        assert_eq!(avro_bytes_required(77), 33); // 10^77 > 2^255
+        assert_eq!(avro_bytes_required(100), 42);
+        // Every result really holds 10^p - 1 and does not with one byte less.
+        for p in 1..=200_u32 {
+            let n = avro_bytes_required(p);
+            let limit = |bytes: u32| num_bigint::BigUint::from(2_u32).pow(8 * bytes - 1);
+            let max_value = num_bigint::BigUint::from(10_u32).pow(p) - 1_u32;
+            assert!(max_value < limit(n), "precision {p} does not fit {n} bytes");
+            if n > 1 {
+                assert!(
+                    max_value >= limit(n - 1),
+                    "precision {p} fits {} bytes",
+                    n - 1
+                );
+            }
+        }
     }
 
     #[test]

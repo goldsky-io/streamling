@@ -434,13 +434,15 @@ async fn string_column_comparison_is_rejected_not_byte_compared() {
 async fn non_numeric_string_literal_is_a_planning_error() {
     let ctx = session();
     table(&ctx, &[Some("1")], &[Some("1")], &[""]);
-    let err = ctx
-        .sql("SELECT id FROM t WHERE w = 'abc'")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .expect_err("non-numeric literal must not silently compare false");
+    // The planner parses the literal while the binary op is built, so the
+    // error may surface at SQL planning or at execution — never as `false`.
+    let err = match ctx.sql("SELECT id FROM t WHERE w = 'abc'").await {
+        Err(err) => err,
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("non-numeric literal must not silently compare false"),
+    };
     assert!(err.to_string().contains("not a decimal number"), "{err}");
 }
 
