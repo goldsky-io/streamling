@@ -530,8 +530,9 @@ sinks:
 
 // ---------------------------------------------------------------------------
 // 10. CAST(amount AS VARCHAR) -> TEXT column (canonical string).
-//     KNOWN GAP per decimal_arb_casts.rs: built-in CAST of decimal_arb to
-//     VARCHAR tries to read LargeBinary as UTF-8 and is expected to FAIL.
+//     KNOWN GAP: the built-in CAST of decimal_arb to VARCHAR tries to read
+//     the canonical LargeBinary payload as UTF-8 and is expected to FAIL.
+//     Use `decimal_arb_to_string(col)`, covered by the next test.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

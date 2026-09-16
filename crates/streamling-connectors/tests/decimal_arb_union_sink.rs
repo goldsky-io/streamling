@@ -51,8 +51,8 @@ async fn union_case(b_scale: u32) -> datafusion::common::Result<()> {
     let physical = sm.new_df(logical).create_physical_plan().await?;
     let config=serde_json::from_value(serde_json::json!({"url":"http://127.0.0.1:30123","database":"default","user":"default","password":"","columns":[{"name":"value","coerce_to":"string"}]})).unwrap();
     let sink = ClickHouseTableProvider::new_sink(
-        "deep_v2_union".into(),
-        "unused_deep_v2_union",
+        "decimal_arb_union".into(),
+        "unused_decimal_arb_union",
         config,
         None,
         "id".into(),
@@ -62,7 +62,7 @@ async fn union_case(b_scale: u32) -> datafusion::common::Result<()> {
         None,
         None,
         None,
-        "deep_v2_union".into(),
+        "decimal_arb_union".into(),
         None,
     )
     .unwrap();
