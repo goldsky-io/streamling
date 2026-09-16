@@ -73,7 +73,7 @@ async fn topology(native: bool, membership: bool, sql: &str) -> Vec<RecordBatch>
     let ctx = sm.session_context();
     let provider = WrappingSourceTableProvider::new(
         Arc::new(source(native, membership)),
-        format!("deep_v3_source_{}", uuid::Uuid::new_v4()),
+        format!("decimal_arb_source_{}", uuid::Uuid::new_v4()),
         None,
         None,
     );
@@ -81,12 +81,16 @@ async fn topology(native: bool, membership: bool, sql: &str) -> Vec<RecordBatch>
     let (sql_plan, name) = sm.create_supported_logical_plan(sql.into()).await.unwrap();
     assert_eq!(name, "t");
     let checkpoint = LogicalPlan::Extension(Extension {
-        node: Arc::new(CheckpointableNode::new(sql_plan, 10, "deep_v3_sql".into())),
+        node: Arc::new(CheckpointableNode::new(
+            sql_plan,
+            10,
+            "decimal_arb_sql".into(),
+        )),
     });
     let wrapped = LogicalPlan::Extension(Extension {
         node: Arc::new(WrappingNode::new_with_non_null_cols(
             checkpoint,
-            format!("deep_v3_transform_{}", uuid::Uuid::new_v4()),
+            format!("decimal_arb_transform_{}", uuid::Uuid::new_v4()),
             false,
             vec!["id".into()],
             None,

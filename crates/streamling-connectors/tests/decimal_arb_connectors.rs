@@ -435,8 +435,8 @@ async fn clickhouse_default_native_pk_projection_is_deduplicable() {
     let ctx = SessionContext::new();
     let config = serde_json::from_value(serde_json::json!({"url":"http://127.0.0.1:30123", "database":"default", "user":"default", "password":""})).unwrap();
     let sink = ClickHouseTableProvider::new_sink(
-        "deep_v2".into(),
-        "unused_deep_v2",
+        "decimal_arb".into(),
+        "unused_decimal_arb",
         config,
         None,
         "amount".into(),
@@ -446,7 +446,7 @@ async fn clickhouse_default_native_pk_projection_is_deduplicable() {
         None,
         None,
         None,
-        "deep_v2".into(),
+        "decimal_arb".into(),
         None,
     )
     .unwrap();
