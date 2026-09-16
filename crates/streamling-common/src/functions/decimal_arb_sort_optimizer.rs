@@ -7,16 +7,15 @@
 //! DataFusion's bytewise sort over `LargeBinary`, which is wrong for
 //! negatives — the canonical encoding's sign byte `0xFF` byte-wise sorts
 //! after `0x00`, placing negatives after non-negatives. The
-//! `decimal_arb_to_sort_key` ScalarUDF (defined in `decimal_arb_ops.rs`,
-//! T046) produces a `LargeBinary` sort key whose bytewise comparison
+//! `decimal_arb_to_sort_key` ScalarUDF (defined in `decimal_arb_ops.rs`)
+//! produces a `LargeBinary` sort key whose bytewise comparison
 //! reproduces numeric order. This rule wraps each Sort expression that
 //! resolves to a `decimal_arb` column in a call to that UDF.
 //!
 //! Composes with the `DecimalArbExprPlanner` from `decimal_arb_coercion.rs`:
 //! the planner handles binary-op rewriting, this rule handles sort
-//! rewriting. Together they deliver FR-005's "deterministic ordering ...
-//! without requiring an explicit cast or function-call wrapper at the
-//! call site."
+//! rewriting. Together they give deterministic ordering without requiring
+//! an explicit cast or function-call wrapper at the call site.
 
 use crate::functions::decimal_arb_ops::DecimalArbSortKeyFunc;
 use crate::types::decimal_arb::DecimalArbType;

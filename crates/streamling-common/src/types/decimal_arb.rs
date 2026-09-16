@@ -1,12 +1,10 @@
 //! Arbitrary-precision decimal extension type (`streamling.decimal_arb`).
 //!
-//! Wire format and metadata schema: see
-//! `specs/001-decimal-arbitrary-precision/contracts/arrow-extension-type.md`.
-//! In-memory shape: see `data-model.md` (E1, E2).
+//! This module provides:
 //!
-//! T008 (this module): extension-type registration helpers — `DecimalArbType`.
-//! T009 (this module): in-memory value newtype — `DecimalArbValue`.
-//! T010+ (later tasks): array, builder, conversions, sort encoding.
+//! - extension-type registration helpers — `DecimalArbType`,
+//! - the in-memory value newtype — `DecimalArbValue`,
+//! - the array and builder types, conversions, and sort encoding.
 
 use crate::error::Result;
 use crate::{streamling_err, streamling_user_err};
@@ -27,12 +25,12 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 // =====================================================================
-// T008 — Extension-type registration
+// Extension-type registration
 // =====================================================================
 
-/// Sanity guard on `precision` per spec Assumptions / contracts arrow-extension-type §2.
-/// This is documented as a "well above realistic schema declarations" bound, not a
-/// hard product requirement; raise it if a real use case appears.
+/// Sanity guard on `precision`. This is a "well above realistic schema
+/// declarations" bound, not a hard product requirement; raise it if a real
+/// use case appears.
 pub const MAX_PRECISION: u32 = 65_535;
 
 /// Extension type identifier for arbitrary-precision decimals.
@@ -41,8 +39,8 @@ pub const MAX_PRECISION: u32 = 65_535;
 /// - `ARROW:extension:name = "streamling.decimal_arb"`
 /// - `ARROW:extension:metadata = "{\"precision\": <u32>, \"scale\": <u32>}"`
 ///
-/// The storage type is `DataType::LargeBinary` (T006 spike resolved this:
-/// `BinaryView` would be auto-expanded at output by the existing
+/// The storage type is `DataType::LargeBinary` (`BinaryView` would be
+/// auto-expanded at output by the existing
 /// `expand_views_at_output` session config in `streamling-core`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DecimalArbType;
@@ -52,8 +50,8 @@ impl DecimalArbType {
     pub const EXTENSION_NAME_KEY: &'static str = "ARROW:extension:name";
     pub const EXTENSION_METADATA_KEY: &'static str = "ARROW:extension:metadata";
 
-    /// Field metadata key for the optional `native_int_kind` hint introduced
-    /// by feature 002 (Retire U256/I256). Carries a value of `"u256"` or
+    /// Field metadata key for the optional `native_int_kind` hint that
+    /// replaced the retired U256/I256 types. Carries a value of `"u256"` or
     /// `"i256"` indicating which fixed-width native integer this decimal_arb
     /// column originated from, so sinks with matching native channels
     /// (ClickHouse `UInt256` / `Int256`) can preserve storage compactness.
@@ -62,8 +60,6 @@ impl DecimalArbType {
     /// runtime values. A `native_int_kind=u256` column whose value happens to
     /// be negative is legal in memory; it surfaces as an error only on a sink
     /// that has a matching native channel and cannot encode the negative.
-    /// See `specs/002-retire-u256-i256/data-model.md` §E1 for the full
-    /// semantics.
     pub const NATIVE_INT_KIND_KEY: &'static str = "streamling.native_int_kind";
 
     /// Storage type for the extension. Always `LargeBinary` in v1.
@@ -73,8 +69,8 @@ impl DecimalArbType {
     }
 
     /// Build the per-`Field` metadata map for a `decimal_arb` column with the
-    /// given declared `precision` and `scale`. Validates the invariants from
-    /// `data-model.md` (E1) before producing the map.
+    /// given declared `precision` and `scale`. Validates the type's
+    /// invariants before producing the map.
     ///
     /// Delegates to the Arrow [`ExtensionType`] machinery so the
     /// `ARROW:extension:{name,metadata}` keys are produced canonically; the
@@ -130,7 +126,7 @@ impl DecimalArbType {
     /// Stamp the `native_int_kind` origin hint on a `decimal_arb` field.
     /// Returns the new `Field` with the hint added to its metadata.
     /// Rejects (with an internal error) if `field` is not a `decimal_arb`
-    /// field — only decimal_arb columns may carry the hint per §E1.
+    /// field — only decimal_arb columns may carry the hint.
     pub fn with_native_int_kind(field: Field, kind: NativeIntKind) -> Result<Field> {
         if !Self::is_decimal_arb_field(&field) {
             return Err(streamling_err!(
@@ -176,8 +172,7 @@ impl DecimalArbType {
 
 /// Resolved `(precision, scale)` carried in a `decimal_arb` field's
 /// `ARROW:extension:metadata` payload, serialized as the JSON object
-/// `{"precision":<u32>,"scale":<u32>}` (see
-/// `specs/001-decimal-arbitrary-precision/contracts/arrow-extension-type.md`).
+/// `{"precision":<u32>,"scale":<u32>}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecimalArbParams {
     pub precision: u32,
@@ -284,7 +279,6 @@ impl ExtensionType for DecimalArbExtension {
 /// native channel ignore it.
 ///
 /// Semantics: this is a *hint about origin*, not a *constraint on values*.
-/// See `specs/002-retire-u256-i256/data-model.md` §E1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeIntKind {
     /// Originated as an unsigned 256-bit integer (Ethereum-style uint256,
@@ -393,7 +387,7 @@ fn parse_precision_scale_json(raw: &str) -> Result<(u32, u32)> {
 }
 
 // =====================================================================
-// T009 — In-memory value
+// In-memory value
 // =====================================================================
 
 /// A single arbitrary-precision decimal value.
@@ -507,7 +501,7 @@ impl DecimalArbValue {
     /// Canonical decimal string in non-exponent form (e.g. `"100"`, not
     /// `"1e+2"`). Round-trips through `from_str`. This matches the wire
     /// format expected by Postgres `NUMERIC`, ClickHouse `String`, and JSON
-    /// digit-string consumers per `contracts/arrow-extension-type.md` §8.
+    /// digit-string consumers.
     pub fn to_canonical_string(&self) -> String {
         self.0.to_plain_string()
     }
@@ -570,16 +564,16 @@ impl Hash for DecimalArbValue {
 
 impl std::fmt::Display for DecimalArbValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Use the plain (non-exponent) form for consistency with FR-017 and
-        // the wire format expected by Postgres / JSON.
+        // Use the plain (non-exponent) form for consistency with the
+        // canonical string form and the wire format expected by Postgres / JSON.
         f.write_str(&self.0.to_plain_string())
     }
 }
 
 // =====================================================================
-// Canonical byte encoding (required by T010 builder/array)
+// Canonical byte encoding (required by the builder/array)
 //
-// Per `contracts/arrow-extension-type.md` §3:
+// Canonical byte layout:
 //
 //     [sign_byte][big-endian magnitude bytes]
 //
@@ -660,13 +654,12 @@ impl DecimalArbValue {
 }
 
 // =====================================================================
-// T010 — DecimalArbArrayBuilder + DecimalArbArray
+// DecimalArbArrayBuilder + DecimalArbArray
 // =====================================================================
 
 /// Builder for a `DecimalArbArray`. Carries the column's declared
 /// `(precision, scale)` and validates each appended value against them
-/// per FR-013 (overflow surfaces as actionable error citing column name
-/// and value).
+/// (overflow surfaces as an actionable error citing column name and value).
 pub struct DecimalArbArrayBuilder {
     column: String,
     precision: u32,
@@ -707,7 +700,7 @@ impl DecimalArbArrayBuilder {
     }
 
     /// Append a `DecimalArbValue`. Validates against declared
-    /// `(precision, scale)` per FR-013 before encoding.
+    /// `(precision, scale)` before encoding.
     pub fn append_value(&mut self, value: &DecimalArbValue) -> Result<()> {
         value.check_fits(self.precision, self.scale, &self.column)?;
         let bytes = value.to_canonical_bytes_at_scale(self.scale);
@@ -731,7 +724,7 @@ impl DecimalArbArrayBuilder {
 }
 
 /// Arrow array of `decimal_arb` values. Wraps a `LargeBinaryArray` whose
-/// payload is the canonical byte format from `arrow-extension-type.md` §3.
+/// payload is the canonical byte format described above.
 /// Carries the declared `(precision, scale)` so per-value decoding is
 /// possible without consulting the source `Field`.
 pub struct DecimalArbArray {
@@ -800,7 +793,7 @@ impl DecimalArbArray {
 }
 
 // =====================================================================
-// T011 — Arrow array conversions (FR-009 casts)
+// Arrow array conversions (casts)
 //
 // All conversions go through `DecimalArbValue` so we inherit canonical
 // equality, validation against `(precision, scale)`, and half-to-even
@@ -870,7 +863,7 @@ impl DecimalArbArray {
     /// Narrow this array to `Decimal128(target_precision, target_scale)`.
     /// Each value is half-to-even rounded to `target_scale` and validated
     /// to fit `target_precision` (max 38). Out-of-range values surface
-    /// FR-013 errors that name the column and value. NULLs preserved.
+    /// errors that name the column and value. NULLs preserved.
     pub fn to_decimal128(
         &self,
         target_precision: u8,
@@ -1077,10 +1070,10 @@ fn arrow_i256_fits_precision(value: ArrowI256, precision: u8) -> bool {
 }
 
 // =====================================================================
-// T012 — Custom row sort encoding for sort correctness on signed values
+// Custom row sort encoding for sort correctness on signed values
 //
-// Per research R5: bytewise compare on the canonical encoding is wrong for
-// negatives (sign byte 0xFF sorts after 0x00). The function below converts
+// Bytewise compare on the canonical encoding is wrong for negatives
+// (sign byte 0xFF sorts after 0x00). The function below converts
 // a canonical-bytes payload into a sort key whose bytewise comparison
 // reproduces numeric order across signs, magnitudes, and lengths.
 // =====================================================================
@@ -1258,7 +1251,7 @@ mod tests {
     #[test]
     fn ordering_works_for_negative_values() {
         // i256-style sort bug regression guard at the value level. The full
-        // bytewise-sort guard lands with T012 (custom Row encoding).
+        // bytewise-sort guard lives with the custom Row encoding below.
         let neg = DecimalArbValue::from_str("-100").unwrap();
         let zero = DecimalArbValue::from_str("0").unwrap();
         let pos = DecimalArbValue::from_str("100").unwrap();
@@ -1479,7 +1472,7 @@ mod tests {
         assert_eq!(decoded.to_canonical_string(), s);
     }
 
-    // ------- T011: Arrow array conversions -------
+    // ------- Arrow array conversions -------
 
     fn build(column: &str, precision: u32, scale: u32, values: &[Option<&str>]) -> DecimalArbArray {
         let mut b =
@@ -1631,7 +1624,7 @@ mod tests {
         assert!(DecimalArbArray::from_string_array(&strings, 10, 0, "x").is_err());
     }
 
-    // ------- T012: sort key encoding (i256-bug regression guard) -------
+    // ------- sort key encoding (i256-bug regression guard) -------
 
     #[test]
     fn sort_key_orders_negatives_then_positives() {
@@ -1695,7 +1688,7 @@ mod tests {
         assert!(kn2 < kn1);
     }
 
-    // ------- T002/T003: native_int_kind hint -------
+    // ------- native_int_kind hint -------
 
     #[test]
     fn native_int_kind_round_trips_through_field_metadata() {

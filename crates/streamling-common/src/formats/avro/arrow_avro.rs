@@ -1321,7 +1321,7 @@ mod tests {
     // Equivalence check (#5): the decimal byte reinterpretation must match the vendored
     // `resolve_decimal(_256)` two's-complement handling exactly (the functions were extracted
     // from them). Locks in the concrete byte→value contract. The former `u256_be_bytes` /
-    // `i256_be_bytes` assertions went away with the u256/i256 types (feature 002); wide values
+    // `i256_be_bytes` assertions went away with the u256/i256 types; wide values
     // now reinterpret through `binary_to_decimal_arb`, covered below.
     #[test]
     fn decimal_byte_reinterpretation_is_twos_complement() {
@@ -1526,7 +1526,7 @@ mod tests {
     // scaled Utf8.
     #[test]
     fn fixed_backed_high_precision_decimals_decode() {
-        // -- wide decimal_arb on fixed(32), top level (was u256 before feature 002) --
+        // -- wide decimal_arb on fixed(32), top level (previously u256) --
         const WIDE_FIXED: &str = r#"{"type":"record","name":"R","fields":[{"name":"v","type":{"type":"fixed","name":"F32","size":32,"logicalType":"decimal","precision":100,"scale":0}}]}"#;
         let mut payload = [0u8; 32];
         payload[0] = 0x0A;
@@ -1554,8 +1554,8 @@ mod tests {
             DecimalArbValue::from_bigint_and_scale(BigInt::from_signed_bytes_be(&payload), 0);
         assert_eq!(decoded, expected, "fixed-backed wide decimal round-trips");
 
-        // -- nested decimal on fixed(32) inside a record: target decimal_arb (was
-        // Decimal128(100, 0) before feature 002 routed nested wide decimals losslessly) --
+        // -- nested decimal on fixed(32) inside a record: target decimal_arb (previously
+        // Decimal128(100, 0), before nested wide decimals routed losslessly) --
         const NESTED_FIXED: &str = r#"{"type":"record","name":"R","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[{"name":"amt","type":{"type":"fixed","name":"FA","size":32,"logicalType":"decimal","precision":100,"scale":0}}]}}]}"#;
         let mut amt = [0u8; 32];
         amt[30] = 0x04; // 0x04D2 == 1234
@@ -1596,8 +1596,8 @@ mod tests {
         let amt_val = DecimalArbValue::from_canonical_bytes_at_scale(amt_col.value(0), 0).unwrap();
         assert_eq!(amt_val.to_canonical_string(), "1234");
 
-        // -- scaled (precision 85, scale 4) on fixed(32): target decimal_arb (was a Utf8
-        // decimal string before feature 002) --
+        // -- scaled (precision 85, scale 4) on fixed(32): target decimal_arb (previously a
+        // Utf8 decimal string) --
         const SCALED_FIXED: &str = r#"{"type":"record","name":"R","fields":[{"name":"amt","type":{"type":"fixed","name":"FS","size":32,"logicalType":"decimal","precision":85,"scale":4}}]}"#;
         let mut unscaled = [0u8; 32];
         unscaled[29] = 0x12; // 0x12D687 == 1234567 -> "123.4567" at scale 4
@@ -1624,8 +1624,8 @@ mod tests {
 
     // Regression (Bugbot): a top-level decimal with precision > 76 AND non-zero scale is too wide
     // for Decimal256. arrow-avro decodes the stripped decimal as raw bytes; a generic Binary→Utf8
-    // cast would yield garbage. Before feature 002 the decode path formatted it as a scale-aware
-    // Utf8 decimal string; it now lands as `streamling.decimal_arb` (FR-018), keeping numeric
+    // cast would yield garbage. The decode path previously formatted it as a scale-aware
+    // Utf8 decimal string; it now lands as `streamling.decimal_arb`, keeping numeric
     // semantics instead of degrading to text. Either way, raw bytes must never leak through.
     #[test]
     fn scaled_high_precision_decimal_decodes_to_decimal_arb() {

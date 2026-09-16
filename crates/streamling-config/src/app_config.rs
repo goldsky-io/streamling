@@ -452,7 +452,7 @@ impl<'de> SerdeDeserialize<'de> for GzipCompressionLevel {
 ///         coerce_to: string
 /// ```
 ///
-/// `coerce_to: string` is the FR-019 opt-in for emitting a wide-precision
+/// `coerce_to: string` is the opt-in for emitting a wide-precision
 /// decimal_arb column to a destination that cannot hold it natively
 /// (e.g. ClickHouse `Decimal` capped at 76 digits). Without the
 /// directive, the pipeline is rejected at config load.
@@ -1588,7 +1588,7 @@ password: ""
         );
     }
 
-    // ------- T062: ColumnDirective YAML parsing -------
+    // ------- ColumnDirective YAML parsing -------
 
     #[test]
     fn parse_clickhouse_config_with_column_directives() {

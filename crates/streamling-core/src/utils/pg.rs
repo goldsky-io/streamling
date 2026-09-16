@@ -1,8 +1,8 @@
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
 use crate::types::decimal_arb::DecimalArbType;
-// Feature 002 (Retire U256/I256): U256/I256 imports removed; wide-int
-// values flow through decimal_arb. Postgres NUMERIC(78, 0) source columns
+// The U256/I256 imports are gone; wide-int values flow through
+// decimal_arb. Postgres NUMERIC(78, 0) source columns
 // are auto-promoted to decimal_arb(78, 0) + native_int_kind=u256 in
 // `postgres_type_to_arrow_field` above.
 use crate::utils::parse_primary_key_columns;
@@ -173,7 +173,7 @@ pub struct PostgresTypeInfo {
 /// Get PostgreSQL type information for an Arrow field
 /// This is the single source of truth for Arrow → PostgreSQL type mapping
 pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
-    // Feature 002 (Retire U256/I256): decimal_arb fields with the
+    // decimal_arb fields with the
     // `streamling.decimal_arb` extension metadata route to
     // `NUMERIC(p, s)`. Pre-checked before the LargeBinary catch-all so
     // wide-integer columns don't fall through to BYTEA.
@@ -337,7 +337,7 @@ fn parse_numeric_params(pg_type_lower: &str, pg_type: &str) -> Result<(u32, i32)
 
 /// Convert PostgreSQL type string to Arrow `DataType`.
 ///
-/// Routing for `NUMERIC(p, s)` / `DECIMAL(p, s)` (FR-018):
+/// Routing for `NUMERIC(p, s)` / `DECIMAL(p, s)`:
 /// - `p ≤ 38`            → `Decimal128(p, s)`
 /// - `38 < p ≤ 76`       → `Decimal256(p, s)`
 /// - `p > 76`            → `LargeBinary` (the storage type for `streamling.decimal_arb`)
@@ -435,13 +435,13 @@ pub fn postgres_type_to_arrow_field(pg_type: &str, name: &str, nullable: bool) -
                 )));
             }
             let field = DecimalArbType::field(name, precision, scale as u32, nullable)?;
-            // Feature 002: NUMERIC(78, 0) is the conventional unsigned
+            // NUMERIC(78, 0) is the conventional unsigned
             // 256-bit storage shape (Ethereum uint256 in blockchain data).
             // Stamp the u256 hint so ClickHouse sinks downstream can emit
             // UInt256 natively (preserving storage compactness on existing
             // wide-int tables). Postgres NUMERIC has no native unsigned
-            // distinction, so no equivalent i256 path on this side — see
-            // contracts/postgres-wide-int.md §"Why no i256 hint".
+            // distinction, so there is no equivalent i256 path on this
+            // side.
             if precision == 78 && scale == 0 {
                 return DecimalArbType::with_native_int_kind(
                     field,
@@ -811,8 +811,8 @@ mod tests {
         );
     }
 
-    // Feature 002: tests for U256/I256 → NUMERIC(78, 0) deleted along
-    // with the retired types. Wide-integer fields now arrive as decimal_arb
+    // The U256/I256 → NUMERIC(78, 0) tests were deleted along with the
+    // retired types. Wide-integer fields now arrive as decimal_arb
     // and route through the decimal_arb branch in get_postgres_type_info.
     #[test]
     fn test_decimal_arb_78_0_maps_to_numeric_78_0() {
@@ -973,9 +973,9 @@ mod tests {
         }
     }
 
-    // ------- T015: postgres_type_to_arrow_type / _to_arrow_field routing -------
+    // ------- postgres_type_to_arrow_type / _to_arrow_field routing -------
     //
-    // Regression guard for FR-018: prior to this fix, `NUMERIC(p, s)` with
+    // Regression guard: prior to this fix, `NUMERIC(p, s)` with
     // `p > 38` would return `Decimal128(p, s)` which violates Arrow's max
     // Decimal128 precision (38). The fix routes by precision band:
     //   p ≤ 38 → Decimal128, 38 < p ≤ 76 → Decimal256, p > 76 → decimal_arb.
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn numeric_above_decimal128_routes_to_decimal256_when_within_76() {
-        // FR-018: `NUMERIC(50, 10)` previously produced an invalid
+        // `NUMERIC(50, 10)` previously produced an invalid
         // Decimal128(50, 10); now it routes to Decimal256.
         let dt = postgres_type_to_arrow_type("NUMERIC(50, 10)").unwrap();
         assert_eq!(dt, DataType::Decimal256(50, 10));
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn numeric_exceeding_decimal256_routes_to_decimal_arb_storage() {
-        // FR-018: `NUMERIC(100, 18)` previously produced an invalid
+        // `NUMERIC(100, 18)` previously produced an invalid
         // Decimal128(100, 18); now it routes to the decimal_arb storage type.
         let dt = postgres_type_to_arrow_type("NUMERIC(100, 18)").unwrap();
         assert_eq!(dt, DataType::LargeBinary);

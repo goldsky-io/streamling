@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use streamling_core::error::{ResultExt, StreamlingError};
 // ReverseBytes32Func retired with U256/I256 endian-flip path.
 use streamling_core::streamling_err;
-// Feature 002 (Retire U256/I256): U256/I256 imports removed; wide
-// integers flow through decimal_arb + native_int_kind hint. ClickHouse
+// The U256/I256 imports are gone; wide integers flow through
+// decimal_arb + the native_int_kind hint. ClickHouse
 // UInt256/Int256 sink emission lives in `clickhouse_column_type` and
 // `decimal_arb_to_clickhouse_native` below.
 use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
@@ -2663,8 +2663,8 @@ impl ClickHouseClient {
             .fields()
             .iter()
             .map(|field| {
-                // Feature 002 (Retire U256/I256): a decimal_arb column with
-                // a native_int_kind hint round-trips to ClickHouse via its
+                // A decimal_arb column with a native_int_kind hint
+                // round-trips to ClickHouse via its
                 // first-class UInt256/Int256 native types. ClickHouse wire
                 // format expects 32 LE bytes; normalize the Arrow shape from
                 // LargeBinary (decimal_arb canonical) to FixedSizeBinary(32)
@@ -2807,13 +2807,13 @@ impl ClickHouseClient {
                         Ok(cast(column.as_ref(), &DataType::Binary)
                             .streamling_context("failed to cast BinaryView to Binary")?)
                     }
-                    // Feature 002 (Retire U256/I256): the FSB(32)+U256/I256
-                    // endian-flip arm is gone — no source produces those
+                    // The FSB(32)+U256/I256 endian-flip arm is gone —
+                    // no source produces those
                     // fields anymore. Wide-int columns now flow as decimal_arb
                     // LargeBinary; the next arm converts them to FSB(32) LE
                     // via the canonical encoding path.
 
-                    // Feature 002: decimal_arb LargeBinary with native_int_kind
+                    // decimal_arb LargeBinary with a native_int_kind
                     // hint → ClickHouse-native UInt256/Int256 storage.
                     // Convert canonical decimal_arb bytes (sign byte + BE
                     // magnitude) into 32-byte little-endian for ClickHouse.
@@ -2876,7 +2876,7 @@ impl ClickHouseClient {
     /// inner-field-name differences (e.g. ClickHouse's `item` vs Kafka/Avro's
     /// `element`); forcing target_schema onto every column would reject those
     /// List columns at `RecordBatch::try_new`.
-    /// Read-side mirror of `decimal_arb_to_clickhouse_native` (feature 002).
+    /// Read-side mirror of `decimal_arb_to_clickhouse_native`.
     ///
     /// ClickHouse stores `UInt256` / `Int256` little-endian and emits them as
     /// `FixedSizeBinary(32)` with no streamling extension metadata. Streamling's
@@ -3278,16 +3278,16 @@ impl ClickHouseClient {
     }
 
     /// Top-level entry point: map an Arrow `Field` to a ClickHouse column
-    /// type, consulting the optional column directive for FR-019
-    /// `coerce_to: string` opt-in and the capability matrix from T032.
+    /// type, consulting the optional column directive for the
+    /// `coerce_to: string` opt-in and the connector capability matrix.
     ///
     /// Returns:
     /// - `Ok("Decimal(p, s)")` for `decimal_arb` columns where ClickHouse
     ///   can natively hold the declared precision (≤76).
     /// - `Ok("String")` for wider `decimal_arb` columns when the user has
-    ///   set `coerce_to: string` on this column (explicit FR-019 opt-in).
+    ///   set `coerce_to: string` on this column (an explicit opt-in).
     /// - `Err(...)` for wider `decimal_arb` columns without the opt-in
-    ///   (FR-011: pipeline rejected at config load with an actionable
+    ///   (the pipeline is rejected at config load with an actionable
     ///   error naming the column, the destination, the declared
     ///   `(precision, scale)`, and the remediation hint).
     /// - For all other types, delegates to [`arrow_field_to_clickhouse`].
@@ -3319,7 +3319,7 @@ impl ClickHouseClient {
             ));
         }
 
-        // Feature 002: also recognize the normalized-FSB(32) shape from
+        // Also recognize the normalized-FSB(32) shape from
         // `normalize_schema_for_clickhouse`. Those fields carry the
         // decimal_arb extension metadata + native_int_kind hint even
         // though the data_type is FixedSizeBinary(32). `is_decimal_arb_field`
@@ -3421,7 +3421,7 @@ impl ClickHouseClient {
                 // decimal_arb is encoded as LargeBinary + extension metadata.
                 // Route narrow-precision (≤76) columns to ClickHouse Decimal
                 // here. Wider columns are rejected at config load by the
-                // pipeline-startup validator (T033/T064) when no
+                // pipeline-startup validator when no
                 // `coerce_to: string` directive is present, so reaching this
                 // arm with `p > 76` only happens via direct callers (e.g.
                 // tests). The directive-aware emission path lives in
@@ -3439,9 +3439,9 @@ impl ClickHouseClient {
                 "String".to_string()
             }
             arrow::datatypes::DataType::FixedSizeBinary(size) => {
-                // Feature 002 (Retire U256/I256): FSB(32)+U256/I256-metadata
-                // fields no longer exist after the Phase 3 source routing
-                // flip. The decimal_arb hint-aware UInt256/Int256 emission
+                // FSB(32)+U256/I256-metadata fields no longer exist now
+                // that sources route wide integers through decimal_arb.
+                // The decimal_arb hint-aware UInt256/Int256 emission
                 // lives in `clickhouse_column_type` (the directive-aware
                 // top-level entry point).
                 format!("FixedString({})", size)
@@ -4225,8 +4225,8 @@ mod tests {
         );
     }
 
-    // Feature 002 (Retire U256/I256): U256/I256-specific tests deleted with
-    // the retired types. UInt256/Int256 emission for hinted decimal_arb
+    // The U256/I256-specific tests were deleted with the retired types.
+    // UInt256/Int256 emission for hinted decimal_arb
     // columns is covered by `clickhouse_column_type_native_for_decimal_arb*`
     // and `build_create_table_query_emits_*` tests below.
     #[test]
@@ -4351,7 +4351,7 @@ mod tests {
         );
     }
 
-    // ------- T059 hard-rejection: clickhouse_column_type -------
+    // ------- hard-rejection: clickhouse_column_type -------
 
     #[test]
     fn clickhouse_column_type_native_for_decimal_arb_within_cap() {
@@ -5783,7 +5783,7 @@ mod schema_overrides {
 }
 
 // ============================================================================
-// Feature 002 (Retire U256/I256): decimal_arb → ClickHouse native byte format
+// decimal_arb → ClickHouse native byte format
 // ============================================================================
 
 /// Convert a column of `decimal_arb` values (canonical encoding: sign byte
@@ -5798,8 +5798,8 @@ mod schema_overrides {
 /// - **U256**: rows must be non-negative (sign byte = `0x00`). Magnitude
 ///   bytes are padded left with zeros to exactly 32 bytes BE, then
 ///   reversed to produce 32 LE bytes. A negative value with the U256 hint
-///   is a contract violation (decimal_arb invariant from data-model.md
-///   §E1) — surfaces a clear error naming the column and row index.
+///   violates the decimal_arb hint invariant — it surfaces a clear error
+///   naming the column and row index.
 /// - **I256**: rows may be negative (sign byte = `0xFF`). Negative
 ///   values are two's-complemented (invert magnitude, add 1) to produce
 ///   the 256-bit signed BE representation; then reversed to LE. Non-

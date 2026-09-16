@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(restored_batch.schema(), target_schema);
     }
 
-    // ------- T031: decimal_arb survives Arrow IPC round-trip -------
+    // ------- decimal_arb survives Arrow IPC round-trip -------
     //
     // The IPC writer leaves non-u256/i256 fields untouched and Arrow IPC
     // preserves field metadata natively, so decimal_arb columns flow through

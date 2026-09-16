@@ -258,9 +258,9 @@ impl HybridTableProvider {
         // The same `Telemetry` is forwarded to both inner phases (bounded
         // ClickHouse + unbounded Kafka). The user is responsible for
         // choosing a column name that exists in both schemas; if it doesn't
-        // exist on one side, that phase's `EventTimeReader` will warn-once
-        // per R5a and the other phase keeps emitting normally. Each inner
-        // phase emits under its own `metric_key_hybrid_src_*` suffix (R9),
+        // exist on one side, that phase's `EventTimeReader` warns once and
+        // the other phase keeps emitting normally. Each inner
+        // phase emits under its own `metric_key_hybrid_src_*` suffix,
         // so bounded vs unbounded series are tag-distinguishable downstream.
         telemetry: Option<&Telemetry>,
         // One scope covers the hybrid's own helper tasks and both inner
@@ -1852,9 +1852,9 @@ impl ClickHouseSchemaAdapter {
     /// - `Ok("Decimal(p, s)")` for `decimal_arb` columns where the
     ///   declared precision (≤76) fits ClickHouse's native decimal range.
     /// - `Ok("String")` for wider `decimal_arb` columns when the user has
-    ///   set `coerce_to: string` on this column (explicit FR-019 opt-in).
+    ///   set `coerce_to: string` on this column (an explicit opt-in).
     /// - `Err(...)` for wider `decimal_arb` columns without the opt-in
-    ///   (FR-011: pipeline rejected at config load with an actionable
+    ///   (the pipeline is rejected at config load with an actionable
     ///   error naming the column, the destination, the declared
     ///   `(precision, scale)`, and the remediation hint).
     /// - For all other types, delegates to
@@ -1865,8 +1865,8 @@ impl ClickHouseSchemaAdapter {
     /// never silently route to `String`.
     ///
     /// Currently only consumed by unit tests; the pipeline-startup
-    /// validator wiring is the deferred follow-up tracked alongside
-    /// `clickhouse_column_type` in T064.
+    /// validator wiring is a deferred follow-up tracked alongside
+    /// `clickhouse_column_type`.
     #[allow(dead_code)]
     pub fn hybrid_column_type(
         field: &arrow::datatypes::Field,
@@ -2246,7 +2246,7 @@ mod tests {
         );
     }
 
-    // ------- T052 hard-rejection: hybrid_column_type -------
+    // ------- hard-rejection: hybrid_column_type -------
 
     #[test]
     fn hybrid_column_type_native_for_decimal_arb_within_cap() {

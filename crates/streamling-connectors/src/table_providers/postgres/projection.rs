@@ -10,11 +10,11 @@ use streamling_core::functions::decimal_arb_ops::{
 use streamling_core::functions::json_string::JsonStringFunc;
 use streamling_core::types::decimal_arb::DecimalArbType;
 use streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind;
-// Feature 002 (Retire U256/I256): U256/I256 imports removed; only
+// The retired U256/I256 imports are gone; only
 // decimal_arb and nested types need projection to Utf8 for PG insert.
 
 /// Build projection expressions to convert decimal_arb and nested types to
-/// Utf8 for PostgreSQL insertion. (U256/I256 paths retired in feature 002.)
+/// Utf8 for PostgreSQL insertion. (The U256/I256 paths are retired.)
 pub fn build_projection_for_postgres(
     state: &dyn Session,
     input: Arc<dyn ExecutionPlan>,

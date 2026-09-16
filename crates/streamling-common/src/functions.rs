@@ -24,9 +24,9 @@ use crate::functions::from_base58::create_from_base58_udf;
 use crate::functions::generate_series::GenerateSeriesFunc;
 use crate::functions::gs_map_to_array_struct::create_gs_map_to_array_struct_udf;
 use crate::functions::hex_to_byte::HexToByteFunc;
-// Feature 002 (Retire U256/I256): u256_ops / i256_ops UDFs removed. Wide
-// integers now flow through decimal_arb's UDF surface (decimal_arb_add,
-// decimal_arb_to_string, etc., registered below).
+// The u256_ops / i256_ops UDFs have been removed. Wide integers now flow
+// through decimal_arb's UDF surface (decimal_arb_add, decimal_arb_to_string,
+// etc., registered below).
 use crate::functions::json_objects_to_clickhouse_tuples::JsonObjectsToClickhouseTuplesFunc;
 use crate::functions::keccak256::Keccak256Func;
 use crate::functions::now::VolatileNowFunc;
@@ -59,14 +59,14 @@ pub mod from_base58;
 pub mod generate_series;
 pub mod gs_map_to_array_struct;
 pub mod hex_to_byte;
-// Feature 002: i256_ops module deleted alongside the I256Type retirement.
+// The i256_ops module was deleted alongside the I256Type retirement.
 pub mod json_objects_to_clickhouse_tuples;
 pub mod json_string;
 pub mod keccak256;
 pub mod now;
 pub mod split_string_to_array;
 pub mod to_large_list;
-// Feature 002: u256_ops module deleted alongside the U256Type retirement.
+// The u256_ops module was deleted alongside the U256Type retirement.
 pub mod util;
 pub mod uuid7;
 pub mod xxhash;
@@ -100,10 +100,10 @@ impl CommonFunctions {
             ScalarUDF::from(ByteToHexFunc::new()),
             ScalarUDF::from(ReverseBytes32Func::new()),
             create_gs_map_to_array_struct_udf(),
-            // U256/I256 UDFs retired in feature 002. Wide-int arithmetic
-            // and conversion now happens through the decimal_arb UDFs below.
+            // The U256/I256 UDFs are retired. Wide-int arithmetic and
+            // conversion now happens through the decimal_arb UDFs below.
             ScalarUDF::from(Uuid7Func::new()),
-            // decimal_arb functions (US1 sink-side helper + US2 arithmetic)
+            // decimal_arb functions (sink-side helpers + arithmetic)
             ScalarUDF::from(DecimalArbToStringFunc::new()),
             ScalarUDF::from(DecimalArbRescaleFunc::new()),
             ScalarUDF::from(DecimalArbRestampFunc::new()),
@@ -120,16 +120,16 @@ impl CommonFunctions {
             ScalarUDF::from(DecimalArbModFunc::new()),
             ScalarUDF::from(DecimalArbNegFunc::new()),
             ScalarUDF::from(DecimalArbAbsFunc::new()),
-            // decimal_arb comparisons (US2 / T043)
+            // decimal_arb comparisons
             ScalarUDF::from(DecimalArbEqFunc::new()),
             ScalarUDF::from(DecimalArbNeqFunc::new()),
             ScalarUDF::from(DecimalArbLtFunc::new()),
             ScalarUDF::from(DecimalArbLteFunc::new()),
             ScalarUDF::from(DecimalArbGtFunc::new()),
             ScalarUDF::from(DecimalArbGteFunc::new()),
-            // decimal_arb sort-key helper (US2 / T046 partial)
+            // decimal_arb sort-key helper
             ScalarUDF::from(DecimalArbSortKeyFunc::new()),
-            // decimal_arb cast UDFs (US4 / T068)
+            // decimal_arb cast UDFs
             ScalarUDF::from(ToDecimalArbFromStringFunc::new()),
             ScalarUDF::from(ToDecimalArbFromDecimal128Func::new()),
             ScalarUDF::from(ToDecimalArbFromDecimal256Func::new()),

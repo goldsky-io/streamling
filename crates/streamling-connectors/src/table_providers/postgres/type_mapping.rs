@@ -2,7 +2,7 @@ use arrow_schema::Field;
 use datafusion::arrow::datatypes::DataType;
 use streamling_core::types::decimal_arb::DecimalArbType;
 use streamling_core::types::decimal_arb_legacy::{LEGACY_WIDE_INT_PRECISION, legacy_wide_int_kind};
-// Feature 002 (Retire U256/I256): U256/I256 imports removed.
+// The retired U256/I256 types no longer need imports here.
 
 /// PostgreSQL type information for an Arrow field
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,10 +17,6 @@ pub struct PostgresTypeInfo {
 /// Get PostgreSQL type information for an Arrow field
 /// This is the single source of truth for Arrow → PostgreSQL type mapping
 pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
-    // Feature 002 (Retire U256/I256): FSB(32)+U256/I256-metadata fields
-    // no longer arrive here after the Phase 3 routing flip. Wide integers
-    // flow through the decimal_arb branch below.
-
     // decimal_arb (LargeBinary + extension metadata) becomes NUMERIC(precision, scale).
     // Scale-aligned canonical bytes are pre-projected to canonical decimal strings
     // by `build_projection_for_postgres`, so the bind path sees Utf8 here.
@@ -181,7 +177,7 @@ mod tests {
         assert_eq!(info.string_cast_sql, Some("numeric(30,6)".to_string()));
     }
 
-    // Feature 002: U256/I256 mapping tests deleted with the retired types.
+    // U256/I256 mapping tests were deleted with the retired types.
     // Wide-int columns now route via the decimal_arb mapping test below.
 
     #[test]

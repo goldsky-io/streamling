@@ -1,11 +1,10 @@
 //! Scalar UDFs for the `streamling.decimal_arb` extension type.
 //!
-//! See `specs/001-decimal-arbitrary-precision/contracts/scalar-udf-signatures.md`
-//! for signatures and `research.md` (R3) for the planner-integration choice
-//! that lets DataFusion's native operator surface dispatch here.
+//! An `ExprPlanner` lets DataFusion's native operator surface dispatch to
+//! these UDFs — see `decimal_arb_coercion.rs`.
 //!
-//! Most ScalarUDFs land in US2 (T042–T045). This module currently exposes
-//! the one helper sinks need today:
+//! Beyond the arithmetic and comparison UDFs, this module exposes the one
+//! helper sinks need today:
 //!
 //! - `DecimalArbToStringFunc` (`decimal_arb_to_string`) — converts a
 //!   `LargeBinary` decimal_arb column into a `Utf8` column of canonical
@@ -42,8 +41,7 @@ fn cap_precision(p: u32) -> u32 {
     p.min(MAX_PRECISION)
 }
 
-/// Compute output `(precision, scale)` for the given binary op kind per
-/// `data-model.md` E5 rules.
+/// Compute output `(precision, scale)` for the given binary op kind.
 #[derive(Debug, Clone, Copy)]
 enum BinaryOpKind {
     Add,
@@ -602,7 +600,7 @@ decimal_arb_cmp_op!(DecimalArbGteFunc, "decimal_arb_gte", |o: Ordering| o
 /// decimal strings.
 ///
 /// The function reads the column's declared `scale` from the input Field's
-/// extension metadata (per `contracts/arrow-extension-type.md` §2). Without
+/// extension metadata. Without
 /// the metadata the function errors — the caller must thread the metadata
 /// through (see `postgres/projection.rs` for the typical wiring).
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -705,7 +703,7 @@ impl ScalarUDFImpl for DecimalArbToStringFunc {
 }
 
 // =====================================================================
-// Sort-key projection (T046)
+// Sort-key projection
 //
 // Bytewise sort on canonical decimal_arb bytes is *wrong* for negatives
 // (sign byte 0xFF sorts after 0x00). The `decimal_arb_to_sort_key`
@@ -783,22 +781,23 @@ impl ScalarUDFImpl for DecimalArbSortKeyFunc {
 }
 
 // =====================================================================
-// Cast UDFs (US4 / T068)
+// Cast UDFs
 //
 // Widening (always lossless):
 //   to_decimal_arb_from_string(text, precision, scale) -> decimal_arb(p, s)
 //   to_decimal_arb_from_decimal128(value)              -> decimal_arb(p, s)  // (p, s) inherited
 //   to_decimal_arb_from_decimal256(value)              -> decimal_arb(p, s)  // (p, s) inherited
 //
-// Narrowing (half-to-even rounding for excess scale; FR-013 error on
+// Narrowing (half-to-even rounding for excess scale; error on
 // out-of-range integer digits):
 //   decimal_arb_to_decimal128(value, precision, scale) -> Decimal128(p, s)
 //   decimal_arb_to_decimal256(value, precision, scale) -> Decimal256(p, s)
 //
-// `decimal_arb_to_string` ships with US1 (T027) — no need to add a cast.
+// `decimal_arb_to_string` already covers the text direction — no need to
+// add a cast for it.
 //
 // Float and Int8/16/32 directions remain to be wrapped on demand;
-// the DecimalArbArray helpers (T011) already exist for them.
+// the DecimalArbArray helpers already exist for them.
 // =====================================================================
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1302,8 +1301,8 @@ impl ScalarUDFImpl for ToDecimalArbFromDecimal256Func {
 
 /// `to_decimal_arb_from_int(value, precision_lit, scale_lit)` — converts
 /// any signed/unsigned integer column into `decimal_arb(p, s)`. Lossless
-/// when the value's magnitude fits the declared precision (FR-013 error
-/// otherwise). The integer is treated as having scale 0; declared `scale`
+/// when the value's magnitude fits the declared precision (an error is
+/// raised otherwise). The integer is treated as having scale 0; declared `scale`
 /// just becomes the column's storage scale (the value is padded
 /// internally on encoding).
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -2754,7 +2753,7 @@ mod tests {
         assert!(func.invoke_with_args(args).is_err());
     }
 
-    // ------- T034 / T042: arithmetic UDFs -------
+    // ------- arithmetic UDFs -------
 
     fn build_decimal_arb_array(
         precision: u32,
@@ -3076,7 +3075,7 @@ mod tests {
         assert_eq_at(lba, 2, 2, "0");
     }
 
-    // ------- T035 / T043: comparison UDFs -------
+    // ------- comparison UDFs -------
 
     fn invoke_cmp(
         func: &dyn ScalarUDFImpl,
@@ -3234,7 +3233,7 @@ mod tests {
         );
     }
 
-    // ------- T068: cast UDFs (minimal slice) -------
+    // ------- cast UDFs (minimal slice) -------
 
     #[test]
     fn to_decimal_arb_from_string_parses_at_declared_precision_scale() {
@@ -3343,7 +3342,7 @@ mod tests {
         assert!(func.invoke_with_args(args).is_err());
     }
 
-    // ------- T068 cast widening: Decimal128/256 -> decimal_arb -------
+    // ------- cast widening: Decimal128/256 -> decimal_arb -------
 
     #[test]
     fn from_decimal128_widens_losslessly() {
@@ -3424,7 +3423,7 @@ mod tests {
         assert!(func.return_field_from_args(ret_args).is_err());
     }
 
-    // ------- T068 cast narrowing: decimal_arb -> Decimal128/256 -------
+    // ------- cast narrowing: decimal_arb -> Decimal128/256 -------
 
     fn invoke_to_decimal128(
         arb: LargeBinaryArray,
@@ -3539,7 +3538,7 @@ mod tests {
         assert!(!dec.is_null(0));
     }
 
-    // ------- T068 widening: from_int -------
+    // ------- widening: from_int -------
 
     fn run_from_int(
         func: &ToDecimalArbFromIntFunc,
@@ -3671,7 +3670,7 @@ mod tests {
         assert!(func.return_field_from_args(ret_args).is_err());
     }
 
-    // ------- Feature 002: native_int_kind hint propagation through ops -------
+    // ------- native_int_kind hint propagation through ops -------
     //
     // These tests lock the *current* behavior: `build_output_field` calls
     // `DecimalArbType::field(...)` which produces a fresh field with the
@@ -3684,7 +3683,7 @@ mod tests {
     // value goes through arithmetic, the result is no longer "the original
     // ClickHouse-side bytes," so dropping the hint and falling back to the
     // generic `Decimal(p, s)` (or `coerce_to: string`) sink path is the
-    // safe default. The data-model documents this behavior under E1.
+    // safe default.
 
     use crate::types::decimal_arb::NativeIntKind;
 

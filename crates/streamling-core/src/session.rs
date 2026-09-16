@@ -171,13 +171,13 @@ impl SessionManager {
             // its array-literal hook is reached (planners are consulted in
             // order and the first to plan wins); it also auto-binds native
             // +/-/*/`/`%/=/!=/</<=/>/`>=` to the decimal_arb ScalarUDFs when
-            // an operand is decimal_arb (T007/T005 spikes confirmed the wiring).
+            // an operand is decimal_arb.
             .with_expr_planners(decimal_arb_expr_planners())
             .with_physical_optimizer_rules(StreamlingPhysicalOptimizerRules::rules())
-            // T046: rewrite ORDER BY decimal_arb_col -> ORDER BY
+            // Rewrite ORDER BY decimal_arb_col -> ORDER BY
             // decimal_arb_to_sort_key(...) so DataFusion's bytewise
             // sort over the canonical encoding produces correct
-            // numeric ordering across signs (FR-005).
+            // numeric ordering across signs.
             .with_optimizer_rule(Arc::new(DecimalArbSortRewriteRule::new()))
             // Bring decimal_arb columns to one scale where DataFusion matches
             // rows on raw bytes: UNION branches and JOIN keys (incl. the
@@ -195,9 +195,9 @@ impl SessionManager {
             ctx.register_udf(udf);
         }
 
-        // T047: register decimal_arb aggregate UDAFs (override built-in
-        // sum/min/max/avg for decimal_arb input columns). The T007 spike
-        // confirmed register_udaf overrides the built-in for that name.
+        // Register decimal_arb aggregate UDAFs (override built-in
+        // sum/min/max/avg for decimal_arb input columns): register_udaf
+        // overrides the built-in for that name.
         ctx.register_udaf(DecimalArbSumUdaf::into_udaf());
         ctx.register_udaf(DecimalArbExtremeUdaf::min_udaf());
         ctx.register_udaf(DecimalArbExtremeUdaf::max_udaf());
@@ -541,7 +541,7 @@ mod tests {
     /// values through the full session — the decimal_arb `ExprPlanner` only
     /// rewrites binary ops, so this confirms CASE rides DataFusion's native
     /// coercion of the underlying `LargeBinary` without erroring. (Mirrors the
-    /// "does not kill the stream" u256 CASE test retired in feature 002.)
+    /// "does not kill the stream" u256 CASE test retired with the u256 type.)
     #[tokio::test]
     async fn case_over_decimal_arb_plans_and_selects_correct_values() {
         use crate::types::decimal_arb::DecimalArbValue;

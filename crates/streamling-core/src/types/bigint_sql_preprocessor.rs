@@ -266,8 +266,8 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
     // `CAST(decimal_arb_col AS TEXT|VARCHAR|STRING|UTF8|CHAR)` to
     // `decimal_arb_to_string(decimal_arb_col)` before the plan is built.
     //
-    // After feature 002 (Retire U256/I256), binary-op rewriting for
-    // wide integers happens at the LogicalPlan level via
+    // Binary-op rewriting for wide integers happens at the
+    // LogicalPlan level via
     // `DecimalArbExprPlanner` — no SQL-string rewriting needed.
 
     fn rewrite_setexpr(
@@ -879,8 +879,8 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                 .and_then(|m| m.as_str().parse().ok())
                 .unwrap_or(0);
             if precision > 76 && scale >= 0 {
-                // Feature 002 (Retire U256/I256): all wide-precision CASTs
-                // route through the decimal_arb cast UDFs. TRY_CAST is
+                // All wide-precision CASTs route through the decimal_arb
+                // cast UDFs. TRY_CAST is
                 // contractually non-throwing, so it takes the `try_` variant,
                 // which yields NULL for a value that does not parse or does
                 // not fit the declared type instead of failing the query.
@@ -1005,8 +1005,8 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                         _ => (0, -1),
                     };
                     if p > 76 && s >= 0 {
-                        // Feature 002 (Retire U256/I256): all wide-precision
-                        // CASTs route through the decimal_arb cast UDF. The
+                        // All wide-precision CASTs route through the
+                        // decimal_arb cast UDF. The
                         // legacy `to_u256` fast path for (p ≤ 78, 0) is
                         // retired alongside the U256/I256 types — those
                         // values now flow through decimal_arb end-to-end.
@@ -1084,8 +1084,8 @@ mod tests {
 
     #[test]
     fn test_preprocess_decimal_78_routes_to_decimal_arb() {
-        // Feature 002 (Retire U256/I256): CAST AS DECIMAL(78, 0) now routes
-        // through the decimal_arb cast UDF. The legacy `to_u256` fast path
+        // CAST AS DECIMAL(78, 0) routes through the decimal_arb cast
+        // UDF. The legacy `to_u256` fast path
         // is retired alongside the U256/I256 extension types.
         let sql = "SELECT CAST(balance AS DECIMAL(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_decimal_77_routes_to_decimal_arb() {
-        // Feature 002 (Retire U256/I256): see test_preprocess_decimal_78.
+        // See test_preprocess_decimal_78.
         let sql = "SELECT CAST(value AS DECIMAL(77, 0)) FROM data";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
@@ -1108,8 +1108,8 @@ mod tests {
 
     #[test]
     fn test_preprocess_decimal_100_to_decimal_arb() {
-        // T070 / FR-018: previously fell back to lossy `CAST(... AS VARCHAR)`;
-        // now routes to the lossless decimal_arb cast UDF.
+        // Previously fell back to lossy `CAST(... AS VARCHAR)`; now
+        // routes to the lossless decimal_arb cast UDF.
         let sql = "SELECT CAST(large_num AS DECIMAL(100, 0)) FROM data";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_try_cast_78_routes_to_decimal_arb() {
-        // Feature 002: TRY_CAST AS DECIMAL(78, 0) routes through decimal_arb.
+        // TRY_CAST AS DECIMAL(78, 0) routes through decimal_arb.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
         // TRY_CAST is non-throwing, so it takes the `try_` constructor.
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_try_cast_100() {
-        // T070 / FR-018: TRY_CAST routes through the same lossless path.
+        // TRY_CAST routes through the same lossless path.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(100, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
@@ -1194,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_decimal_with_scale_routes_to_decimal_arb() {
-        // T070 / FR-018: previously this case was left untouched (and would
+        // Previously this case was left untouched (and would
         // fail at DataFusion's CAST resolution because Decimal128 caps at
         // 38). It now routes through the decimal_arb cast UDF.
         let sql = "SELECT CAST(price AS DECIMAL(78,2)) FROM products";
@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_multiple_casts() {
-        // Feature 002: both 78 and 100 route through decimal_arb (the u256
+        // Both 78 and 100 route through decimal_arb (the u256
         // fast path is retired alongside the U256/I256 types).
         let sql = "SELECT CAST(a AS DECIMAL(78, 0)), CAST(b AS DECIMAL(100, 0)) FROM t";
         let result = preprocess_bigint_decimal_casts(sql);
@@ -1346,10 +1346,10 @@ mod tests {
         }
     }
 
-    // ---------------- Feature 002 (Retire U256/I256) — decimal_arb CAST AS TEXT ----------------
+    // ---------------- decimal_arb CAST AS TEXT ----------------
     //
-    // After feature 002, wide-integer columns (Avro decimal(p, 0) with
-    // p > 76) arrive in streamling SQL as decimal_arb. DataFusion has no
+    // Wide-integer columns (Avro decimal(p, 0) with p > 76) arrive in
+    // streamling SQL as decimal_arb. DataFusion has no
     // native cast from `LargeBinary` (decimal_arb storage) to `Utf8View`,
     // so `CAST(decimal_arb_col AS TEXT)` would fail with "Unsupported
     // CAST from LargeBinary to Utf8View". The preprocessor lowers all four

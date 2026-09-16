@@ -1,7 +1,7 @@
 use crate::formats::avro::MAX_SCHEMA_PRECISION;
 use crate::formats::avro::arrow_avro::AVRO_DECIMAL_SCALE_META;
 use crate::types::decimal_arb::DecimalArbType;
-// Note: U256Type/I256Type were retired in feature 002 (Retire U256/I256).
+// Note: the U256Type/I256Type Arrow types have been retired.
 // The Avro schema → Arrow type mapping routes all wide-precision decimals
 // through `decimal_arb`. For `decimal(p, 0)` where `77 ≤ p ≤ 78` the
 // field also carries a `native_int_kind=u256` hint so a downstream
@@ -129,7 +129,7 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                         ))
                     }
                     // p > 76 with non-zero scale: route to streamling.decimal_arb
-                    // (FR-018 — replaces the prior Utf8 fallback that lost numeric semantics).
+                    // (replaces the prior Utf8 fallback that lost numeric semantics).
                     // Negative scales are documented as unsupported for decimal_arb; fall back to
                     // the (still-lossy) Utf8 mapping for that edge case so the field at least
                     // transmits, carrying the scale so the arrow-avro decode path (`coerce_array`)
@@ -684,8 +684,8 @@ mod tests {
 
     #[test]
     fn test_convert_avro_schema_wide_decimal_routes_to_decimal_arb_with_hint() {
-        // Feature 002 (retire u256/i256): decimal(p, 0) with p > 76 routes
-        // to streamling.decimal_arb. The historic streamling routing was
+        // decimal(p, 0) with p > 76 routes to streamling.decimal_arb now
+        // that u256/i256 are retired. The historic streamling routing was
         // "all decimal(p > 76, 0) → U256Type" — we preserve that semantics
         // by always stamping u256 here (no signed inference; pipelines
         // needing Int256 round-trip must use a sink schema_override).
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_convert_avro_schema_decimal_with_scale_routes_to_decimal_arb() {
-        // FR-018: previously precision > 76 with non-zero scale fell back to
+        // Previously, precision > 76 with non-zero scale fell back to
         // Utf8 (lossy — broke arithmetic semantics on the destination side).
         // It now routes to the streamling.decimal_arb extension type so the
         // value is preserved as a numeric column end-to-end.
@@ -870,7 +870,7 @@ mod tests {
             arrow_schema.field(3).data_type(),
             &DataType::Decimal256(76, 18)
         );
-        // Feature 002: decimal(100, 0) routes to decimal_arb(100, 0). The
+        // decimal(100, 0) routes to decimal_arb(100, 0). The
         // native_int_kind hint is NOT stamped at precision > 78 — the
         // capability matrix doesn't consult the hint above that ceiling,
         // so the field carries no dead metadata.
