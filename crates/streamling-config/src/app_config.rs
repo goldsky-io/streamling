@@ -275,6 +275,19 @@ pub struct KafkaConfig {
     pub consumer_group_id: Option<String>, // Source only property
     pub client_id: Option<String>,
     pub lag_report_interval_ms: Option<u64>,
+    /// librdkafka `statistics.interval.ms`. Left unset, statistics are off
+    /// (librdkafka's default). Set it to turn on the periodic producer stats
+    /// log — per-broker RTT, broker-side throttling, in-flight depth and local
+    /// queue utilisation — which is what distinguishes a slow broker/network
+    /// from a pipeline that simply is not feeding the producer.
+    pub statistics_interval_ms: Option<String>,
+    /// Escape hatch for arbitrary librdkafka *producer* properties, as a
+    /// comma-separated `key=value` list (e.g.
+    /// `max.in.flight.requests.per.connection=5,request.timeout.ms=30000`).
+    /// Applied last, so it overrides both the optimizer defaults and the
+    /// per-sink settings. Intended for tuning experiments against a specific
+    /// broker without cutting a new image.
+    pub producer_overrides: Option<String>,
 }
 
 impl std::fmt::Debug for KafkaConfig {
@@ -302,6 +315,8 @@ impl std::fmt::Debug for KafkaConfig {
             )
             .field("consumer_group_id", &self.consumer_group_id)
             .field("client_id", &self.client_id)
+            .field("statistics_interval_ms", &self.statistics_interval_ms)
+            .field("producer_overrides", &self.producer_overrides)
             .finish()
     }
 }

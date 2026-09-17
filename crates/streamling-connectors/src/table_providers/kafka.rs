@@ -108,12 +108,56 @@ static KAFKA_HEADER_OPERATION: &str = "dbz.op";
 /// can fail on the next `check_error()` call.
 struct KafkaProducerContext {
     first_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Previous stats sample, so the periodic log can report *rates* rather
+    /// than librdkafka's monotonically growing counters.
+    prev_stats: Arc<std::sync::Mutex<Option<ProducerStatsSample>>>,
 }
+
+/// The cumulative counters we diff between two `stats()` callbacks.
+#[derive(Clone)]
+struct ProducerStatsSample {
+    ts_us: i64,
+    txmsgs: i64,
+    txmsg_bytes: i64,
+    /// Keyed by broker name (`HOSTNAME:PORT/ID`).
+    brokers: std::collections::HashMap<String, BrokerStatsSample>,
+    /// Transmitted-message counters keyed by `topic/partition`, so a partition
+    /// that holds a backlog while making no progress can be spotted.
+    partitions: std::collections::HashMap<String, u64>,
+}
+
+#[derive(Clone, Copy)]
+struct BrokerStatsSample {
+    tx: u64,
+    txbytes: u64,
+    req_timeouts: u64,
+    txretries: u64,
+    connects: i64,
+    disconnects: i64,
+}
+
+/// One partition's producer-side backlog, flattened from librdkafka's stats.
+struct PartInfo {
+    key: String,
+    backlog: i64,
+    progressed: bool,
+    leader: i32,
+}
+
+/// A partition is "stalled" when it is holding this many queued messages and
+/// transmitted none since the previous sample. Per-partition ordering means one
+/// such partition throttles the whole sink while every broker-level aggregate
+/// still looks healthy, so this is the case the summary line exists to catch.
+const PARTITION_STALL_BACKLOG: i64 = 100;
+/// Cap on individually logged stalled partitions, so a broker-wide outage
+/// cannot turn one stats tick into hundreds of log lines.
+const MAX_STALLED_PARTITIONS_LOGGED: usize = 5;
 
 impl KafkaProducerContext {
     fn new() -> Self {
         Self {
             first_error: Arc::new(std::sync::Mutex::new(None)),
+            prev_stats: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -127,7 +171,275 @@ impl KafkaProducerContext {
     }
 }
 
-impl ClientContext for KafkaProducerContext {}
+impl ClientContext for KafkaProducerContext {
+    /// Periodic librdkafka producer statistics, flattened into one log line per
+    /// broker plus one producer-wide line.
+    ///
+    /// This exists to answer a single question when a Kafka sink is slow: is the
+    /// pipeline failing to feed the producer, or is the broker/network failing
+    /// to drain it? The two look identical from the outside and have opposite
+    /// fixes.
+    ///
+    /// - `queue_used_pct` near 100 means the sink is the bottleneck: rows are
+    ///   piling up locally because the broker cannot absorb them. Near 0 means
+    ///   the producer is starved and the bottleneck is upstream (source,
+    ///   transform, or Avro encoding).
+    /// - `rtt_p99_ms` is the broker round trip. A WAN-distance broker shows tens
+    ///   to low hundreds of ms; seconds means the broker or the path is sick.
+    /// - `throttle_max_ms` is the broker's own `throttle_time_ms` from the
+    ///   ProduceResponse, i.e. a *deliberate* Kafka quota. Non-zero here is a
+    ///   definitive answer: the broker is rate limiting us on purpose.
+    /// - `wire_kbps` is what we actually achieve on the socket, and
+    ///   `avg_req_kb` the mean ProduceRequest size. A small `wire_kbps` with a
+    ///   healthy `rtt` and a full queue points at bandwidth or a middlebox
+    ///   rather than at the broker's own latency.
+    /// - `in_flight` pinned at a low number while the queue is full means we are
+    ///   pipelining-limited (bandwidth-delay product), which is the one failure
+    ///   mode a client-side config change can fix.
+    fn stats(&self, statistics: rdkafka::Statistics) {
+        let now_us = statistics.ts;
+        let mut guard = self.prev_stats.lock().unwrap();
+        let prev = guard.clone();
+
+        let mut brokers = std::collections::HashMap::new();
+        for (name, broker) in &statistics.brokers {
+            brokers.insert(
+                name.clone(),
+                BrokerStatsSample {
+                    tx: broker.tx,
+                    txbytes: broker.txbytes,
+                    req_timeouts: broker.req_timeouts,
+                    txretries: broker.txretries,
+                    connects: broker.connects.unwrap_or(0),
+                    disconnects: broker.disconnects.unwrap_or(0),
+                },
+            );
+        }
+        let mut partitions = std::collections::HashMap::new();
+        for topic in statistics.topics.values() {
+            for part in topic.partitions.values() {
+                partitions.insert(format!("{}/{}", topic.topic, part.partition), part.txmsgs);
+            }
+        }
+        *guard = Some(ProducerStatsSample {
+            ts_us: now_us,
+            txmsgs: statistics.txmsgs,
+            txmsg_bytes: statistics.txmsg_bytes,
+            brokers,
+            partitions,
+        });
+        drop(guard);
+
+        // librdkafka's clock is monotonic microseconds; guard against the first
+        // sample and against a non-advancing clock.
+        let elapsed_s = prev
+            .as_ref()
+            .map(|p| (now_us - p.ts_us) as f64 / 1_000_000.0)
+            .filter(|s| *s > 0.0);
+
+        let queue_used_pct = if statistics.msg_size_max > 0 {
+            (statistics.msg_size as f64 / statistics.msg_size_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let queue_msgs_pct = if statistics.msg_max > 0 {
+            (statistics.msg_cnt as f64 / statistics.msg_max as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let (msgs_per_s, produced_kbps) = match (&prev, elapsed_s) {
+            (Some(p), Some(secs)) => (
+                (statistics.txmsgs - p.txmsgs) as f64 / secs,
+                (statistics.txmsg_bytes - p.txmsg_bytes) as f64 / 1024.0 / secs,
+            ),
+            _ => (0.0, 0.0),
+        };
+
+        info!(
+            "kafka producer stats: queue_used_pct={:.1} ({} / {} bytes), queue_msgs_pct={:.1} ({} / {} msgs), produced={:.0} msg/s {:.1} KiB/s",
+            queue_used_pct,
+            statistics.msg_size,
+            statistics.msg_size_max,
+            queue_msgs_pct,
+            statistics.msg_cnt,
+            statistics.msg_max,
+            msgs_per_s,
+            produced_kbps,
+        );
+
+        for (name, broker) in &statistics.brokers {
+            // Bootstrap/logical handles carry no produce traffic; skip the noise.
+            if broker.nodeid < 0 && broker.tx == 0 {
+                continue;
+            }
+
+            let prev_broker = prev.as_ref().and_then(|p| p.brokers.get(name).copied());
+            let (wire_kbps, reqs_per_s, avg_req_kb) = match (prev_broker, elapsed_s) {
+                (Some(pb), Some(secs)) => {
+                    let d_bytes = broker.txbytes.saturating_sub(pb.txbytes) as f64;
+                    let d_reqs = broker.tx.saturating_sub(pb.tx) as f64;
+                    (
+                        d_bytes / 1024.0 / secs,
+                        d_reqs / secs,
+                        if d_reqs > 0.0 {
+                            d_bytes / d_reqs / 1024.0
+                        } else {
+                            0.0
+                        },
+                    )
+                }
+                _ => (0.0, 0.0, 0.0),
+            };
+            let d_timeouts = prev_broker
+                .map(|pb| broker.req_timeouts.saturating_sub(pb.req_timeouts))
+                .unwrap_or(0);
+            let d_retries = prev_broker
+                .map(|pb| broker.txretries.saturating_sub(pb.txretries))
+                .unwrap_or(0);
+            // Deltas, not the cumulative counters: reconnect thrash is visible
+            // in one line instead of requiring a diff across two.
+            let d_connects = prev_broker
+                .map(|pb| broker.connects.unwrap_or(0).saturating_sub(pb.connects))
+                .unwrap_or(0);
+            let d_disconnects = prev_broker
+                .map(|pb| {
+                    broker
+                        .disconnects
+                        .unwrap_or(0)
+                        .saturating_sub(pb.disconnects)
+                })
+                .unwrap_or(0);
+
+            let win_ms = |w: &Option<rdkafka::statistics::Window>,
+                          field: fn(&rdkafka::statistics::Window) -> i64| {
+                w.as_ref().map(|w| field(w) as f64 / 1000.0).unwrap_or(0.0)
+            };
+            // `rtt`, `int_latency` and `outbuf_latency` are microseconds;
+            // `throttle` is already milliseconds.
+            let throttle_avg = broker.throttle.as_ref().map(|w| w.avg).unwrap_or(0);
+            let throttle_max = broker.throttle.as_ref().map(|w| w.max).unwrap_or(0);
+
+            info!(
+                "kafka broker stats: broker={} state={} rtt_avg_ms={:.1} rtt_p99_ms={:.1} throttle_avg_ms={} throttle_max_ms={} wire_kbps={:.1} reqs_per_s={:.1} avg_req_kb={:.1} in_flight={} outbuf_reqs={} outbuf_msgs={} int_latency_avg_ms={:.1} outbuf_latency_avg_ms={:.1} req_timeouts_delta={} retries_delta={} txerrs={} connects_delta={} disconnects_delta={} connects_total={} produce_reqs={}",
+                broker.name,
+                broker.state,
+                win_ms(&broker.rtt, |w| w.avg),
+                win_ms(&broker.rtt, |w| w.p99),
+                throttle_avg,
+                throttle_max,
+                wire_kbps,
+                reqs_per_s,
+                avg_req_kb,
+                broker.waitresp_cnt,
+                broker.outbuf_cnt,
+                broker.outbuf_msg_cnt,
+                win_ms(&broker.int_latency, |w| w.avg),
+                win_ms(&broker.outbuf_latency, |w| w.avg),
+                d_timeouts,
+                d_retries,
+                broker.txerrs,
+                d_connects,
+                d_disconnects,
+                broker.connects.unwrap_or(0),
+                broker.req.get("Produce").copied().unwrap_or(0),
+            );
+        }
+
+        Self::log_partition_backlog(&statistics, prev.as_ref(), elapsed_s.is_some());
+    }
+}
+
+impl KafkaProducerContext {
+    /// Flatten librdkafka's per-topic/per-partition stats into the few fields
+    /// the backlog summary needs. Pure, so the stall rule can be tested without
+    /// a live producer.
+    fn collect_partition_info(
+        statistics: &rdkafka::Statistics,
+        prev: Option<&ProducerStatsSample>,
+    ) -> Vec<PartInfo> {
+        let mut parts = Vec::new();
+        for topic in statistics.topics.values() {
+            for part in topic.partitions.values() {
+                // librdkafka reports an internal partition -1 for messages not
+                // yet assigned to a real partition; it has no leader and would
+                // otherwise look like a permanently stalled partition.
+                if part.partition < 0 {
+                    continue;
+                }
+                let key = format!("{}/{}", topic.topic, part.partition);
+                let progressed = prev
+                    .and_then(|p| p.partitions.get(&key))
+                    .map(|prev_tx| part.txmsgs > *prev_tx)
+                    // No previous sample for this partition: assume progress
+                    // rather than reporting a spurious stall on the first tick.
+                    .unwrap_or(true);
+                parts.push(PartInfo {
+                    backlog: part.msgq_cnt + part.xmit_msgq_cnt,
+                    progressed,
+                    leader: part.leader,
+                    key,
+                });
+            }
+        }
+        parts
+    }
+
+    /// Per-partition backlog, summarised.
+    ///
+    /// Every broker-level number in the line above is an aggregate, and Kafka
+    /// preserves ordering per partition — so a single partition that stops
+    /// draining (lost leader, a batch stuck in retry) throttles the whole sink
+    /// while `queue_used_pct`, `rtt` and `wire_kbps` all still look reasonable.
+    /// One summary line per tick makes that visible; individual partitions are
+    /// logged only when they are actually stalled, so a healthy sink stays quiet.
+    fn log_partition_backlog(
+        statistics: &rdkafka::Statistics,
+        prev: Option<&ProducerStatsSample>,
+        have_prev_window: bool,
+    ) {
+        let parts = Self::collect_partition_info(statistics, prev);
+        if parts.is_empty() {
+            return;
+        }
+
+        let total_backlog: i64 = parts.iter().map(|p| p.backlog).sum();
+        let with_backlog = parts.iter().filter(|p| p.backlog > 0).count();
+        let max = parts.iter().max_by_key(|p| p.backlog).expect("non-empty");
+        // Only meaningful once a previous sample exists to diff against.
+        let stalled: Vec<&PartInfo> = if have_prev_window {
+            parts
+                .iter()
+                .filter(|p| p.backlog >= PARTITION_STALL_BACKLOG && !p.progressed)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        info!(
+            "kafka partition backlog: partitions={} with_backlog={} total_backlog={} max_backlog={} (on {}) stalled={}",
+            parts.len(),
+            with_backlog,
+            total_backlog,
+            max.backlog,
+            max.key,
+            stalled.len(),
+        );
+
+        for p in stalled.iter().take(MAX_STALLED_PARTITIONS_LOGGED) {
+            warn!(
+                "kafka partition stalled: {} holding {} queued message(s) with no transmission since the last sample (leader broker {})",
+                p.key, p.backlog, p.leader,
+            );
+        }
+        if stalled.len() > MAX_STALLED_PARTITIONS_LOGGED {
+            warn!(
+                "kafka partition stalled: {} further stalled partition(s) not listed",
+                stalled.len() - MAX_STALLED_PARTITIONS_LOGGED,
+            );
+        }
+    }
+}
 
 impl rdkafka::producer::ProducerContext for KafkaProducerContext {
     type DeliveryOpaque = ();
@@ -2987,7 +3299,49 @@ impl KafkaSink {
         // Applied last so the per-sink setting wins over the optimizer default.
         builder.set("compression.type", compression.as_str());
 
+        if let Some(interval) = &config.statistics_interval_ms {
+            builder.set("statistics.interval.ms", interval);
+        }
+
+        // The escape hatch outranks everything above it on purpose: it exists so
+        // a broker-specific tuning experiment does not need a new image.
+        for (key, value) in Self::parse_producer_overrides(config.producer_overrides.as_deref()) {
+            info!("Kafka producer override: {}={}", key, value);
+            builder.set(key, value);
+        }
+
         builder
+    }
+
+    /// Parse the `producer_overrides` escape hatch: a comma-separated
+    /// `key=value` list. Malformed entries are skipped with a warning rather
+    /// than failing the pipeline, so a typo in a debugging knob cannot take a
+    /// sink down.
+    fn parse_producer_overrides(raw: Option<&str>) -> Vec<(String, String)> {
+        let Some(raw) = raw else {
+            return Vec::new();
+        };
+        raw.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| match entry.split_once('=') {
+                Some((key, value)) => {
+                    let (key, value) = (key.trim(), value.trim());
+                    if key.is_empty() {
+                        warn!("ignoring Kafka producer override with empty key: '{entry}'");
+                        None
+                    } else {
+                        Some((key.to_string(), value.to_string()))
+                    }
+                }
+                None => {
+                    warn!(
+                        "ignoring malformed Kafka producer override (expected key=value): '{entry}'"
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 
     /// One producer per sink, shared by every concurrent write stream.
@@ -3788,6 +4142,8 @@ mod tests {
             consumer_group_id: None,
             client_id: None,
             lag_report_interval_ms: None,
+            statistics_interval_ms: None,
+            producer_overrides: None,
         }
     }
 
@@ -3811,6 +4167,140 @@ mod tests {
                 "compression {compression:?} should reach the producer config"
             );
         }
+    }
+
+    fn stats_with_partitions(parts: &[(i32, i64, i64, u64)]) -> rdkafka::Statistics {
+        use rdkafka::statistics::{Partition, Topic};
+        let mut topic = Topic {
+            topic: "t".to_string(),
+            ..Default::default()
+        };
+        for (id, msgq, xmit, txmsgs) in parts {
+            topic.partitions.insert(
+                *id,
+                Partition {
+                    partition: *id,
+                    msgq_cnt: *msgq,
+                    xmit_msgq_cnt: *xmit,
+                    txmsgs: *txmsgs,
+                    leader: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut stats = rdkafka::Statistics::default();
+        stats.topics.insert("t".to_string(), topic);
+        stats
+    }
+
+    fn prev_sample(parts: &[(&str, u64)]) -> ProducerStatsSample {
+        ProducerStatsSample {
+            ts_us: 0,
+            txmsgs: 0,
+            txmsg_bytes: 0,
+            brokers: std::collections::HashMap::new(),
+            partitions: parts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        }
+    }
+
+    #[test]
+    fn partition_with_backlog_and_no_transmission_is_stalled() {
+        // p0 holds a backlog and its txmsgs did not move; p1 holds the same
+        // backlog but is draining. Only p0 is a stall.
+        let stats = stats_with_partitions(&[(0, 500, 0, 1_000), (1, 500, 0, 2_500)]);
+        let prev = prev_sample(&[("t/0", 1_000), ("t/1", 2_000)]);
+        let parts = KafkaProducerContext::collect_partition_info(&stats, Some(&prev));
+
+        let stalled: Vec<&str> = parts
+            .iter()
+            .filter(|p| p.backlog >= PARTITION_STALL_BACKLOG && !p.progressed)
+            .map(|p| p.key.as_str())
+            .collect();
+        assert_eq!(stalled, vec!["t/0"]);
+        assert!(parts.iter().all(|p| p.leader == 1));
+    }
+
+    #[test]
+    fn internal_unassigned_partition_is_not_reported_as_stalled() {
+        // librdkafka's partition -1 holds not-yet-assigned messages and never
+        // transmits; without the filter it would look stalled forever.
+        let stats = stats_with_partitions(&[(-1, 5_000, 0, 0), (0, 10, 0, 5)]);
+        let parts = KafkaProducerContext::collect_partition_info(&stats, None);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].key, "t/0");
+    }
+
+    #[test]
+    fn first_sample_does_not_report_spurious_stalls() {
+        // No previous sample: every partition must count as progressing, or the
+        // first stats tick after startup would warn about every partition.
+        let stats = stats_with_partitions(&[(0, 9_000, 500, 0), (1, 9_000, 0, 0)]);
+        let parts = KafkaProducerContext::collect_partition_info(&stats, None);
+        assert!(parts.iter().all(|p| p.progressed));
+        assert_eq!(parts.iter().map(|p| p.backlog).sum::<i64>(), 18_500);
+    }
+
+    #[test]
+    fn producer_overrides_are_parsed_and_win_over_everything_else() {
+        let mut config = test_kafka_config();
+        // Deliberately fight both the optimizer default (lz4) and a per-sink
+        // setting (linger.ms from batch_flush_interval).
+        config.producer_overrides = Some(
+            "max.in.flight.requests.per.connection=5, linger.ms=5 ,compression.type=zstd".into(),
+        );
+        config.statistics_interval_ms = Some("10000".into());
+
+        let cfg = KafkaSink::build_producer_config(
+            &config,
+            Some(200),
+            Some(200),
+            None,
+            KafkaCompression::Lz4,
+        );
+
+        assert_eq!(
+            cfg.get("max.in.flight.requests.per.connection"),
+            Some("5"),
+            "override should reach the producer config"
+        );
+        assert_eq!(
+            cfg.get("linger.ms"),
+            Some("5"),
+            "override is applied after the per-sink batch_flush_interval"
+        );
+        assert_eq!(
+            cfg.get("compression.type"),
+            Some("zstd"),
+            "override is applied after the per-sink compression"
+        );
+        assert_eq!(cfg.get("statistics.interval.ms"), Some("10000"));
+    }
+
+    #[test]
+    fn malformed_producer_overrides_are_skipped_not_fatal() {
+        let parsed = KafkaSink::parse_producer_overrides(Some(
+            "good.key=1,,no-equals-sign,  =emptykey, spaced.key = 2 ",
+        ));
+        assert_eq!(
+            parsed,
+            vec![
+                ("good.key".to_string(), "1".to_string()),
+                ("spaced.key".to_string(), "2".to_string()),
+            ],
+        );
+        assert!(KafkaSink::parse_producer_overrides(None).is_empty());
+    }
+
+    #[test]
+    fn statistics_are_off_unless_explicitly_configured() {
+        let cfg = KafkaSink::build_producer_config(
+            &test_kafka_config(),
+            None,
+            None,
+            None,
+            KafkaCompression::None,
+        );
+        assert_eq!(cfg.get("statistics.interval.ms"), None);
     }
 
     #[test]
