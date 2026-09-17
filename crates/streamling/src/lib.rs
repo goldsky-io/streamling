@@ -3863,6 +3863,140 @@ mod tests {
         }
     }
 
+    /// Repro for the real topology: the SQL transform reads another TRANSFORM,
+    /// not a source. Transforms are registered as `ViewTable`s, so the scan is a
+    /// view that expands to a `SubqueryAlias` over the upstream plan — which
+    /// carries the upstream's field qualifiers, not this node's.
+    #[tokio::test]
+    async fn transform_parallelism_over_an_upstream_transform() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::view::ViewTable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("vid", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("raw", Arc::new(source))
+            .unwrap();
+
+        // Stand in for an upstream transform: a view over the raw source,
+        // registered under its own name exactly as a transform node is.
+        let (upstream_plan, _) = session_manager
+            .create_supported_logical_plan("select * from raw".to_string())
+            .await
+            .unwrap();
+        session_manager
+            .session_context()
+            .register_table("upstream", Arc::new(ViewTable::new(upstream_plan, None)))
+            .unwrap();
+
+        let (sql_plan, source_name) = session_manager
+            .create_supported_logical_plan(
+                "select id, vid, _gs_op from upstream where vid = 100".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let sql_plan = wrap_transform_input_with_repartition(
+            sql_plan,
+            &source_name,
+            &by_key(&["id"]),
+            4,
+            "filter_blocks",
+        )
+        .unwrap();
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(CheckpointableNode::new(
+                sql_plan,
+                10,
+                "filter_blocks".to_string(),
+            )),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .expect("reading an upstream transform must plan like reading a source");
+        let rendered = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            rendered.contains("StreamingRepartitionExec: partitions=4, keys=[id@0]"),
+            "plan:\n{rendered}"
+        );
+    }
+
+    /// Repro: the same widening, but with an explicit projection instead of
+    /// `select *`. Production transforms name their columns, and that is the
+    /// shape that fails.
+    #[tokio::test]
+    async fn transform_parallelism_with_an_explicit_projection() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("vid", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (sql_plan, source_name) = session_manager
+            .create_supported_logical_plan(
+                "select id, vid, _gs_op from blocks where vid = 100".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let sql_plan = wrap_transform_input_with_repartition(
+            sql_plan,
+            &source_name,
+            &by_key(&["id"]),
+            4,
+            "filter_blocks",
+        )
+        .unwrap();
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(CheckpointableNode::new(
+                sql_plan,
+                10,
+                "filter_blocks".to_string(),
+            )),
+        });
+
+        let physical_plan = session_manager
+            .new_df(logical_plan)
+            .create_physical_plan()
+            .await
+            .expect("an explicit projection must plan just like select *");
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+        assert!(
+            rendered.contains("StreamingRepartitionExec: partitions=4, keys=[id@0]"),
+            "plan:\n{rendered}"
+        );
+    }
+
     /// A handler transform's `parallelism` has to reach the HTTP calls
     /// themselves: `ExternalHandlerExec` used to declare a single partition and
     /// require `SinglePartition` input, which collapsed any width above it back
