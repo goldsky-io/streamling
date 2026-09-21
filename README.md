@@ -465,13 +465,15 @@ sources:
       poll_interval: 10s   # optional; defaults to 5s
 ```
 
+`parallelism` reads newly discovered files across that many output partitions (default 1), which transforms and sinks inherit. The partitions share one queue of discovered files and one listing per `poll_interval`; rows from different files interleave across partitions.
+
 **Discovery semantics & caveats (continuous mode).** Discovery is **polling-based** and tracked with a **scalar `last_modified` watermark** plus a small set of paths already ingested at that exact timestamp. Understand these limits before relying on it:
 
 - Each poll lists the path and ingests every file whose object `last_modified` is **greater than** the watermark, plus any file **sharing the watermark's exact timestamp** that hasn't been ingested yet — so new files landing in the same second the watermark sits on are not lost (common with second-granularity object-store mtimes). The watermark then advances to the newest `last_modified` seen, and its boundary set resets when a newer timestamp appears.
 - **Files with an older timestamp can be missed.** Any file that becomes visible with a `last_modified` **strictly below** the current watermark is skipped permanently — there is no per-file bookkeeping below the boundary.
 - **Updated files are reprocessed.** A rewritten file is re-ingested if its new `last_modified` reaches or exceeds the watermark. Reprocessed rows are emitted as inserts (`_gs_op = 'i'`) at the moment.
 - **Deletions are not detected** — removing a file has no effect on already-ingested data.
-- **At-least-once across restarts.** The watermark (and its boundary set) is persisted to the state backend only on a checkpoint **finalize** (mirroring the Kafka source). On restart the source reloads the last finalized watermark and re-reads any files from polls that had not finalized, so downstream may see duplicates (deduplicated by `primary_key` + an upsert sink).
+- **At-least-once across restarts.** The watermark (and its boundary set) is persisted to the state backend only on a checkpoint **finalize** (mirroring the Kafka source). On restart the source reloads the last finalized watermark and re-reads any files that had not finalized, so downstream may see duplicates (deduplicated by `primary_key` + an upsert sink). Partitions finish files out of order, so the watermark advances only over files committed in `(last_modified, path)` order; files committed past one still being read are persisted alongside it and skipped on restart.
 - Idle polls emit empty heartbeat batches so checkpoint markers keep propagating even when no new files arrive.
 
 For guaranteed no-miss discovery, ensure new data always lands as immutable, newly-named files whose `last_modified` never goes backwards (atomic writes), or use **bounded** mode for one-shot reads.

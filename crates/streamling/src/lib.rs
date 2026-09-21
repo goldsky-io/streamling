@@ -12,9 +12,7 @@ use std::time::Duration;
 use streamling_config::AppConfig;
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
 use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
-use streamling_connectors::table_providers::file::{
-    FileSourceTableProvider, build_bounded_file_source_provider,
-};
+use streamling_connectors::table_providers::file::{FileSourceReadMode, FileSourceTableProvider};
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
 use streamling_connectors::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -496,16 +494,6 @@ fn validate_parallelism(topology: &PipelineTopology) -> Result<usize> {
 
     for (name, source) in &topology.sources {
         check("source", name, source.parallelism())?;
-        if let topology::Source::file(file) = source
-            && file.parallelism.is_some_and(|p| p > 1)
-            && matches!(file.mode, topology::FileSourceMode::Continuous { .. })
-        {
-            streamling_user_bail!(
-                "source '{name}': a continuous file source is single-stream (one \
-                 watermark cursor and one checkpoint drain point) and cannot run \
-                 with parallelism > 1; use mode: bounded to read in parallel"
-            );
-        }
     }
     for (name, transform) in &topology.transforms {
         check("transform", name, transform.parallelism())?;
@@ -1203,20 +1191,19 @@ impl Streamling {
                         .get(reference_name)
                         .expect("node context must exist");
 
-                    let provider: Arc<dyn TableProvider> = match &file.mode {
-                        topology::FileSourceMode::Bounded => build_bounded_file_source_provider(
-                            reference_name,
-                            &file.path,
-                            file.format,
-                            &session_manager,
-                            file.parallelism,
-                        )
-                        .await
-                        .map_err(|e| {
-                            e.context(format!("{}: failed to create file source", ctx.format()))
-                        })?,
+                    let mode = match &file.mode {
+                        // A bounded file source is bounded work, so the drain
+                        // policy always drains it: the control handle is wired
+                        // unconditionally and closes the source with a terminal
+                        // checkpoint.
+                        topology::FileSourceMode::Bounded => FileSourceReadMode::Bounded {
+                            parallelism: file.parallelism,
+                            state_backend: state_backend_factory
+                                .create(app_config.state_backend_namespace()),
+                            checkpoint_control: Some(checkpoint_control.clone()),
+                        },
                         topology::FileSourceMode::Continuous { poll_interval } => {
-                            let interval =
+                            let poll_interval =
                                 humantime::parse_duration(poll_interval).map_err(|e| {
                                     streamling_user_err!(
                                         "{}: invalid poll_interval '{}': {}",
@@ -1225,22 +1212,29 @@ impl Streamling {
                                         e
                                     )
                                 })?;
-                            FileSourceTableProvider::try_new(
-                                reference_name,
-                                &file.path,
-                                file.format,
-                                interval,
-                                &session_manager,
-                                state_backend_factory.create(app_config.state_backend_namespace()),
-                                app_config.num_records_before_stop,
-                                app_config.internal_buffer_size,
-                            )
-                            .await
-                            .map_err(|e| {
-                                e.context(format!("{}: failed to create file source", ctx.format()))
-                            })?
+                            FileSourceReadMode::Continuous {
+                                poll_interval,
+                                // Unlike bounded, one stream unless asked: a wider
+                                // source widens every pipeline that reads it.
+                                parallelism: file.parallelism.unwrap_or(1),
+                                state_backend: state_backend_factory
+                                    .create(app_config.state_backend_namespace()),
+                            }
                         }
                     };
+                    let provider: Arc<dyn TableProvider> = FileSourceTableProvider::try_new(
+                        reference_name,
+                        &file.path,
+                        file.format,
+                        mode,
+                        &session_manager,
+                        app_config.num_records_before_stop,
+                        app_config.internal_buffer_size,
+                    )
+                    .await
+                    .map_err(|e| {
+                        e.context(format!("{}: failed to create file source", ctx.format()))
+                    })?;
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         provider,

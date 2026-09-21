@@ -767,3 +767,379 @@ sinks:
         missing.iter().map(|r| r.0).collect::<Vec<_>>()
     );
 }
+
+/// Rows per CSV file in the bounded file source checkpoint tests.
+const FILE_ROWS: i64 = 20;
+
+/// Writes `files` CSV files of [`FILE_ROWS`] rows with consecutive ids, so an
+/// id's file is `(id - 1) / FILE_ROWS`.
+fn write_id_files(ctx: &TestContext, dir_name: &str, files: i64) -> std::path::PathBuf {
+    let dir = ctx.temp_dir.path().join(dir_name);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    for file in 0..files {
+        let mut csv = String::from("id,value\n");
+        for row in 0..FILE_ROWS {
+            let id = file * FILE_ROWS + row + 1;
+            csv.push_str(&format!("{id},value_{id}\n"));
+        }
+        std::fs::write(dir.join(format!("part_{file:04}.csv")), csv).expect("write csv");
+    }
+    dir
+}
+
+/// A two-partition file source in `mode` into Postgres, one row per INSERT, so a
+/// read of a few hundred files spans several one-second checkpoint intervals.
+fn file_pipeline(dir: &std::path::Path, table: &str, mode: &str) -> String {
+    format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    parallelism: 2
+    mode:
+      type: {mode}
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: file_src
+    table: {table}
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        path = dir.display(),
+    )
+}
+
+async fn written_ids(ctx: &TestContext, table: &str) -> std::collections::BTreeSet<i64> {
+    let rows: Vec<(i64,)> = ctx
+        .postgres
+        .query(&format!("SELECT id FROM public.{table}"))
+        .await
+        .expect("Failed to query written ids");
+    rows.into_iter().map(|row| row.0).collect()
+}
+
+/// The epoch numbers in log lines of the form `{prefix}{epoch}`.
+fn logged_epochs<'a>(logs: &'a str, prefix: &'a str) -> impl Iterator<Item = u64> + 'a {
+    logs.lines().filter_map(move |line| {
+        let digits: String = line
+            .split(prefix)
+            .nth(1)?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    })
+}
+
+/// A bounded file source takes part in checkpointing: periodic epochs finalize
+/// while it reads, and a terminal epoch closes it once every file is read.
+///
+/// Before, no batch from the bounded scan carried a marker, so the sink never
+/// acked and every epoch stalled until the timeout removed it. Unlike the unnest
+/// test above, this pipeline terminates on its own.
+#[tokio::test]
+async fn test_bounded_file_source_checkpoints_while_reading() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new())
+        .await
+        .expect("Failed to create test context");
+
+    const FILES: i64 = 300;
+    let dir = write_id_files(&ctx, "bounded_ckpt_data", FILES);
+    let state_table = format!("bounded_file_ckpt_state_{}", ctx.test_id.replace('-', "_"));
+    let application_id = format!("bounded_file_ckpt_{}", ctx.test_id);
+
+    let output = ctx
+        .run_pipeline_raw(
+            &file_pipeline(&dir, "bounded_file_ckpt_out", "bounded"),
+            PipelineOpts::new()
+                .timeout(std::time::Duration::from_secs(180))
+                .env("STREAMLING__APPLICATION_ID", &application_id)
+                .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+                .env(
+                    "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+                    &ctx.postgres.host,
+                )
+                .env(
+                    "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+                    ctx.postgres.port.to_string(),
+                )
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+                .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+                .env(
+                    "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+                    &state_table,
+                )
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1"),
+        )
+        .await
+        .expect("Pipeline execution failed");
+    let logs = &output.stderr;
+    assert!(
+        output.status.success(),
+        "the bounded pipeline should finish on its own; stderr tail:\n{}",
+        &logs[logs.len().saturating_sub(4000)..]
+    );
+
+    let terminal_epoch = logged_epochs(logs, "Begin terminal checkpoint: epoch ")
+        .next()
+        .expect("the source must close with a terminal checkpoint");
+    assert!(
+        logged_epochs(logs, "Epoch finalized: ").any(|epoch| epoch < terminal_epoch),
+        "a periodic epoch must finalize while the source reads (terminal epoch {terminal_epoch})"
+    );
+    assert!(
+        logs.contains(&format!(
+            "terminal epoch {terminal_epoch} finalized; progress persisted"
+        )),
+        "the terminal epoch must finalize and persist the source's progress"
+    );
+
+    let checkpoint_count = ctx
+        .postgres
+        .count(&format!(
+            "SELECT COUNT(*) FROM streamling.\"{}\"",
+            state_table
+        ))
+        .await
+        .expect("Failed to query checkpoint state table");
+    assert!(
+        checkpoint_count > 0,
+        "the source's progress must be persisted"
+    );
+
+    assert_eq!(
+        written_ids(&ctx, "bounded_file_ckpt_out").await.len() as i64,
+        FILES * FILE_ROWS,
+        "every row must be written"
+    );
+}
+
+/// A bounded file source resumes from its checkpointed progress.
+///
+/// Run 1 is stopped by SIGTERM mid-read: its partitions stop at a batch boundary
+/// and close with a terminal checkpoint covering the files they fully emitted.
+/// Run 2 reuses the state backend and must read only the rest, re-reading at most
+/// the file each partition had in flight. Run 3 finds every file covered and
+/// reads nothing.
+///
+/// A record limit can't stop run 1: the sink that reaches it stops consuming,
+/// which drops the source's stream and aborts its terminal round-trip.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_bounded_file_source_resumes_from_checkpoint() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new())
+        .await
+        .expect("Failed to create test context");
+
+    const FILES: i64 = 400;
+    const PARTITIONS: usize = 2;
+    let dir = write_id_files(&ctx, "bounded_resume_data", FILES);
+
+    // One application id and one Sqlite state file across every run, like a
+    // pod restart with a persistent state volume. Only the sink table changes,
+    // so each run's writes can be told apart.
+    let application_id = format!("bounded_file_resume_{}", ctx.test_id);
+    let state_path = std::env::temp_dir()
+        .join(format!("bounded_file_resume_state_{}.sqlite", ctx.test_id))
+        .to_string_lossy()
+        .into_owned();
+    let opts = || {
+        PipelineOpts::new()
+            .timeout(std::time::Duration::from_secs(180))
+            .env("STREAMLING__APPLICATION_ID", &application_id)
+            .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+            // A small channel keeps the drained tail short, so the terminal
+            // epoch finalizes well inside the shutdown budget.
+            .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1")
+            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Sqlite")
+            .env(
+                "STREAMLING__STATE_BACKEND__SQLITE__DATABASE_PATH",
+                &state_path,
+            )
+    };
+
+    let (status, _) = ctx
+        .run_pipeline_with_sigterm(
+            &file_pipeline(&dir, "bounded_resume_run1", "bounded"),
+            opts(),
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("Run 1 execution failed");
+    assert!(
+        status.success(),
+        "run 1 should drain and exit after SIGTERM"
+    );
+
+    let total = (FILES * FILE_ROWS) as usize;
+    let run_1 = written_ids(&ctx, "bounded_resume_run1").await;
+    assert!(
+        !run_1.is_empty() && run_1.len() < total,
+        "SIGTERM must land mid-read for the resume to mean anything; run 1 wrote {} of {total} rows",
+        run_1.len()
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &file_pipeline(&dir, "bounded_resume_run2", "bounded"),
+            opts(),
+        )
+        .await
+        .expect("Run 2 execution failed");
+    assert!(status.success(), "run 2 should read the rest and finish");
+    let run_2 = written_ids(&ctx, "bounded_resume_run2").await;
+
+    let missing: Vec<i64> = (1..=FILES * FILE_ROWS)
+        .filter(|id| !run_1.contains(id) && !run_2.contains(id))
+        .collect();
+    assert!(missing.is_empty(), "the resumed run lost rows: {missing:?}");
+
+    let reread_files: std::collections::BTreeSet<i64> = run_1
+        .intersection(&run_2)
+        .map(|id| (id - 1) / FILE_ROWS)
+        .collect();
+    assert!(
+        reread_files.len() <= PARTITIONS,
+        "run 2 may re-read only the files in flight when run 1 stopped (one per partition); \
+         it re-read files {reread_files:?}"
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &file_pipeline(&dir, "bounded_resume_run3", "bounded"),
+            opts(),
+        )
+        .await
+        .expect("Run 3 execution failed");
+    assert!(
+        output.status.success(),
+        "run 3 should finish without reading"
+    );
+    assert!(
+        output
+            .stderr
+            .contains(&format!("0 of {FILES} listed file(s) left to read")),
+        "rerunning a finished job must read nothing"
+    );
+}
+
+/// A two-partition continuous file source resumes from its checkpointed
+/// watermark.
+///
+/// Run 1 is stopped by SIGTERM mid-read. A continuous source closes without a
+/// terminal checkpoint, so run 2 resumes from run 1's last finalized periodic
+/// epoch: it must write every row run 1 didn't, re-reading only the files that
+/// epoch didn't cover rather than everything run 1 read. The partitions finish
+/// files out of order, so the persisted progress includes files committed past
+/// one still being read.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_continuous_file_source_resumes_from_checkpoint() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new())
+        .await
+        .expect("Failed to create test context");
+
+    const FILES: i64 = 400;
+    const RUN_1_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+    // The source never finishes on its own, so run 2 is stopped after well over
+    // the time a full read takes.
+    const RUN_2_DURATION: std::time::Duration = std::time::Duration::from_secs(45);
+    const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    let dir = write_id_files(&ctx, "continuous_resume_data", FILES);
+
+    // One application id and one Sqlite state file across both runs, like a pod
+    // restart with a persistent state volume.
+    let application_id = format!("continuous_file_resume_{}", ctx.test_id);
+    let state_path = std::env::temp_dir()
+        .join(format!(
+            "continuous_file_resume_state_{}.sqlite",
+            ctx.test_id
+        ))
+        .to_string_lossy()
+        .into_owned();
+    let opts = || {
+        PipelineOpts::new()
+            .env("STREAMLING__APPLICATION_ID", &application_id)
+            .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Sqlite")
+            .env(
+                "STREAMLING__STATE_BACKEND__SQLITE__DATABASE_PATH",
+                &state_path,
+            )
+    };
+
+    let (status, _) = ctx
+        .run_pipeline_with_sigterm(
+            &file_pipeline(&dir, "continuous_resume_run1", "continuous"),
+            opts(),
+            RUN_1_DURATION,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Run 1 execution failed");
+    assert!(
+        status.success(),
+        "run 1 should drain and exit after SIGTERM"
+    );
+
+    let total = (FILES * FILE_ROWS) as usize;
+    let run_1 = written_ids(&ctx, "continuous_resume_run1").await;
+    assert!(
+        !run_1.is_empty() && run_1.len() < total,
+        "SIGTERM must land mid-read for the resume to mean anything; run 1 wrote {} of {total} rows",
+        run_1.len()
+    );
+
+    let (status, _) = ctx
+        .run_pipeline_with_sigterm(
+            &file_pipeline(&dir, "continuous_resume_run2", "continuous"),
+            opts(),
+            RUN_2_DURATION,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Run 2 execution failed");
+    assert!(
+        status.success(),
+        "run 2 should drain and exit after SIGTERM"
+    );
+    let run_2 = written_ids(&ctx, "continuous_resume_run2").await;
+
+    let missing: Vec<i64> = (1..=FILES * FILE_ROWS)
+        .filter(|id| !run_1.contains(id) && !run_2.contains(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the resumed run lost rows (or needed longer than {RUN_2_DURATION:?}): {missing:?}"
+    );
+
+    let file_of = |id: &i64| (id - 1) / FILE_ROWS;
+    let run_1_files: std::collections::BTreeSet<i64> = run_1.iter().map(file_of).collect();
+    let reread_files: std::collections::BTreeSet<i64> =
+        run_1.intersection(&run_2).map(file_of).collect();
+    assert!(
+        reread_files.len() < run_1_files.len(),
+        "run 2 must resume from the checkpointed watermark; it re-read {} of the {} files run 1 wrote",
+        reread_files.len(),
+        run_1_files.len()
+    );
+}
