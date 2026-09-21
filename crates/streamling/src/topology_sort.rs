@@ -308,6 +308,7 @@ mod tests {
             schema: None,
             parallelism: None,
             batch_size: None,
+            batch_flush_interval: None,
             telemetry: None,
         })
     }

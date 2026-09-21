@@ -579,8 +579,15 @@ pub struct ScriptTransform {
     /// `primary_key`. Each stream owns one WASM instance. Defaults to the input
     /// width.
     pub parallelism: Option<usize>,
-    /// Rows accumulated per execution stream before invoking WASM.
+    /// Rows accumulated per execution stream before invoking WASM. Omit it to
+    /// invoke WASM on each upstream batch as it arrives, with no accumulator
+    /// in between.
     pub batch_size: Option<usize>,
+    /// How long a partially filled batch may wait before WASM is invoked
+    /// anyway, e.g. `"1s"`. Without it a `batch_size` batch is released only
+    /// once those rows arrive, so a stream that goes quiet holds both its rows
+    /// and any checkpoint marker queued behind them until it resumes.
+    pub batch_flush_interval: Option<String>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -1284,6 +1291,36 @@ sinks: {}
             }
             _ => panic!("expected dynamic_table transform"),
         }
+    }
+
+    #[test]
+    fn script_transform_parses_batch_flush_interval() {
+        // `ScriptTransform` denies unknown fields, so a pipeline that sets this
+        // knob fails to parse at all until the field exists.
+        let yaml = r#"
+primary_key: id
+from: raw
+language: typescript
+script: "function process(input) { return input; }"
+batch_size: 100
+batch_flush_interval: 1s
+"#;
+        let transform: ScriptTransform = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(transform.batch_size, Some(100));
+        assert_eq!(transform.batch_flush_interval.as_deref(), Some("1s"));
+    }
+
+    #[test]
+    fn script_transform_batch_flush_interval_defaults_to_none() {
+        let yaml = r#"
+primary_key: id
+from: raw
+language: typescript
+script: "function process(input) { return input; }"
+"#;
+        let transform: ScriptTransform = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(transform.batch_flush_interval, None);
+        assert_eq!(transform.batch_size, None);
     }
 
     #[test]

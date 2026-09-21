@@ -1697,6 +1697,10 @@ impl Streamling {
                     let schema = &script_transform.schema;
                     let parallelism = script_transform.parallelism;
                     let batch_size = script_transform.batch_size;
+                    let batch_flush_interval = parse_batch_flush_interval(
+                        &script_transform.batch_flush_interval,
+                        &ctx.format(),
+                    )?;
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
@@ -1767,7 +1771,7 @@ impl Streamling {
                             reference_name.clone(),
                         ),
                         batch_size,
-                        None,
+                        batch_flush_interval,
                         reference_name.clone(),
                     );
                     let wasm_node = WasmRunnerNode::with_options(
@@ -4005,6 +4009,49 @@ mod tests {
                 "expected {expected:?} in plan:\n{rendered}"
             );
         }
+
+        // A script transform's `batch_flush_interval` has to reach the
+        // rebatcher, otherwise a size-only accumulator holds a partial batch —
+        // and any checkpoint marker queued behind it — until `batch_size` rows
+        // arrive, which a stream at an event-empty head may never deliver.
+        let timed_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan.clone(),
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            Some(2),
+            Some(std::time::Duration::from_secs(1)),
+            "normalize".to_string(),
+        );
+        let timed_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    timed_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+        let timed_rendered = displayable(
+            session_manager
+                .new_df(timed_plan)
+                .create_physical_plan()
+                .await
+                .unwrap()
+                .as_ref(),
+        )
+        .indent(true)
+        .to_string();
+        assert!(
+            timed_rendered.contains("RebatchExec(batch_size=2, interval=1s, partitions=4)"),
+            "expected the flush interval in plan:\n{timed_rendered}"
+        );
 
         let inherited_input =
             wrap_with_repartition(source_plan, &by_key(&["id"]), None, "normalize".to_string());
