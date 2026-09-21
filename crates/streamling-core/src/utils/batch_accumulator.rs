@@ -111,11 +111,23 @@ impl BatchAccumulator {
             !extract_checkpoint_messages(batch.schema().metadata()).is_empty();
 
         if batch.num_rows() == 0 {
-            // If empty batch has checkpoint metadata, add it to accumulated batches
-            if has_checkpoint_data {
-                self.accumulated_batches.push_back(batch);
+            // A zero-row batch without checkpoint metadata carries nothing.
+            if !has_checkpoint_data {
+                return None;
             }
-            return None;
+            // A marker-only batch is queued behind any data already
+            // accumulated (marker-after-covered-data ordering). It must still
+            // honor the size threshold: with `batch_size == 0` (passthrough)
+            // the marker has to leave now, because a streaming source at an
+            // event-empty head may never deliver another non-empty batch and
+            // the script rebatcher has no flush timer — parking it here held
+            // checkpoint markers until shutdown drain (STRM-6643).
+            self.accumulated_batches.push_back(batch);
+            return if self.should_flush_by_size() {
+                self.flush()
+            } else {
+                None
+            };
         }
 
         self.current_row_count += batch.num_rows();
@@ -1347,6 +1359,54 @@ mod tests {
 
         let total_rows: usize = output.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 30);
+    }
+
+    #[test]
+    fn test_batch_size_zero_releases_marker_only_batch_on_push() {
+        // Repro for STRM-6643: a script transform with `batch_size: 0` and no
+        // flush interval receives a zero-row batch that only carries a
+        // checkpoint marker (the plugin source's synthetic flush at an
+        // event-empty head). batch_size 0 means "pass every batch through",
+        // so the marker must be released by this push, not parked until a
+        // later non-empty batch arrives.
+        let mut accumulator = BatchAccumulator::new(0, None);
+        let released = accumulator.push(create_test_batch_with_checkpoint(0, 7));
+        let released = released.expect("marker-only batch must be released with batch_size 0");
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            extract_checkpoint_messages(released[0].schema().metadata()).len(),
+            1
+        );
+        assert!(accumulator.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_async_accumulator_batch_size_zero_forwards_marker_while_input_idle() {
+        // Same scenario through the stream driver used by RebatchExec: the
+        // input stays open (a streaming source at head) and never delivers
+        // another non-empty batch. Before the fix, with no timer the only
+        // release path was end-of-stream, which is what the shutdown drain
+        // triggered (markers for every stalled epoch arrived at once).
+        let accumulator = AsyncBatchAccumulator::new(0, None);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, DataFusionError>>(4);
+        let input = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut output = Box::pin(accumulator.process_stream(Box::pin(input)));
+
+        tx.send(Ok(create_test_batch_with_checkpoint(0, 10)))
+            .await
+            .unwrap();
+
+        let first = timeout(Duration::from_millis(500), output.next())
+            .await
+            .expect("marker-only batch must not be parked while the input is idle")
+            .expect("stream should yield the marker batch")
+            .unwrap();
+        assert_eq!(first.num_rows(), 0);
+        assert_eq!(
+            extract_checkpoint_messages(first.schema().metadata()).len(),
+            1
+        );
+        drop(tx);
     }
 
     #[test]
