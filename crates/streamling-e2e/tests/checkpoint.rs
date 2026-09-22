@@ -828,6 +828,48 @@ async fn written_ids(ctx: &TestContext, table: &str) -> std::collections::BTreeS
     rows.into_iter().map(|row| row.0).collect()
 }
 
+/// How long a progress wait gives the pipeline before the test goes on to fail
+/// on its assertions rather than hang.
+const PROGRESS_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+const PROGRESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Resolves once `table` holds at least `rows`, so a SIGTERM lands at the same
+/// point in the read whatever the machine's speed. The sink creates the table on
+/// startup, so a count that fails counts as zero.
+async fn wait_for_rows(ctx: &TestContext, table: &str, rows: i64) {
+    let deadline = std::time::Instant::now() + PROGRESS_WAIT_LIMIT;
+    while std::time::Instant::now() < deadline {
+        let written = ctx
+            .postgres
+            .count(&format!("SELECT COUNT(*) FROM public.{table}"))
+            .await
+            .unwrap_or(0);
+        if written >= rows {
+            return;
+        }
+        tokio::time::sleep(PROGRESS_POLL_INTERVAL).await;
+    }
+}
+
+/// Resolves once `table` holds every id missing from `already_written`, so a
+/// resumed run is stopped when it has caught up rather than after a guessed
+/// duration.
+async fn wait_until_caught_up(
+    ctx: &TestContext,
+    table: &str,
+    already_written: &std::collections::BTreeSet<i64>,
+    total: i64,
+) {
+    let deadline = std::time::Instant::now() + PROGRESS_WAIT_LIMIT;
+    while std::time::Instant::now() < deadline {
+        let written = written_ids(ctx, table).await;
+        if (1..=total).all(|id| already_written.contains(&id) || written.contains(&id)) {
+            return;
+        }
+        tokio::time::sleep(PROGRESS_POLL_INTERVAL).await;
+    }
+}
+
 /// The epoch numbers in log lines of the form `{prefix}{epoch}`.
 fn logged_epochs<'a>(logs: &'a str, prefix: &'a str) -> impl Iterator<Item = u64> + 'a {
     logs.lines().filter_map(move |line| {
@@ -930,7 +972,10 @@ async fn test_bounded_file_source_checkpoints_while_reading() {
 
 /// A bounded file source resumes from its checkpointed progress.
 ///
-/// Run 1 is stopped by SIGTERM mid-read: its partitions stop at a batch boundary
+/// Run 1 is stopped by SIGTERM once it has written a fraction of the rows, so
+/// the stop lands mid-read whatever the machine's speed; a fixed delay lets a
+/// fast host finish the whole read, leaving nothing to resume. Its partitions
+/// then stop at a batch boundary
 /// and close with a terminal checkpoint covering the files they fully emitted.
 /// Run 2 reuses the state backend and must read only the rest, re-reading at most
 /// the file each partition had in flight. Run 3 finds every file covered and
@@ -949,6 +994,7 @@ async fn test_bounded_file_source_resumes_from_checkpoint() {
 
     const FILES: i64 = 400;
     const PARTITIONS: usize = 2;
+    const ROWS_BEFORE_SIGTERM: i64 = FILES * FILE_ROWS / 8;
     let dir = write_id_files(&ctx, "bounded_resume_data", FILES);
 
     // One application id and one Sqlite state file across every run, like a
@@ -975,10 +1021,10 @@ async fn test_bounded_file_source_resumes_from_checkpoint() {
     };
 
     let (status, _) = ctx
-        .run_pipeline_with_sigterm(
+        .run_pipeline_with_sigterm_when(
             &file_pipeline(&dir, "bounded_resume_run1", "bounded"),
             opts(),
-            std::time::Duration::from_secs(4),
+            wait_for_rows(&ctx, "bounded_resume_run1", ROWS_BEFORE_SIGTERM),
             std::time::Duration::from_secs(30),
         )
         .await
@@ -992,7 +1038,8 @@ async fn test_bounded_file_source_resumes_from_checkpoint() {
     let run_1 = written_ids(&ctx, "bounded_resume_run1").await;
     assert!(
         !run_1.is_empty() && run_1.len() < total,
-        "SIGTERM must land mid-read for the resume to mean anything; run 1 wrote {} of {total} rows",
+        "SIGTERM must land mid-read for the resume to mean anything; run 1 wrote {} of {total} rows \
+         (it should stop near {ROWS_BEFORE_SIGTERM})",
         run_1.len()
     );
 
@@ -1047,8 +1094,9 @@ async fn test_bounded_file_source_resumes_from_checkpoint() {
 /// closes without a terminal checkpoint, so run 2 resumes from run 1's last
 /// finalized periodic epoch: it must write every row run 1 didn't, re-reading
 /// only the files that epoch didn't cover rather than everything run 1 read.
-/// The partitions finish files out of order, so the persisted progress includes
-/// files committed past one still being read.
+/// Run 2 never finishes on its own, so it is stopped once it has written every
+/// row run 1 missed. The partitions finish files out of order, so the persisted
+/// progress includes files committed past one still being read.
 ///
 /// A record limit would be wrong in the bounded test above — the sink stops
 /// consuming, which aborts the source's terminal round-trip — but continuous
@@ -1066,9 +1114,6 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
     const FILES: i64 = 300;
     // Half the rows, so run 1 always stops with files left to read.
     const RUN_1_RECORD_LIMIT: u64 = (FILES * FILE_ROWS / 2) as u64;
-    // The source never finishes on its own, so run 2 is stopped after well over
-    // the time reading the rest takes.
-    const RUN_2_DURATION: std::time::Duration = std::time::Duration::from_secs(45);
     const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     let dir = write_id_files(&ctx, "continuous_resume_data", FILES);
 
@@ -1121,10 +1166,10 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
     );
 
     let (status, _) = ctx
-        .run_pipeline_with_sigterm(
+        .run_pipeline_with_sigterm_when(
             &file_pipeline(&dir, "continuous_resume_run2", "continuous"),
             opts(),
-            RUN_2_DURATION,
+            wait_until_caught_up(&ctx, "continuous_resume_run2", &run_1, FILES * FILE_ROWS),
             EXIT_DEADLINE,
         )
         .await
@@ -1140,7 +1185,7 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
         .collect();
     assert!(
         missing.is_empty(),
-        "the resumed run lost rows (or needed longer than {RUN_2_DURATION:?}): {missing:?}"
+        "the resumed run lost rows (or did not catch up within {PROGRESS_WAIT_LIMIT:?}): {missing:?}"
     );
 
     let file_of = |id: &i64| (id - 1) / FILE_ROWS;
