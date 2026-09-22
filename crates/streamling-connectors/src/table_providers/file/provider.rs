@@ -515,9 +515,18 @@ impl FileSourceExec {
     }
 }
 
+impl ExecMode {
+    fn name(&self) -> &'static str {
+        match self {
+            ExecMode::Bounded { .. } => "bounded",
+            ExecMode::Continuous { .. } => "continuous",
+        }
+    }
+}
+
 impl Debug for FileSourceExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "FileSourceExec")
+        write!(f, "FileSourceExec: mode={}", self.mode.name())
     }
 }
 
@@ -525,7 +534,8 @@ impl DisplayAs for FileSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "FileSourceExec: partitions={}",
+            "FileSourceExec: mode={}, partitions={}",
+            self.mode.name(),
             self.properties().output_partitioning().partition_count()
         )
     }
