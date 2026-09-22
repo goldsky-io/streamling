@@ -851,6 +851,31 @@ async fn wait_for_rows(ctx: &TestContext, table: &str, rows: i64) {
     }
 }
 
+/// Resolves once `table` holds at least `rows` rows and the pipeline has
+/// persisted checkpoint state, so a SIGTERM lands mid-read and after an epoch
+/// finalized — the progress a resumed run needs — whatever the machine's speed.
+async fn wait_for_checkpointed_rows(ctx: &TestContext, table: &str, rows: i64, state_table: &str) {
+    let deadline = std::time::Instant::now() + PROGRESS_WAIT_LIMIT;
+    while std::time::Instant::now() < deadline {
+        let written = ctx
+            .postgres
+            .count(&format!("SELECT COUNT(*) FROM public.{table}"))
+            .await
+            .unwrap_or(0);
+        let checkpointed = ctx
+            .postgres
+            .count(&format!(
+                "SELECT COUNT(*) FROM streamling.\"{state_table}\""
+            ))
+            .await
+            .unwrap_or(0);
+        if written >= rows && checkpointed > 0 {
+            return;
+        }
+        tokio::time::sleep(PROGRESS_POLL_INTERVAL).await;
+    }
+}
+
 /// Resolves once `table` holds every id missing from `already_written`, so a
 /// resumed run is stopped when it has caught up rather than after a guessed
 /// duration.
@@ -1090,18 +1115,21 @@ async fn test_bounded_file_source_resumes_from_checkpoint() {
 /// A two-partition continuous file source resumes from its checkpointed
 /// watermark.
 ///
-/// Run 1 stops at a record limit, which lands mid-read. A continuous source
-/// closes without a terminal checkpoint, so run 2 resumes from run 1's last
-/// finalized periodic epoch: it must write every row run 1 didn't, re-reading
-/// only the files that epoch didn't cover rather than everything run 1 read.
-/// Run 2 never finishes on its own, so it is stopped once it has written every
-/// row run 1 missed. The partitions finish files out of order, so the persisted
-/// progress includes files committed past one still being read.
+/// Run 1 is stopped by SIGTERM once it has written a fraction of the rows AND
+/// persisted checkpoint state. A continuous source closes without a terminal
+/// checkpoint, so the resume only means anything if a periodic epoch finalized
+/// first; waiting on both conditions stops the run at the same point on any
+/// machine, where a fixed delay or a record limit stops it wherever the host's
+/// speed happens to put it.
 ///
-/// A record limit would be wrong in the bounded test above — the sink stops
-/// consuming, which aborts the source's terminal round-trip — but continuous
-/// mode has no terminal checkpoint to abort, and periodic epochs are exactly
-/// what this test resumes from.
+/// Run 2 resumes from that epoch: it must write every row run 1 didn't,
+/// re-reading only the files the epoch didn't cover rather than everything run 1
+/// read. It never finishes on its own, so it is stopped once it has caught up.
+/// The partitions finish files out of order, so the persisted progress includes
+/// files committed past one still being read.
+///
+/// State lives in Postgres rather than Sqlite so the test can see when progress
+/// has been persisted.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_continuous_file_source_resumes_from_checkpoint() {
@@ -1111,47 +1139,63 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
         .await
         .expect("Failed to create test context");
 
-    const FILES: i64 = 300;
-    // Half the rows, so run 1 always stops with files left to read.
-    const RUN_1_RECORD_LIMIT: u64 = (FILES * FILE_ROWS / 2) as u64;
+    // Enough files that the read outlasts the checkpoint interval on a fast host.
+    const FILES: i64 = 600;
+    const ROWS_BEFORE_SIGTERM: i64 = FILES * FILE_ROWS / 8;
     const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     let dir = write_id_files(&ctx, "continuous_resume_data", FILES);
 
-    // One application id and one Sqlite state file across both runs, like a pod
+    // One application id and one state table across both runs, like a pod
     // restart with a persistent state volume.
     let application_id = format!("continuous_file_resume_{}", ctx.test_id);
-    let state_path = std::env::temp_dir()
-        .join(format!(
-            "continuous_file_resume_state_{}.sqlite",
-            ctx.test_id
-        ))
-        .to_string_lossy()
-        .into_owned();
+    let state_table = format!(
+        "continuous_file_resume_state_{}",
+        ctx.test_id.replace('-', "_")
+    );
     let opts = || {
         PipelineOpts::new()
             .env("STREAMLING__APPLICATION_ID", &application_id)
             .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
-            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Sqlite")
+            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
             .env(
-                "STREAMLING__STATE_BACKEND__SQLITE__DATABASE_PATH",
-                &state_path,
+                "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+                &ctx.postgres.host,
+            )
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+                ctx.postgres.port.to_string(),
+            )
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+                &state_table,
             )
             .timeout(std::time::Duration::from_secs(180))
     };
 
-    let run_1_output = ctx
-        .run_pipeline_raw(
+    let (status, run_1_logs) = ctx
+        .run_pipeline_with_sigterm_when(
             &file_pipeline(&dir, "continuous_resume_run1", "continuous"),
-            opts().record_limit(RUN_1_RECORD_LIMIT),
+            opts(),
+            wait_for_checkpointed_rows(
+                &ctx,
+                "continuous_resume_run1",
+                ROWS_BEFORE_SIGTERM,
+                &state_table,
+            ),
+            EXIT_DEADLINE,
         )
         .await
         .expect("Run 1 execution failed");
     assert!(
-        run_1_output.status.success(),
-        "run 1 should stop at its record limit and exit"
+        status.success(),
+        "run 1 should drain and exit after SIGTERM"
     );
     assert!(
-        logged_epochs(&run_1_output.stderr, "Epoch finalized: ")
+        logged_epochs(&run_1_logs, "Epoch finalized: ")
             .next()
             .is_some(),
         "an epoch must finalize while run 1 reads, or it persists no progress to resume from"
@@ -1161,7 +1205,8 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
     let run_1 = written_ids(&ctx, "continuous_resume_run1").await;
     assert!(
         !run_1.is_empty() && run_1.len() < total,
-        "the record limit must stop run 1 mid-read; it wrote {} of {total} rows",
+        "the SIGTERM must land mid-read; run 1 wrote {} of {total} rows \
+         (it should stop near {ROWS_BEFORE_SIGTERM})",
         run_1.len()
     );
 
