@@ -5018,6 +5018,7 @@ mod tests {
             }),
             sink_params: None,
             metric_metadata_id: "test_metric".to_string(),
+            scope: streamling_core::shutdown::ComponentScope::detached("clickhouse"),
         };
 
         let session = SessionContext::new();
