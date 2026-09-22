@@ -828,6 +828,17 @@ async fn written_ids(ctx: &TestContext, table: &str) -> std::collections::BTreeS
     rows.into_iter().map(|row| row.0).collect()
 }
 
+/// The ids written to `table` so far — empty while the sink has yet to create
+/// it, so a progress wait can poll from before the pipeline starts.
+async fn written_ids_so_far(ctx: &TestContext, table: &str) -> std::collections::BTreeSet<i64> {
+    let rows: Vec<(i64,)> = ctx
+        .postgres
+        .query(&format!("SELECT id FROM public.{table}"))
+        .await
+        .unwrap_or_default();
+    rows.into_iter().map(|row| row.0).collect()
+}
+
 /// How long a progress wait gives the pipeline before the test goes on to fail
 /// on its assertions rather than hang.
 const PROGRESS_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -887,7 +898,7 @@ async fn wait_until_caught_up(
 ) {
     let deadline = std::time::Instant::now() + PROGRESS_WAIT_LIMIT;
     while std::time::Instant::now() < deadline {
-        let written = written_ids(ctx, table).await;
+        let written = written_ids_so_far(ctx, table).await;
         if (1..=total).all(|id| already_written.contains(&id) || written.contains(&id)) {
             return;
         }
