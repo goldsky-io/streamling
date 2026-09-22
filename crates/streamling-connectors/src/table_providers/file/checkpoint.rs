@@ -19,6 +19,10 @@ use super::reader::ReadPlan;
 /// consumer instance does, so an ended partition never leaves a dead receiver for
 /// the coordinator's next broadcast to prune.
 pub(super) struct CheckpointInbox {
+    /// The channel subscribed to. Tests pass a private one so that a message
+    /// sent by one of them cannot reach another's inbox through the
+    /// process-wide coordinator channel.
+    channel: &'static str,
     receiver: crossbeam::channel::Receiver<CheckpointMessage>,
     subscriber_id: SubscriberId,
     pub(super) buffer: Vec<CheckpointMessage>,
@@ -26,8 +30,13 @@ pub(super) struct CheckpointInbox {
 
 impl CheckpointInbox {
     pub(super) fn subscribe() -> Self {
-        let (receiver, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+        Self::subscribe_to(CHECKPOINT_COORDINATOR_CHANNEL)
+    }
+
+    pub(super) fn subscribe_to(channel: &'static str) -> Self {
+        let (receiver, subscriber_id) = subscribe_with_id(channel);
         Self {
+            channel,
             receiver,
             subscriber_id,
             buffer: Vec::new(),
@@ -56,7 +65,7 @@ impl CheckpointInbox {
 
 impl Drop for CheckpointInbox {
     fn drop(&mut self) {
-        unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, self.subscriber_id);
+        unsubscribe(self.channel, self.subscriber_id);
     }
 }
 

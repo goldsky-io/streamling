@@ -250,6 +250,7 @@ mod tests {
     use datafusion::datasource::TableProvider;
     use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
     use futures::StreamExt;
+    use streamling_core::checkpoints::checkpoint_management::extract_checkpoint_messages;
 
     fn tracker_of(plan: &Arc<dyn ExecutionPlan>) -> Arc<ProgressTracker<RangeProgress>> {
         let exec = plan
@@ -523,6 +524,90 @@ mod tests {
                 prefix.clone().join("1.csv").as_ref().to_string(),
             ],
             "reading to EOF records every file as emitted"
+        );
+    }
+
+    /// A partition drains the coordinator between batches while it reads, so a
+    /// marker rides the next batch and its `Finalizer` persists the files
+    /// emitted before it — without waiting for the whole read to finish.
+    ///
+    /// The inbox is subscribed to a private channel: the coordinator channel is
+    /// process-wide, so a marker sent on it would reach every other test's
+    /// source running in the same binary.
+    #[tokio::test]
+    async fn bounded_partition_carries_markers_and_persists_while_reading() {
+        const CHANNEL: &str = "file_source_marker_during_read_test";
+
+        // More files than the stream's buffer holds, so the partition is still
+        // reading when the marker arrives instead of having raced to the end.
+        let dir = temp_dir_with("marker_during_read", &csv_files(20));
+        let state_backend = bounded_backend("marker_during_read");
+        let (session_manager, provider) =
+            bounded_provider(&dir, "marker_src", Some(1), state_backend.clone(), None).await;
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
+            .await
+            .unwrap();
+        let exec = plan
+            .downcast_ref::<FileSourceExec>()
+            .expect("a file source plan");
+
+        let inbox = CheckpointInbox::subscribe_to(CHANNEL);
+        let mut stream = exec
+            .execute_with_inbox(0, session_manager.session_context().task_ctx(), inbox)
+            .unwrap();
+
+        // Two batches in, the first file has been read to its end and counted, so
+        // a marker arriving now has progress to cover.
+        for _ in 0..2 {
+            stream.next().await.expect("a batch").unwrap();
+        }
+        streamling_core::checkpoints::channels::send(
+            CHANNEL,
+            CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(1),
+                created_at_ms: now_ms(),
+            },
+        )
+        .unwrap();
+
+        let mut carried_marker = false;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            if matches!(
+                extract_checkpoint_messages(batch.schema().metadata()).as_slice(),
+                [CheckpointMessage::Marker { epoch, .. }] if epoch.0 == 1
+            ) {
+                carried_marker = true;
+                break;
+            }
+        }
+        assert!(
+            carried_marker,
+            "a batch emitted after the marker must carry it downstream"
+        );
+
+        // Finalizing mid-read must persist what the marker covered, rather than
+        // waiting for the source to reach the end of its queue.
+        streamling_core::checkpoints::channels::send(
+            CHANNEL,
+            CheckpointMessage::Finalizer(CheckpointEpoch(1)),
+        )
+        .unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let prefix = provider.discovery.table_url.prefix().clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        let persisted = state_backend
+            .get(bounded_progress_state_key("marker_src"))
+            .await
+            .unwrap()
+            .expect("the finalized epoch must persist progress");
+        assert!(
+            persisted.covers(prefix.clone().join("0.csv").as_ref()),
+            "progress must cover the file emitted before the marker; got {persisted:?}"
         );
     }
 

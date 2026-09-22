@@ -556,6 +556,21 @@ impl ExecutionPlan for FileSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        // Subscribe synchronously, before the stream is returned, so no
+        // coordinator message is missed.
+        self.execute_with_inbox(partition, context, CheckpointInbox::subscribe())
+    }
+}
+
+impl FileSourceExec {
+    /// [`ExecutionPlan::execute`] with the coordinator subscription passed in, so
+    /// a test can drive one partition from a private channel.
+    pub(super) fn execute_with_inbox(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+        inbox: CheckpointInbox,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
         let partitions = self.properties().output_partitioning().partition_count();
         if partition >= partitions {
             return internal_err!(
@@ -570,9 +585,6 @@ impl ExecutionPlan for FileSourceExec {
         );
         let tx = builder.tx();
 
-        // Subscribe synchronously, before the stream is returned, so no
-        // coordinator message is missed.
-        let inbox = CheckpointInbox::subscribe();
         let reader = PartitionReader {
             reference_name: self.reference_name.clone(),
             object_store_url: self.discovery.table_url.object_store(),
