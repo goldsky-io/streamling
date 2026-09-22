@@ -1043,12 +1043,17 @@ async fn test_bounded_file_source_resumes_from_checkpoint() {
 /// A two-partition continuous file source resumes from its checkpointed
 /// watermark.
 ///
-/// Run 1 is stopped by SIGTERM mid-read. A continuous source closes without a
-/// terminal checkpoint, so run 2 resumes from run 1's last finalized periodic
-/// epoch: it must write every row run 1 didn't, re-reading only the files that
-/// epoch didn't cover rather than everything run 1 read. The partitions finish
-/// files out of order, so the persisted progress includes files committed past
-/// one still being read.
+/// Run 1 stops at a record limit, which lands mid-read. A continuous source
+/// closes without a terminal checkpoint, so run 2 resumes from run 1's last
+/// finalized periodic epoch: it must write every row run 1 didn't, re-reading
+/// only the files that epoch didn't cover rather than everything run 1 read.
+/// The partitions finish files out of order, so the persisted progress includes
+/// files committed past one still being read.
+///
+/// A record limit would be wrong in the bounded test above — the sink stops
+/// consuming, which aborts the source's terminal round-trip — but continuous
+/// mode has no terminal checkpoint to abort, and periodic epochs are exactly
+/// what this test resumes from.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_continuous_file_source_resumes_from_checkpoint() {
@@ -1058,10 +1063,11 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
         .await
         .expect("Failed to create test context");
 
-    const FILES: i64 = 400;
-    const RUN_1_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+    const FILES: i64 = 300;
+    // Half the rows, so run 1 always stops with files left to read.
+    const RUN_1_RECORD_LIMIT: u64 = (FILES * FILE_ROWS / 2) as u64;
     // The source never finishes on its own, so run 2 is stopped after well over
-    // the time a full read takes.
+    // the time reading the rest takes.
     const RUN_2_DURATION: std::time::Duration = std::time::Duration::from_secs(45);
     const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     let dir = write_id_files(&ctx, "continuous_resume_data", FILES);
@@ -1085,27 +1091,32 @@ async fn test_continuous_file_source_resumes_from_checkpoint() {
                 "STREAMLING__STATE_BACKEND__SQLITE__DATABASE_PATH",
                 &state_path,
             )
+            .timeout(std::time::Duration::from_secs(180))
     };
 
-    let (status, _) = ctx
-        .run_pipeline_with_sigterm(
+    let run_1_output = ctx
+        .run_pipeline_raw(
             &file_pipeline(&dir, "continuous_resume_run1", "continuous"),
-            opts(),
-            RUN_1_DURATION,
-            EXIT_DEADLINE,
+            opts().record_limit(RUN_1_RECORD_LIMIT),
         )
         .await
         .expect("Run 1 execution failed");
     assert!(
-        status.success(),
-        "run 1 should drain and exit after SIGTERM"
+        run_1_output.status.success(),
+        "run 1 should stop at its record limit and exit"
+    );
+    assert!(
+        logged_epochs(&run_1_output.stderr, "Epoch finalized: ")
+            .next()
+            .is_some(),
+        "an epoch must finalize while run 1 reads, or it persists no progress to resume from"
     );
 
     let total = (FILES * FILE_ROWS) as usize;
     let run_1 = written_ids(&ctx, "continuous_resume_run1").await;
     assert!(
         !run_1.is_empty() && run_1.len() < total,
-        "SIGTERM must land mid-read for the resume to mean anything; run 1 wrote {} of {total} rows",
+        "the record limit must stop run 1 mid-read; it wrote {} of {total} rows",
         run_1.len()
     );
 

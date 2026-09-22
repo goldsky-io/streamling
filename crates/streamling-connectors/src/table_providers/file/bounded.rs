@@ -483,7 +483,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows(collect_partitions(&plan, &session_manager).await), 3);
         assert!(
-            tracker_of(&plan).emitted(0).is_empty(),
+            tracker_of(&plan).pending(0).is_empty(),
             "a file whose stream never ended must not count as emitted"
         );
 
@@ -501,7 +501,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows(collect_partitions(&plan, &session_manager).await), 2);
         assert!(
-            tracker_of(&plan).emitted(0).is_empty(),
+            tracker_of(&plan).pending(0).is_empty(),
             "a file the scan limit truncated must not count as emitted"
         );
 
@@ -514,7 +514,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             tracker_of(&plan)
-                .emitted(0)
+                .pending(0)
                 .into_iter()
                 .map(|file| file.path)
                 .collect::<Vec<_>>(),

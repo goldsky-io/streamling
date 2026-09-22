@@ -63,14 +63,37 @@ pub(super) struct ProgressTracker<P: Progress> {
 struct TrackerState<P> {
     progress: P,
     persisted_epoch: Option<CheckpointEpoch>,
-    /// Files each partition has fully emitted since the last persist, in
+    /// Files each partition has fully emitted but not persisted yet, in
     /// emission order.
-    emitted: Vec<Vec<FileKey>>,
+    pending: Vec<Vec<FileKey>>,
+    /// Files each partition has already persisted.
+    persisted: Vec<usize>,
     /// Whether each partition's stream has ended.
     ended: Vec<bool>,
-    /// How many of each partition's `emitted` files preceded an epoch's `Marker`
-    /// on its stream.
+    /// How many files each partition had emitted in total when it drained an
+    /// epoch's `Marker`. A total, not a position in `pending`, so a persist
+    /// draining that list leaves the other epochs' snapshots valid.
     snapshots: BTreeMap<CheckpointEpoch, HashMap<usize, usize>>,
+}
+
+impl<P> TrackerState<P> {
+    /// How many of each partition's pending files precede `epoch`'s marker.
+    fn pending_before(&self, epoch: &CheckpointEpoch) -> Vec<usize> {
+        let recorded = self.snapshots.get(epoch);
+        (0..self.pending.len())
+            .map(
+                |partition| match recorded.and_then(|counts| counts.get(&partition)) {
+                    Some(emitted) => emitted.saturating_sub(self.persisted[partition]),
+                    // An ended stream that never carried the epoch's marker
+                    // precedes it at every merge point, so all of its files count.
+                    None if self.ended[partition] => self.pending[partition].len(),
+                    // Unreachable for a partition subscribed before the marker
+                    // (see the type docs); counting nothing is safe.
+                    None => 0,
+                },
+            )
+            .collect()
+    }
 }
 
 impl<P: Progress> ProgressTracker<P> {
@@ -86,7 +109,8 @@ impl<P: Progress> ProgressTracker<P> {
             state: Mutex::new(TrackerState {
                 progress,
                 persisted_epoch: None,
-                emitted: vec![Vec::new(); partitions],
+                pending: vec![Vec::new(); partitions],
+                persisted: vec![0; partitions],
                 ended: vec![false; partitions],
                 snapshots: BTreeMap::new(),
             }),
@@ -95,12 +119,12 @@ impl<P: Progress> ProgressTracker<P> {
     }
 
     pub(super) fn advance(&self, partition: usize, file: FileKey) {
-        self.state().emitted[partition].push(file);
+        self.state().pending[partition].push(file);
     }
 
     pub(super) fn snapshot(&self, partition: usize, epoch: &CheckpointEpoch) {
         let mut state = self.state();
-        let emitted = state.emitted[partition].len();
+        let emitted = state.persisted[partition] + state.pending[partition].len();
         state
             .snapshots
             .entry(epoch.clone())
@@ -131,26 +155,13 @@ impl<P: Progress> ProgressTracker<P> {
             if state
                 .persisted_epoch
                 .as_ref()
-                .is_some_and(|persisted| persisted >= epoch)
+                .is_some_and(|last| last >= epoch)
             {
                 return Ok(());
             }
-            let recorded = state.snapshots.get(epoch);
-            let counted: Vec<usize> = (0..state.emitted.len())
-                .map(
-                    |partition| match recorded.and_then(|counts| counts.get(&partition)) {
-                        Some(count) => *count,
-                        // An ended stream that never carried the epoch's marker
-                        // precedes it at every merge point, so all of its files count.
-                        None if state.ended[partition] => state.emitted[partition].len(),
-                        // Unreachable for a partition subscribed before the marker
-                        // (see the type docs); counting nothing is safe.
-                        None => 0,
-                    },
-                )
-                .collect();
+            let counted = state.pending_before(epoch);
             let files = state
-                .emitted
+                .pending
                 .iter()
                 .zip(&counted)
                 .flat_map(|(files, count)| files[..*count].iter().cloned())
@@ -169,23 +180,20 @@ impl<P: Progress> ProgressTracker<P> {
 
         // Partitions may have emitted more during the `put`; only each one's
         // counted prefix is persisted now.
-        let mut state = self.state();
-        for (files, count) in state.emitted.iter_mut().zip(&counted) {
-            files.drain(..*count);
+        let mut guard = self.state();
+        let state = &mut *guard;
+        for (partition, count) in counted.into_iter().enumerate() {
+            state.pending[partition].drain(..count);
+            state.persisted[partition] += count;
         }
         state.snapshots.retain(|recorded, _| recorded > epoch);
-        for counts in state.snapshots.values_mut() {
-            for (partition, count) in counts.iter_mut() {
-                *count = count.saturating_sub(counted[*partition]);
-            }
-        }
         state.persisted_epoch = Some(epoch.clone());
         Ok(())
     }
 
     #[cfg(test)]
-    pub(super) fn emitted(&self, partition: usize) -> Vec<FileKey> {
-        self.state().emitted[partition].clone()
+    pub(super) fn pending(&self, partition: usize) -> Vec<FileKey> {
+        self.state().pending[partition].clone()
     }
 
     fn state(&self) -> MutexGuard<'_, TrackerState<P>> {
