@@ -601,6 +601,10 @@ Note: `script` field accepts any valid **browser** JavaScript or TypeScript snip
 single `input` argument. The input record is passed as `input` argument, and the transformed record must be returned
 from the function.
 
+**Batching**: `batch_size` accumulates that many rows per execution stream before invoking the script, and
+`batch_flush_interval` (e.g. `1s`) caps how long a partially filled batch waits before the script is invoked anyway.
+Omit `batch_size` to invoke the script on each upstream batch as it arrives, with no accumulator in between.
+
 ### Sinks
 
 All sinks are implemented as custom DataFusion Table Providers (`TableProvider`) returning a `DataSinkExec`. Sinks

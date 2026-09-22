@@ -1692,6 +1692,10 @@ impl Streamling {
                     let schema = &script_transform.schema;
                     let parallelism = script_transform.parallelism;
                     let batch_size = script_transform.batch_size;
+                    let batch_flush_interval = parse_batch_flush_interval(
+                        &script_transform.batch_flush_interval,
+                        &ctx.format(),
+                    )?;
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
@@ -1762,7 +1766,7 @@ impl Streamling {
                             reference_name.clone(),
                         ),
                         batch_size,
-                        None,
+                        batch_flush_interval,
                         reference_name.clone(),
                     );
                     let wasm_node = WasmRunnerNode::with_options(
@@ -4038,6 +4042,79 @@ mod tests {
         assert!(
             !inherited_rendered.contains("RebatchExec"),
             "unexpected RebatchExec in plan:\n{inherited_rendered}"
+        );
+    }
+
+    async fn rendered_script_plan(
+        batch_size: Option<usize>,
+        batch_flush_interval: Option<Duration>,
+    ) -> String {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![], vec![], vec![]]).unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan,
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            batch_size,
+            batch_flush_interval,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        displayable(
+            session_manager
+                .new_df(logical_plan)
+                .create_physical_plan()
+                .await
+                .unwrap()
+                .as_ref(),
+        )
+        .indent(true)
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn script_transform_batch_flush_interval_reaches_rebatch_node() {
+        let rendered = rendered_script_plan(Some(2), Some(Duration::from_secs(1))).await;
+        assert!(
+            rendered.contains("RebatchExec(batch_size=2, interval=1s, partitions=4)"),
+            "expected the flush interval in plan:\n{rendered}"
         );
     }
 
