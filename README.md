@@ -603,7 +603,9 @@ from the function.
 
 **Batching**: `batch_size` accumulates that many rows per execution stream before invoking the script, and
 `batch_flush_interval` (e.g. `1s`) caps how long a partially filled batch waits before the script is invoked anyway.
-Omit `batch_size` to invoke the script on each upstream batch as it arrives, with no accumulator in between.
+With `batch_size` set and no interval given, it defaults to `1s` — that default is specific to `script` transforms;
+`handler` and `plugin` transforms leave the interval unset. Omit `batch_size` to invoke the script on each
+upstream batch as it arrives, with no accumulator in between.
 
 ### Sinks
 
