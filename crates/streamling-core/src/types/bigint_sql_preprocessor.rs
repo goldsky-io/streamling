@@ -8,16 +8,18 @@
 
 use crate::error::{Result, ResultExt};
 use crate::streamling_user_err;
-use datafusion::arrow::datatypes::DataType;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::sqlparser::ast::{
-    BinaryOperator, Expr as SqlExpr, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator,
+    BinaryOperator, CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, UnaryOperator, Value, Visit, Visitor, visit_expressions_mut,
 };
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 // ---------------- Shared helpers ----------------
 
@@ -31,485 +33,10 @@ fn parse_single_statement(sql: &str) -> Option<Statement> {
     }
 }
 
-fn column_ident(e: &SqlExpr) -> Option<&str> {
-    match e {
-        SqlExpr::Identifier(id) => Some(id.value.as_str()),
-        SqlExpr::CompoundIdentifier(ids) if !ids.is_empty() => {
-            Some(ids.last().unwrap().value.as_str())
-        }
-        _ => None,
-    }
-}
-
-fn parse_wrapped_fn(func_name: &str, inner: &SqlExpr) -> Option<SqlExpr> {
-    let dialect = GenericDialect {};
-    let inner_sql = inner.to_string();
-    let sql = format!("SELECT {func_name}({inner_sql})");
-    let mut stmts = Parser::parse_sql(&dialect, sql.as_str()).ok()?;
-    if stmts.len() != 1 {
-        return None;
-    }
-    if let Statement::Query(query) = stmts.remove(0)
-        && let SetExpr::Select(select) = query.body.as_ref()
-        && let Some(item) = select.projection.first()
-    {
-        return match item {
-            SelectItem::UnnamedExpr(e) => Some(e.clone()),
-            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
-            _ => None,
-        };
-    }
-    None
-}
-
-fn parse_binary_fn(func_name: &str, left: &SqlExpr, right: &SqlExpr) -> Option<SqlExpr> {
-    let dialect = GenericDialect {};
-    let lsql = left.to_string();
-    let rsql = right.to_string();
-    let sql = format!("SELECT {func_name}({lsql},{rsql})");
-    let mut stmts = Parser::parse_sql(&dialect, sql.as_str()).ok()?;
-    if stmts.len() != 1 {
-        return None;
-    }
-    if let Statement::Query(query) = stmts.remove(0)
-        && let SetExpr::Select(select) = query.body.as_ref()
-        && let Some(item) = select.projection.first()
-    {
-        return match item {
-            SelectItem::UnnamedExpr(e) => Some(e.clone()),
-            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
-            _ => None,
-        };
-    }
-    None
-}
-
-/// Returns true for operators that produce a bigint result when their
-/// operands are bigint (arithmetic ops). Returns false for comparison
-/// and logical operators which always produce Boolean.
-fn is_bigint_producing_op(op: &BinaryOperator) -> bool {
-    matches!(
-        op,
-        BinaryOperator::Plus
-            | BinaryOperator::Minus
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide
-            | BinaryOperator::Modulo
-            | BinaryOperator::BitwiseAnd
-            | BinaryOperator::BitwiseOr
-            | BinaryOperator::BitwiseXor
-    )
-}
-
 fn clone_strip_nested(expr: &SqlExpr) -> SqlExpr {
     match expr {
         SqlExpr::Nested(inner) => clone_strip_nested(inner),
         _ => expr.clone(),
-    }
-}
-
-/// Check whether a function name starting with the bigint prefix actually
-/// returns the bigint type.  Functions like `i256_to_string` or
-/// `i256_to_int64` convert *out* of the bigint type and must not be treated
-/// as bigint-producing expressions.
-fn is_bigint_returning_prefixed_func<K: BigIntKind>(name: &str) -> bool {
-    if !name.starts_with(K::PREFIX) {
-        return false;
-    }
-    let suffix = &name[K::PREFIX.len()..];
-    !suffix.starts_with("to_")
-}
-
-fn is_kind_func_call<K: BigIntKind>(e: &SqlExpr) -> bool {
-    if let SqlExpr::Function(f) = e {
-        let full = f.name.to_string();
-        let last = full.rsplit('.').next().unwrap_or(full.as_str());
-        return last == K::TO_NAME || is_bigint_returning_prefixed_func::<K>(last);
-    }
-    false
-}
-
-fn wrap_literals_if_needed<K: BigIntKind>(
-    left: &mut SqlExpr,
-    right: &mut SqlExpr,
-    left_is_kind: bool,
-    right_is_kind: bool,
-) {
-    if left_is_kind || right_is_kind {
-        if !left_is_kind && let Some(func) = parse_wrapped_fn(K::TO_NAME, left) {
-            *left = func;
-        }
-        if !right_is_kind && let Some(func) = parse_wrapped_fn(K::TO_NAME, right) {
-            *right = func;
-        }
-    }
-}
-
-trait BigIntKind {
-    const TO_NAME: &'static str;
-    const PREFIX: &'static str;
-    const TO_STRING_NAME: &'static str;
-    fn bin_op_name(op: &BinaryOperator) -> Option<&'static str>;
-    fn neg_name() -> Option<&'static str> {
-        None
-    }
-}
-
-struct U256Kind;
-impl BigIntKind for U256Kind {
-    const TO_NAME: &'static str = "to_u256";
-    const PREFIX: &'static str = "u256_";
-    const TO_STRING_NAME: &'static str = "u256_to_string";
-    fn bin_op_name(op: &BinaryOperator) -> Option<&'static str> {
-        match op {
-            BinaryOperator::Plus => Some("u256_add"),
-            BinaryOperator::Minus => Some("u256_sub"),
-            BinaryOperator::Multiply => Some("u256_mul"),
-            BinaryOperator::Divide => Some("u256_div"),
-            BinaryOperator::Modulo => Some("u256_mod"),
-            _ => None,
-        }
-    }
-}
-
-struct I256Kind;
-impl BigIntKind for I256Kind {
-    const TO_NAME: &'static str = "to_i256";
-    const PREFIX: &'static str = "i256_";
-    const TO_STRING_NAME: &'static str = "i256_to_string";
-    fn bin_op_name(op: &BinaryOperator) -> Option<&'static str> {
-        match op {
-            BinaryOperator::Plus => Some("i256_add"),
-            BinaryOperator::Minus => Some("i256_sub"),
-            BinaryOperator::Multiply => Some("i256_mul"),
-            BinaryOperator::Divide => Some("i256_div"),
-            BinaryOperator::Modulo => Some("i256_mod"),
-            _ => None,
-        }
-    }
-    fn neg_name() -> Option<&'static str> {
-        Some("i256_neg")
-    }
-}
-
-fn is_bigint_expr<K: BigIntKind>(expr: &SqlExpr, cols: &HashSet<String>) -> bool {
-    match expr {
-        SqlExpr::Nested(inner) => is_bigint_expr::<K>(inner, cols),
-        SqlExpr::UnaryOp { expr, .. } => is_bigint_expr::<K>(expr, cols),
-        SqlExpr::BinaryOp { left, op, right } => {
-            // Only arithmetic operations produce bigint results.
-            // Comparison (>, <, =, etc.) and logical (AND, OR) operators
-            // produce Boolean regardless of operand types.
-            if is_bigint_producing_op(op) {
-                is_bigint_expr::<K>(left, cols) || is_bigint_expr::<K>(right, cols)
-            } else {
-                false
-            }
-        }
-        SqlExpr::Cast { expr, .. } => is_bigint_expr::<K>(expr, cols),
-        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
-            column_ident(expr).is_some_and(|c| cols.contains(c))
-        }
-        SqlExpr::Function(f) => {
-            let fname = f.name.to_string().to_lowercase();
-            // Functions that convert OUT of bigint (e.g. i256_to_string,
-            // u256_to_string) do not produce a bigint result.
-            if fname.starts_with(K::PREFIX) && !is_bigint_returning_prefixed_func::<K>(&fname) {
-                return false;
-            }
-            if fname == K::TO_NAME || is_bigint_returning_prefixed_func::<K>(&fname) {
-                return true;
-            }
-            if (fname == "coalesce" || fname == "coalesce_meta")
-                && let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
-                    &f.args
-            {
-                for arg in arglist.args.iter() {
-                    if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
-                        datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ) = arg
-                        && is_bigint_expr::<K>(e, cols)
-                    {
-                        return true;
-                    }
-                }
-            }
-            // Check if the function directly wraps a to_<kind>() call
-            let s = f.to_string().to_lowercase();
-            if s.contains(&(String::from(K::TO_NAME) + "(")) {
-                return true;
-            }
-            false
-        }
-        // A CASE produces a bigint value iff any of its result branches does.
-        // The WHEN conditions and operand do not affect the result type.
-        SqlExpr::Case {
-            conditions,
-            else_result,
-            ..
-        } => {
-            conditions
-                .iter()
-                .any(|when| is_bigint_expr::<K>(&when.result, cols))
-                || else_result
-                    .as_ref()
-                    .is_some_and(|e| is_bigint_expr::<K>(e, cols))
-        }
-        _ => false,
-    }
-}
-
-fn contains_bigint_operations<K: BigIntKind>(expr: &SqlExpr, cols: &HashSet<String>) -> bool {
-    match expr {
-        SqlExpr::Nested(inner) => contains_bigint_operations::<K>(inner, cols),
-        SqlExpr::UnaryOp { expr, .. } => contains_bigint_operations::<K>(expr, cols),
-        SqlExpr::BinaryOp { left, right, .. } => {
-            contains_bigint_operations::<K>(left, cols)
-                || contains_bigint_operations::<K>(right, cols)
-        }
-        SqlExpr::Cast { expr, .. } => contains_bigint_operations::<K>(expr, cols),
-        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
-            column_ident(expr).is_some_and(|c| cols.contains(c))
-        }
-        SqlExpr::Function(f) => {
-            let fname = f.name.to_string().to_lowercase();
-            if fname.starts_with(K::PREFIX) && !is_bigint_returning_prefixed_func::<K>(&fname) {
-                return false;
-            }
-            if is_bigint_returning_prefixed_func::<K>(&fname) || fname == K::TO_NAME {
-                return true;
-            }
-            if (fname == "coalesce" || fname == "coalesce_meta")
-                && let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
-                    &f.args
-            {
-                for arg in arglist.args.iter() {
-                    if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
-                        datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ) = arg
-                        && contains_bigint_operations::<K>(e, cols)
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        SqlExpr::Case {
-            conditions,
-            else_result,
-            ..
-        } => {
-            conditions
-                .iter()
-                .any(|when| contains_bigint_operations::<K>(&when.result, cols))
-                || else_result
-                    .as_ref()
-                    .is_some_and(|e| contains_bigint_operations::<K>(e, cols))
-        }
-        _ => false,
-    }
-}
-
-/// Returns true when a NULL literal — these are left untouched in CASE branches
-/// because DataFusion coerces NULL to any branch type, whereas to_<kind>() would
-/// reject it.
-fn is_null_literal(e: &SqlExpr) -> bool {
-    matches!(
-        e,
-        SqlExpr::Value(v)
-            if matches!(v.value, datafusion::logical_expr::sqlparser::ast::Value::Null)
-    )
-}
-
-/// Coerce a single CASE result branch to the bigint kind when needed. Branches
-/// that are already kind-typed (columns, to_<kind>() calls, bigint expressions)
-/// and NULL literals are left as-is; everything else (e.g. an integer literal
-/// `0`) is wrapped in to_<kind>() so all branches share the FixedSizeBinary(32)
-/// type and DataFusion's CASE type-coercion succeeds.
-fn coerce_case_branch<K: BigIntKind>(branch: &mut SqlExpr, cols: &HashSet<String>) {
-    if is_kind_func_call::<K>(branch)
-        || is_bigint_expr::<K>(branch, cols)
-        || is_null_literal(branch)
-    {
-        return;
-    }
-    if let Some(wrapped) = parse_wrapped_fn(K::TO_NAME, branch) {
-        *branch = wrapped;
-    }
-}
-
-/// Rewrite a CASE expression for the given bigint kind. Recurses into every
-/// sub-expression, and when the CASE produces a bigint value: coerces literal
-/// result branches to the kind, then wraps the whole CASE in to_<kind>(). The
-/// outer wrap is an identity passthrough for FixedSizeBinary(32) that re-declares
-/// the extension metadata which native CASE drops — the Postgres sink relies on
-/// that metadata to cast to numeric(78,0).
-fn rewrite_case_kind<K: BigIntKind>(e: &mut SqlExpr, cols: &HashSet<String>) {
-    let result_is_kind = {
-        let SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } = e
-        else {
-            return;
-        };
-
-        if let Some(op) = operand.as_mut() {
-            rewrite_expr_kind::<K>(op, cols);
-        }
-        for when in conditions.iter_mut() {
-            rewrite_expr_kind::<K>(&mut when.condition, cols);
-            rewrite_expr_kind::<K>(&mut when.result, cols);
-        }
-        if let Some(er) = else_result.as_mut() {
-            rewrite_expr_kind::<K>(er, cols);
-        }
-
-        let is_kind = conditions.iter().any(|when| {
-            is_kind_func_call::<K>(&when.result) || is_bigint_expr::<K>(&when.result, cols)
-        }) || else_result
-            .as_ref()
-            .is_some_and(|er| is_kind_func_call::<K>(er) || is_bigint_expr::<K>(er, cols));
-
-        if is_kind {
-            for when in conditions.iter_mut() {
-                coerce_case_branch::<K>(&mut when.result, cols);
-            }
-            if let Some(er) = else_result.as_mut() {
-                coerce_case_branch::<K>(er, cols);
-            }
-        }
-        is_kind
-    };
-
-    if result_is_kind && let Some(wrapped) = parse_wrapped_fn(K::TO_NAME, e) {
-        *e = wrapped;
-    }
-}
-
-fn rewrite_expr_kind<K: BigIntKind>(e: &mut SqlExpr, cols: &HashSet<String>) {
-    match e {
-        SqlExpr::BinaryOp { left, op, right } => {
-            rewrite_expr_kind::<K>(left.as_mut(), cols);
-            rewrite_expr_kind::<K>(right.as_mut(), cols);
-
-            let left_is_col = column_ident(left).is_some_and(|c| cols.contains(c));
-            let right_is_col = column_ident(right).is_some_and(|c| cols.contains(c));
-            let left_is_kind =
-                left_is_col || is_kind_func_call::<K>(left) || is_bigint_expr::<K>(left, cols);
-            let right_is_kind =
-                right_is_col || is_kind_func_call::<K>(right) || is_bigint_expr::<K>(right, cols);
-
-            // Always wrap literals if needed (for both comparison and arithmetic operators)
-            wrap_literals_if_needed::<K>(
-                left.as_mut(),
-                right.as_mut(),
-                left_is_kind,
-                right_is_kind,
-            );
-
-            // Handle arithmetic operators (convert to function calls)
-            if let Some(fname) = K::bin_op_name(op)
-                && (left_is_kind || right_is_kind)
-            {
-                let left_clone = clone_strip_nested(left);
-                let right_clone = clone_strip_nested(right);
-                if let Some(func) = parse_binary_fn(fname, &left_clone, &right_clone) {
-                    *e = func;
-                }
-            }
-        }
-        SqlExpr::Case { .. } => rewrite_case_kind::<K>(e, cols),
-        SqlExpr::Nested(inner) => rewrite_expr_kind::<K>(inner.as_mut(), cols),
-        SqlExpr::UnaryOp { op, expr } => {
-            if matches!(op, UnaryOperator::Minus) {
-                if let Some(neg_name) = K::neg_name() {
-                    let target_is_col = column_ident(expr).is_some_and(|c| cols.contains(c));
-                    let target_is_kind = target_is_col || is_kind_func_call::<K>(expr);
-                    rewrite_expr_kind::<K>(expr.as_mut(), cols);
-                    if target_is_kind {
-                        if !target_is_col
-                            && !is_kind_func_call::<K>(expr)
-                            && let Some(func) = parse_wrapped_fn(K::TO_NAME, expr)
-                        {
-                            **expr = func;
-                        }
-                        if let Some(neg) = parse_wrapped_fn(neg_name, expr) {
-                            *e = neg;
-                        }
-                    }
-                }
-            } else {
-                rewrite_expr_kind::<K>(expr.as_mut(), cols);
-            }
-        }
-        SqlExpr::Cast {
-            expr, data_type, ..
-        } => {
-            // Enable CAST of 32-byte bigints to string e.g. CAST(u256_col AS VARCHAR)
-            let dt = data_type.to_string().to_lowercase();
-            if (dt.contains("varchar") || dt.contains("string") || dt.contains("utf8"))
-                && is_bigint_expr::<K>(expr, cols)
-                && !is_kind_func_call::<K>(expr)
-            {
-                let inner = clone_strip_nested(expr);
-                if let Some(wrapped) = parse_wrapped_fn(K::TO_STRING_NAME, &inner) {
-                    *expr.as_mut() = wrapped; // wrap inner expr without extra nesting
-                }
-            }
-            rewrite_expr_kind::<K>(expr.as_mut(), cols)
-        }
-        SqlExpr::Function(func) => {
-            // For functions, always recurse into args; for COALESCE, coerce args to kind if any is kind.
-            let fname = func.name.to_string().to_lowercase();
-            if let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
-                &mut func.args
-            {
-                let coalesce = fname == "coalesce" || fname == "coalesce_meta";
-                let any_is_kind = if coalesce {
-                    arglist.args.iter().any(|arg| {
-                        matches!(arg,
-                            datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
-                                datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e)
-                            ) if is_kind_func_call::<K>(e) || is_bigint_expr::<K>(e, cols)
-                        )
-                    })
-                } else {
-                    false
-                };
-                for arg in arglist.args.iter_mut() {
-                    if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
-                        datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ) = arg
-                    {
-                        if coalesce
-                            && any_is_kind
-                            && !(is_kind_func_call::<K>(e) || is_bigint_expr::<K>(e, cols))
-                            && let Some(wrapped) = parse_wrapped_fn(K::TO_NAME, e)
-                        {
-                            *e = wrapped;
-                        }
-                        rewrite_expr_kind::<K>(e, cols);
-                        // Remove redundant parentheses introduced by original SQL
-                        *e = clone_strip_nested(e);
-                    }
-                }
-
-                // If this is COALESCE and any arg is kind, rewrite function name to coalesce_meta
-                if fname == "coalesce" && any_is_kind {
-                    use datafusion::logical_expr::sqlparser::ast::{
-                        Ident, ObjectName, ObjectNamePart,
-                    };
-                    func.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-                        "coalesce_meta",
-                    ))]);
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -709,113 +236,621 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
     })?;
 
     let arrow_schema = table_provider.schema();
-    let mut u256_cols: HashSet<String> = HashSet::new();
-    let mut i256_cols: HashSet<String> = HashSet::new();
+    let mut decimal_arb_cols: HashSet<String> = HashSet::new();
     for field in arrow_schema.fields() {
-        if matches!(field.data_type(), DataType::FixedSizeBinary(32)) {
-            if crate::types::u256::U256Type::is_u256_metadata(field.metadata()) {
-                u256_cols.insert(field.name().to_string());
-            } else if crate::types::i256::I256Type::is_i256_metadata(field.metadata()) {
-                i256_cols.insert(field.name().to_string());
+        if crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(field) {
+            decimal_arb_cols.insert(field.name().to_string());
+        }
+    }
+    // Joined tables contribute their decimal_arb columns too; one that
+    // cannot be resolved here is left for DataFusion to report.
+    for table in tables.iter().skip(1) {
+        let (schema_name, table_name) =
+            crate::session::SessionManager::extract_schema_and_table_names(table);
+        let Some(schema) = catalog.schema(schema_name) else {
+            continue;
+        };
+        let Ok(Some(provider)) = schema.table(table_name).await else {
+            continue;
+        };
+        for field in provider.schema().fields() {
+            if crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(field) {
+                decimal_arb_cols.insert(field.name().to_string());
             }
         }
     }
 
-    fn rewrite_expr(e: &mut SqlExpr, u256_cols: &HashSet<String>, i256_cols: &HashSet<String>) {
-        // Run U256 rewrite pass, then I256 pass. Each pass is idempotent for the other kind.
-        rewrite_expr_kind::<U256Kind>(e, u256_cols);
-        rewrite_expr_kind::<I256Kind>(e, i256_cols);
-    }
+    // Walk the SQL AST and apply the decimal_arb CAST-to-string rewrite.
+    // DataFusion has no native cast from LargeBinary
+    // (decimal_arb storage) to Utf8View, so this rewrite lowers
+    // `CAST(decimal_arb_col AS TEXT|VARCHAR|STRING|UTF8|CHAR)` to
+    // `decimal_arb_to_string(decimal_arb_col)` before the plan is built.
+    //
+    // Binary-op rewriting for wide integers happens at the
+    // LogicalPlan level via
+    // `DecimalArbExprPlanner` — no SQL-string rewriting needed.
 
-    // Helper function to rewrite expressions in a SetExpr
     fn rewrite_setexpr(
         expr: &mut datafusion::logical_expr::sqlparser::ast::SetExpr,
-        u256_cols: &HashSet<String>,
-        i256_cols: &HashSet<String>,
+        decimal_arb_cols: &HashSet<String>,
     ) {
         match expr {
             SetExpr::Select(select) => {
                 for item in select.projection.iter_mut() {
                     match item {
-                        SelectItem::UnnamedExpr(expr) => rewrite_expr(expr, u256_cols, i256_cols),
+                        SelectItem::UnnamedExpr(expr) => {
+                            rewrite_expr_for_decimal_arb_cast(expr, decimal_arb_cols)
+                        }
                         SelectItem::ExprWithAlias { expr, .. } => {
-                            rewrite_expr(expr, u256_cols, i256_cols)
+                            rewrite_expr_for_decimal_arb_cast(expr, decimal_arb_cols)
                         }
                         _ => {}
                     }
                 }
                 if let Some(selection) = select.selection.as_mut() {
-                    rewrite_expr(selection, u256_cols, i256_cols);
+                    rewrite_expr_for_decimal_arb_cast(selection, decimal_arb_cols);
                 }
                 if let Some(having) = select.having.as_mut() {
-                    rewrite_expr(having, u256_cols, i256_cols);
+                    rewrite_expr_for_decimal_arb_cast(having, decimal_arb_cols);
                 }
             }
             SetExpr::SetOperation { left, right, .. } => {
-                rewrite_setexpr(left.as_mut(), u256_cols, i256_cols);
-                rewrite_setexpr(right.as_mut(), u256_cols, i256_cols);
+                rewrite_setexpr(left.as_mut(), decimal_arb_cols);
+                rewrite_setexpr(right.as_mut(), decimal_arb_cols);
             }
             _ => {}
         }
     }
 
     if let Statement::Query(query) = &mut stmt {
-        // Track CTE columns that contain bigint data
-        let mut cte_u256_columns: HashSet<String> = HashSet::new();
-        let mut cte_i256_columns: HashSet<String> = HashSet::new();
-
-        // Process CTEs first and track which columns contain bigint data
+        // Process CTEs (their projections may yield decimal_arb columns
+        // referenced by the main query, but the CAST-to-string rewrite
+        // only requires the source-table column set — CTE column tracking
+        // is no longer needed once BigIntKind binary-op rewriting is gone).
         if let Some(with) = &mut query.with {
             for cte in &mut with.cte_tables {
-                // Analyze CTE to find columns that contain bigint expressions
-                let cte_name = cte.alias.name.to_string();
+                rewrite_setexpr(&mut cte.query.body, &decimal_arb_cols);
+            }
+        }
+        rewrite_setexpr(&mut query.body, &decimal_arb_cols);
+    }
 
-                // Process the CTE body
-                rewrite_setexpr(&mut cte.query.body, &u256_cols, &i256_cols);
+    let names = DecimalArbNames::collect(&stmt, decimal_arb_cols);
+    quote_inexact_literals_near_decimal_arb(&mut stmt, &names);
 
-                // Analyze the CTE to determine which output columns contain bigint data
-                if let SetExpr::Select(select) = cte.query.body.as_ref() {
-                    for item in &select.projection {
-                        if let SelectItem::ExprWithAlias { alias, expr, .. } = item {
-                            let alias_name = alias.value.to_string();
-                            // Check if the expression contains bigint operations
-                            // This is a heuristic - if the expression was rewritten with u256_ or i256_ functions,
-                            // then the output column contains bigint data
+    Ok(stmt.to_string())
+}
 
-                            // Check if this expression contains U256 or I256 operations
-                            let contains_u256 =
-                                contains_bigint_operations::<U256Kind>(expr, &u256_cols);
-                            let contains_i256 =
-                                contains_bigint_operations::<I256Kind>(expr, &i256_cols);
-
-                            if contains_u256 {
-                                cte_u256_columns.insert(format!("{}.{}", cte_name, alias_name));
-                                cte_u256_columns.insert(alias_name.clone()); // Also add without table prefix
-                            }
-                            if contains_i256 {
-                                cte_i256_columns.insert(format!("{}.{}", cte_name, alias_name));
-                                cte_i256_columns.insert(alias_name.clone()); // Also add without table prefix
-                            }
-                        }
+/// Recursively walk a SQL expression tree and rewrite any
+/// `CAST(decimal_arb_col AS TEXT/VARCHAR/STRING/CHAR)` (case-insensitive)
+/// to `decimal_arb_to_string(decimal_arb_col)`. DataFusion has no native
+/// cast from `LargeBinary` to `Utf8View`, so this rewrite is the only
+/// safe lowering for the natural SQL form.
+///
+/// Only the immediate inner-expression case is handled (i.e. `CAST(col AS
+/// TEXT)` where `col` is a decimal_arb column). More complex inner
+/// expressions (e.g. `CAST(col_a + col_b AS TEXT)`) fall through; users
+/// can wrap with `decimal_arb_to_string(...)` explicitly for those.
+fn rewrite_expr_for_decimal_arb_cast(e: &mut SqlExpr, decimal_arb_cols: &HashSet<String>) {
+    match e {
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => {
+            // Match against explicit sqlparser DataType variants rather than
+            // substringing the stringified type — `contains("char")` would
+            // false-positive on e.g. `Array(VARCHAR)` and rewrite a cast
+            // whose target is a collection.
+            let is_text_target = matches!(
+                data_type,
+                SqlDataType::Text
+                    | SqlDataType::Varchar(_)
+                    | SqlDataType::CharacterVarying(_)
+                    | SqlDataType::CharVarying(_)
+                    | SqlDataType::Char(_)
+                    | SqlDataType::Character(_)
+                    | SqlDataType::String(_)
+            );
+            if is_text_target {
+                let stripped = clone_strip_nested(expr);
+                if let SqlExpr::Identifier(ident) = &stripped
+                    && decimal_arb_cols.contains(&ident.value)
+                {
+                    // Rewrite the whole Cast node to decimal_arb_to_string(col)
+                    *e = build_decimal_arb_to_string_call(stripped);
+                    return;
+                }
+                if let SqlExpr::CompoundIdentifier(idents) = &stripped
+                    && let Some(last) = idents.last()
+                    && decimal_arb_cols.contains(&last.value)
+                {
+                    *e = build_decimal_arb_to_string_call(stripped);
+                    return;
+                }
+            }
+            // Recurse into the inner expression even if we didn't rewrite.
+            rewrite_expr_for_decimal_arb_cast(expr.as_mut(), decimal_arb_cols);
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_expr_for_decimal_arb_cast(left.as_mut(), decimal_arb_cols);
+            rewrite_expr_for_decimal_arb_cast(right.as_mut(), decimal_arb_cols);
+        }
+        SqlExpr::UnaryOp { expr, .. } => {
+            rewrite_expr_for_decimal_arb_cast(expr.as_mut(), decimal_arb_cols);
+        }
+        SqlExpr::Nested(inner) => {
+            rewrite_expr_for_decimal_arb_cast(inner.as_mut(), decimal_arb_cols);
+        }
+        SqlExpr::Function(func) => {
+            if let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
+                &mut func.args
+            {
+                for arg in arglist.args.iter_mut() {
+                    if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
+                        datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e_inner),
+                    ) = arg
+                    {
+                        rewrite_expr_for_decimal_arb_cast(e_inner, decimal_arb_cols);
                     }
                 }
             }
         }
+        _ => {}
+    }
+}
 
-        // Process main query body with CTE column awareness
-        if cte_u256_columns.is_empty() && cte_i256_columns.is_empty() {
-            rewrite_setexpr(&mut query.body, &u256_cols, &i256_cols);
-        } else {
-            // Combine base columns with CTE columns
-            let mut extended_u256_cols = u256_cols.clone();
-            let mut extended_i256_cols = i256_cols.clone();
-            extended_u256_cols.extend(cte_u256_columns);
-            extended_i256_cols.extend(cte_i256_columns);
-            rewrite_setexpr(&mut query.body, &extended_u256_cols, &extended_i256_cols);
+/// Construct an AST node for the call `decimal_arb_to_string(inner)`.
+fn build_decimal_arb_to_string_call(inner: SqlExpr) -> SqlExpr {
+    use datafusion::logical_expr::sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
+        ObjectName, ObjectNamePart,
+    };
+    // Build via sqlparser's own pretty-printed form to avoid hand-constructing
+    // every span; fall back to a Function expression if parse fails.
+    let call_sql = format!("SELECT decimal_arb_to_string({})", inner);
+    if let Some(Statement::Query(q)) = parse_single_statement(&call_sql)
+        && let SetExpr::Select(select) = q.body.as_ref()
+        && let Some(SelectItem::UnnamedExpr(expr)) = select.projection.first()
+    {
+        return expr.clone();
+    }
+    // Fallback: build minimally. Should never fire — kept for safety.
+    SqlExpr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(
+            datafusion::logical_expr::sqlparser::ast::Ident::new("decimal_arb_to_string"),
+        )]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+/// The digits of a bare numeric literal — optionally signed, possibly
+/// parenthesised — exactly as written.
+fn number_literal_text(expr: &SqlExpr) -> Option<String> {
+    match expr {
+        SqlExpr::Nested(inner) => number_literal_text(inner),
+        SqlExpr::Value(v) => match &v.value {
+            Value::Number(n, _) => Some(n.to_string()),
+            _ => None,
+        },
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => number_literal_text(expr).map(|t| format!("-{t}")),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => number_literal_text(expr),
+        _ => None,
+    }
+}
+
+// ---------------- Exact numeric literals next to decimal_arb ----------------
+//
+// DataFusion types a numeric literal that fits neither i64 nor u64, or that
+// has a fractional part or an exponent, as Float64 — its digits are gone
+// before any decimal_arb rule runs (`1000000000000000000000000` plans as
+// 999999999999999983222784, and `amount > 1000000000000000000000000` then
+// fails coercion outright). Where such a literal is an operand of a
+// decimal_arb expression the preprocessor quotes it: the decimal_arb planner
+// and rewrite parse string literals exactly. An operand that is not
+// decimal_arb is never touched, so other columns keep DataFusion's typing.
+
+/// Would DataFusion plan this numeric token as Float64?
+fn is_inexact_number(text: &str) -> bool {
+    if text.contains(['.', 'e', 'E']) {
+        return true;
+    }
+    if text.starts_with('-') {
+        text.parse::<i64>().is_err()
+    } else {
+        text.parse::<i64>().is_err() && text.parse::<u64>().is_err()
+    }
+}
+
+/// Replace a bare numeric literal DataFusion would plan as Float64 with a
+/// string literal carrying the same digits.
+fn quote_inexact_literal(expr: &mut SqlExpr) {
+    if let Some(text) = number_literal_text(expr)
+        && is_inexact_number(&text)
+    {
+        *expr = SqlExpr::Value(Value::SingleQuotedString(text).into());
+    }
+}
+
+fn is_arithmetic(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+    )
+}
+
+fn is_comparison(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
+    )
+}
+
+fn function_name(func: &Function) -> Option<String> {
+    func.name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_ascii_lowercase())
+}
+
+fn function_args(func: &Function) -> Vec<&SqlExpr> {
+    match &func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .filter_map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn function_args_mut(func: &mut Function) -> Vec<&mut SqlExpr> {
+    match &mut func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter_mut()
+            .filter_map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// UDFs that produce decimal_arb whatever their arguments.
+const DECIMAL_ARB_CONSTRUCTORS: &[&str] = &[
+    "to_decimal_arb_from_string",
+    "try_to_decimal_arb_from_string",
+    "to_decimal_arb_from_int",
+    "to_decimal_arb_from_decimal128",
+    "to_decimal_arb_from_decimal256",
+    "legacy_wide_int_to_decimal_arb",
+    "decimal_arb_add",
+    "decimal_arb_sub",
+    "decimal_arb_mul",
+    "decimal_arb_div",
+    "decimal_arb_mod",
+    "decimal_arb_neg",
+    "decimal_arb_abs",
+    "decimal_arb_rescale",
+    "decimal_arb_with_meta",
+    "decimal_arb_restamp",
+    "decimal_arb_greatest",
+    "decimal_arb_least",
+    "decimal_arb_array_min",
+    "decimal_arb_array_max",
+];
+
+/// Functions whose result is decimal_arb when a decimal_arb argument goes in.
+const DECIMAL_ARB_PRESERVING: &[&str] = &[
+    "coalesce",
+    "nvl",
+    "nvl2",
+    "ifnull",
+    "nullif",
+    "greatest",
+    "least",
+    "abs",
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "first_value",
+    "last_value",
+    "lag",
+    "lead",
+    "nth_value",
+    "any_value",
+    "array_element",
+    "array_extract",
+    "list_element",
+    "list_extract",
+    "array_min",
+    "array_max",
+];
+
+/// Functions whose arguments are compared or combined with each other, so a
+/// numeric literal among them meets the decimal_arb argument.
+const DECIMAL_ARB_ARGUMENT_FUNCTIONS: &[&str] = &[
+    "coalesce",
+    "nvl",
+    "nvl2",
+    "ifnull",
+    "nullif",
+    "greatest",
+    "least",
+    "decimal_arb_greatest",
+    "decimal_arb_least",
+    "make_array",
+    "make_list",
+    "array_has",
+    "array_has_any",
+    "array_has_all",
+    "array_position",
+    "array_positions",
+    "array_remove",
+    "array_remove_n",
+    "array_remove_all",
+    "array_replace",
+    "array_replace_n",
+    "array_replace_all",
+    "array_append",
+    "array_prepend",
+    "list_append",
+    "list_prepend",
+];
+
+/// Column names known to hold decimal_arb: the referenced tables' columns
+/// plus every projection alias (in CTEs and derived tables too) whose
+/// expression is decimal_arb-valued.
+struct DecimalArbNames(HashSet<String>);
+
+impl DecimalArbNames {
+    fn collect(stmt: &Statement, seed: HashSet<String>) -> Self {
+        let mut names = Self(seed);
+        // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
+        // FROM a)`), so collect until nothing new appears.
+        loop {
+            let before = names.0.len();
+            let mut collector = AliasCollector { names: &mut names };
+            let _ = stmt.visit(&mut collector);
+            if names.0.len() == before {
+                break;
+            }
+        }
+        names
+    }
+
+    /// Is `expr` decimal_arb-valued, as far as names and shapes can tell?
+    fn is_decimal(&self, expr: &SqlExpr) -> bool {
+        match expr {
+            SqlExpr::Identifier(ident) => self.0.contains(&ident.value),
+            SqlExpr::CompoundIdentifier(parts) => {
+                parts.last().is_some_and(|p| self.0.contains(&p.value))
+            }
+            SqlExpr::Nested(inner) => self.is_decimal(inner),
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                expr,
+            } => self.is_decimal(expr),
+            SqlExpr::BinaryOp { left, op, right } if is_arithmetic(op) => {
+                self.is_decimal(left) || self.is_decimal(right)
+            }
+            SqlExpr::Cast { data_type, .. } => is_wide_decimal_type(data_type),
+            SqlExpr::Case {
+                conditions,
+                else_result,
+                ..
+            } => {
+                conditions.iter().any(|c| self.is_decimal(&c.result))
+                    || else_result.as_deref().is_some_and(|e| self.is_decimal(e))
+            }
+            SqlExpr::Function(func) => match function_name(func) {
+                Some(name) if DECIMAL_ARB_CONSTRUCTORS.contains(&name.as_str()) => true,
+                Some(name) if DECIMAL_ARB_PRESERVING.contains(&name.as_str()) => {
+                    function_args(func).into_iter().any(|a| self.is_decimal(a))
+                }
+                _ => false,
+            },
+            SqlExpr::Array(array) => array.elem.iter().any(|e| self.is_decimal(e)),
+            SqlExpr::Subquery(query) => first_projection(query).is_some_and(|e| self.is_decimal(e)),
+            _ => false,
         }
     }
 
-    Ok(stmt.to_string())
+    /// Record the output columns of `select` that are decimal_arb-valued:
+    /// explicit aliases, and positional aliases from `alias(c1, c2, …)`.
+    fn record_select(&mut self, select: &Select, positional: Option<&TableAlias>) {
+        for (i, item) in select.projection.iter().enumerate() {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr) => expr,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if self.is_decimal(expr) {
+                        self.0.insert(alias.value.clone());
+                    }
+                    expr
+                }
+                _ => continue,
+            };
+            if let Some(alias) = positional
+                && let Some(column) = alias.columns.get(i)
+                && self.is_decimal(expr)
+            {
+                self.0.insert(column.name.value.clone());
+            }
+        }
+    }
+}
+
+/// `CAST(… AS DECIMAL(p[, s]))` beyond DataFusion's native precision routes
+/// to decimal_arb.
+fn is_wide_decimal_type(data_type: &SqlDataType) -> bool {
+    let info = match data_type {
+        SqlDataType::Decimal(info)
+        | SqlDataType::Numeric(info)
+        | SqlDataType::Dec(info)
+        | SqlDataType::BigNumeric(info)
+        | SqlDataType::BigDecimal(info) => info,
+        _ => return false,
+    };
+    match info {
+        ExactNumberInfo::Precision(p) | ExactNumberInfo::PrecisionAndScale(p, _) => *p > 76,
+        ExactNumberInfo::None => false,
+    }
+}
+
+/// The left-most `SELECT` of a query body (through set operations).
+fn leftmost_select(body: &SetExpr) -> Option<&Select> {
+    match body {
+        SetExpr::Select(select) => Some(select),
+        SetExpr::SetOperation { left, .. } => leftmost_select(left),
+        SetExpr::Query(query) => leftmost_select(&query.body),
+        _ => None,
+    }
+}
+
+fn first_projection(query: &Query) -> Option<&SqlExpr> {
+    match leftmost_select(&query.body)?.projection.first()? {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        _ => None,
+    }
+}
+
+struct AliasCollector<'a> {
+    names: &'a mut DecimalArbNames,
+}
+
+impl Visitor for AliasCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                if let Some(select) = leftmost_select(&cte.query.body) {
+                    self.names.record_select(select, Some(&cte.alias));
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } = table_factor
+            && let Some(select) = leftmost_select(&subquery.body)
+        {
+            self.names.record_select(select, Some(alias));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        self.names.record_select(select, None);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Quote every Float64-typed numeric literal that is compared, combined or
+/// listed together with a decimal_arb expression, anywhere in `stmt`.
+fn quote_inexact_literals_near_decimal_arb(stmt: &mut Statement, names: &DecimalArbNames) {
+    let quote_all = |exprs: Vec<&mut SqlExpr>| {
+        for e in exprs {
+            quote_inexact_literal(e);
+        }
+    };
+    let _ = visit_expressions_mut(stmt, |expr: &mut SqlExpr| {
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } if is_arithmetic(op) || is_comparison(op) => {
+                if names.is_decimal(left) {
+                    quote_inexact_literal(right);
+                } else if names.is_decimal(right) {
+                    quote_inexact_literal(left);
+                }
+            }
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                if names.is_decimal(expr) || names.is_decimal(low) || names.is_decimal(high) {
+                    quote_all(vec![expr, low, high]);
+                }
+            }
+            SqlExpr::InList { expr, list, .. } => {
+                if names.is_decimal(expr) || list.iter().any(|e| names.is_decimal(e)) {
+                    quote_inexact_literal(expr);
+                    quote_all(list.iter_mut().collect());
+                }
+            }
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand
+                    && (names.is_decimal(operand)
+                        || conditions.iter().any(|c| names.is_decimal(&c.condition)))
+                {
+                    quote_inexact_literal(operand);
+                    quote_all(conditions.iter_mut().map(|c| &mut c.condition).collect());
+                }
+                if conditions.iter().any(|c| names.is_decimal(&c.result))
+                    || else_result.as_deref().is_some_and(|e| names.is_decimal(e))
+                {
+                    quote_all(conditions.iter_mut().map(|c| &mut c.result).collect());
+                    if let Some(else_result) = else_result {
+                        quote_inexact_literal(else_result);
+                    }
+                }
+            }
+            SqlExpr::Array(array) => {
+                if array.elem.iter().any(|e| names.is_decimal(e)) {
+                    quote_all(array.elem.iter_mut().collect());
+                }
+            }
+            SqlExpr::Function(func) => {
+                if function_name(func)
+                    .is_some_and(|name| DECIMAL_ARB_ARGUMENT_FUNCTIONS.contains(&name.as_str()))
+                    && function_args(func).into_iter().any(|a| names.is_decimal(a))
+                {
+                    quote_all(function_args_mut(func));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
@@ -824,24 +859,42 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         static ref DECIMAL_TRY_RE: Regex = Regex::new(
             r"(?i)TRY_CAST\s*\(\s*(.+?)\s+AS\s+DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)"
         ).unwrap();
+        /// An unquoted SQL numeric literal (optionally signed, fractional,
+        /// exponent), as it appears inside `TRY_CAST(<literal> AS …)`.
+        static ref NUMERIC_LITERAL_RE: Regex =
+            Regex::new(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$").unwrap();
     }
     let sql = DECIMAL_TRY_RE
         .replace_all(sql, |caps: &regex::Captures| {
             let expr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let precision: u8 = caps
+            // Parse precision as u32 — decimal_arb supports declared
+            // precision well beyond u8::MAX. Scale parses as u32 too because
+            // negative scale isn't representable for decimal_arb.
+            let precision: u32 = caps
                 .get(2)
                 .and_then(|m| m.as_str().parse().ok())
                 .unwrap_or(0);
-            let scale: i8 = caps
+            let scale: i32 = caps
                 .get(3)
                 .and_then(|m| m.as_str().parse().ok())
                 .unwrap_or(0);
-            if precision > 76 && scale == 0 {
-                if precision <= 78 {
-                    format!("to_u256({})", expr)
+            if precision > 76 && scale >= 0 {
+                // All wide-precision CASTs route through the decimal_arb
+                // cast UDFs. TRY_CAST is
+                // contractually non-throwing, so it takes the `try_` variant,
+                // which yields NULL for a value that does not parse or does
+                // not fit the declared type instead of failing the query.
+                // A bare numeric literal is quoted rather than cast to
+                // VARCHAR: planned as Float64 it would lose digits first.
+                let text = if NUMERIC_LITERAL_RE.is_match(expr.trim()) {
+                    format!("'{}'", expr.trim())
                 } else {
-                    format!("TRY_CAST({} AS VARCHAR)", expr)
-                }
+                    format!("TRY_CAST({expr} AS VARCHAR)")
+                };
+                format!(
+                    "try_to_decimal_arb_from_string({}, {}, {})",
+                    text, precision, scale
+                )
             } else {
                 caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
             }
@@ -874,15 +927,65 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         None
     }
 
+    /// The source text of a numeric literal, looking through parentheses and
+    /// a leading sign: `18446744073709551617`, `(1e30)`, `-5`.
+    /// Build `to_decimal_arb_from_string(<text>, {precision}, {scale})` as an
+    /// `SqlExpr`, where `<text>` is `CAST({inner} AS VARCHAR)` — or, for a bare
+    /// numeric literal, the literal's own digits as a string. Falls back to the
+    /// inner cast-to-varchar (lossy) if the function-call shape can't be parsed
+    /// for some reason.
+    fn parse_to_decimal_arb_from_string(
+        inner: &SqlExpr,
+        precision: u64,
+        scale: u64,
+        non_throwing: bool,
+    ) -> Option<SqlExpr> {
+        let dialect = GenericDialect {};
+        // TRY_CAST must yield NULL for a value that does not convert.
+        let function = if non_throwing {
+            "try_to_decimal_arb_from_string"
+        } else {
+            "to_decimal_arb_from_string"
+        };
+        // An unquoted wide literal (`CAST(18446744073709551617 AS DECIMAL(77,0))`)
+        // has no SQL type of its own: DataFusion plans it as Float64 before the
+        // cast ever runs, so `CAST(... AS VARCHAR)` saw an approximation and the
+        // exact digits were gone. Quoting the token keeps them.
+        let inner_sql = match number_literal_text(inner) {
+            Some(text) => format!("'{text}'"),
+            None => format!("CAST({inner} AS VARCHAR)"),
+        };
+        let call_sql = format!(
+            "SELECT {}({}, {}, {})",
+            function, inner_sql, precision, scale
+        );
+        let mut stmts = Parser::parse_sql(&dialect, call_sql.as_str()).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        if let Statement::Query(query) = stmts.remove(0)
+            && let SetExpr::Select(select) = query.body.as_ref()
+            && let Some(item) = select.projection.first()
+        {
+            return match item {
+                SelectItem::UnnamedExpr(e) => Some(e.clone()),
+                SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+                _ => None,
+            };
+        }
+        None
+    }
+
     fn rewrite_expr(expr: &mut SqlExpr) {
         match expr {
             SqlExpr::Cast {
                 expr: inner,
                 data_type,
-                kind: _,
+                kind,
                 format: _,
-                ..
+                array: _,
             } => {
+                let non_throwing = matches!(kind, CastKind::TryCast | CastKind::SafeCast);
                 // Attempt to parse DECIMAL(p,s) from data_type.to_string()
                 let dt = data_type.to_string();
                 let dt_lower = dt.to_lowercase();
@@ -901,17 +1004,19 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                         ),
                         _ => (0, -1),
                     };
-                    if p > 76 && s == 0 {
-                        if p <= 78 {
-                            if let Some(func) = parse_wrapped_fn("to_u256", inner) {
-                                **inner = func;
-                            }
-                            // Replace the Cast node with its inner (now to_u256(inner))
-                            if let Some(replacement) = Some((**inner).clone()) {
-                                *expr = replacement;
-                                return;
-                            }
+                    if p > 76 && s >= 0 {
+                        // All wide-precision CASTs route through the
+                        // decimal_arb cast UDF. The
+                        // legacy `to_u256` fast path for (p ≤ 78, 0) is
+                        // retired alongside the U256/I256 types — those
+                        // values now flow through decimal_arb end-to-end.
+                        if let Some(call) =
+                            parse_to_decimal_arb_from_string(inner, p, s as u64, non_throwing)
+                        {
+                            *expr = call;
+                            return;
                         } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
+                            // Defensive fallback — should not fire in practice.
                             *expr = cast_varchar;
                             return;
                         }
@@ -978,24 +1083,39 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_preprocess_decimal_78_to_u256() {
+    fn test_preprocess_decimal_78_routes_to_decimal_arb() {
+        // CAST AS DECIMAL(78, 0) routes through the decimal_arb cast
+        // UDF. The legacy `to_u256` fast path
+        // is retired alongside the U256/I256 extension types.
         let sql = "SELECT CAST(balance AS DECIMAL(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT to_u256(balance) FROM accounts");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+        );
     }
 
     #[test]
-    fn test_preprocess_decimal_77_to_u256() {
+    fn test_preprocess_decimal_77_routes_to_decimal_arb() {
+        // See test_preprocess_decimal_78.
         let sql = "SELECT CAST(value AS DECIMAL(77, 0)) FROM data";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT to_u256(value) FROM data");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(value AS VARCHAR), 77, 0) FROM data"
+        );
     }
 
     #[test]
-    fn test_preprocess_decimal_100_to_varchar() {
+    fn test_preprocess_decimal_100_to_decimal_arb() {
+        // Previously fell back to lossy `CAST(... AS VARCHAR)`; now
+        // routes to the lossless decimal_arb cast UDF.
         let sql = "SELECT CAST(large_num AS DECIMAL(100, 0)) FROM data";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT CAST(large_num AS VARCHAR) FROM data");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(large_num AS VARCHAR), 100, 0) FROM data"
+        );
     }
 
     #[test]
@@ -1025,17 +1145,44 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_try_cast_78() {
+    fn test_preprocess_try_cast_78_routes_to_decimal_arb() {
+        // TRY_CAST AS DECIMAL(78, 0) routes through decimal_arb.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT to_u256(balance) FROM accounts");
+        // TRY_CAST is non-throwing, so it takes the `try_` constructor.
+        assert_eq!(
+            result,
+            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_try_cast_quotes_numeric_literal() {
+        // An unquoted wide literal must not pass through Float64 on its way
+        // to the constructor.
+        let sql = "SELECT TRY_CAST(18446744073709551617 AS DECIMAL(77, 0)) FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert_eq!(
+            result,
+            "SELECT try_to_decimal_arb_from_string('18446744073709551617', 77, 0) FROM t"
+        );
+        let sql = "SELECT CAST(18446744073709551617 AS DECIMAL(77, 0)) FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string('18446744073709551617', 77, 0) FROM t"
+        );
     }
 
     #[test]
     fn test_preprocess_try_cast_100() {
+        // TRY_CAST routes through the same lossless path.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(100, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT TRY_CAST(balance AS VARCHAR) FROM accounts");
+        assert_eq!(
+            result,
+            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 100, 0) FROM accounts"
+        );
     }
 
     #[test]
@@ -1046,24 +1193,39 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_decimal_with_scale_unchanged() {
+    fn test_preprocess_decimal_with_scale_routes_to_decimal_arb() {
+        // Previously this case was left untouched (and would
+        // fail at DataFusion's CAST resolution because Decimal128 caps at
+        // 38). It now routes through the decimal_arb cast UDF.
         let sql = "SELECT CAST(price AS DECIMAL(78,2)) FROM products";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, sql);
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(price AS VARCHAR), 78, 2) FROM products"
+        );
     }
 
     #[test]
     fn test_preprocess_multiple_casts() {
+        // Both 78 and 100 route through decimal_arb (the u256
+        // fast path is retired alongside the U256/I256 types).
         let sql = "SELECT CAST(a AS DECIMAL(78, 0)), CAST(b AS DECIMAL(100, 0)) FROM t";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT to_u256(a), CAST(b AS VARCHAR) FROM t");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(a AS VARCHAR), 78, 0), \
+             to_decimal_arb_from_string(CAST(b AS VARCHAR), 100, 0) FROM t"
+        );
     }
 
     #[test]
     fn test_preprocess_case_insensitive() {
         let sql = "SELECT cast(balance as decimal(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
-        assert_eq!(result, "SELECT to_u256(balance) FROM accounts");
+        assert_eq!(
+            result,
+            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+        );
     }
 
     // Helper functions for test setup
@@ -1080,15 +1242,25 @@ mod tests {
         SessionContext::new_with_config(cfg)
     }
 
-    fn register_u256_table(ctx: &SessionContext, table_name: &str, fields: Vec<(&str, bool)>) {
+    /// Register a MemTable whose named fields are decimal_arb(78, 0).
+    /// `kind` controls the optional native_int_kind hint per field; pass
+    /// `None` for plain decimal_arb.
+    fn register_decimal_arb_table(
+        ctx: &SessionContext,
+        table_name: &str,
+        fields: Vec<(&str, Option<crate::types::decimal_arb::NativeIntKind>)>,
+    ) {
         let schema_fields: Vec<Field> = fields
             .into_iter()
-            .map(|(name, is_u256)| {
-                if is_u256 {
-                    Field::new(name, DataType::FixedSizeBinary(32), false)
-                        .with_metadata(crate::types::u256::U256Type::metadata())
-                } else {
-                    Field::new(name, DataType::Int64, false)
+            .map(|(name, kind_opt)| {
+                let f =
+                    crate::types::decimal_arb::DecimalArbType::field(name, 78, 0, false).unwrap();
+                match kind_opt {
+                    Some(k) => {
+                        crate::types::decimal_arb::DecimalArbType::with_native_int_kind(f, k)
+                            .unwrap()
+                    }
+                    None => f,
                 }
             })
             .collect();
@@ -1097,771 +1269,216 @@ mod tests {
         ctx.register_table(table_name, Arc::new(table)).unwrap();
     }
 
-    fn register_i256_table(ctx: &SessionContext, table_name: &str, fields: Vec<(&str, bool)>) {
-        let schema_fields: Vec<Field> = fields
-            .into_iter()
-            .map(|(name, is_i256)| {
-                if is_i256 {
-                    Field::new(name, DataType::FixedSizeBinary(32), false)
-                        .with_metadata(crate::types::i256::I256Type::metadata())
-                } else {
-                    Field::new(name, DataType::Int64, false)
-                }
-            })
-            .collect();
-        let schema = Arc::new(Schema::new(schema_fields));
-        let table = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
-        ctx.register_table(table_name, Arc::new(table)).unwrap();
-    }
+    // ---------------- Exact numeric literals next to decimal_arb ----------------
 
     #[tokio::test]
-    async fn test_u256_literal_wrapping() {
+    async fn test_wide_and_fractional_literals_next_to_decimal_arb_are_quoted() {
         let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        let sql = "SELECT coalesce(value, 0) + 2 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_add(coalesce_meta(value, to_u256(0)), to_u256(2)) AS x FROM t"
-        );
-
-        // works with nested additions
-        let sql = "SELECT (value - 1) + 2 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_add(u256_sub(value, to_u256(1)), to_u256(2)) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_i256_operations() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "t", vec![("balance", true)]);
-
-        // Basic I256 addition
-        let sql = "SELECT balance + 100 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT i256_add(balance, to_i256(100)) AS x FROM t"
-        );
-
-        // I256 subtraction
-        let sql = "SELECT balance - 50 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT i256_sub(balance, to_i256(50)) AS x FROM t"
-        );
-
-        // I256 multiplication
-        let sql = "SELECT balance * 2 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT i256_mul(balance, to_i256(2)) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_u256_all_operators() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        // Multiplication
-        let sql = "SELECT value * 5 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT u256_mul(value, to_u256(5)) AS x FROM t");
-
-        // Division
-        let sql = "SELECT value / 10 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT u256_div(value, to_u256(10)) AS x FROM t");
-
-        // Modulo
-        let sql = "SELECT value % 3 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT u256_mod(value, to_u256(3)) AS x FROM t");
-    }
-    #[tokio::test]
-    async fn test_nested_coalesce_mul_with_to_string() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        let sql = "SELECT u256_to_string((coalesce(value, 0) * 2)) AS value_times_2_string FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_to_string(u256_mul(coalesce_meta(value, to_u256(0)), to_u256(2))) AS value_times_2_string FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_i256_unary_negation() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "t", vec![("balance", true)]);
-
-        // Unary minus
-        let sql = "SELECT -balance AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT i256_neg(balance) AS x FROM t");
-
-        // Unary minus in expression
-        let sql = "SELECT -balance + 100 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT i256_add(i256_neg(balance), to_i256(100)) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_column_to_column_operations() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("a", true), ("b", true)]);
-
-        // Column + column
-        let sql = "SELECT a + b AS sum FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT u256_add(a, b) AS sum FROM t");
-
-        // Column - column
-        let sql = "SELECT a - b AS diff FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT u256_sub(a, b) AS diff FROM t");
-
-        // Column * column
-        let sql = "SELECT a * b AS product FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT u256_mul(a, b) AS product FROM t");
-    }
-
-    #[tokio::test]
-    async fn test_complex_nested_expressions() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        // Deeply nested: (value + 1) * 2 - 3
-        let sql = "SELECT (value + 1) * 2 - 3 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_sub(u256_mul(u256_add(value, to_u256(1)), to_u256(2)), to_u256(3)) AS x FROM t"
-        );
-
-        // With division and modulo: value / 100 % 10
-        let sql = "SELECT value / 100 % 10 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_mod(u256_div(value, to_u256(100)), to_u256(10)) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_where_clause_rewriting() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        // WHERE clause with arithmetic
-        let sql = "SELECT value FROM t WHERE value + 10 > 100";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        // Check if WHERE clause arithmetic is rewritten
-        assert!(rewritten.contains("u256_add(value, to_u256(10))"));
-    }
-
-    #[tokio::test]
-    async fn test_multiple_projections() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("a", true), ("b", true)]);
-
-        // Multiple SELECT items
-        let sql = "SELECT a + 1 AS x, b * 2 AS y, a - b AS z FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert!(rewritten.contains("u256_add(a, to_u256(1))"));
-        assert!(rewritten.contains("u256_mul(b, to_u256(2))"));
-        assert!(rewritten.contains("u256_sub(a, b)"));
-    }
-
-    #[tokio::test]
-    async fn test_literal_left_operand() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        // Literal on left side
-        let sql = "SELECT 100 + value AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_add(to_u256(100), value) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mixed_u256_and_i256_tables() {
-        let ctx = setup_session_context();
-
-        // Table 1 with U256
-        register_u256_table(&ctx, "t1", vec![("unsigned_val", true)]);
-
-        // Table 2 with I256
-        register_i256_table(&ctx, "t2", vec![("signed_val", true)]);
-
-        // U256 operation
-        let sql = "SELECT unsigned_val + 1 FROM t1";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_add(unsigned_val, to_u256(1)) FROM t1"
-        );
-
-        // I256 operation
-        let sql = "SELECT signed_val - 1 FROM t2";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, "SELECT i256_sub(signed_val, to_i256(1)) FROM t2");
-    }
-
-    #[tokio::test]
-    async fn test_having_clause() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("id", false), ("value", true)]);
-
-        // HAVING clause with arithmetic
-        let sql = "SELECT id, SUM(value) as total FROM t GROUP BY id HAVING SUM(value) + 10 > 100";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        // Check if HAVING clause arithmetic is rewritten
-        assert!(rewritten.contains("HAVING"));
-    }
-
-    #[tokio::test]
-    async fn test_no_rewrite_for_non_bigint_columns() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", false)]);
-
-        // Should NOT rewrite regular int operations
-        let sql = "SELECT value + 10 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, sql); // Should remain unchanged
-    }
-
-    #[tokio::test]
-    async fn test_mixed_u256_and_regular_columns() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("u256_val", true), ("int_val", false)]);
-
-        // U256 column with literal
-        let sql = "SELECT u256_val + 100 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_add(u256_val, to_u256(100)) AS x FROM t"
-        );
-
-        // Regular int column should not be rewritten
-        let sql = "SELECT int_val + 100 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, sql);
-    }
-
-    #[tokio::test]
-    async fn test_parenthesized_expressions() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true)]);
-
-        // Multiple levels of parentheses
-        let sql = "SELECT ((value + 1)) AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert!(rewritten.contains("u256_add"));
-        assert!(rewritten.contains("to_u256(1)"));
-    }
-
-    #[tokio::test]
-    async fn test_i256_division_and_modulo() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "t", vec![("balance", true)]);
-
-        // Division
-        let sql = "SELECT balance / 10 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT i256_div(balance, to_i256(10)) AS x FROM t"
-        );
-
-        // Modulo
-        let sql = "SELECT balance % 5 AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT i256_mod(balance, to_i256(5)) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cte_with_u256_operations() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "accounts", vec![("balance", true), ("id", false)]);
-
-        // CTE with U256 operations
-        let sql = r#"
-        WITH processed_balances AS (
-            SELECT id, balance + 100 AS adjusted_balance
-            FROM accounts
+        register_decimal_arb_table(&ctx, "transfers", vec![("amount", None), ("fee", None)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        ctx.register_table(
+            "meta",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
         )
-        SELECT id, adjusted_balance * 2 AS doubled_balance
-        FROM processed_balances
-        "#;
+        .unwrap();
+
+        let cases = [
+            (
+                "SELECT * FROM transfers WHERE amount > 1000000000000000000000000",
+                "SELECT * FROM transfers WHERE amount > '1000000000000000000000000'",
+            ),
+            (
+                "SELECT * FROM transfers WHERE 1000000000000000000000000 < transfers.amount",
+                "SELECT * FROM transfers WHERE '1000000000000000000000000' < transfers.amount",
+            ),
+            (
+                "SELECT amount * 1.5, amount + (-0.25) FROM transfers",
+                "SELECT amount * '1.5', amount + '-0.25' FROM transfers",
+            ),
+            (
+                "SELECT * FROM transfers WHERE amount BETWEEN 0.5 AND 1e24 OR amount IN (1, 2.5)",
+                "SELECT * FROM transfers WHERE amount BETWEEN '0.5' AND '1e24' OR amount IN (1, '2.5')",
+            ),
+            (
+                "SELECT coalesce(amount, 0.5), greatest(fee, 1.5, 2), CASE amount WHEN 1.5 THEN 1 ELSE 0.5 END FROM transfers",
+                "SELECT coalesce(amount, '0.5'), greatest(fee, '1.5', 2), CASE amount WHEN '1.5' THEN 1 ELSE 0.5 END FROM transfers",
+            ),
+            (
+                "SELECT CASE WHEN id = 1 THEN amount ELSE 0.5 END FROM transfers",
+                "SELECT CASE WHEN id = 1 THEN amount ELSE '0.5' END FROM transfers",
+            ),
+            // Aliases in CTEs and derived tables are tracked, positionally too.
+            (
+                "WITH c AS (SELECT amount AS a FROM transfers), d(b) AS (SELECT a FROM c) SELECT * FROM d WHERE b > 18446744073709551616",
+                "WITH c AS (SELECT amount AS a FROM transfers), d (b) AS (SELECT a FROM c) SELECT * FROM d WHERE b > '18446744073709551616'",
+            ),
+            (
+                "SELECT * FROM (SELECT amount + fee AS total FROM transfers) s WHERE s.total >= 0.001",
+                "SELECT * FROM (SELECT amount + fee AS total FROM transfers) s WHERE s.total >= '0.001'",
+            ),
+            (
+                "SELECT * FROM transfers WHERE sum(amount) > 1.5 AND (SELECT max(amount) FROM transfers) > 1e30",
+                "SELECT * FROM transfers WHERE sum(amount) > '1.5' AND (SELECT max(amount) FROM transfers) > '1e30'",
+            ),
+            // Integer literals keep DataFusion's exact integer typing.
+            (
+                "SELECT * FROM transfers WHERE amount > 9223372036854775808 AND amount < -5",
+                "SELECT * FROM transfers WHERE amount > 9223372036854775808 AND amount < -5",
+            ),
+            // Nothing changes for other columns.
+            (
+                "SELECT * FROM meta WHERE price > 1.5 AND id * 0.5 > 1e24 AND coalesce(price, 0.5) IN (1.5, 2)",
+                "SELECT * FROM meta WHERE price > 1.5 AND id * 0.5 > 1e24 AND coalesce(price, 0.5) IN (1.5, 2)",
+            ),
+            (
+                "SELECT * FROM transfers WHERE CAST(amount AS TEXT) = '1.5' AND length(CAST(amount AS TEXT)) > 1.5",
+                "SELECT * FROM transfers WHERE decimal_arb_to_string(amount) = '1.5' AND length(decimal_arb_to_string(amount)) > 1.5",
+            ),
+        ];
+        for (input, expected) in cases {
+            let result = preprocess_bigint_binary_ops_with_schema(&ctx, input)
+                .await
+                .unwrap();
+            assert_eq!(result, expected, "input: {input}");
+        }
+    }
+
+    // ---------------- decimal_arb CAST AS TEXT ----------------
+    //
+    // Wide-integer columns (Avro decimal(p, 0) with p > 76) arrive in
+    // streamling SQL as decimal_arb. DataFusion has no
+    // native cast from `LargeBinary` (decimal_arb storage) to `Utf8View`,
+    // so `CAST(decimal_arb_col AS TEXT)` would fail with "Unsupported
+    // CAST from LargeBinary to Utf8View". The preprocessor lowers all four
+    // text-cast keyword spellings to `decimal_arb_to_string(col)`.
+    //
+    // This closes the wide-int text-cast regression *via the decimal_arb path*. The legacy
+    // u256/i256 path is retired as part of the same feature; once those
+    // types are deleted in Phase 8 there is no remaining FSB(32)-based
+    // wide-int route.
+
+    #[tokio::test]
+    async fn test_cast_decimal_arb_as_text() {
+        let ctx = setup_session_context();
+        register_decimal_arb_table(&ctx, "t", vec![("gas_used", None)]);
+        let sql = "SELECT CAST(gas_used AS TEXT) AS gas_used FROM t";
         let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
             .await
             .unwrap();
-
-        // Check that CTE expressions are rewritten
-        assert!(rewritten.contains("u256_add(balance, to_u256(100))"));
-        assert!(rewritten.contains("u256_mul(adjusted_balance, to_u256(2))"));
-    }
-
-    #[tokio::test]
-    async fn test_nested_cte_with_bigint_operations() {
-        let ctx = setup_session_context();
-        register_u256_table(
-            &ctx,
-            "transactions",
-            vec![("amount", true), ("fee", true), ("id", false)],
+        assert!(
+            rewritten.contains("decimal_arb_to_string(gas_used)"),
+            "rewrite must wrap inner expression in decimal_arb_to_string, got: {}",
+            rewritten
         );
-
-        // Nested CTEs with U256 operations
-        let sql = r#"
-        WITH base_tx AS (
-            SELECT id, amount, fee
-            FROM transactions
-        ),
-        processed_tx AS (
-            SELECT id, amount + fee AS total_cost, amount * 2 AS double_amount
-            FROM base_tx
-        )
-        SELECT id, total_cost - 50 AS net_cost
-        FROM processed_tx
-        "#;
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-
-        // Check that all CTE expressions are rewritten
-        assert!(rewritten.contains("u256_add(amount, fee)"));
-        assert!(rewritten.contains("u256_mul(amount, to_u256(2))"));
-        assert!(rewritten.contains("u256_sub(total_cost, to_u256(50))"));
-    }
-
-    #[tokio::test]
-    async fn test_cte_with_i256_operations() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "balances", vec![("amount", true), ("user_id", false)]);
-
-        // CTE with I256 operations including negation
-        let sql = r#"
-        WITH adjusted_balances AS (
-            SELECT user_id, -amount AS negative_amount, amount / 10 AS tenth_amount
-            FROM balances
-        )
-        SELECT user_id, negative_amount + 100 AS final_amount
-        FROM adjusted_balances
-        "#;
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-
-        // Check that CTE expressions are rewritten
-        assert!(rewritten.contains("i256_neg(amount)"));
-        assert!(rewritten.contains("i256_div(amount, to_i256(10))"));
-        assert!(rewritten.contains("i256_add(negative_amount, to_i256(100))"));
-    }
-
-    #[tokio::test]
-    async fn test_cte_with_union_all() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "table1", vec![("value", true), ("id", false)]);
-
-        // CTE with UNION ALL using same table
-        let sql = r#"
-        WITH combined_data AS (
-            SELECT id, value + 1 AS adjusted_value FROM table1
-            UNION ALL
-            SELECT id, value * 2 AS adjusted_value FROM table1
-        )
-        SELECT id, adjusted_value - 10 AS final_value
-        FROM combined_data
-        "#;
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-
-        // Check that expressions in both parts of UNION are rewritten
-        assert!(rewritten.contains("u256_add(value, to_u256(1))"));
-        assert!(rewritten.contains("u256_mul(value, to_u256(2))"));
-        // Note: The main query may not be rewritten due to CTE extraction limitations with UNION ALL
-        // This is a known limitation of the current implementation
-    }
-
-    #[tokio::test]
-    async fn test_cast_then_coalesce() {
-        let ctx = setup_session_context();
-        register_u256_table(
-            &ctx,
-            "table1",
-            vec![("decoded.event_params[3]", true), ("id", false)],
-        );
-
-        // CTE with UNION ALL using same table
-        let sql = r#"
-        SELECT COALESCE(TRY_CAST(decoded.event_params[3] AS DECIMAL(78)), 0) AS x FROM table1
-        "#;
-        let cast_rewritten = preprocess_bigint_decimal_casts(sql);
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, &cast_rewritten)
-            .await
-            .unwrap();
-
-        // Check that the CAST is rewritten to to_u256 and COALESCE to coalesce_meta
-        assert_eq!(
-            rewritten,
-            "SELECT coalesce_meta(to_u256(decoded.event_params[3]), to_u256(0)) AS x FROM table1"
+        assert!(
+            !rewritten.to_lowercase().contains("cast(gas_used as text"),
+            "rewrite must NOT leave a raw CAST AS TEXT in the output, got: {}",
+            rewritten
         );
     }
 
     #[tokio::test]
-    async fn test_greater_than_comparison() {
+    async fn test_cast_decimal_arb_as_varchar() {
         let ctx = setup_session_context();
-        register_u256_table(
-            &ctx,
-            "ethereum_transfers",
-            vec![
-                ("id", false),
-                ("address", false),
-                ("sender", false),
-                ("recipient", false),
-                ("amount", true),
-                ("block_timestamp", false),
-                ("transaction_hash", false),
-                ("_gs_op", false),
-            ],
-        );
-
-        let sql = r#"
-        SELECT
-            id,
-            address as token,
-            sender,
-            recipient,
-            amount,
-            block_timestamp,
-            transaction_hash,
-            _gs_op
-        FROM ethereum_transfers
-        WHERE amount > 1000000000000000000000000
-        "#;
+        register_decimal_arb_table(&ctx, "t", vec![("amount", None)]);
+        let sql = "SELECT CAST(amount AS VARCHAR) AS amount_text FROM t";
         let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
             .await
             .unwrap();
-
-        // Check that the literal is wrapped in to_u256
-        assert!(rewritten.contains("to_u256(1000000000000000000000000)"));
-        assert!(rewritten.contains("amount > to_u256(1000000000000000000000000)"));
+        assert!(
+            rewritten.contains("decimal_arb_to_string(amount)"),
+            "VARCHAR cast must lower to decimal_arb_to_string: {}",
+            rewritten
+        );
     }
 
     #[tokio::test]
-    async fn test_comparison_with_and_does_not_wrap_boolean() {
+    async fn test_cast_decimal_arb_as_string() {
         let ctx = setup_session_context();
-        register_u256_table(
+        register_decimal_arb_table(&ctx, "t", vec![("balance", None)]);
+        let sql = "SELECT CAST(balance AS STRING) FROM t";
+        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert!(
+            rewritten.contains("decimal_arb_to_string(balance)"),
+            "STRING cast must lower to decimal_arb_to_string: {}",
+            rewritten
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cast_decimal_arb_case_insensitive() {
+        let ctx = setup_session_context();
+        register_decimal_arb_table(&ctx, "t", vec![("v", None)]);
+        for variant in &[
+            "SELECT CAST(v AS text) FROM t",
+            "SELECT cast(v AS TEXT) FROM t",
+            "SELECT CAST(v as Text) FROM t",
+            "SELECT cast(v as varchar) FROM t",
+        ] {
+            let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, variant)
+                .await
+                .unwrap();
+            assert!(
+                rewritten.contains("decimal_arb_to_string(v)"),
+                "case-insensitive variant {:?} must lower to decimal_arb_to_string: {}",
+                variant,
+                rewritten
+            );
+        }
+    }
+
+    /// The canonical CAST-AS-TEXT YAML reproduction, expressed as a SQL
+    /// transform: `SELECT * EXCEPT col, CAST(col AS TEXT) AS col FROM t`
+    /// where `col` is a decimal_arb column (post-feature-002 routing).
+    #[tokio::test]
+    async fn test_select_except_cast_as_text() {
+        let ctx = setup_session_context();
+        register_decimal_arb_table(
             &ctx,
             "traces",
-            vec![("id", false), ("call_type", false), ("value", true)],
+            vec![(
+                "gas_used",
+                Some(crate::types::decimal_arb::NativeIntKind::U256),
+            )],
         );
-
-        // Reproduces STRM-5695: `value > 0` involves a u256 column but the AND
-        // combines two boolean predicates. The preprocessor must NOT wrap the
-        // boolean side (`call_type <> 'delegatecall'`) with to_u256().
-        let sql = "SELECT * FROM traces WHERE call_type <> 'delegatecall' AND `value` > 0";
+        let sql = "SELECT * EXCEPT (gas_used), CAST(gas_used AS TEXT) AS gas_used FROM traces";
         let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
             .await
             .unwrap();
-
-        // The literal should be wrapped (backticks may be preserved)
         assert!(
-            rewritten.contains("> to_u256(0)"),
-            "Literal 0 should be wrapped with to_u256, got: {}",
-            rewritten
-        );
-        // The boolean predicate must NOT be wrapped with to_u256
-        assert!(
-            !rewritten.contains("to_u256(call_type"),
-            "Boolean predicate should not be wrapped with to_u256, got: {}",
+            rewritten.contains("decimal_arb_to_string(gas_used)"),
+            "wide-int text-cast YAML pattern must lower the cast: {}",
             rewritten
         );
         assert!(
-            rewritten.contains("call_type <> 'delegatecall'"),
-            "Boolean predicate should remain unchanged, got: {}",
+            !rewritten.to_lowercase().contains("cast(gas_used as text"),
+            "wide-int text-cast fix must NOT leave the raw cast: {}",
             rewritten
         );
     }
 
+    /// Non-decimal_arb columns are not rewritten — verifies the
+    /// preprocessor doesn't over-apply.
     #[tokio::test]
-    async fn test_comparison_with_or_does_not_wrap_boolean() {
+    async fn test_cast_int_as_text_is_left_alone() {
         let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
-
-        let sql = "SELECT * FROM t WHERE flag = 1 OR value > 0";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-
-        assert!(
-            rewritten.contains("value > to_u256(0)"),
-            "Literal should be wrapped, got: {}",
-            rewritten
-        );
-        assert!(
-            !rewritten.contains("to_u256(flag"),
-            "Non-bigint predicate should not be wrapped, got: {}",
-            rewritten
-        );
-    }
-
-    #[tokio::test]
-    async fn test_multiple_and_conditions_with_u256() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("id", false), ("a", true), ("b", true)]);
-
-        let sql = "SELECT * FROM t WHERE a > 0 AND b < 100 AND id = 1";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-
-        assert!(
-            rewritten.contains("a > to_u256(0)"),
-            "a > 0 should be rewritten, got: {}",
-            rewritten
-        );
-        assert!(
-            rewritten.contains("b < to_u256(100)"),
-            "b < 100 should be rewritten, got: {}",
-            rewritten
-        );
-        assert!(
-            !rewritten.contains("to_u256(id"),
-            "Non-bigint column should not be wrapped, got: {}",
-            rewritten
-        );
-    }
-
-    #[tokio::test]
-    async fn test_coalesce_with_non_bigint_function_on_i256_column() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "t", vec![("rent_epoch", true), ("id", false)]);
-
-        // to_int64() converts I256 to Int64, so COALESCE should NOT be
-        // rewritten to coalesce_meta — both args are plain Int64.
-        let sql = "SELECT COALESCE(to_int64(rent_epoch), 0) AS rent_epoch FROM t";
+        // Register a plain-Int64 column to verify no rewrite fires.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let table = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        ctx.register_table("u", Arc::new(table)).unwrap();
+        let sql = "SELECT CAST(id AS TEXT) AS id_text FROM u";
         let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
             .await
             .unwrap();
         assert!(
-            !rewritten.contains("coalesce_meta"),
-            "COALESCE should not be rewritten to coalesce_meta when \
-             the result is Int64, got: {}",
+            !rewritten.contains("decimal_arb_to_string"),
+            "Int64 column CAST AS TEXT must not be rewritten: {}",
             rewritten
-        );
-        assert!(
-            !rewritten.contains("to_i256(0)"),
-            "literal 0 should not be wrapped with to_i256, got: {}",
-            rewritten
-        );
-    }
-
-    #[tokio::test]
-    async fn test_coalesce_with_non_bigint_function_on_u256_column() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true), ("id", false)]);
-
-        // u256_to_string converts U256 to Utf8, so COALESCE should NOT be
-        // rewritten to coalesce_meta.
-        let sql = "SELECT COALESCE(u256_to_string(value), 'none') AS val FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert!(
-            !rewritten.contains("coalesce_meta"),
-            "COALESCE should not be rewritten to coalesce_meta when \
-             the result is Utf8, got: {}",
-            rewritten
-        );
-    }
-
-    #[tokio::test]
-    async fn test_i256_to_string_in_coalesce() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "t", vec![("balance", true), ("id", false)]);
-
-        let sql = "SELECT COALESCE(i256_to_string(balance), '0') AS bal FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert!(
-            !rewritten.contains("coalesce_meta"),
-            "COALESCE should not be rewritten to coalesce_meta when \
-             the result is Utf8, got: {}",
-            rewritten
-        );
-    }
-
-    #[tokio::test]
-    async fn test_case_literal_branch_is_wrapped() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
-
-        // A bare integer literal branch (`ELSE 0`) alongside a u256 branch would
-        // fail DataFusion type-coercion. The preprocessor must wrap the literal
-        // with to_u256() so both branches share the u256 type.
-        let sql = "SELECT CASE WHEN flag = 1 THEN value ELSE 0 END AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT to_u256(CASE WHEN flag = 1 THEN value ELSE to_u256(0) END) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_case_over_u256_is_wrapped_to_preserve_metadata() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("a", true), ("b", true), ("flag", false)]);
-
-        // Even when both branches are u256, the whole CASE is wrapped in to_u256
-        // so the result field re-declares the u256 extension metadata (native
-        // CASE drops it).
-        let sql = "SELECT CASE WHEN flag = 1 THEN a ELSE b END AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT to_u256(CASE WHEN flag = 1 THEN a ELSE b END) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_case_inside_u256_to_string() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
-
-        let sql = "SELECT u256_to_string(CASE WHEN flag = 1 THEN value ELSE 0 END) AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT u256_to_string(to_u256(CASE WHEN flag = 1 THEN value ELSE to_u256(0) END)) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_case_arithmetic_branch_is_rewritten() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", true), ("flag", false)]);
-
-        // Arithmetic inside a branch must be rewritten to the u256 UDF form.
-        let sql = "SELECT CASE WHEN flag = 1 THEN value * 2 ELSE value END AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT to_u256(CASE WHEN flag = 1 THEN u256_mul(value, to_u256(2)) ELSE value END) AS x FROM t"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_non_u256_case_is_unchanged() {
-        let ctx = setup_session_context();
-        register_u256_table(&ctx, "t", vec![("value", false), ("flag", false)]);
-
-        // No u256 columns involved -> CASE must be left exactly as-is.
-        let sql = "SELECT CASE WHEN flag = 1 THEN value ELSE 0 END AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(rewritten, sql);
-    }
-
-    #[tokio::test]
-    async fn test_i256_case_literal_branch_is_wrapped() {
-        let ctx = setup_session_context();
-        register_i256_table(&ctx, "t", vec![("balance", true), ("flag", false)]);
-
-        let sql = "SELECT CASE WHEN flag = 1 THEN balance ELSE 0 END AS x FROM t";
-        let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
-            .await
-            .unwrap();
-        assert_eq!(
-            rewritten,
-            "SELECT to_i256(CASE WHEN flag = 1 THEN balance ELSE to_i256(0) END) AS x FROM t"
         );
     }
 }

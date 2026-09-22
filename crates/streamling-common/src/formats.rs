@@ -1,6 +1,7 @@
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
 
+pub mod decimal_arb_text;
 pub mod json;
 
 pub mod avro;

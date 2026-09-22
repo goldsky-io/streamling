@@ -1642,8 +1642,9 @@ sinks:
 // Scenario: Hybrid source ClickHouse Nullable(UInt128) → u256 endianness
 // ============================================================================
 
-/// Avro schema with a Decimal logical type at precision > 76 — converts to
-/// streamling u256 (FixedSizeBinary(32) + u256 extension metadata).
+/// Avro schema with a Decimal logical type at precision 78, scale 0 — converts
+/// to streamling.decimal_arb carrying a `native_int_kind=u256` hint (feature
+/// 002 retired the dedicated u256 type in favour of decimal_arb).
 const U256_SCHEMA: &str = r#"{
     "type": "record",
     "name": "U256TestMessage",
@@ -1659,14 +1660,14 @@ const U256_SCHEMA: &str = r#"{
 /// ClickHouse stores UInt128/UInt256 little-endian and the hybrid layer's
 /// schema adapter widens `Nullable(UInt128)` to `Nullable(UInt256)` via a
 /// server-side CAST. ClickHouse emits UInt256 as Arrow `FixedSizeBinary(32)`
-/// in little-endian, while streamling stores big-endian. Before
-/// `normalize_batch_from_clickhouse` was added on the read side, a logical
-/// `1` arrived as `2^248` and downstream u256 arithmetic / serialization
-/// produced garbage.
+/// in little-endian, while streamling's decimal_arb canonical form is
+/// big-endian. `normalize_batch_from_clickhouse` reinterprets the LE bytes as
+/// decimal_arb on the read side; without it, a logical `1` arrived as `2^248`
+/// and downstream serialization produced garbage.
 ///
 /// Job mode lets the bounded phase finish and exits without consuming Kafka,
-/// so the unbounded source is only present to declare the u256 schema (which
-/// drives the bounded CAST + the read-side normalization).
+/// so the unbounded source is only present to declare the decimal_arb schema
+/// (which drives the bounded CAST + the read-side normalization).
 #[tokio::test]
 async fn test_hybrid_clickhouse_uint128_widened_to_u256_preserves_value() {
     init_tracing();
@@ -1746,7 +1747,7 @@ transforms:
   stringify:
     type: sql
     primary_key: id
-    sql: "SELECT block, id, u256_to_string(wei_value) AS wei_str FROM hybrid_source"
+    sql: "SELECT block, id, decimal_arb_to_string(wei_value) AS wei_str FROM hybrid_source"
 
 sinks:
   pg_sink:
@@ -1786,7 +1787,7 @@ sinks:
     let by_id: std::collections::HashMap<String, Option<String>> = rows.into_iter().collect();
 
     // Logical 1 must arrive as "1", not "452312848583266388373324160190187140051835877600158453279131187530910662656"
-    // (which is 2^248, the value bytes_to_u256 yields when fed LE bytes for 1).
+    // (which is 2^248, the value you'd get reading LE bytes for 1 as big-endian).
     assert_eq!(
         by_id.get("one"),
         Some(&Some("1".to_string())),
