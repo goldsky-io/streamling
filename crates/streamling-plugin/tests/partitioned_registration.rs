@@ -365,9 +365,8 @@ async fn create_partitioned_dispatches_each_kind_with_its_context() {
     }
 }
 
-/// A host that predates partitioning only knows `create`.
 #[tokio::test(flavor = "multi_thread")]
-async fn create_runs_partitioned_ids_as_a_single_stream() {
+async fn create_refuses_partitioned_ids() {
     let create = get_module().create();
 
     for (id, input) in [
@@ -375,16 +374,21 @@ async fn create_runs_partitioned_ids_as_a_single_stream() {
         (PARTITIONED_TRANSFORM, input_schema()),
         (PARTITIONED_SINK, input_schema()),
     ] {
-        let channels = test_channels();
         let result = create(
             RString::from(id),
             input,
             no_options(),
             runtime(),
             state_backend_config(),
-            channels.clone(),
+            test_channels(),
         );
-        assert_eq!(reported_partition(result, &channels).await, "0/1", "{id}");
+        match result {
+            RResult::RErr(PluginInitializationError::Configuration(message)) => {
+                assert!(message.contains(id), "{message}")
+            }
+            RResult::RErr(other) => panic!("{id}: expected a configuration error, got {other:?}"),
+            RResult::ROk(_) => panic!("{id} must only be created through `create_partitioned`"),
+        }
     }
 }
 

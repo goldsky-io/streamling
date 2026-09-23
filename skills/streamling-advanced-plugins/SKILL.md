@@ -144,7 +144,7 @@ How the host runs it:
 - **State.** `state.create()` is scoped to the partition (`{reference_name}[{index}]`); `state.create_shared()` is shared by every instance of the node, and is where a formerly single-stream plugin finds its old state.
 - **Checkpoints.** Each instance sees one copy of every marker on its own stream. A sink instance acks from `process_checkpoint_marker` as usual; the host acks the epoch once every instance flushed it.
 - **Failures.** An error from a hook is reported to the host right away, which fails the pipeline and drains it.
-- **Compatibility.** A host that predates partitioned plugins runs a partition-aware plugin through its single-stream `create` as partition 0 of 1 (and refuses one whose `minimum` is above 1). A single-stream plugin rejects `parallelism` above 1.
+- **Compatibility.** A host that predates partitioned plugins refuses to create a partition-aware plugin. A single-stream plugin rejects `parallelism` above 1.
 
 ## Registering many kinds in one crate
 

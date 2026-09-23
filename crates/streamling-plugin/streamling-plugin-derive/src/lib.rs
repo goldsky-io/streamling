@@ -349,8 +349,7 @@ enum PartitionedKind {
 
 /// Registers a partition-aware plugin: `describe_partitioned` and
 /// `create_partitioned` dispatch to its `Partitioned*Plugin` impl, and the
-/// single-stream `create` (all a host predating partitioning calls) runs it
-/// as the only partition of its node.
+/// single-stream `create` refuses it.
 fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStream {
     let PluginComponent {
         namespace,
@@ -361,13 +360,15 @@ fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStrea
 
     let (component_id, plugin_id) = generate_plugin_identifiers(&namespace, &name);
 
-    let (create_arm, describe_arm, create_partitioned_arm) = match kind {
+    let create_arm = quote! {
+        #component_id => Err(PluginInitializationError::Configuration(RString::from(format!(
+            "plugin {} is partition-aware and needs a host that supports partitioned plugins",
+            plugin_id
+        ))))
+        .into_c(),
+    };
+    let (describe_arm, create_partitioned_arm) = match kind {
         PartitionedKind::Source => (
-            quote! {
-                #component_id => streamling_plugin::create_partitioned_source_single_stream::<#component_type>(
-                    plugin_id, options, runtime, state_backend_config, message_channels,
-                ),
-            },
             quote! {
                 #component_id => streamling_plugin::describe_partitioned_source::<#component_type>(options),
             },
@@ -379,11 +380,6 @@ fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStrea
         ),
         PartitionedKind::Transform => (
             quote! {
-                #component_id => streamling_plugin::create_partitioned_transform_single_stream::<#component_type>(
-                    plugin_id, input_schema, options, runtime, state_backend_config, message_channels,
-                ),
-            },
-            quote! {
                 #component_id => streamling_plugin::describe_partitioned_transform::<#component_type>(input_schema, options),
             },
             quote! {
@@ -393,11 +389,6 @@ fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStrea
             },
         ),
         PartitionedKind::Sink => (
-            quote! {
-                #component_id => streamling_plugin::create_partitioned_sink_single_stream::<#component_type>(
-                    plugin_id, input_schema, options, runtime, state_backend_config, message_channels,
-                ),
-            },
             quote! {
                 #component_id => streamling_plugin::describe_partitioned_sink::<#component_type>(input_schema, options),
             },
@@ -875,6 +866,8 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
             }).into_c()
         }
 
+        // A library registering only partition-aware plugins uses none of these.
+        #[allow(unused_variables)]
         extern "C" fn create(
             plugin_id: RString,
             input_schema: ROption<SafeArrowSchema>,
