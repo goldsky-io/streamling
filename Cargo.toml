@@ -8,8 +8,6 @@ members = [
     "crates/streamling-connectors",
     "crates/streamling-plugin",
     "crates/streamling-plugin/streamling-plugin-derive",
-    "crates/streamling-plugin/abi-fixtures/pre-shutdown-signal",
-    "crates/streamling-plugin/abi-fixtures/pre-partitioning",
     "crates/streamling-state",
     "crates/streamling",
     "crates/streamling-flink-compat",
