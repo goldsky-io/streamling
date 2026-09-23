@@ -7,6 +7,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Formatter;
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -576,6 +577,41 @@ impl std::fmt::Debug for ClickHouseSourceConfig {
     }
 }
 
+/// Tunables for the `file` source.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileSourceConfig {
+    /// How many discovered files are sampled to detect the Hive partition
+    /// layout. The sample has to agree on the layout, so a larger value catches
+    /// a mixed prefix at the cost of a longer listing before the first scan.
+    #[serde(
+        default = "default_partition_sample_size",
+        deserialize_with = "deserialize_partition_sample_size"
+    )]
+    pub partition_sample_size: NonZeroUsize,
+}
+
+fn default_partition_sample_size() -> NonZeroUsize {
+    NonZeroUsize::new(10).expect("10 is non-zero")
+}
+
+/// The config crate doesn't attach the key path to deserialization errors, so
+/// serde's own `NonZeroUsize` error wouldn't say which setting is wrong.
+fn deserialize_partition_sample_size<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    NonZeroUsize::new(usize::deserialize(deserializer)?)
+        .ok_or_else(|| D::Error::custom("file_source.partition_sample_size must be at least 1"))
+}
+
+impl Default for FileSourceConfig {
+    fn default() -> Self {
+        Self {
+            partition_sample_size: default_partition_sample_size(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PrintSinkConfig {
     pub sample_every: u32,
@@ -894,6 +930,8 @@ pub struct AppConfig {
     pub kafka_sink: KafkaConfig,
     pub clickhouse_source: ClickHouseSourceConfig,
     pub clickhouse_sink: ClickHouseSinkConfig,
+    #[serde(default)]
+    pub file_source: FileSourceConfig,
     pub print_sink: PrintSinkConfig,
     pub postgres_sink: PostgresSinkConfig,
     pub open_telemetry_metrics: OpenTelemetryMetricsConfig,
@@ -1363,6 +1401,40 @@ mod tests {
         assert!(
             rendered.contains("batch_flush_interval") && rendered.contains("1 fortnight"),
             "the error must name the field and the offending value, got: {rendered}"
+        );
+    }
+
+    /// A zero sample reads no paths, so a Hive-partitioned source would silently
+    /// lose its partition columns.
+    #[test]
+    fn file_source_rejects_zero_partition_sample_size_at_load() {
+        let _guard = env_guard();
+
+        let name = "STREAMLING__FILE_SOURCE__PARTITION_SAMPLE_SIZE";
+        let previous = std::env::var(name).ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var(name, "0");
+        }
+
+        let result = std::panic::catch_unwind(AppConfig::load);
+
+        // SAFETY: see above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let err = result
+            .expect("test body panicked")
+            .expect_err("a zero partition_sample_size must fail the load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("partition_sample_size"),
+            "the error must name the field, got: {rendered}"
         );
     }
 

@@ -167,14 +167,9 @@ Label constraints (enforced at config load):
 - **k3s not running**: Run `just env-status` to check, `just env-setup` to start.
 - **Linker issues with nextest on macOS**: Set `export DYLD_LIBRARY_PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/lib:$DYLD_LIBRARY_PATH"`.
 
-## AI Review Rules
+## Code Review Rules
 
-This section defines rules enforced by the automated AI code review system
-(`.github/workflows/ai-review.yml`). Each rule has a severity that determines
-how it appears in review output. The review system also computes a per-file
-risk score — see `scripts/ai-review/` for configuration and scoring logic.
-
-Configuration (model, weights, thresholds) lives in `scripts/ai-review/review_config.json`.
+Each rule has a severity: Block (must fix before merge), Recommend (should fix), Minor (nit).
 
 ### Convention Rules
 
@@ -211,13 +206,3 @@ Configuration (model, weights, thresholds) lives in `scripts/ai-review/review_co
 | PIPE-001 | Block     | Arrow schema changes must be backward-compatible or versioned                         |
 | PIPE-002 | Recommend | New transforms must handle empty `RecordBatch`es gracefully                           |
 | PIPE-003 | Recommend | Checkpoint-related changes must preserve exactly-once semantics                       |
-
-### Tuning the Reviewer
-
-When the AI reviewer gets something wrong, update this section with a new rule or
-adjust an existing rule's severity. This is the primary correction mechanism — treat
-it like a living document the team edits to steer the reviewer.
-
-To adjust risk scoring weights and thresholds, edit `scripts/ai-review/review_config.json`.
-To change the model (e.g. switch between `claude-opus-4-20250514` and `claude-sonnet-4-20250514`),
-update the `model` field in that same config file.

@@ -399,14 +399,26 @@ impl AsyncBatchAccumulator {
             // Macro for processing a single batch from the input stream
             macro_rules! handle_batch {
                 ($batch:expr) => {
-                    if let Some(batches) = self.accumulator.push($batch) {
+                    let batch = $batch;
+                    // A batch carrying checkpoint messages drains the accumulator
+                    // rather than waiting for `batch_size` rows or a flush
+                    // interval that may not be configured at all. The source that
+                    // sent the marker can hold its stream open until the epoch
+                    // finalizes, so holding it back here deadlocks the pipeline
+                    // instead of merely delaying a checkpoint. Markers arrive once
+                    // an epoch, so the partial flush costs next to nothing.
+                    let carries_checkpoint =
+                        !extract_checkpoint_messages(batch.schema().metadata()).is_empty();
+                    if let Some(batches) = self.accumulator.push(batch) {
                         yield_merged!(batches);
-                        while self.accumulator.should_flush_by_size() {
-                            if let Some(batches) = self.accumulator.flush() {
-                                yield_merged!(batches);
-                            } else {
-                                break;
-                            }
+                    }
+                    while (carries_checkpoint && !self.accumulator.is_empty())
+                        || self.accumulator.should_flush_by_size()
+                    {
+                        if let Some(batches) = self.accumulator.flush() {
+                            yield_merged!(batches);
+                        } else {
+                            break;
                         }
                     }
                 };
@@ -1037,6 +1049,58 @@ mod tests {
             .expect("stream should produce a batch")
             .expect("batch should not be an error");
         assert_eq!(batch.num_rows(), 5);
+    }
+
+    /// With no flush interval there is no timer to move a marker along, so a
+    /// batch carrying one has to drain the accumulator as it arrives. The source
+    /// that sent it can hold its stream open until the epoch finalizes, so
+    /// waiting here for `batch_size` rows that never come deadlocks the pipeline
+    /// — which is what a `script` transform with `batch_size` and no interval hit.
+    #[tokio::test]
+    async fn test_async_accumulator_flushes_checkpoint_batches_without_a_timer() {
+        use crate::checkpoints::checkpoint_management::{
+            CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+        };
+        use crate::utils::batch::enrich_batch_with_metadata;
+
+        // A batch size far above the rows pushed: nothing but the marker can
+        // flush them.
+        let accumulator = AsyncBatchAccumulator::new(1000, None);
+
+        let mut metadata = std::collections::HashMap::new();
+        enrich_batch_metadata_with_checkpoints(
+            &mut metadata,
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(7),
+                created_at_ms: 1000,
+            }],
+        );
+        let checkpoint_batch = enrich_batch_with_metadata(create_test_batch(0), metadata).unwrap();
+
+        // The input never ends, so the end-of-stream flush cannot be what
+        // delivers the marker.
+        let input = Box::pin(
+            stream::iter(vec![Ok(create_test_batch(3)), Ok(checkpoint_batch)])
+                .chain(stream::pending()),
+        );
+        let mut output_stream = Box::pin(accumulator.process_stream(input));
+
+        let flushed = timeout(Duration::from_millis(500), output_stream.next())
+            .await
+            .expect("a marker must flush without waiting for more rows")
+            .expect("Stream should produce at least one batch")
+            .expect("Batch should not be an error");
+
+        assert_eq!(
+            flushed.num_rows(),
+            3,
+            "the rows accumulated before the marker must go downstream with it"
+        );
+        assert_eq!(
+            extract_checkpoint_messages(flushed.schema().metadata()).len(),
+            1,
+            "the marker must ride the flushed batch"
+        );
     }
 
     #[tokio::test]

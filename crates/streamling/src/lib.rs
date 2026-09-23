@@ -14,9 +14,7 @@ use std::time::Duration;
 use streamling_config::AppConfig;
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
 use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
-use streamling_connectors::table_providers::file::{
-    FileSourceTableProvider, build_bounded_file_source_provider,
-};
+use streamling_connectors::table_providers::file::{FileSourceReadMode, FileSourceTableProvider};
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
 use streamling_connectors::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -24,7 +22,9 @@ use streamling_connectors::table_providers::memory::MemoryTableProvider;
 use streamling_connectors::table_providers::postgres::PostgresSinkTableProvider;
 use streamling_connectors::table_providers::postgres::query_builder::validate_update_where;
 use streamling_connectors::table_providers::print::PrintTableProvider;
-use streamling_core::checkpoints::checkpoint_management::CheckpointCoordinator;
+use streamling_core::checkpoints::checkpoint_management::{
+    CheckpointControl, CheckpointCoordinator,
+};
 use streamling_core::error::{Result, ResultExt};
 use streamling_core::node_context::{NodeContext, TopologyNodeType, init_node_registry};
 use streamling_core::operators::broadcast::{MultiSinkEntry, MultiSinkLogicalNode};
@@ -493,6 +493,7 @@ async fn build_source_providers(
     state_backend_factory: &Arc<StateBackendFactories>,
     session_manager: &SessionManager,
     shutdown_controller: &streamling_core::shutdown::ShutdownController,
+    checkpoint_control: &CheckpointControl,
 ) -> Result<HashMap<String, PreparedSource>> {
     use futures::StreamExt as _;
 
@@ -632,19 +633,24 @@ async fn build_source_providers(
                 let namespace = app_config.state_backend_namespace().to_string();
                 let num_records_before_stop = app_config.num_records_before_stop;
                 let internal_buffer_size = app_config.internal_buffer_size;
+                let file_source_config = app_config.file_source.clone();
+                let checkpoint_control = checkpoint_control.clone();
                 Box::pin(async move {
-                    let provider: Arc<dyn TableProvider> = match &file.mode {
-                        topology::FileSourceMode::Bounded => build_bounded_file_source_provider(
-                            &name,
-                            &file.path,
-                            file.format,
-                            &session_manager,
-                            file.parallelism,
-                        )
-                        .await
-                        .map_err(|e| e.context(format!("{}: failed to create file source", ctx)))?,
+                    let mode = match &file.mode {
+                        // A bounded file source is bounded work, so the drain
+                        // policy always drains it: the control handle is wired
+                        // unconditionally and closes the source with a terminal
+                        // checkpoint.
+                        topology::FileSourceMode::Bounded => FileSourceReadMode::Bounded {
+                            parallelism: file.parallelism,
+                            state_backend: state_backend_factory.create(&namespace),
+                            checkpoint_control: Some(checkpoint_control),
+                        },
                         topology::FileSourceMode::Continuous { poll_interval } => {
-                            let interval =
+                            // Parsed here rather than before the builds start, so a
+                            // bad interval races its siblings like any other source
+                            // error and the name-order sort still picks the winner.
+                            let poll_interval =
                                 humantime::parse_duration(poll_interval).map_err(|e| {
                                     streamling_user_err!(
                                         "{}: invalid poll_interval '{}': {}",
@@ -653,22 +659,27 @@ async fn build_source_providers(
                                         e
                                     )
                                 })?;
-                            FileSourceTableProvider::try_new(
-                                &name,
-                                &file.path,
-                                file.format,
-                                interval,
-                                &session_manager,
-                                state_backend_factory.create(&namespace),
-                                num_records_before_stop,
-                                internal_buffer_size,
-                            )
-                            .await
-                            .map_err(|e| {
-                                e.context(format!("{}: failed to create file source", ctx))
-                            })?
+                            FileSourceReadMode::Continuous {
+                                poll_interval,
+                                // Unlike bounded, one stream unless asked: a wider
+                                // source widens every pipeline that reads it.
+                                parallelism: file.parallelism.unwrap_or(1),
+                                state_backend: state_backend_factory.create(&namespace),
+                            }
                         }
                     };
+                    let provider: Arc<dyn TableProvider> = FileSourceTableProvider::try_new(
+                        &name,
+                        &file.path,
+                        file.format,
+                        mode,
+                        &session_manager,
+                        num_records_before_stop,
+                        internal_buffer_size,
+                        &file_source_config,
+                    )
+                    .await
+                    .map_err(|e| e.context(format!("{}: failed to create file source", ctx)))?;
                     Ok(PreparedSource::File(provider))
                 })
             }
@@ -791,16 +802,6 @@ fn validate_parallelism(topology: &PipelineTopology) -> Result<usize> {
 
     for (name, source) in &topology.sources {
         check("source", name, source.parallelism())?;
-        if let topology::Source::file(file) = source
-            && file.parallelism.is_some_and(|p| p > 1)
-            && matches!(file.mode, topology::FileSourceMode::Continuous { .. })
-        {
-            streamling_user_bail!(
-                "source '{name}': a continuous file source is single-stream (one \
-                 watermark cursor and one checkpoint drain point) and cannot run \
-                 with parallelism > 1; use mode: bounded to read in parallel"
-            );
-        }
     }
     for (name, transform) in &topology.transforms {
         check("transform", name, transform.parallelism())?;
@@ -1215,6 +1216,7 @@ impl Streamling {
             &state_backend_factory,
             &session_manager,
             &shutdown_controller,
+            &checkpoint_control,
         )
         .await?;
 
@@ -5132,6 +5134,7 @@ mod source_build_tests {
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
         let shutdown_controller =
             streamling_core::shutdown::ShutdownController::new(std::time::Duration::from_secs(5));
+        let checkpoint_control = CheckpointCoordinator::new().control();
         build_source_providers(
             &topology,
             &node_contexts,
@@ -5140,6 +5143,7 @@ mod source_build_tests {
             &state_backend_factory,
             &session_manager,
             &shutdown_controller,
+            &checkpoint_control,
         )
         .await
     }
