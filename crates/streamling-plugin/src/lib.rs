@@ -160,11 +160,8 @@ pub struct PluginInstanceContext {
 /// before routing physical partition `i` to plugin instance `i`.
 ///
 /// Non-exhaustive across the FFI boundary (like `PluginMsg`), so an older host
-/// can still load a library that adds a variant later. The reverse is
-/// rejected: a host with more variants fails the layout check of a library
-/// built before them, so adding a variant needs a new frozen twin in
-/// [`compat`] carrying a frozen copy of this enum. Unlike `PluginMsg` it has
-/// no Rust `#[non_exhaustive]`: this type appears in `extern "C"` signatures,
+/// can still load a library that adds a variant later. Unlike `PluginMsg` it
+/// has no Rust `#[non_exhaustive]`: this type appears in `extern "C"` signatures,
 /// and that attribute makes rustc flag every hand-written module function
 /// using it as not FFI-safe.
 #[repr(u8)]
@@ -832,114 +829,6 @@ pub fn create_partitioned_sink<T: PartitionedSinkPlugin>(
     )
 }
 
-/// The context a partition-aware plugin runs with when a host that predates
-/// partitioning creates it through the single-stream `create`: the only
-/// partition of its node. Fails when the plugin cannot run that narrow.
-fn single_stream_context(
-    state_backend_config: &PluginStateBackendConfig,
-    described: DescribeResult,
-) -> Result<PluginInstanceContext, PluginInitializationError> {
-    let minimum = match described {
-        RResult::ROk(description) => description.map_or(1, |d| d.partition_count.minimum),
-        RResult::RErr(e) => return Err(e),
-    };
-    if minimum > 1 {
-        return Err(PluginInitializationError::Configuration(RString::from(
-            format!(
-                "plugin requires at least {minimum} partitions, but the host runs it as a \
-                 single stream (it predates partitioned plugins)"
-            ),
-        )));
-    }
-    Ok(PluginInstanceContext {
-        reference_name: state_backend_config.plugin_reference_name.clone(),
-        partition_index: 0,
-        partition_count: 1,
-    })
-}
-
-/// `create` for a plugin registered with `register_partitioned_plugin_source!`.
-/// Only a host that predates partitioning calls it.
-pub fn create_partitioned_source_single_stream<T: PartitionedSourcePlugin>(
-    id: RString,
-    options: PluginOptions,
-    runtime: PluginAsyncRuntimeObj,
-    state_backend_config: PluginStateBackendConfig,
-    message_channels: PluginChannels,
-) -> RResult<PluginResult, PluginInitializationError> {
-    let described = describe_partitioned_source::<T>(options.clone());
-    match single_stream_context(&state_backend_config, described) {
-        Ok(context) => create_partitioned_source::<T>(
-            id,
-            options,
-            context,
-            runtime,
-            state_backend_config,
-            message_channels,
-        ),
-        Err(e) => RResult::RErr(e),
-    }
-}
-
-/// `create` for a plugin registered with
-/// `register_partitioned_plugin_transform!`. Only a host that predates
-/// partitioning calls it.
-pub fn create_partitioned_transform_single_stream<T: PartitionedTransformPlugin>(
-    id: RString,
-    input_schema: ROption<SafeArrowSchema>,
-    options: PluginOptions,
-    runtime: PluginAsyncRuntimeObj,
-    state_backend_config: PluginStateBackendConfig,
-    message_channels: PluginChannels,
-) -> RResult<PluginResult, PluginInitializationError> {
-    let input_schema: Option<SchemaRef> = input_schema.into_option().map(Into::into);
-    let described = describe_partitioned_transform::<T>(
-        input_schema.clone().map(Into::into).into_c(),
-        options.clone(),
-    );
-    match single_stream_context(&state_backend_config, described) {
-        Ok(context) => create_partitioned_transform::<T>(
-            id,
-            input_schema.map(Into::into).into_c(),
-            options,
-            context,
-            runtime,
-            state_backend_config,
-            message_channels,
-        ),
-        Err(e) => RResult::RErr(e),
-    }
-}
-
-/// `create` for a plugin registered with `register_partitioned_plugin_sink!`.
-/// Only a host that predates partitioning calls it.
-pub fn create_partitioned_sink_single_stream<T: PartitionedSinkPlugin>(
-    id: RString,
-    input_schema: ROption<SafeArrowSchema>,
-    options: PluginOptions,
-    runtime: PluginAsyncRuntimeObj,
-    state_backend_config: PluginStateBackendConfig,
-    message_channels: PluginChannels,
-) -> RResult<PluginResult, PluginInitializationError> {
-    let input_schema: Option<SchemaRef> = input_schema.into_option().map(Into::into);
-    let described = describe_partitioned_sink::<T>(
-        input_schema.clone().map(Into::into).into_c(),
-        options.clone(),
-    );
-    match single_stream_context(&state_backend_config, described) {
-        Ok(context) => create_partitioned_sink::<T>(
-            id,
-            input_schema.map(Into::into).into_c(),
-            options,
-            context,
-            runtime,
-            state_backend_config,
-            message_channels,
-        ),
-        Err(e) => RResult::RErr(e),
-    }
-}
-
 /// Descriptor for a single UDF provided by a plugin.
 #[repr(C)]
 #[derive(StableAbi)]
@@ -1563,47 +1452,6 @@ mod partitioned_generator_tests {
         assert!(result.output_schema.is_some());
         terminate(result, &channels).await;
     }
-
-    /// A host that predates partitioning calls `create`; a partition-aware
-    /// plugin then runs as the only partition of its node.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn single_stream_create_runs_partition_zero_of_one() {
-        let channels = channels();
-
-        let result = create_partitioned_source_single_stream::<PartitionReporter>(
-            "test.source".into(),
-            options(&[]),
-            DirectTokioProxy::new().into_async_runtime_obj(),
-            state_backend_config(),
-            channels.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            label_value(&result, PARTITION_LABEL).as_deref(),
-            Some("blocks:0/1")
-        );
-        terminate(result, &channels).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn single_stream_create_rejects_plugins_needing_more_partitions() {
-        let result = create_partitioned_source_single_stream::<PartitionReporter>(
-            "test.source".into(),
-            options(&[(MINIMUM_PARTITIONS_OPTION, "2")]),
-            DirectTokioProxy::new().into_async_runtime_obj(),
-            state_backend_config(),
-            channels(),
-        );
-
-        match result {
-            RResult::RErr(PluginInitializationError::Configuration(message)) => {
-                assert!(message.contains("at least 2 partitions"), "{message}")
-            }
-            RResult::RErr(other) => panic!("expected a configuration error, got {other:?}"),
-            RResult::ROk(_) => panic!("a plugin needing 2 partitions must not run as one"),
-        }
-    }
 }
 
 // New functions can be added to the end of the struct
@@ -1650,8 +1498,8 @@ pub struct PluginModule {
     /// NOTE: abi_stable's load-time layout check rejects a library whose
     /// module has FEWER fields than the host expects, even for suffix fields
     /// (the tolerance is one-directional; only extra fields on the library
-    /// side pass). Loaders must therefore fall back to probing with the
-    /// frozen twins in [`compat`] before trusting the suffix accessors —
+    /// side pass). Loaders must therefore fall back to probing with
+    /// [`compat::PluginModuleRef`] before trusting the suffix accessors —
     /// see `compat` for the contract.
     pub set_shutdown_signal: extern "C" fn(crate::shutdown::ShutdownSignalObj),
 
@@ -1698,8 +1546,8 @@ impl RootModule for PluginModuleRef {
     }
 }
 
-/// Compatibility probes for plugin libraries built against an SDK older than
-/// the newest module field.
+/// Compatibility probe for plugin libraries built against an SDK older than
+/// the newest module field (the frozen four-field module shape).
 ///
 /// abi_stable's layout check only tolerates a field-count difference in one
 /// direction: a library may have MORE module fields than the host expects
@@ -1709,128 +1557,60 @@ impl RootModule for PluginModuleRef {
 /// `Option` guarded by the library's own recorded field count) never get a
 /// chance to run.
 ///
-/// Each submodule carries a byte-identical twin of an older
-/// [`PluginModule`] shape under the same type name (the layout check compares
-/// type names), so its layout matches what libraries built against that SDK
-/// embed. A loader that fails the primary layout check validates the library
-/// against these frozen shapes, newest to oldest; success proves every field
-/// the library actually has is intact, after which obtaining the primary
-/// [`super::PluginModuleRef`] with the layout check skipped is sound: every
-/// accessor past the library's field count returns `None` via abi_stable's
-/// runtime field guard.
+/// This module carries a byte-identical twin of the original four-field
+/// [`PluginModule`] under the same type name, so its layout matches what
+/// pre-`set_shutdown_signal` libraries embed. A loader that fails the primary
+/// layout check can validate the library against this frozen shape; success
+/// proves the shared prefix (and the two original suffix fields) are intact,
+/// after which obtaining the primary [`super::PluginModuleRef`] with the
+/// layout check skipped is sound: every accessor past the library's field
+/// count returns `None` via abi_stable's runtime field guard.
 ///
-/// Do not add fields to a twin, ever — they are fossils, not live types. A
-/// new module field gets a new twin with the shape it supersedes.
+/// Do not add fields here, ever — this is a fossil, not a live type.
 pub mod compat {
-    /// Five-field shape of SDK 0.2.2 and 0.2.3: everything up to
-    /// `set_shutdown_signal`, before partitioned plugins existed.
-    pub mod pre_partitioning {
-        use crate::*;
+    use super::*;
 
-        /// Frozen five-field twin of [`crate::PluginModule`]. See the
-        /// [`crate::compat`] docs.
-        #[repr(C)]
-        #[derive(StableAbi)]
-        #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
-        pub struct PluginModule {
-            /// See [`crate::PluginModule::init`].
-            pub init:
-                extern "C" fn(
-                    logging: PluginLogging,
-                )
-                    -> RResult<PluginRuntimeConfiguration, PluginInitializationError>,
+    /// Frozen four-field twin of [`super::PluginModule`]. See the module docs.
+    #[repr(C)]
+    #[derive(StableAbi)]
+    #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
+    pub struct PluginModule {
+        /// See [`super::PluginModule::init`].
+        pub init: extern "C" fn(
+            logging: PluginLogging,
+        )
+            -> RResult<PluginRuntimeConfiguration, PluginInitializationError>,
 
-            // Same prefix boundary as the live type; moving it would desync
-            // the two layouts and break the probe.
-            #[sabi(last_prefix_field)]
-            /// See [`crate::PluginModule::create`].
-            pub create: extern "C" fn(
-                plugin_id: RString,
-                input_schema: ROption<SafeArrowSchema>,
-                options: PluginOptions,
-                runtime: PluginAsyncRuntimeObj,
-                state_backend_config: PluginStateBackendConfig,
-                message_channels: PluginChannels,
-            )
-                -> RResult<PluginResult, PluginInitializationError>,
+        // Same prefix boundary as the live type; moving it would desync the
+        // two layouts and break the probe.
+        #[sabi(last_prefix_field)]
+        /// See [`super::PluginModule::create`].
+        pub create: extern "C" fn(
+            plugin_id: RString,
+            input_schema: ROption<SafeArrowSchema>,
+            options: PluginOptions,
+            runtime: PluginAsyncRuntimeObj,
+            state_backend_config: PluginStateBackendConfig,
+            message_channels: PluginChannels,
+        ) -> RResult<PluginResult, PluginInitializationError>,
 
-            /// See [`crate::PluginModule::udf_descriptors`].
-            pub udf_descriptors:
-                extern "C" fn() -> RResult<RVec<PluginUdfDescriptor>, PluginInitializationError>,
+        /// See [`super::PluginModule::udf_descriptors`].
+        pub udf_descriptors:
+            extern "C" fn() -> RResult<RVec<PluginUdfDescriptor>, PluginInitializationError>,
 
-            /// See [`crate::PluginModule::side_output_descriptors`].
-            pub side_output_descriptors: extern "C" fn() -> RResult<
-                RVec<PluginSideOutputDescriptor>,
-                PluginInitializationError,
-            >,
-
-            /// See [`crate::PluginModule::set_shutdown_signal`].
-            pub set_shutdown_signal: extern "C" fn(crate::shutdown::ShutdownSignalObj),
-        }
-
-        impl RootModule for PluginModuleRef {
-            declare_root_module_statics! {PluginModuleRef}
-            const BASE_NAME: &'static str = "streamling_plugin";
-            const NAME: &'static str = "streamling_plugin";
-            const VERSION_STRINGS: VersionStrings = package_version_strings!();
-
-            fn initialization(self) -> Result<Self, LibraryError> {
-                Ok(self)
-            }
-        }
+        /// See [`super::PluginModule::side_output_descriptors`].
+        pub side_output_descriptors:
+            extern "C" fn() -> RResult<RVec<PluginSideOutputDescriptor>, PluginInitializationError>,
     }
 
-    /// Four-field shape of SDK 0.2.1, before `set_shutdown_signal`.
-    pub mod pre_shutdown_signal {
-        use crate::*;
+    impl RootModule for PluginModuleRef {
+        declare_root_module_statics! {PluginModuleRef}
+        const BASE_NAME: &'static str = "streamling_plugin";
+        const NAME: &'static str = "streamling_plugin";
+        const VERSION_STRINGS: VersionStrings = package_version_strings!();
 
-        /// Frozen four-field twin of [`crate::PluginModule`]. See the
-        /// [`crate::compat`] docs.
-        #[repr(C)]
-        #[derive(StableAbi)]
-        #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
-        pub struct PluginModule {
-            /// See [`crate::PluginModule::init`].
-            pub init:
-                extern "C" fn(
-                    logging: PluginLogging,
-                )
-                    -> RResult<PluginRuntimeConfiguration, PluginInitializationError>,
-
-            // Same prefix boundary as the live type; moving it would desync
-            // the two layouts and break the probe.
-            #[sabi(last_prefix_field)]
-            /// See [`crate::PluginModule::create`].
-            pub create: extern "C" fn(
-                plugin_id: RString,
-                input_schema: ROption<SafeArrowSchema>,
-                options: PluginOptions,
-                runtime: PluginAsyncRuntimeObj,
-                state_backend_config: PluginStateBackendConfig,
-                message_channels: PluginChannels,
-            )
-                -> RResult<PluginResult, PluginInitializationError>,
-
-            /// See [`crate::PluginModule::udf_descriptors`].
-            pub udf_descriptors:
-                extern "C" fn() -> RResult<RVec<PluginUdfDescriptor>, PluginInitializationError>,
-
-            /// See [`crate::PluginModule::side_output_descriptors`].
-            pub side_output_descriptors: extern "C" fn() -> RResult<
-                RVec<PluginSideOutputDescriptor>,
-                PluginInitializationError,
-            >,
-        }
-
-        impl RootModule for PluginModuleRef {
-            declare_root_module_statics! {PluginModuleRef}
-            const BASE_NAME: &'static str = "streamling_plugin";
-            const NAME: &'static str = "streamling_plugin";
-            const VERSION_STRINGS: VersionStrings = package_version_strings!();
-
-            fn initialization(self) -> Result<Self, LibraryError> {
-                Ok(self)
-            }
+        fn initialization(self) -> Result<Self, LibraryError> {
+            Ok(self)
         }
     }
 }
@@ -1841,62 +1621,34 @@ mod compat_layout_tests {
     use abi_stable::StableAbi;
     use abi_stable::abi_stability::abi_checking::check_layout_compatibility;
 
-    use abi_stable::type_layout::TypeLayout;
-
-    fn frozen_twins() -> [(&'static str, &'static TypeLayout); 2] {
-        [
-            (
-                "pre_partitioning",
-                <compat::pre_partitioning::PluginModuleRef as StableAbi>::LAYOUT,
-            ),
-            (
-                "pre_shutdown_signal",
-                <compat::pre_shutdown_signal::PluginModuleRef as StableAbi>::LAYOUT,
-            ),
-        ]
-    }
-
-    /// Each frozen twin must stay a loadable prefix of the live module type:
-    /// a host expecting the twin's fields accepts a library exporting the
-    /// live (larger) module. This is the direction the compatibility probe
-    /// relies on; it breaks if the live type's prefix drifts or if a field is
-    /// ever added to a twin.
+    /// The frozen twin must stay a loadable prefix of the live module type:
+    /// a host expecting the twin's four fields accepts a library exporting
+    /// the live (larger) module. This is the direction the compatibility
+    /// probe relies on; it breaks if the live type's prefix drifts or if a
+    /// field is ever added to `compat`.
     #[test]
-    fn frozen_twins_accept_live_module() {
-        for (name, twin) in frozen_twins() {
-            check_layout_compatibility(twin, <PluginModuleRef as StableAbi>::LAYOUT)
-                .unwrap_or_else(|e| {
-                    panic!("frozen twin {name} no longer a prefix of the live module: {e}")
-                });
-        }
+    fn frozen_twin_accepts_live_module() {
+        check_layout_compatibility(
+            <compat::PluginModuleRef as StableAbi>::LAYOUT,
+            <PluginModuleRef as StableAbi>::LAYOUT,
+        )
+        .unwrap_or_else(|e| panic!("frozen twin no longer a prefix of the live module: {e}"));
     }
 
     /// Documents the asymmetry that makes the loader fallback necessary: the
-    /// live module (more fields) does NOT accept a library with fewer fields,
-    /// even though the missing fields are suffix fields. If a future
-    /// abi_stable upgrade makes this pass, the compatibility probe (and this
-    /// test) can be retired.
+    /// live module (more fields) does NOT accept a four-field library, even
+    /// though the missing field is a suffix field. If a future abi_stable
+    /// upgrade makes this pass, the compatibility probe (and this test) can
+    /// be retired.
     #[test]
-    fn live_module_still_rejects_smaller_libraries() {
-        for (name, twin) in frozen_twins() {
-            assert!(
-                check_layout_compatibility(<PluginModuleRef as StableAbi>::LAYOUT, twin).is_err(),
-                "abi_stable now tolerates missing suffix fields ({name}); the compat probe is obsolete"
-            );
-        }
-    }
-
-    /// The same asymmetry between the twins is why the loader probes newest
-    /// to oldest: a four-field library fails the five-field probe and needs
-    /// its own.
-    #[test]
-    fn pre_partitioning_twin_rejects_pre_shutdown_signal_library() {
+    fn live_module_still_rejects_smaller_library() {
         assert!(
             check_layout_compatibility(
-                <compat::pre_partitioning::PluginModuleRef as StableAbi>::LAYOUT,
-                <compat::pre_shutdown_signal::PluginModuleRef as StableAbi>::LAYOUT,
+                <PluginModuleRef as StableAbi>::LAYOUT,
+                <compat::PluginModuleRef as StableAbi>::LAYOUT,
             )
-            .is_err()
+            .is_err(),
+            "abi_stable now tolerates missing suffix fields; the compat probe is obsolete"
         );
     }
 }
