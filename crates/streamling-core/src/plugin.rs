@@ -243,50 +243,6 @@ pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// Module layouts older SDKs export, which a library is validated against
-/// when the current layout rejects it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompatLayout {
-    /// SDK 0.2.2 and 0.2.3: five fields, up to `set_shutdown_signal`.
-    PrePartitioning,
-    /// SDK 0.2.1: four fields.
-    PreShutdownSignal,
-}
-
-impl fmt::Display for CompatLayout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            CompatLayout::PrePartitioning => "pre-partitioning",
-            CompatLayout::PreShutdownSignal => "pre-shutdown-signal",
-        })
-    }
-}
-
-/// Refuses a library that has module fields past the layout it matched.
-///
-/// A frozen layout accepts a library with MORE fields than it has, without
-/// checking the extra ones. A library that failed the current layout yet
-/// matched an older one can only have extra fields if those are exactly the
-/// incompatible ones, so they must never be called.
-fn ensure_fields_validated(module: &PluginModuleRef, layout: CompatLayout) -> Result<()> {
-    let partitioning_fields =
-        module.describe_partitioned().is_some() || module.create_partitioned().is_some();
-    let unvalidated_fields = match layout {
-        CompatLayout::PrePartitioning => partitioning_fields,
-        CompatLayout::PreShutdownSignal => {
-            partitioning_fields || module.set_shutdown_signal().is_some()
-        }
-    };
-    if unvalidated_fields {
-        return Err(streamling_err!(
-            "its module matches only the {} layout, and its newer fields are incompatible \
-             with this host",
-            layout
-        ));
-    }
-    Ok(())
-}
-
 /// Load the root module from a plugin library, tolerating libraries built
 /// against an older SDK whose `PluginModule` has fewer (suffix) fields.
 ///
@@ -295,67 +251,49 @@ fn ensure_fields_validated(module: &PluginModuleRef, layout: CompatLayout) -> Re
 /// `FieldCountMismatch` even when the missing fields sit after
 /// `last_prefix_field` — the runtime `Option` accessors never get a chance.
 /// So on a primary-check failure, re-validate the library against the frozen
-/// twins in `streamling_plugin::compat`, newest (five fields) to oldest (four).
-/// A twin rejects a library with fewer fields just like the live type does,
-/// but accepts one with more without checking them, so the library is then
-/// refused unless it has no fields past the twin it matched. What remains is
-/// a library whose every field was validated; loading the primary ref with
-/// the layout check skipped is sound for it — every suffix accessor past the
-/// library's own recorded field count returns `None` via abi_stable's runtime
-/// field guard, which is exactly the degraded-but-bounded path the call sites
-/// already handle.
+/// four-field twin (`streamling_plugin::compat`); if that passes, the shared
+/// prefix is proven intact and loading the primary ref with the layout check
+/// skipped is sound — every suffix accessor past the library's own recorded
+/// field count returns `None` via abi_stable's runtime field guard, which is
+/// exactly the degraded-but-bounded path the call sites already handle.
 fn load_plugin_module(plugin_path: &Path) -> Result<PluginModuleRef> {
-    use streamling_plugin::compat::{pre_partitioning, pre_shutdown_signal};
-
     let header = lib_header_from_path(plugin_path)
         .map_err(|e| streamling_err!("Unable to read plugin library {:?}: {}", plugin_path, e))?;
 
     match header.init_root_module::<PluginModuleRef>() {
         Ok(module) => Ok(module),
         Err(primary_err) => {
-            let matched_layout = header
-                .init_root_module::<pre_partitioning::PluginModuleRef>()
-                .map(|_| CompatLayout::PrePartitioning)
-                .or_else(|five_field_err| {
-                    header
-                        .init_root_module::<pre_shutdown_signal::PluginModuleRef>()
-                        .map(|_| CompatLayout::PreShutdownSignal)
-                        .map_err(|four_field_err| {
-                            streamling_err!(
-                                "Unable to load plugin from {:?}: not a compatible plugin module \
-                                 (current-ABI check: {}; pre-partitioning check: {}; \
-                                 pre-shutdown-signal check: {})",
-                                plugin_path,
-                                primary_err,
-                                five_field_err,
-                                four_field_err
-                            )
-                        })
+            header
+                .init_root_module::<streamling_plugin::compat::PluginModuleRef>()
+                .map_err(|compat_err| {
+                    streamling_err!(
+                        "Unable to load plugin from {:?}: not a compatible plugin module \
+                         (current-ABI check: {}; frozen-ABI check: {})",
+                        plugin_path,
+                        primary_err,
+                        compat_err
+                    )
                 })?;
 
             info!(
-                "Plugin library predates the current module ABI ({} layout); loading in \
+                "Plugin library predates the current module ABI; loading in \
                  compatibility mode (newer capabilities report as absent): {:?}",
-                matched_layout, plugin_path
+                plugin_path
             );
 
             // SAFETY: the compat probe above validated the library's module
-            // against a frozen layout that is a prefix of the primary layout;
-            // suffix-field access is guarded at runtime by the library's own
-            // recorded field count, and `ensure_fields_validated` below refuses
-            // the library before any field past that layout can be called.
-            let module =
-                unsafe { header.init_root_module_with_unchecked_layout::<PluginModuleRef>() }
-                    .map_err(|e| {
-                        streamling_err!(
-                            "Unable to load plugin from {:?} in compatibility mode: {}",
-                            plugin_path,
-                            e
-                        )
-                    })?;
-            ensure_fields_validated(&module, matched_layout)
-                .map_err(|e| e.context(format!("Unable to load plugin from {plugin_path:?}")))?;
-            Ok(module)
+            // against the frozen four-field layout, which is a prefix of the
+            // primary layout; suffix-field access is guarded at runtime by
+            // the library's own recorded field count.
+            unsafe { header.init_root_module_with_unchecked_layout::<PluginModuleRef>() }.map_err(
+                |e| {
+                    streamling_err!(
+                        "Unable to load plugin from {:?} in compatibility mode: {}",
+                        plugin_path,
+                        e
+                    )
+                },
+            )
         }
     }
 }
@@ -1210,25 +1148,6 @@ mod tests {
         ) {
             Ok(_) => panic!("expected Err for unknown plugin"),
             Err(err) => assert_unknown_plugin_user_error(err),
-        }
-    }
-
-    /// A frozen layout also accepts a library with MORE fields than it has,
-    /// without checking them — and when the current layout rejected that
-    /// library, its extra fields are exactly the incompatible ones. The
-    /// loader must refuse it rather than call them.
-    #[test]
-    fn a_library_with_fields_past_the_matched_layout_is_refused() {
-        let module = test_plugins::get_module();
-
-        for layout in [
-            CompatLayout::PrePartitioning,
-            CompatLayout::PreShutdownSignal,
-        ] {
-            assert!(
-                ensure_fields_validated(&module, layout).is_err(),
-                "a full module matched by the {layout} layout must be refused"
-            );
         }
     }
 
