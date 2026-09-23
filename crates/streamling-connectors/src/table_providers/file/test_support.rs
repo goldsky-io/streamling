@@ -7,6 +7,7 @@ use std::time::Duration;
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::StreamExt;
+use streamling_config::FileSourceConfig;
 use streamling_core::dynamic_table::DynamicTableRegistry;
 use streamling_core::session::SessionManager;
 use streamling_core::topology::FileSourceFormat;
@@ -65,6 +66,7 @@ pub(super) async fn continuous_provider(
         &session_manager,
         None,
         10,
+        &FileSourceConfig::default(),
     )
     .await
     .unwrap();
@@ -91,6 +93,7 @@ pub(super) async fn bounded_provider(
         &session_manager,
         num_records_before_stop,
         10,
+        &FileSourceConfig::default(),
     )
     .await
     .unwrap();

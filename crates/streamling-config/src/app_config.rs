@@ -546,6 +546,28 @@ impl std::fmt::Debug for ClickHouseSourceConfig {
     }
 }
 
+/// Tunables for the `file` source.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileSourceConfig {
+    /// How many discovered files are sampled to detect the Hive partition
+    /// layout. The sample has to agree on the layout, so a larger value catches
+    /// a mixed prefix at the cost of a longer listing before the first scan.
+    #[serde(default = "default_partition_sample_size")]
+    pub partition_sample_size: usize,
+}
+
+fn default_partition_sample_size() -> usize {
+    10
+}
+
+impl Default for FileSourceConfig {
+    fn default() -> Self {
+        Self {
+            partition_sample_size: default_partition_sample_size(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PrintSinkConfig {
     pub sample_every: u32,
@@ -864,6 +886,8 @@ pub struct AppConfig {
     pub kafka_sink: KafkaConfig,
     pub clickhouse_source: ClickHouseSourceConfig,
     pub clickhouse_sink: ClickHouseSinkConfig,
+    #[serde(default)]
+    pub file_source: FileSourceConfig,
     pub print_sink: PrintSinkConfig,
     pub postgres_sink: PostgresSinkConfig,
     pub open_telemetry_metrics: OpenTelemetryMetricsConfig,

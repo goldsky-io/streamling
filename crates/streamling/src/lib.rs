@@ -1230,6 +1230,7 @@ impl Streamling {
                         &session_manager,
                         app_config.num_records_before_stop,
                         app_config.internal_buffer_size,
+                        &app_config.file_source,
                     )
                     .await
                     .map_err(|e| {

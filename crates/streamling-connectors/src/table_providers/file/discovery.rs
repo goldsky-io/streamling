@@ -88,9 +88,6 @@ async fn list_candidates(
     }
 }
 
-/// Number of discovered files sampled to detect the Hive partition layout.
-const PARTITION_SAMPLE_SIZE: usize = 10;
-
 /// Detects Hive partition column names from a sample of file paths: the leading
 /// run of `key=value` parent directory segments, required to be consistent across
 /// the sample. Plain (non `key=value`) directories yield no partition columns, so
@@ -134,6 +131,7 @@ pub(super) async fn infer_partition_columns(
     table_url: &ListingTableUrl,
     file_extension: &str,
     object_store: &dyn object_store::ObjectStore,
+    sample_size: usize,
 ) -> Vec<(String, DataType)> {
     let sample: Vec<object_store::path::Path> = object_store
         .list(Some(table_url.prefix()))
@@ -145,7 +143,7 @@ pub(super) async fn infer_partition_columns(
                     .map(|object| object.location)
             }
         })
-        .take(PARTITION_SAMPLE_SIZE)
+        .take(sample_size)
         .collect()
         .await;
     detect_partition_columns(table_url, &sample)

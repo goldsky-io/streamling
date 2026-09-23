@@ -35,6 +35,7 @@ use datafusion::physical_plan::{
 use tokio::sync::watch;
 use tracing::{debug, info};
 
+use streamling_config::FileSourceConfig;
 use streamling_core::checkpoints::checkpoint_management::CheckpointControl;
 use streamling_core::data::COLUMN_NAME_OP;
 use streamling_core::error::Result;
@@ -108,6 +109,7 @@ impl FileSourceTableProvider {
         session_manager: &SessionManager,
         num_records_before_stop: Option<u64>,
         internal_buffer_size: u32,
+        file_source_config: &FileSourceConfig,
     ) -> Result<Arc<Self>> {
         let table_url = ListingTableUrl::parse(path)?;
         register_object_store_for_url(&table_url, path, session_manager)?;
@@ -159,8 +161,13 @@ impl FileSourceTableProvider {
         // `key=value` directory segments count, so plain nested subfolders yield no
         // partition columns.
         let object_store = state.runtime_env().object_store(table_url.object_store())?;
-        let partition_cols =
-            infer_partition_columns(&table_url, &file_extension, object_store.as_ref()).await;
+        let partition_cols = infer_partition_columns(
+            &table_url,
+            &file_extension,
+            object_store.as_ref(),
+            file_source_config.partition_sample_size,
+        )
+        .await;
         let partition_fields: Vec<Field> = partition_cols
             .iter()
             .map(|(name, datatype)| Field::new(name, datatype.clone(), false))
