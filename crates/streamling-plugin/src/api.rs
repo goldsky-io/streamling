@@ -62,13 +62,19 @@
 //! fast remote releases → exit. Anything slower than a second or two in
 //! `terminate()` is usually a bug.
 
-use crate::{PluginLabel, PluginStateBackendConfig};
+use crate::r#async::PluginAsyncRuntimeObj;
+use crate::ffi::PluginMetricsRecorder;
+use crate::{
+    PluginInitializationError, PluginInstanceContext, PluginLabel, PluginStateBackendConfig,
+    partition_instance_name,
+};
 use abi_stable::traits::IntoReprRust;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::io;
 use std::sync::{Arc, RwLock};
@@ -84,6 +90,9 @@ pub struct PluginStateBackendFactory {
     factories: StateBackendFactories,
     application_namespace: String,
     plugin_reference_name: String,
+    /// Set for a partition instance of a partitioned plugin; scopes `create`
+    /// to that partition.
+    partition_index: Option<u32>,
 }
 
 impl PluginStateBackendFactory {
@@ -99,18 +108,53 @@ impl PluginStateBackendFactory {
             factories,
             application_namespace: config.application_namespace.into_rust(),
             plugin_reference_name: config.plugin_reference_name.into_rust(),
+            partition_index: None,
         }
     }
 
+    /// Factory for one partition instance: `create` is scoped to the
+    /// partition, `create_shared` to the whole node.
+    pub fn for_partition(
+        config: PluginStateBackendConfig,
+        context: &PluginInstanceContext,
+    ) -> Self {
+        PluginStateBackendFactory {
+            partition_index: Some(context.partition_index),
+            ..Self::new(config)
+        }
+    }
+
+    /// State owned by this instance. For a partition instance it is keyed by
+    /// the partition (`{reference_name}[{index}]`), so instances never see
+    /// each other's state; otherwise it is the node's state.
     pub fn create<V>(&self) -> Arc<PluginStateBackend<V>>
     where
         V: Serialize + for<'de> Deserialize<'de> + Send + Sync + Unpin + Clone + Debug + 'static,
     {
+        let reference_name = match self.partition_index {
+            Some(index) => partition_instance_name(&self.plugin_reference_name, index),
+            None => self.plugin_reference_name.clone(),
+        };
+        self.create_named(reference_name)
+    }
+
+    /// State shared by every partition instance of the node, for coordinated
+    /// node-wide bookkeeping. Instances write it concurrently, so they must
+    /// coordinate (e.g. through distinct `_kv` keys). It is also where a
+    /// plugin that used to be single-stream finds the state it wrote then.
+    pub fn create_shared<V>(&self) -> Arc<PluginStateBackend<V>>
+    where
+        V: Serialize + for<'de> Deserialize<'de> + Send + Sync + Unpin + Clone + Debug + 'static,
+    {
+        self.create_named(self.plugin_reference_name.clone())
+    }
+
+    fn create_named<V>(&self, reference_name: String) -> Arc<PluginStateBackend<V>>
+    where
+        V: Serialize + for<'de> Deserialize<'de> + Send + Sync + Unpin + Clone + Debug + 'static,
+    {
         let inner = self.factories.create(&self.application_namespace);
-        Arc::new(PluginStateBackend::new(
-            inner,
-            self.plugin_reference_name.clone(),
-        ))
+        Arc::new(PluginStateBackend::new(inner, reference_name))
     }
 }
 
@@ -325,6 +369,130 @@ pub trait SinkPlugin: SupportsGracefulShutdown + Send + Sync {
     -> Result<(), PluginError>;
 }
 
+/// Planning-time constraints on how many partitions a partitioned plugin can
+/// run with. The host resolves the width from the topology before creating
+/// any instance; an instance cannot change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionCount {
+    pub minimum: u32,
+    pub maximum: Option<u32>,
+    /// Width a source runs with when the topology does not set `parallelism`
+    /// (e.g. its native shard count). Transforms and sinks inherit their
+    /// input's width instead.
+    pub preferred: Option<u32>,
+}
+
+impl Default for PartitionCount {
+    /// Any width, no preference.
+    fn default() -> Self {
+        PartitionCount {
+            minimum: 1,
+            maximum: None,
+            preferred: None,
+        }
+    }
+}
+
+/// How the host must place input rows before routing physical partition `i`
+/// to instance `i`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputPlacement {
+    /// All rows of a primary key land on one instance. The key is the node's
+    /// configured primary key, or its upstream node's when unset.
+    ByPrimaryKey,
+    /// All rows sharing these columns' values land on one instance.
+    ByColumns(Vec<String>),
+    /// Any instance will do.
+    RoundRobin,
+}
+
+/// What a partitioned source reports about itself before any instance exists.
+/// Every instance must produce this schema and these labels.
+#[derive(Clone, Debug)]
+pub struct SourceDescription {
+    pub output_schema: SchemaRef,
+    pub labels: Vec<PluginLabel>,
+    pub partition_count: PartitionCount,
+}
+
+/// What a partitioned transform reports about itself before any instance
+/// exists. Every instance must produce this schema and these labels.
+#[derive(Clone, Debug)]
+pub struct TransformDescription {
+    pub output_schema: SchemaRef,
+    pub labels: Vec<PluginLabel>,
+    pub input_placement: InputPlacement,
+    pub partition_count: PartitionCount,
+}
+
+/// What a partitioned sink reports about itself before any instance exists.
+/// Every instance must declare these labels.
+#[derive(Clone, Debug)]
+pub struct SinkDescription {
+    pub labels: Vec<PluginLabel>,
+    pub input_placement: InputPlacement,
+    pub partition_count: PartitionCount,
+}
+
+/// A source that runs as one instance per physical stream. Register it with
+/// `register_partitioned_plugin_source!`.
+///
+/// `describe` runs at planning time and must not construct a running
+/// instance: validate options and report metadata only. It must not open
+/// connections that outlive the call or reserve durable resources; read-only
+/// schema discovery is fine. `create` is then called once per partition.
+pub trait PartitionedSourcePlugin: SourcePlugin + Sized + 'static {
+    fn describe(
+        options: &HashMap<String, String>,
+    ) -> Result<SourceDescription, PluginInitializationError>;
+
+    fn create(
+        context: PluginInstanceContext,
+        runtime: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError>;
+}
+
+/// A transform that runs as one instance per physical stream. Register it
+/// with `register_partitioned_plugin_transform!`. See
+/// [`PartitionedSourcePlugin`] for the `describe` contract.
+pub trait PartitionedTransformPlugin: TransformPlugin + Sized + 'static {
+    fn describe(
+        input_schema: SchemaRef,
+        options: &HashMap<String, String>,
+    ) -> Result<TransformDescription, PluginInitializationError>;
+
+    fn create(
+        context: PluginInstanceContext,
+        input_schema: SchemaRef,
+        runtime: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError>;
+}
+
+/// A sink that runs as one instance per physical stream. Register it with
+/// `register_partitioned_plugin_sink!`. See [`PartitionedSourcePlugin`] for
+/// the `describe` contract.
+pub trait PartitionedSinkPlugin: SinkPlugin + Sized + 'static {
+    fn describe(
+        input_schema: SchemaRef,
+        options: &HashMap<String, String>,
+    ) -> Result<SinkDescription, PluginInitializationError>;
+
+    fn create(
+        context: PluginInstanceContext,
+        input_schema: SchemaRef,
+        runtime: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError>;
+}
+
 /// Trait for plugins to implement side output support.
 /// Side outputs observe data from all sources without modifying the pipeline.
 /// Unlike other plugin types, side outputs use direct FFI invocation (no channels).
@@ -332,4 +500,46 @@ pub trait SinkPlugin: SupportsGracefulShutdown + Send + Sync {
 pub trait SideOutputPlugin: Send + Sync {
     fn process_batch(&self, batch: &RecordBatch) -> Result<(), String>;
     fn shutdown(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PluginInstanceContext;
+
+    const REFERENCE_NAME: &str = "blocks";
+
+    fn in_memory_config() -> PluginStateBackendConfig {
+        PluginStateBackendConfig::new(
+            "app".to_string(),
+            REFERENCE_NAME.to_string(),
+            r#"{"backend_type":"InMemory","postgres":null,"sqlite":null}"#.to_string(),
+        )
+    }
+
+    fn context(partition_index: u32) -> PluginInstanceContext {
+        PluginInstanceContext {
+            reference_name: REFERENCE_NAME.into(),
+            partition_index,
+            partition_count: 4,
+        }
+    }
+
+    // Two instances of one node must never read each other's per-stream
+    // state; the node-wide namespace is the one they coordinate through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partition_state_is_scoped_to_its_partition() {
+        let factory = PluginStateBackendFactory::for_partition(in_memory_config(), &context(2));
+
+        assert_eq!(factory.create::<u64>().reference_name, "blocks[2]");
+        assert_eq!(factory.create_shared::<u64>().reference_name, "blocks");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_stream_state_is_node_wide() {
+        let factory = PluginStateBackendFactory::new(in_memory_config());
+
+        assert_eq!(factory.create::<u64>().reference_name, "blocks");
+        assert_eq!(factory.create_shared::<u64>().reference_name, "blocks");
+    }
 }

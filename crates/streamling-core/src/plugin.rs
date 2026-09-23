@@ -1,9 +1,12 @@
 pub mod diagnostics;
 pub mod operator;
+pub mod partitioned;
 mod preprocessor;
 pub mod side_output;
 pub mod table_provider;
 mod telemetry;
+#[cfg(test)]
+mod test_plugins;
 pub mod udf;
 
 pub use preprocessor::build_plugin_preprocessors;
@@ -240,6 +243,50 @@ pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Module layouts older SDKs export, which a library is validated against
+/// when the current layout rejects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompatLayout {
+    /// SDK 0.2.2 and 0.2.3: five fields, up to `set_shutdown_signal`.
+    PrePartitioning,
+    /// SDK 0.2.1: four fields.
+    PreShutdownSignal,
+}
+
+impl fmt::Display for CompatLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CompatLayout::PrePartitioning => "pre-partitioning",
+            CompatLayout::PreShutdownSignal => "pre-shutdown-signal",
+        })
+    }
+}
+
+/// Refuses a library that has module fields past the layout it matched.
+///
+/// A frozen layout accepts a library with MORE fields than it has, without
+/// checking the extra ones. A library that failed the current layout yet
+/// matched an older one can only have extra fields if those are exactly the
+/// incompatible ones, so they must never be called.
+fn ensure_fields_validated(module: &PluginModuleRef, layout: CompatLayout) -> Result<()> {
+    let partitioning_fields =
+        module.describe_partitioned().is_some() || module.create_partitioned().is_some();
+    let unvalidated_fields = match layout {
+        CompatLayout::PrePartitioning => partitioning_fields,
+        CompatLayout::PreShutdownSignal => {
+            partitioning_fields || module.set_shutdown_signal().is_some()
+        }
+    };
+    if unvalidated_fields {
+        return Err(streamling_err!(
+            "its module matches only the {} layout, and its newer fields are incompatible \
+             with this host",
+            layout
+        ));
+    }
+    Ok(())
+}
+
 /// Load the root module from a plugin library, tolerating libraries built
 /// against an older SDK whose `PluginModule` has fewer (suffix) fields.
 ///
@@ -248,49 +295,67 @@ pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
 /// `FieldCountMismatch` even when the missing fields sit after
 /// `last_prefix_field` — the runtime `Option` accessors never get a chance.
 /// So on a primary-check failure, re-validate the library against the frozen
-/// four-field twin (`streamling_plugin::compat`); if that passes, the shared
-/// prefix is proven intact and loading the primary ref with the layout check
-/// skipped is sound — every suffix accessor past the library's own recorded
-/// field count returns `None` via abi_stable's runtime field guard, which is
-/// exactly the degraded-but-bounded path the call sites already handle.
+/// twins in `streamling_plugin::compat`, newest (five fields) to oldest (four).
+/// A twin rejects a library with fewer fields just like the live type does,
+/// but accepts one with more without checking them, so the library is then
+/// refused unless it has no fields past the twin it matched. What remains is
+/// a library whose every field was validated; loading the primary ref with
+/// the layout check skipped is sound for it — every suffix accessor past the
+/// library's own recorded field count returns `None` via abi_stable's runtime
+/// field guard, which is exactly the degraded-but-bounded path the call sites
+/// already handle.
 fn load_plugin_module(plugin_path: &Path) -> Result<PluginModuleRef> {
+    use streamling_plugin::compat::{pre_partitioning, pre_shutdown_signal};
+
     let header = lib_header_from_path(plugin_path)
         .map_err(|e| streamling_err!("Unable to read plugin library {:?}: {}", plugin_path, e))?;
 
     match header.init_root_module::<PluginModuleRef>() {
         Ok(module) => Ok(module),
         Err(primary_err) => {
-            header
-                .init_root_module::<streamling_plugin::compat::PluginModuleRef>()
-                .map_err(|compat_err| {
-                    streamling_err!(
-                        "Unable to load plugin from {:?}: not a compatible plugin module \
-                         (current-ABI check: {}; frozen-ABI check: {})",
-                        plugin_path,
-                        primary_err,
-                        compat_err
-                    )
+            let matched_layout = header
+                .init_root_module::<pre_partitioning::PluginModuleRef>()
+                .map(|_| CompatLayout::PrePartitioning)
+                .or_else(|five_field_err| {
+                    header
+                        .init_root_module::<pre_shutdown_signal::PluginModuleRef>()
+                        .map(|_| CompatLayout::PreShutdownSignal)
+                        .map_err(|four_field_err| {
+                            streamling_err!(
+                                "Unable to load plugin from {:?}: not a compatible plugin module \
+                                 (current-ABI check: {}; pre-partitioning check: {}; \
+                                 pre-shutdown-signal check: {})",
+                                plugin_path,
+                                primary_err,
+                                five_field_err,
+                                four_field_err
+                            )
+                        })
                 })?;
 
             info!(
-                "Plugin library predates the current module ABI; loading in \
+                "Plugin library predates the current module ABI ({} layout); loading in \
                  compatibility mode (newer capabilities report as absent): {:?}",
-                plugin_path
+                matched_layout, plugin_path
             );
 
             // SAFETY: the compat probe above validated the library's module
-            // against the frozen four-field layout, which is a prefix of the
-            // primary layout; suffix-field access is guarded at runtime by
-            // the library's own recorded field count.
-            unsafe { header.init_root_module_with_unchecked_layout::<PluginModuleRef>() }.map_err(
-                |e| {
-                    streamling_err!(
-                        "Unable to load plugin from {:?} in compatibility mode: {}",
-                        plugin_path,
-                        e
-                    )
-                },
-            )
+            // against a frozen layout that is a prefix of the primary layout;
+            // suffix-field access is guarded at runtime by the library's own
+            // recorded field count, and `ensure_fields_validated` below refuses
+            // the library before any field past that layout can be called.
+            let module =
+                unsafe { header.init_root_module_with_unchecked_layout::<PluginModuleRef>() }
+                    .map_err(|e| {
+                        streamling_err!(
+                            "Unable to load plugin from {:?} in compatibility mode: {}",
+                            plugin_path,
+                            e
+                        )
+                    })?;
+            ensure_fields_validated(&module, matched_layout)
+                .map_err(|e| e.context(format!("Unable to load plugin from {plugin_path:?}")))?;
+            Ok(module)
         }
     }
 }
@@ -299,7 +364,17 @@ pub fn load_and_initialize_plugin(path: &str, app_config: &AppConfig) -> Result<
     let plugin_path = Path::new(path);
     info!("Loading plugin from: {:?}", plugin_path);
 
-    let plugin_module = Arc::new(load_plugin_module(plugin_path)?);
+    initialize_plugin_module(load_plugin_module(plugin_path)?, app_config, path)
+}
+
+/// Registers every plugin a loaded module provides and hands the module the
+/// host's shutdown signal. `path` names the module in logs.
+fn initialize_plugin_module(
+    plugin_module: PluginModuleRef,
+    app_config: &AppConfig,
+    path: &str,
+) -> Result<()> {
+    let plugin_module = Arc::new(plugin_module);
 
     let logging_config = create_logging(app_config);
     let init_fn = plugin_module.init();
@@ -637,6 +712,15 @@ pub fn send_to_plugin_blocking<T>(
     }
 }
 
+/// The stream error a host forwarder raises when a plugin instance reports,
+/// through `PluginMsg::Error`, that it failed.
+pub(crate) fn plugin_failure(
+    instance_key: &str,
+    message: &str,
+) -> datafusion::error::DataFusionError {
+    streamling_err!("plugin {} failed: {}", instance_key, message).into()
+}
+
 fn plugin_channel_closed(plugin_id: &str) -> crate::error::StreamlingError {
     streamling_err!(
         "plugin '{}' input channel is closed (dispatcher exited); cannot deliver message",
@@ -655,9 +739,36 @@ fn create_logging(app_config: &AppConfig) -> PluginLogging {
 pub type ExecutionFuture =
     Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send + 'static>>;
 
+/// Resolves once a plugin instance's dispatcher has exited.
+///
+/// Observed through its execution future, which the run loop polls; an
+/// execution future that is dropped unpolled counts as exited.
+#[derive(Clone, Debug)]
+pub struct InstanceExit(tokio::sync::watch::Receiver<bool>);
+
+impl InstanceExit {
+    pub async fn exited(&mut self) {
+        // An error means the execution future was dropped: exited as well.
+        let _ = self.0.wait_for(|exited| *exited).await;
+    }
+}
+
+/// Wraps `execution_future` so the returned [`InstanceExit`] resolves when it
+/// completes.
+pub(crate) fn track_exit(execution_future: ExecutionFuture) -> (ExecutionFuture, InstanceExit) {
+    let (exited, exit) = tokio::sync::watch::channel(false);
+    let tracked = Box::pin(async move {
+        let result = execution_future.await;
+        let _ = exited.send(true);
+        result
+    });
+    (tracked, InstanceExit(exit))
+}
+
 pub struct InitializedPlugin {
     pub plugin_id: String,
     pub execution_future: ExecutionFuture,
+    pub exit: InstanceExit,
     pub channels: PluginChannels,
     /// Expected to be defined for sources and transforms, but not for sinks.
     pub output_schema: Option<SchemaRef>,
@@ -676,9 +787,11 @@ impl InitializedPlugin {
             streamling_user_bail!("Output schema must contain the column '{}'", COLUMN_NAME_OP);
         }
 
+        let (execution_future, exit) = track_exit(execution_future);
         Ok(InitializedPlugin {
             plugin_id,
             execution_future,
+            exit,
             channels,
             output_schema,
         })
@@ -881,9 +994,11 @@ pub fn create_preprocessor_plugin(
     let mapped_future = result
         .execution_future
         .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let (execution_future, exit) = track_exit(Box::pin(mapped_future));
     Ok(InitializedPlugin {
         plugin_id: plugin_type.to_string(),
-        execution_future: Box::pin(mapped_future),
+        execution_future,
+        exit,
         channels: plugin_channels,
         output_schema: None,
     })
@@ -1095,6 +1210,143 @@ mod tests {
         ) {
             Ok(_) => panic!("expected Err for unknown plugin"),
             Err(err) => assert_unknown_plugin_user_error(err),
+        }
+    }
+
+    mod abi_fixtures {
+        use super::*;
+        use std::path::PathBuf;
+        use std::sync::OnceLock;
+
+        const PRE_SHUTDOWN_SIGNAL: &str = "abi-fixture-pre-shutdown-signal";
+        const PRE_PARTITIONING: &str = "abi-fixture-pre-partitioning";
+
+        /// Builds the fixture libraries (workspace members exporting older
+        /// module layouts) and returns each one's path, keyed by package.
+        fn fixture_libraries() -> &'static HashMap<String, PathBuf> {
+            static LIBRARIES: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+            LIBRARIES.get_or_init(|| {
+                let output = std::process::Command::new(env!("CARGO"))
+                    .args(["build", "--message-format=json-render-diagnostics"])
+                    .args(
+                        [PRE_SHUTDOWN_SIGNAL, PRE_PARTITIONING]
+                            .iter()
+                            .flat_map(|package| ["-p", package]),
+                    )
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .output()
+                    .expect("failed to invoke cargo build for the ABI fixtures");
+                assert!(
+                    output.status.success(),
+                    "building the ABI fixtures failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|message| message["reason"] == "compiler-artifact")
+                    .filter_map(|artifact| {
+                        let package = artifact["target"]["name"].as_str()?.replace('_', "-");
+                        let library = artifact["filenames"]
+                            .as_array()?
+                            .iter()
+                            .filter_map(|f| f.as_str())
+                            .find(|f| f.ends_with(std::env::consts::DLL_SUFFIX))?;
+                        Some((package, PathBuf::from(library)))
+                    })
+                    .collect()
+            })
+        }
+
+        fn fixture(package: &str) -> &'static Path {
+            fixture_libraries()
+                .get(package)
+                .unwrap_or_else(|| panic!("no library built for {package}"))
+        }
+
+        #[test]
+        fn pre_shutdown_signal_library_loads_without_newer_fields() {
+            let module = load_plugin_module(fixture(PRE_SHUTDOWN_SIGNAL))
+                .expect("a 0.2.1 library must still load");
+
+            assert!(module.set_shutdown_signal().is_none());
+            assert!(module.describe_partitioned().is_none());
+            assert!(module.create_partitioned().is_none());
+        }
+
+        #[test]
+        fn pre_partitioning_library_loads_with_its_shutdown_signal() {
+            let module = load_plugin_module(fixture(PRE_PARTITIONING))
+                .expect("a 0.2.3 library must still load");
+
+            assert!(module.set_shutdown_signal().is_some());
+            assert!(module.describe_partitioned().is_none());
+            assert!(module.create_partitioned().is_none());
+        }
+
+        /// Libraries built before partitioning run every plugin single-stream.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn older_libraries_describe_as_single_stream() {
+            let app_config = AppConfig::load().expect("embedded config must load");
+            for (package, plugin_type) in [
+                (PRE_SHUTDOWN_SIGNAL, "abi_fixture.pre_shutdown_signal"),
+                (PRE_PARTITIONING, "abi_fixture.pre_partitioning"),
+            ] {
+                load_and_initialize_plugin(fixture(package).to_str().unwrap(), &app_config)
+                    .unwrap();
+                let described = partitioned::PartitionedPlugin::describe(
+                    &app_config,
+                    "fixture",
+                    plugin_type,
+                    partitioned::PluginKind::Source,
+                    None,
+                    HashMap::new(),
+                )
+                .unwrap();
+                assert!(described.is_none(), "{plugin_type} must stay single-stream");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn pre_partitioning_library_receives_the_shutdown_signal() {
+            let app_config = AppConfig::load().expect("embedded config must load");
+            load_and_initialize_plugin(fixture(PRE_PARTITIONING).to_str().unwrap(), &app_config)
+                .unwrap();
+
+            // The fixture's `create` reports whether its shutdown signal was
+            // installed instead of creating anything.
+            let report = match create_source_plugin(
+                &app_config,
+                "fixture".to_string(),
+                "abi_fixture.pre_partitioning".to_string(),
+                HashMap::new(),
+            ) {
+                Ok(_) => panic!("the fixture never creates a plugin"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                report.contains("shutdown_signal_installed=true"),
+                "{report}"
+            );
+        }
+    }
+
+    /// A frozen layout also accepts a library with MORE fields than it has,
+    /// without checking them — and when the current layout rejected that
+    /// library, its extra fields are exactly the incompatible ones. The
+    /// loader must refuse it rather than call them.
+    #[test]
+    fn a_library_with_fields_past_the_matched_layout_is_refused() {
+        let module = test_plugins::get_module();
+
+        for layout in [
+            CompatLayout::PrePartitioning,
+            CompatLayout::PreShutdownSignal,
+        ] {
+            assert!(
+                ensure_fields_validated(&module, layout).is_err(),
+                "a full module matched by the {layout} layout must be refused"
+            );
         }
     }
 
