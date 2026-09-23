@@ -165,7 +165,7 @@ impl FileSourceTableProvider {
             &table_url,
             &file_extension,
             object_store.as_ref(),
-            file_source_config.partition_sample_size,
+            file_source_config.partition_sample_size.get(),
         )
         .await;
         let partition_fields: Vec<Field> = partition_cols
