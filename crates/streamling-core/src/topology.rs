@@ -256,10 +256,9 @@ pub struct FileSource {
     pub format: FileSourceFormat,
     #[serde(default)]
     pub mode: FileSourceMode,
-    /// Number of concurrent scan partitions the discovered files are split
-    /// across. Bounded mode only; defaults to the session's target partitions.
-    /// A continuous file source is single-stream (one watermark cursor) and
-    /// rejects any value above 1.
+    /// Number of output partitions the discovered files are read across.
+    /// Bounded mode defaults to the session's target partitions; continuous
+    /// mode defaults to 1.
     pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
@@ -279,8 +278,11 @@ fn default_file_poll_interval() -> String {
 ///   never self-terminates and so is not allowed under `job_mode`. When the mode
 ///   is omitted entirely (or given without `poll_interval`), `poll_interval`
 ///   defaults to [`DEFAULT_FILE_POLL_INTERVAL`].
-/// - `Bounded` lists the matching files once via DataFusion's `ListingTable`,
-///   reads them to completion, and lets the job terminate.
+/// - `Bounded` lists the matching files once, reads them to completion across
+///   `parallelism` partitions, and lets the job terminate. Progress is
+///   checkpointed per file, so a restarted job resumes where the last finalized
+///   checkpoint left it; rerunning a finished job is a no-op until its state is
+///   cleared.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum FileSourceMode {

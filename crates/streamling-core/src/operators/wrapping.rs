@@ -340,6 +340,22 @@ impl TableProvider for WrappingSourceTableProvider {
         self.inner.table_type()
     }
 
+    /// A shared scan is built once from the first consumer's arguments and
+    /// broadcast to every consumer, so a pushed filter would drop rows the other
+    /// consumers need. Only an unshared source may push filters.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        if self.scan_sharing_registry.is_some() {
+            return Ok(vec![
+                datafusion::logical_expr::TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
+        self.inner.supports_filters_pushdown(filters)
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -370,12 +386,13 @@ impl TableProvider for WrappingSourceTableProvider {
             // First scan - call inner.scan and create the handle.
             // The shared source broadcasts full rows so each consumer can apply its own
             // projection independently (see `project_broadcast`); pass `None` here so the
-            // first consumer's projection isn't baked into the shared scan.
+            // first consumer's projection isn't baked into the shared scan. The same
+            // goes for its limit, which would cut rows the other consumers need.
             debug!(
                 "First scan for source: {}, calling inner.scan",
                 reference_name
             );
-            let inner_exec = self.inner.scan(state, None, filters, limit).await?;
+            let inner_exec = self.inner.scan(state, None, filters, None).await?;
 
             let side_outputs: Vec<Arc<dyn SourceSideOutput>> = self
                 .side_outputs
@@ -1114,6 +1131,67 @@ mod tests {
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::prelude::SessionContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A shared scan is built once from the first consumer's arguments, so only
+    /// an unshared source may push filters into its inner provider.
+    #[test]
+    fn filter_pushdown_is_delegated_only_without_scan_sharing() {
+        use datafusion::logical_expr::{TableProviderFilterPushDown, lit};
+
+        #[derive(Debug)]
+        struct InexactFilters;
+
+        #[async_trait]
+        impl TableProvider for InexactFilters {
+            fn schema(&self) -> SchemaRef {
+                Arc::new(Schema::empty())
+            }
+
+            fn table_type(&self) -> TableType {
+                TableType::Base
+            }
+
+            async fn scan(
+                &self,
+                _state: &dyn Session,
+                _projection: Option<&Vec<usize>>,
+                _filters: &[Expr],
+                _limit: Option<usize>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                unimplemented!("pushdown negotiation never scans")
+            }
+
+            fn supports_filters_pushdown(
+                &self,
+                filters: &[&Expr],
+            ) -> Result<Vec<TableProviderFilterPushDown>> {
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+            }
+        }
+
+        let filter = lit(true);
+        let unshared = WrappingSourceTableProvider::new(
+            Arc::new(InexactFilters),
+            "src".to_string(),
+            None,
+            None,
+        );
+        assert_eq!(
+            unshared.supports_filters_pushdown(&[&filter]).unwrap(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let shared = WrappingSourceTableProvider::new(
+            Arc::new(InexactFilters),
+            "src".to_string(),
+            Some(SharedSourceRegistry::new()),
+            None,
+        );
+        assert_eq!(
+            shared.supports_filters_pushdown(&[&filter]).unwrap(),
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+    }
 
     #[test]
     fn sql_with_subtree_metrics_suppresses_wall_clock() {
