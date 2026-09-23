@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
 };
 
 use crate::checkpoints::checkpoint_management::{
-    register_sink_streams, send_checkpoint_ack, sink_stream_done,
+    register_sink_streams, send_checkpoint_ack, sink_stream_done, sink_stream_failed,
 };
 use crate::operators::parallel_sink::ParallelSinkExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -515,6 +515,11 @@ impl ExecutionPlan for MultiSinkExec {
         // calls `write_all` directly rather than going through
         // `ParallelSinkExec`, so the ack gate has to be registered here or a
         // sink would ack an epoch on the first partition that flushed it.
+        for sink in &self.sinks {
+            if let Some(sink_exec) = sink.downcast_ref::<ParallelSinkExec>() {
+                sink_exec.check_sink_width(input_partitions)?;
+            }
+        }
         for sink_name in &self.sink_names {
             register_sink_streams(sink_name, input_partitions);
         }
@@ -572,7 +577,7 @@ impl ExecutionPlan for MultiSinkExec {
                     let data_sink_exec = sink
                         .downcast_ref::<ParallelSinkExec>()
                         .expect("MultiSinkExec: sink must be a ParallelSinkExec");
-                    let data_sink = data_sink_exec.sink();
+                    let data_sink = data_sink_exec.sink_for(input_partition);
 
                     // Per-sink rebatching: run the broadcast consumer through an
                     // `AsyncBatchAccumulator` before it reaches the sink. Placing
@@ -618,18 +623,20 @@ impl ExecutionPlan for MultiSinkExec {
 
                     let write_result = data_sink.write_all(input_stream, &task_context).await;
 
-                    // Release this stream's share of the ack gate and count it
-                    // done on BOTH paths (success and failure): the stream will
-                    // never report another epoch either way, and the broadcast's
-                    // all-streams-completed stop must not stall on a failed sink.
-                    // The epochs freed by a FAILED write are deliberately not
-                    // acked — acking them would let the source commit offsets for
-                    // rows that never landed.
-                    let freed_epochs = sink_stream_done(&sink_name);
+                    // Release this stream's share of the ack gate, or poison it
+                    // when the write FAILED: the failed stream's lost rows are
+                    // covered by every epoch not yet acked, so neither the
+                    // epochs its exit would free nor any the other streams flush
+                    // later may be acked — that would let the source commit
+                    // offsets for rows that never landed. Either way the stream
+                    // counts as done below: the broadcast's all-streams-completed
+                    // stop must not stall on a failed sink.
                     if write_result.is_ok() {
-                        for epoch in freed_epochs {
+                        for epoch in sink_stream_done(&sink_name, input_partition) {
                             send_checkpoint_ack(epoch, &sink_name);
                         }
+                    } else {
+                        sink_stream_failed(&sink_name);
                     }
                     {
                         let mut count = completed_sinks.lock().await;
@@ -929,6 +936,45 @@ mod tests {
                 "sink {index} must receive both input partitions"
             );
         }
+    }
+
+    /// A sink bound per partition (a partitioned plugin sink, one instance per
+    /// write stream) must get partition `i` on sink `i` in a fan-out too.
+    #[tokio::test]
+    async fn fan_out_routes_each_partition_to_its_own_sink() {
+        use crate::operators::parallel_sink::ParallelSinks;
+        use datafusion::datasource::sink::DataSink;
+
+        let (input, schema) = two_partition_input();
+        let per_partition: Vec<Arc<CollectingSink>> = (0..2)
+            .map(|_| Arc::new(CollectingSink::new(schema.clone())))
+            .collect();
+        let sink_plan: Arc<dyn ExecutionPlan> = Arc::new(ParallelSinkExec::new(
+            Arc::clone(&input),
+            ParallelSinks::PerPartition(
+                per_partition
+                    .iter()
+                    .map(|s| Arc::clone(s) as Arc<dyn DataSink>)
+                    .collect(),
+            ),
+            "fanout_per_partition_sink".to_string(),
+        ));
+        let exec = MultiSinkExec::new(
+            input,
+            vec![sink_plan],
+            vec![false],
+            vec!["fanout_per_partition_sink".to_string()],
+            vec![RebatchConfig::default()],
+            10,
+            crate::shutdown::ComponentScope::detached("test"),
+        );
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
+        while (futures::StreamExt::next(&mut stream).await).is_some() {}
+
+        assert_eq!(per_partition[0].sorted_ids(), vec![1, 2, 3]);
+        assert_eq!(per_partition[1].sorted_ids(), vec![4, 5]);
     }
 
     /// `MultiSinkExec` calls `write_all` directly instead of going through

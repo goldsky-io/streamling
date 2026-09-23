@@ -1,11 +1,11 @@
 ---
 name: streamling-advanced-plugins
-description: Use when implementing a streamling preprocessor (rewriting pipeline topology YAML before it parses), a DataFusion scalar UDF usable in SQL, a side output (observing every source without joining the pipeline), registering many component kinds in one crate, or dropping below the registration macros to the low-level manual FFI plugin module. Assumes streamling-plugin-basics.
+description: Use when implementing a streamling preprocessor (rewriting pipeline topology YAML before it parses), a DataFusion scalar UDF usable in SQL, a side output (observing every source without joining the pipeline), a partitioned source/transform/sink (one instance per physical stream), registering many component kinds in one crate, or dropping below the registration macros to the low-level manual FFI plugin module. Assumes streamling-plugin-basics.
 ---
 
 # streamling advanced plugin kinds — Agent Skill
 
-Beyond sources, transforms, and sinks, a plugin crate can register three more component kinds — **preprocessors**, **UDFs**, and **side outputs** — and can mix all six in one `cdylib`. This skill also covers the **low-level manual FFI** escape hatch for when the registration macros don't fit.
+Beyond sources, transforms, and sinks, a plugin crate can register three more component kinds — **preprocessors**, **UDFs**, and **side outputs** — and can mix all six in one `cdylib`. Sources, transforms, and sinks can also be **partitioned**, running one instance per physical stream. This skill also covers the **low-level manual FFI** escape hatch for when the registration macros don't fit.
 
 **Prerequisite:** [`streamling-plugin-basics`](skill://streamling-plugin-basics).
 
@@ -94,6 +94,57 @@ register_plugin_side_output!("monitor", MonitorSideOutput);
 ```
 
 Note: `SideOutputPlugin` is sync and returns `Result<(), String>` (a plain `String` error, not `PluginError`). Instances are auto-registered against every source; you don't wire a `from:`.
+
+## Partitioned plugins — one instance per physical stream
+
+A source, transform, or sink registered with the `register_plugin_*!` macros is **single-stream**: the host runs one instance and narrows its input to one stream. Register it with `register_partitioned_plugin_source!` / `_transform!` / `_sink!` instead and the host runs **one instance per physical stream**, each with its own channels. Use this when shards of the stream can be processed independently (a source with native shards, a keyed sink or transform).
+
+Implement `PartitionedSourcePlugin` / `PartitionedTransformPlugin` / `PartitionedSinkPlugin` on top of the usual trait:
+
+- `describe(...)` runs at planning time, **without** constructing an instance: validate options and report the output schema (sources and transforms), labels, input placement (transforms and sinks), and a `PartitionCount { minimum, maximum, preferred }`. Don't open connections that outlive the call or reserve durable resources; read-only schema discovery is fine.
+- `create(context, ...)` is called once per partition. `context` carries `reference_name`, `partition_index`, and `partition_count`. Every instance must produce the described schema and labels.
+
+```rust
+use streamling_plugin::{
+    InputPlacement, PartitionCount, PartitionedSinkPlugin, PluginInitializationError,
+    PluginInstanceContext, SinkDescription,
+};
+
+impl PartitionedSinkPlugin for ShardedSink {
+    fn describe(
+        _input_schema: SchemaRef,
+        options: &HashMap<String, String>,
+    ) -> Result<SinkDescription, PluginInitializationError> {
+        Ok(SinkDescription {
+            labels: vec![],
+            input_placement: InputPlacement::ByPrimaryKey,
+            partition_count: PartitionCount { maximum: Some(16), ..PartitionCount::default() },
+        })
+    }
+
+    fn create(
+        context: PluginInstanceContext,
+        input_schema: SchemaRef,
+        rt: PluginAsyncRuntimeObj,
+        state: PluginStateBackendFactory,
+        metrics: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError> {
+        // connect to shard `context.partition_index` ...
+    }
+}
+
+register_partitioned_plugin_sink!("my_plugin", "sharded_sink", ShardedSink);
+```
+
+How the host runs it:
+
+- **Width.** `parallelism` on the node sets it. Without it, a source runs `preferred` partitions (else 1) and a transform or sink inherits its input's width. A width outside `minimum..=maximum` fails planning, naming what set it (in a fan-out, that may be a sibling sink's `parallelism`), and so does a fan-out group whose width differs from a plugin sink's own `parallelism`.
+- **Input placement.** Before routing stream `i` to instance `i`, the host places rows as declared: `ByPrimaryKey` (the node's `primary_key`; for a transform whose key names columns it generates, the upstream node's key), `ByColumns(..)`, or `RoundRobin`.
+- **State.** `state.create()` is scoped to the partition (`{reference_name}[{index}]`); `state.create_shared()` is shared by every instance of the node, and is where a formerly single-stream plugin finds its old state.
+- **Checkpoints.** Each instance sees one copy of every marker on its own stream. A sink instance acks from `process_checkpoint_marker` as usual; the host acks the epoch once every instance flushed it.
+- **Failures.** An error from a hook is reported to the host right away, which fails the pipeline and drains it.
+- **Compatibility.** A host that predates partitioned plugins runs a partition-aware plugin through its single-stream `create` as partition 0 of 1 (and refuses one whose `minimum` is above 1). A single-stream plugin rejects `parallelism` above 1.
 
 ## Registering many kinds in one crate
 
@@ -193,6 +244,8 @@ pub fn get_module() -> PluginModuleRef {
     PluginModule::new(init, create, udf_descriptors, side_output_descriptors)
 }
 ```
+
+A hand-written module must also fill the fields added after these: `set_shutdown_signal` (install the host's signal with `streamling_plugin::shutdown::install_shutdown_signal`), `describe_partitioned` (return `RResult::ROk(RNone)` for single-stream plugin ids), and `create_partitioned` (only called for ids `describe_partitioned` described). `plugin_examples/low_level` shows all of them.
 
 Use the low-level path only when you must hand-route `create` or channel handling; otherwise the macros generate this boilerplate correctly and keep you ABI-safe.
 

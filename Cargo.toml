@@ -8,6 +8,8 @@ members = [
     "crates/streamling-connectors",
     "crates/streamling-plugin",
     "crates/streamling-plugin/streamling-plugin-derive",
+    "crates/streamling-plugin/abi-fixtures/pre-shutdown-signal",
+    "crates/streamling-plugin/abi-fixtures/pre-partitioning",
     "crates/streamling-state",
     "crates/streamling",
     "crates/streamling-flink-compat",
@@ -37,7 +39,7 @@ streamling-core          = { path = "crates/streamling-core", version = "0.4.0" 
 streamling-retry         = { path = "crates/streamling-retry", version = "0.4.0" }
 streamling-connectors    = { path = "crates/streamling-connectors", version = "0.4.0" }
 streamling-flink-compat  = { path = "crates/streamling-flink-compat", version = "0.4.0" }
-streamling-plugin        = { path = "crates/streamling-plugin", version = "0.2.3" }
+streamling-plugin        = { path = "crates/streamling-plugin", version = "0.2.4" }
 streamling-plugin-derive = { path = "crates/streamling-plugin/streamling-plugin-derive", version = "0.4.0" }
 streamling-e2e           = { path = "crates/streamling-e2e", version = "0.4.0" }
 
