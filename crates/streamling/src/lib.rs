@@ -5124,10 +5124,28 @@ mod source_build_tests {
         )
     }
 
+    /// A ClickHouse source pointed at a port nothing listens on. Its
+    /// constructor is one of the synchronous ones, so it exercises the
+    /// blocking-pool path rather than the file source's inline async one, and
+    /// a refused connection fails it without waiting out a connect timeout.
+    const UNREACHABLE_CLICKHOUSE: &str = "http://127.0.0.1:1";
+
+    fn clickhouse_source(table: &str) -> String {
+        format!("    type: clickhouse\n    table_name: {table}\n    primary_key: id\n")
+    }
+
     async fn build(topology_yaml: &str) -> Result<HashMap<String, PreparedSource>> {
+        build_with(topology_yaml, |_| {}).await
+    }
+
+    async fn build_with(
+        topology_yaml: &str,
+        configure: impl FnOnce(&mut AppConfig),
+    ) -> Result<HashMap<String, PreparedSource>> {
         let topology = PipelineTopology::load_from_string(topology_yaml).unwrap();
         let mut app_config = AppConfig::load().expect("embedded config must load");
         app_config.state_backend = StateBackendConfig::default();
+        configure(&mut app_config);
         let node_contexts = Streamling::build_node_contexts(&topology);
         let state_backend_factory =
             Arc::new(StateBackendFactories::new(app_config.state_backend.clone()).unwrap());
@@ -5199,6 +5217,65 @@ mod source_build_tests {
         assert!(
             !message.contains("not-a-duration"),
             "the later source's error must not be the one reported, got: {message}"
+        );
+    }
+
+    /// A constructor that runs on the blocking pool reports its failure as a
+    /// normal build error. The `spawn_blocking` wrapper has its own failure
+    /// mode — a panicking or cancelled task resolves as a `JoinError`, not as
+    /// the constructor's `Result` — so the path needs its own coverage; the
+    /// file-source tests above only reach the inline async one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reports_a_blocking_pool_build_failure() {
+        let yaml = format!(
+            "sources:\n  ch:\n{}transforms: {{}}\nsinks:\n  out:\n    type: print\n    from: ch\n",
+            clickhouse_source("some_table"),
+        );
+
+        let message = match build_with(&yaml, |config| {
+            config.clickhouse_source.connection.url = UNREACHABLE_CLICKHOUSE.to_string();
+        })
+        .await
+        {
+            Ok(_) => panic!("an unreachable ClickHouse must fail the build"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("some_table"),
+            "the constructor's own error should survive the blocking task, got: {message}"
+        );
+        assert!(
+            !message.contains("source construction task failed"),
+            "a refused connection is a build error, not a join failure, got: {message}"
+        );
+    }
+
+    /// Name ordering holds across the two build paths, not just within one:
+    /// `a_ch` fails on the blocking pool, `b_file` inline. Whichever finishes
+    /// first, the reported error is `a_ch`'s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orders_failures_across_both_build_paths() {
+        let dir = scratch_dir();
+        let missing = dir.join("does-not-exist.csv");
+        let yaml = format!(
+            "sources:\n  b_file:\n{}  a_ch:\n{}transforms: {{}}\nsinks:\n  out_a:\n    type: print\n    from: a_ch\n  out_b:\n    type: print\n    from: b_file\n",
+            bounded_file_source(&missing.to_string_lossy()),
+            clickhouse_source("some_table"),
+        );
+
+        let message = match build_with(&yaml, |config| {
+            config.clickhouse_source.connection.url = UNREACHABLE_CLICKHOUSE.to_string();
+        })
+        .await
+        {
+            Ok(_) => panic!("both sources must fail to build"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("some_table"),
+            "expected the blocking-pool source, first in name order, got: {message}"
         );
     }
 }
