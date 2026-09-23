@@ -19,6 +19,23 @@ thread_local! {
     static PLUGIN_UDF_DESCRIPTOR_FNS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     static PLUGIN_SIDE_OUTPUT_COMPONENTS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     static PLUGIN_SIDE_OUTPUT_DESCRIPTOR_FNS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    static PLUGIN_DESCRIBE_PARTITIONED_COMPONENTS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    static PLUGIN_CREATE_PARTITIONED_COMPONENTS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Joins the match arms accumulated in one of the thread-locals above.
+fn combined_components(
+    components: &'static std::thread::LocalKey<std::cell::RefCell<Vec<String>>>,
+) -> proc_macro2::TokenStream {
+    components.with(|components| {
+        let mut combined = proc_macro2::TokenStream::new();
+        for component_str in components.borrow().iter() {
+            if let Ok(component_tokens) = component_str.parse::<proc_macro2::TokenStream>() {
+                combined.extend(component_tokens);
+            }
+        }
+        combined
+    })
 }
 
 // Helper function to generate both component_id and plugin_id string
@@ -323,6 +340,109 @@ pub fn register_plugin_sink(input: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
+/// The node kinds a partition-aware registration can declare.
+enum PartitionedKind {
+    Source,
+    Transform,
+    Sink,
+}
+
+/// Registers a partition-aware plugin: `describe_partitioned` and
+/// `create_partitioned` dispatch to its `Partitioned*Plugin` impl, and the
+/// single-stream `create` (all a host predating partitioning calls) runs it
+/// as the only partition of its node.
+fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStream {
+    let PluginComponent {
+        namespace,
+        name,
+        component_type,
+        caps: _caps,
+    } = parse_macro_input!(input as PluginComponent);
+
+    let (component_id, plugin_id) = generate_plugin_identifiers(&namespace, &name);
+
+    let (create_arm, describe_arm, create_partitioned_arm) = match kind {
+        PartitionedKind::Source => (
+            quote! {
+                #component_id => streamling_plugin::create_partitioned_source_single_stream::<#component_type>(
+                    plugin_id, options, runtime, state_backend_config, message_channels,
+                ),
+            },
+            quote! {
+                #component_id => streamling_plugin::describe_partitioned_source::<#component_type>(options),
+            },
+            quote! {
+                #component_id => streamling_plugin::create_partitioned_source::<#component_type>(
+                    plugin_id, options, context, runtime, state_backend_config, message_channels,
+                ),
+            },
+        ),
+        PartitionedKind::Transform => (
+            quote! {
+                #component_id => streamling_plugin::create_partitioned_transform_single_stream::<#component_type>(
+                    plugin_id, input_schema, options, runtime, state_backend_config, message_channels,
+                ),
+            },
+            quote! {
+                #component_id => streamling_plugin::describe_partitioned_transform::<#component_type>(input_schema, options),
+            },
+            quote! {
+                #component_id => streamling_plugin::create_partitioned_transform::<#component_type>(
+                    plugin_id, input_schema, options, context, runtime, state_backend_config, message_channels,
+                ),
+            },
+        ),
+        PartitionedKind::Sink => (
+            quote! {
+                #component_id => streamling_plugin::create_partitioned_sink_single_stream::<#component_type>(
+                    plugin_id, input_schema, options, runtime, state_backend_config, message_channels,
+                ),
+            },
+            quote! {
+                #component_id => streamling_plugin::describe_partitioned_sink::<#component_type>(input_schema, options),
+            },
+            quote! {
+                #component_id => streamling_plugin::create_partitioned_sink::<#component_type>(
+                    plugin_id, input_schema, options, context, runtime, state_backend_config, message_channels,
+                ),
+            },
+        ),
+    };
+
+    PLUGIN_COMPONENTS.with(|components| components.borrow_mut().push(create_arm.to_string()));
+    PLUGIN_DESCRIBE_PARTITIONED_COMPONENTS
+        .with(|components| components.borrow_mut().push(describe_arm.to_string()));
+    PLUGIN_CREATE_PARTITIONED_COMPONENTS.with(|components| {
+        components
+            .borrow_mut()
+            .push(create_partitioned_arm.to_string())
+    });
+    PLUGIN_IDS.with(|ids| ids.borrow_mut().push(plugin_id));
+
+    TokenStream::new()
+}
+
+/// Registers a type implementing `PartitionedSourcePlugin`: one instance runs
+/// per physical stream. Same arguments as `register_plugin_source!`.
+#[proc_macro]
+pub fn register_partitioned_plugin_source(input: TokenStream) -> TokenStream {
+    register_partitioned(input, PartitionedKind::Source)
+}
+
+/// Registers a type implementing `PartitionedTransformPlugin`: one instance
+/// runs per physical stream. Same arguments as `register_plugin_transform!`.
+#[proc_macro]
+pub fn register_partitioned_plugin_transform(input: TokenStream) -> TokenStream {
+    register_partitioned(input, PartitionedKind::Transform)
+}
+
+/// Registers a type implementing `PartitionedSinkPlugin`: one instance runs
+/// per physical stream. Same arguments as `register_plugin_sink!`.
+#[proc_macro]
+pub fn register_partitioned_plugin_sink(input: TokenStream) -> TokenStream {
+    register_partitioned(input, PartitionedKind::Sink)
+}
+
 #[proc_macro]
 pub fn register_plugin_preprocessor(input: TokenStream) -> TokenStream {
     let PluginComponent {
@@ -618,57 +738,13 @@ pub fn init_plugin_with_async_runtime(_input: TokenStream) -> TokenStream {
 }
 
 fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
-    let components = PLUGIN_COMPONENTS.with(|components| {
-        let borrowed = components.borrow();
-        let mut combined = proc_macro2::TokenStream::new();
-
-        for component_str in borrowed.iter() {
-            if let Ok(component_tokens) = component_str.parse::<proc_macro2::TokenStream>() {
-                combined.extend(component_tokens);
-            }
-        }
-
-        combined
-    });
-
-    let preprocessor_components = PLUGIN_PREPROCESSOR_COMPONENTS.with(|components| {
-        let borrowed = components.borrow();
-        let mut combined = proc_macro2::TokenStream::new();
-
-        for component_str in borrowed.iter() {
-            if let Ok(component_tokens) = component_str.parse::<proc_macro2::TokenStream>() {
-                combined.extend(component_tokens);
-            }
-        }
-
-        combined
-    });
-
-    let udf_components = PLUGIN_UDF_COMPONENTS.with(|components| {
-        let borrowed = components.borrow();
-        let mut combined = proc_macro2::TokenStream::new();
-
-        for component_str in borrowed.iter() {
-            if let Ok(component_tokens) = component_str.parse::<proc_macro2::TokenStream>() {
-                combined.extend(component_tokens);
-            }
-        }
-
-        combined
-    });
-
-    let side_output_components = PLUGIN_SIDE_OUTPUT_COMPONENTS.with(|components| {
-        let borrowed = components.borrow();
-        let mut combined = proc_macro2::TokenStream::new();
-
-        for component_str in borrowed.iter() {
-            if let Ok(component_tokens) = component_str.parse::<proc_macro2::TokenStream>() {
-                combined.extend(component_tokens);
-            }
-        }
-
-        combined
-    });
+    let components = combined_components(&PLUGIN_COMPONENTS);
+    let preprocessor_components = combined_components(&PLUGIN_PREPROCESSOR_COMPONENTS);
+    let udf_components = combined_components(&PLUGIN_UDF_COMPONENTS);
+    let side_output_components = combined_components(&PLUGIN_SIDE_OUTPUT_COMPONENTS);
+    let describe_partitioned_components =
+        combined_components(&PLUGIN_DESCRIBE_PARTITIONED_COMPONENTS);
+    let create_partitioned_components = combined_components(&PLUGIN_CREATE_PARTITIONED_COMPONENTS);
 
     let udf_descriptor_calls: Vec<proc_macro2::TokenStream> =
         PLUGIN_UDF_DESCRIPTOR_FNS.with(|fns| {
@@ -823,9 +899,50 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
             streamling_plugin::shutdown::install_shutdown_signal(signal);
         }
 
+        // Plugin ids registered with the single-stream macros (and unknown
+        // ids) describe as `RNone`: the host then runs them through `create`.
+        #[allow(unused_variables)]
+        extern "C" fn describe_partitioned(
+            plugin_id: RString,
+            input_schema: ROption<SafeArrowSchema>,
+            options: PluginOptions,
+        ) -> RResult<ROption<streamling_plugin::PartitionedPluginDescription>, PluginInitializationError> {
+            match plugin_id.as_str() {
+                #describe_partitioned_components
+                _ => RResult::ROk(ROption::RNone),
+            }
+        }
+
+        #[allow(unused_variables)]
+        extern "C" fn create_partitioned(
+            plugin_id: RString,
+            input_schema: ROption<SafeArrowSchema>,
+            options: PluginOptions,
+            context: streamling_plugin::PluginInstanceContext,
+            #runtime_param
+            state_backend_config: PluginStateBackendConfig,
+            message_channels: PluginChannels,
+        ) -> RResult<PluginResult, PluginInitializationError> {
+            #runtime_setup
+
+            match plugin_id.as_str() {
+                #create_partitioned_components
+                _ => Err(PluginInitializationError::NotImplemented).into_c(),
+            }
+        }
+
         #[export_root_module]
         pub fn get_module() -> PluginModuleRef {
-            PluginModule { init, create, udf_descriptors, side_output_descriptors, set_shutdown_signal }.leak_into_prefix()
+            PluginModule {
+                init,
+                create,
+                udf_descriptors,
+                side_output_descriptors,
+                set_shutdown_signal,
+                describe_partitioned,
+                create_partitioned,
+            }
+            .leak_into_prefix()
         }
     };
 

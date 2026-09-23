@@ -14,7 +14,7 @@ option/secret patterns — grounded in this repo's plugin API.
 | `streamling-sink-plugin` | Implementing a `SinkPlugin` — lazy client init, empty-batch guard, NDJSON, batched writes with retry + partial-failure handling, checkpoint acks. |
 | `streamling-transform-plugin` | Implementing a `TransformPlugin` — `process_batch`, `output_schema`, arrow-compute filtering. |
 | `streamling-udf-plugin` | Implementing a DataFusion scalar UDF — `ScalarUDFImpl`, the modern `invoke_with_args`/`ScalarFunctionArgs` API, calling custom functions from SQL. |
-| `streamling-advanced-plugins` | Preprocessors (YAML rewrite), side outputs, multi-kind crate registration, low-level manual FFI. |
+| `streamling-advanced-plugins` | Preprocessors (YAML rewrite), side outputs, partitioned plugins (one instance per stream), multi-kind crate registration, low-level manual FFI. |
 
 The skills cross-reference each other by `skill://<name>` links, which resolve once installed.
 

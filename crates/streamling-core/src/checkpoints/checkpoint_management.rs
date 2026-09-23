@@ -7,7 +7,7 @@ use arrow::datatypes::Schema;
 use crossbeam::channel::RecvTimeoutError;
 use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -233,9 +233,93 @@ impl MarkerAligner {
     }
 }
 
+/// Per-sink ack gate: an epoch is acked once every concurrent write stream
+/// has flushed it or finished.
+///
+/// Sinks that report from inside `write_all` cannot say which stream they
+/// are, so their reports are aligned by count ([`MarkerAligner`]). Sinks
+/// that know their stream report it: counting cannot tell whether a finished
+/// stream's copy was its own, so once that stream stops being live its copy
+/// would stand in for a stream that has not flushed the epoch yet.
+#[derive(Debug)]
+struct SinkAckGate {
+    anonymous: MarkerAligner,
+    streams: usize,
+    /// Epoch → the streams that flushed it, for identified reports.
+    flushed: BTreeMap<CheckpointEpoch, BTreeSet<usize>>,
+    /// Kept so a late report of a released epoch cannot ack it twice.
+    released: BTreeSet<CheckpointEpoch>,
+    finished: BTreeSet<usize>,
+    /// Set once any stream's write failed: its lost rows are covered by every
+    /// epoch not yet acked, so none of them may be acked any more.
+    failed: bool,
+}
+
+impl SinkAckGate {
+    fn new(streams: usize) -> Self {
+        Self {
+            anonymous: MarkerAligner::new(streams),
+            streams,
+            flushed: BTreeMap::new(),
+            released: BTreeSet::new(),
+            finished: BTreeSet::new(),
+            failed: false,
+        }
+    }
+
+    fn covered(&self, flushed: &BTreeSet<usize>) -> bool {
+        (0..self.streams).all(|stream| flushed.contains(&stream) || self.finished.contains(&stream))
+    }
+
+    /// Returns true when this report releases the epoch.
+    fn report(&mut self, stream: usize, epoch: CheckpointEpoch) -> bool {
+        if self.failed || self.released.contains(&epoch) {
+            return false;
+        }
+        let flushed = self.flushed.entry(epoch.clone()).or_default();
+        flushed.insert(stream);
+        let flushed = flushed.clone();
+        if !self.covered(&flushed) {
+            return false;
+        }
+        self.flushed.remove(&epoch);
+        self.released.insert(epoch);
+        true
+    }
+
+    /// Returns the epochs `stream` finishing releases.
+    fn stream_done(&mut self, stream: usize) -> Vec<CheckpointEpoch> {
+        if self.failed {
+            return Vec::new();
+        }
+        self.finished.insert(stream);
+        let mut released: Vec<CheckpointEpoch> = self
+            .anonymous
+            .input_done()
+            .into_iter()
+            .filter_map(|m| match m {
+                CheckpointMessage::Marker { epoch, .. } => Some(epoch),
+                _ => None,
+            })
+            .collect();
+        let covered: Vec<CheckpointEpoch> = self
+            .flushed
+            .iter()
+            .filter(|(_, flushed)| self.covered(flushed))
+            .map(|(epoch, _)| epoch.clone())
+            .collect();
+        for epoch in covered {
+            self.flushed.remove(&epoch);
+            self.released.insert(epoch.clone());
+            released.push(epoch);
+        }
+        released
+    }
+}
+
 /// Tracks, per sink, how many concurrent write streams must flush an epoch
 /// before the sink acks it. See [`MarkerAligner`] for why this gate exists.
-static SINK_ACK_GATES: once_cell::sync::Lazy<Mutex<HashMap<String, MarkerAligner>>> =
+static SINK_ACK_GATES: once_cell::sync::Lazy<Mutex<HashMap<String, SinkAckGate>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Declare that `sink_id` is written by `streams` concurrent partition streams.
@@ -248,38 +332,59 @@ pub fn register_sink_streams(sink_id: &str, streams: usize) {
     }
     SINK_ACK_GATES
         .lock()
-        .insert(sink_id.to_string(), MarkerAligner::new(streams));
+        .insert(sink_id.to_string(), SinkAckGate::new(streams));
 }
 
 /// Report that one write stream of `sink_id` has flushed `epoch`. Returns true
 /// when this was the last stream outstanding and the ack should be sent.
+///
+/// For sinks that cannot tell which stream is reporting; see
+/// [`report_marker_at_sink_stream`] for why a sink that can should use it.
 pub fn report_marker_at_sink(sink_id: &str, epoch: CheckpointEpoch) -> bool {
     let mut gates = SINK_ACK_GATES.lock();
     let Some(gate) = gates.get_mut(sink_id) else {
         return true;
     };
-    !gate
-        .observe(vec![CheckpointMessage::Marker {
-            epoch,
-            created_at_ms: now_ms(),
-        }])
-        .is_empty()
+    !gate.failed
+        && !gate
+            .anonymous
+            .observe(vec![CheckpointMessage::Marker {
+                epoch,
+                created_at_ms: now_ms(),
+            }])
+            .is_empty()
 }
 
-/// Report that one write stream of `sink_id` has finished, returning any epochs
-/// that become ackable because the stream will never report them itself.
-pub fn sink_stream_done(sink_id: &str) -> Vec<CheckpointEpoch> {
+/// Report that write stream `stream` of `sink_id` has flushed `epoch`.
+/// Returns true when every stream has flushed it or finished, and the ack
+/// should be sent.
+pub fn report_marker_at_sink_stream(sink_id: &str, stream: usize, epoch: CheckpointEpoch) -> bool {
+    let mut gates = SINK_ACK_GATES.lock();
+    let Some(gate) = gates.get_mut(sink_id) else {
+        return true;
+    };
+    gate.report(stream, epoch)
+}
+
+/// Report that a write stream of `sink_id` failed. Every epoch not yet acked
+/// may cover rows the failed stream lost, and a stream that fails cannot
+/// flush anything more, so the sink acks nothing from now on — even epochs
+/// its other streams go on to flush.
+pub fn sink_stream_failed(sink_id: &str) {
+    if let Some(gate) = SINK_ACK_GATES.lock().get_mut(sink_id) {
+        gate.failed = true;
+    }
+}
+
+/// Report that write stream `stream` of `sink_id` has finished, returning any
+/// epochs that become ackable because the stream will never report them
+/// itself.
+pub fn sink_stream_done(sink_id: &str, stream: usize) -> Vec<CheckpointEpoch> {
     let mut gates = SINK_ACK_GATES.lock();
     let Some(gate) = gates.get_mut(sink_id) else {
         return Vec::new();
     };
-    gate.input_done()
-        .into_iter()
-        .filter_map(|m| match m {
-            CheckpointMessage::Marker { epoch, .. } => Some(epoch),
-            _ => None,
-        })
-        .collect()
+    gate.stream_done(stream)
 }
 
 #[derive(Debug)]
@@ -1328,9 +1433,60 @@ mod tests {
         register_sink_streams(sink, 2);
         assert!(!report_marker_at_sink(sink, CheckpointEpoch(4)));
         assert_eq!(
-            sink_stream_done(sink),
+            sink_stream_done(sink, 1),
             vec![CheckpointEpoch(4)],
             "a finished stream cannot report the epoch, so it is released"
+        );
+    }
+
+    /// Stream 1 flushed the epoch and then ended; stream 0 has not flushed
+    /// it. Counting copies alone, stream 1's copy would stand in for stream
+    /// 0 once stream 1 stopped being live, and the epoch would be acked
+    /// with stream 0's rows still unflushed.
+    #[test]
+    fn a_finished_stream_does_not_flush_an_epoch_for_the_others() {
+        let sink = "gate_test_sink_identified_streams";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink_stream(sink, 1, CheckpointEpoch(2)));
+
+        assert!(
+            sink_stream_done(sink, 1).is_empty(),
+            "stream 0 has not flushed the epoch"
+        );
+        assert!(
+            report_marker_at_sink_stream(sink, 0, CheckpointEpoch(2)),
+            "the ack is released once stream 0 flushed it"
+        );
+    }
+
+    #[test]
+    fn a_finished_stream_releases_epochs_it_never_saw() {
+        let sink = "gate_test_sink_identified_stream_done";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink_stream(sink, 0, CheckpointEpoch(3)));
+
+        assert_eq!(sink_stream_done(sink, 1), vec![CheckpointEpoch(3)]);
+        assert!(
+            !report_marker_at_sink_stream(sink, 0, CheckpointEpoch(3)),
+            "a released epoch is not acked twice"
+        );
+    }
+
+    /// A stream whose write failed lost rows no later epoch may cover, so
+    /// nothing the other streams flush can be acked any more.
+    #[test]
+    fn a_failed_stream_blocks_every_later_ack() {
+        let sink = "gate_test_sink_failed_stream";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink_stream(sink, 0, CheckpointEpoch(5)));
+
+        sink_stream_failed(sink);
+
+        assert!(!report_marker_at_sink_stream(sink, 0, CheckpointEpoch(6)));
+        assert!(!report_marker_at_sink(sink, CheckpointEpoch(6)));
+        assert!(
+            sink_stream_done(sink, 0).is_empty(),
+            "no epoch is released after a stream failed"
         );
     }
 

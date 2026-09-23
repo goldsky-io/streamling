@@ -116,6 +116,7 @@ pub fn register_plugin_side_outputs(
                 metrics_channel.receiver,
                 host_metrics_recorder,
                 metric_metadata_id,
+                source_name.clone(),
                 scope.stage_token().clone(),
             ));
 

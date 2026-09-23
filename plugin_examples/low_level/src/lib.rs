@@ -9,9 +9,10 @@ use streamling_plugin::api::PluginStateBackendFactory;
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::SafeArrowSchema;
 use streamling_plugin::{
-    PluginChannels, PluginInitializationError, PluginLogging, PluginModule, PluginModuleRef,
-    PluginOptions, PluginResult, PluginRuntimeConfiguration, PluginSideOutputDescriptor,
-    PluginStateBackendConfig, PluginUdfDescriptor,
+    PartitionedPluginDescription, PluginChannels, PluginInitializationError, PluginInstanceContext,
+    PluginLogging, PluginModule, PluginModuleRef, PluginOptions, PluginResult,
+    PluginRuntimeConfiguration, PluginSideOutputDescriptor, PluginStateBackendConfig,
+    PluginUdfDescriptor,
 };
 use tracing::info;
 
@@ -100,6 +101,30 @@ extern "C" fn set_shutdown_signal(signal: streamling_plugin::shutdown::ShutdownS
     streamling_plugin::shutdown::install_shutdown_signal(signal);
 }
 
+/// This library's only plugin is single-stream: describing it as `RNone`
+/// tells the host to run it through `create`.
+extern "C" fn describe_partitioned(
+    _plugin_id: RString,
+    _input_schema: ROption<SafeArrowSchema>,
+    _options: PluginOptions,
+) -> RResult<ROption<PartitionedPluginDescription>, PluginInitializationError> {
+    RResult::ROk(RNone)
+}
+
+/// Never called: the host only creates partition instances of plugins that
+/// `describe_partitioned` reported as partition-capable.
+extern "C" fn create_partitioned(
+    _plugin_id: RString,
+    _input_schema: ROption<SafeArrowSchema>,
+    _options: PluginOptions,
+    _context: PluginInstanceContext,
+    _runtime: PluginAsyncRuntimeObj,
+    _state_backend_config: PluginStateBackendConfig,
+    _message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    Err(PluginInitializationError::NotImplemented).into_c()
+}
+
 #[export_root_module]
 pub fn get_module() -> PluginModuleRef {
     PluginModule {
@@ -108,6 +133,8 @@ pub fn get_module() -> PluginModuleRef {
         udf_descriptors,
         side_output_descriptors,
         set_shutdown_signal,
+        describe_partitioned,
+        create_partitioned,
     }
     .leak_into_prefix()
 }

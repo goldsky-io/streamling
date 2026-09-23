@@ -235,6 +235,9 @@ pub struct PluginSource {
     pub r#type: String,
     pub options: Option<HashMap<String, serde_yaml::Value>>,
     pub primary_key: Option<String>,
+    /// Number of partition instances, for plugins that support partitioned
+    /// execution. Defaults to the plugin's preferred count, or 1.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -242,7 +245,8 @@ impl PluginSource {
     /// Must list exactly this struct's fields (see `merge_plugin_options`).
     /// Anything listed here is invisible to the plugin as an option;
     /// anything missing leaks a typed field into the plugin's options map.
-    const TYPED_FIELDS: &'static [&'static str] = &["type", "primary_key", "telemetry"];
+    const TYPED_FIELDS: &'static [&'static str] =
+        &["type", "primary_key", "parallelism", "telemetry"];
 }
 
 /// Source that reads files from `path` in the given `format`. `path` may be a
@@ -500,7 +504,8 @@ impl Source {
         match self {
             Source::kafka(s) => s.parallelism,
             Source::file(s) => s.parallelism,
-            Source::clickhouse(_) | Source::hybrid(_) | Source::plugin(_) => None,
+            Source::plugin(s) => s.parallelism,
+            Source::clickhouse(_) | Source::hybrid(_) => None,
         }
     }
 }
@@ -591,6 +596,9 @@ pub struct PluginTransform {
     pub from: String,
     pub options: Option<HashMap<String, serde_yaml::Value>>,
     pub primary_key: Option<String>,
+    /// Number of partition instances, for plugins that support partitioned
+    /// execution. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -602,6 +610,7 @@ impl PluginTransform {
         "type",
         "from",
         "primary_key",
+        "parallelism",
         "telemetry",
         "batch_size",
         "batch_flush_interval",
@@ -635,13 +644,14 @@ impl Transform {
 
     /// Requested output width for this transform.
     ///
-    /// `plugin` and `dynamic_table` are `SinglePartition` operators.
+    /// `dynamic_table` is a `SinglePartition` operator.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Transform::sql(t) => t.parallelism,
             Transform::handler(t) => t.parallelism,
             Transform::script(t) => t.parallelism,
-            Transform::dynamic_table(_) | Transform::plugin(_) => None,
+            Transform::plugin(t) => t.parallelism,
+            Transform::dynamic_table(_) => None,
         }
     }
 }
@@ -873,6 +883,9 @@ pub struct PluginSink {
     pub r#type: String,
     pub options: Option<HashMap<String, serde_yaml::Value>>,
     pub primary_key: Option<String>,
+    /// Number of partition instances (concurrent write streams), for plugins
+    /// that support partitioned execution. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -884,6 +897,7 @@ impl PluginSink {
         "type",
         "from",
         "primary_key",
+        "parallelism",
         "telemetry",
         "batch_size",
         "batch_flush_interval",
@@ -934,7 +948,7 @@ impl Sink {
             Sink::blackhole(s) => s.parallelism,
             Sink::memory(s) => s.parallelism,
             Sink::webhook(s) => s.parallelism,
-            Sink::plugin(_) => None,
+            Sink::plugin(s) => s.parallelism,
         }
     }
 }
@@ -1473,6 +1487,56 @@ sinks:
         } else {
             panic!("Expected plugin sink");
         }
+    }
+
+    // `parallelism` is a host-level knob on every plugin node: it binds to the
+    // typed field, and like every typed field it never reaches the plugin as
+    // an option, even when misplaced under `options:`.
+    #[test]
+    fn test_plugin_parallelism_is_typed_on_every_node_kind() {
+        let yaml = r#"
+sources:
+  src:
+    type: test_source_plugin
+    parallelism: 3
+    options:
+      start_block: "100"
+transforms:
+  xform:
+    type: test_transform_plugin
+    from: src
+    parallelism: 2
+sinks:
+  out:
+    type: test_sink_plugin
+    from: xform
+    options:
+      parallelism: 4
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+
+        let source = topology.sources.get("src").unwrap();
+        assert_eq!(source.parallelism(), Some(3));
+        let transform = topology.transforms.get("xform").unwrap();
+        assert_eq!(transform.parallelism(), Some(2));
+        let sink = topology.sinks.get("out").unwrap();
+        assert_eq!(sink.parallelism(), None);
+
+        let Source::plugin(source) = source else {
+            panic!("Expected plugin source")
+        };
+        assert!(!source.options.as_ref().unwrap().contains_key("parallelism"));
+        let Transform::plugin(transform) = transform else {
+            panic!("Expected plugin transform")
+        };
+        assert!(transform.options.is_none());
+        let Sink::plugin(sink) = sink else {
+            panic!("Expected plugin sink")
+        };
+        assert!(
+            sink.options.is_none(),
+            "a misplaced parallelism must not reach the plugin"
+        );
     }
 
     // PluginSource has NO typed batch fields, so `batch_size` /
