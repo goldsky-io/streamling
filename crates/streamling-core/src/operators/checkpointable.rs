@@ -19,6 +19,7 @@ use crate::operators::filter::StreamingFilterExec;
 use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::spawn_marker_preserving_forwarder;
 use crate::operators::wrapping::WrappingExec;
+use crate::telemetry::recorder::try_get_metrics_recorder;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -347,6 +348,14 @@ impl ExecutionPlan for CheckpointableExec {
         // (no cross-partition barrier alignment — today's only multi-partition
         // source, the bounded file source, emits no markers).
         let output_schema = self.schema();
+        // `reference_name` is the bare topology name; node-flow metrics are
+        // keyed by `metric_key(application_id, reference_name)` like every other
+        // node, so resolve the composite here.
+        let metric_metadata_id = try_get_metrics_recorder()
+            .map(|r| {
+                crate::telemetry::provider::metric_key(r.application_id(), &self.reference_name)
+            })
+            .unwrap_or_else(|| self.reference_name.clone());
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             output_schema.clone(),
             self.internal_buffer_size as usize,
@@ -358,6 +367,7 @@ impl ExecutionPlan for CheckpointableExec {
             &output_schema,
             &context,
             format!("CheckpointableExec [{}]", self.reference_name),
+            metric_metadata_id,
         )?;
         Ok(builder.build())
     }

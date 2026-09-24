@@ -1998,7 +1998,8 @@ impl Streamling {
                             "{}: failed to build script transform",
                             ctx.format()
                         ))
-                    })?;
+                    })?
+                    .with_metric_metadata_id(metric_key(&application_id, reference_name.as_str()));
 
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(wasm_node),

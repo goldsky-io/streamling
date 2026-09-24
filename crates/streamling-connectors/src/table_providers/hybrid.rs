@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::table_providers::clickhouse::{ClickHouseClient, ClickHouseTableProvider};
 use crate::table_providers::kafka::KafkaSourceTableProvider;
@@ -27,9 +27,13 @@ use streamling_core::error::ResultExt;
 use streamling_core::operators::wrapping::WrappingSourceTableProvider;
 use streamling_core::session::SessionManager;
 use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
+use streamling_core::telemetry::node_flow::{
+    record_backpressure_wait, record_inflight_buffered, send_batch_with_metrics,
+};
 use streamling_core::telemetry::provider::{
     metric_key, metric_key_hybrid_src_bounded, metric_key_hybrid_src_unbounded,
 };
+use streamling_core::telemetry::recorder::try_get_metrics_recorder;
 use streamling_core::topology::{
     HybridBoundedSource, HybridOffsetTable, HybridUnboundedSource, Telemetry,
 };
@@ -138,6 +142,10 @@ pub struct HybridTableProvider {
     state_backend: Arc<dyn StateOperatorBackend<HybridSourceState>>,
     pub state: Arc<RwLock<HybridSourceState>>,
     reference_name: String,
+    /// Attribution key for this source's node-flow metrics. Defaults to the
+    /// bare reference name; `new_from_topology` upgrades it to the composite
+    /// `metric_key(application_id, reference_name)` the registry is keyed by.
+    metric_metadata_id: String,
     session_manager: SessionManager,
     /// Control handle for the checkpoint coordinator. When set, this source
     /// begins a terminal checkpoint and emits its marker/finalizer inline after
@@ -214,6 +222,7 @@ impl HybridTableProvider {
             schema,
             state_backend,
             state: Arc::new(RwLock::new(initial_state)),
+            metric_metadata_id: reference_name.clone(),
             reference_name,
             session_manager,
             checkpoint_control: None,
@@ -244,6 +253,14 @@ impl HybridTableProvider {
     /// provider is wrapped in an `Arc`.
     pub fn with_scope(mut self, scope: Arc<streamling_core::shutdown::ComponentScope>) -> Self {
         self.scope = scope;
+        self
+    }
+
+    /// Set the metrics-registry key this source's node-flow metrics are
+    /// attributed to. Builder-style, applied before the provider is wrapped in
+    /// an `Arc`.
+    pub fn with_metric_metadata_id(mut self, metric_metadata_id: String) -> Self {
+        self.metric_metadata_id = metric_metadata_id;
         self
     }
 
@@ -424,6 +441,7 @@ impl HybridTableProvider {
 
         let state_backend =
             state_backend_factory.create::<HybridSourceState>(application_id.as_str());
+        let metric_metadata_id = metric_key(&application_id, &reference_name);
         let provider = Self::new(
             reference_name,
             config,
@@ -431,7 +449,8 @@ impl HybridTableProvider {
             state_backend,
             session_manager,
         )?
-        .with_scope(scope);
+        .with_scope(scope)
+        .with_metric_metadata_id(metric_metadata_id);
         debug!("Created HybridTableProvider: {:?}", provider);
 
         Ok(provider)
@@ -1159,6 +1178,9 @@ impl ExecutionPlan for HybridSourceExec {
         let pending_for_main = pending_markers.clone();
 
         let reference_name_for_spawn = self.provider.reference_name.clone();
+        let metrics_recorder = try_get_metrics_recorder();
+        let metric_metadata_id = self.provider.metric_metadata_id.clone();
+        let node_flow_tags = [("execution_kind", "native")];
         let checkpoint_control = provider.checkpoint_control.clone();
         let shutdown_rx = provider.shutdown_rx.clone();
 
@@ -1188,6 +1210,12 @@ impl ExecutionPlan for HybridSourceExec {
         });
 
         scope.spawn(async move {
+            record_inflight_buffered(
+                metrics_recorder.as_deref(),
+                &metric_metadata_id,
+                &node_flow_tags,
+                0,
+            );
             // Every exit path from the loop falls through to the
             // post-loop teardown below — `break 'outer` is used uniformly
             // (instead of `return`) so the forwarder is signalled to
@@ -1204,7 +1232,14 @@ impl ExecutionPlan for HybridSourceExec {
                 let _current_source = match current_source_result {
                     Ok(source) => source,
                     Err(e) => {
+                        let send_start = Instant::now();
                         let _ = tx.send(Err(e)).await;
+                        record_backpressure_wait(
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &node_flow_tags,
+                            send_start,
+                        );
                         break 'outer;
                     }
                 };
@@ -1222,7 +1257,14 @@ impl ExecutionPlan for HybridSourceExec {
                 let mut stream = match stream_result {
                     Ok(s) => s,
                     Err(e) => {
+                        let send_start = Instant::now();
                         let _ = tx.send(Err(e)).await;
+                        record_backpressure_wait(
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &node_flow_tags,
+                            send_start,
+                        );
                         break 'outer;
                     }
                 };
@@ -1282,7 +1324,14 @@ impl ExecutionPlan for HybridSourceExec {
                             let batch = match align_batch_to_schema(&batch, &schema_for_main) {
                                 Ok(b) => b,
                                 Err(e) => {
+                                    let send_start = Instant::now();
                                     let _ = tx.send(Err(e)).await;
+                                    record_backpressure_wait(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &node_flow_tags,
+                                        send_start,
+                                    );
                                     break 'outer;
                                 }
                             };
@@ -1298,12 +1347,29 @@ impl ExecutionPlan for HybridSourceExec {
                             ) {
                                 Ok(b) => b,
                                 Err(e) => {
+                                    let send_start = Instant::now();
                                     let _ = tx.send(Err(e)).await;
+                                    record_backpressure_wait(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &node_flow_tags,
+                                        send_start,
+                                    );
                                     break 'outer;
                                 }
                             };
                             let merged = merge_pending_markers(normalized, &pending_for_main);
-                            if tx.send(Ok(merged)).await.is_err() {
+                            let num_rows = merged.num_rows() as u64;
+                            if !send_batch_with_metrics(
+                                &tx,
+                                Ok(merged),
+                                num_rows,
+                                metrics_recorder.as_deref(),
+                                &metric_metadata_id,
+                                &node_flow_tags,
+                            )
+                            .await
+                            {
                                 break 'outer;
                             }
                         }
@@ -1424,7 +1490,14 @@ impl ExecutionPlan for HybridSourceExec {
                              The next restart will probe per-phase state for recovery: {:?}",
                             provider.reference_name, e
                         );
+                        let send_start = Instant::now();
                         let _ = tx.send(Err(e)).await;
+                        record_backpressure_wait(
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &node_flow_tags,
+                            send_start,
+                        );
                         break 'outer;
                     }
                 }
