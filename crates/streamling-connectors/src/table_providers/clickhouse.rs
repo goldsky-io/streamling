@@ -164,6 +164,40 @@ pub(crate) fn build_checkpoint_flush_batch(
     Some(enriched)
 }
 
+/// Shape a fully-read page for emission.
+///
+/// 1. Strip the dedup-only version column (force-included when the configured
+///    columns omit it) so the batches match `external_schema` — the schema the
+///    provider advertises and the index space of `projection`.
+/// 2. Apply the pushed-down `projection` (indices relative to
+///    `external_schema`), yielding batches shaped like the exec's output schema.
+///
+/// The order is load-bearing: the projection indices are only valid once the
+/// version column is gone, and both steps must precede checkpoint-metadata
+/// attachment so the markers ride the final shape. `RecordBatch::project`
+/// keeps the row count, so a projection that prunes every column still emits
+/// its rows.
+fn shape_for_emit(
+    batches: Vec<RecordBatch>,
+    project_out_version_index: Option<usize>,
+    external_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let batch = match project_out_version_index {
+                Some(drop_idx) => project_out_column(batch, drop_idx, external_schema.clone())?,
+                None => batch,
+            };
+            match projection {
+                Some(indices) => batch.project(indices).map_err(Into::into),
+                None => Ok(batch),
+            }
+        })
+        .collect()
+}
+
 /// Drop the column at `drop_idx` and re-tag the batch with `target_schema`.
 /// Strips a dedup-only version column (force-included because the configured
 /// columns omit it) before emission, so the external schema is unchanged.
@@ -1883,43 +1917,22 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                     receiver_dropped = true;
                                 }
                             } else {
-                                // Strip the dedup-only version column (if it was
-                                // force-included) so the emitted batches match
-                                // the external schema. Projection is total — a
-                                // failure here is unrecoverable for the scan.
-                                if let Some(drop_idx) = project_out_version_index {
-                                    match emit_batches
-                                        .into_iter()
-                                        .map(|b| {
-                                            project_out_column(b, drop_idx, schema.clone())
-                                        })
-                                        .collect::<Result<Vec<_>>>()
-                                    {
-                                        Ok(p) => emit_batches = p,
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e)).await;
-                                            break;
-                                        }
-                                    }
-                                }
-                                // Apply the pushed-down projection. Indices are
-                                // relative to the external schema, so this must
-                                // run after the version column is stripped and
-                                // before checkpoint metadata is attached (so it
-                                // rides the final shape). `RecordBatch::project`
-                                // keeps the row count, so a projection that
-                                // prunes every column still emits its rows.
-                                if let Some(indices) = &projection {
-                                    match emit_batches
-                                        .into_iter()
-                                        .map(|b| b.project(indices).map_err(DataFusionError::from))
-                                        .collect::<Result<Vec<_>>>()
-                                    {
-                                        Ok(p) => emit_batches = p,
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e)).await;
-                                            break;
-                                        }
+                                // Shape the page for emission: strip the
+                                // dedup-only version column, then apply the
+                                // pushed-down projection (see `shape_for_emit`
+                                // for why that order is load-bearing). Shaping
+                                // is total — a failure here is unrecoverable
+                                // for the scan.
+                                match shape_for_emit(
+                                    emit_batches,
+                                    project_out_version_index,
+                                    &schema,
+                                    projection.as_deref(),
+                                ) {
+                                    Ok(p) => emit_batches = p,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e)).await;
+                                        break;
                                     }
                                 }
                                 for batch in emit_batches.into_iter() {
@@ -3544,6 +3557,92 @@ mod tests {
 
     fn make_int64_batch(n: i64) -> RecordBatch {
         make_int64_batch_with_meta(n, None)
+    }
+
+    /// The emit-point shaping the projection depends on: the force-included
+    /// version column sits INSIDE the scan batch (here at index 2, between
+    /// `id` and `payload`), so the pushed indices — relative to the external
+    /// schema `[block_number, id, payload]` — are only valid after it is
+    /// stripped. Projecting first would read `insert_timestamp` as `payload`.
+    #[test]
+    fn shape_for_emit_strips_version_column_before_applying_projection() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let scan_schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::Int64, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("insert_timestamp", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let external_schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::Int64, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let page = RecordBatch::try_new(
+            scan_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![1000, 2000])),
+                Arc::new(StringArray::from(vec!["payload_a", "payload_b"])),
+            ],
+        )
+        .unwrap();
+
+        // Non-prefix, reordered projection over the EXTERNAL schema:
+        // [payload, block_number].
+        let shaped = shape_for_emit(vec![page.clone()], Some(2), &external_schema, Some(&[2, 0]))
+            .expect("shaping must succeed");
+        assert_eq!(shaped.len(), 1);
+        let out = &shaped[0];
+        let names: Vec<_> = out
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["payload".to_string(), "block_number".to_string()]
+        );
+        let payload = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column 0 must be the utf8 payload, not the stripped version column");
+        assert_eq!(payload.value(0), "payload_a");
+        assert_eq!(payload.value(1), "payload_b");
+        let blocks = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("column 1 must be block_number");
+        assert_eq!(blocks.values().to_vec(), vec![1, 2]);
+
+        // No projection: exactly the external schema.
+        let shaped = shape_for_emit(vec![page.clone()], Some(2), &external_schema, None).unwrap();
+        assert_eq!(shaped[0].schema(), external_schema);
+
+        // No version column to strip, projection only.
+        let narrow = shaped[0].clone();
+        let shaped = shape_for_emit(vec![narrow], None, &external_schema, Some(&[1])).unwrap();
+        let names: Vec<_> = shaped[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, vec!["id".to_string()]);
+
+        // Empty projection keeps the rows (checkpoint attach must still work).
+        let shaped = shape_for_emit(vec![page], Some(2), &external_schema, Some(&[])).unwrap();
+        assert_eq!(shaped[0].num_columns(), 0);
+        assert_eq!(shaped[0].num_rows(), 2);
+        let enriched =
+            enrich_batch_with_metadata(shaped[0].clone(), std::collections::HashMap::new())
+                .expect("zero-column batch must survive metadata enrichment");
+        assert_eq!(enriched.num_rows(), 2);
     }
 
     #[test]
