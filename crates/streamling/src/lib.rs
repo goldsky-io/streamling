@@ -410,6 +410,18 @@ fn parse_batch_flush_interval(
         .transpose()
 }
 
+/// Without a timer a partial batch, and any marker behind it, waits for rows a filtered stream may never deliver.
+const DEFAULT_SCRIPT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+fn script_batch_flush_interval(
+    batch_size: Option<usize>,
+    configured: Option<Duration>,
+) -> Option<Duration> {
+    configured.or_else(|| {
+        matches!(batch_size, Some(n) if n > 0).then_some(DEFAULT_SCRIPT_BATCH_FLUSH_INTERVAL)
+    })
+}
+
 fn wrap_with_rebatch(
     plan: LogicalPlan,
     batch_size: Option<usize>,
@@ -1692,6 +1704,13 @@ impl Streamling {
                     let schema = &script_transform.schema;
                     let parallelism = script_transform.parallelism;
                     let batch_size = script_transform.batch_size;
+                    let batch_flush_interval = script_batch_flush_interval(
+                        batch_size,
+                        parse_batch_flush_interval(
+                            &script_transform.batch_flush_interval,
+                            &ctx.format(),
+                        )?,
+                    );
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
@@ -1762,7 +1781,7 @@ impl Streamling {
                             reference_name.clone(),
                         ),
                         batch_size,
-                        None,
+                        batch_flush_interval,
                         reference_name.clone(),
                     );
                     let wasm_node = WasmRunnerNode::with_options(
@@ -4039,6 +4058,103 @@ mod tests {
             !inherited_rendered.contains("RebatchExec"),
             "unexpected RebatchExec in plan:\n{inherited_rendered}"
         );
+    }
+
+    async fn rendered_script_plan(
+        batch_size: Option<usize>,
+        batch_flush_interval: Option<Duration>,
+    ) -> String {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan,
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            batch_size,
+            batch_flush_interval,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        displayable(
+            session_manager
+                .new_df(logical_plan)
+                .create_physical_plan()
+                .await
+                .unwrap()
+                .as_ref(),
+        )
+        .indent(true)
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn script_transform_batch_flush_interval_reaches_rebatch_node() {
+        let rendered = rendered_script_plan(Some(2), Some(Duration::from_secs(1))).await;
+        assert!(
+            rendered.contains("RebatchExec(batch_size=2, interval=1s, partitions=4)"),
+            "expected the flush interval in plan:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_batch_size_alone_defaults_the_flush_interval() {
+        let defaulted =
+            rendered_script_plan(Some(100), script_batch_flush_interval(Some(100), None)).await;
+        assert!(
+            defaulted.contains("RebatchExec(batch_size=100, interval=1s, partitions=4)"),
+            "expected the default flush interval in plan:\n{defaulted}"
+        );
+
+        let explicit = rendered_script_plan(
+            Some(100),
+            script_batch_flush_interval(Some(100), Some(Duration::from_millis(500))),
+        )
+        .await;
+        assert!(
+            explicit.contains("RebatchExec(batch_size=100, interval=500ms, partitions=4)"),
+            "an explicit interval must win:\n{explicit}"
+        );
+
+        assert_eq!(script_batch_flush_interval(Some(0), None), None);
+        assert_eq!(script_batch_flush_interval(None, None), None);
     }
 
     fn empty_plan() -> LogicalPlan {
