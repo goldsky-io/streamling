@@ -7,7 +7,7 @@ use crate::table_providers::clickhouse::{ClickHouseClient, ClickHouseTableProvid
 use crate::table_providers::kafka::KafkaSourceTableProvider;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -485,7 +485,12 @@ impl HybridTableProvider {
             unbounded_column_names
         );
 
-        for (col_name, col_type) in &unbounded_fields {
+        for unbounded_field in unbounded_schema.fields() {
+            let col_name = unbounded_field.name();
+            if col_name == COLUMN_NAME_OP {
+                continue;
+            }
+            let col_type = unbounded_field.data_type();
             match bounded_fields.iter().find(|(name, _)| name == col_name) {
                 Some((_, bounded_type)) => {
                     if !Self::is_compatible_data_type(bounded_type, col_type) {
@@ -497,6 +502,8 @@ impl HybridTableProvider {
                         );
                     }
                 }
+                // HybridSourceExec fills it with nulls during bounded phases.
+                None if unbounded_field.is_nullable() => {}
                 None => {
                     streamling_user_bail!(
                         "unbounded source column '{}' not found in bounded source",
@@ -865,8 +872,10 @@ impl HybridTableProvider {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let current_source = self.get_current_source().await?;
         let session_state = self.session_manager.session_state();
+        let source_projection =
+            project_onto_source(projection.as_ref(), &self.schema, &current_source.schema());
         let plan = current_source
-            .scan(&session_state, projection.as_ref(), filters, limit)
+            .scan(&session_state, source_projection.as_ref(), filters, limit)
             .await?;
         plan.execute(partition, context)
     }
@@ -892,8 +901,10 @@ impl TableProvider for HybridTableProvider {
         self.load_state().await?;
 
         let current_source = self.get_current_source().await?;
+        let source_projection =
+            project_onto_source(projection, &self.schema, &current_source.schema());
         let inner_plan = current_source
-            .scan(state, projection, filters, limit)
+            .scan(state, source_projection.as_ref(), filters, limit)
             .await?;
 
         Ok(Arc::new(HybridSourceExec::new(
@@ -956,6 +967,32 @@ impl HybridSourceExec {
     }
 }
 
+/// Re-express a projection over the hybrid schema as indices into `source`'s
+/// schema, matched by name. Hybrid columns the source does not declare are
+/// dropped; `align_batch_to_schema` fills them with nulls.
+fn project_onto_source(
+    projection: Option<&Vec<usize>>,
+    hybrid: &SchemaRef,
+    source: &SchemaRef,
+) -> Option<Vec<usize>> {
+    let projection = projection?;
+    let same_shape = hybrid.fields().len() == source.fields().len()
+        && hybrid
+            .fields()
+            .iter()
+            .zip(source.fields())
+            .all(|(a, b)| a.name() == b.name());
+    if same_shape {
+        return Some(projection.clone());
+    }
+    Some(
+        projection
+            .iter()
+            .filter_map(|&i| source.index_of(hybrid.field(i).name()).ok())
+            .collect(),
+    )
+}
+
 /// Align a batch to `target` by selecting the target's columns by NAME.
 ///
 /// Inner phase plans do not reliably honor the projection pushed into the
@@ -964,7 +1001,15 @@ impl HybridSourceExec {
 /// schema order), so the hybrid exec — which declares `target` as its output
 /// schema — must reshape each batch itself. Name-based selection is
 /// deliberately insensitive to both column order and extra columns.
-fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> DataFusionResult<RecordBatch> {
+///
+/// A nullable target column that `source` (the phase's declared schema) does
+/// not have at all — e.g. a Kafka field the ClickHouse dataset dropped — is
+/// filled with nulls. Any other missing column is an error.
+fn align_batch_to_schema(
+    batch: &RecordBatch,
+    target: &SchemaRef,
+    source: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
     let batch_schema = batch.schema();
     // Fast path: already the exact target shape (names, in order).
     if batch_schema.fields().len() == target.fields().len()
@@ -980,23 +1025,52 @@ fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> DataFusionR
     let indices = target
         .fields()
         .iter()
-        .map(|field| {
-            batch_schema.index_of(field.name()).map_err(|_| {
-                DataFusionError::from(streamling_err!(
-                    "hybrid source: column '{}' required by the query is missing from an \
-                     inner phase batch (batch columns: {:?})",
-                    field.name(),
-                    batch_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                ))
-            })
+        .map(|field| match batch_schema.index_of(field.name()) {
+            Ok(idx) => Ok(Some(idx)),
+            Err(_) if field.is_nullable() && source.index_of(field.name()).is_err() => Ok(None),
+            Err(_) => Err(DataFusionError::from(streamling_err!(
+                "hybrid source: column '{}' required by the query is missing from an \
+                 inner phase batch (batch columns: {:?})",
+                field.name(),
+                batch_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+            ))),
         })
-        .collect::<DataFusionResult<Vec<usize>>>()?;
+        .collect::<DataFusionResult<Vec<Option<usize>>>>()?;
 
-    batch.project(&indices).map_err(Into::into)
+    if indices.iter().all(Option::is_some) {
+        let indices: Vec<usize> = indices.into_iter().flatten().collect();
+        return batch.project(&indices).map_err(Into::into);
+    }
+
+    let mut fields = Vec::with_capacity(indices.len());
+    let mut columns = Vec::with_capacity(indices.len());
+    for (target_field, idx) in target.fields().iter().zip(indices) {
+        match idx {
+            Some(idx) => {
+                fields.push(batch_schema.fields()[idx].clone());
+                columns.push(batch.column(idx).clone());
+            }
+            None => {
+                fields.push(target_field.clone());
+                columns.push(new_null_array(target_field.data_type(), batch.num_rows()));
+            }
+        }
+    }
+    // Keep the batch metadata: checkpoint markers ride on it.
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(Into::into)
 }
 
 impl DisplayAs for HybridSourceExec {
@@ -1201,8 +1275,8 @@ impl ExecutionPlan for HybridSourceExec {
                     executing_phase >= provider.config.bounded_sources.len();
 
                 let current_source_result = provider.get_current_source().await;
-                let _current_source = match current_source_result {
-                    Ok(source) => source,
+                let current_source_schema = match current_source_result {
+                    Ok(source) => source.schema(),
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
                         break 'outer;
@@ -1279,7 +1353,11 @@ impl ExecutionPlan for HybridSourceExec {
                             // and emits every column, in ClickHouse order), so
                             // align each batch to the declared (projected)
                             // schema by name before anything downstream sees it.
-                            let batch = match align_batch_to_schema(&batch, &schema_for_main) {
+                            let batch = match align_batch_to_schema(
+                                &batch,
+                                &schema_for_main,
+                                &current_source_schema,
+                            ) {
                                 Ok(b) => b,
                                 Err(e) => {
                                     let _ = tx.send(Err(e)).await;
@@ -1710,10 +1788,11 @@ struct ClickHouseSchemaAdapter {
     client: ClickHouseClient,
 }
 impl ClickHouseSchemaAdapter {
-    // Returns a list of column expressions that match the target schema.
-    // If a column type doesn't match, it will be cast to the target type.
-    // Extra columns in the ClickHouse table (not in target schema) are automatically
-    // discarded - the ClickHouse table can be a superset of the target schema.
+    /// Returns the ClickHouse SELECT expressions for the target (Kafka) schema.
+    /// Columns whose type differs are cast to the target type. Extra ClickHouse
+    /// columns are not selected. A nullable target column absent from the table
+    /// (e.g. a field the stored dataset dropped) is skipped here and filled with
+    /// nulls by `HybridSourceExec`; a missing non-nullable column is an error.
     fn get_columns(
         &self,
         table_name: &str,
@@ -1729,11 +1808,6 @@ impl ClickHouseSchemaAdapter {
                     e
                 )
             })?;
-        let table_fields: HashMap<&str, Arc<Field>> = table_schema
-            .fields()
-            .iter()
-            .map(|f| (f.name().as_str(), f.clone()))
-            .collect();
 
         let all_clickhouse_columns: Vec<String> = table_schema
             .fields()
@@ -1748,36 +1822,60 @@ impl ClickHouseSchemaAdapter {
             all_clickhouse_columns
         );
 
-        let mut columns = Vec::with_capacity(target_schema.fields().len());
-        for target_field in target_schema.fields() {
-            // Skip _gs_op as it's a virtual column that ClickHouse query builder adds automatically
-            if target_field.name() == COLUMN_NAME_OP {
-                continue;
-            }
-            let clickhouse_expression = match table_fields.get(target_field.name().as_str()) {
-                Some(table_field) => {
-                    if table_field.data_type() == target_field.data_type() {
-                        format!("`{}`", target_field.name())
-                    } else {
-                        Self::convert_field_type(table_field, target_field)
-                    }
-                }
-                None => {
-                    streamling_user_bail!(
-                        "column '{}' not found in ClickHouse table '{}'",
-                        target_field.name(),
-                        table_name
-                    );
-                }
-            };
-            columns.push(clickhouse_expression);
-        }
+        let columns = Self::select_columns(table_name, &table_schema, target_schema)?;
         debug!(
             "Hybrid source bounded source (ClickHouse table '{}') selected columns matching unbounded schema ({}): {:?}",
             table_name,
             columns.len(),
             columns
         );
+        Ok(columns)
+    }
+
+    fn select_columns(
+        table_name: &str,
+        table_schema: &SchemaRef,
+        target_schema: &SchemaRef,
+    ) -> Result<Vec<String>, DataFusionError> {
+        let table_fields: HashMap<&str, &Arc<Field>> = table_schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f))
+            .collect();
+
+        let mut columns = Vec::with_capacity(target_schema.fields().len());
+        let mut absent = Vec::new();
+        for target_field in target_schema.fields() {
+            // Skip _gs_op as it's a virtual column that ClickHouse query builder adds automatically
+            if target_field.name() == COLUMN_NAME_OP {
+                continue;
+            }
+            match table_fields.get(target_field.name().as_str()) {
+                Some(table_field) => {
+                    if table_field.data_type() == target_field.data_type() {
+                        columns.push(format!("`{}`", target_field.name()));
+                    } else {
+                        columns.push(Self::convert_field_type(table_field, target_field));
+                    }
+                }
+                None if target_field.is_nullable() => absent.push(target_field.name().as_str()),
+                None => {
+                    streamling_user_bail!(
+                        "column '{}' not found in ClickHouse table '{}' (it is non-nullable in the \
+                         source schema, so it cannot be backfilled with nulls)",
+                        target_field.name(),
+                        table_name
+                    );
+                }
+            }
+        }
+        if !absent.is_empty() {
+            warn!(
+                "Hybrid source: ClickHouse table '{}' lacks nullable source column(s) {:?}; \
+                 they will be null for rows read from the bounded phase",
+                table_name, absent
+            );
+        }
         Ok(columns)
     }
 
@@ -2084,41 +2182,52 @@ mod tests {
     }
 
     #[test]
-    fn test_get_columns_skips_gs_op() {
-        // Create a target schema that includes _gs_op (like Kafka source would)
+    fn select_columns_skips_absent_nullable_and_extra_columns() {
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("insert_time", DataType::Int64, false),
+        ]));
         let target_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("block_number", DataType::Int64, false),
-            Field::new(COLUMN_NAME_OP, DataType::Utf8, false), // This should be skipped
-            Field::new("data", DataType::Utf8, false),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+            Field::new(
+                "after_evm_transfers",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
         ]));
 
-        // Simulate the logic from get_columns() - iterate through target schema fields
-        // and skip _gs_op
-        let mut columns = Vec::with_capacity(target_schema.fields().len());
-        for target_field in target_schema.fields() {
-            // Skip _gs_op as it's a virtual column that ClickHouse query builder adds automatically
-            if target_field.name() == COLUMN_NAME_OP {
-                continue;
-            }
-            columns.push(target_field.name().to_string());
-        }
+        let columns =
+            ClickHouseSchemaAdapter::select_columns("raw_traces", &table_schema, &target_schema)
+                .expect("nullable column absent from ClickHouse must not fail");
 
-        // Verify that _gs_op is NOT in the columns list
-        assert!(
-            !columns.contains(&COLUMN_NAME_OP.to_string()),
-            "_gs_op should be skipped and not included in columns list"
-        );
-
-        // Verify that other columns ARE in the list
         assert_eq!(
-            columns.len(),
-            3,
-            "Should have 3 columns (id, block_number, data)"
+            columns,
+            vec![
+                "`id`".to_string(),
+                "CAST(`block_number` AS Int64) AS `block_number`".to_string(),
+            ]
         );
-        assert!(columns.contains(&"id".to_string()));
-        assert!(columns.contains(&"block_number".to_string()));
-        assert!(columns.contains(&"data".to_string()));
+    }
+
+    #[test]
+    fn select_columns_rejects_absent_non_nullable_column() {
+        let table_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("block_number", DataType::Int64, false),
+        ]));
+
+        let err =
+            ClickHouseSchemaAdapter::select_columns("raw_traces", &table_schema, &target_schema)
+                .expect_err("a non-nullable column cannot be backfilled with nulls");
+        assert!(
+            err.to_string()
+                .contains("column 'block_number' not found in ClickHouse table 'raw_traces'"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3036,6 +3145,93 @@ mod tests {
             assert_eq!(names.value(1), "b");
         }
         assert!(saw_data, "the bounded phase's batch must be forwarded");
+    }
+
+    /// The Kafka schema may carry a nullable field the ClickHouse dataset
+    /// dropped (Arbitrum's `after_evm_transfers`). Building the hybrid source
+    /// must succeed and bounded-phase batches must carry that column as nulls,
+    /// both with and without a projection that selects it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_fills_kafka_only_nullable_column_with_nulls() {
+        use datafusion::arrow::array::{Array, StringArray};
+
+        let transfers_type = DataType::List(Arc::new(Field::new("element", DataType::Utf8, true)));
+        let hybrid_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("after_evm_transfers", transfers_type.clone(), true),
+        ]));
+
+        for (label, projection) in [("full", None), ("projected", Some(vec![2usize, 1]))] {
+            let config = HybridSourceConfig {
+                bounded_sources: vec![Arc::new(ReorderedBatchMockProvider::new())],
+                unbounded_source: Arc::new(FiniteMockTableProvider {
+                    schema: hybrid_schema.clone(),
+                }),
+                offset_provider: None,
+                job_mode: true,
+            };
+            let name = format!("test_fill_missing_nullable_{label}");
+            let hybrid_provider = HybridTableProvider::new(
+                name.clone(),
+                config,
+                hybrid_schema.clone(),
+                create_state_backend(&name).await,
+                SESSION_MANAGER.clone(),
+            )
+            .expect("a nullable Kafka-only column must not fail schema validation");
+
+            let session_state = SESSION_MANAGER.session_state();
+            let plan = hybrid_provider
+                .scan(&session_state, projection.as_ref(), &[], None)
+                .await
+                .expect("scan should succeed");
+            let expected_schema = match &projection {
+                Some(p) => Arc::new(hybrid_schema.project(p).unwrap()),
+                None => hybrid_schema.clone(),
+            };
+
+            let batches: Vec<_> = plan
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute should succeed")
+                .collect()
+                .await;
+            let mut saw_data = false;
+            for batch in batches {
+                let batch = batch.expect("stream batch should not be an error");
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                saw_data = true;
+                let batch_schema = batch.schema();
+                let names: Vec<&str> = batch_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                let expected_names: Vec<&str> = expected_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                assert_eq!(names, expected_names, "[{label}] column order");
+
+                let transfers = batch.column_by_name("after_evm_transfers").unwrap();
+                assert_eq!(transfers.data_type(), &transfers_type, "[{label}]");
+                assert_eq!(transfers.null_count(), 2, "[{label}] filled with nulls");
+                let names = batch
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!((names.value(0), names.value(1)), ("a", "b"), "[{label}]");
+            }
+            assert!(
+                saw_data,
+                "[{label}] the bounded phase's batch must be forwarded"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
