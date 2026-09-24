@@ -399,22 +399,19 @@ fn secret_name_to_resolve(secret_name: Option<&str>, dry_run: bool) -> Option<&s
     if dry_run { None } else { secret_name }
 }
 
-/// Upper bound on source providers built concurrently by
-/// [`build_source_providers`]. Bounds the burst of schema-registry fetches and
-/// ClickHouse probes a wide topology fires at startup.
+/// Caps the burst of schema-registry fetches and ClickHouse probes a wide
+/// topology fires at startup.
 const MAX_CONCURRENT_SOURCE_BUILDS: usize = 8;
 
-/// A source table provider built ahead of registration by
-/// [`build_source_providers`]. Plugin sources are not prepared: their
-/// construction is a fast FFI call that touches process-wide registries, so it
-/// stays on the sequential registration path.
-/// The providers are NOT wrapped in `Arc` here: the registration loop still
-/// applies the by-value builders (`with_scope`, `with_checkpoint_control`,
-/// `with_shutdown`) that wire a source into shutdown and checkpointing, and
-/// wraps the result itself. Only the constructor — the part that does I/O —
-/// moves off the sequential path.
-/// The providers are boxed only to keep the variants a uniform size
-/// (`clippy::large_enum_variant`); the box is unwrapped at registration.
+/// A source provider built ahead of registration by [`build_source_providers`].
+///
+/// Owned rather than `Arc`ed, because registration still applies the by-value
+/// builders (`with_scope`, `with_checkpoint_control`, `with_shutdown`) and
+/// wraps the result itself; only the constructor moves off the sequential
+/// path. Boxed to keep the variants a uniform size (`large_enum_variant`).
+///
+/// Plugin sources are not prepared: their construction is a fast FFI call into
+/// process-wide registries, so it stays sequential.
 enum PreparedSource {
     Kafka(Box<KafkaSourceTableProvider>),
     Clickhouse(Box<ClickHouseTableProvider>),
@@ -454,15 +451,12 @@ impl PreparedSource {
 
 /// Runs a synchronous source constructor on the blocking pool.
 ///
-/// The Kafka, ClickHouse and hybrid constructors block internally
-/// (`block_in_place` + `block_on` around the schema-registry fetch,
-/// `futures::executor::block_on` around the ClickHouse probes). On a blocking
-/// thread that is harmless and keeps them off the runtime workers.
+/// The Kafka, ClickHouse and hybrid constructors block internally (`block_on`
+/// around the schema-registry fetch and the ClickHouse probes), which is
+/// harmless on a blocking thread and keeps them off the runtime workers.
 ///
-/// This needs no `ComponentScope`: the join handle is awaited right here, so
-/// the task cannot outlive the call and there is nothing for the drain ladder
-/// to track. Startup is also before any scope exists — a source has to be
-/// built before it can be given one.
+/// No `ComponentScope`: the join handle is awaited here, so nothing outlives
+/// the call for the drain ladder to track.
 async fn build_source_blocking<F>(ctx: String, build: F) -> Result<PreparedSource>
 where
     F: FnOnce() -> Result<PreparedSource> + Send + 'static,
@@ -474,16 +468,13 @@ where
 
 /// Builds the non-plugin source providers of `topology` concurrently.
 ///
-/// Constructing a Kafka, ClickHouse or hybrid source is where startup talks to
-/// the outside world: one schema-registry fetch per Kafka phase and several
-/// ClickHouse probes per bounded phase, each a blocking round trip. Built one
-/// source after another, a six-source pipeline paid for ~30 sequential round
-/// trips before planning even started; built here, it pays for the slowest
-/// source. Synchronous constructors run on the blocking pool, the async file
-/// builders run inline, at most [`MAX_CONCURRENT_SOURCE_BUILDS`] at a time.
+/// Construction is where startup talks to the outside world: a schema-registry
+/// fetch per Kafka phase and several ClickHouse probes per bounded phase, each
+/// a blocking round trip. Sequentially a six-source pipeline paid for ~30 of
+/// them before planning started; here it pays for the slowest source.
 ///
-/// Results are reported in source-name order, so the error a failing topology
-/// surfaces does not depend on scheduling.
+/// Failures are reported in source-name order, so which error a broken
+/// topology surfaces does not depend on scheduling.
 #[allow(clippy::too_many_arguments)]
 async fn build_source_providers(
     topology: &PipelineTopology,
@@ -499,8 +490,7 @@ async fn build_source_providers(
 
     type BuildFuture = Pin<Box<dyn Future<Output = Result<PreparedSource>>>>;
 
-    // Name order, so the cheap synchronous validation below also fails
-    // deterministically.
+    // Name order, so the synchronous validation below also fails predictably.
     let mut source_names: Vec<&String> = topology.sources.keys().collect();
     source_names.sort();
 
@@ -601,9 +591,8 @@ async fn build_source_providers(
                 let app_config = app_config.clone();
                 let state_backend_factory = Arc::clone(state_backend_factory);
                 let session_manager = session_manager.clone();
-                // Created here rather than in the closure: `ShutdownController`
-                // is not shared with the build tasks, and a scope is just an
-                // `Arc` handle.
+                // Out here because the controller is not shared with the build
+                // tasks; a scope is just an `Arc` handle.
                 let scope = shutdown_controller.scope(format!("hybrid-source:{reference_name}"));
                 Box::pin(build_source_blocking(ctx, move || {
                     let provider = HybridTableProvider::new_from_topology(
@@ -647,9 +636,9 @@ async fn build_source_providers(
                             checkpoint_control: Some(checkpoint_control),
                         },
                         topology::FileSourceMode::Continuous { poll_interval } => {
-                            // Parsed here rather than before the builds start, so a
-                            // bad interval races its siblings like any other source
-                            // error and the name-order sort still picks the winner.
+                            // Parsed in the task, not before it: a bad interval
+                            // then races its siblings like any other error and
+                            // the name-order sort still picks the winner.
                             let poll_interval =
                                 humantime::parse_duration(poll_interval).map_err(|e| {
                                     streamling_user_err!(
@@ -1202,12 +1191,10 @@ impl Streamling {
 
         let pipeline_topology_clone = pipeline_topology.clone();
 
-        // Build the network-touching source providers concurrently (schema
-        // registry fetches, ClickHouse schema probes, file listings), then
-        // register them below in name order. Registration mutates shared state
-        // (session catalog, primary-key registry, side outputs) and is cheap,
-        // so it stays sequential and deterministic; only the slow, independent
-        // construction runs in parallel.
+        // Only construction — the part that waits on the network — runs
+        // concurrently. Registration below mutates shared state (session
+        // catalog, primary-key registry, side outputs) and is cheap, so it
+        // stays sequential, in name order.
         let mut prepared_sources = build_source_providers(
             &pipeline_topology_clone,
             &node_contexts,

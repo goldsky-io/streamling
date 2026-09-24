@@ -312,11 +312,10 @@ impl KafkaConfig {
     /// Returns schema registry settings if a schema registry URL is configured.
     /// Returns None if no schema registry URL is set (e.g., when using JSON format).
     ///
-    /// Settings are built once per (url, username, password) and cached for the
-    /// life of the process: building them constructs a `reqwest::Client`, which
-    /// parses the system CA bundle, and every Kafka source (plus each hybrid
-    /// source's Kafka phase) asks for one at startup. `SrSettings` is `Clone`
-    /// around an `Arc`'d client, so the clones share one connection pool too.
+    /// Cached per (url, username, password) for the life of the process:
+    /// building one constructs a `reqwest::Client`, which parses the system CA
+    /// bundle, and every Kafka source asks for one at startup. `SrSettings`
+    /// clones around an `Arc`'d client, so the clones share a connection pool.
     pub fn get_schema_registry_settings(&self) -> Option<SrSettings> {
         let url = self.schema_registry_url.as_ref()?;
         let key = (
@@ -325,9 +324,9 @@ impl KafkaConfig {
             self.schema_registry_password.clone(),
         );
 
-        // The lock is held across the build on purpose: sources are constructed
-        // concurrently at startup, and a check-then-insert would let every one
-        // of them miss the cache at once and build its own client.
+        // Held across the build on purpose: sources are constructed
+        // concurrently, and a check-then-insert would let them all miss at
+        // once and build a client each.
         let mut cache = SCHEMA_REGISTRY_SETTINGS
             .get_or_init(Default::default)
             .lock()

@@ -2101,15 +2101,10 @@ impl ClickHouseSourceExec {
 
 /// The one `reqwest::Client` behind every [`ClickHouseClient`] in the process.
 ///
-/// Building a `reqwest::Client` is not cheap: the TLS backend parses the
-/// system CA bundle (twice, via openssl) on every build, roughly tens of
-/// milliseconds each. A pipeline used to build one per `ClickHouseClient` — a
-/// hybrid source alone constructs three (schema adapter, bounded source,
-/// offset provider) — which on a wide topology added up to over a second of
-/// pure CPU at startup and dominated `--validate` time. The pool settings below
-/// carry no per-connection state, and credentials, database and compression
-/// stay per `ClickHouseClient`, so one shared client (and connection pool) is
-/// equivalent and `Clone` on it is an `Arc` bump.
+/// Each build parses the system CA bundle (twice, via openssl), and a hybrid
+/// source alone built three clients — over a second of startup CPU on a wide
+/// topology. Sharing is equivalent: the settings below hold no per-connection
+/// state, and credentials, database and compression stay per client.
 static SHARED_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     // Configure HTTP client with optimized connection pooling settings
     // These settings improve connection reuse and reduce latency for high-throughput workloads
