@@ -8,7 +8,7 @@
 
 use crate::error::{Result, ResultExt};
 use crate::streamling_user_err;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::sqlparser::ast::{
     BinaryOperator, Expr as SqlExpr, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator,
@@ -16,6 +16,7 @@ use datafusion::logical_expr::sqlparser::ast::{
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::Token;
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -708,24 +709,7 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         )
     })?;
 
-    let arrow_schema = table_provider.schema();
-    let mut u256_cols: HashSet<String> = HashSet::new();
-    let mut i256_cols: HashSet<String> = HashSet::new();
-    for field in arrow_schema.fields() {
-        if matches!(field.data_type(), DataType::FixedSizeBinary(32)) {
-            if crate::types::u256::U256Type::is_u256_metadata(field.metadata()) {
-                u256_cols.insert(field.name().to_string());
-            } else if crate::types::i256::I256Type::is_i256_metadata(field.metadata()) {
-                i256_cols.insert(field.name().to_string());
-            }
-        }
-    }
-
-    fn rewrite_expr(e: &mut SqlExpr, u256_cols: &HashSet<String>, i256_cols: &HashSet<String>) {
-        // Run U256 rewrite pass, then I256 pass. Each pass is idempotent for the other kind.
-        rewrite_expr_kind::<U256Kind>(e, u256_cols);
-        rewrite_expr_kind::<I256Kind>(e, i256_cols);
-    }
+    let (u256_cols, i256_cols) = bigint_columns(&table_provider.schema());
 
     // Helper function to rewrite expressions in a SetExpr
     fn rewrite_setexpr(
@@ -737,18 +721,20 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
             SetExpr::Select(select) => {
                 for item in select.projection.iter_mut() {
                     match item {
-                        SelectItem::UnnamedExpr(expr) => rewrite_expr(expr, u256_cols, i256_cols),
+                        SelectItem::UnnamedExpr(expr) => {
+                            rewrite_bigint_expr(expr, u256_cols, i256_cols)
+                        }
                         SelectItem::ExprWithAlias { expr, .. } => {
-                            rewrite_expr(expr, u256_cols, i256_cols)
+                            rewrite_bigint_expr(expr, u256_cols, i256_cols)
                         }
                         _ => {}
                     }
                 }
                 if let Some(selection) = select.selection.as_mut() {
-                    rewrite_expr(selection, u256_cols, i256_cols);
+                    rewrite_bigint_expr(selection, u256_cols, i256_cols);
                 }
                 if let Some(having) = select.having.as_mut() {
-                    rewrite_expr(having, u256_cols, i256_cols);
+                    rewrite_bigint_expr(having, u256_cols, i256_cols);
                 }
             }
             SetExpr::SetOperation { left, right, .. } => {
@@ -818,14 +804,35 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
     Ok(stmt.to_string())
 }
 
-pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
-    // First, normalize TRY_CAST DECIMAL via regex (AST may not have TryCast variant)
+fn bigint_columns(schema: &Schema) -> (HashSet<String>, HashSet<String>) {
+    let mut u256_cols: HashSet<String> = HashSet::new();
+    let mut i256_cols: HashSet<String> = HashSet::new();
+    for field in schema.fields() {
+        if matches!(field.data_type(), DataType::FixedSizeBinary(32)) {
+            if crate::types::u256::U256Type::is_u256_metadata(field.metadata()) {
+                u256_cols.insert(field.name().to_string());
+            } else if crate::types::i256::I256Type::is_i256_metadata(field.metadata()) {
+                i256_cols.insert(field.name().to_string());
+            }
+        }
+    }
+    (u256_cols, i256_cols)
+}
+
+fn rewrite_bigint_expr(e: &mut SqlExpr, u256_cols: &HashSet<String>, i256_cols: &HashSet<String>) {
+    // Run U256 rewrite pass, then I256 pass. Each pass is idempotent for the other kind.
+    rewrite_expr_kind::<U256Kind>(e, u256_cols);
+    rewrite_expr_kind::<I256Kind>(e, i256_cols);
+}
+
+// TRY_CAST DECIMAL is normalized via regex because the AST may not have a TryCast variant.
+fn rewrite_decimal_try_casts(sql: &str) -> String {
     lazy_static::lazy_static! {
         static ref DECIMAL_TRY_RE: Regex = Regex::new(
             r"(?i)TRY_CAST\s*\(\s*(.+?)\s+AS\s+DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)"
         ).unwrap();
     }
-    let sql = DECIMAL_TRY_RE
+    DECIMAL_TRY_RE
         .replace_all(sql, |caps: &regex::Captures| {
             let expr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let precision: u8 = caps
@@ -846,120 +853,148 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                 caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
             }
         })
-        .to_string();
+        .to_string()
+}
+
+fn parse_cast_varchar(inner: &SqlExpr) -> Option<SqlExpr> {
+    let dialect = GenericDialect {};
+    let inner_sql = inner.to_string();
+    let cast_sql = format!("SELECT CAST({} AS VARCHAR)", inner_sql);
+    let mut stmts = Parser::parse_sql(&dialect, cast_sql.as_str()).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    if let Statement::Query(query) = stmts.remove(0)
+        && let SetExpr::Select(select) = query.body.as_ref()
+        && let Some(item) = select.projection.first()
+    {
+        return match item {
+            SelectItem::UnnamedExpr(e) => Some(e.clone()),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn rewrite_decimal_cast_expr(expr: &mut SqlExpr) {
+    match expr {
+        SqlExpr::Cast {
+            expr: inner,
+            data_type,
+            kind: _,
+            format: _,
+            ..
+        } => {
+            // Attempt to parse DECIMAL(p,s) from data_type.to_string()
+            let dt = data_type.to_string();
+            let dt_lower = dt.to_lowercase();
+            // naive parse: decimal(p[, s])
+            if let Some(start) = dt_lower.find("decimal(")
+                && dt_lower.ends_with(')')
+            {
+                // extract inside parens
+                let inside = &dt_lower[start + "decimal(".len()..dt_lower.len() - 1];
+                let parts: Vec<&str> = inside.split(',').map(|s| s.trim()).collect();
+                let (p, s) = match parts.len() {
+                    1 => (parts[0].parse::<u64>().unwrap_or(0), 0i64),
+                    2 => (
+                        parts[0].parse::<u64>().unwrap_or(0),
+                        parts[1].parse::<i64>().unwrap_or(-1),
+                    ),
+                    _ => (0, -1),
+                };
+                if p > 76 && s == 0 {
+                    if p <= 78 {
+                        if let Some(func) = parse_wrapped_fn("to_u256", inner) {
+                            **inner = func;
+                        }
+                        // Replace the Cast node with its inner (now to_u256(inner))
+                        if let Some(replacement) = Some((**inner).clone()) {
+                            *expr = replacement;
+                            return;
+                        }
+                    } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
+                        *expr = cast_varchar;
+                        return;
+                    }
+                }
+            }
+            // Recurse into inner if not rewritten
+            rewrite_decimal_cast_expr(inner);
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_decimal_cast_expr(left);
+            rewrite_decimal_cast_expr(right);
+        }
+        SqlExpr::UnaryOp { expr, .. } => rewrite_decimal_cast_expr(expr),
+        SqlExpr::Nested(inner) => rewrite_decimal_cast_expr(inner),
+        SqlExpr::Function(func) => {
+            // Recurse into function args
+            if let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
+                &mut func.args
+            {
+                for arg in arglist.args.iter_mut() {
+                    if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
+                        datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = arg
+                    {
+                        rewrite_decimal_cast_expr(e);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
+    let sql = rewrite_decimal_try_casts(sql);
 
     // Now parse AST and handle CAST(... AS DECIMAL(p,s))
     let Some(mut stmt) = parse_single_statement(&sql) else {
         return sql;
     };
 
-    fn parse_cast_varchar(inner: &SqlExpr) -> Option<SqlExpr> {
-        let dialect = GenericDialect {};
-        let inner_sql = inner.to_string();
-        let cast_sql = format!("SELECT CAST({} AS VARCHAR)", inner_sql);
-        let mut stmts = Parser::parse_sql(&dialect, cast_sql.as_str()).ok()?;
-        if stmts.len() != 1 {
-            return None;
-        }
-        if let Statement::Query(query) = stmts.remove(0)
-            && let SetExpr::Select(select) = query.body.as_ref()
-            && let Some(item) = select.projection.first()
-        {
-            return match item {
-                SelectItem::UnnamedExpr(e) => Some(e.clone()),
-                SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
-                _ => None,
-            };
-        }
-        None
-    }
-
-    fn rewrite_expr(expr: &mut SqlExpr) {
-        match expr {
-            SqlExpr::Cast {
-                expr: inner,
-                data_type,
-                kind: _,
-                format: _,
-                ..
-            } => {
-                // Attempt to parse DECIMAL(p,s) from data_type.to_string()
-                let dt = data_type.to_string();
-                let dt_lower = dt.to_lowercase();
-                // naive parse: decimal(p[, s])
-                if let Some(start) = dt_lower.find("decimal(")
-                    && dt_lower.ends_with(')')
-                {
-                    // extract inside parens
-                    let inside = &dt_lower[start + "decimal(".len()..dt_lower.len() - 1];
-                    let parts: Vec<&str> = inside.split(',').map(|s| s.trim()).collect();
-                    let (p, s) = match parts.len() {
-                        1 => (parts[0].parse::<u64>().unwrap_or(0), 0i64),
-                        2 => (
-                            parts[0].parse::<u64>().unwrap_or(0),
-                            parts[1].parse::<i64>().unwrap_or(-1),
-                        ),
-                        _ => (0, -1),
-                    };
-                    if p > 76 && s == 0 {
-                        if p <= 78 {
-                            if let Some(func) = parse_wrapped_fn("to_u256", inner) {
-                                **inner = func;
-                            }
-                            // Replace the Cast node with its inner (now to_u256(inner))
-                            if let Some(replacement) = Some((**inner).clone()) {
-                                *expr = replacement;
-                                return;
-                            }
-                        } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
-                            *expr = cast_varchar;
-                            return;
-                        }
-                    }
-                }
-                // Recurse into inner if not rewritten
-                rewrite_expr(inner);
-            }
-            SqlExpr::UnaryOp { expr, .. } => rewrite_expr(expr),
-            SqlExpr::Nested(inner) => rewrite_expr(inner),
-            SqlExpr::Function(func) => {
-                // Recurse into function args
-                if let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
-                    &mut func.args
-                {
-                    for arg in arglist.args.iter_mut() {
-                        if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
-                            datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) = arg
-                        {
-                            rewrite_expr(e);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     if let Statement::Query(query) = &mut stmt
         && let SetExpr::Select(select) = query.body.as_mut()
     {
         for item in select.projection.iter_mut() {
             match item {
-                SelectItem::UnnamedExpr(e) => rewrite_expr(e),
-                SelectItem::ExprWithAlias { expr, .. } => rewrite_expr(expr),
+                SelectItem::UnnamedExpr(e) => rewrite_decimal_cast_expr(e),
+                SelectItem::ExprWithAlias { expr, .. } => rewrite_decimal_cast_expr(expr),
                 _ => {}
             }
         }
         if let Some(selection) = select.selection.as_mut() {
-            rewrite_expr(selection);
+            rewrite_decimal_cast_expr(selection);
         }
         if let Some(having) = select.having.as_mut() {
-            rewrite_expr(having);
+            rewrite_decimal_cast_expr(having);
         }
     }
 
     stmt.to_string()
+}
+
+/// Same rewrites as [`preprocess_bigint_sql`], applied to a standalone expression
+/// (e.g. a source `filter:`) whose columns resolve against `schema` instead of a
+/// table in the session catalog.
+pub fn preprocess_bigint_expr(expr_sql: &str, schema: &Schema) -> Result<String> {
+    let sql = rewrite_decimal_try_casts(expr_sql);
+    let mut expr = Parser::new(&GenericDialect {})
+        .try_with_sql(&sql)
+        .and_then(|mut parser| {
+            let expr = parser.parse_expr()?;
+            parser.expect_token(&Token::EOF)?;
+            Ok(expr)
+        })
+        .map_err(|e| streamling_user_err!("failed to parse expression '{}': {}", expr_sql, e))?;
+
+    rewrite_decimal_cast_expr(&mut expr);
+    let (u256_cols, i256_cols) = bigint_columns(schema);
+    rewrite_bigint_expr(&mut expr, &u256_cols, &i256_cols);
+    Ok(expr.to_string())
 }
 
 /// Combined preprocessor: first applies DECIMAL cast rewrite, then bigint binary-op rewrite.
@@ -971,7 +1006,10 @@ pub async fn preprocess_bigint_sql(ctx: &SessionContext, sql: &str) -> Result<St
 
 #[cfg(test)]
 mod tests {
-    use super::{preprocess_bigint_binary_ops_with_schema, preprocess_bigint_decimal_casts};
+    use super::{
+        preprocess_bigint_binary_ops_with_schema, preprocess_bigint_decimal_casts,
+        preprocess_bigint_expr,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -1863,5 +1901,39 @@ mod tests {
             rewritten,
             "SELECT to_i256(CASE WHEN flag = 1 THEN balance ELSE to_i256(0) END) AS x FROM t"
         );
+    }
+
+    #[test]
+    fn test_expr_wraps_literals_against_schema_columns() {
+        let schema = Schema::new(vec![
+            Field::new("value", DataType::FixedSizeBinary(32), false)
+                .with_metadata(crate::types::u256::U256Type::metadata()),
+            Field::new("balance", DataType::FixedSizeBinary(32), false)
+                .with_metadata(crate::types::i256::I256Type::metadata()),
+            Field::new("status", DataType::Int64, false),
+        ]);
+
+        let rewritten = preprocess_bigint_expr(
+            "call_type <> 'delegatecall' AND value > 0 AND status = 1 AND balance + 1 < -5",
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten,
+            "call_type <> 'delegatecall' AND value > to_u256(0) AND status = 1 \
+             AND i256_add(balance, to_i256(1)) < to_i256(-5)"
+        );
+
+        assert_eq!(
+            preprocess_bigint_expr("CAST(status AS DECIMAL(78, 0)) = value", &schema).unwrap(),
+            "to_u256(status) = value"
+        );
+    }
+
+    #[test]
+    fn test_expr_rejects_trailing_tokens() {
+        let schema = Schema::new(vec![Field::new("status", DataType::Int64, false)]);
+        assert!(preprocess_bigint_expr("status = 1 GROUP BY status", &schema).is_err());
+        assert!(preprocess_bigint_expr("status >>>", &schema).is_err());
     }
 }
