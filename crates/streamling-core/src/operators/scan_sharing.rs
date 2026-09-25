@@ -102,6 +102,10 @@ pub struct SharedSourceHandle {
     /// Number of consumer plans. Each executes every partition, so this is also
     /// the count a single partition waits for.
     expected_consumers: AtomicUsize,
+    /// `metric_metadata_id` (metric_key form) of the shared producer, threaded
+    /// into the `BroadcastStream` so per-consumer blocked-send time is attributed
+    /// to the producer.
+    upstream_metadata_id: Option<Arc<str>>,
     scope: Arc<crate::shutdown::ComponentScope>,
 }
 
@@ -122,6 +126,7 @@ impl SharedSourceHandle {
         base_exec: Arc<dyn ExecutionPlan>,
         channel_capacity: usize,
         expected_consumers: usize,
+        upstream_metadata_id: Option<Arc<str>>,
         scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let base_partitions = base_exec.output_partitioning().partition_count().max(1);
@@ -135,6 +140,7 @@ impl SharedSourceHandle {
             ),
             channel_capacity,
             expected_consumers: AtomicUsize::new(expected_consumers),
+            upstream_metadata_id,
             scope,
         }
     }
@@ -165,6 +171,7 @@ impl SharedSourceHandle {
         &self,
         partition: usize,
         context: Arc<TaskContext>,
+        downstream_id: String,
     ) -> Result<BroadcastConsumer> {
         let mut partitions = self.partitions.lock().unwrap();
         let partition_count = partitions.len();
@@ -174,16 +181,19 @@ impl SharedSourceHandle {
             );
         };
 
+        let upstream_metadata_id = self.upstream_metadata_id.clone();
+        let schema = self.schema.clone();
+        let channel_capacity = self.channel_capacity;
         let broadcast = state
             .stream
             .get_or_insert_with(|| {
-                Arc::new(BroadcastStream::new(
-                    self.schema.clone(),
-                    self.channel_capacity,
-                ))
+                Arc::new(
+                    BroadcastStream::new(schema, channel_capacity)
+                        .with_upstream_metadata_id(upstream_metadata_id),
+                )
             })
             .clone();
-        let consumer = broadcast.add_consumer();
+        let consumer = broadcast.add_consumer(downstream_id);
 
         state.registered_consumers += 1;
         let expected = self.expected_consumers.load(Ordering::SeqCst);
@@ -216,7 +226,7 @@ impl SharedSourceHandle {
 /// than wrapping it in a separate projection node) preserves the broadcast
 /// consumer-registration timing and the per-batch schema metadata that carries
 /// streamling's checkpoint signals.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BroadcastingExec {
     handle: Arc<SharedSourceHandle>,
     /// Column indices into the shared source's full schema, or `None` for all columns.
@@ -224,6 +234,10 @@ pub struct BroadcastingExec {
     /// Output schema after applying `projection` (full schema when `None`).
     schema: SchemaRef,
     cache: Arc<PlanProperties>,
+    /// Plain name of the consumer this leaf feeds, stamped by the
+    /// `DownstreamAttributionRule` and passed to `add_consumer` so blocked-send
+    /// time carries `downstream_id`.
+    downstream_id: Option<String>,
 }
 
 impl BroadcastingExec {
@@ -239,7 +253,21 @@ impl BroadcastingExec {
             projection,
             schema,
             cache: Arc::new(cache),
+            downstream_id: None,
         })
+    }
+
+    /// Stamp the plain name of the consumer this leaf feeds (set by the
+    /// attribution rule). Used to attribute the producer's blocked-send time.
+    pub fn with_downstream_id(&self, downstream_id: String) -> Self {
+        let mut exec = self.clone();
+        exec.downstream_id = Some(downstream_id);
+        exec
+    }
+
+    /// This leaf's stamped downstream consumer name, if any.
+    pub fn downstream_id(&self) -> Option<&str> {
+        self.downstream_id.as_deref()
     }
 
     fn compute_properties(schema: SchemaRef, partitions: usize) -> PlanProperties {
@@ -300,7 +328,11 @@ impl ExecutionPlan for BroadcastingExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let consumer = self.handle.add_consumer(partition, context)?;
+        let consumer = self.handle.add_consumer(
+            partition,
+            context,
+            self.downstream_id.clone().unwrap_or_default(),
+        )?;
 
         match &self.projection {
             // Apply the consumer's projection to each broadcast batch. `RecordBatch::project`
@@ -366,6 +398,7 @@ mod tests {
             base,
             10,
             2,
+            None,
             crate::shutdown::ComponentScope::detached("test"),
         ));
         let first = BroadcastingExec::new(handle.clone(), None).unwrap();
@@ -409,6 +442,7 @@ mod tests {
             base,
             10,
             2,
+            None,
             crate::shutdown::ComponentScope::detached("test"),
         ));
         let first = BroadcastingExec::new(handle.clone(), None).unwrap();
