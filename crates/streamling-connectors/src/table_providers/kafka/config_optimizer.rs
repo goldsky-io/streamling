@@ -1,6 +1,7 @@
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
+use std::sync::OnceLock;
 use std::time::Duration;
 use streamling_config::KafkaConfig;
 use streamling_core::error::ResultExt;
@@ -8,6 +9,32 @@ use tracing::debug;
 
 const IMDS_TOKEN_ENDPOINT: &str = "http://169.254.169.254/latest/api/token";
 const AZ_ENDPOINT: &str = "http://169.254.169.254/latest/meta-data/placement/availability-zone/";
+
+/// The AZ cannot change under a running pod, so a successful lookup is reused
+/// for the rest of the process: every client built for a WarpStream broker
+/// would otherwise repeat the IMDS round trip, and a sink now builds one
+/// producer per concurrent write stream. A failure is not cached, so a
+/// transient IMDS error still gets another chance on the next client.
+static DETECTED_AZ: OnceLock<String> = OnceLock::new();
+
+fn detected_az() -> Option<&'static str> {
+    if let Some(az) = DETECTED_AZ.get() {
+        return Some(az.as_str());
+    }
+    let az = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async { load_az().await })
+    });
+    match az {
+        Ok(az) => {
+            debug!("Detected AZ: {}", az);
+            Some(DETECTED_AZ.get_or_init(|| az).as_str())
+        }
+        Err(e) => {
+            debug!("Failed to detect AZ: {}", e);
+            None
+        }
+    }
+}
 
 pub struct KafkaConfigOptimizer {
     kafka_config: KafkaConfig,
@@ -37,15 +64,8 @@ impl KafkaConfigOptimizer {
 
             let mut config = self.to_string_vec(config);
 
-            let az = tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current().block_on(async move { self.load_az().await })
-            });
-
-            if let Ok(az) = az {
-                debug!("Detected AZ: {}", az);
+            if let Some(az) = detected_az() {
                 config.push(("client.id".to_string(), format!("warpstream_az={}", az)));
-            } else {
-                debug!("Failed to detect AZ");
             }
 
             config
@@ -79,15 +99,8 @@ impl KafkaConfigOptimizer {
 
             let mut config = self.to_string_vec(config);
 
-            let az = tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current().block_on(async move { self.load_az().await })
-            });
-
-            if let Ok(az) = az {
-                debug!("Detected AZ: {}", az);
+            if let Some(az) = detected_az() {
                 config.push(("client.id".to_string(), format!("warpstream_az={}", az)));
-            } else {
-                debug!("Failed to detect AZ");
             }
 
             config
@@ -113,44 +126,44 @@ impl KafkaConfigOptimizer {
             .map(|(k, v)| (k.into(), v.into()))
             .collect()
     }
+}
 
-    async fn load_az(&self) -> streamling_core::error::Result<String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .streamling_context("failed to build HTTP client")?;
+async fn load_az() -> streamling_core::error::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .streamling_context("failed to build HTTP client")?;
 
-        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-        let client = ClientBuilder::new(client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+    let client = ClientBuilder::new(client)
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build();
 
-        // IMDSv2: First get a session token
-        let token = client
-            .put(IMDS_TOKEN_ENDPOINT)
-            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
-            .send()
-            .await
-            .streamling_context("IMDS token request failed")?
-            .error_for_status()
-            .streamling_context("IMDS token request returned error status")?
-            .text()
-            .await
-            .streamling_context("failed to read IMDS token")?;
+    // IMDSv2: First get a session token
+    let token = client
+        .put(IMDS_TOKEN_ENDPOINT)
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+        .send()
+        .await
+        .streamling_context("IMDS token request failed")?
+        .error_for_status()
+        .streamling_context("IMDS token request returned error status")?
+        .text()
+        .await
+        .streamling_context("failed to read IMDS token")?;
 
-        // IMDSv2: Use the token to fetch the AZ
-        let az = client
-            .get(AZ_ENDPOINT)
-            .header("X-aws-ec2-metadata-token", &token)
-            .send()
-            .await
-            .streamling_context("IMDS AZ request failed")?
-            .error_for_status()
-            .streamling_context("IMDS AZ request returned error status")?
-            .text()
-            .await
-            .streamling_context("failed to read AZ")?;
+    // IMDSv2: Use the token to fetch the AZ
+    let az = client
+        .get(AZ_ENDPOINT)
+        .header("X-aws-ec2-metadata-token", &token)
+        .send()
+        .await
+        .streamling_context("IMDS AZ request failed")?
+        .error_for_status()
+        .streamling_context("IMDS AZ request returned error status")?
+        .text()
+        .await
+        .streamling_context("failed to read AZ")?;
 
-        Ok(az)
-    }
+    Ok(az)
 }
