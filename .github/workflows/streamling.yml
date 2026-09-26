@@ -355,9 +355,127 @@ jobs:
           tags: ${{ steps.generate_tags.outputs.tags }}
           provenance: false
 
+  # TEMPORARY: publishes branch images for perf/script-transform-runtime so it
+  # can be deployed for testing. Drop this job before merging to main.
+  build-and-push-image-branch:
+    needs: [validate-and-test, build-release-main]
+    if: ${{ always() && github.ref_name == 'perf/script-transform-runtime' && needs.validate-and-test.result != 'failure' && needs.build-release-main.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            os: linux
+            arch: x86_64
+            image_arch: amd64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            os: linux
+            arch: aarch64
+            image_arch: arm64
+    steps:
+      - name: Mask AWS account ID
+        env:
+          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
+        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download release binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: release-artifacts/
+      - name: Install release binaries
+        run: |
+          mkdir -p target/release
+          cp release-artifacts/streamling target/release/
+          chmod +x target/release/streamling
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up Docker Builder
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682 # v1
+      - name: Generate tags
+        id: generate_tags
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: streamling
+          IMAGE_TAG: ${{ github.sha }}
+          ARCH: ${{ matrix.image_arch }}
+        run: |
+          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
+          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG-$ARCH
+          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest-$ARCH
+          echo "tags=$TAG_SHA,$TAG_LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=$TAG_LATEST" >> "$GITHUB_OUTPUT"
+      - name: Build and push Docker image (prebuilt artifacts)
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.generate_tags.outputs.tags }}
+          provenance: false
+
   create-manifest-main:
     needs: [build-and-push-image-main]
     if: ${{ always() && github.ref_name == 'main' && needs.build-and-push-image-main.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Mask AWS account ID
+        env:
+          AWS_DEV_ACCOUNT_ID: ${{ secrets.AWS_DEV_ACCOUNT_ID }}
+        run: echo "::add-mask::$AWS_DEV_ACCOUNT_ID"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.DEV_GHA_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+      - name: Create and push multi-arch manifest
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: streamling
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          SAFE_IMAGE_BRANCH=$(echo ${{ github.ref_name }} | tr / -)
+          TAG_SHA=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-$IMAGE_TAG
+          TAG_LATEST=$ECR_REGISTRY/$ECR_REPOSITORY:$SAFE_IMAGE_BRANCH-latest
+
+          docker manifest create $TAG_SHA \
+            $TAG_SHA-amd64 \
+            $TAG_SHA-arm64
+          docker manifest push $TAG_SHA
+
+          docker manifest create $TAG_LATEST \
+            $TAG_LATEST-amd64 \
+            $TAG_LATEST-arm64
+          docker manifest push $TAG_LATEST
+
+          echo "Created multi-arch manifests:"
+          echo "  - $TAG_SHA"
+          echo "  - $TAG_LATEST"
+
+  # TEMPORARY: publishes the branch manifest for perf/script-transform-runtime.
+  # Drop this job before merging to main.
+  create-manifest-branch:
+    needs: [build-and-push-image-branch]
+    if: ${{ always() && github.ref_name == 'perf/script-transform-runtime' && needs.build-and-push-image-branch.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
