@@ -27,10 +27,11 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use streamling_plugin::PluginRuntimeConfiguration;
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
 };
@@ -206,38 +207,94 @@ impl PluginAsyncRuntime for PluginTokioWrapper {
     }
 }
 
+/// Loads every plugin library under `plugin.path` and registers them in a
+/// deterministic order: libraries providing `plugin.preprocessor_ids` first,
+/// in that configured order, then the remaining libraries by file name.
 pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
-    if let Some(ref path) = app_config.plugin.path {
-        if path.is_empty() {
-            return Ok(());
-        }
-
-        let plugin_path = Path::new(path);
-
-        if !plugin_path.exists() {
-            streamling_user_bail!("Plugin path '{}' does not exist", path);
-        }
-
-        if plugin_path.is_file() {
-            // If the path is a file, just load that specific plugin file
-            load_and_initialize_plugin(path, app_config)?;
-        } else if plugin_path.is_dir() {
-            // If the path is a directory, load all plugin files in the directory
-            for entry in std::fs::read_dir(plugin_path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
-                    load_and_initialize_plugin(path.to_str().unwrap(), app_config)?
-                }
-            }
-        } else {
-            streamling_user_bail!("Plugin path '{}' is neither a file nor a directory", path);
-        }
-    } else {
+    let Some(ref path) = app_config.plugin.path else {
         info!("No plugin path specified in the configuration, skipping plugin loading.");
+        return Ok(());
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    let libraries = plugin_library_paths(Path::new(path))?
+        .iter()
+        .map(|library_path| initialize_plugin_library(library_path, app_config))
+        .collect::<Result<Vec<_>>>()?;
+
+    let provided_ids: Vec<Vec<String>> = libraries
+        .iter()
+        .map(|library| {
+            library
+                .configuration
+                .plugin_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect()
+        })
+        .collect();
+    let order = registration_order(&provided_ids, &app_config.plugin.preprocessor_ids);
+
+    let mut libraries: Vec<Option<InitializedPluginLibrary>> =
+        libraries.into_iter().map(Some).collect();
+    for index in order {
+        let library = libraries[index]
+            .take()
+            .expect("registration_order yields each library index exactly once");
+        register_plugin_library(library)?;
     }
 
     Ok(())
+}
+
+/// Resolves `path` to plugin library files: the file itself, or every file
+/// in the directory sorted by path.
+fn plugin_library_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        streamling_user_bail!("Plugin path '{}' does not exist", path.display());
+    }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !path.is_dir() {
+        streamling_user_bail!(
+            "Plugin path '{}' is neither a file nor a directory",
+            path.display()
+        );
+    }
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry_path = entry?.path();
+        if entry_path.is_file() {
+            files.push(entry_path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Returns library indices in registration order. For each configured
+/// preprocessor id in sequence, the first library that provides it comes
+/// next; every other library follows in its original order.
+fn registration_order(provided_ids: &[Vec<String>], preprocessor_ids: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> = Vec::with_capacity(provided_ids.len());
+    for preprocessor_id in preprocessor_ids {
+        if let Some(index) = provided_ids
+            .iter()
+            .position(|ids| ids.contains(preprocessor_id))
+            && !order.contains(&index)
+        {
+            order.push(index);
+        }
+    }
+    let remaining: Vec<usize> = (0..provided_ids.len())
+        .filter(|index| !order.contains(index))
+        .collect();
+    order.extend(remaining);
+    order
 }
 
 /// Load the root module from a plugin library, tolerating libraries built
@@ -295,35 +352,61 @@ fn load_plugin_module(plugin_path: &Path) -> Result<PluginModuleRef> {
     }
 }
 
-pub fn load_and_initialize_plugin(path: &str, app_config: &AppConfig) -> Result<()> {
-    let plugin_path = Path::new(path);
-    info!("Loading plugin from: {:?}", plugin_path);
+/// A plugin library whose `init` has run but whose ids are not yet registered.
+struct InitializedPluginLibrary {
+    path: PathBuf,
+    module: Arc<PluginModuleRef>,
+    configuration: PluginRuntimeConfiguration,
+}
 
-    let plugin_module = Arc::new(load_plugin_module(plugin_path)?);
+fn initialize_plugin_library(
+    path: &Path,
+    app_config: &AppConfig,
+) -> Result<InitializedPluginLibrary> {
+    info!("Loading plugin from: {:?}", path);
 
-    let logging_config = create_logging(app_config);
-    let init_fn = plugin_module.init();
-    let init_result = init_fn(logging_config);
+    let module = Arc::new(load_plugin_module(path)?);
 
-    let plugin_runtime_configuration = init_result
+    let init_fn = module.init();
+    let configuration = init_fn(create_logging(app_config))
         .into_rust()
         .map_err(|e| streamling_err!("Plugin initialization failed: {:?}", e))?;
 
-    let mut module_registry = PLUGIN_MODULE_REGISTRY.write().unwrap();
-    let mut caps_registry = PLUGIN_DEFAULT_CAPS.write().unwrap();
+    Ok(InitializedPluginLibrary {
+        path: path.to_path_buf(),
+        module,
+        configuration,
+    })
+}
 
-    // Register the plugin module for each plugin ID it provides
-    for plugin_id in plugin_runtime_configuration.plugin_ids.into_iter() {
-        let plugin_id_string = plugin_id.into_rust();
-        let plugin_id_key: PluginId = plugin_id_string.clone().into();
-        module_registry.insert(plugin_id_key.clone(), plugin_module.clone());
+fn register_plugin_library(library: InitializedPluginLibrary) -> Result<()> {
+    let InitializedPluginLibrary {
+        path,
+        module: plugin_module,
+        configuration: plugin_runtime_configuration,
+    } = library;
 
-        // If init provided default caps for this id, store them
-        if let Some(caps) = plugin_runtime_configuration
-            .default_channel_caps
-            .get(plugin_id_string.as_str())
-        {
-            caps_registry.insert(plugin_id_key, *caps);
+    {
+        let mut module_registry = PLUGIN_MODULE_REGISTRY
+            .write()
+            .expect("plugin module registry lock poisoned");
+        let mut caps_registry = PLUGIN_DEFAULT_CAPS
+            .write()
+            .expect("plugin default caps lock poisoned");
+
+        // Register the plugin module for each plugin ID it provides
+        for plugin_id in plugin_runtime_configuration.plugin_ids.into_iter() {
+            let plugin_id_string = plugin_id.into_rust();
+            let plugin_id_key: PluginId = plugin_id_string.clone().into();
+            module_registry.insert(plugin_id_key.clone(), plugin_module.clone());
+
+            // If init provided default caps for this id, store them
+            if let Some(caps) = plugin_runtime_configuration
+                .default_channel_caps
+                .get(plugin_id_string.as_str())
+            {
+                caps_registry.insert(plugin_id_key, *caps);
+            }
         }
     }
 
@@ -928,6 +1011,60 @@ pub fn terminate_plugins(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provided(libraries: &[&[&str]]) -> Vec<Vec<String>> {
+        libraries
+            .iter()
+            .map(|ids| ids.iter().map(|id| id.to_string()).collect())
+            .collect()
+    }
+
+    fn configured(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn registration_order_puts_preprocessor_libraries_first_in_configured_order() {
+        let order = registration_order(
+            &provided(&[&["sink_a"], &["second_pre"], &["source_b"], &["first_pre"]]),
+            &configured(&["first_pre", "second_pre"]),
+        );
+        assert_eq!(order, vec![3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn registration_order_lists_a_library_providing_several_preprocessors_once() {
+        let order = registration_order(
+            &provided(&[&["sink_a"], &["pre_x", "pre_y"]]),
+            &configured(&["pre_x", "pre_y"]),
+        );
+        assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn registration_order_ignores_unprovided_preprocessor_ids() {
+        let order = registration_order(
+            &provided(&[&["sink_a"], &["source_b"]]),
+            &configured(&["missing_pre"]),
+        );
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[test]
+    fn plugin_library_paths_lists_directory_files_sorted() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        for name in ["libc.so", "liba.so", "libb.so"] {
+            std::fs::write(dir.path().join(name), b"").expect("write file");
+        }
+        std::fs::create_dir(dir.path().join("nested")).expect("create nested dir");
+
+        let paths = plugin_library_paths(dir.path()).expect("list plugin paths");
+        let names: Vec<_> = paths
+            .iter()
+            .map(|path| path.file_name().expect("file name").to_owned())
+            .collect();
+        assert_eq!(names, vec!["liba.so", "libb.so", "libc.so"]);
+    }
 
     /// §1.2 facade: a disconnected input channel (dispatcher exited) must be
     /// a typed error, not the panic the old `send().unwrap()` produced.

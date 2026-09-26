@@ -7048,6 +7048,7 @@ dependencies = [
  "swc_common",
  "swc_ecma_ast",
  "swc_ecma_lexer",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
