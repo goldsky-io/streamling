@@ -1542,7 +1542,7 @@ Each plugin configuration requires:
 
 ### Including Plugins
 
-A plugin is a shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows) built against the Streamling plugin ABI. To make a plugin usable in a pipeline, point the runtime at it before startup via `STREAMLING__PLUGIN__PATH`. The path may be a single library file or a directory — every file in a directory is loaded:
+A plugin is a shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows) built against the Streamling plugin ABI. To make a plugin usable in a pipeline, point the runtime at it before startup via `STREAMLING__PLUGIN__PATH`. The path may be a single library file or a directory — every file in a directory is loaded. Libraries that provide `STREAMLING__PLUGIN__PREPROCESSOR_IDS` are registered first, in that order; the rest follow by file name:
 
 ```bash
 # a single plugin library
