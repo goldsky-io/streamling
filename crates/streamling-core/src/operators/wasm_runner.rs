@@ -15,8 +15,12 @@ use crate::formats::{FromArrowConverter, ToArrowConverter};
 use crate::operators::wasm_runner::transpiler::TsToJSTranspiler;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Schema};
 use async_trait::async_trait;
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int32Array, Int32Builder,
+    Int64Array, Int64Builder, StringArray, StringBuilder, new_null_array,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DFSchemaRef, Statistics};
 use datafusion::error::DataFusionError;
@@ -220,6 +224,16 @@ impl ExtensionPlanner for WasmRunnerExtensionPlanner {
                     .await?;
 
                 let output_schema = wasm_runner_node.get_output_schema()?;
+                // A "schema" config key is only sent to the plugin when the
+                // pipeline declares an explicit output schema (`schema:` in
+                // the script transform's YAML); without one there's no
+                // column-name list to build the schema-aware output path
+                // from, so the plugin falls back to its Arrow-IPC/inferred
+                // output path instead.
+                let schema_config_json = wasm_runner_node
+                    .schema_map
+                    .is_some()
+                    .then(|| build_schema_config_json(&output_schema));
 
                 let wasm_exec = Arc::new(WasmRunnerExec::new(
                     input_physical,
@@ -228,6 +242,7 @@ impl ExtensionPlanner for WasmRunnerExtensionPlanner {
                     wasm_runner_node.runtime_wasm_file_path.clone(),
                     wasm_runner_node.internal_buffer_size,
                     output_schema,
+                    schema_config_json,
                 ));
                 Some(wasm_exec)
             } else {
@@ -247,6 +262,11 @@ struct WasmRunnerExec {
     schema: SchemaRef,
     /// Pre-transpiled code (cached for efficiency)
     transpiled_code: String,
+    /// The `schema` config value sent to the plugin, when the script
+    /// transform declares an explicit output schema. `Some` selects the
+    /// schema-aware JSON output path in `process_batch`; `None` keeps the
+    /// Arrow IPC/inferred output path.
+    schema_config_json: Option<String>,
 }
 
 impl WasmRunnerExec {
@@ -257,6 +277,7 @@ impl WasmRunnerExec {
         runtime_wasm_file_path: Option<String>,
         internal_buffer_size: u32,
         schema: SchemaRef,
+        schema_config_json: Option<String>,
     ) -> Self {
         let transpiler = TsToJSTranspiler::new();
         let cache = Self::compute_properties(&input, schema.clone());
@@ -283,6 +304,7 @@ impl WasmRunnerExec {
             cache: Arc::new(cache),
             schema,
             transpiled_code,
+            schema_config_json,
         }
     }
 
@@ -347,6 +369,7 @@ impl ExecutionPlan for WasmRunnerExec {
             self.runtime_wasm_file_path.clone(),
             self.internal_buffer_size,
             self.schema.clone(),
+            self.schema_config_json.clone(),
         )))
     }
 
@@ -365,6 +388,8 @@ impl ExecutionPlan for WasmRunnerExec {
         let output_schema = self.schema.clone();
         let runtime_wasm_file_path = self.runtime_wasm_file_path.clone();
         let transpiled_code = self.transpiled_code.clone();
+        let schema_config_json = self.schema_config_json.clone();
+        let use_json_output = schema_config_json.is_some();
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             self.schema(),
@@ -374,7 +399,11 @@ impl ExecutionPlan for WasmRunnerExec {
 
         builder.spawn(async move {
             let plugin = tokio::task::spawn_blocking(move || {
-                Self::create_wasm_plugin(runtime_wasm_file_path, transpiled_code)
+                Self::create_wasm_plugin(
+                    runtime_wasm_file_path,
+                    transpiled_code,
+                    schema_config_json,
+                )
             })
             .await
             .map_err(|error| {
@@ -396,7 +425,7 @@ impl ExecutionPlan for WasmRunnerExec {
                             error
                         ))
                     })?;
-                    Self::process_batch(&batch, &mut plugin, &batch_output_schema)
+                    Self::process_batch(&batch, &mut plugin, &batch_output_schema, use_json_output)
                 })
                 .await
                 .map_err(|error| {
@@ -434,6 +463,7 @@ impl WasmRunnerExec {
     fn create_wasm_plugin(
         runtime_wasm_file_path: Option<String>,
         transpiled_code: String,
+        schema_config_json: Option<String>,
     ) -> Result<Plugin> {
         let wasm = match runtime_wasm_file_path {
             Some(path) => Wasm::file(path),
@@ -447,9 +477,12 @@ impl WasmRunnerExec {
         // per-batch transform completes in milliseconds; 60s is orders of
         // magnitude above any legitimate call.
         const WASM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-        let manifest = Manifest::new([wasm])
+        let mut manifest = Manifest::new([wasm])
             .with_config_key("code", transpiled_code)
             .with_timeout(WASM_CALL_TIMEOUT);
+        if let Some(schema_config_json) = schema_config_json {
+            manifest = manifest.with_config_key("schema", schema_config_json);
+        }
         Plugin::new(&manifest, [], true).map_err(|error| {
             DataFusionError::from(crate::streamling_err!(
                 "failed to create WASM instance: {}",
@@ -462,6 +495,7 @@ impl WasmRunnerExec {
         batch: &RecordBatch,
         plugin: &mut Plugin,
         output_schema: &SchemaRef,
+        use_json_output: bool,
     ) -> Result<RecordBatch> {
         let input_metadata = batch.schema().metadata().clone();
 
@@ -486,7 +520,7 @@ impl WasmRunnerExec {
             return enrich_batch_with_metadata(empty_batch, input_metadata).map_err(Into::into);
         };
 
-        let output_ipc_bytes = plugin
+        let output_bytes = plugin
             .call::<Vec<u8>, Vec<u8>>(WASM_FUNCTION_INVOKE, ipc_bytes)
             .map_err(|error| {
                 error!("Script encountered errors: \n{}", error);
@@ -496,11 +530,328 @@ impl WasmRunnerExec {
                 ))
             })?;
 
-        let mut converter = FromIpcToArrowConverter::new(output_schema.clone());
-        converter.buffer(output_ipc_bytes);
-        let output_batch = converter.convert_to_batch()?;
+        let output_batch = if use_json_output {
+            decode_json_output(output_bytes, output_schema)?
+        } else {
+            let mut converter = FromIpcToArrowConverter::new(output_schema.clone());
+            converter.buffer(output_bytes);
+            converter.convert_to_batch()?
+        };
         enrich_batch_with_metadata(output_batch, input_metadata).map_err(Into::into)
     }
+}
+
+/// Build the `schema` config value sent to the WASM plugin when the script
+/// transform declares an explicit output schema: a JSON list of
+/// `{name, type}` for every output field, including `_gs_op`. `type` is one
+/// of the runtime's simple output types ("string", "int64", "boolean",
+/// "float64"); every other Arrow type is sent as `type: null` since the
+/// runtime only needs each column's name to build the schema-aware output
+/// (see `crates/streamling-core/wasm/runtime.js`'s `runSchemaAware`) --
+/// output values round-trip as JSON regardless of the declared type.
+fn build_schema_config_json(schema: &SchemaRef) -> String {
+    let entries: Vec<serde_json::Value> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let type_str = match f.data_type() {
+                DataType::Utf8 => Some("string"),
+                DataType::Int64 => Some("int64"),
+                DataType::Boolean => Some("boolean"),
+                DataType::Float64 => Some("float64"),
+                _ => None,
+            };
+            serde_json::json!({"name": f.name(), "type": type_str})
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_default()
+}
+
+/// Decode the schema-aware plugin output into a `RecordBatch` matching
+/// `output_schema`. The runtime writes this output as one JSON string,
+/// `{"columns": {name: [values...]}, "num_rows": N}`, via `Host.outputString`
+/// when the "schema" config key is set (see `runtime.js`'s `runSchemaAware`).
+///
+/// One Arrow builder per output field for the common scalar types (Utf8,
+/// Int64, Int32, Float64, Boolean). Any other output field type falls back
+/// to `arrow_json::ReaderBuilder` on a small row-oriented NDJSON blob built
+/// just for those columns.
+fn decode_json_output(bytes: Vec<u8>, output_schema: &SchemaRef) -> Result<RecordBatch> {
+    if bytes.is_empty() {
+        return Ok(RecordBatch::new_empty(output_schema.clone()));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        DataFusionError::from(crate::streamling_user_err!(
+            "script transform produced invalid JSON output: {}",
+            error
+        ))
+    })?;
+    let num_rows = parsed
+        .get("num_rows")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            DataFusionError::from(crate::streamling_user_err!(
+                "script transform output is missing 'num_rows'"
+            ))
+        })? as usize;
+    let columns_obj = parsed
+        .get("columns")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            DataFusionError::from(crate::streamling_user_err!(
+                "script transform output is missing a 'columns' object"
+            ))
+        })?;
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    let mut fallback_fields: Vec<FieldRef> = Vec::new();
+    let mut fallback_indices: Vec<usize> = Vec::new();
+
+    for field in output_schema.fields() {
+        let values = columns_obj.get(field.name()).and_then(|v| v.as_array());
+        let array: Option<ArrayRef> = match field.data_type() {
+            // `_gs_op` defaults to "i" (Insert) when the script's returned
+            // row doesn't set it, matching the default already applied when
+            // the column is absent from the plugin's output entirely (see
+            // `FromIpcToArrowConverter::convert_batch_to_original_schema`).
+            DataType::Utf8 if field.name() == crate::data::COLUMN_NAME_OP => {
+                Some(Arc::new(build_op_column(values, num_rows)))
+            }
+            DataType::Utf8 => Some(Arc::new(build_utf8_array(values, num_rows))),
+            // A value whose JSON kind doesn't match the declared scalar type
+            // (a string in an int64 column, a number in a boolean column,
+            // etc.) is coerced by casting, not silently turned into null --
+            // see build_scalar_array.
+            DataType::Int64 => {
+                if column_values_all(values, num_rows, |v| v.as_i64().is_some()) {
+                    Some(Arc::new(build_int64_array(values, num_rows)))
+                } else {
+                    Some(build_scalar_array(values, num_rows, field.data_type())?)
+                }
+            }
+            DataType::Int32 => {
+                if column_values_all(values, num_rows, |v| v.as_i64().is_some()) {
+                    Some(Arc::new(build_int32_array(values, num_rows)))
+                } else {
+                    Some(build_scalar_array(values, num_rows, field.data_type())?)
+                }
+            }
+            DataType::Float64 => {
+                if column_values_all(values, num_rows, |v| v.as_f64().is_some()) {
+                    Some(Arc::new(build_float64_array(values, num_rows)))
+                } else {
+                    Some(build_scalar_array(values, num_rows, field.data_type())?)
+                }
+            }
+            DataType::Boolean => {
+                if column_values_all(values, num_rows, |v| v.is_boolean()) {
+                    Some(Arc::new(build_bool_array(values, num_rows)))
+                } else {
+                    Some(build_scalar_array(values, num_rows, field.data_type())?)
+                }
+            }
+            _ => None,
+        };
+        match array {
+            Some(array) => arrays.push(array),
+            None => {
+                // Placeholder, overwritten below once the fallback batch is
+                // decoded. Keeps `arrays` aligned with `output_schema.fields()`
+                // by index in the meantime.
+                arrays.push(new_null_array(field.data_type(), num_rows));
+                fallback_fields.push(field.clone());
+                fallback_indices.push(arrays.len() - 1);
+            }
+        }
+    }
+
+    if !fallback_fields.is_empty() {
+        let fallback_schema: SchemaRef = Arc::new(Schema::new(fallback_fields.clone()));
+        let mut ndjson = Vec::new();
+        for i in 0..num_rows {
+            let mut row = serde_json::Map::new();
+            for field in &fallback_fields {
+                let value = columns_obj
+                    .get(field.name())
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.get(i))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                row.insert(field.name().clone(), value);
+            }
+            serde_json::to_writer(&mut ndjson, &serde_json::Value::Object(row)).map_err(
+                |error| {
+                    DataFusionError::from(crate::streamling_err!(
+                        "failed to build fallback JSON row for script transform output: {}",
+                        error
+                    ))
+                },
+            )?;
+            ndjson.push(b'\n');
+        }
+        let reader = arrow_json::ReaderBuilder::new(fallback_schema.clone())
+            .build(std::io::Cursor::new(ndjson))
+            .map_err(|error| {
+                DataFusionError::from(crate::streamling_user_err!(
+                    "failed to decode script transform output for non-scalar field types: {}",
+                    error
+                ))
+            })?;
+        let fallback_batches =
+            reader
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    DataFusionError::from(crate::streamling_user_err!(
+                        "failed to decode script transform output for non-scalar field types: {}",
+                        error
+                    ))
+                })?;
+        let fallback_batch = if fallback_batches.is_empty() {
+            RecordBatch::new_empty(fallback_schema.clone())
+        } else {
+            datafusion::arrow::compute::concat_batches(&fallback_schema, &fallback_batches)
+                .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?
+        };
+        for (col_idx, field_idx) in fallback_indices.into_iter().enumerate() {
+            arrays[field_idx] = fallback_batch.column(col_idx).clone();
+        }
+    }
+
+    RecordBatch::try_new(output_schema.clone(), arrays).map_err(|error| {
+        DataFusionError::from(crate::streamling_err!(
+            "failed to build record batch from script transform JSON output: {}",
+            error
+        ))
+    })
+}
+
+fn build_utf8_array(values: Option<&Vec<serde_json::Value>>, num_rows: usize) -> StringArray {
+    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 8);
+    for i in 0..num_rows {
+        match values.and_then(|arr| arr.get(i)) {
+            Some(serde_json::Value::String(s)) => builder.append_value(s),
+            Some(serde_json::Value::Null) | None => builder.append_null(),
+            // Non-string JSON scalar in a "string" column: coerce via its own
+            // JSON text, matching the implicit ToString the JS side would
+            // otherwise have applied.
+            Some(other) => builder.append_value(other.to_string()),
+        }
+    }
+    builder.finish()
+}
+
+/// `_gs_op` column values, defaulting missing/null entries to "i" (Insert)
+/// instead of leaving them null, since the field is declared non-nullable.
+fn build_op_column(values: Option<&Vec<serde_json::Value>>, num_rows: usize) -> StringArray {
+    let default_op = crate::data::RowKind::Insert.to_str();
+    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 8);
+    for i in 0..num_rows {
+        match values.and_then(|arr| arr.get(i)) {
+            Some(serde_json::Value::String(s)) => builder.append_value(s),
+            Some(other) if !other.is_null() => builder.append_value(other.to_string()),
+            _ => builder.append_value(&default_op),
+        }
+    }
+    builder.finish()
+}
+
+fn build_int64_array(values: Option<&Vec<serde_json::Value>>, num_rows: usize) -> Int64Array {
+    let mut builder = Int64Builder::with_capacity(num_rows);
+    for i in 0..num_rows {
+        match values.and_then(|arr| arr.get(i)).and_then(|v| v.as_i64()) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn build_int32_array(values: Option<&Vec<serde_json::Value>>, num_rows: usize) -> Int32Array {
+    let mut builder = Int32Builder::with_capacity(num_rows);
+    for i in 0..num_rows {
+        match values
+            .and_then(|arr| arr.get(i))
+            .and_then(|v| v.as_i64())
+            .and_then(|v| i32::try_from(v).ok())
+        {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn build_float64_array(values: Option<&Vec<serde_json::Value>>, num_rows: usize) -> Float64Array {
+    let mut builder = Float64Builder::with_capacity(num_rows);
+    for i in 0..num_rows {
+        match values.and_then(|arr| arr.get(i)).and_then(|v| v.as_f64()) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn build_bool_array(values: Option<&Vec<serde_json::Value>>, num_rows: usize) -> BooleanArray {
+    let mut builder = BooleanBuilder::with_capacity(num_rows);
+    for i in 0..num_rows {
+        match values.and_then(|arr| arr.get(i)).and_then(|v| v.as_bool()) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+/// Whether every non-null entry in the column (missing/null entries always
+/// pass) satisfies `predicate`. Used to decide whether a column's values
+/// all have the JSON kind a scalar type's direct builder expects.
+fn column_values_all(
+    values: Option<&Vec<serde_json::Value>>,
+    num_rows: usize,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> bool {
+    (0..num_rows).all(|i| {
+        values
+            .and_then(|arr| arr.get(i))
+            .is_none_or(|v| v.is_null() || predicate(v))
+    })
+}
+
+/// Build a scalar (Int64/Int32/Float64/Boolean) column for a value whose
+/// JSON kind doesn't match `target_type`'s direct builder (e.g. the string
+/// "7" or the number 1.5 in a declared int64 column, or the string "true"
+/// in a declared boolean column). Infers one Arrow type for the whole
+/// column the same way flechette's own type inference does without an
+/// explicit schema -- Int64 if every non-null value is a whole number, else
+/// Float64 if every non-null value is any number, else Boolean if every
+/// non-null value is a bool, else Utf8 -- then casts to `target_type`. This
+/// coerces a mismatched value instead of silently turning it into null,
+/// matching what the old Arrow-IPC/inferred output path already did
+/// (flechette infers a column's type, then Rust casts it to the declared
+/// schema type via `FromIpcToArrowConverter`).
+fn build_scalar_array(
+    values: Option<&Vec<serde_json::Value>>,
+    num_rows: usize,
+    target_type: &DataType,
+) -> Result<ArrayRef> {
+    let inferred: ArrayRef = if column_values_all(values, num_rows, |v| v.as_i64().is_some()) {
+        Arc::new(build_int64_array(values, num_rows))
+    } else if column_values_all(values, num_rows, |v| v.as_f64().is_some()) {
+        Arc::new(build_float64_array(values, num_rows))
+    } else if column_values_all(values, num_rows, |v| v.is_boolean()) {
+        Arc::new(build_bool_array(values, num_rows))
+    } else {
+        Arc::new(build_utf8_array(values, num_rows))
+    };
+
+    datafusion::arrow::compute::cast(&inferred, target_type).map_err(|error| {
+        DataFusionError::from(crate::streamling_user_err!(
+            "script transform returned a value that doesn't match its declared output type: {}",
+            error
+        ))
+    })
 }
 
 impl PartialEq for WasmRunnerNode {
@@ -2138,5 +2489,281 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_wasm_json_output_non_ascii_strings() {
+        // Schema-aware output path (schema_map Some) round-trips non-ASCII
+        // text correctly: an accented Latin-1 character and a 4-byte UTF-8
+        // emoji (a JS surrogate pair).
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+
+        let input_data = [r#"{"id": 1, "name": "test1"}"#];
+
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]));
+
+        let mut input_converter = JsonToArrowConverter::new(input_schema.clone(), true, None);
+        for json_str in input_data {
+            input_converter.buffer(json_str.to_string());
+        }
+        let input_batch = input_converter.convert_to_batch().unwrap();
+
+        ctx.register_batch("test_table", input_batch).unwrap();
+
+        let script = r#"
+        function invoke(data) {
+            return {
+                id: data.id,
+                name: "café " + "🎉",
+            };
+        }
+        "#;
+
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert("id".to_string(), "int64".to_string());
+        schema_map.insert("name".to_string(), "string".to_string());
+
+        let wasm_node = WasmRunnerNode::new(
+            ctx.table("test_table")
+                .await
+                .unwrap()
+                .into_optimized_plan()
+                .unwrap(),
+            "javascript".to_string(),
+            script.to_string(),
+            None,
+            1000,
+            Some(schema_map),
+        );
+
+        let df = ctx.execute_logical_plan(wasm_node.into()).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let schema = batches[0].schema();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        let name_col = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column should be StringArray");
+        assert_eq!(name_col.value(0), "café 🎉");
+    }
+
+    #[tokio::test]
+    async fn test_wasm_json_output_large_string_batch() {
+        // Schema-aware output path with a batch large enough to exercise the
+        // JSON output path's throughput: 1000 rows, each producing a 10 KB
+        // string, must finish correctly (not just fast).
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+
+        let num_rows = 1000;
+        let ids: Vec<i64> = (0..num_rows).collect();
+        let names: Vec<String> = ids.iter().map(|id| format!("name{id}")).collect();
+
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]));
+        let input_batch = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("test_table", input_batch).unwrap();
+
+        // Each output row's "blob" field is a distinct 10 KB string, built
+        // from the row's own id so a corrupted/misaligned row is detectable.
+        let script = r#"
+        function invoke(data) {
+            return {
+                id: data.id,
+                blob: (data.id + "_").repeat(1250),
+            };
+        }
+        "#;
+
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert("id".to_string(), "int64".to_string());
+        schema_map.insert("blob".to_string(), "string".to_string());
+
+        let wasm_node = WasmRunnerNode::new(
+            ctx.table("test_table")
+                .await
+                .unwrap()
+                .into_optimized_plan()
+                .unwrap(),
+            "javascript".to_string(),
+            script.to_string(),
+            None,
+            (num_rows * 2) as u32,
+            Some(schema_map),
+        );
+
+        let df = ctx.execute_logical_plan(wasm_node.into()).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let schema = batches[0].schema();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(batch.num_rows(), num_rows as usize);
+        let id_col = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let blob_col = batch
+            .column_by_name("blob")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        for i in 0..num_rows as usize {
+            let id = id_col.value(i);
+            let expected_prefix = format!("{id}_");
+            assert!(
+                blob_col.value(i).starts_with(&expected_prefix),
+                "row {i}'s blob should start with its own id"
+            );
+            assert_eq!(
+                blob_col.value(i).len(),
+                expected_prefix.len() * 1250,
+                "row {i}'s blob should be the full repeated length"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wasm_json_output_parity_with_ipc_inferred_for_mismatched_value_kinds() {
+        // The schema-aware JSON output path must coerce a value whose JSON
+        // kind doesn't match its declared output type the same way the
+        // Arrow-IPC/inferred output path already does (flechette infers a
+        // column's own type, Rust casts it to the declared schema type) --
+        // not silently turn it into null. This drives create_wasm_plugin +
+        // process_batch directly, once with no "schema" config (the
+        // Arrow-IPC/inferred path) and once with one (the JSON path), for
+        // the identical input batch and output schema, and checks the two
+        // decoded batches agree.
+        //
+        // Each mismatched column is internally one consistent JSON kind
+        // across rows (a float column, a numeric-string column, a bool
+        // column, etc.) rather than switching kind row to row: flechette's
+        // own type inference throws ("Mixed types detected") on a column
+        // that mixes kinds, so the Arrow-IPC/inferred path -- this test's
+        // ground truth for "old semantics" -- can only run at all when each
+        // column's non-null values share one kind. That single kind can
+        // still mismatch the declared schema type, which is exactly the
+        // case this test covers.
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(
+            input_schema,
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+
+        // count_float/count_str/count_bool: declared int64, but the script
+        // consistently returns a float / numeric string / bool instead.
+        // amount_str: declared float64, consistently returns a numeric
+        // string. active_str/active_num: declared boolean, consistently
+        // returns the string "true"/"false" / the number 1/0. label:
+        // declared string, always a string (sanity control column). Row 3
+        // is explicit null for every mismatched column; row 4 omits every
+        // mismatched column's key entirely (missing); row 5 sets every
+        // mismatched column explicitly to `undefined`.
+        let script = r#"
+        function invoke(data) {
+            const id = data.id;
+            if (id === 1) {
+                return {
+                    id, count_float: 1.5, count_str: "10", count_bool: true,
+                    amount_str: "1.1", active_str: "true", active_num: 1, label: "a",
+                };
+            } else if (id === 2) {
+                return {
+                    id, count_float: 2.5, count_str: "20", count_bool: false,
+                    amount_str: "2.2", active_str: "false", active_num: 0, label: "b",
+                };
+            } else if (id === 3) {
+                return {
+                    id, count_float: null, count_str: null, count_bool: null,
+                    amount_str: null, active_str: null, active_num: null, label: "c",
+                };
+            } else if (id === 4) {
+                return { id, label: "d" };
+            } else {
+                return {
+                    id, count_float: undefined, count_str: undefined, count_bool: undefined,
+                    amount_str: undefined, active_str: undefined, active_num: undefined, label: "e",
+                };
+            }
+        }
+        "#;
+
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert("id".to_string(), "int64".to_string());
+        schema_map.insert("count_float".to_string(), "int64".to_string());
+        schema_map.insert("count_str".to_string(), "int64".to_string());
+        schema_map.insert("count_bool".to_string(), "int64".to_string());
+        schema_map.insert("amount_str".to_string(), "float64".to_string());
+        schema_map.insert("active_str".to_string(), "boolean".to_string());
+        schema_map.insert("active_num".to_string(), "boolean".to_string());
+        schema_map.insert("label".to_string(), "string".to_string());
+
+        let output_schema = WasmRunnerNode::create_arrow_schema_from_map(&schema_map).unwrap();
+        let transpiled_code = script.to_string();
+
+        let mut inferred_plugin =
+            WasmRunnerExec::create_wasm_plugin(None, transpiled_code.clone(), None).unwrap();
+        let inferred_batch = WasmRunnerExec::process_batch(
+            &input_batch,
+            &mut inferred_plugin,
+            &output_schema,
+            false,
+        )
+        .unwrap();
+
+        let schema_config_json = Some(build_schema_config_json(&output_schema));
+        let mut json_plugin =
+            WasmRunnerExec::create_wasm_plugin(None, transpiled_code, schema_config_json).unwrap();
+        let json_batch =
+            WasmRunnerExec::process_batch(&input_batch, &mut json_plugin, &output_schema, true)
+                .unwrap();
+
+        let to_json_rows = |batch: &RecordBatch| -> Vec<serde_json::Value> {
+            FromArrowToJsonConverter::new()
+                .convert_from_batch(batch)
+                .unwrap()
+                .into_iter()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .collect()
+        };
+
+        assert_eq!(inferred_batch.schema(), json_batch.schema());
+        assert_eq!(
+            to_json_rows(&inferred_batch),
+            to_json_rows(&json_batch),
+            "schema-aware JSON output must decode a mismatched-kind value the \
+             same way the Arrow-IPC/inferred output path does"
+        );
     }
 }

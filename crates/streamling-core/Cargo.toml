@@ -22,6 +22,10 @@ streamling-flink-compat = { workspace = true }
 datafusion.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
+# Fallback decode for script transform JSON output fields whose declared
+# type isn't one of the runtime's fast-path scalar types (see
+# operators/wasm_runner.rs's decode_json_output).
+arrow-json.workspace = true
 
 # Async runtime
 tokio.workspace = true

@@ -7004,6 +7004,7 @@ dependencies = [
  "abi_stable",
  "anyhow",
  "arrow",
+ "arrow-json",
  "arrow-schema",
  "async-ffi",
  "async-stream",

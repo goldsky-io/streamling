@@ -1,53 +1,71 @@
-import { tableFromIPC, tableToIPC, tableFromArrays } from "@uwdata/flechette";
+// Runtime for user-provided JS/TS script transforms. Reads Arrow IPC input
+// bytes from the host, runs the user's `invoke(row)` function once per input
+// row, and writes the result back to the host.
+//
+// Two output paths, chosen by whether the "schema" config key is present:
+//
+// - Schema-aware (config key "schema" set): the host already knows every
+//   output field's name (a JSON list of `{name, type}`, sent by the operator
+//   when the pipeline declares `schema:`). This path skips building an Arrow
+//   table on the output side entirely: it pushes each returned row's values
+//   straight into one plain array per output column, then serializes those
+//   columns to a JSON string (`{"columns": {name: [values...]}, "num_rows": N}`)
+//   and hands it to the host with `Host.outputString`. `Host.outputString`
+//   encodes the string to UTF-8 natively on the host side, so this path never
+//   calls `TextEncoder` in JS.
+// - Inferred (no "schema" config key): the output schema isn't known ahead of
+//   time, so this path collects each returned row as an object, unions their
+//   keys, builds an Arrow table from the resulting columns, and encodes it to
+//   Arrow IPC file-format bytes via `Host.outputBytes`.
+//
+// `patch_text_decoder.js` is imported first so its `TextDecoder.prototype.decode`
+// patch is installed before flechette's own module-scope decoder is created
+// (flechette builds a `TextDecoder` at module load, in util/strings.js).
+import "./patch_text_decoder.js";
+import { tableFromIPC, tableFromArrays, tableToIPC } from "@uwdata/flechette";
 
-// Custom base64 encoding function (btoa equivalent)
-function btoa(str) {
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let result = "";
-  let i = 0;
-  while (i < str.length) {
-    const a = str.charCodeAt(i++);
-    const hasB = i < str.length;
-    const b = hasB ? str.charCodeAt(i++) : 0;
-    const hasC = i < str.length;
-    const c = hasC ? str.charCodeAt(i++) : 0;
-    const bitmap = (a << 16) | (b << 8) | c;
-    result += chars.charAt((bitmap >> 18) & 63);
-    result += chars.charAt((bitmap >> 12) & 63);
-    if (hasB) {
-      result += chars.charAt((bitmap >> 6) & 63);
-    } else {
-      result += "=";
-    }
-    if (hasC) {
-      result += chars.charAt(bitmap & 63);
-    } else {
-      result += "=";
-    }
+// `eval(code)` compiles the user's script into a callable function. The
+// compiled function is cached per plugin instance (keyed by the raw code
+// string) so a script is only compiled once, not once per invoke() call.
+const compiledFnCache = new Map();
+function getCompiledFn(code) {
+  let fn = compiledFnCache.get(code);
+  if (!fn) {
+    fn = eval("(" + code + ")");
+    compiledFnCache.set(code, fn);
   }
-  return result;
+  return fn;
+}
+
+// Config.get("schema") never changes across invoke() calls within one plugin
+// instance, but re-parsing its JSON on every call is wasted work. Cache the
+// parsed value keyed by the raw string.
+const parsedSchemaCache = new Map();
+function getParsedSchema(raw) {
+  if (!raw) return null;
+  let parsed = parsedSchemaCache.get(raw);
+  if (!parsed) {
+    parsed = JSON.parse(raw);
+    parsedSchemaCache.set(raw, parsed);
+  }
+  return parsed;
 }
 
 function invoke() {
   try {
     const code = Config.get("code");
-    // Compile the function once outside the loop for better performance
-    const fn = eval("(" + code + ")");
+    const fn = getCompiledFn(code);
 
-    // Read Arrow IPC bytes from host
+    const schemaConfigRaw = Config.get("schema");
+    const outputSchema = getParsedSchema(schemaConfigRaw);
+
     const inputBytes = Host.inputBytes();
-
-    // Ensure we have a Uint8Array (flechette expects Uint8Array, not ArrayBuffer)
+    // flechette expects a Uint8Array, not a raw ArrayBuffer.
     const inputUint8Array =
       inputBytes instanceof Uint8Array
         ? inputBytes
         : new Uint8Array(inputBytes);
 
-    // Decode Arrow IPC to table with proxy support for efficient iteration
-    // Proxy allows for 'zero-copy' iteration over the table
-    // but prevents things like Object.keys() from being called.
-    // In testing this is faster and uses less memory.
     let inputTable;
     try {
       inputTable = tableFromIPC(inputUint8Array, { useProxy: true });
@@ -60,132 +78,18 @@ function invoke() {
     }
 
     const numRows = inputTable.numRows;
-    const results = [];
 
-    // Process each row using table iterator with .get()
-    for (let i = 0; i < numRows; i++) {
-      let inputObj;
-      try {
-        inputObj = inputTable.get(i);
-      } catch (error) {
-        throw new Error(
-          `Failed to get row ${i} from table: ${error.message}${
-            error.stack ? "\n" + error.stack : ""
-          }`
-        );
-      }
-      try {
-        const result = fn(inputObj);
-
-        // Allow null to filter out rows from the batch
-        if (result === null) {
-          continue;
-        }
-
-        // Support returning an array to expand one row into many rows
-        if (Array.isArray(result)) {
-          for (let j = 0; j < result.length; j++) {
-            const row = result[j];
-
-            // Allow null in array to filter out specific rows
-            if (row === null) {
-              continue;
-            }
-
-            if (typeof row !== "object") {
-              throw new Error(
-                `Script must return an object, null, or array of objects. Array element at index ${j} is ${typeof row}`
-              );
-            }
-
-            // Always preserve _gs_op from input if it exists, even if user function doesn't include it
-            if ("_gs_op" in inputObj) {
-              row._gs_op = inputObj._gs_op;
-            }
-
-            results.push(row);
-          }
-          continue;
-        }
-
-        if (typeof result !== "object") {
-          throw new Error(
-            `Script must return an object, null, or array of objects, got ${typeof result}`
-          );
-        }
-
-        // Always preserve _gs_op from input if it exists, even if user function doesn't include it
-        if ("_gs_op" in inputObj) {
-          result._gs_op = inputObj._gs_op;
-        }
-
-        results.push(result);
-      } catch (error) {
-        // Format the error with context and throw it
-        throw new Error(formatError(error, inputObj, i + 1));
-      }
+    if (outputSchema && outputSchema.length > 0) {
+      const jsonString = runSchemaAware(fn, inputTable, numRows, outputSchema);
+      return Host.outputString(jsonString);
     }
 
-    // Convert results back to Arrow table
-    let outputTable;
-    try {
-      if (results.length === 0) {
-        // For empty results, create a minimal table with empty columns
-        // We'll create a table with a single dummy column that we can remove
-        outputTable = tableFromArrays({ _dummy: [] });
-      } else {
-        // Transform array of objects into columnar format (object of arrays)
-        // Collect all unique keys from all result objects
-        const allKeys = new Set();
-        for (const result of results) {
-          if (result && typeof result === "object") {
-            const keys = Object.keys(result);
-            for (const key of keys) {
-              allKeys.add(key);
-            }
-          }
-        }
+    const outputTable = runInferred(fn, inputTable, numRows);
 
-        // Build columnar structure: { columnName: [value1, value2, ...] }
-        const columns = {};
-        for (const key of allKeys) {
-          columns[key] = results.map((row) => {
-            if (row && typeof row === "object" && key in row) {
-              return row[key] ?? null;
-            }
-            return null;
-          });
-        }
-
-        try {
-          outputTable = tableFromArrays(columns);
-        } catch (error) {
-          console.error(`Error in tableFromArrays: ${error.message}`);
-          throw new Error(
-            `Failed to create Arrow table from arrays: ${error.message}${
-              error.stack ? "\n" + error.stack : ""
-            }`
-          );
-        }
-      }
-    } catch (error) {
-      throw new Error(
-        `Failed to create Arrow table from results: ${error.message}${
-          error.stack ? "\n" + error.stack : ""
-        }`
-      );
-    }
-
-    // Encode table to Arrow IPC bytes
-    // Try to encode in smaller chunks or with different options if it fails
     let outputBytes;
     try {
-      // Use file format (matches what Rust expects)
+      // File format matches what the Rust side's FileReader expects.
       outputBytes = tableToIPC(outputTable, { format: "file" });
-
-      if (outputBytes === null) {
-        throw new Error("tableToIPC returned null even with explicit format");
-      }
     } catch (error) {
       throw new Error(
         `Failed to encode Arrow IPC output: ${error.message}${
@@ -194,16 +98,195 @@ function invoke() {
       );
     }
 
-    // Return Arrow IPC bytes directly - extism will convert Uint8Array to Vec<u8>
     return Host.outputBytes(outputBytes.buffer);
   } catch (error) {
-    // Catch any unexpected errors and provide context
     throw new Error(
       `script runtime error: ${error.message}${
         error.stack ? "\n" + error.stack : ""
       }`
     );
   }
+}
+
+// Inferred path: run the user function over every input row, collect the
+// returned rows as plain objects, then build an Arrow table whose columns
+// are the union of every returned row's keys.
+function runInferred(fn, inputTable, numRows) {
+  const results = [];
+
+  for (let i = 0; i < numRows; i++) {
+    let inputObj;
+    try {
+      inputObj = inputTable.get(i);
+    } catch (error) {
+      throw new Error(
+        `Failed to get row ${i} from table: ${error.message}${
+          error.stack ? "\n" + error.stack : ""
+        }`
+      );
+    }
+    try {
+      const result = fn(inputObj);
+
+      // Returning null filters the row out of the batch.
+      if (result === null) {
+        continue;
+      }
+
+      // Returning an array expands one input row into many output rows.
+      if (Array.isArray(result)) {
+        for (let j = 0; j < result.length; j++) {
+          const row = result[j];
+
+          // null entries in the array filter out that specific row.
+          if (row === null) {
+            continue;
+          }
+
+          if (typeof row !== "object") {
+            throw new Error(
+              `Script must return an object, null, or array of objects. Array element at index ${j} is ${typeof row}`
+            );
+          }
+
+          // Always preserve _gs_op from the input, even if the user's
+          // function doesn't include it in its returned row.
+          if ("_gs_op" in inputObj) {
+            row._gs_op = inputObj._gs_op;
+          }
+
+          results.push(row);
+        }
+        continue;
+      }
+
+      if (typeof result !== "object") {
+        throw new Error(
+          `Script must return an object, null, or array of objects, got ${typeof result}`
+        );
+      }
+
+      if ("_gs_op" in inputObj) {
+        result._gs_op = inputObj._gs_op;
+      }
+
+      results.push(result);
+    } catch (error) {
+      throw new Error(formatError(error, inputObj, i + 1));
+    }
+  }
+
+  let outputTable;
+  try {
+    if (results.length === 0) {
+      // Minimal table with one dummy column, for an all-filtered-out batch.
+      outputTable = tableFromArrays({ _dummy: [] });
+    } else {
+      const allKeys = new Set();
+      for (const result of results) {
+        if (result && typeof result === "object") {
+          for (const key of Object.keys(result)) {
+            allKeys.add(key);
+          }
+        }
+      }
+
+      const columns = {};
+      for (const key of allKeys) {
+        columns[key] = results.map((row) => {
+          if (row && typeof row === "object" && key in row) {
+            return row[key] ?? null;
+          }
+          return null;
+        });
+      }
+
+      try {
+        outputTable = tableFromArrays(columns);
+      } catch (error) {
+        throw new Error(
+          `Failed to create Arrow table from arrays: ${error.message}${
+            error.stack ? "\n" + error.stack : ""
+          }`
+        );
+      }
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to create Arrow table from results: ${error.message}${
+        error.stack ? "\n" + error.stack : ""
+      }`
+    );
+  }
+  return outputTable;
+}
+
+// Schema-aware path: the caller already knows every output column's name
+// (outputSchema), so each returned row's values are pushed straight into one
+// plain array per column -- no row-object array, no key-union pass. The
+// per-column arrays are serialized to one JSON string, which the caller
+// writes to the host directly (no Arrow table is built on the output side).
+function runSchemaAware(fn, inputTable, numRows, outputSchema) {
+  const columnNames = outputSchema.map((f) => f.name);
+  const columnArrays = new Map(columnNames.map((name) => [name, []]));
+  let rowCount = 0;
+
+  const pushRow = (row, inputObj) => {
+    if ("_gs_op" in inputObj) row._gs_op = inputObj._gs_op;
+    for (const name of columnNames) {
+      const v = row[name];
+      columnArrays.get(name).push(v === undefined ? null : v);
+    }
+    rowCount++;
+  };
+
+  for (let i = 0; i < numRows; i++) {
+    let inputObj;
+    try {
+      inputObj = inputTable.get(i);
+    } catch (error) {
+      throw new Error(
+        `Failed to get row ${i} from table: ${error.message}${
+          error.stack ? "\n" + error.stack : ""
+        }`
+      );
+    }
+    try {
+      const result = fn(inputObj);
+
+      if (result === null) continue;
+
+      if (Array.isArray(result)) {
+        for (let j = 0; j < result.length; j++) {
+          const row = result[j];
+          if (row === null) continue;
+          if (typeof row !== "object") {
+            throw new Error(
+              `Script must return an object, null, or array of objects. Array element at index ${j} is ${typeof row}`
+            );
+          }
+          pushRow(row, inputObj);
+        }
+        continue;
+      }
+
+      if (typeof result !== "object") {
+        throw new Error(
+          `Script must return an object, null, or array of objects, got ${typeof result}`
+        );
+      }
+
+      pushRow(result, inputObj);
+    } catch (error) {
+      throw new Error(formatError(error, inputObj, i + 1));
+    }
+  }
+
+  const columns = {};
+  for (const name of columnNames) {
+    columns[name] = columnArrays.get(name);
+  }
+  return JSON.stringify({ columns, num_rows: rowCount });
 }
 
 function truncateString(str, maxLength) {
@@ -220,7 +303,6 @@ function formatError(error, input, lineNumber) {
   const errorType = error.constructor.name;
   let commonIssues = [];
 
-  // Add type-specific guidance
   if (errorType === "TypeError") {
     commonIssues = [
       "Check if you're accessing properties that exist in the input",
@@ -251,13 +333,11 @@ function formatError(error, input, lineNumber) {
     formattedError += `Stack trace:\n${error.stack}\n\n`;
   }
 
-  // Format input data with truncation if too large
   let inputDataDisplay;
   try {
     const inputJson = JSON.stringify(input, null, 2);
     inputDataDisplay = truncateString(inputJson, MAX_INPUT_LENGTH);
   } catch (e) {
-    // If JSON stringify fails, show a simple representation
     inputDataDisplay = truncateString(String(input), MAX_INPUT_LENGTH);
   }
 
