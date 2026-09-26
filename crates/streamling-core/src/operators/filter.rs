@@ -78,6 +78,12 @@ pub struct StreamingFilterExec {
     projection: Option<Vec<usize>>,
     /// Copy of the original FilterExec for method delegation
     original_filter: FilterExec,
+    /// True when this filter belongs to an upstream source node and was
+    /// re-applied above the source's `WrappingExec` (see
+    /// `wrap_with_side_outputs_before_filter`). Marks a topology boundary for
+    /// downstream metric aggregation so this operator's compute is not
+    /// attributed to the consuming transform.
+    source_owned: bool,
 }
 
 impl StreamingFilterExec {
@@ -100,6 +106,7 @@ impl StreamingFilterExec {
                     cache: Arc::new(cache),
                     projection: None,
                     original_filter,
+                    source_owned: false,
                 })
             }
             other => {
@@ -108,6 +115,10 @@ impl StreamingFilterExec {
         }
     }
 
+    /// NOTE: always resets `source_owned` to `false`. A rebuild path that
+    /// routes a source-owned filter through here silently drops the topology
+    /// boundary mark — callers must re-apply it via [`Self::with_source_owned`]
+    /// (see `wrap_with_side_outputs_before_filter`).
     pub fn from_original(original_filter: FilterExec) -> Result<Self> {
         Ok(Self {
             predicate: original_filter.predicate().clone(),
@@ -117,7 +128,27 @@ impl StreamingFilterExec {
             cache: original_filter.properties().clone(),
             projection: original_filter.projection().as_ref().map(|p| p.to_vec()),
             original_filter,
+            source_owned: false,
         })
+    }
+
+    /// Whether this filter is owned by an upstream source node (re-applied
+    /// above the source's `WrappingExec`); see the `source_owned` field.
+    ///
+    /// Crate-internal: the mark is only set by
+    /// `wrap_with_side_outputs_before_filter` (and tests that model that path).
+    pub(crate) fn is_source_owned(&self) -> bool {
+        self.source_owned
+    }
+
+    /// Consume `self`, returning it marked as owned by an upstream source
+    /// node (see the `source_owned` field).
+    ///
+    /// Crate-internal: only `wrap_with_side_outputs_before_filter` should set
+    /// this mark (tests may model that path).
+    pub(crate) fn with_source_owned(mut self) -> Self {
+        self.source_owned = true;
+        self
     }
 
     pub fn with_default_selectivity(
@@ -160,6 +191,7 @@ impl StreamingFilterExec {
             cache: Arc::new(cache),
             projection,
             original_filter: self.original_filter.clone(),
+            source_owned: self.source_owned,
         })
     }
 
@@ -307,6 +339,12 @@ impl StreamingFilterExec {
     }
 }
 
+impl crate::operators::TopologyBoundary for StreamingFilterExec {
+    fn bounds_metric_aggregation(&self) -> bool {
+        self.is_source_owned()
+    }
+}
+
 impl DisplayAs for StreamingFilterExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
@@ -327,7 +365,13 @@ impl DisplayAs for StreamingFilterExec {
                 } else {
                     "".to_string()
                 };
-                write!(f, "FilterExec: {}{}", self.predicate, display_projections)
+                write!(
+                    f,
+                    "FilterExec: {}{}, partitions={}",
+                    self.predicate,
+                    display_projections,
+                    self.cache.output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "predicate={}", fmt_sql(self.predicate.as_ref()))
@@ -386,7 +430,13 @@ impl ExecutionPlan for StreamingFilterExec {
             e.with_default_selectivity(selectivity)
         })
         .and_then(|e| e.with_projection(self.projection().cloned()))
-        .map(|e| Arc::new(e) as _)
+        .map(|mut e| {
+            // `try_new` resets `source_owned` to false; this restores the
+            // caller's mark. `with_projection` only copies the rebuilt
+            // (false) flag, so this assignment is not redundant.
+            e.source_owned = self.source_owned;
+            Arc::new(e) as _
+        })
     }
 
     /// Tries to swap `projection` with its input (`filter`). If possible, performs
@@ -395,6 +445,24 @@ impl ExecutionPlan for StreamingFilterExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Never push a projection below a topology boundary: the swap would
+        // place the downstream transform's own projection UNDER this
+        // source-owned filter, excluding the transform's projection compute
+        // from its metrics (and embedding would hide it inside the boundary
+        // node). Mirrors the unification guard on StreamingProjectionExec.
+        //
+        // NOTE: the production session replaces DataFusion's physical
+        // optimizer rules with `StreamlingPhysicalOptimizerRules` (see
+        // session.rs), so ProjectionPushdown/FilterPushdown never run there.
+        // This guard (and its sibling in `handle_child_pushdown_result`) is
+        // defense-in-depth for embedders and future rule-set changes.
+        if self.source_owned {
+            return Ok(None);
+        }
+        // The rebuild below uses `try_new`, which resets `source_owned` to
+        // false. That is only safe because source-owned filters already
+        // returned: allowing the swap would drop the topology-boundary mark
+        // and push the transform's projection under the source filter.
         // If the projection does not narrow the schema, we should not try to push it down:
         if projection.expr().len() < projection.input().schema().fields().len() {
             // Each column in the predicate expression must exist after the projection.
@@ -421,6 +489,12 @@ impl ExecutionPlan for StreamingFilterExec {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         if !matches!(phase, FilterPushdownPhase::Pre) {
+            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+        }
+        // Never absorb a downstream transform's predicates into a topology
+        // boundary: the transform's filter compute would be excluded from its
+        // own metrics. Mirrors the projection-swap guard above.
+        if self.source_owned {
             return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
         }
         // We absorb any parent filters that were not handled by our children
@@ -462,9 +536,10 @@ impl ExecutionPlan for StreamingFilterExec {
                             )
                         })
                         .collect::<Vec<_>>();
-                    Some(Arc::new(StreamingProjectionExec::from_original(
+                    let replacement = StreamingProjectionExec::from_original(
                         ProjectionExec::try_new(proj_exprs, filter_input)?,
-                    )?) as Arc<dyn ExecutionPlan>)
+                    )?;
+                    Some(Arc::new(replacement) as Arc<dyn ExecutionPlan>)
                 }
                 None => {
                     // No projection needed, just return the input
@@ -489,6 +564,9 @@ impl ExecutionPlan for StreamingFilterExec {
                 )?),
                 projection: None,
                 original_filter: self.original_filter.clone(),
+                // Source-owned filters already returned above; this rewrite
+                // is only for transform-owned filters.
+                source_owned: false,
             };
             Some(Arc::new(new) as _)
         };
@@ -726,6 +804,133 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn from_original_resets_source_owned() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let marked = StreamingFilterExec::from_original(original.clone())
+            .unwrap()
+            .with_source_owned();
+        assert!(marked.is_source_owned());
+        let reset = StreamingFilterExec::from_original(original).unwrap();
+        assert!(
+            !reset.is_source_owned(),
+            "from_original always resets the topology-boundary mark"
+        );
+    }
+
+    #[test]
+    fn source_owned_filter_refuses_projection_swap_and_keeps_mark() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+
+        // Narrowing projection above the filter, as ProjectionPushdown presents it.
+        let projection = ProjectionExec::try_new(
+            vec![(
+                Arc::new(Column::new("id", 0)) as Arc<dyn PhysicalExpr>,
+                "id".to_string(),
+            )],
+            Arc::clone(&filter),
+        )
+        .unwrap();
+
+        let swapped = filter
+            .try_swapping_with_projection(&projection)
+            .expect("swap handler");
+        assert!(
+            swapped.is_none(),
+            "a source-owned filter must refuse the projection swap"
+        );
+        assert!(
+            filter
+                .downcast_ref::<StreamingFilterExec>()
+                .expect("original filter still in place")
+                .is_source_owned(),
+            "refusing the swap must leave the original boundary mark in place"
+        );
+    }
+
+    #[test]
+    fn source_owned_filter_pushdown_does_not_rewrite_the_node() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = FilterExec::try_new(lit(true), Arc::clone(&input)).unwrap();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+
+        // One child, no remaining predicates. Without the source-owned
+        // early-return this would strip the filter (`updated_node = Some(input)`).
+        let child_result = ChildPushdownResult {
+            parent_filters: vec![],
+            self_filters: vec![vec![]],
+        };
+        let out = filter
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Pre,
+                child_result,
+                &ConfigOptions::new(),
+            )
+            .expect("pushdown handler");
+        assert!(
+            out.updated_node.is_none(),
+            "a source-owned filter must not be rewritten or stripped by filter pushdown"
+        );
+        assert!(
+            filter
+                .downcast_ref::<StreamingFilterExec>()
+                .expect("still a StreamingFilterExec")
+                .is_source_owned()
+        );
+    }
+
+    #[test]
+    fn with_new_children_preserves_source_owned() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let original = FilterExec::try_new(lit(true), input).unwrap();
+        let marked = Arc::new(
+            StreamingFilterExec::from_original(original)
+                .unwrap()
+                .with_source_owned(),
+        );
+        assert!(marked.is_source_owned());
+
+        let new_child: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let rebuilt = Arc::clone(&marked)
+            .with_new_children(vec![new_child])
+            .expect("with_new_children");
+        let rebuilt = rebuilt
+            .downcast_ref::<StreamingFilterExec>()
+            .expect("must remain a StreamingFilterExec");
+        assert!(
+            rebuilt.is_source_owned(),
+            "with_new_children must not drop the topology-boundary mark"
+        );
     }
 
     #[test]

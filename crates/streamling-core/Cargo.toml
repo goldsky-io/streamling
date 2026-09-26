@@ -1,6 +1,6 @@
 [package]
 name = "streamling-core"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Core streaming execution engine for Streamling, built on Apache DataFusion."
@@ -13,6 +13,7 @@ too_many_arguments = "allow"
 [dependencies]
 # Internal dependencies
 streamling-common = { workspace = true }
+streamling-retry = { workspace = true }
 streamling-config = { workspace = true }
 streamling-plugin = { workspace = true }
 streamling-flink-compat = { workspace = true }
@@ -24,6 +25,7 @@ arrow-schema.workspace = true
 
 # Async runtime
 tokio.workspace = true
+tokio-util.workspace = true
 
 # Database
 sqlx.workspace = true
@@ -46,6 +48,7 @@ async-stream.workspace = true
 dashmap.workspace = true
 fixed_deque.workspace = true
 indexmap.workspace = true
+hashbrown.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -87,6 +90,7 @@ tonic.workspace = true
 paste.workspace = true
 
 [dev-dependencies]
-rand.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+rand.workspace = true
 serial_test.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

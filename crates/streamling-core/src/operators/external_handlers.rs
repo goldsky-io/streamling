@@ -2,12 +2,12 @@ use crate::data::RowKind;
 use crate::error::StreamlingError;
 use crate::formats::json::{FromArrowToJsonConverter, JsonToArrowConverter};
 use crate::formats::{FromArrowConverter, ToArrowConverter};
-use crate::retry::retry_if_retriable;
+use crate::retry::retry_if_retriable_until_cancelled;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::common::{DFSchemaRef, internal_err};
+use datafusion::common::DFSchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::{
@@ -16,8 +16,8 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
-    Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    Partitioning, PlanProperties, Statistics,
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -143,7 +143,7 @@ struct ExternalHandlerExec {
 
 impl ExternalHandlerExec {
     fn new(input: Arc<dyn ExecutionPlan>, config: ExternalHandlerConfig) -> Self {
-        let cache = Self::compute_properties(input.schema());
+        let cache = Self::compute_properties(&input);
         Self {
             input,
             config,
@@ -151,10 +151,14 @@ impl ExternalHandlerExec {
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            EquivalenceProperties::new(input.schema()),
+            // The input's width, but not its `Hash` claim: the endpoint returns
+            // the rows it wants, so any column — the primary key included — may
+            // come back rewritten. Inheriting the claim would elide a downstream
+            // keyed sink's exchange on a placement that no longer holds.
+            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -175,7 +179,12 @@ impl DisplayAs for ExternalHandlerExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "ExternalHandlerExec: url={}", self.config.url)
+                write!(
+                    f,
+                    "ExternalHandlerExec: url={}, partitions={}",
+                    self.config.url,
+                    self.properties().output_partitioning().partition_count()
+                )
             }
         }
     }
@@ -191,7 +200,8 @@ impl ExecutionPlan for ExternalHandlerExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        // Every input partition gets its own request stream and its own client.
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -213,10 +223,9 @@ impl ExecutionPlan for ExternalHandlerExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if 0 != partition {
-            return internal_err!("ExternalHandlerRunner invalid partition {partition}");
-        }
-
+        // One client per partition, deliberately: its `JsonToArrowConverter`
+        // buffers the responses it is about to convert, so streams sharing one
+        // would interleave into each other's output batches.
         let client = ExternalHandlerClient::new(
             self.schema(),
             self.config.url.clone(),
@@ -487,12 +496,16 @@ impl ExternalHandlerClient {
         self.client.post(&self.url).headers(headers.clone())
     }
 
-    /// Send an HTTP request with retry semantics via `retry_if_retriable`.
+    /// Send an HTTP request with retry semantics via
+    /// `retry_if_retriable_until_cancelled`.
     ///
     /// Retriable conditions (network errors, timeouts, 408, 429, 5xx) are retried
     /// indefinitely with exponential backoff unless `skip_on_error` is enabled.
     /// In skip mode, response errors are acknowledged immediately while transport
-    /// failures still retry.
+    /// failures still retry. Once process shutdown is requested the loop stops
+    /// between attempts instead — a down endpoint used to retry forever and pin
+    /// the drain; per-request timeouts bound
+    /// each individual attempt.
     async fn send_with_retry(
         &self,
         body: String,
@@ -503,7 +516,8 @@ impl ExternalHandlerClient {
             .as_ref()
             .map(|_| get_metrics_recorder());
         let pending_retry_status_class = parking_lot::Mutex::new(None::<&'static str>);
-        retry_if_retriable(
+        let mut shutdown = crate::shutdown::subscribe();
+        retry_if_retriable_until_cancelled(
             || {
                 let body = body.clone();
                 let metrics_recorder = metrics_recorder.clone();
@@ -612,6 +626,7 @@ impl ExternalHandlerClient {
                 }
             },
             operation_name,
+            &mut shutdown,
         )
         .await
     }
@@ -1044,6 +1059,8 @@ mod tests {
             let listener = tokio::net::TcpListener::bind(address.clone())
                 .await
                 .unwrap();
+            // Test task; not part of any pipeline drain.
+            #[allow(clippy::disallowed_methods)]
             tokio::spawn(async {
                 axum::serve(listener, app).await.unwrap();
             });

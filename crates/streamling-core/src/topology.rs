@@ -153,6 +153,11 @@ impl HybridOffsetTable {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct KafkaSource {
     pub topic: String,
+    /// Number of concurrent consumer instances. All instances share one consumer
+    /// group, so the broker assigns each a disjoint slice of the topic's
+    /// partitions. Defaults to 1. Values above the topic's partition count leave
+    /// the surplus instances idle.
+    pub parallelism: Option<usize>,
     pub starting_offsets: Option<String>,
     pub include_metadata: Option<bool>,
     pub filter: Option<String>,
@@ -233,6 +238,13 @@ pub struct PluginSource {
     pub telemetry: Option<Telemetry>,
 }
 
+impl PluginSource {
+    /// Must list exactly this struct's fields (see `merge_plugin_options`).
+    /// Anything listed here is invisible to the plugin as an option;
+    /// anything missing leaks a typed field into the plugin's options map.
+    const TYPED_FIELDS: &'static [&'static str] = &["type", "primary_key", "telemetry"];
+}
+
 /// Source that reads files from `path` in the given `format`. `path` may be a
 /// local path or a remote object store URL (`s3://`, `gs://`); remote
 /// credentials come from the environment. The `mode` selects between a
@@ -244,6 +256,10 @@ pub struct FileSource {
     pub format: FileSourceFormat,
     #[serde(default)]
     pub mode: FileSourceMode,
+    /// Number of output partitions the discovered files are read across.
+    /// Bounded mode defaults to the session's target partitions; continuous
+    /// mode defaults to 1.
+    pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
 }
@@ -262,8 +278,11 @@ fn default_file_poll_interval() -> String {
 ///   never self-terminates and so is not allowed under `job_mode`. When the mode
 ///   is omitted entirely (or given without `poll_interval`), `poll_interval`
 ///   defaults to [`DEFAULT_FILE_POLL_INTERVAL`].
-/// - `Bounded` lists the matching files once via DataFusion's `ListingTable`,
-///   reads them to completion, and lets the job terminate.
+/// - `Bounded` lists the matching files once, reads them to completion across
+///   `parallelism` partitions, and lets the job terminate. Progress is
+///   checkpointed per file, so a restarted job resumes where the last finalized
+///   checkpoint left it; rerunning a finished job is a no-op until its state is
+///   cleared.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum FileSourceMode {
@@ -310,27 +329,23 @@ pub enum FileSourceFormat {
 /// into a single `options:` mapping for `serde_yaml` to bind to the
 /// plugin's typed `options: HashMap<String, Value>` field.
 ///
-/// Fields in `EXCLUDED_FIELDS` are typed on the node struct itself (e.g.
+/// `typed_fields` are the fields typed on THAT node struct (e.g.
 /// `telemetry`, `primary_key`) and must not leak into the plugin's options
 /// map. They are stripped from BOTH the flat-top-level sweep AND any
 /// nested `options:` block — plugin authors sometimes place typed fields
 /// inside `options:` by mistake, and silent leakage would make
 /// `telemetry.labels` or `telemetry.event_time` invisible to the host
 /// while the plugin received a stray options entry it doesn't understand.
-fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping) {
+///
+/// The list is per node struct on purpose: a single shared list once
+/// stripped `batch_size`/`batch_flush_interval` from plugin SOURCES too —
+/// where no typed field exists to bind them — so a source option by either
+/// name silently vanished before reaching the plugin. Only exclude a key
+/// for a node when the node struct actually has that typed field.
+fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping, typed_fields: &[&str]) {
     const OPTIONS_FIELD: &str = "options";
-    // Nested options are kept, but the `options` field itself is removed.
-    // `telemetry` is excluded so it binds to the typed `PluginSource`
-    // field instead of getting swept into the plugin's options map.
-    const EXCLUDED_FIELDS: &[&str] = &[
-        "type",
-        "from",
-        "primary_key",
-        "telemetry",
-        "batch_size",
-        "batch_flush_interval",
-        OPTIONS_FIELD,
-    ];
+
+    let excluded = |key: &str| key == OPTIONS_FIELD || typed_fields.contains(&key);
 
     let mut merged_options = serde_yaml::Mapping::new();
 
@@ -342,7 +357,7 @@ fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping) {
     {
         for (k, v) in options_mapping.iter() {
             if let Some(key_str) = k.as_str()
-                && !EXCLUDED_FIELDS.contains(&key_str)
+                && !excluded(key_str)
             {
                 merged_options.insert(serde_yaml::Value::String(key_str.to_string()), v.clone());
             }
@@ -352,7 +367,7 @@ fn merge_plugin_options(inner_mapping: &mut serde_yaml::Mapping) {
     // Then, collect flattened top-level fields of any type (these will overwrite nested options)
     for (k, v) in inner_mapping.iter() {
         if let Some(key_str) = k.as_str()
-            && !EXCLUDED_FIELDS.contains(&key_str)
+            && !excluded(key_str)
         {
             merged_options.insert(serde_yaml::Value::String(key_str.to_string()), v.clone());
         }
@@ -433,9 +448,11 @@ macro_rules! define_typed_enum {
                             }
                         )*
                         _ => {
-                            // Plugin type: merge flattened options and keep the type field
+                            // Plugin type: merge flattened options and keep the type field.
+                            // The exclusion list is the node struct's own typed
+                            // fields — per node, not shared (see merge_plugin_options).
                             if let serde_yaml::Value::Mapping(ref mut map) = value {
-                                merge_plugin_options(map);
+                                merge_plugin_options(map, [<Plugin $enum_name>]::TYPED_FIELDS);
                             }
                             serde_yaml::from_value::<[<Plugin $enum_name>]>(value)
                                 .map($enum_name::plugin)
@@ -477,6 +494,17 @@ impl Source {
             Source::plugin(s) => s.telemetry.as_ref(),
         }
     }
+
+    /// Requested number of concurrent instances for this source, if the source
+    /// type supports more than one. Sources not listed here are structurally
+    /// single-stream and have no field to set.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Source::kafka(s) => s.parallelism,
+            Source::file(s) => s.parallelism,
+            Source::clickhouse(_) | Source::hybrid(_) | Source::plugin(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -493,6 +521,18 @@ pub struct DynamicTableTransform {
     /// only ever active when `time_column` is set.
     #[serde(default)]
     pub cache: Option<bool>,
+    /// How long to trust the in-memory cache before re-checking the table's
+    /// freshness (`SELECT MAX(<time_column>)`). When omitted, falls back to the
+    /// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms`
+    /// config; when neither is set,
+    /// `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (1000ms) applies. Set 0 explicitly
+    /// (here or globally) to re-check on every batch.
+    ///
+    /// Raising this trades staleness for round trips: lookups may miss rows
+    /// written by OTHER writers for up to this long. This pipeline's own writes
+    /// stay visible immediately (see `append`).
+    #[serde(default)]
+    pub cache_refresh_debounce_ms: Option<u64>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -501,6 +541,10 @@ pub struct DynamicTableTransform {
 pub struct SqlTransform {
     pub primary_key: String,
     pub sql: String,
+    /// Width of this transform's output: the rows are hash-partitioned by
+    /// `primary_key` into this many streams, letting a narrow source feed wider
+    /// downstream compute. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -515,6 +559,11 @@ pub struct HandlerTransform {
     pub one_row_per_request: Option<bool>,
     pub payload_version: Option<u32>,
     pub schema_override: Option<BTreeMap<String, Option<String>>>,
+    /// Number of concurrent request streams, hash-partitioned by `primary_key`
+    /// so a key is never in flight against the endpoint twice at once.
+    /// Each stream runs its own HTTP client, so in-flight requests multiply by
+    /// this. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -528,11 +577,11 @@ pub struct ScriptTransform {
     pub language: String,
     pub script: String,
     pub schema: Option<BTreeMap<String, String>>,
-    /// Number of WASM plugin instances for parallel processing.
-    /// Overrides the global wasm_script.parallelism if specified.
+    /// Number of concurrent WASM execution streams, hash-partitioned by
+    /// `primary_key`. Each stream owns one WASM instance. Defaults to the input
+    /// width.
     pub parallelism: Option<usize>,
-    /// Minimum rows to accumulate before processing.
-    /// Overrides the global wasm_script.batch_size if specified.
+    /// Rows accumulated per execution stream before invoking WASM.
     pub batch_size: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
@@ -547,6 +596,18 @@ pub struct PluginTransform {
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
+}
+
+impl PluginTransform {
+    /// See `PluginSource::TYPED_FIELDS`.
+    const TYPED_FIELDS: &'static [&'static str] = &[
+        "type",
+        "from",
+        "primary_key",
+        "telemetry",
+        "batch_size",
+        "batch_flush_interval",
+    ];
 }
 
 define_typed_enum!(
@@ -573,6 +634,18 @@ impl Transform {
             Transform::plugin(t) => t.telemetry.as_ref(),
         }
     }
+
+    /// Requested output width for this transform.
+    ///
+    /// `plugin` and `dynamic_table` are `SinglePartition` operators.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Transform::sql(t) => t.parallelism,
+            Transform::handler(t) => t.parallelism,
+            Transform::script(t) => t.parallelism,
+            Transform::dynamic_table(_) | Transform::plugin(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -586,6 +659,12 @@ pub struct WebhookSink {
     pub payload_version: Option<u32>,
     pub skip_on_error: Option<bool>,
     pub primary_key: Option<String>,
+    /// Number of concurrent write streams, keyed by `primary_key` so a key is
+    /// never delivered by two streams at once — the payload carries a per-row
+    /// op, so a receiver applying upserts and deletes depends on that ordering.
+    /// In-flight HTTP requests against the endpoint multiply by this. Defaults
+    /// to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -595,6 +674,11 @@ pub struct WebhookSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PrintSink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink neither dedupes nor depends on ordering,
+    /// so it needs no primary key to parallelize. Output from the streams
+    /// interleaves.
+    pub parallelism: Option<usize>,
     pub sample_every: Option<u32>,
     pub num_records_before_stop: Option<u64>,
     pub primary_key: Option<String>,
@@ -607,6 +691,10 @@ pub struct PrintSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct BlackholeSink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink discards everything, so it needs no
+    /// primary key to parallelize.
+    pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
@@ -617,6 +705,11 @@ pub struct BlackholeSink {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MemorySink {
     pub from: String,
+    /// Number of concurrent write streams. Rows are dealt out round-robin
+    /// rather than by key: this sink appends into a shared store and neither
+    /// dedupes nor depends on ordering, so it needs no primary key to
+    /// parallelize. Batch order in the store becomes nondeterministic.
+    pub parallelism: Option<usize>,
     pub exclude_gs_op: Option<bool>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
@@ -631,13 +724,16 @@ pub struct PostgresSink {
     pub table: String,
     pub schema: String,
     pub batch_flush_interval: Option<String>,
+    /// Rows accumulated per write stream before a write is issued, so a sink
+    /// with `parallelism: N` buffers up to `N * batch_size` rows.
     pub batch_size: Option<u32>,
     pub primary_key: Option<String>,
     #[serde(default = "default_on_conflict")]
     pub on_conflict: String,
     pub update_where: Option<std::collections::BTreeMap<String, String>>,
-    /// Number of parallel tasks for writing to PostgreSQL. Each task processes
-    /// a slice of the accumulated batch concurrently. Defaults to 1.
+    /// Number of concurrent write streams into the table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    /// Also sizes the connection pool. Defaults to 1.
     pub parallelism: Option<usize>,
     /// When true (default), each batch is collapsed to the latest row per
     /// `primary_key` before it is written.
@@ -681,6 +777,13 @@ pub struct AggregateColumn {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PostgresAggregateSink {
     pub from: String,
+    /// Number of concurrent write streams into the landing table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    ///
+    /// Note this parallelizes the *insert*, not the aggregation: the aggregate
+    /// table is maintained by a Postgres trigger, and concurrent inserts whose
+    /// rows fall in the same `group_by` bucket contend on that row.
+    pub parallelism: Option<usize>,
     pub schema: String,
     pub landing_table: String,
     pub agg_table: String,
@@ -730,9 +833,14 @@ pub struct ClickhouseSink {
     pub from: String,
     pub table: String,
     pub batch_flush_interval: Option<String>,
+    /// Rows accumulated per write stream before an INSERT is issued, so a sink
+    /// with `parallelism: N` buffers up to `N * batch_size` rows.
     pub batch_size: Option<u32>,
     pub primary_key: String,
     pub version_column_name: Option<String>,
+    /// Number of concurrent write streams into the table, keyed by
+    /// `primary_key` so a key is never written by two streams at once.
+    /// Defaults to 1.
     pub parallelism: Option<usize>,
     /// When true (default), uses ReplacingMergeTree(insert_time, is_deleted) with
     /// automatic is_deleted/insert_time columns derived from _gs_op.
@@ -772,6 +880,18 @@ pub struct PluginSink {
     pub batch_flush_interval: Option<String>,
 }
 
+impl PluginSink {
+    /// See `PluginSource::TYPED_FIELDS`.
+    const TYPED_FIELDS: &'static [&'static str] = &[
+        "type",
+        "from",
+        "primary_key",
+        "telemetry",
+        "batch_size",
+        "batch_flush_interval",
+    ];
+}
+
 define_typed_enum!(
     #[allow(non_camel_case_types)]
     #[derive(Debug, Clone)]
@@ -802,6 +922,21 @@ impl Sink {
             Sink::kafka(s) => s.telemetry.as_ref(),
             Sink::clickhouse(s) => s.telemetry.as_ref(),
             Sink::plugin(s) => s.telemetry.as_ref(),
+        }
+    }
+
+    /// Requested number of concurrent write streams for this sink.
+    pub fn parallelism(&self) -> Option<usize> {
+        match self {
+            Sink::postgres(s) => s.parallelism,
+            Sink::kafka(s) => s.parallelism,
+            Sink::clickhouse(s) => s.parallelism,
+            Sink::postgres_aggregate(s) => s.parallelism,
+            Sink::print(s) => s.parallelism,
+            Sink::blackhole(s) => s.parallelism,
+            Sink::memory(s) => s.parallelism,
+            Sink::webhook(s) => s.parallelism,
+            Sink::plugin(_) => None,
         }
     }
 }
@@ -1093,8 +1228,8 @@ data_format: avro
     }
 
     #[test]
-    fn dynamic_table_cache_defaults_to_none_and_parses_explicit() {
-        // When `cache` is omitted the field is None (falls back to global).
+    fn dynamic_table_cache_and_debounce_parse_and_default() {
+        // Fields omitted -> None (falls back to global config at runtime).
         let yaml = r#"
 sources:
   src: { type: kafka, topic: t, primary_key: id }
@@ -1108,11 +1243,14 @@ sinks: {}
 "#;
         let topology = PipelineTopology::load_from_string(yaml).unwrap();
         match topology.transforms.get("dt_omitted").unwrap() {
-            Transform::dynamic_table(dt) => assert_eq!(dt.cache, None),
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, None);
+                assert_eq!(dt.cache_refresh_debounce_ms, None);
+            }
             _ => panic!("expected dynamic_table transform"),
         }
 
-        // An explicit topology-level value is preserved.
+        // Explicit topology-level values are preserved.
         let yaml = r#"
 sources:
   src: { type: kafka, topic: t, primary_key: id }
@@ -1123,21 +1261,29 @@ transforms:
     backend_entity_name: tbl
     time_column: updated_at
     cache: true
+    cache_refresh_debounce_ms: 5000
   dt_off:
     type: dynamic_table
     backend_type: Postgres
     backend_entity_name: tbl2
     time_column: updated_at
     cache: false
+    cache_refresh_debounce_ms: 0
 sinks: {}
 "#;
         let topology = PipelineTopology::load_from_string(yaml).unwrap();
         match topology.transforms.get("dt_on").unwrap() {
-            Transform::dynamic_table(dt) => assert_eq!(dt.cache, Some(true)),
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, Some(true));
+                assert_eq!(dt.cache_refresh_debounce_ms, Some(5000));
+            }
             _ => panic!("expected dynamic_table transform"),
         }
         match topology.transforms.get("dt_off").unwrap() {
-            Transform::dynamic_table(dt) => assert_eq!(dt.cache, Some(false)),
+            Transform::dynamic_table(dt) => {
+                assert_eq!(dt.cache, Some(false));
+                assert_eq!(dt.cache_refresh_debounce_ms, Some(0));
+            }
             _ => panic!("expected dynamic_table transform"),
         }
     }
@@ -1328,6 +1474,48 @@ sinks:
             assert_eq!(plugin.batch_flush_interval.as_deref(), Some("1s"));
         } else {
             panic!("Expected plugin sink");
+        }
+    }
+
+    // PluginSource has NO typed batch fields, so `batch_size` /
+    // `batch_flush_interval` on a plugin source are ordinary plugin options
+    // and must reach the plugin. A shared exclusion list once stripped them
+    // here too — the option silently vanished (nothing typed existed to bind
+    // it) while sibling keys passed, which is invisible until the plugin
+    // misbehaves in the field.
+    #[test]
+    fn test_plugin_source_keeps_batch_options() {
+        let yaml = r#"
+sources:
+  bounded_source:
+    type: test_source_plugin
+    options:
+      start_block: "100"
+      end_block: "200"
+      batch_size: "1000"
+    batch_flush_interval: "500ms"
+transforms: {}
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        if let Source::plugin(plugin) = topology.sources.get("bounded_source").unwrap() {
+            let opts = plugin.options.as_ref().unwrap();
+            assert_eq!(
+                opts.get("batch_size").and_then(|v| v.as_str()),
+                Some("1000"),
+                "nested batch_size must reach the plugin's options"
+            );
+            assert_eq!(
+                opts.get("batch_flush_interval").and_then(|v| v.as_str()),
+                Some("500ms"),
+                "flattened batch_flush_interval must reach the plugin's options"
+            );
+            assert_eq!(
+                opts.get("start_block").and_then(|v| v.as_str()),
+                Some("100")
+            );
+        } else {
+            panic!("Expected plugin source");
         }
     }
 

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -16,14 +16,13 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use streamling_core::checkpoints::channels::send;
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
-    process_checkpoint_acks,
+    extract_checkpoint_messages, now_ms, process_checkpoint_acks,
 };
 use streamling_core::data::RowKind;
 use streamling_core::formats::FromArrowConverter;
 use streamling_core::formats::json::FromArrowToJsonConverter;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
@@ -35,7 +34,9 @@ struct PrintSink {
     num_records_before_stop: Option<u64>,
     schema: SchemaRef,
     counter: AtomicU64,
-    source_name: String,
+    /// Global `num_records_before_stop` progress across the concurrent
+    /// per-partition `write_all` streams (`ParallelSinkExec`).
+    rows_received: AtomicU64,
     metric_metadata_id: String,
 }
 
@@ -44,7 +45,6 @@ impl PrintSink {
         sample_every: u32,
         num_records_before_stop: Option<u64>,
         schema: SchemaRef,
-        source_name: String,
         metric_metadata_id: String,
     ) -> Self {
         Self {
@@ -52,7 +52,7 @@ impl PrintSink {
             num_records_before_stop,
             schema,
             counter: AtomicU64::new(0),
-            source_name,
+            rows_received: AtomicU64::new(0),
             metric_metadata_id,
         }
     }
@@ -83,6 +83,10 @@ impl DataSink for PrintSink {
 
             if batch.num_rows() > 0 {
                 row_count += batch.num_rows();
+                let total_received = self
+                    .rows_received
+                    .fetch_add(batch.num_rows() as u64, Ordering::SeqCst)
+                    + batch.num_rows() as u64;
 
                 let row_kinds = RowKind::extract_row_kinds_from_batch(&batch);
 
@@ -102,16 +106,17 @@ impl DataSink for PrintSink {
                         num_of_printed_rows.add(1);
                     }
                 }
+                // Compare against the global received count so the stop threshold
+                // stays global across the concurrent per-partition streams.
                 if let Some(stop_at) = self.num_records_before_stop
-                    && row_count >= stop_at as usize
-                    && !(stop_at == 0 && row_count == 0)
+                    && total_received >= stop_at
+                    && !(stop_at == 0 && total_received == 0)
                 {
                     info!("Stopping after {} records", row_count);
-                    // Notify the coordinator (and sources) that the sink has received the expected rows
-                    let _ = send(
-                        CHECKPOINT_COORDINATOR_CHANNEL,
-                        CheckpointMessage::SourceComplete(self.source_name.clone()),
-                    );
+                    // Record-limit reached: request process-wide graceful
+                    // shutdown so every source drains and ends its stream —
+                    // the same path SIGTERM takes (test-only mode).
+                    streamling_core::shutdown::request_shutdown();
                     //need to flush since we are breaking the outer loop
                     metrics_recorder.record_output_rows_count(
                         num_of_printed_rows.value() as u64,
@@ -172,7 +177,6 @@ pub struct PrintTableProvider {
     sample_every: u32,
     num_records_before_stop: Option<u64>,
     schema: SchemaRef,
-    source_name: String,
     metric_metadata_id: String,
     telemetry: Option<Telemetry>,
 }
@@ -182,7 +186,6 @@ impl PrintTableProvider {
         sample_every: u32,
         num_records_before_stop: Option<u64>,
         schema: SchemaRef,
-        source_name: String,
         metric_metadata_id: String,
         telemetry: Option<Telemetry>,
     ) -> Self {
@@ -191,7 +194,6 @@ impl PrintTableProvider {
             sample_every,
             num_records_before_stop,
             schema,
-            source_name,
             telemetry,
         }
     }
@@ -227,7 +229,6 @@ impl TableProvider for PrintTableProvider {
             self.sample_every,
             self.num_records_before_stop,
             self.schema.clone(),
-            self.source_name.clone(),
             self.metric_metadata_id.clone(),
         ));
         let with_telemetry = Arc::new(WrappingDataSink::new(
@@ -236,6 +237,10 @@ impl TableProvider for PrintTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(input, with_telemetry, None)))
+        Ok(Arc::new(ParallelSinkExec::new(
+            input,
+            with_telemetry,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+        )))
     }
 }

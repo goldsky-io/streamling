@@ -4282,7 +4282,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streamling-common"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -4302,6 +4302,7 @@ dependencies = [
  "regex",
  "serde_json",
  "sha3",
+ "streamling-retry",
  "tracing",
  "tracing-subscriber",
  "uint",
@@ -4311,12 +4312,13 @@ dependencies = [
 
 [[package]]
 name = "streamling-config"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "config",
  "futures",
+ "humantime",
  "percent-encoding",
  "schema_registry_converter",
  "serde",
@@ -4328,7 +4330,7 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "abi_stable",
  "arrow",
@@ -4338,20 +4340,23 @@ dependencies = [
  "crossbeam-channel",
  "datafusion",
  "datafusion-ffi",
+ "futures",
  "serde",
  "serde_json",
  "streamling-common",
  "streamling-config",
  "streamling-plugin-derive",
+ "streamling-retry",
  "streamling-state",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "streamling-plugin-derive"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4359,8 +4364,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamling-retry"
+version = "0.4.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "streamling-state"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -4629,6 +4642,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

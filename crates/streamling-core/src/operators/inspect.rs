@@ -71,12 +71,18 @@ impl LiveDataInspect {
         );
         let (broadcast_tx, _) = broadcast::channel(channel_capacity);
 
-        // Start a background task to maintain capacity only if there are topology nodes
+        // Start a background task to maintain capacity only if there are
+        // topology nodes. The singleton is initialized in main.rs BEFORE the
+        // run loop's ShutdownController exists, so no ladder scope can reach
+        // it — a detached scope keeps the spawn on the sanctioned API. The
+        // task observes the process-wide watch and exits on shutdown; nothing
+        // awaits it (by design: in-memory sampling only).
+        let scope = crate::shutdown::ComponentScope::detached("live-data-inspect");
         let background_task = if topology_node_keys.is_empty() {
             // No work to do, spawn a task that immediately completes
-            tokio::spawn(async {})
+            scope.spawn(async {})
         } else {
-            tokio::spawn(async move {
+            scope.spawn(async move {
                 let mut interval =
                     tokio::time::interval(Duration::from_secs(refresh_in_secs as u64));
                 loop {
@@ -519,6 +525,8 @@ mod tests {
         // Spawn multiple tasks processing different operators
         for i in 1..6 {
             let inspector_clone = inspector.clone();
+            // Test task; not part of any pipeline drain.
+            #[allow(clippy::disallowed_methods)]
             let handle = tokio::spawn(async move {
                 let topology_node_key = format!("operator_{}", i);
                 let batch = create_test_batch((i * records_per_topology_node) as i32, 20);
@@ -640,6 +648,8 @@ mod tests {
             let topology_node_key = thread_reference_mapping[thread_id].clone();
             let shutdown_flag_clone = shutdown_flag.clone();
 
+            // Test task; not part of any pipeline drain.
+            #[allow(clippy::disallowed_methods)]
             let handle = tokio::spawn(async move {
                 use rand::SeedableRng;
                 let mut rng = rand::rngs::StdRng::from_entropy();

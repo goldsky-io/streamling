@@ -392,3 +392,119 @@ sinks:
         "Bob's balance should be 50 (deduplicated, not 100)"
     );
 }
+
+// ============================================================================
+// Parallel writes into the landing table
+// ============================================================================
+
+/// `parallelism` on an aggregation sink widens the write into the *landing*
+/// table, keyed on the primary key. The aggregate table is maintained by a
+/// Postgres trigger, so concurrent inserts whose rows fall in the same
+/// `group_by` bucket contend on that row — the aggregate must still come out
+/// exact, which is what this pins.
+#[tokio::test]
+async fn test_aggregation_with_sink_parallelism() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TRANSFER_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Two accounts, so both write streams end up touching the same aggregate
+    // rows and the trigger is genuinely exercised under concurrency.
+    const TRANSFERS: i64 = 20;
+    let records: Vec<Transfer> = (1..=TRANSFERS)
+        .map(|i| Transfer {
+            id: i,
+            account: if i % 2 == 0 { "alice" } else { "bob" }.to_string(),
+            amount: i,
+        })
+        .collect();
+    let expected_alice: i64 = (1..=TRANSFERS).filter(|i| i % 2 == 0).sum();
+    let expected_bob: i64 = (1..=TRANSFERS).filter(|i| i % 2 != 0).sum();
+
+    ctx.kafka
+        .produce_avro_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  postgres_agg:
+    type: postgres_aggregate
+    from: kafka_source
+    landing_table: parallel_transfers
+    agg_table: parallel_balances
+    schema: streamling
+    batch_flush_interval: 1s
+    batch_size: 1
+    primary_key: id
+    parallelism: 2
+    group_by:
+      account:
+        type: text
+    aggregate:
+      balance:
+        from: amount
+        fn: sum
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    // Every id is distinct, so in-batch dedup collapses nothing and the limit is
+    // reachable; `batch_size: 1` keeps it that way regardless of how the two
+    // streams batch.
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(TRANSFERS as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let landing_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM streamling.parallel_transfers")
+        .await
+        .expect("Failed to count landing table rows");
+    assert_eq!(
+        landing_count, TRANSFERS,
+        "every transfer must reach the landing table across both write streams"
+    );
+
+    // The trigger's sums must be exact: a lost or double-counted insert under
+    // concurrency would show up here even though the row count above matched.
+    let balances: Vec<(String, i64)> = ctx
+        .postgres
+        .query("SELECT account, balance FROM streamling.parallel_balances ORDER BY account")
+        .await
+        .expect("Failed to query balances");
+
+    assert_eq!(
+        balances,
+        vec![
+            ("alice".to_string(), expected_alice),
+            ("bob".to_string(), expected_bob)
+        ],
+        "aggregate totals must be exact under concurrent inserts"
+    );
+}

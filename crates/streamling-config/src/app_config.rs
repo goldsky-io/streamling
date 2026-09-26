@@ -7,6 +7,9 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Formatter;
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 fn default_sslmode() -> String {
     "require".to_string()
@@ -31,6 +34,12 @@ pub struct PostgresStateBackendConfig {
     pub max_connections: Option<u32>,
     pub state_schema_name: Option<String>,
     pub state_table_name: Option<String>,
+    /// Ceiling on waiting for a pool connection, in seconds. When unset, the
+    /// engine derives it from the shutdown budget at startup (see the state
+    /// backend construction in `streamling`) so a state-backend outage is
+    /// always reportable inside the drain window — sqlx's own 30s default
+    /// out-waits every budget below ~42s of grace.
+    pub acquire_timeout_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresStateBackendConfig {
@@ -151,6 +160,13 @@ impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
 }
 
 // TODO: perhaps this can be merged with PostgresStateBackendConfig
+
+/// Freshness-check debounce window (ms) for the postgres dynamic table cache,
+/// applied when neither the topology's `cache_refresh_debounce_ms` nor the
+/// global `dynamic_table_backend.postgres.cache_refresh_debounce_ms` is set.
+/// An explicit 0 (topology or global) still disables the window.
+pub const DEFAULT_CACHE_REFRESH_DEBOUNCE_MS: u64 = 1000;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PostgresDynamicTableBackendConfig {
     pub host: String,
@@ -169,6 +185,16 @@ pub struct PostgresDynamicTableBackendConfig {
     /// Caching is only ever active when the table sets `time_column`.
     #[serde(default)]
     pub cache_enabled: bool,
+    /// Global default for the cache freshness-check debounce window in
+    /// milliseconds (see `cache_refresh_debounce_ms` on dynamic_table
+    /// transforms). Individual transforms override this via their own field;
+    /// when that field is omitted the global value applies. When neither is
+    /// set, `DEFAULT_CACHE_REFRESH_DEBOUNCE_MS` (1000ms) applies; set 0
+    /// explicitly to re-check on every batch. Settable via the
+    /// `STREAMLING__DYNAMIC_TABLE_BACKEND__POSTGRES__CACHE_REFRESH_DEBOUNCE_MS`
+    /// environment variable.
+    #[serde(default)]
+    pub cache_refresh_debounce_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
@@ -188,6 +214,7 @@ impl std::fmt::Debug for PostgresDynamicTableBackendConfig {
             .field("max_connections", &self.max_connections)
             .field("dt_schema_name", &self.dt_schema_name)
             .field("cache_enabled", &self.cache_enabled)
+            .field("cache_refresh_debounce_ms", &self.cache_refresh_debounce_ms)
             .finish()
     }
 }
@@ -284,8 +311,30 @@ impl std::fmt::Debug for KafkaConfig {
 impl KafkaConfig {
     /// Returns schema registry settings if a schema registry URL is configured.
     /// Returns None if no schema registry URL is set (e.g., when using JSON format).
+    ///
+    /// Cached per (url, username, password) for the life of the process:
+    /// building one constructs a `reqwest::Client`, which parses the system CA
+    /// bundle, and every Kafka source asks for one at startup. `SrSettings`
+    /// clones around an `Arc`'d client, so the clones share a connection pool.
     pub fn get_schema_registry_settings(&self) -> Option<SrSettings> {
         let url = self.schema_registry_url.as_ref()?;
+        let key = (
+            url.clone(),
+            self.schema_registry_username.clone(),
+            self.schema_registry_password.clone(),
+        );
+
+        // Held across the build on purpose: sources are constructed
+        // concurrently, and a check-then-insert would let them all miss at
+        // once and build a client each.
+        let mut cache = SCHEMA_REGISTRY_SETTINGS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(settings) = cache.get(&key) {
+            return Some(settings.clone());
+        }
+
         let mut builder = SrSettings::new_builder(url.clone());
 
         if let (Some(username), Some(password)) = (
@@ -295,13 +344,19 @@ impl KafkaConfig {
             builder.set_basic_authorization(username, Some(password.as_str()));
         }
 
-        Some(
-            builder
-                .build()
-                .expect("failed to build schema registry settings from KafkaConfig"),
-        )
+        let settings = builder
+            .build()
+            .expect("failed to build schema registry settings from KafkaConfig");
+        cache.insert(key, settings.clone());
+        Some(settings)
     }
 }
+
+/// Process-wide cache behind [`KafkaConfig::get_schema_registry_settings`],
+/// keyed by (url, username, password).
+type SchemaRegistryKey = (String, Option<String>, Option<String>);
+static SCHEMA_REGISTRY_SETTINGS: OnceLock<Mutex<HashMap<SchemaRegistryKey, SrSettings>>> =
+    OnceLock::new();
 
 /// Compression codec applied by the Kafka sink's producer (librdkafka
 /// `compression.type`). Defaults to `lz4`, which is the historical built-in
@@ -444,7 +499,55 @@ pub struct ClickHouseSourceConfig {
     pub sort_key_range: Option<i64>,
 }
 
-pub type ClickHouseSinkConfig = ClickHouseConfig;
+/// Global defaults for every ClickHouse sink in the pipeline. Connection fields
+/// are flattened, so `clickhouse_sink.url` / `STREAMLING__CLICKHOUSE_SINK__URL`
+/// keep working unchanged.
+///
+/// `deny_unknown_fields` is deliberately absent: serde rejects it alongside
+/// `flatten`, since the flattened struct is what consumes the "unknown" keys.
+#[derive(Clone, Deserialize)]
+pub struct ClickHouseSinkConfig {
+    #[serde(flatten)]
+    pub connection: ClickHouseConfig,
+    /// Rows per INSERT for sinks that omit `batch_size` in the pipeline YAML.
+    /// The old fallback (the global `record_batch_size`, 1000) caps row-heavy
+    /// backfills well below what ClickHouse will accept; 100k measured ~12x
+    /// higher throughput on transaction-shaped data (STRM-6530). Override with
+    /// `STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE`.
+    pub batch_size: u32,
+    /// Flush interval for sinks that omit `batch_flush_interval`, as a
+    /// humantime duration (`"1s"`, `"500ms"`). Bounds tail latency for
+    /// low-volume pipelines that would never fill a `batch_size` batch.
+    /// Override with `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL`.
+    pub batch_flush_interval: String,
+}
+
+impl ClickHouseSinkConfig {
+    /// Parses `batch_flush_interval` into a `Duration`.
+    ///
+    /// Called during `AppConfig` load so a malformed value (typically a typo in
+    /// `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL`) fails startup with a
+    /// clear message, instead of surviving until the first ClickHouse sink is
+    /// planned.
+    pub fn parsed_batch_flush_interval(&self) -> anyhow::Result<Duration> {
+        humantime::parse_duration(&self.batch_flush_interval).with_context(|| {
+            format!(
+                "clickhouse_sink.batch_flush_interval must be a duration like \"1s\" or \"500ms\", got '{}'",
+                self.batch_flush_interval
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for ClickHouseSinkConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseSinkConfig")
+            .field("connection", &self.connection)
+            .field("batch_size", &self.batch_size)
+            .field("batch_flush_interval", &self.batch_flush_interval)
+            .finish()
+    }
+}
 
 impl std::fmt::Debug for ClickHouseConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -470,6 +573,41 @@ impl std::fmt::Debug for ClickHouseSourceConfig {
             .field("connection", &self.connection)
             .field("page_size", &self.page_size)
             .finish()
+    }
+}
+
+/// Tunables for the `file` source.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileSourceConfig {
+    /// How many discovered files are sampled to detect the Hive partition
+    /// layout. The sample has to agree on the layout, so a larger value catches
+    /// a mixed prefix at the cost of a longer listing before the first scan.
+    #[serde(
+        default = "default_partition_sample_size",
+        deserialize_with = "deserialize_partition_sample_size"
+    )]
+    pub partition_sample_size: NonZeroUsize,
+}
+
+fn default_partition_sample_size() -> NonZeroUsize {
+    NonZeroUsize::new(10).expect("10 is non-zero")
+}
+
+/// The config crate doesn't attach the key path to deserialization errors, so
+/// serde's own `NonZeroUsize` error wouldn't say which setting is wrong.
+fn deserialize_partition_sample_size<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    NonZeroUsize::new(usize::deserialize(deserializer)?)
+        .ok_or_else(|| D::Error::custom("file_source.partition_sample_size must be at least 1"))
+}
+
+impl Default for FileSourceConfig {
+    fn default() -> Self {
+        Self {
+            partition_sample_size: default_partition_sample_size(),
+        }
     }
 }
 
@@ -688,21 +826,6 @@ pub struct WasmScriptConfig {
     /// compiled into the binary is used.
     #[serde(default)]
     pub runtime_wasm_file_path: Option<String>,
-    /// Number of WASM plugin instances in the pool for concurrent processing.
-    /// Higher values allow more concurrent batch processing but use more memory.
-    /// Default is 4.
-    #[serde(default = "default_wasm_parallelism")]
-    pub parallelism: usize,
-    /// Minimum number of rows to accumulate before processing.
-    /// Smaller batches are combined until this threshold is reached.
-    /// Set to 0 to disable accumulation and process each batch immediately.
-    /// Default is 0 (disabled).
-    #[serde(default)]
-    pub batch_size: usize,
-}
-
-fn default_wasm_parallelism() -> usize {
-    4
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -806,6 +929,8 @@ pub struct AppConfig {
     pub kafka_sink: KafkaConfig,
     pub clickhouse_source: ClickHouseSourceConfig,
     pub clickhouse_sink: ClickHouseSinkConfig,
+    #[serde(default)]
+    pub file_source: FileSourceConfig,
     pub print_sink: PrintSinkConfig,
     pub postgres_sink: PostgresSinkConfig,
     pub open_telemetry_metrics: OpenTelemetryMetricsConfig,
@@ -837,6 +962,40 @@ pub struct AppConfig {
     /// Set via STREAMLING__JOB_MODE env var by streamling-agent when `job: true`.
     #[serde(default)]
     pub job_mode: bool,
+    /// How a graceful shutdown treats in-flight data. Set via
+    /// STREAMLING__DRAIN_POLICY (`auto` | `drain` | `fast`).
+    #[serde(default)]
+    pub drain_policy: DrainPolicy,
+}
+
+/// Shutdown drain policy: whether a graceful shutdown fully drains and
+/// durably checkpoints the in-flight tail, or exits fast and lets the tail
+/// replay on restart.
+///
+/// The trade-off is duplicate-vs-latency, and it splits cleanly by topology:
+/// bounded work (job mode, hybrid backfills, bounded table/file scans) never
+/// restarts after completing, so its tail has no replay to recover it — it
+/// MUST drain. Plain streaming restarts by definition, so at-least-once
+/// replay covers its tail and the operator may prefer a fast exit (the
+/// duplicate window equals the drained tail, visible only on non-idempotent
+/// sinks).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DrainPolicy {
+    /// Derive from the topology: drain when the pipeline has bounded work
+    /// (job mode, or any hybrid / ClickHouse / bounded file source),
+    /// fast-exit for plain streaming.
+    #[default]
+    Auto,
+    /// Always drain: on shutdown, mint a terminal checkpoint so the drained
+    /// tail's offsets commit before exit and a restart does not replay it.
+    Drain,
+    /// Exit fast: skip the terminal checkpoint (source offsets stay
+    /// uncommitted; the drained tail replays on restart) and cap the plugin
+    /// flush wait. Sinks still flush what they consumed, scopes still drain,
+    /// and the consumer still unsubscribes — this is a clean exit 0, not a
+    /// kill. Ignored (with a warning) when the pipeline has bounded work.
+    Fast,
 }
 
 impl AppConfig {
@@ -920,6 +1079,7 @@ impl AppConfig {
             .state_backend
             .validate()
             .context("invalid state backend configuration")?;
+        app_config.clickhouse_sink.parsed_batch_flush_interval()?;
         Ok(app_config.apply_env_overrides())
     }
 
@@ -1146,6 +1306,135 @@ mod tests {
             .expect("prod sink connection must be populated from env");
         assert_eq!(prod.host.as_deref(), Some("prod.example.com"));
         assert_eq!(prod.db, None);
+    }
+
+    /// The embedded defaults are what every pipeline that omits `batch_size`
+    /// actually runs with, so pin them: silently reverting to the old
+    /// `record_batch_size` fallback (1000) would quietly re-cap backfills.
+    #[test]
+    fn clickhouse_sink_batch_defaults_come_from_embedded_config() {
+        let config = base_app_config();
+
+        assert_eq!(config.clickhouse_sink.batch_size, 100_000);
+        assert_eq!(config.clickhouse_sink.batch_flush_interval, "1s");
+        assert!(
+            humantime::parse_duration(&config.clickhouse_sink.batch_flush_interval).is_ok(),
+            "the shipped default must parse as a humantime duration, or every \
+             ClickHouse pipeline fails to plan"
+        );
+        // Flattening the connection must not shadow the connection fields.
+        assert_eq!(config.clickhouse_sink.connection.database, "default");
+    }
+
+    /// `batch_size` sits behind `#[serde(flatten)]`, and env vars arrive as
+    /// strings — the combination is exactly where config-rs coercion tends to
+    /// break, so exercise the documented override end to end.
+    #[test]
+    fn clickhouse_sink_batch_defaults_are_env_overridable() {
+        let _guard = env_guard();
+
+        let vars = [
+            ("STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE", "250000"),
+            ("STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL", "500ms"),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            AppConfig::load().expect("embedded defaults plus env overrides must load")
+        });
+
+        // SAFETY: see above.
+        unsafe {
+            for (name, value) in previous {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let config = result.expect("test body panicked");
+        assert_eq!(config.clickhouse_sink.batch_size, 250_000);
+        assert_eq!(config.clickhouse_sink.batch_flush_interval, "500ms");
+    }
+
+    /// A typo in the interval env var must fail startup, not survive until the
+    /// first ClickHouse sink is planned (which for a job-mode backfill can be
+    /// minutes of source setup later).
+    #[test]
+    fn clickhouse_sink_rejects_unparseable_batch_flush_interval_at_load() {
+        let _guard = env_guard();
+
+        let name = "STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL";
+        let previous = std::env::var(name).ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var(name, "1 fortnight");
+        }
+
+        let result = std::panic::catch_unwind(AppConfig::load);
+
+        // SAFETY: see above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let err = result
+            .expect("test body panicked")
+            .expect_err("an unparseable batch_flush_interval must fail the load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("batch_flush_interval") && rendered.contains("1 fortnight"),
+            "the error must name the field and the offending value, got: {rendered}"
+        );
+    }
+
+    /// A zero sample reads no paths, so a Hive-partitioned source would silently
+    /// lose its partition columns.
+    #[test]
+    fn file_source_rejects_zero_partition_sample_size_at_load() {
+        let _guard = env_guard();
+
+        let name = "STREAMLING__FILE_SOURCE__PARTITION_SAMPLE_SIZE";
+        let previous = std::env::var(name).ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var(name, "0");
+        }
+
+        let result = std::panic::catch_unwind(AppConfig::load);
+
+        // SAFETY: see above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let err = result
+            .expect("test body panicked")
+            .expect_err("a zero partition_sample_size must fail the load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("partition_sample_size"),
+            "the error must name the field, got: {rendered}"
+        );
     }
 
     /// Verifies the full path: STREAMLING__HTTP_SECRET_HEADER__* and STREAMLING__HTTP_SECRET_VALUE__* env

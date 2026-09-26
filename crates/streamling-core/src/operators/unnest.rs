@@ -146,7 +146,11 @@ impl DisplayAs for StreamingUnnestExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "UnnestExec")
+                write!(
+                    f,
+                    "UnnestExec: partitions={}",
+                    self.properties().output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "")

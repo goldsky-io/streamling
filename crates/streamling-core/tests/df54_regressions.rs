@@ -82,7 +82,7 @@ fn projection_pushdown_must_not_elide_wrapping_exec() {
 
 #[test]
 fn leaf_expression_extraction_is_disabled() {
-    let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new()).unwrap();
+    let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
     let state = sm.session_state();
     assert!(
         !state

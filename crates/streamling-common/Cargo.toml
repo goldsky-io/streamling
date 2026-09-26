@@ -1,6 +1,6 @@
 [package]
 name = "streamling-common"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90.0"
 description = "Shared types, formats, and utilities for Streamling."
@@ -19,6 +19,8 @@ arrow-json.workspace = true
 arrow-avro.workspace = true
 
 # Logging
+streamling-retry.workspace = true
+
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

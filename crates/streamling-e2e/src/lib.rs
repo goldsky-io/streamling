@@ -442,11 +442,22 @@ impl TestContext {
 
     /// Create an additional Kafka topic for use in tests (e.g., for sink output)
     pub async fn create_kafka_topic(&self, topic_suffix: &str) -> Result<KafkaResource> {
+        self.create_kafka_topic_with_partitions(topic_suffix, 1)
+            .await
+    }
+
+    /// Create an additional Kafka topic with `partitions` partitions.
+    pub async fn create_kafka_topic_with_partitions(
+        &self,
+        topic_suffix: &str,
+        partitions: i32,
+    ) -> Result<KafkaResource> {
         let topic = format!("test_{}_{}", &self.test_id[..8], topic_suffix);
-        KafkaResource::new(
+        KafkaResource::new_with_partitions(
             &self.config.kafka_broker,
             &self.config.schema_registry_url,
             &topic,
+            partitions,
         )
         .await
     }
@@ -529,7 +540,26 @@ impl TestContext {
         opts: PipelineOpts,
         signal_after: std::time::Duration,
         exit_deadline: std::time::Duration,
-    ) -> Result<ExitStatus> {
+    ) -> Result<(ExitStatus, String)> {
+        self.run_pipeline_with_sigterm_when(
+            pipeline_yaml,
+            opts,
+            tokio::time::sleep(signal_after),
+            exit_deadline,
+        )
+        .await
+    }
+
+    /// Like [`Self::run_pipeline_with_sigterm`], but signals once `signal_when`
+    /// resolves. Wait on the pipeline's observed progress whenever a fixed delay
+    /// would stop it somewhere else on a faster machine.
+    pub async fn run_pipeline_with_sigterm_when(
+        &self,
+        pipeline_yaml: &str,
+        opts: PipelineOpts,
+        signal_when: impl std::future::Future<Output = ()>,
+        exit_deadline: std::time::Duration,
+    ) -> Result<(ExitStatus, String)> {
         let pipeline_path = self.temp_dir.path().join("pipeline.yaml");
         std::fs::write(&pipeline_path, pipeline_yaml)?;
 
@@ -542,11 +572,11 @@ impl TestContext {
         }
         env_vars.extend(opts.extra_env);
 
-        streamling::run_streamling_with_sigterm(
+        streamling::run_streamling_with_sigterm_when(
             &pipeline_path,
             self.config.streamling_bin.as_deref(),
             &env_vars,
-            signal_after,
+            signal_when,
             exit_deadline,
         )
         .await

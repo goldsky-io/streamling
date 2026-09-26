@@ -4,7 +4,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -18,14 +18,14 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
-use streamling_core::checkpoints::channels::send;
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
-    process_checkpoint_acks,
+    extract_checkpoint_messages, now_ms, process_checkpoint_acks,
 };
 use streamling_core::data::COLUMN_NAME_OP;
+use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
@@ -74,7 +74,9 @@ pub fn clear_memory_sink(sink_name: &str) {
 pub struct MemorySink {
     storage: MemorySinkStorage,
     num_records_before_stop: Option<u64>, // for integration tests only!
-    source_name: String,                  // for SourceComplete message
+    /// Global `num_records_before_stop` progress across the concurrent
+    /// per-partition `write_all` streams (`ParallelSinkExec`).
+    rows_received: AtomicU64,
     schema: SchemaRef,
     metric_metadata_id: String,
 }
@@ -83,14 +85,13 @@ impl MemorySink {
     fn new(
         storage: MemorySinkStorage,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         schema: SchemaRef,
         metric_metadata_id: String,
     ) -> Self {
         Self {
             storage,
             num_records_before_stop,
-            source_name,
+            rows_received: AtomicU64::new(0),
             schema,
             metric_metadata_id,
         }
@@ -119,6 +120,10 @@ impl DataSink for MemorySink {
             let arrival_time_ms = now_ms();
             let row_count_in_batch = batch.num_rows();
             row_count += row_count_in_batch;
+            let total_received = self
+                .rows_received
+                .fetch_add(row_count_in_batch as u64, Ordering::SeqCst)
+                + row_count_in_batch as u64;
 
             // Store the batch in memory
             let ack_start = Instant::now();
@@ -147,25 +152,23 @@ impl DataSink for MemorySink {
                 &sink_id,
             );
 
+            // Compare against the global received count so the stop threshold
+            // stays global across the concurrent per-partition streams.
             if let Some(num_records_before_stop) = self.num_records_before_stop
-                && row_count >= num_records_before_stop as usize
-                && !(num_records_before_stop == 0 && row_count == 0)
+                && total_received >= num_records_before_stop
+                && !(num_records_before_stop == 0 && total_received == 0)
             {
-                // Notify the coordinator (and sources) that the sink has received the expected rows
-                let _ = send(
-                    CHECKPOINT_COORDINATOR_CHANNEL,
-                    CheckpointMessage::SourceComplete(self.source_name.clone()),
-                );
+                // Record-limit reached: request process-wide graceful shutdown
+                // so every source drains and ends its stream — the same path
+                // SIGTERM takes (test-only mode).
+                streamling_core::shutdown::request_shutdown();
                 break;
             }
         }
         // If running in test mode and the stream ended before reaching the limit,
         // notify the coordinator so sources waiting on completion can finish.
         if self.num_records_before_stop.is_some() {
-            let _ = send(
-                CHECKPOINT_COORDINATOR_CHANNEL,
-                CheckpointMessage::SourceComplete(self.source_name.clone()),
-            );
+            streamling_core::shutdown::request_shutdown();
         }
         Ok(row_count as u64)
     }
@@ -194,7 +197,6 @@ pub struct MemoryTableProvider {
     schema: SchemaRef,
     storage: MemorySinkStorage,
     num_records_before_stop: Option<u64>,
-    source_name: String,
     exclude_gs_op: bool,
     metric_metadata_id: String,
     telemetry: Option<Telemetry>,
@@ -204,7 +206,6 @@ impl MemoryTableProvider {
     pub fn new(
         schema: SchemaRef,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         sink_name: String,
         metric_metadata_id: String,
         telemetry: Option<Telemetry>,
@@ -212,7 +213,6 @@ impl MemoryTableProvider {
         Self::new_with_options(
             schema,
             num_records_before_stop,
-            source_name,
             sink_name,
             false,
             metric_metadata_id,
@@ -223,7 +223,6 @@ impl MemoryTableProvider {
     pub fn new_with_options(
         schema: SchemaRef,
         num_records_before_stop: Option<u64>,
-        source_name: String,
         sink_name: String,
         exclude_gs_op: bool,
         metric_metadata_id: String,
@@ -241,7 +240,6 @@ impl MemoryTableProvider {
             schema,
             storage,
             num_records_before_stop,
-            source_name,
             exclude_gs_op,
             metric_metadata_id,
             telemetry,
@@ -310,7 +308,6 @@ impl TableProvider for MemoryTableProvider {
         let memory_sink = Arc::new(MemorySink::new(
             self.storage.clone(),
             self.num_records_before_stop,
-            self.source_name.clone(),
             final_input.schema(),
             self.metric_metadata_id.clone(),
         ));
@@ -320,10 +317,10 @@ impl TableProvider for MemoryTableProvider {
             None,
             self.telemetry.as_ref(),
         ));
-        Ok(Arc::new(DataSinkExec::new(
+        Ok(Arc::new(ParallelSinkExec::new(
             final_input,
             telemetry_data_sink,
-            None,
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
         )))
     }
 }

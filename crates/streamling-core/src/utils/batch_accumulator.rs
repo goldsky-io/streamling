@@ -313,9 +313,26 @@ pub fn merge_batches(
     }
 }
 
+/// How far to shift one stream's flush timer so that accumulators created
+/// together — one per partition, or one per fan-out sink — spread their flushes
+/// evenly across the interval instead of firing on the same tick.
+///
+/// `tokio::time::interval` is anchored to creation time, not to the last flush,
+/// so without this every stream started at the same moment keeps flushing on the
+/// same grid for the life of the job. Each flush merges, copies and serializes a
+/// full `batch_size` batch, so simultaneous flushes stack those peaks into one
+/// memory spike.
+fn flush_stagger(interval: Duration, position: usize, total: usize) -> Duration {
+    if total <= 1 || position >= total {
+        return Duration::ZERO;
+    }
+    interval.mul_f64(position as f64 / total as f64)
+}
+
 pub struct AsyncBatchAccumulator {
     accumulator: BatchAccumulator,
     batch_flush_interval: Option<Duration>,
+    flush_stagger: Duration,
     name: String,
 }
 
@@ -324,12 +341,24 @@ impl AsyncBatchAccumulator {
         Self {
             accumulator: BatchAccumulator::new(batch_size, batch_flush_interval),
             batch_flush_interval,
+            flush_stagger: Duration::ZERO,
             name: String::new(),
         }
     }
 
     pub fn with_name(mut self, name: String) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Offsets this stream's flush timer by its share of the interval, so
+    /// concurrent streams don't flush in lockstep — see [`flush_stagger`].
+    /// `position` is this stream's index among `total` streams sharing the sink.
+    pub fn with_flush_stagger(mut self, position: usize, total: usize) -> Self {
+        self.flush_stagger = self
+            .batch_flush_interval
+            .map(|interval| flush_stagger(interval, position, total))
+            .unwrap_or_default();
         self
     }
 
@@ -370,14 +399,26 @@ impl AsyncBatchAccumulator {
             // Macro for processing a single batch from the input stream
             macro_rules! handle_batch {
                 ($batch:expr) => {
-                    if let Some(batches) = self.accumulator.push($batch) {
+                    let batch = $batch;
+                    // A batch carrying checkpoint messages drains the accumulator
+                    // rather than waiting for `batch_size` rows or a flush
+                    // interval that may not be configured at all. The source that
+                    // sent the marker can hold its stream open until the epoch
+                    // finalizes, so holding it back here deadlocks the pipeline
+                    // instead of merely delaying a checkpoint. Markers arrive once
+                    // an epoch, so the partial flush costs next to nothing.
+                    let carries_checkpoint =
+                        !extract_checkpoint_messages(batch.schema().metadata()).is_empty();
+                    if let Some(batches) = self.accumulator.push(batch) {
                         yield_merged!(batches);
-                        while self.accumulator.should_flush_by_size() {
-                            if let Some(batches) = self.accumulator.flush() {
-                                yield_merged!(batches);
-                            } else {
-                                break;
-                            }
+                    }
+                    while (carries_checkpoint && !self.accumulator.is_empty())
+                        || self.accumulator.should_flush_by_size()
+                    {
+                        if let Some(batches) = self.accumulator.flush() {
+                            yield_merged!(batches);
+                        } else {
+                            break;
                         }
                     }
                 };
@@ -385,7 +426,10 @@ impl AsyncBatchAccumulator {
 
             if let Some(interval) = self.batch_flush_interval {
                 // Time + size based flushing
-                let mut timer = tokio::time::interval(interval);
+                let mut timer = tokio::time::interval_at(
+                    tokio::time::Instant::now() + self.flush_stagger,
+                    interval,
+                );
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
@@ -952,6 +996,111 @@ mod tests {
             .expect("Batch should not be an error");
 
         assert_eq!(first_batch.num_rows(), 5);
+    }
+
+    #[test]
+    fn test_flush_stagger_spreads_streams_across_the_interval() {
+        let interval = Duration::from_secs(10);
+
+        assert_eq!(flush_stagger(interval, 0, 3), Duration::ZERO);
+        assert_eq!(flush_stagger(interval, 1, 3), interval.mul_f64(1.0 / 3.0));
+        assert_eq!(flush_stagger(interval, 2, 3), interval.mul_f64(2.0 / 3.0));
+
+        // A lone stream has nothing to spread against, and an out-of-range
+        // position must not shift the timer past the interval.
+        assert_eq!(flush_stagger(interval, 0, 1), Duration::ZERO);
+        assert_eq!(flush_stagger(interval, 3, 3), Duration::ZERO);
+        assert_eq!(flush_stagger(interval, 0, 0), Duration::ZERO);
+    }
+
+    /// Without staggering, every accumulator started together flushes on the
+    /// same grid and their merge/copy/encode peaks stack. Position 1 of 2 must
+    /// shift this stream's grid by half an interval.
+    #[tokio::test]
+    async fn test_flush_stagger_shifts_the_time_flush_grid() {
+        let interval = Duration::from_millis(200);
+        let accumulator =
+            AsyncBatchAccumulator::new(1_000_000, Some(interval)).with_flush_stagger(1, 2);
+
+        // One small batch, then silence: only the timer can flush it.
+        let input = Box::pin(stream::unfold(0, |state| async move {
+            match state {
+                0 => Some((Ok(create_test_batch(5)), 1)),
+                _ => {
+                    sleep(Duration::from_secs(10)).await;
+                    None
+                }
+            }
+        }));
+        let mut output = Box::pin(accumulator.process_stream(input));
+
+        // Unstaggered this flushes at one interval (200ms); offset by half an
+        // interval its first flush cannot land before 300ms.
+        assert!(
+            timeout(Duration::from_millis(250), output.next())
+                .await
+                .is_err(),
+            "staggered stream flushed on the unstaggered grid"
+        );
+
+        let batch = timeout(Duration::from_secs(2), output.next())
+            .await
+            .expect("staggered flush must still arrive one interval after the offset")
+            .expect("stream should produce a batch")
+            .expect("batch should not be an error");
+        assert_eq!(batch.num_rows(), 5);
+    }
+
+    /// With no flush interval there is no timer to move a marker along, so a
+    /// batch carrying one has to drain the accumulator as it arrives. The source
+    /// that sent it can hold its stream open until the epoch finalizes, so
+    /// waiting here for `batch_size` rows that never come deadlocks the pipeline
+    /// — which is what a `script` transform with `batch_size` and no interval hit.
+    #[tokio::test]
+    async fn test_async_accumulator_flushes_checkpoint_batches_without_a_timer() {
+        use crate::checkpoints::checkpoint_management::{
+            CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+        };
+        use crate::utils::batch::enrich_batch_with_metadata;
+
+        // A batch size far above the rows pushed: nothing but the marker can
+        // flush them.
+        let accumulator = AsyncBatchAccumulator::new(1000, None);
+
+        let mut metadata = std::collections::HashMap::new();
+        enrich_batch_metadata_with_checkpoints(
+            &mut metadata,
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(7),
+                created_at_ms: 1000,
+            }],
+        );
+        let checkpoint_batch = enrich_batch_with_metadata(create_test_batch(0), metadata).unwrap();
+
+        // The input never ends, so the end-of-stream flush cannot be what
+        // delivers the marker.
+        let input = Box::pin(
+            stream::iter(vec![Ok(create_test_batch(3)), Ok(checkpoint_batch)])
+                .chain(stream::pending()),
+        );
+        let mut output_stream = Box::pin(accumulator.process_stream(input));
+
+        let flushed = timeout(Duration::from_millis(500), output_stream.next())
+            .await
+            .expect("a marker must flush without waiting for more rows")
+            .expect("Stream should produce at least one batch")
+            .expect("Batch should not be an error");
+
+        assert_eq!(
+            flushed.num_rows(),
+            3,
+            "the rows accumulated before the marker must go downstream with it"
+        );
+        assert_eq!(
+            extract_checkpoint_messages(flushed.schema().metadata()).len(),
+            1,
+            "the marker must ride the flushed batch"
+        );
     }
 
     #[tokio::test]

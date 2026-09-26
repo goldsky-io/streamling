@@ -465,13 +465,15 @@ sources:
       poll_interval: 10s   # optional; defaults to 5s
 ```
 
+`parallelism` reads newly discovered files across that many output partitions (default 1), which transforms and sinks inherit. The partitions share one queue of discovered files and one listing per `poll_interval`; rows from different files interleave across partitions.
+
 **Discovery semantics & caveats (continuous mode).** Discovery is **polling-based** and tracked with a **scalar `last_modified` watermark** plus a small set of paths already ingested at that exact timestamp. Understand these limits before relying on it:
 
 - Each poll lists the path and ingests every file whose object `last_modified` is **greater than** the watermark, plus any file **sharing the watermark's exact timestamp** that hasn't been ingested yet — so new files landing in the same second the watermark sits on are not lost (common with second-granularity object-store mtimes). The watermark then advances to the newest `last_modified` seen, and its boundary set resets when a newer timestamp appears.
 - **Files with an older timestamp can be missed.** Any file that becomes visible with a `last_modified` **strictly below** the current watermark is skipped permanently — there is no per-file bookkeeping below the boundary.
 - **Updated files are reprocessed.** A rewritten file is re-ingested if its new `last_modified` reaches or exceeds the watermark. Reprocessed rows are emitted as inserts (`_gs_op = 'i'`) at the moment.
 - **Deletions are not detected** — removing a file has no effect on already-ingested data.
-- **At-least-once across restarts.** The watermark (and its boundary set) is persisted to the state backend only on a checkpoint **finalize** (mirroring the Kafka source). On restart the source reloads the last finalized watermark and re-reads any files from polls that had not finalized, so downstream may see duplicates (deduplicated by `primary_key` + an upsert sink).
+- **At-least-once across restarts.** The watermark (and its boundary set) is persisted to the state backend only on a checkpoint **finalize** (mirroring the Kafka source). On restart the source reloads the last finalized watermark and re-reads any files that had not finalized, so downstream may see duplicates (deduplicated by `primary_key` + an upsert sink). Partitions finish files out of order, so the watermark advances only over files committed in `(last_modified, path)` order; files committed past one still being read are persisted alongside it and skipped on restart.
 - Idle polls emit empty heartbeat batches so checkpoint markers keep propagating even when no new files arrive.
 
 For guaranteed no-miss discovery, ensure new data always lands as immutable, newly-named files whose `last_modified` never goes backwards (atomic writes), or use **bounded** mode for one-shot reads.
@@ -880,6 +882,7 @@ The ClickHouse sink writes records to a ClickHouse table over the HTTP interface
 - **Upsert Semantics**: INSERT/UPDATE/DELETE operations are derived from the `_gs_op` column (see `Upsert Semantics` section below). With `append_only_mode: true` (the default), the sink targets a `ReplacingMergeTree(insert_time, is_deleted)` table and derives the `is_deleted`/`insert_time` columns automatically. With `append_only_mode: false`, it uses `INSERT` for upserts and `ALTER TABLE ... DELETE` for deletes.
 - **Compression**: INSERT request bodies are compressed with zstd by default. gzip and lz4 are also available. The global default comes from `clickhouse_sink.compression`/`clickhouse_sink.compression_level` and can be overridden per sink with the `compression` and `compression_level` fields.
 - **Deduplication**: each batch is collapsed to the latest row per `primary_key` before writing. Set `deduplicate: false` for append-only tables whose rows are deltas rather than states (e.g. `SummingMergeTree`) — see `Batch Deduplication` below.
+- **Batching**: `batch_size` rows are accumulated per INSERT, flushed early after `batch_flush_interval`. Both are optional per sink and fall back to `clickhouse_sink.batch_size` (100000) and `clickhouse_sink.batch_flush_interval` (`1s`). Larger batches dominate ClickHouse INSERT throughput — 100k rows measured ~12x the rows/s of a 1k batch on row-heavy backfills — so lower them only for latency-sensitive or memory-constrained pipelines. `parallelism` splits each batch into that many concurrent INSERTs of `batch_size / parallelism` rows.
 
 Sample configuration:
 
@@ -903,6 +906,8 @@ sinks:
 | `STREAMLING__CLICKHOUSE_SINK__DATABASE` | `default` | Database name |
 | `STREAMLING__CLICKHOUSE_SINK__COMPRESSION` | `zstd` | Wire compression for INSERTs (`none`, `gzip`, `zstd`, or `lz4`); the per-sink `compression` field overrides it |
 | `STREAMLING__CLICKHOUSE_SINK__COMPRESSION_LEVEL` | `6` | gzip compression level (0–9); ignored unless compression resolves to `gzip` |
+| `STREAMLING__CLICKHOUSE_SINK__BATCH_SIZE` | `100000` | Rows per INSERT for sinks that omit `batch_size`; the per-sink field overrides it |
+| `STREAMLING__CLICKHOUSE_SINK__BATCH_FLUSH_INTERVAL` | `1s` | Flush interval for sinks that omit `batch_flush_interval`; the per-sink field overrides it |
 
 ## Dynamic Tables
 
@@ -992,6 +997,13 @@ transforms:
     backend_type: Postgres
     backend_entity_name: persistent_data
     time_column: updated_at
+    # Optional: how long to trust the cache before re-checking table freshness
+    # (`SELECT MAX(time_column)`). When omitted (and unset globally), a 1000ms
+    # default applies; 0 re-checks on every batch — one database round trip per
+    # batch. Raising it trades staleness for round trips: rows written by OTHER
+    # writers may be missed for up to this long, while this pipeline's own
+    # writes stay visible immediately.
+    cache_refresh_debounce_ms: 5000
 ```
 
 The cache is off by default and is used only when both settings are present. The initial lookup
@@ -999,6 +1011,10 @@ loads the full table through bounded PostgreSQL cursor pages. Each later `dynami
 batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Streamling
 creates an index on the time column for tables it creates; add that index manually only for
 pre-existing tables Streamling did not create.
+
+Configs that omit the setting entirely — including ones written before it existed — get the
+built-in 1000ms default on upgrade. Set `cache_refresh_debounce_ms: 0` (globally or per
+transform) to restore the pre-debounce re-check-on-every-batch behavior.
 
 PostgreSQL dynamic tables are append-only when the in-memory cache is enabled. Updating or deleting
 existing membership, including removals, is not supported in this mode. Keeping `time_column` current

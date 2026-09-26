@@ -5,6 +5,7 @@
 //! - UNION query handling
 //! - Flink-compatible string functions
 //! - SQL filter metrics
+//! - Multi-operator SQL subtree df_-prefixed metrics (unnest)
 //!
 //! Ported from crates/streamling/tests/pipeline.rs
 
@@ -467,6 +468,190 @@ sinks:
         output_rows.is_ok(),
         "Should have output rows metric for sql_transform: {:?}",
         output_rows
+    );
+}
+
+/// SQL transform `elapsed_compute` is the DataFusion subtree **delta** path
+/// (wall-clock around `next().await` is suppressed when the SQL plan exposes
+/// metrics). Must exceed the 1ms series seed so this fails if only the seed
+/// or wrapping idle-wait were recorded.
+#[tokio::test]
+async fn test_sql_transform_elapsed_compute_emitted() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus should be available");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Enough rows of a CPU-ish projection that DataFusion's elapsed_compute
+    // on the SQL subtree exceeds the 1ms per-node series seed.
+    let records = create_test_records(50);
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    primary_key: id
+
+transforms:
+  sql_transform:
+    type: sql
+    sql: "SELECT id, md5(repeat(data, 8000)) AS h, _gs_op FROM kafka_source"
+    primary_key: id
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: sql_transform
+"#,
+        topic = ctx.kafka_topic
+    );
+
+    let _status = ctx
+        .run_pipeline_with_opts(&pipeline, PipelineOpts::new().record_limit(50))
+        .await
+        .expect("Pipeline should complete successfully");
+
+    use streamling_e2e::resources::PrometheusResource;
+    let elapsed_query =
+        PrometheusResource::elapsed_compute_query("sql_transform", Some(&ctx.test_id));
+
+    // Seed records 1ms; the compute-bound `md5(repeat(...))` projection is
+    // SQL subtree elapsed_compute (WrappingExec suppresses wall-clock idle-wait
+    // when DF metrics exist). Require a strictly larger sum so this fails if
+    // we only ever emit the seed.
+    let elapsed = prometheus
+        .wait_for_metric_at_least(&elapsed_query, 2, 15, 500)
+        .await;
+    assert!(
+        elapsed.is_ok(),
+        "sql_transform elapsed_compute must exceed the 1ms series seed via subtree deltas (wall-clock suppressed for SQL): {:?}",
+        elapsed
+    );
+
+    // Histogram sample count must stay small: seed (1) + per-batch *deltas*,
+    // not seed + wall-clock-per-batch + deltas. 50 rows in default batches
+    // plus seed is well under a wall-clock-per-row inflation.
+    let count_query = format!(
+        "streamling_elapsed_compute_milliseconds_count{{id=\"sql_transform\",instance=\"{}\"}}",
+        ctx.test_id
+    );
+    let sample_count = prometheus
+        .query_count(&count_query)
+        .await
+        .expect("query elapsed_compute count")
+        .expect("elapsed_compute _count series must exist after seed + compute");
+    assert!(
+        sample_count < 50,
+        "SQL elapsed_compute sample count {sample_count} looks like wall-clock-per-batch; expected seed + subtree deltas only ({count_query})"
+    );
+}
+
+/// Multi-operator SQL subtree (filter + make_array projection + unnest) exercises
+/// the `df_`-prefixed recording path. JOIN SQL is unsupported (`sql_parse` /
+/// bigint preprocessor reject it); `StreamingUnnestExec` already emits named
+/// Count metrics (`input_rows`, `input_batches`) which export as `streamling_df_*`.
+/// Same unnest/`make_array` shape as the checkpoint e2e.
+#[tokio::test]
+async fn test_sql_unnest_emits_df_prefixed_subtree_metrics() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus should be available");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Same CPU-ish projection as `test_sql_transform_elapsed_compute_emitted`:
+    // a cheap unnest alone can stay at the 1ms series seed on fast runners
+    // (CI flake: Timeout waiting for elapsed_compute to reach 2).
+    let records = create_test_records(50);
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    primary_key: id
+
+transforms:
+  sql_unnest:
+    type: sql
+    sql: "SELECT id, md5(repeat(item, 8000)) AS h, _gs_op FROM (SELECT id, unnest(make_array(data, data)) AS item, _gs_op FROM kafka_source WHERE block > 0) t"
+    primary_key: id
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: sql_unnest
+"#,
+        topic = ctx.kafka_topic
+    );
+
+    // 50 source rows × 2 unnest elements; RECORD_BATCH_SIZE=1 so UnnestExec
+    // records per-row Count metrics instead of one fat batch.
+    let _status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(100)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+        )
+        .await
+        .expect("Pipeline should complete successfully");
+
+    use streamling_e2e::resources::PrometheusResource;
+    let elapsed_query = PrometheusResource::elapsed_compute_query("sql_unnest", Some(&ctx.test_id));
+    let elapsed = prometheus
+        .wait_for_metric_at_least(&elapsed_query, 2, 15, 500)
+        .await;
+    assert!(
+        elapsed.is_ok(),
+        "sql_unnest elapsed_compute must exceed the 1ms series seed: {:?}",
+        elapsed
+    );
+
+    // StreamingUnnestExec::input_rows is a named Count, exported as df_input_rows.
+    let df_input_rows = format!(
+        "streamling_df_input_rows_total{{id=\"sql_unnest\",instance=\"{}\"}}",
+        ctx.test_id
+    );
+    let rows = prometheus
+        .wait_for_metric_at_least(&df_input_rows, 1, 15, 500)
+        .await;
+    assert!(
+        rows.is_ok(),
+        "sql_unnest must export df_input_rows from the unnest operator (df_-prefixed subtree path): {:?}",
+        rows
     );
 }
 

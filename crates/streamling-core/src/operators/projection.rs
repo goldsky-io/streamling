@@ -41,9 +41,18 @@ pub struct StreamingProjectionExec {
     cache: Arc<PlanProperties>,
     /// Copy of the original DataFusion ProjectionExec for method delegation
     original_projection: ProjectionExec,
+    /// True when this projection belongs to an upstream source node and was
+    /// re-applied above the source's `WrappingExec` (see
+    /// `wrap_with_side_outputs_before_filter`). Marks a topology boundary for
+    /// downstream metric aggregation.
+    source_owned: bool,
 }
 
 impl StreamingProjectionExec {
+    /// NOTE: always resets `source_owned` to `false`. A rebuild path that
+    /// routes a source-owned projection through here silently drops the
+    /// topology boundary mark — callers must re-apply it via
+    /// [`Self::with_source_owned`] (see `wrap_with_side_outputs_before_filter`).
     pub fn from_original(original_projection: ProjectionExec) -> Result<Self> {
         Ok(Self {
             expr: original_projection
@@ -56,7 +65,28 @@ impl StreamingProjectionExec {
             metrics: ExecutionPlanMetricsSet::new(),
             cache: original_projection.properties().clone(),
             original_projection,
+            source_owned: false,
         })
+    }
+
+    /// Whether this projection is owned by an upstream source node
+    /// (re-applied above the source's `WrappingExec`); see the
+    /// `source_owned` field.
+    ///
+    /// Crate-internal: the mark is only set by
+    /// `wrap_with_side_outputs_before_filter` (and tests that model that path).
+    pub(crate) fn is_source_owned(&self) -> bool {
+        self.source_owned
+    }
+
+    /// Consume `self`, returning it marked as owned by an upstream source
+    /// node (see the `source_owned` field).
+    ///
+    /// Crate-internal: only `wrap_with_side_outputs_before_filter` should set
+    /// this mark (tests may model that path).
+    pub(crate) fn with_source_owned(mut self) -> Self {
+        self.source_owned = true;
+        self
     }
 
     /// The projection expressions
@@ -67,6 +97,12 @@ impl StreamingProjectionExec {
     /// The input plan
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+}
+
+impl crate::operators::TopologyBoundary for StreamingProjectionExec {
+    fn bounds_metric_aggregation(&self) -> bool {
+        self.is_source_owned()
     }
 }
 
@@ -87,7 +123,12 @@ impl DisplayAs for StreamingProjectionExec {
                     })
                     .collect();
 
-                write!(f, "ProjectionExec: expr=[{}]", expr.join(", "))
+                write!(
+                    f,
+                    "ProjectionExec: expr=[{}], partitions={}",
+                    expr.join(", "),
+                    self.properties().output_partitioning().partition_count()
+                )
             }
             DisplayFormatType::TreeRender => {
                 for (i, (e, alias)) in self.expr().iter().enumerate() {
@@ -135,7 +176,10 @@ impl ExecutionPlan for StreamingProjectionExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let new_projection = ProjectionExec::try_new(self.expr.clone(), children.swap_remove(0))?;
 
-        StreamingProjectionExec::from_original(new_projection).map(|e| Arc::new(e) as _)
+        StreamingProjectionExec::from_original(new_projection).map(|mut e| {
+            e.source_owned = self.source_owned;
+            Arc::new(e) as _
+        })
     }
 
     fn execute(
@@ -165,8 +209,22 @@ impl ExecutionPlan for StreamingProjectionExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let streaming_projection = StreamingProjectionExec::from_original(projection.clone())?;
-        let maybe_unified = try_unifying_projections(&streaming_projection, self)?;
+        // Never unify across a topology boundary: merging a source-owned
+        // projection with a downstream transform's projection would blend the
+        // source's expression cost into the transform's metrics (and drop the
+        // boundary mark). Keep the two projections stacked instead (the shared
+        // fallback arm below).
+        //
+        // NOTE: the production session replaces DataFusion's physical
+        // optimizer rules with `StreamlingPhysicalOptimizerRules` (see
+        // session.rs), so ProjectionPushdown never runs there. This guard is
+        // defense-in-depth for embedders and future rule-set changes.
+        let maybe_unified = if self.source_owned {
+            None
+        } else {
+            let streaming_projection = StreamingProjectionExec::from_original(projection.clone())?;
+            try_unifying_projections(&streaming_projection, self)?
+        };
         if let Some(new_plan) = maybe_unified {
             // To unify 3 or more sequential projections:
             remove_unnecessary_projections(new_plan).data().map(Some)
@@ -400,4 +458,28 @@ fn try_unifying_projections(
 /// An expression is considered trivial if it is either a `Column` or a `Literal`.
 fn is_expr_trivial(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.downcast_ref::<Column>().is_some() || expr.downcast_ref::<Literal>().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    #[test]
+    fn from_original_resets_source_owned() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let original = ProjectionExec::try_new(vec![(col, "id".to_string())], input).unwrap();
+        let marked = StreamingProjectionExec::from_original(original.clone())
+            .unwrap()
+            .with_source_owned();
+        assert!(marked.is_source_owned());
+        let reset = StreamingProjectionExec::from_original(original).unwrap();
+        assert!(
+            !reset.is_source_owned(),
+            "from_original always resets the topology-boundary mark"
+        );
+    }
 }

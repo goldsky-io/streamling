@@ -32,10 +32,11 @@ pub struct CheckpointEpoch(pub u64);
 /// Every Finalizer consumer MUST be idempotent and non-blocking, and MUST
 /// NEVER gate progress on receiving the Finalizer for one specific epoch:
 /// - Finalizers can be delivered more than once for the same epoch.
-/// - Finalizers can be SKIPPED entirely: the coordinator drops non-finalized
-///   timer epochs when a terminal checkpoint begins
-///   (`CheckpointControl::begin_terminal_checkpoint`), and a terminal epoch
-///   that never finalizes has its Finalizer withheld deliberately.
+/// - Finalizers can be SKIPPED entirely: a timer epoch still in flight when a
+///   terminal checkpoint begins is retained but may never collect its
+///   remaining acks (a completed source can no longer carry its marker), and
+///   a terminal epoch that never finalizes has its Finalizer withheld
+///   deliberately.
 /// - Commit/cleanup semantics must therefore be cumulative (offsets, current
 ///   state snapshots) or range-based (`<= N-1` truncation), so a later
 ///   Finalizer covers any skipped one.
@@ -64,11 +65,35 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Send an ack for `epoch` on behalf of `sink_id`.
+///
+/// The coordinator subscriber can exit before a sink's last stream does, so a
+/// failed send is logged rather than fatal — the pipeline is shutting down and
+/// there is nothing left to finalize.
+pub fn send_checkpoint_ack(epoch: CheckpointEpoch, sink_id: &str) {
+    if let Err(e) = send(
+        CHECKPOINT_COORDINATOR_CHANNEL,
+        CheckpointMessage::Ack {
+            epoch: epoch.clone(),
+            sink_id: sink_id.to_string(),
+        },
+    ) {
+        error!(
+            "failed to send checkpoint ack for epoch {} from sink '{}': {}",
+            epoch.0, sink_id, e
+        );
+    }
+}
+
 /// Process checkpoint messages from a batch: record arrival latency, send ack,
 /// and record sink flush time. This is the standard pattern used by all sinks.
 ///
 /// `arrival_time_ms` should be captured via `now_ms()` at the start of batch processing,
 /// before any flush work begins, to accurately measure marker propagation time.
+///
+/// When the sink writes several partition streams concurrently the ack is gated
+/// by [`report_marker_at_sink`], so the coordinator only sees the epoch once
+/// every stream has flushed it.
 pub fn process_checkpoint_acks(
     messages: Vec<CheckpointMessage>,
     arrival_time_ms: u64,
@@ -90,15 +115,11 @@ pub fn process_checkpoint_acks(
                 metric_metadata_id,
             );
             // Best-effort: during shutdown a source may have dropped its
-            // channel receiver already; a failed broadcast must not panic the
-            // sink mid-drain.
-            let _ = send(
-                CHECKPOINT_COORDINATOR_CHANNEL,
-                CheckpointMessage::Ack {
-                    epoch,
-                    sink_id: sink_id.to_string(),
-                },
-            );
+            // channel receiver already; `send_checkpoint_ack` logs instead of
+            // panicking so a failed broadcast can't kill the sink mid-drain.
+            if report_marker_at_sink(sink_id, epoch.clone()) {
+                send_checkpoint_ack(epoch, sink_id);
+            }
             metrics_recorder.record_time(
                 "checkpoint_sink_flush",
                 ack_start.elapsed(),
@@ -106,6 +127,159 @@ pub fn process_checkpoint_acks(
             );
         }
     }
+}
+
+/// Per-epoch bookkeeping for [`MarkerAligner`].
+#[derive(Debug, Default)]
+struct MarkerState {
+    copies: usize,
+    released: bool,
+}
+
+/// Aligns checkpoint markers arriving on several concurrent streams down to a
+/// single copy.
+///
+/// Streamling's correctness invariant is that **every stream carries at most one
+/// marker copy per epoch**: a sink acks an epoch as soon as it sees a marker, and
+/// the coordinator finalizes on the first ack per sink name. Any place where N
+/// streams merge into one — `StreamingCoalesceExec`, a `StreamingRepartitionExec`
+/// output, a sink writing N partitions — must therefore hold a marker back until
+/// every live input has delivered it, or the source commits offsets for data that
+/// is still in flight on the slower streams.
+///
+/// Alignment only ever *delays* a marker; data is never blocked, so at-least-once
+/// delivery is preserved.
+#[derive(Debug)]
+pub struct MarkerAligner {
+    live_inputs: usize,
+    /// Released epochs stay recorded so a late copy from a slower input is
+    /// absorbed rather than releasing the same epoch a second time. Entries are
+    /// pruned when the epoch is finalized.
+    epochs: BTreeMap<CheckpointEpoch, MarkerState>,
+    seen_finalizers: HashSet<u64>,
+    seen_source_completions: HashSet<String>,
+}
+
+impl MarkerAligner {
+    pub fn new(inputs: usize) -> Self {
+        Self {
+            live_inputs: inputs,
+            epochs: BTreeMap::new(),
+            seen_finalizers: HashSet::new(),
+            seen_source_completions: HashSet::new(),
+        }
+    }
+
+    /// Feed the messages observed on one input stream, returning the messages
+    /// that may now be forwarded downstream.
+    pub fn observe(&mut self, messages: Vec<CheckpointMessage>) -> Vec<CheckpointMessage> {
+        let mut released = Vec::new();
+        for message in messages {
+            match message {
+                CheckpointMessage::Marker {
+                    ref epoch,
+                    created_at_ms,
+                } => {
+                    let live = self.live_inputs;
+                    let state = self.epochs.entry(epoch.clone()).or_default();
+                    if state.released {
+                        continue;
+                    }
+                    state.copies += 1;
+                    if state.copies >= live.max(1) {
+                        state.released = true;
+                        released.push(CheckpointMessage::Marker {
+                            epoch: epoch.clone(),
+                            created_at_ms,
+                        });
+                    }
+                }
+                // A finalizer/completion is a broadcast notification rather than a
+                // per-stream barrier: forwarding the first copy is both necessary
+                // and sufficient.
+                CheckpointMessage::Finalizer(ref epoch) => {
+                    self.epochs.retain(|e, _| e.0 > epoch.0);
+                    if self.seen_finalizers.insert(epoch.0) {
+                        released.push(message);
+                    }
+                }
+                CheckpointMessage::SourceComplete(ref source) => {
+                    if self.seen_source_completions.insert(source.clone()) {
+                        released.push(message);
+                    }
+                }
+                CheckpointMessage::Ack { .. } => released.push(message),
+            }
+        }
+        released
+    }
+
+    /// Record that one input stream has ended. Its share of every pending epoch
+    /// counts as delivered, so epochs it would never contribute to are released.
+    pub fn input_done(&mut self) -> Vec<CheckpointMessage> {
+        self.live_inputs = self.live_inputs.saturating_sub(1);
+        let live = self.live_inputs.max(1);
+        let mut released = Vec::new();
+        for (epoch, state) in self.epochs.iter_mut() {
+            if !state.released && (state.copies >= live || self.live_inputs == 0) {
+                state.released = true;
+                released.push(CheckpointMessage::Marker {
+                    epoch: epoch.clone(),
+                    created_at_ms: now_ms(),
+                });
+            }
+        }
+        released
+    }
+}
+
+/// Tracks, per sink, how many concurrent write streams must flush an epoch
+/// before the sink acks it. See [`MarkerAligner`] for why this gate exists.
+static SINK_ACK_GATES: once_cell::sync::Lazy<Mutex<HashMap<String, MarkerAligner>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Declare that `sink_id` is written by `streams` concurrent partition streams.
+///
+/// Sinks that never register are treated as single-stream, which is exactly the
+/// ungated behaviour they had before.
+pub fn register_sink_streams(sink_id: &str, streams: usize) {
+    if streams <= 1 {
+        return;
+    }
+    SINK_ACK_GATES
+        .lock()
+        .insert(sink_id.to_string(), MarkerAligner::new(streams));
+}
+
+/// Report that one write stream of `sink_id` has flushed `epoch`. Returns true
+/// when this was the last stream outstanding and the ack should be sent.
+pub fn report_marker_at_sink(sink_id: &str, epoch: CheckpointEpoch) -> bool {
+    let mut gates = SINK_ACK_GATES.lock();
+    let Some(gate) = gates.get_mut(sink_id) else {
+        return true;
+    };
+    !gate
+        .observe(vec![CheckpointMessage::Marker {
+            epoch,
+            created_at_ms: now_ms(),
+        }])
+        .is_empty()
+}
+
+/// Report that one write stream of `sink_id` has finished, returning any epochs
+/// that become ackable because the stream will never report them itself.
+pub fn sink_stream_done(sink_id: &str) -> Vec<CheckpointEpoch> {
+    let mut gates = SINK_ACK_GATES.lock();
+    let Some(gate) = gates.get_mut(sink_id) else {
+        return Vec::new();
+    };
+    gate.input_done()
+        .into_iter()
+        .filter_map(|m| match m {
+            CheckpointMessage::Marker { epoch, .. } => Some(epoch),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -259,13 +433,14 @@ impl CheckpointControl {
     ///
     /// Known trade-off (multi-source completion): the FIRST completing source
     /// stops the timer producer for the whole pipeline, so branches that are
-    /// still producing get no further periodic checkpoints — their tail's
-    /// durability rides entirely on the shared terminal epoch. A crash in that
-    /// window replays those branches from their last finalized epoch
-    /// (at-least-once preserved; the window is bounded by job length). Keeping
-    /// per-branch timer checkpoints alive would require per-branch epoch
-    /// tracking in the coordinator — a larger redesign deliberately out of
-    /// scope here (see shutdown-investigation.md §5.4).
+    /// still producing get no further NEW periodic checkpoints — their tail's
+    /// durability rides on the last in-flight timer epoch (retained below so
+    /// it can still finalize off late acks) and then the shared terminal
+    /// epoch. A crash in that window replays those branches from their last
+    /// finalized epoch (at-least-once preserved; the window is bounded by job
+    /// length). Keeping per-branch timer checkpoints alive would require
+    /// per-branch epoch tracking in the coordinator — a larger redesign
+    /// deliberately out of scope here.
     pub fn begin_terminal_checkpoint(&self) -> CheckpointEpoch {
         self.terminal_started.store(true, Ordering::SeqCst);
 
@@ -278,20 +453,26 @@ impl CheckpointControl {
         if let Some(existing) = self.terminal_epoch.lock().clone() {
             return existing;
         }
-        // Drop any in-flight timer epochs. The source is done producing data,
-        // so their markers can no longer reach the sinks and they would never
-        // finalize. The terminal epoch is the only one that matters now.
+        // In-flight timer epochs are RETAINED alongside the terminal epoch
+        // (they used to be dropped here). Their markers were broadcast before
+        // terminal began and are still riding batches through the pipeline,
+        // so acks for them keep arriving — the subscriber's ack arm handles
+        // any epoch in this map, so a late-acked timer epoch still finalizes
+        // and its Finalizer still commits durable state (Kafka offsets,
+        // ClickHouse split state) for branches that are still producing.
+        // Dropping them threw that last periodic checkpoint away and widened
+        // the §5.4 replay window by up to one checkpoint interval per branch
+        // for no benefit.
         //
-        // Dropping a non-finalized epoch without broadcasting its Finalizer is
-        // safe: no consumer blocks waiting for a Finalizer — sinks ack Markers
-        // and treat Finalizers as best-effort commit/truncate signals, and the
-        // work those dropped epochs would have committed is re-covered by the
-        // terminal epoch's Finalizer. This also mirrors the timer producer,
-        // which has always cleared the previous epoch before inserting a new
-        // one.
+        // An epoch whose remaining markers can no longer reach a sink (the
+        // sink is fed only by the completed source) simply never finalizes:
+        // nothing waits on timer epochs — the run loop awaits only the
+        // terminal epoch — so the cost is a `checkpoint_epochs_failed` metric
+        // from the timeout checker, and `stop()` clears the map at teardown.
         //
-        // Audited consumers (all fire-and-forget; none matches an exact epoch
-        // in a way that can stall):
+        // Skipped Finalizers remain safe for every audited consumer (all
+        // fire-and-forget; none matches an exact epoch in a way that can
+        // stall):
         // - Kafka source: exact-match offset lookup with a silent no-op on
         //   miss; commits are cumulative, so the next finalized epoch covers
         //   any skipped one (bounded replay, never a wait).
@@ -302,7 +483,6 @@ impl CheckpointControl {
         //   whose contract requires idempotent, non-blocking handling.
         // Any FUTURE consumer must follow the same rule: never gate progress
         // on receiving the Finalizer for one specific epoch.
-        epochs.clear();
         let epoch_num = self.next_epoch.fetch_add(1, Ordering::SeqCst);
         let terminal = CheckpointEpoch(epoch_num);
         epochs.insert(
@@ -349,6 +529,39 @@ impl CheckpointControl {
             tokio::select! {
                 _ = self.finalized_notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
+    }
+
+    /// Wait for the terminal checkpoint on a source's completion path, returning
+    /// whether it finalized. Same ordering requirement as
+    /// [`Self::await_terminal_finalized`].
+    ///
+    /// How long to wait depends on WHY the source is completing:
+    /// - Shutdown requested (SIGTERM): the watchdog is armed, so the wait must
+    ///   be bounded under the shutdown budget.
+    /// - Natural job-mode completion: no deadline is running, and in a
+    ///   multi-source job the shared terminal epoch cannot finalize until the
+    ///   SLOWEST branch completes and its sinks ack — sibling skew can
+    ///   legitimately exceed any SIGTERM-sized budget. Wait until finalized or
+    ///   until a shutdown request arrives (then fall back to the bounded wait).
+    ///   A sink wedged forever with no shutdown request keeps the pipeline
+    ///   alive-but-stalled, exactly as an unacked epoch does on main; the
+    ///   operator-initiated SIGTERM then drains it under the budget.
+    pub async fn await_terminal_finalized_on_completion(&self) -> bool {
+        let mut shutdown = crate::shutdown::subscribe();
+        let finalize_timeout = crate::shutdown::terminal_checkpoint_finalize_timeout();
+        if *shutdown.borrow() {
+            return tokio::time::timeout(finalize_timeout, self.await_terminal_finalized())
+                .await
+                .is_ok();
+        }
+        tokio::select! {
+            _ = self.await_terminal_finalized() => true,
+            _ = shutdown.changed() => {
+                tokio::time::timeout(finalize_timeout, self.await_terminal_finalized())
+                    .await
+                    .is_ok()
             }
         }
     }
@@ -525,6 +738,9 @@ impl CheckpointCoordinator {
         let expected_sinks_sub = Arc::clone(&expected_sinks);
         let finalized_notify_sub = Arc::clone(&self.finalized_notify);
 
+        // Sanctioned: structured concurrency — the handle is stored on self
+        // and joined by `stop()`, which the run loop awaits under the budget.
+        #[allow(clippy::disallowed_methods)]
         let subscriber_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
 
@@ -680,6 +896,9 @@ impl CheckpointCoordinator {
         let expected_sinks_prod = Arc::clone(&expected_sinks);
         let terminal_started_prod = Arc::clone(&self.terminal_started);
 
+        // Sanctioned: structured concurrency — the handle is stored on self
+        // and joined by `stop()`, which the run loop awaits under the budget.
+        #[allow(clippy::disallowed_methods)]
         let producer_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
 
@@ -804,9 +1023,10 @@ impl CheckpointCoordinator {
                 let created_at_ms = now_ms();
                 // Mint and insert under the epochs lock, re-checking the terminal
                 // flag inside that same critical section. `begin_terminal_checkpoint`
-                // clears the map and inserts its own epoch under this lock, so this
-                // re-check guarantees we never clear the terminal epoch by racing a
-                // fresh timer epoch over it.
+                // sets the flag and inserts its epoch under this same lock
+                // (in-flight timer epochs are RETAINED, not cleared — late acks
+                // still finalize them), so this re-check guarantees a fresh
+                // timer epoch can never race in after the terminal epoch began.
                 let new_epoch = {
                     let mut epochs_guard = epochs.lock();
                     if terminal_started_prod.load(Ordering::SeqCst) {
@@ -888,6 +1108,9 @@ impl CheckpointCoordinator {
         // construct the coordinator with a small timeout.
         let check_interval = Duration::from_secs((self.timeout_sec / 2).clamp(1, 30));
 
+        // Sanctioned: structured concurrency — the handle is stored on self
+        // and joined by `stop()`, which the run loop awaits under the budget.
+        #[allow(clippy::disallowed_methods)]
         let timeout_handle = tokio::spawn(async move {
             let metrics_recorder = get_checkpoint_metrics_recorder();
             let poll_interval = Duration::from_millis(500); // Poll for shutdown frequently
@@ -957,6 +1180,29 @@ impl CheckpointCoordinator {
             let _ = handle.await;
         }
 
+        // A terminal epoch that never finalized is a broken drain contract —
+        // its offsets were not committed and the drained tail replays on
+        // restart. It is exempt from the timeout checker (by design), so
+        // without this sweep it failed without ever touching
+        // `checkpoint_epochs_failed`: on a fleet monitored through metrics, a
+        // shutdown that lost its tail looked purely successful. Only the
+        // terminal epoch is counted — ordinary in-flight timer epochs at
+        // teardown are routine (fast-exit leaves them uncommitted on purpose;
+        // the replayed tail covers them). The final flush in main() exports
+        // this before the process exits. Lock discipline: bind and drop the
+        // terminal_epoch guard BEFORE locking epochs (see
+        // is_terminal_finalized for why).
+        let terminal = self.terminal_epoch.lock().clone();
+        if let Some(epoch) = terminal
+            && !matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized))
+        {
+            warn!(
+                "Terminal checkpoint epoch {} never finalized before coordinator stop; recording it as failed (offsets stay uncommitted; the tail replays on restart)",
+                epoch.0
+            );
+            get_checkpoint_metrics_recorder().record_count("checkpoint_epochs_failed", 1);
+        }
+
         // The subscriber task has exited and dropped its receiver; remove the
         // now-dead sender from the global channel map so later sends don't fail
         // against it.
@@ -1013,6 +1259,122 @@ pub fn strip_checkpoint_messages(batch: &RecordBatch) -> RecordBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marker(epoch: u64) -> CheckpointMessage {
+        CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(epoch),
+            created_at_ms: 0,
+        }
+    }
+
+    fn epochs_of(messages: &[CheckpointMessage]) -> Vec<u64> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                CheckpointMessage::Marker { epoch, .. } => Some(epoch.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aligner_releases_a_marker_only_after_every_input_delivers_it() {
+        let mut aligner = MarkerAligner::new(2);
+        assert!(
+            aligner.observe(vec![marker(1)]).is_empty(),
+            "one of two inputs is not enough"
+        );
+        assert_eq!(
+            epochs_of(&aligner.observe(vec![marker(1)])),
+            vec![1],
+            "the second copy completes the epoch"
+        );
+    }
+
+    #[test]
+    fn aligner_absorbs_a_late_copy_of_an_already_released_epoch() {
+        let mut aligner = MarkerAligner::new(2);
+        aligner.observe(vec![marker(1)]);
+        assert_eq!(epochs_of(&aligner.observe(vec![marker(1)])), vec![1]);
+        // A third copy (e.g. from an input that ended and was re-counted) must
+        // not release the epoch a second time — that would break the
+        // "at most one copy per stream per epoch" invariant the sink ack relies on.
+        assert!(aligner.observe(vec![marker(1)]).is_empty());
+    }
+
+    #[test]
+    fn aligner_treats_an_ended_input_as_having_delivered() {
+        let mut aligner = MarkerAligner::new(2);
+        assert!(aligner.observe(vec![marker(7)]).is_empty());
+        assert_eq!(
+            epochs_of(&aligner.input_done()),
+            vec![7],
+            "an input that ends can no longer withhold an epoch"
+        );
+    }
+
+    #[test]
+    fn aligner_releases_later_epochs_at_the_reduced_input_count() {
+        let mut aligner = MarkerAligner::new(2);
+        aligner.input_done();
+        assert_eq!(
+            epochs_of(&aligner.observe(vec![marker(3)])),
+            vec![3],
+            "with one input left a single copy completes the epoch"
+        );
+    }
+
+    #[test]
+    fn aligner_forwards_finalizers_and_completions_once() {
+        let mut aligner = MarkerAligner::new(2);
+        let first = aligner.observe(vec![CheckpointMessage::Finalizer(CheckpointEpoch(1))]);
+        assert_eq!(first.len(), 1, "the first finalizer copy is forwarded");
+        assert!(
+            aligner
+                .observe(vec![CheckpointMessage::Finalizer(CheckpointEpoch(1))])
+                .is_empty(),
+            "a finalizer is a broadcast, not a barrier: later copies are dropped"
+        );
+
+        let complete = CheckpointMessage::SourceComplete("src".to_string());
+        assert_eq!(aligner.observe(vec![complete.clone()]).len(), 1);
+        assert!(aligner.observe(vec![complete]).is_empty());
+    }
+
+    #[test]
+    fn sink_gate_acks_once_every_stream_reported() {
+        let sink = "gate_test_sink";
+        register_sink_streams(sink, 2);
+        assert!(
+            !report_marker_at_sink(sink, CheckpointEpoch(1)),
+            "the first of two write streams must not ack"
+        );
+        assert!(
+            report_marker_at_sink(sink, CheckpointEpoch(1)),
+            "the last write stream releases the ack"
+        );
+    }
+
+    #[test]
+    fn sink_gate_releases_when_a_write_stream_finishes() {
+        let sink = "gate_test_sink_stream_done";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink(sink, CheckpointEpoch(4)));
+        assert_eq!(
+            sink_stream_done(sink),
+            vec![CheckpointEpoch(4)],
+            "a finished stream cannot report the epoch, so it is released"
+        );
+    }
+
+    #[test]
+    fn unregistered_sink_acks_immediately() {
+        assert!(
+            report_marker_at_sink("never_registered_sink", CheckpointEpoch(1)),
+            "single-stream sinks keep their ungated behaviour"
+        );
+    }
+
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Fields};
     use serial_test::serial;
@@ -1363,6 +1725,59 @@ mod tests {
             epochs.len(),
             1,
             "only the single terminal epoch should exist"
+        );
+    }
+
+    /// Regression: beginning the
+    /// terminal checkpoint used to CLEAR in-flight timer epochs, throwing away
+    /// the last periodic checkpoint of every still-running branch — late acks
+    /// hit "unknown epoch" and the epoch's Finalizer (which commits Kafka
+    /// offsets / ClickHouse split state) was never sent, widening the
+    /// crash-replay window by up to one checkpoint interval per branch.
+    /// In-flight epochs must survive terminal begin and still finalize.
+    #[test]
+    #[serial]
+    fn test_terminal_begin_retains_in_flight_timer_epochs() {
+        let coordinator = CheckpointCoordinator::with_timeout(300);
+        let timer_epoch = CheckpointEpoch(2042);
+
+        {
+            let mut expected = coordinator.expected_sinks.lock();
+            expected.insert("sink_a_retain".to_string());
+            expected.insert("sink_b_retain".to_string());
+        }
+        {
+            let mut epochs = coordinator.epochs.lock();
+            let mut acked_sinks = HashSet::new();
+            acked_sinks.insert("sink_b_retain".to_string());
+            epochs.insert(
+                timer_epoch.clone(),
+                EpochState::InProgress {
+                    acked_sinks,
+                    created_at: Instant::now(),
+                },
+            );
+        }
+
+        let control = coordinator.control();
+        let terminal = control.begin_terminal_checkpoint();
+
+        {
+            let epochs = coordinator.epochs.lock();
+            assert!(
+                epochs.contains_key(&timer_epoch),
+                "in-flight timer epoch must survive terminal begin"
+            );
+            assert!(epochs.contains_key(&terminal), "terminal epoch must exist");
+        }
+
+        // The retained epoch still finalizes when its outstanding sink
+        // completes (same for a late ack via the subscriber).
+        control.sink_completed("sink_a_retain");
+        let epochs = coordinator.epochs.lock();
+        assert!(
+            matches!(epochs.get(&timer_epoch), Some(EpochState::Finalized)),
+            "retained timer epoch must still finalize after terminal begin"
         );
     }
 
