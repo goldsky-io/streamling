@@ -2,33 +2,23 @@
 // bytes from the host, runs the user's `invoke(row)` function once per input
 // row, and writes the result back to the host.
 //
-// Two output paths, chosen by whether the "schema" config key is present:
-//
-// - Schema-aware (config key "schema" set): the host already knows every
-//   output field's name and type (a JSON list of `{name, type}`, sent by the
-//   operator when the pipeline declares `schema:`). This path always collects
-//   the same row-object `results` array the inferred path builds, then tries
-//   a JSON fast path: fill one plain array per declared column while checking
-//   that every column was returned by every row and every value's JS kind
-//   matches its declared type. When that holds, the columns serialize
-//   straight to a JSON string (`{"columns": {name: [values...]}, "num_rows":
-//   N}`) and `Host.outputString` writes it -- no Arrow table is built on the
-//   output side. Whenever a row omits a declared column, returns a value of
-//   the wrong kind, declares a non-scalar type, or the JSON would contain a
-//   lone surrogate, the fast path is skipped and the same `results` array
-//   runs through the inferred path's Arrow-table + IPC encoding instead, so
-//   the output byte-for-byte matches what running without a schema would
-//   produce for that batch.
-// - Inferred (no "schema" config key): the output schema isn't known ahead of
-//   time, so this path collects each returned row as an object, unions their
-//   keys, builds an Arrow table from the resulting columns, and encodes it to
-//   Arrow IPC file-format bytes via `Host.outputBytes`.
+// Runs the user function over every input row, collects the returned row
+// objects, and writes them as newline-delimited JSON (one JSON object per
+// output row) via `Host.outputString`. The Rust side knows the output schema
+// (declared `schema:` or the input schema) and decodes this JSON directly
+// against it with arrow_json.
 //
 // `patch_text_decoder.js` is imported first so its `TextDecoder.prototype.decode`
 // patch is installed before flechette's own module-scope decoder is created
 // (flechette builds a `TextDecoder` at module load, in util/strings.js).
 import "./patch_text_decoder.js";
-import { tableFromIPC, tableFromArrays, tableToIPC } from "@uwdata/flechette";
+import { tableFromIPC } from "@uwdata/flechette";
+
+// JSON.stringify throws on BigInt; writing it as a string lets the Rust
+// decoder parse it into int64/U256 columns.
+BigInt.prototype.toJSON = function () {
+  return this.toString();
+};
 
 // `eval(code)` compiles the user's script into a callable function. The
 // compiled function is cached per plugin instance (keyed by the raw code
@@ -43,36 +33,10 @@ function getCompiledFn(code) {
   return fn;
 }
 
-// Config.get("schema") never changes across invoke() calls within one plugin
-// instance, but re-parsing its JSON on every call is wasted work. Cache the
-// parsed value keyed by the raw string.
-const parsedSchemaCache = new Map();
-function getParsedSchema(raw) {
-  if (!raw) return null;
-  let parsed = parsedSchemaCache.get(raw);
-  if (!parsed) {
-    parsed = JSON.parse(raw);
-    parsedSchemaCache.set(raw, parsed);
-  }
-  return parsed;
-}
-
-// JSON.stringify escapes an unpaired UTF-16 surrogate (half of a 4-byte
-// character truncated or otherwise produced without its partner) as a
-// `\udXXX`-style escape in its output text, even though it leaves valid
-// surrogate *pairs* unescaped. serde_json, which decodes the fast path's
-// JSON string on the Rust side, rejects that escape -- a lone surrogate
-// doesn't correspond to any Unicode scalar value. A batch whose fast-path
-// JSON contains one falls back to the inferred path instead.
-const LONE_SURROGATE_RE = /\\ud[89a-f][0-9a-f]{2}/i;
-
 function invoke() {
   try {
     const code = Config.get("code");
     const fn = getCompiledFn(code);
-
-    const schemaConfigRaw = Config.get("schema");
-    const outputSchema = getParsedSchema(schemaConfigRaw);
 
     const inputBytes = Host.inputBytes();
     // flechette expects a Uint8Array, not a raw ArrayBuffer.
@@ -93,21 +57,14 @@ function invoke() {
     }
 
     const numRows = inputTable.numRows;
+    const results = collectResults(fn, inputTable, numRows);
 
-    if (outputSchema && outputSchema.length > 0) {
-      const { results, fastPathJson } = runSchemaAware(
-        fn,
-        inputTable,
-        numRows,
-        outputSchema
-      );
-      if (fastPathJson !== null) {
-        return Host.outputString(fastPathJson);
-      }
-      return outputArrowTable(resultsToArrowTable(results));
-    }
+    // `results.map(...).join("\n")` builds the whole string in one pass;
+    // repeated `+=` concatenation would copy the growing string on every
+    // row. arrow_json doesn't need a trailing newline after the last row.
+    const out = fixLoneSurrogates(results.map((row) => JSON.stringify(row)).join("\n"));
 
-    return outputArrowTable(runInferred(fn, inputTable, numRows));
+    return Host.outputString(out);
   } catch (error) {
     throw new Error(
       `script runtime error: ${error.message}${
@@ -117,29 +74,13 @@ function invoke() {
   }
 }
 
-// Encodes an Arrow table to IPC file-format bytes and writes it to the host.
-// Shared by the inferred path and by the schema-aware path's fallback (when
-// the JSON fast path isn't safe for a batch).
-function outputArrowTable(outputTable) {
-  let outputBytes;
-  try {
-    // File format matches what the Rust side's FileReader expects.
-    outputBytes = tableToIPC(outputTable, { format: "file" });
-  } catch (error) {
-    throw new Error(
-      `Failed to encode Arrow IPC output: ${error.message}${
-        error.stack ? "\n" + error.stack : ""
-      }`
-    );
-  }
-  return Host.outputBytes(outputBytes.buffer);
-}
-
 // Runs the user function over every input row and returns the resulting
 // row-object array: returning null filters a row out, returning an array
-// expands one input row into many output rows, and `_gs_op` is always
-// copied over from the input row when the input has it, even if the user's
-// function doesn't include it in its returned row.
+// expands one input row into many output rows. `_gs_op` is always copied
+// over from the input row when the input has it, even if the user's
+// function doesn't include it in its returned row; otherwise, when the
+// returned row doesn't set `_gs_op` (or sets it to null/undefined), it
+// defaults to "i" (insert).
 function collectResults(fn, inputTable, numRows) {
   const results = [];
 
@@ -177,6 +118,8 @@ function collectResults(fn, inputTable, numRows) {
 
           if ("_gs_op" in inputObj) {
             row._gs_op = inputObj._gs_op;
+          } else if (row._gs_op === null || row._gs_op === undefined) {
+            row._gs_op = "i";
           }
 
           results.push(row);
@@ -192,6 +135,8 @@ function collectResults(fn, inputTable, numRows) {
 
       if ("_gs_op" in inputObj) {
         result._gs_op = inputObj._gs_op;
+      } else if (result._gs_op === null || result._gs_op === undefined) {
+        result._gs_op = "i";
       }
 
       results.push(result);
@@ -203,158 +148,25 @@ function collectResults(fn, inputTable, numRows) {
   return results;
 }
 
-// Inferred path: run the user function over every input row, collect the
-// returned rows as plain objects, then build an Arrow table whose columns
-// are the union of every returned row's keys.
-function runInferred(fn, inputTable, numRows) {
-  return resultsToArrowTable(collectResults(fn, inputTable, numRows));
-}
-
-// Builds an Arrow table from a row-object array: the columns are the union
-// of every row's keys, with a missing key or an explicit null both reading
-// back as null. An empty `results` array produces a minimal one-column
-// table instead of a zero-column one.
-function resultsToArrowTable(results) {
-  let outputTable;
-  try {
-    if (results.length === 0) {
-      // Minimal table with one dummy column, for an all-filtered-out batch.
-      outputTable = tableFromArrays({ _dummy: [] });
-    } else {
-      const allKeys = new Set();
-      for (const result of results) {
-        if (result && typeof result === "object") {
-          for (const key of Object.keys(result)) {
-            allKeys.add(key);
-          }
-        }
-      }
-
-      const columns = {};
-      for (const key of allKeys) {
-        columns[key] = results.map((row) => {
-          if (row && typeof row === "object" && key in row) {
-            return row[key] ?? null;
-          }
-          return null;
-        });
-      }
-
-      try {
-        outputTable = tableFromArrays(columns);
-      } catch (error) {
-        throw new Error(
-          `Failed to create Arrow table from arrays: ${error.message}${
-            error.stack ? "\n" + error.stack : ""
-          }`
-        );
-      }
-    }
-  } catch (error) {
-    throw new Error(
-      `Failed to create Arrow table from results: ${error.message}${
-        error.stack ? "\n" + error.stack : ""
-      }`
-    );
+// JSON.stringify writes an unpaired UTF-16 surrogate (half of a 4-byte
+// character truncated or otherwise produced without its partner) as a
+// lowercase `\udXXX`-style escape, and a valid surrogate pair as raw
+// characters. The Rust JSON decoder rejects a lone surrogate escape, so
+// replace each one with the U+FFFD replacement character escape -- the same
+// result `TextEncoder` gives when it encodes a lone surrogate. A user string
+// containing a literal backslash is written as `\\`, so this only matches an
+// escape preceded by an even number of backslashes (an odd count means the
+// backslash belongs to the user's text, not the start of a real escape).
+//
+// The regex scan below walks the whole output string, which is expensive in
+// QuickJS on a large batch. A lone surrogate is rare, so a plain substring
+// check skips the regex entirely in the common case where there's nothing
+// to fix.
+function fixLoneSurrogates(json) {
+  if (json.indexOf("\\ud") === -1) {
+    return json;
   }
-  return outputTable;
-}
-
-// Whether a declared output type has a direct JSON fast-path builder on the
-// Rust side. Any other declared type (struct, list, etc.) forces the whole
-// batch through the inferred path, where the value round-trips as Arrow
-// through flechette's own type inference instead.
-function isFastPathType(type) {
-  return (
-    type === "string" ||
-    type === "int64" ||
-    type === "float64" ||
-    type === "boolean"
-  );
-}
-
-// Whether `value` is safe to serialize into a `type`-declared JSON column:
-// null/undefined always is (the Rust side nulls it, or defaults it for
-// `_gs_op`), otherwise the JS value's kind must match the declared type
-// exactly -- no coercion, since the JSON path never casts.
-function valueMatchesType(value, type) {
-  if (value === null || value === undefined) return true;
-  switch (type) {
-    case "string":
-      return typeof value === "string";
-    case "int64":
-      return Number.isSafeInteger(value);
-    case "float64":
-      return typeof value === "number" && Number.isFinite(value);
-    case "boolean":
-      return typeof value === "boolean";
-    default:
-      return false;
-  }
-}
-
-// Schema-aware path: collects the same row-object `results` array the
-// inferred path builds, then attempts the JSON fast path -- filling one
-// plain array per declared output column while tracking, per column,
-// whether every row returned it (`seen`) and whether every returned value's
-// kind matches its declared type (`kindOk`). The fast path is only safe when
-// every declared type has a direct JSON builder, every non-`_gs_op` column
-// was seen, and every value's kind matched; `_gs_op` itself only needs to be
-// a string when present (its declared type is always "string", so the
-// generic kind check already covers this). An empty `results` array, and any
-// batch where the fast path isn't safe, returns with `fastPathJson: null` so
-// the caller runs the existing inferred-path Arrow/IPC encoding on the same
-// `results` array instead.
-function runSchemaAware(fn, inputTable, numRows, outputSchema) {
-  const results = collectResults(fn, inputTable, numRows);
-
-  if (results.length === 0) {
-    return { results, fastPathJson: null };
-  }
-
-  const fastPathAllowed = outputSchema.every((f) => isFastPathType(f.type));
-  if (!fastPathAllowed) {
-    return { results, fastPathJson: null };
-  }
-
-  const columnNames = outputSchema.map((f) => f.name);
-  const typeByName = new Map(outputSchema.map((f) => [f.name, f.type]));
-  const columns = {};
-  const seen = new Map(columnNames.map((name) => [name, false]));
-  let allKindOk = true;
-
-  for (const name of columnNames) {
-    columns[name] = new Array(results.length);
-  }
-
-  for (let i = 0; i < results.length; i++) {
-    const row = results[i];
-    for (const name of columnNames) {
-      const has = row && typeof row === "object" && name in row;
-      if (has) seen.set(name, true);
-      const value = has ? row[name] : undefined;
-      const normalized = value === undefined ? null : value;
-      columns[name][i] = normalized;
-      if (allKindOk && !valueMatchesType(normalized, typeByName.get(name))) {
-        allKindOk = false;
-      }
-    }
-  }
-
-  const allSeen = columnNames.every(
-    (name) => name === "_gs_op" || seen.get(name)
-  );
-
-  if (!allSeen || !allKindOk) {
-    return { results, fastPathJson: null };
-  }
-
-  const jsonString = JSON.stringify({ columns, num_rows: results.length });
-  if (LONE_SURROGATE_RE.test(jsonString)) {
-    return { results, fastPathJson: null };
-  }
-
-  return { results, fastPathJson: jsonString };
+  return json.replace(/(?<!\\)((?:\\\\)*)\\ud[89a-f][0-9a-f]{2}/g, "$1\\ufffd");
 }
 
 function truncateString(str, maxLength) {

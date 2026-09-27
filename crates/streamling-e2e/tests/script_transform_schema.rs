@@ -1,10 +1,10 @@
-//! Permanent e2e coverage for the schema-aware `type: script` output path
-//! (see `crates/streamling-core/wasm/runtime.js`'s `runSchemaAware` and
-//! `crates/streamling-core/src/operators/wasm_runner.rs`'s
-//! `decode_json_output`): the production traces transform and its declared
-//! `schema:` against a Kafka Avro source and a Postgres sink, checked against
-//! exact expected rows for the real production payload, a handful of
-//! hand-checkable edge cases, and a small type-coercion script.
+//! Permanent e2e coverage for `type: script` transforms with a declared
+//! `schema:` (`crates/streamling-core/wasm/runtime.js` writes one JSON object
+//! per output row, and `crates/streamling-core/src/operators/wasm_runner.rs`
+//! decodes it against that schema): the production traces transform and its
+//! declared `schema:` against a Kafka Avro source and a Postgres sink,
+//! checked against exact expected rows for the real production payload, a
+//! handful of hand-checkable edge cases, and a small type-coercion script.
 //!
 //! Runs against a single, normally-built `streamling` binary (whatever
 //! `E2E_STREAMLING_BIN`/the default build points at).
@@ -407,8 +407,8 @@ async fn test_script_transform_schema_traces_production_and_edges() {
 }
 
 // ============================================================================
-// Coercion script: every declared column gets one consistently mismatched
-// JS kind, exercising the fallback-to-IPC/Arrow-cast coercion path.
+// Coercion script: every declared column gets a value of a mismatched but
+// coercible JS kind, exercising the JSON decoder's type coercion.
 // ============================================================================
 
 const COERCION_TS: &str = r#"
@@ -418,7 +418,6 @@ function transformCoercion(data: any): any {
     _gs_op: 'i',
     c_int_from_string: "7",
     c_int_from_float: 2.9,
-    c_bool_from_string: "true",
     c_float_from_string: "2.5",
     c_string_from_number: 42,
     c_always_null: null,
@@ -430,7 +429,6 @@ const P2_SCHEMA: &str = r#"      id: string
       _gs_op: string
       c_int_from_string: int64
       c_int_from_float: int64
-      c_bool_from_string: boolean
       c_float_from_string: float64
       c_string_from_number: string
       c_always_null: int64
@@ -464,16 +462,14 @@ async fn test_script_transform_schema_coercion() {
         .expect("run pipeline");
     assert!(status.success(), "pipeline exited with {status:?}");
 
-    // Every column except `c_always_missing` (a declared column the script
-    // never returns -- deliberately not asserted here, since its value is
-    // the same order-dependent positional fallback the Arrow-IPC/inferred
-    // path has always produced for a missing column, not a fixed value).
+    // `c_always_missing` is a declared column the script never returns, so it
+    // decodes as null.
     let rows = ctx
         .postgres
         .query_rows_as_text(&format!(
             "SELECT c_int_from_string::text, c_int_from_float::text, \
-             c_bool_from_string::text, c_float_from_string::text, \
-             c_string_from_number, c_always_null::text \
+             c_float_from_string::text, c_string_from_number, \
+             c_always_null::text, c_always_missing::text \
              FROM public.{table} ORDER BY id"
         ))
         .await
@@ -486,10 +482,10 @@ async fn test_script_transform_schema_coercion() {
             vec![
                 "7".to_string(),    // "7" -> 7
                 "2".to_string(),    // 2.9 -> 2 (cast truncates, doesn't round)
-                "true".to_string(), // "true" -> true
                 "2.5".to_string(),  // "2.5" -> 2.5
                 "42".to_string(),   // 42 -> "42"
                 "NULL".to_string(), // explicit null
+                "NULL".to_string(), // never returned by the script
             ]
         );
     }

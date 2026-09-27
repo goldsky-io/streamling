@@ -8,6 +8,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{
     Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, StringArray,
 };
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
@@ -136,14 +137,40 @@ impl JsonToArrowConverter {
     /// `single_row_mode` - if true, each JSON string represents a single row, otherwise a JSON array of objects is expected
     /// `field_to_extract` - if set, the field to extract from the JSON object. This allows to "unwrap" a JSON object, e.g. an envelope
     pub fn new(schema: SchemaRef, single_row_mode: bool, field_to_extract: Option<String>) -> Self {
-        // If the schema contains U256 or I256 extension fields, create a transformed schema
-        // where those fields are converted to Utf8 (to match what FromArrowToJsonConverter produces)
+        // Every existing caller passes a schema already known to be decodable (a schema this
+        // same converter round-trips through `FromArrowToJsonConverter`, or one built from a
+        // fixed set of Arrow types); an unsupported type here is a bug in the caller, not user
+        // input, so this panics instead of returning a `Result`.
+        let decoder = Self::build_decoder(&schema, false)
+            .expect("schema is decodable: not user-supplied here, see fn doc");
+
+        Self {
+            schema,
+            values: Vec::new(),
+            decoder,
+            single_row_mode,
+            field_to_extract,
+        }
+    }
+
+    /// Builds the decoder for `schema`. U256/I256 extension fields are decoded as Utf8 (decimal
+    /// strings), matching what `FromArrowToJsonConverter` produces, and converted back to their
+    /// fixed-size binary representation by `convert_batch_to_original_schema`.
+    ///
+    /// `coerce_primitive` controls whether a value of the wrong JS-originating JSON kind (a
+    /// string in a number column, a float in an int column) is cast into the declared type
+    /// instead of raising an error.
+    ///
+    /// Errors when `schema` declares a type arrow_json can't decode (e.g. an Interval type):
+    /// callers that build the schema from user input (a script transform's `schema:` YAML) must
+    /// report that as a user error, not panic.
+    fn build_decoder(schema: &SchemaRef, coerce_primitive: bool) -> Result<Decoder> {
         let has_u256_or_i256 = schema
             .fields()
             .iter()
             .any(|f| U256Type::is_u256_field(f) || I256Type::is_i256_field(f));
 
-        let decoder = if has_u256_or_i256 {
+        let decoder_schema = if has_u256_or_i256 {
             let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
             for field in schema.fields().iter() {
                 if U256Type::is_u256_field(field) || I256Type::is_i256_field(field) {
@@ -157,21 +184,74 @@ impl JsonToArrowConverter {
                     new_fields.push(field.as_ref().clone());
                 }
             }
-            let transformed_schema = Arc::new(Schema::new(new_fields));
-            ReaderBuilder::new(transformed_schema)
-                .build_decoder()
-                .unwrap()
+            Arc::new(Schema::new(new_fields))
         } else {
-            ReaderBuilder::new(schema.clone()).build_decoder().unwrap()
+            schema.clone()
         };
 
-        Self {
-            schema,
-            values: Vec::new(),
-            decoder,
-            single_row_mode,
-            field_to_extract,
+        ReaderBuilder::new(decoder_schema)
+            .with_coerce_primitive(coerce_primitive)
+            .build_decoder()
+            .map_err(|e| {
+                DataFusionError::from(streamling_user_err!(
+                    "unsupported type in script transform schema: {}",
+                    e
+                ))
+            })
+    }
+
+    /// Rebuilds the decoder with `coerce_primitive` set, so a value of the wrong JS-originating
+    /// JSON kind is cast into the declared column type instead of raising an error (a string
+    /// into a number column, a float into an int column, a number into a string column).
+    pub fn with_coerce_primitive(mut self, coerce_primitive: bool) -> Result<Self> {
+        self.decoder = Self::build_decoder(&self.schema, coerce_primitive)?;
+        Ok(self)
+    }
+
+    /// Decodes newline-delimited JSON (one JSON object per line) into a single `RecordBatch`
+    /// against this converter's schema. Used to decode WASM script transform output, where the
+    /// JS runtime writes one JSON object per output row.
+    ///
+    /// A declared column missing from a row decodes as null. Empty input returns an empty batch.
+    pub fn decode_ndjson(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
+        if bytes.is_empty() {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
+
+        let map_decode_err = |e: arrow_schema::ArrowError| {
+            DataFusionError::from(streamling_user_err!(
+                "script transform output does not match the output schema: {}",
+                e
+            ))
+        };
+
+        let mut batches = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let read = self
+                .decoder
+                .decode(&bytes[offset..])
+                .map_err(map_decode_err)?;
+            offset += read;
+            if let Some(batch) = self.decoder.flush().map_err(map_decode_err)? {
+                batches.push(batch);
+            }
+            if read == 0 {
+                break;
+            }
+        }
+        if let Some(batch) = self.decoder.flush().map_err(map_decode_err)? {
+            batches.push(batch);
+        }
+
+        let batch = if batches.is_empty() {
+            RecordBatch::new_empty(self.schema.clone())
+        } else {
+            let decoder_schema = batches[0].schema();
+            concat_batches(&decoder_schema, &batches)?
+        };
+
+        self.convert_batch_to_original_schema(batch)
     }
 
     fn extract_field_from(field: String, value: &Value) -> Result<Value> {
@@ -502,6 +582,59 @@ mod tests {
         let json_str = String::from_utf8(rows[0].clone()).unwrap();
         assert_eq!(json_str, r#"{"u256":"12345"}"#);
     }
+    /// A row missing a declared column decodes as null. With `coerce_primitive` on, a number
+    /// written into a Utf8 column parses as its string form ("42" for the integer 42).
+    #[test]
+    fn test_decode_ndjson() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+
+        let mut converter = JsonToArrowConverter::new(schema.clone(), true, None)
+            .with_coerce_primitive(true)
+            .unwrap();
+
+        let ndjson = "{\"a\":1,\"b\":42}\n{\"a\":2}\n";
+        let batch = converter.decode_ndjson(ndjson.as_bytes()).unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        let a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(a, &Int32Array::from(vec![1, 2]));
+        assert_eq!(b.value(0), "42");
+        assert!(b.is_null(1));
+    }
+
+    /// A schema declaring a type arrow_json's JSON reader doesn't support (here, Interval)
+    /// returns an error from `build_decoder`, not a panic. The type comes from a script
+    /// transform's `schema:` YAML, so it's user input and must be reported, not crash the
+    /// process.
+    #[test]
+    fn test_build_decoder_rejects_unsupported_type_without_panicking() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
+            true,
+        )]));
+
+        let err = JsonToArrowConverter::build_decoder(&schema, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported type in script transform schema"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_json_to_arrow_converter_with_u256_single_row() {
         // Build a schema with a U256 field
