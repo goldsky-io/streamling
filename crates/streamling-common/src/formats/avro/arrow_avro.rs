@@ -1627,4 +1627,86 @@ mod tests {
             "scaled high-precision decimal formats as a decimal string, not raw bytes"
         );
     }
+
+    // STRM-6578: arrow-avro's `ReaderBuilder` caps a decoder at `batch_size` rows (default 1024).
+    // Past that, `Decoder::decode` consumes 0 bytes and returns `Ok(0)`, so every later message
+    // is silently dropped. The Kafka source appends one `_gs_op` per message, so the payload
+    // batch and `_gs_op` disagree in length as soon as `record_batch_size > 1024`.
+    #[test]
+    fn decodes_every_message_past_arrow_avro_default_batch_size() {
+        const SCHEMA: &str =
+            r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let schema = AvroWriterSchema::parse_str(SCHEMA).unwrap();
+        let id = 1u32;
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(id, SCHEMA).unwrap();
+
+        let n = 1025usize;
+        let mut zero_consumed = Vec::new();
+        for i in 0..n {
+            let mut rec = Record::new(&schema).unwrap();
+            rec.put("id", Value::Long(i as i64));
+            let frame = confluent_frame(id, &to_avro_datum(&schema, rec).unwrap());
+            let consumed = decoder.decode(&frame).unwrap();
+            if consumed != frame.len() {
+                zero_consumed.push((i, consumed, frame.len()));
+            }
+        }
+        let b = decoder.flush().unwrap().expect("batch");
+        assert!(
+            zero_consumed.is_empty() && b.num_rows() == n,
+            "decoded {} of {n} rows; decode() consumed (index, consumed, frame_len) = {:?}",
+            b.num_rows(),
+            zero_consumed
+        );
+    }
+
+    // STRM-6578 (prod symptom): what the Kafka source does after the loop above — append one
+    // `_gs_op` string per Kafka message to the payload batch. Reproduces the exact Arrow error.
+    #[test]
+    fn appending_per_message_op_column_to_capped_batch_fails_like_prod() {
+        use arrow::array::StringArray;
+        use arrow_schema::{Field, Schema};
+
+        const SCHEMA: &str =
+            r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let schema = AvroWriterSchema::parse_str(SCHEMA).unwrap();
+        let id = 1u32;
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(id, SCHEMA).unwrap();
+
+        let record_batch_size = 1025usize;
+        let mut row_kinds = Vec::new();
+        for i in 0..record_batch_size {
+            let mut rec = Record::new(&schema).unwrap();
+            rec.put("id", Value::Long(i as i64));
+            decoder
+                .decode(&confluent_frame(id, &to_avro_datum(&schema, rec).unwrap()))
+                .unwrap();
+            row_kinds.push("INSERT");
+        }
+        let payload = decoder.flush().unwrap().expect("batch");
+
+        let mut fields: Vec<Field> = payload
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new("_gs_op", DataType::Utf8, false));
+        let mut columns = payload.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(row_kinds)));
+
+        let result = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns);
+        assert!(
+            result.is_ok(),
+            "payload rows = {}, _gs_op rows = {record_batch_size}: {}",
+            payload.num_rows(),
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
 }
