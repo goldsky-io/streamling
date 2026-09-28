@@ -33,8 +33,9 @@ use datafusion::physical_plan::{
 };
 
 use crate::checkpoints::checkpoint_management::{
-    register_sink_streams, send_checkpoint_ack, sink_stream_done, sink_stream_failed,
+    register_sink_streams, send_checkpoint_ack, sink_stream_done,
 };
+use crate::operators::LastMarker;
 use crate::operators::parallel_sink::ParallelSinkExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use std::fmt;
@@ -621,22 +622,22 @@ impl ExecutionPlan for MultiSinkExec {
                             .expect("Failed to execute sink input plan over broadcast data")
                     };
 
-                    let write_result = data_sink.write_all(input_stream, &task_context).await;
+                    let last_marker = LastMarker::default();
+                    let write_result = data_sink
+                        .write_all(last_marker.track(input_stream), &task_context)
+                        .await;
 
-                    // Release this stream's share of the ack gate, or poison it
-                    // when the write FAILED: the failed stream's lost rows are
-                    // covered by every epoch not yet acked, so neither the
-                    // epochs its exit would free nor any the other streams flush
-                    // later may be acked — that would let the source commit
-                    // offsets for rows that never landed. Either way the stream
-                    // counts as done below: the broadcast's all-streams-completed
-                    // stop must not stall on a failed sink.
+                    // Only a successful write releases this stream's share of the
+                    // ack gate. A failed stream stays required: an epoch it
+                    // didn't flush may cover rows it lost, so that epoch must
+                    // never be acked, even after every other stream flushed it.
+                    // Either way the stream counts as done below: the
+                    // broadcast's all-streams-completed stop must not stall on a
+                    // failed sink.
                     if write_result.is_ok() {
-                        for epoch in sink_stream_done(&sink_name, input_partition) {
+                        for epoch in sink_stream_done(&sink_name, last_marker.epoch()) {
                             send_checkpoint_ack(epoch, &sink_name);
                         }
-                    } else {
-                        sink_stream_failed(&sink_name);
                     }
                     {
                         let mut count = completed_sinks.lock().await;
