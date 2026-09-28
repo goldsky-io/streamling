@@ -370,7 +370,7 @@ impl PartitionedPlugin {
                     return Err(e);
                 }
             };
-            let mismatch = self.mismatch(&created_instance);
+            let mismatch = self.check_for_mismatch(&created_instance);
             instances.push(created_instance.instance);
             futures.push(created_instance.execution);
             if let Err(e) = mismatch {
@@ -453,7 +453,7 @@ impl PartitionedPlugin {
     /// Every instance must produce what the node described: downstream nodes
     /// were planned against that schema, and its labels are already merged
     /// into the node's metrics.
-    fn mismatch(&self, created: &CreatedInstance) -> Result<()> {
+    fn check_for_mismatch(&self, created: &CreatedInstance) -> Result<()> {
         let key = &created.instance.key;
         let fields = |schema: &Option<SchemaRef>| schema.as_ref().map(|s| s.fields().clone());
         if fields(&created.output_schema) != fields(&self.output_schema) {

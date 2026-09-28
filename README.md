@@ -1547,6 +1547,8 @@ Each plugin configuration requires:
 - `type`: Unique plugin id, consisting of the plugin namespace (optional) and an operator name, separated by a dot (e.g., `basic_plugin.random_source`)
 - `options`: Key-value pairs for plugin-specific configuration
 
+Partitioned plugins also accept `parallelism`; see [Partitioned Plugins](#partitioned-plugins).
+
 ### Including Plugins
 
 A plugin is a shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows) built against the Streamling plugin ABI. To make a plugin usable in a pipeline, point the runtime at it before startup via `STREAMLING__PLUGIN__PATH`. The path may be a single library file or a directory — every file in a directory is loaded:
@@ -1852,6 +1854,7 @@ Helper macros make it easy to implement the plugin interface:
 - `register_plugin_source!("<plugin_id>", <SourcePlugin>);` to register a source plugin.
 - `register_plugin_transform!("<plugin_id>", <TransformPlugin>);` to register a transform plugin.
 - `register_plugin_sink!("<plugin_id>", <SinkPlugin>);` to register a sink plugin.
+- `register_partitioned_plugin_source!`, `register_partitioned_plugin_transform!`, and `register_partitioned_plugin_sink!` (same arguments) to register a plugin that runs one instance per stream; see [Partitioned Plugins](#partitioned-plugins).
 - `register_plugin_preprocessor!("<plugin_id>", <PreprocessorPlugin>);` to register a preprocessor plugin.
 - `register_plugin_udf!(<ScalarUDFImpl>);` to register a UDF from a type implementing `ScalarUDFImpl` + `Default`.
 - `register_plugin_udf_fn!(<factory_fn>);` to register a UDF from a factory function returning `ScalarUDF`.
@@ -1884,6 +1887,146 @@ fn new(
     metrics_recorder: PluginMetricsRecorder,
     options: HashMap<String, String>,
 ) -> Self
+```
+
+### Partitioned Plugins
+
+A source, transform, or sink registered with `register_plugin_*!` is **single-stream**: the host runs one instance of it, and merges a transform's or sink's input into one stream. A **partitioned** plugin runs one instance per physical stream, each with its own channels, so it scales with the node's `parallelism`. Use it when shards of the stream can be processed independently: a source with native shards, or a transform or sink whose work can be split by key.
+
+#### Creating a Partitioned Plugin
+
+Implement the regular operator trait (`SourcePlugin`, `TransformPlugin`, or `SinkPlugin`), plus its partitioned counterpart:
+
+```rust
+pub trait PartitionedSourcePlugin: SourcePlugin + Sized + 'static {
+    fn describe(
+        options: &HashMap<String, String>,
+    ) -> Result<SourceDescription, PluginInitializationError>;
+
+    fn create(
+        context: PluginInstanceContext,
+        runtime: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError>;
+}
+
+pub trait PartitionedTransformPlugin: TransformPlugin + Sized + 'static {
+    fn describe(
+        input_schema: SchemaRef,
+        options: &HashMap<String, String>,
+    ) -> Result<TransformDescription, PluginInitializationError>;
+
+    fn create(
+        context: PluginInstanceContext,
+        input_schema: SchemaRef,
+        runtime: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError>;
+}
+
+// PartitionedSinkPlugin: SinkPlugin has the same shape as the transform,
+// with `describe` returning a SinkDescription.
+```
+
+- `describe` runs at planning time, before any instance exists. It validates the options and reports what the host needs to plan the node: the output schema (sources and transforms), labels, how the input must be placed (transforms and sinks), and a `PartitionCount`. It must not open connections that outlive the call or reserve durable resources; read-only schema discovery is fine.
+- `create` replaces the single-stream `new` constructor and is called once per partition. `PluginInstanceContext` carries the node's `reference_name`, and this instance's `partition_index` out of `partition_count`. Every instance must produce the schema and labels `describe` reported.
+
+The description types:
+
+- `PartitionCount { minimum, maximum, preferred }`: the widths the plugin can run with. `PartitionCount::default()` accepts any width. `preferred` is the width a source runs with when the pipeline doesn't set `parallelism` (e.g. its native shard count); transforms and sinks ignore it.
+- `InputPlacement` (transforms and sinks): how the host splits the input across instances. `ByPrimaryKey` sends all rows of a primary key to the same instance, `ByColumns(columns)` does the same for the given columns, and `RoundRobin` spreads rows evenly.
+
+Register it with `register_partitioned_plugin_source!`, `register_partitioned_plugin_transform!`, or `register_partitioned_plugin_sink!`. They take the same arguments as `register_plugin_*!`, and both kinds can be registered in one library:
+
+```rust
+impl PartitionedSinkPlugin for ShardedSink {
+    fn describe(
+        _input_schema: SchemaRef,
+        options: &HashMap<String, String>,
+    ) -> Result<SinkDescription, PluginInitializationError> {
+        if !options.contains_key("endpoint") {
+            return Err(PluginInitializationError::Configuration(
+                "option 'endpoint' is required".into(),
+            ));
+        }
+        Ok(SinkDescription {
+            labels: vec![],
+            input_placement: InputPlacement::ByPrimaryKey,
+            partition_count: PartitionCount { maximum: Some(16), ..PartitionCount::default() },
+        })
+    }
+
+    fn create(
+        context: PluginInstanceContext,
+        input_schema: SchemaRef,
+        rt: PluginAsyncRuntimeObj,
+        state_backend_factory: PluginStateBackendFactory,
+        metrics_recorder: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError> {
+        // Writes shard `context.partition_index` of `context.partition_count`.
+        ShardedSink::new(context, input_schema, rt, state_backend_factory, metrics_recorder, options)
+    }
+}
+
+register_partitioned_plugin_sink!("my_plugin", "sharded_sink", ShardedSink);
+init_plugin_with_async_runtime!();
+```
+
+`plugin_examples/basic/src/partitioned.rs` has a complete source, transform, and sink.
+
+How instances behave at runtime:
+
+- **State.** `state_backend_factory.create()` is scoped to the instance's partition (keyed `{reference_name}[{partition_index}]`), so instances never see each other's state. `create_shared()` returns state shared by every instance of the node; instances write it concurrently, so they must coordinate (e.g. through distinct keys). Partition-scoped state is not redistributed when the width changes: after a restart with a different `parallelism`, instance `i` still reads partition `i`'s state while receiving different keys. Keep state that must survive rescaling in `create_shared()`.
+- **Checkpoints.** Each instance sees one copy of every checkpoint marker on its own stream. A sink instance acks from `process_checkpoint_marker` as usual, once its data is durable; the host acks the epoch only after every instance has.
+- **Failures.** An error from any instance fails the pipeline.
+
+#### Pipeline Configuration
+
+A partitioned plugin node is configured like any plugin node, plus an optional `parallelism`: the number of instances. Set it on the node itself; a `parallelism` inside `options:` is ignored.
+
+| Node      | Without `parallelism`                                  | With `parallelism: N`                           |
+|-----------|--------------------------------------------------------|-------------------------------------------------|
+| Source    | the plugin's `preferred` count, or 1                   | N instances                                     |
+| Transform | one instance per stream of its input                   | its input is repartitioned into N streams       |
+| Sink      | one instance per stream of its input                   | its input is repartitioned into N streams       |
+
+The resulting width must be within the plugin's `PartitionCount`, or planning fails with an error naming what set the width. A single-stream plugin rejects `parallelism` above 1.
+
+Before stream `i` reaches instance `i`, the host places the input rows as the plugin declared:
+
+- `ByPrimaryKey` uses the node's `primary_key`, or the upstream node's key when the node sets none. A transform's `primary_key` describes its output, so it is used only when the transform's input has all of its columns; otherwise the upstream node's key is used. Planning fails if no usable key is found.
+- `ByColumns` requires every listed column to be in the input schema.
+- `RoundRobin` needs no configuration.
+
+Sinks that read the same node share one exchange, so they run at one width: the largest `parallelism` among them, or the input's width if none sets it. A partitioned plugin sink fails planning if its own `parallelism` differs from that width. The whole group runs on a single stream if any of its sinks is single-stream or if they declare different primary keys.
+
+This pipeline uses the example plugins from `plugin_examples/basic`:
+
+```yaml
+sources:
+  numbers:
+    type: basic_plugin.partitioned_source
+    rows: "100"
+    parallelism: 4         # 4 source instances
+    primary_key: id
+
+transforms:
+  tagged:
+    type: basic_plugin.partitioned_transform
+    from: numbers          # no parallelism: 4 instances, one per source stream
+    primary_key: id
+
+sinks:
+  files:
+    type: basic_plugin.partitioned_file_sink
+    from: tagged
+    parallelism: 2         # the 4 streams are repartitioned by `id` into 2
+    output_dir: /tmp       # an existing directory; each instance writes files-<partition>.csv
 ```
 
 ### Examples

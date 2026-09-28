@@ -294,11 +294,11 @@ impl ExecutionPlan for ParallelSinkExec {
             }
             let mut total_count: u64 = 0;
             while let Some(joined) = writes.join_next().await {
-                // A FAILED write poisons the sink's ack gate: its lost rows are
-                // covered by every epoch not yet acked, so neither the epochs
-                // its exit would free nor any a sibling stream flushes later may
-                // be acked — that would let the source commit offsets for rows
-                // that never landed.
+                // When one stream's write fails, stop acking epochs for the whole
+                // sink. The rows that stream lost may belong to any epoch that
+                // isn't acked yet. Acking such an epoch, whether because the
+                // failed stream exited or because a sibling stream flushed it,
+                // would let the source commit offsets for rows never written.
                 let (stream, written) = match joined {
                     Ok((stream, Ok(written))) => (stream, written),
                     Ok((_, Err(e))) => {
