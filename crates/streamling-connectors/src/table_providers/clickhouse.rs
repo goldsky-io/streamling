@@ -19,7 +19,6 @@ use streamling_core::types::{i256::I256Type, u256::U256Type};
 use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
 use streamling_core::utils::parse_primary_key_columns;
 
-use async_stream;
 use datafusion::arrow::ipc::reader::FileReader;
 use datafusion::arrow::ipc::writer::FileWriter;
 use datafusion::common::ScalarValue;
@@ -1814,15 +1813,24 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             let (mut emit_batches, deduped_to_empty): (Vec<RecordBatch>, bool) =
                                 match &dedup_version_column {
                                     Some(version_col) => {
-                                        match deduplicate_record_batches_by_version(
-                                            &batches,
-                                            &dedup_key,
-                                            version_col,
-                                            Some(&TombstoneRule {
-                                                column: "_gs_op".to_string(),
-                                                value: "d".to_string(),
-                                            }),
-                                        ) {
+                                        let dedup_key_owned = dedup_key.clone();
+                                        let version_col_owned = version_col.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            deduplicate_record_batches_by_version(
+                                                &batches,
+                                                &dedup_key_owned,
+                                                &version_col_owned,
+                                                Some(&TombstoneRule {
+                                                    column: "_gs_op".to_string(),
+                                                    value: "d".to_string(),
+                                                }),
+                                            )
+                                        })
+                                        .await
+                                        .unwrap_or_else(|join_err| {
+                                            Err(streamling_err!("dedup task failed: {}", join_err))
+                                        })
+                                        {
                                             Ok(deduped) if deduped.num_rows() == 0 => {
                                                 (Vec::new(), true)
                                             }
@@ -2053,21 +2061,10 @@ impl ClickHouseSourceExec {
             .process_http_response(response_result, query.as_str(), "run")
             .await?;
 
-        let record_batch_stream = async_stream::stream! {
-            let reader = match client.create_arrow_reader(response_bytes, query.as_str()) {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(ArrowError::ExternalError(e.into()));
-                    return;
-                }
-            };
-            for batch_result in reader {
-                yield batch_result;
-            }
-        };
+        let batches = decode_arrow_ipc_blocking(client, response_bytes, query).await;
 
         trace!("Created async record batch stream");
-        Ok(Box::pin(record_batch_stream))
+        Ok(Box::pin(futures::stream::iter(batches)))
     }
 
     pub fn extract_keyset_from_batch(
@@ -2096,6 +2093,26 @@ impl ClickHouseSourceExec {
         }
 
         Ok(keyset_values)
+    }
+}
+
+/// Decodes a ClickHouse Arrow IPC response on the blocking pool, so a large page
+/// does not hold a tokio worker thread while it decodes.
+async fn decode_arrow_ipc_blocking(
+    client: ClickHouseClient,
+    response_bytes: Vec<u8>,
+    query: String,
+) -> Vec<arrow::error::Result<RecordBatch>> {
+    let join_result = tokio::task::spawn_blocking(move || {
+        match client.create_arrow_reader(response_bytes, &query) {
+            Ok(reader) => reader.collect(),
+            Err(e) => vec![Err(ArrowError::ExternalError(e.into()))],
+        }
+    })
+    .await;
+    match join_result {
+        Ok(batches) => batches,
+        Err(join_err) => vec![Err(ArrowError::ExternalError(Box::new(join_err)))],
     }
 }
 
@@ -4834,6 +4851,54 @@ mod tests {
             row_count += batch.num_rows();
         }
         assert_eq!(row_count, 3, "should have received 3 rows");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decode_arrow_ipc_runs_off_the_runtime_thread() {
+        use arrow::array::StringArray;
+        use arrow::ipc::writer::FileWriter;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a multi-MB Arrow IPC body: one batch with ~500_000 string rows.
+        let values: Vec<String> = (0..500_000).map(|i| format!("0x{:064x}", i)).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .unwrap();
+        let mut body = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut body, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // A task spawned on the runtime can only run while the decoding future
+        // yields control back. With spawn_blocking the worker thread is free;
+        // an inline synchronous decode would hold it for the whole decode.
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        // Test-only helper task; the disallowed-methods lint targets production code.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        let batches = decode_arrow_ipc_blocking(
+            create_test_client("http://localhost:1"),
+            body,
+            "q".to_string(),
+        )
+        .await;
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "runtime thread was not free to run other tasks while decoding"
+        );
+        let total_rows: usize = batches
+            .into_iter()
+            .map(|r| r.expect("decode failed").num_rows())
+            .sum();
+        assert_eq!(total_rows, 500_000);
     }
 
     #[tokio::test]
