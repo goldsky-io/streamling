@@ -648,128 +648,6 @@ impl PluginSink {
             init: std::sync::Once::new(),
         }
     }
-
-    fn sink_id(&self) -> String {
-        metric_metadata_id_to_reference_name(&self.metric_metadata_id)
-            .unwrap_or_else(|| self.metric_metadata_id.clone())
-    }
-
-    /// Forwards the instance's checkpoint acks and failure report,
-    /// independently of batch arrival. An ack lands on the plugin output
-    /// channel only after the plugin's durable flush completes, and the
-    /// terminal marker rides the LAST batch — so an ack drained only from
-    /// inside the batch loop is never picked up: the loop is parked on a
-    /// stream that ends only once the coordinator finalizes the terminal
-    /// epoch, which needs this very ack. A dedicated task breaks that cycle.
-    /// Same polling pattern as process_plugin_metrics (the channel is a sync
-    /// crossbeam channel; a blocking recv() here would pin an executor
-    /// thread).
-    fn spawn_ack_forwarder(&self) {
-        let ack_receiver = self.instance.channels.output.receiver.clone();
-        let ack_state = self.ack_state.clone();
-        let sink_id = self.sink_id();
-        let stream = self.stream;
-        let instance_key = self.instance.key.clone();
-        // PostPlugin-stage scope: the ack forwarder MUST outlive the plugin
-        // dispatcher drain (acks still flow while the plugin flushes after
-        // Terminate); the stage placement guarantees it. Exits on scope
-        // cancellation once the queue is drained — the channel itself never
-        // disconnects (host and plugin each hold both ends for the process's
-        // life), so without watching the token this task can only ever blow
-        // its drain slice. By PostPlugin-cancel time the dispatcher's flush
-        // has run, so every ack it emitted has been forwarded.
-        let ack_cancel = self.scope.stage_token().clone();
-        self.scope.spawn(async move {
-            // Cancellation is checked on the BUSY path too, not only when
-            // the queue goes idle: a plugin acking faster than the 10ms
-            // idle poll would otherwise never let the Empty arm run,
-            // leaving the teardown-ordering invariant as the only
-            // protection. Once cancellation is observed, the drain is
-            // bounded to the acks queued at that moment — complete by
-            // PostPlugin-cancel, so none are lost — and a plugin
-            // misbehaving past Terminate cannot pin this task.
-            let mut remaining_after_cancel: Option<usize> = None;
-            loop {
-                if remaining_after_cancel.is_none() && ack_cancel.is_cancelled() {
-                    remaining_after_cancel = Some(ack_receiver.len());
-                }
-                if remaining_after_cancel == Some(0) {
-                    debug!("Scope cancelled and queued acks forwarded; stopping ack forwarder");
-                    break;
-                }
-                match ack_receiver.try_recv() {
-                    Ok(message) => {
-                        if let Some(n) = remaining_after_cancel.as_mut() {
-                            *n -= 1;
-                        }
-                        match message.into_enum() {
-                            Ok(PluginMsg::CheckpointAck { epoch }) => {
-                                debug!(
-                                    "Propagating checkpoint Ack with epoch {} from plugin {}",
-                                    epoch.0, instance_key
-                                );
-                                // The sink acks once every write stream's
-                                // instance has flushed the epoch.
-                                let release = report_marker_at_sink_stream(
-                                    &sink_id,
-                                    stream,
-                                    CheckpointEpoch(epoch.0),
-                                );
-                                // Counted by the gate before `write_all` may
-                                // see the epoch acked and finish its stream.
-                                ack_state.send_modify(|state| {
-                                    state.unacked.remove(&epoch.0);
-                                });
-                                if release
-                                    && let Err(e) = send(
-                                        CHECKPOINT_COORDINATOR_CHANNEL,
-                                        CheckpointMessage::Ack {
-                                            epoch: CheckpointEpoch(epoch.0),
-                                            sink_id: sink_id.clone(),
-                                        },
-                                    )
-                                {
-                                    warn!(
-                                        "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
-                                        epoch.0, e
-                                    );
-                                    ack_state.send_modify(|state| {
-                                        state.failure.get_or_insert_with(|| {
-                                            format!("coordinator rejected its ack: {e}")
-                                        });
-                                    });
-                                    break;
-                                }
-                            }
-                            Ok(PluginMsg::Error { message }) => {
-                                error!("Plugin {} reported a failure: {}", instance_key, message);
-                                ack_state.send_modify(|state| {
-                                    state.failure.get_or_insert_with(|| message.to_string());
-                                });
-                            }
-                            _ => {
-                                warn!("Received unexpected message from plugin channel");
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => {
-                        if ack_cancel.is_cancelled() {
-                            debug!("Scope cancelled and queue drained; stopping ack forwarder");
-                            break;
-                        }
-                        // Acks arrive at checkpoint cadence (seconds
-                        // apart); ~10ms keeps the idle poll cheap while
-                        // still negligible against checkpoint latency.
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        debug!("Plugin output channel disconnected, stopping ack forwarder");
-                        break;
-                    }
-                }
-            }
-        });
-    }
 }
 
 #[async_trait]
@@ -804,7 +682,122 @@ impl DataSink for PluginSink {
                 self.instance.key.clone(),
                 self.scope.stage_token().clone(),
             ));
-            self.spawn_ack_forwarder();
+
+            // Forward plugin checkpoint acks to the coordinator, and its failure
+            // report to this sink's writes, independently of batch arrival. An ack
+            // lands on the plugin output channel only after the plugin's durable
+            // flush completes, and the terminal marker rides the LAST batch — so an
+            // ack drained only from inside the batch loop is never picked up: the
+            // loop is parked on a stream that ends only once the coordinator
+            // finalizes the terminal epoch, which needs this very ack. A dedicated
+            // task breaks that cycle. Same polling pattern as process_plugin_metrics
+            // (the channel is a sync crossbeam channel; a blocking recv() here would
+            // pin an executor thread).
+            let ack_receiver = self.instance.channels.output.receiver.clone();
+            let ack_state = self.ack_state.clone();
+            let sink_id = metric_metadata_id_to_reference_name(&self.metric_metadata_id)
+                .unwrap_or_else(|| self.metric_metadata_id.clone());
+            let stream = self.stream;
+            let instance_key = self.instance.key.clone();
+            // PostPlugin-stage scope: the ack forwarder MUST outlive the plugin
+            // dispatcher drain (acks still flow while the plugin flushes after
+            // Terminate); the stage placement guarantees it. Exits on scope
+            // cancellation once the queue is drained — the channel itself never
+            // disconnects (host and plugin each hold both ends for the process's
+            // life), so without watching the token this task can only ever blow
+            // its drain slice. By PostPlugin-cancel time the dispatcher's flush
+            // has run, so every ack it emitted has been forwarded.
+            let ack_cancel = self.scope.stage_token().clone();
+            self.scope.spawn(async move {
+                // Cancellation is checked on the BUSY path too, not only when
+                // the queue goes idle: a plugin acking faster than the 10ms
+                // idle poll would otherwise never let the Empty arm run,
+                // leaving the teardown-ordering invariant as the only
+                // protection. Once cancellation is observed, the drain is
+                // bounded to the acks queued at that moment — complete by
+                // PostPlugin-cancel, so none are lost — and a plugin
+                // misbehaving past Terminate cannot pin this task.
+                let mut remaining_after_cancel: Option<usize> = None;
+                loop {
+                    if remaining_after_cancel.is_none() && ack_cancel.is_cancelled() {
+                        remaining_after_cancel = Some(ack_receiver.len());
+                    }
+                    if remaining_after_cancel == Some(0) {
+                        debug!("Scope cancelled and queued acks forwarded; stopping ack forwarder");
+                        break;
+                    }
+                    match ack_receiver.try_recv() {
+                        Ok(message) => {
+                            if let Some(n) = remaining_after_cancel.as_mut() {
+                                *n -= 1;
+                            }
+                            match message.into_enum() {
+                                Ok(PluginMsg::CheckpointAck { epoch }) => {
+                                    debug!(
+                                        "Propagating checkpoint Ack with epoch {} from plugin {}",
+                                        epoch.0, instance_key
+                                    );
+                                    // The sink acks once every write stream's
+                                    // instance has flushed the epoch.
+                                    let release = report_marker_at_sink_stream(
+                                        &sink_id,
+                                        stream,
+                                        CheckpointEpoch(epoch.0),
+                                    );
+                                    // Counted by the gate before `write_all` may
+                                    // see the epoch acked and finish its stream.
+                                    ack_state.send_modify(|state| {
+                                        state.unacked.remove(&epoch.0);
+                                    });
+                                    if release
+                                        && let Err(e) = send(
+                                            CHECKPOINT_COORDINATOR_CHANNEL,
+                                            CheckpointMessage::Ack {
+                                                epoch: CheckpointEpoch(epoch.0),
+                                                sink_id: sink_id.clone(),
+                                            },
+                                        )
+                                    {
+                                        warn!(
+                                            "Stopping plugin ack forwarder: coordinator channel rejected ack for epoch {}: {}",
+                                            epoch.0, e
+                                        );
+                                        ack_state.send_modify(|state| {
+                                            state.failure.get_or_insert_with(|| {
+                                                format!("coordinator rejected its ack: {e}")
+                                            });
+                                        });
+                                        break;
+                                    }
+                                }
+                                Ok(PluginMsg::Error { message }) => {
+                                    error!("Plugin {} reported a failure: {}", instance_key, message);
+                                    ack_state.send_modify(|state| {
+                                        state.failure.get_or_insert_with(|| message.to_string());
+                                    });
+                                }
+                                _ => {
+                                    warn!("Received unexpected message from plugin channel");
+                                }
+                            }
+                        }
+                        Err(TryRecvError::Empty) => {
+                            if ack_cancel.is_cancelled() {
+                                debug!("Scope cancelled and queue drained; stopping ack forwarder");
+                                break;
+                            }
+                            // Acks arrive at checkpoint cadence (seconds
+                            // apart); ~10ms keeps the idle poll cheap while
+                            // still negligible against checkpoint latency.
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            debug!("Plugin output channel disconnected, stopping ack forwarder");
+                            break;
+                        }
+                    }
+                }
+            });
 
             // Sent through the shutdown-aware blocking facade (we are inside
             // a sync Once closure): bounded, and a disconnected channel
