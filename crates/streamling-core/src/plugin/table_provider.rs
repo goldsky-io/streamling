@@ -1,7 +1,7 @@
 use crate::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
-    report_marker_at_sink_stream,
+    report_marker_at_sink,
 };
 use crate::operators::parallel_sink::{ParallelSinkExec, ParallelSinks};
 use crate::plugin::partitioned::{PluginInstance, PluginInstances};
@@ -606,19 +606,17 @@ async fn reported_failure(ack_state: &mut watch::Receiver<AckState>) -> String {
 struct PluginSink {
     schema: SchemaRef,
     instance: PluginInstance,
-    /// The write stream this sink is bound to, which it reports its
-    /// instance's acks for.
-    stream: usize,
     num_records_before_stop: Option<u64>, // for integration tests only!
     metric_metadata_id: String,
     /// PostPlugin-stage scope for the metrics and ack forwarders: both serve
     /// the plugin dispatcher's flush, so they drain after it.
     scope: Arc<crate::shutdown::ComponentScope>,
     /// Set for a partition instance: its stream is one of several gated
-    /// write streams, and a finished stream releases its share of every
-    /// pending epoch (see `ParallelSinkExec`). Plugin acks arrive after
-    /// `write_all` has sent the marker, so `write_all` must not finish before
-    /// the instance acked every marker it was sent.
+    /// write streams, and once `write_all` returns, the stream counts as
+    /// having flushed every marker it carried (see `ParallelSinkExec`).
+    /// Plugin acks arrive after `write_all` has sent the marker, so
+    /// `write_all` must not finish before the instance acked every marker it
+    /// was sent.
     awaits_acks: bool,
     ack_state: Arc<watch::Sender<AckState>>,
     /// One `PluginMsg::Init` and one metrics/ack-forwarder set for the
@@ -630,7 +628,6 @@ impl PluginSink {
     fn new(
         schema: SchemaRef,
         instance: PluginInstance,
-        stream: usize,
         num_records_before_stop: Option<u64>,
         metric_metadata_id: String,
         scope: Arc<crate::shutdown::ComponentScope>,
@@ -639,7 +636,6 @@ impl PluginSink {
         Self {
             schema,
             instance,
-            stream,
             num_records_before_stop,
             metric_metadata_id,
             scope,
@@ -697,7 +693,6 @@ impl DataSink for PluginSink {
             let ack_state = self.ack_state.clone();
             let sink_id = metric_metadata_id_to_reference_name(&self.metric_metadata_id)
                 .unwrap_or_else(|| self.metric_metadata_id.clone());
-            let stream = self.stream;
             let instance_key = self.instance.key.clone();
             // PostPlugin-stage scope: the ack forwarder MUST outlive the plugin
             // dispatcher drain (acks still flow while the plugin flushes after
@@ -739,11 +734,8 @@ impl DataSink for PluginSink {
                                     );
                                     // The sink acks once every write stream's
                                     // instance has flushed the epoch.
-                                    let release = report_marker_at_sink_stream(
-                                        &sink_id,
-                                        stream,
-                                        CheckpointEpoch(epoch.0),
-                                    );
+                                    let release =
+                                        report_marker_at_sink(&sink_id, CheckpointEpoch(epoch.0));
                                     // Counted by the gate before `write_all` may
                                     // see the epoch acked and finish its stream.
                                     ack_state.send_modify(|state| {
@@ -1020,12 +1012,10 @@ impl TableProvider for PluginSinkProvider {
             .await?;
         let sinks = instances
             .into_iter()
-            .enumerate()
-            .map(|(stream, instance)| {
+            .map(|instance| {
                 let sink = Arc::new(PluginSink::new(
                     self.schema.clone(),
                     instance,
-                    stream,
                     self.num_records_before_stop,
                     self.metric_metadata_id.clone(),
                     self.scope.clone(),
@@ -1135,7 +1125,6 @@ mod tests {
                 channels: channels.clone(),
                 exit: crate::plugin::track_exit(Box::pin(std::future::pending())).1,
             },
-            0,
             None,
             "plugin::ack_after_last_batch_sink".to_string(),
             crate::shutdown::ComponentScope::detached("test"),

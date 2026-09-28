@@ -21,8 +21,9 @@
 //! per-sink ack gate registered here (see `MarkerAligner`).
 
 use crate::checkpoints::checkpoint_management::{
-    register_sink_streams, send_checkpoint_ack, sink_stream_done, sink_stream_failed,
+    register_sink_streams, send_checkpoint_ack, sink_stream_done,
 };
+use crate::operators::LastMarker;
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -283,37 +284,31 @@ impl ExecutionPlan for ParallelSinkExec {
             // thread. `JoinSet` aborts the remaining writes when the first
             // error propagates out.
             let mut writes = JoinSet::new();
-            for (stream, (sink, data)) in streams.into_iter().enumerate() {
+            for (sink, data) in streams {
                 let context = Arc::clone(&context);
+                let last_marker = LastMarker::default();
+                let data = last_marker.track(data);
                 // Sanctioned: structured concurrency — every task is joined
                 // via `join_next` below before this stream completes, and the
                 // JoinSet's abort-on-drop is the intended first-error
                 // behavior (cancel the sibling writes when one fails).
                 #[allow(clippy::disallowed_methods)]
-                writes.spawn(async move { (stream, sink.write_all(data, &context).await) });
+                writes.spawn(async move { (sink.write_all(data, &context).await, last_marker) });
             }
             let mut total_count: u64 = 0;
             while let Some(joined) = writes.join_next().await {
-                // When one stream's write fails, stop acking epochs for the whole
-                // sink. The rows that stream lost may belong to any epoch that
-                // isn't acked yet. Acking such an epoch, whether because the
-                // failed stream exited or because a sibling stream flushed it,
-                // would let the source commit offsets for rows never written.
-                let (stream, written) = match joined {
-                    Ok((stream, Ok(written))) => (stream, written),
-                    Ok((_, Err(e))) => {
-                        sink_stream_failed(&sink_id);
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        sink_stream_failed(&sink_id);
-                        return Err(internal_datafusion_err!("sink write task failed: {e}"));
-                    }
-                };
+                // Only a successful write releases its stream's share of the ack
+                // gate, so the `?`s come first. A failed stream stays required:
+                // an epoch it didn't flush may cover rows it lost, so that epoch
+                // must never be acked, even after every other stream flushed it.
+                // Otherwise the source would commit offsets for rows that were
+                // never written.
+                let (write_result, last_marker) =
+                    joined.map_err(|e| internal_datafusion_err!("sink write task failed: {e}"))?;
+                let written = write_result?;
                 // A finished stream will never report another epoch; releasing
                 // its share here keeps a late epoch from waiting forever on it.
-                let freed_epochs = sink_stream_done(&sink_id, stream);
-                for epoch in freed_epochs {
+                for epoch in sink_stream_done(&sink_id, last_marker.epoch()) {
                     send_checkpoint_ack(epoch, &sink_id);
                 }
                 total_count += written;
@@ -587,9 +582,9 @@ mod tests {
 
     const FREED_EPOCH: CheckpointEpoch = CheckpointEpoch(7);
 
-    /// One stream flushes an epoch and stays open, the other fails: finishing the
-    /// failed stream frees that epoch from the ack gate, and acking it there
-    /// would let the source commit offsets for the rows the failed write lost.
+    /// One stream flushes an epoch and stays open, the other fails: the epoch
+    /// covers the rows the failed write lost, and acking it would let the source
+    /// commit offsets for them.
     #[derive(Debug)]
     struct OneStreamFailsSink {
         schema: SchemaRef,
