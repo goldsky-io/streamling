@@ -508,8 +508,6 @@ impl ExecutionPlan for PluginSourceExec {
 pub struct PluginSourceProvider {
     schema: SchemaRef,
     instances: PluginInstances,
-    /// How many streams the source runs: 1 for a single-stream plugin.
-    partitions: usize,
     internal_buffer_size: u32,
     metric_metadata_id: String,
     /// PostPlugin-stage scope: the metrics forwarder must outlive the plugin
@@ -522,7 +520,6 @@ impl PluginSourceProvider {
     pub fn new(
         schema: SchemaRef,
         instances: PluginInstances,
-        partitions: usize,
         internal_buffer_size: u32,
         metric_metadata_id: String,
         scope: Arc<crate::shutdown::ComponentScope>,
@@ -530,7 +527,6 @@ impl PluginSourceProvider {
         Self {
             schema,
             instances,
-            partitions,
             internal_buffer_size,
             metric_metadata_id,
             scope,
@@ -546,7 +542,11 @@ impl PluginSourceProvider {
         let projection = projections
             .filter(|indices| !indices.iter().copied().eq(0..self.schema.fields().len()))
             .cloned();
-        let instances = self.instances.resolve(self.partitions, None).await?;
+        let partitions = match &self.instances {
+            PluginInstances::Single(_) => 1,
+            PluginInstances::Partitioned(plugin) => plugin.source_width()?,
+        };
+        let instances = self.instances.resolve(partitions, None).await?;
         Ok(Arc::new(PluginSourceExec::new(
             schema_projected,
             projection,
@@ -981,15 +981,6 @@ impl TableProvider for PluginSinkProvider {
         // per write stream, each bound to its stream.
         let partitions = input.output_partitioning().partition_count();
         let awaits_acks = matches!(self.instances, PluginInstances::Partitioned(_));
-        if let PluginInstances::Partitioned(plugin) = &self.instances {
-            plugin.check_width(
-                partitions,
-                &format!(
-                    "its input is {partitions} streams wide; set `parallelism` on the sink \
-                     to run it at a supported width"
-                ),
-            )?;
-        }
         let instances = self
             .instances
             .resolve(partitions, Some(self.schema.clone()))
@@ -1028,7 +1019,7 @@ mod tests {
     use crate::checkpoints::checkpoint_management::now_ms;
     use crate::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
     use crate::plugin::test_plugins::{
-        self, ACK_DELAY_MS, FAIL_BATCHES_AT, FAIL_MARKERS, ID_STRIDE, NODE, ROWS, SINK,
+        self, ACK_DELAY_MS, FAIL_BATCHES_AT, FAIL_MARKERS, ID_STRIDE, NODE, PREFERRED, ROWS, SINK,
         SLOW_ACK_AT, SOURCE, batch, ids, marker, shut_down, source_schema,
     };
     use abi_stable::external_types::crossbeam_channel as ffi_channel;
@@ -1177,20 +1168,16 @@ mod tests {
             kind,
             input_schema,
             options(node, extra),
+            None,
         )
         .unwrap()
         .unwrap()
     }
 
-    async fn scan_source(
-        node: &str,
-        source: &Arc<PartitionedPlugin>,
-        width: usize,
-    ) -> Arc<dyn ExecutionPlan> {
+    async fn scan_source(node: &str, source: &Arc<PartitionedPlugin>) -> Arc<dyn ExecutionPlan> {
         PluginSourceProvider::new(
             source_schema(),
             PluginInstances::Partitioned(source.clone()),
-            width,
             10,
             format!("app::{node}"),
             crate::shutdown::ComponentScope::detached("test"),
@@ -1252,8 +1239,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn partitioned_source_routes_each_partition_to_its_own_instance() {
-        let source = describe("routed_source", SOURCE, PluginKind::Source, &[(ROWS, "25")]);
-        let exec = scan_source("routed_source", &source, 3).await;
+        let source = describe(
+            "routed_source",
+            SOURCE,
+            PluginKind::Source,
+            &[(ROWS, "25"), (PREFERRED, "3")],
+        );
+        let exec = scan_source("routed_source", &source).await;
         assert_eq!(exec.output_partitioning().partition_count(), 3);
 
         let streams = (0..3).map(|partition| {
@@ -1282,8 +1274,13 @@ mod tests {
     #[serial]
     async fn each_source_partition_carries_one_copy_of_a_marker() {
         const EPOCH: u64 = 90_001;
-        let source = describe("marked_source", SOURCE, PluginKind::Source, &[]);
-        let exec = scan_source("marked_source", &source, 2).await;
+        let source = describe(
+            "marked_source",
+            SOURCE,
+            PluginKind::Source,
+            &[(PREFERRED, "2")],
+        );
+        let exec = scan_source("marked_source", &source).await;
         let mut streams: Vec<_> = (0..2)
             .map(|p| exec.execute(p, Arc::new(TaskContext::default())).unwrap())
             .collect();
@@ -1331,7 +1328,7 @@ mod tests {
             PluginKind::Source,
             &[(FAIL_MARKERS, "true")],
         );
-        let exec = scan_source("failing_source", &source, 1).await;
+        let exec = scan_source("failing_source", &source).await;
         let mut stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
         let deadline = Instant::now() + EXIT_BOUND;
         while !test_plugins::log("failing_source[0]").initialized {
@@ -1422,6 +1419,7 @@ mod tests {
             PluginKind::Sink,
             Some(source_schema()),
             options("stateful_sink", &[(test_plugins::WRITE_STATE, "true")]),
+            None,
         )
         .unwrap()
         .unwrap();

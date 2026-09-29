@@ -204,17 +204,8 @@ impl ExtensionPlanner for PluginExtensionPlanner {
                 // its input is already as wide as it will run, either
                 // inherited or widened by the exchange planned under it.
                 let partitions = input_physical.output_partitioning().partition_count();
-                let instances = plugin_node.instances();
-                if let PluginInstances::Partitioned(plugin) = &instances {
-                    plugin.check_width(
-                        partitions,
-                        &format!(
-                            "its input is {partitions} streams wide; set `parallelism` on the \
-                             transform to run it at a supported width"
-                        ),
-                    )?;
-                }
-                let instances = instances
+                let instances = plugin_node
+                    .instances()
                     .resolve(partitions, Some(input_physical.schema()))
                     .await?;
 
@@ -546,9 +537,7 @@ mod tests {
     use crate::app_config::AppConfig;
     use crate::checkpoints::checkpoint_management::CheckpointMessage;
     use crate::dynamic_table::DynamicTableRegistry;
-    use crate::plugin::partitioned::{
-        PartitionedPlugin, PluginInstance, PluginInstances, PluginKind,
-    };
+    use crate::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
     use crate::plugin::test_plugins::{
         self, FAIL_BATCHES_AT, LEGACY_TRANSFORM, MAXIMUM, NODE, TRANSFORM,
         TRANSFORM_PARTITION_COLUMN, batch, ids, marker, shut_down, source_schema,
@@ -580,6 +569,7 @@ mod tests {
             PluginKind::Transform,
             Some(source_schema()),
             options(node, extra),
+            None,
         )
         .unwrap()
         .unwrap()
@@ -650,11 +640,7 @@ mod tests {
             source_schema(),
         )
         .unwrap();
-        let instance = PluginInstance {
-            key: "coalesced".to_string(),
-            channels: Arc::new(legacy.channels.clone()),
-            exit: legacy.exit.clone(),
-        };
+        let instance = legacy.instance("coalesced".to_string());
 
         let plan = plan_over(
             3,
