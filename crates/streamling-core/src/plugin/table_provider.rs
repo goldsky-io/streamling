@@ -589,19 +589,6 @@ struct AckState {
     failure: Option<String>,
 }
 
-/// Resolves once the instance reported a failure.
-async fn reported_failure(ack_state: &mut watch::Receiver<AckState>) -> String {
-    let failure = ack_state
-        .wait_for(|state| state.failure.is_some())
-        .await
-        .map(|state| state.failure.clone().unwrap_or_default());
-    match failure {
-        Ok(failure) => failure,
-        // The sender lives as long as the sink writing through this receiver.
-        Err(_) => std::future::pending().await,
-    }
-}
-
 /// The write path into one plugin instance.
 struct PluginSink {
     schema: SchemaRef,
@@ -736,8 +723,6 @@ impl DataSink for PluginSink {
                                     // instance has flushed the epoch.
                                     let release =
                                         report_marker_at_sink(&sink_id, CheckpointEpoch(epoch.0));
-                                    // Counted by the gate before `write_all` may
-                                    // see the epoch acked and finish its stream.
                                     ack_state.send_modify(|state| {
                                         state.unacked.remove(&epoch.0);
                                     });
@@ -803,19 +788,39 @@ impl DataSink for PluginSink {
         init_send?;
 
         let mut row_count = 0;
+        let mut input_ended = false;
+        let mut exit = self.instance.exit.clone();
 
         loop {
-            // A failed plugin keeps draining its input until teardown, so its
-            // report is the only way this write learns of the failure early.
+            {
+                let state = ack_state.borrow_and_update();
+                // A failed plugin keeps draining its input until teardown, so
+                // its report is the only way this write learns of the failure
+                // early.
+                if let Some(failure) = &state.failure {
+                    return Err(crate::plugin::plugin_failure(&self.instance.key, failure));
+                }
+                if input_ended && (!self.awaits_acks || state.unacked.is_empty()) {
+                    break;
+                }
+            }
             let next = tokio::select! {
                 biased;
-                failure = reported_failure(&mut ack_state) => {
+                Ok(()) = ack_state.changed() => continue,
+                // An instance can also exit without reporting a failure (a hook
+                // that panicked); its unacked epochs are then never flushed.
+                () = exit.exited(), if input_ended => {
+                    let state = ack_state.borrow();
+                    let failure = state.failure.clone().unwrap_or_else(|| {
+                        format!("it exited with epochs {:?} unacked", state.unacked)
+                    });
                     return Err(crate::plugin::plugin_failure(&self.instance.key, &failure));
                 }
-                next = data.next() => next,
+                next = data.next(), if !input_ended => next,
             };
             let Some(batch) = next.transpose()? else {
-                break;
+                input_ended = true;
+                continue;
             };
             row_count += batch.num_rows();
 
@@ -888,28 +893,7 @@ impl DataSink for PluginSink {
             if let Some(num_records_before_stop) = self.num_records_before_stop
                 && row_count >= num_records_before_stop as usize
             {
-                break;
-            }
-        }
-
-        if self.awaits_acks {
-            // An instance can also exit without reporting a failure (a hook
-            // that panicked); its unacked epochs are then never flushed.
-            let mut exit = self.instance.exit.clone();
-            tokio::select! {
-                biased;
-                _ = ack_state.wait_for(|state| state.failure.is_some() || state.unacked.is_empty()) => {}
-                () = exit.exited() => {}
-            }
-            let failure = {
-                let state = ack_state.borrow();
-                state.failure.clone().or_else(|| {
-                    (!state.unacked.is_empty())
-                        .then(|| format!("it exited with epochs {:?} unacked", state.unacked))
-                })
-            };
-            if let Some(failure) = failure {
-                return Err(crate::plugin::plugin_failure(&self.instance.key, &failure));
+                input_ended = true;
             }
         }
 
@@ -1040,11 +1024,18 @@ impl TableProvider for PluginSinkProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::AppConfig;
     use crate::checkpoints::checkpoint_management::now_ms;
+    use crate::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
+    use crate::plugin::test_plugins::{
+        self, ACK_DELAY_MS, FAIL_BATCHES_AT, FAIL_MARKERS, ID_STRIDE, NODE, ROWS, SINK,
+        SLOW_ACK_AT, SOURCE, batch, ids, marker, shut_down, source_schema,
+    };
     use abi_stable::external_types::crossbeam_channel as ffi_channel;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::arrow::array::Int64Array;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
     use serial_test::serial;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -1160,21 +1151,6 @@ mod tests {
         unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, coordinator_sub_id);
         fake_plugin.join().expect("test plugin thread panicked");
     }
-}
-
-#[cfg(test)]
-mod partitioned_tests {
-    use super::*;
-    use crate::app_config::AppConfig;
-    use crate::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
-    use crate::plugin::test_plugins::{
-        self, ACK_DELAY_MS, FAIL_BATCHES_AT, FAIL_MARKERS, ID_STRIDE, NODE, ROWS, SINK,
-        SLOW_ACK_AT, SOURCE, batch, ids, marker, shut_down, source_schema,
-    };
-    use datafusion::prelude::SessionContext;
-    use serial_test::serial;
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
 
     const EXIT_BOUND: Duration = Duration::from_secs(5);
 
