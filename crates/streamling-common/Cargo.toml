@@ -60,10 +60,6 @@ num-bigint.workspace = true
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build", "ssl-vendored"] }
 
-# ⚠️ macOS has no system OpenSSL either — the comment above used to say the macOS build was "unchanged",
-# and it does not link. mklove works there (it is a Unix), so only the vendored OpenSSL is needed, not
-# cmake-build. Without this every macOS developer carries an uncommitted Cargo.toml edit, which is how it
-# has been handled until now: a local block in the CONSUMING repo adding a direct `rdkafka` dependency
-# purely to unify this feature onto a transitive one. That belongs here, at the crate that pulls it in.
+# macOS also has no system OpenSSL for librdkafka; mklove works there, so only ssl-vendored is needed.
 [target.'cfg(target_os = "macos")'.dependencies]
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
