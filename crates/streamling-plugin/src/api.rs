@@ -310,6 +310,10 @@ pub trait SourcePlugin: SupportsGracefulShutdown + Send + Sync {
     /// construction time (e.g. `chain_slug`, `network`, `topic`). Returned labels flow
     /// through `PluginResult::labels` into the metrics subsystem as Prometheus labels.
     /// Default: no labels.
+    ///
+    /// A partitioned plugin's instances must all return exactly the labels its
+    /// `describe` returned: labels identify the node, so they cannot vary per
+    /// partition (for example, by carrying the partition index).
     fn labels(&self) -> Vec<PluginLabel> {
         Vec::new()
     }
