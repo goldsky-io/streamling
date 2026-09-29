@@ -1151,10 +1151,12 @@ impl DataSink for ClickHouseSinkExec {
 
             let start_at = Instant::now();
 
-            let normalized_batch = match ClickHouseClient::normalize_batch_for_clickhouse(
-                &batch,
-                &normalized_schema,
-            ) {
+            let normalized_schema_clone = normalized_schema.clone();
+            let normalized_batch = match run_blocking(move || {
+                ClickHouseClient::normalize_batch_for_clickhouse(&batch, &normalized_schema_clone)
+            })
+            .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
@@ -1164,7 +1166,6 @@ impl DataSink for ClickHouseSinkExec {
                     return Err(e);
                 }
             };
-            drop(batch);
 
             // Deduplication is handled by WrappingDataSink before batches reach this sink.
 
@@ -1194,17 +1195,45 @@ impl DataSink for ClickHouseSinkExec {
                 }
             } else {
                 // append_only_mode=false: split rows by _gs_op into inserts vs deletes
-                let (insert_rows, delete_indices) = split_rows_by_operation(&normalized_batch)?;
+                let primary_keys_clone = primary_keys.clone();
+                let (insert, delete_count, delete_batch) = run_blocking(move || {
+                    let (insert_rows, delete_indices) = split_rows_by_operation(&normalized_batch)?;
 
-                // Process inserts/updates: strip _gs_op, then send via Arrow IPC
-                if let Some(insert_rows) = insert_rows {
-                    let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
-                    // Build schema without _gs_op for INSERTs
-                    let insert_schema =
-                        Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
-                            insert_batch.schema().as_ref(),
-                        ));
+                    // Process inserts/updates: strip _gs_op, then build the
+                    // insert schema without it.
+                    let insert = if let Some(insert_rows) = insert_rows {
+                        let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
+                        // Build schema without _gs_op for INSERTs
+                        let insert_schema =
+                            Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
+                                insert_batch.schema().as_ref(),
+                            ));
+                        Some((insert_batch, insert_schema))
+                    } else {
+                        None
+                    };
 
+                    let delete_count = delete_indices.len();
+                    // Only build the delete batch when there are delete rows
+                    // and primary keys are configured.
+                    let delete_batch =
+                        if !delete_indices.is_empty() && !primary_keys_clone.is_empty() {
+                            let indices_array = arrow::array::UInt32Array::from(delete_indices);
+                            // See the safe_take_record_batch comment in `split_rows_by_operation`.
+                            Some(streamling_core::utils::arrow::safe_take_record_batch(
+                                &normalized_batch,
+                                &indices_array,
+                            )?)
+                        } else {
+                            None
+                        };
+
+                    Ok::<_, DataFusionError>((insert, delete_count, delete_batch))
+                })
+                .await?;
+
+                // Process inserts/updates: send the stripped batch via Arrow IPC
+                if let Some((insert_batch, insert_schema)) = insert {
                     let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
                     let mut shutdown = streamling_core::shutdown::subscribe();
                     match retry_forever_with_backoff_until_cancelled(
@@ -1230,22 +1259,14 @@ impl DataSink for ClickHouseSinkExec {
                 }
 
                 // Process deletes: extract PK columns and issue ALTER TABLE DELETE
-                if !delete_indices.is_empty() && primary_keys.is_empty() {
+                if delete_count > 0 && primary_keys.is_empty() {
                     warn!(
                         "{}: dropping {} delete rows for table '{}' because no primary keys are configured",
-                        node_label,
-                        delete_indices.len(),
-                        table_name
+                        node_label, delete_count, table_name
                     );
                 }
-                if !delete_indices.is_empty() && !primary_keys.is_empty() {
-                    let indices_array = arrow::array::UInt32Array::from(delete_indices);
-                    // See the safe_take_record_batch comment in `split_rows_by_operation`.
-                    let delete_batch = streamling_core::utils::arrow::safe_take_record_batch(
-                        &normalized_batch,
-                        &indices_array,
-                    )?;
 
+                if let Some(delete_batch) = delete_batch {
                     let operation_name = format!("{}: DELETE from '{}'", node_label, table_name);
                     let client_for_delete = client.clone();
                     let table_for_delete = table_name.clone();
@@ -1815,7 +1836,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                     Some(version_col) => {
                                         let dedup_key_owned = dedup_key.clone();
                                         let version_col_owned = version_col.clone();
-                                        match tokio::task::spawn_blocking(move || {
+                                        match run_blocking(move || {
                                             deduplicate_record_batches_by_version(
                                                 &batches,
                                                 &dedup_key_owned,
@@ -1827,9 +1848,6 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                             )
                                         })
                                         .await
-                                        .unwrap_or_else(|join_err| {
-                                            Err(streamling_err!("dedup task failed: {}", join_err))
-                                        })
                                         {
                                             Ok(deduped) if deduped.num_rows() == 0 => {
                                                 (Vec::new(), true)
@@ -2114,6 +2132,21 @@ async fn decode_arrow_ipc_blocking(
         Ok(batches) => batches,
         Err(join_err) => vec![Err(ArrowError::ExternalError(Box::new(join_err)))],
     }
+}
+
+/// Runs CPU-heavy work on the blocking pool so it does not hold a tokio
+/// worker thread. A failed or cancelled task becomes an error of the
+/// caller's type.
+pub(crate) async fn run_blocking<T, E>(
+    f: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
+) -> std::result::Result<T, E>
+where
+    T: Send + 'static,
+    E: From<StreamlingError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(E::from(streamling_err!("blocking task failed: {}", e))))
 }
 
 /// The one `reqwest::Client` behind every [`ClickHouseClient`] in the process.
@@ -2911,55 +2944,74 @@ impl ClickHouseClient {
             return Ok(());
         }
 
-        // Build all value tuples first
-        let mut value_tuples = Vec::with_capacity(delete_batch.num_rows());
-        for row_idx in 0..delete_batch.num_rows() {
-            let mut values = Vec::with_capacity(primary_keys.len());
-            for pk in primary_keys {
-                let col = delete_batch.column_by_name(pk).ok_or_else(|| {
-                    streamling_err!("primary key column '{}' not found in delete batch", pk)
-                })?;
-                let scalar =
-                    ScalarValue::try_from_array(col, row_idx).streamling_with_context(|| {
-                        format!(
-                            "failed to extract primary key value for column '{}' at row {}",
-                            pk, row_idx
-                        )
+        let table_name_owned = table_name.to_string();
+        let pks_owned = primary_keys.to_vec();
+        let batch_clone = delete_batch.clone();
+        // Build the per-row value tuples, the pk_clause, and the chunked
+        // ALTER TABLE ... DELETE WHERE ... query strings off the async thread.
+        let queries = run_blocking(move || {
+            // Build all value tuples first
+            let mut value_tuples = Vec::with_capacity(batch_clone.num_rows());
+            for row_idx in 0..batch_clone.num_rows() {
+                let mut values = Vec::with_capacity(pks_owned.len());
+                for pk in &pks_owned {
+                    let col = batch_clone.column_by_name(pk).ok_or_else(|| {
+                        streamling_err!("primary key column '{}' not found in delete batch", pk)
                     })?;
-                values.push(Self::scalar_to_clickhouse_literal(&scalar));
+                    let scalar = ScalarValue::try_from_array(col, row_idx)
+                        .streamling_with_context(|| {
+                            format!(
+                                "failed to extract primary key value for column '{}' at row {}",
+                                pk, row_idx
+                            )
+                        })?;
+                    values.push(Self::scalar_to_clickhouse_literal(&scalar));
+                }
+                if pks_owned.len() == 1 {
+                    value_tuples.push(values[0].clone());
+                } else {
+                    value_tuples.push(format!("({})", values.join(", ")));
+                }
             }
-            if primary_keys.len() == 1 {
-                value_tuples.push(values[0].clone());
+
+            let pk_clause = if pks_owned.len() == 1 {
+                format!("`{}`", pks_owned[0])
             } else {
-                value_tuples.push(format!("({})", values.join(", ")));
-            }
-        }
+                format!(
+                    "({})",
+                    pks_owned
+                        .iter()
+                        .map(|pk| format!("`{}`", pk))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
 
-        let pk_clause = if primary_keys.len() == 1 {
-            format!("`{}`", primary_keys[0])
-        } else {
-            format!(
-                "({})",
-                primary_keys
-                    .iter()
-                    .map(|pk| format!("`{}`", pk))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+            // Chunk deletes to stay well under ClickHouse's max_query_size (256KB default).
+            // 1000 rows per chunk is conservative and safe for most PK sizes.
+            const DELETE_CHUNK_SIZE: usize = 1000;
 
-        // Chunk deletes to stay well under ClickHouse's max_query_size (256KB default).
-        // 1000 rows per chunk is conservative and safe for most PK sizes.
-        const DELETE_CHUNK_SIZE: usize = 1000;
+            let queries: Vec<(String, usize)> = value_tuples
+                .chunks(DELETE_CHUNK_SIZE)
+                .map(|chunk| {
+                    let where_clause = format!("{} IN ({})", pk_clause, chunk.join(", "));
+                    let query = format!(
+                        "ALTER TABLE {} DELETE WHERE {}",
+                        table_name_owned, where_clause
+                    );
+                    (query, chunk.len())
+                })
+                .collect();
 
-        for chunk in value_tuples.chunks(DELETE_CHUNK_SIZE) {
-            let where_clause = format!("{} IN ({})", pk_clause, chunk.join(", "));
-            let query = format!("ALTER TABLE {} DELETE WHERE {}", table_name, where_clause);
+            Ok::<_, StreamlingError>(queries)
+        })
+        .await?;
 
+        for (query, chunk_len) in queries {
             debug!(
                 "ClickHouse DELETE for table {} ({} rows in this chunk, {} total)",
                 table_name,
-                chunk.len(),
+                chunk_len,
                 delete_batch.num_rows()
             );
 
@@ -4899,6 +4951,33 @@ mod tests {
             .map(|r| r.expect("decode failed").num_rows())
             .sum();
         assert_eq!(total_rows, 500_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_runs_off_the_runtime_thread() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        // Test-only helper task; the disallowed-methods lint targets production code.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        let value = run_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok::<_, StreamlingError>(7)
+        })
+        .await
+        .expect("run_blocking failed");
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "runtime thread was not free to run other tasks while run_blocking worked"
+        );
+        assert_eq!(value, 7);
     }
 
     #[tokio::test]
