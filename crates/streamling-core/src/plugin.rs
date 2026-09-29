@@ -734,6 +734,15 @@ impl InitializedPlugin {
             output_schema,
         })
     }
+
+    /// This plugin as the single instance of node `reference_name`.
+    pub fn instance(&self, reference_name: String) -> partitioned::PluginInstance {
+        partitioned::PluginInstance {
+            key: reference_name,
+            channels: Arc::new(self.channels.clone()),
+            exit: self.exit.clone(),
+        }
+    }
 }
 
 /// Convert plugin-returned labels into the `(String, String)` shape expected by

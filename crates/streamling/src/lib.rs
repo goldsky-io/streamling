@@ -63,9 +63,7 @@ pub mod error_format;
 mod topology_sort;
 pub mod validate;
 use streamling_core::plugin::operator::PluginNode;
-use streamling_core::plugin::partitioned::{
-    InputPlacement, PartitionRange, PartitionedPlugin, PluginInstance, PluginInstances, PluginKind,
-};
+use streamling_core::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
 use streamling_core::plugin::side_output::{
     register_plugin_side_outputs, shutdown_plugin_side_outputs,
 };
@@ -763,9 +761,6 @@ struct SinkEntry {
     placement: Placement,
     /// Number of concurrent write streams requested by the sink's `parallelism`.
     parallelism: Option<usize>,
-    /// The widths a partitioned plugin sink supports; `None` for every other
-    /// sink.
-    partitions: Option<PartitionRange>,
 }
 
 impl SinkEntry {
@@ -775,7 +770,6 @@ impl SinkEntry {
         rebatch_config: RebatchConfig,
         placement: Placement,
         parallelism: Option<usize>,
-        partitions: Option<PartitionRange>,
     ) -> Self {
         Self {
             name,
@@ -783,7 +777,6 @@ impl SinkEntry {
             rebatch_config,
             placement,
             parallelism,
-            partitions,
         }
     }
 }
@@ -837,180 +830,70 @@ fn validate_parallelism(topology: &PipelineTopology) -> Result<usize> {
 /// A sink that cannot be parallelized at all short-circuits this: `MultiSinkExec`
 /// spawns one `write_all` per input partition per sink, so the only way to hold
 /// that sink to one write stream is to narrow the whole group.
-///
-/// A partitioned plugin sink runs one instance per stream of the group, so
-/// the group's width must be one it supports, and the one its own
-/// `parallelism` asks for when set. When the width is decided here it is
-/// checked here, naming what set it; an inherited width is checked when the
-/// sink is planned.
 fn wrap_multi_sink_with_repartition(
     plan: LogicalPlan,
     sinks: &[SinkEntry],
     group_name: &str,
-) -> Result<LogicalPlan> {
+) -> LogicalPlan {
     let single_stream_sinks: Vec<&str> = sinks
         .iter()
         .filter(|entry| matches!(entry.placement, Placement::Single))
         .map(|entry| entry.name.as_str())
         .collect();
-    // The placement, the width it is planned at (when decided here), and why.
-    let (placement, parallelism, width_reason) = if !single_stream_sinks.is_empty() {
+    if !single_stream_sinks.is_empty() {
         warn!(
             "sinks [{}] share one input, but [{}] cannot write from more than one stream; \
              running the whole group on a single stream, since they all read one exchange",
             group_name,
             single_stream_sinks.join(", ")
         );
-        (
-            Placement::Single,
-            None,
-            Some(format!(
-                "its fan-out group [{group_name}] runs 1 stream because [{}] cannot write \
-                 from more than one",
-                single_stream_sinks.join(", ")
-            )),
-        )
-    } else {
-        let mut key_sets: Vec<&Vec<String>> = sinks
-            .iter()
-            .filter_map(|entry| match &entry.placement {
-                Placement::ByKey(columns) if !columns.is_empty() => Some(columns),
-                _ => None,
-            })
-            .collect();
-        key_sets.sort();
-        key_sets.dedup();
+        return wrap_with_repartition(plan, &Placement::Single, None, group_name.to_string());
+    }
 
-        let widest = sinks
-            .iter()
-            .filter_map(|entry| entry.parallelism.map(|p| (p, entry.name.as_str())))
-            .max_by_key(|(parallelism, _)| *parallelism);
-        let parallelism = widest.map(|(parallelism, _)| parallelism);
-        let set_by = widest.map(|(parallelism, name)| {
-            format!(
-                "its fan-out group [{group_name}] runs {parallelism} streams, set by sink \
-                 '{name}''s parallelism"
+    let mut key_sets: Vec<&Vec<String>> = sinks
+        .iter()
+        .filter_map(|entry| match &entry.placement {
+            Placement::ByKey(columns) if !columns.is_empty() => Some(columns),
+            _ => None,
+        })
+        .collect();
+    key_sets.sort();
+    key_sets.dedup();
+
+    let parallelism = sinks.iter().filter_map(|entry| entry.parallelism).max();
+
+    match key_sets.as_slice() {
+        // Round-robin serves every sink here, since none of them cares which
+        // stream a row lands on.
+        [] => wrap_with_repartition(
+            plan,
+            &Placement::RoundRobin,
+            parallelism,
+            group_name.to_string(),
+        ),
+        [keys] => wrap_with_repartition(
+            plan,
+            &Placement::ByKey((*keys).clone()),
+            parallelism,
+            group_name.to_string(),
+        ),
+        _ => {
+            warn!(
+                "sinks [{}] share one input but declare different primary keys ({}); \
+                 running them on a single stream, since one exchange cannot key for all of them",
+                group_name,
+                key_sets
+                    .iter()
+                    .map(|keys| keys.join("+"))
+                    .collect::<Vec<_>>()
+                    .join(" vs ")
+            );
+            wrap_with_repartition(
+                plan,
+                &Placement::RoundRobin,
+                Some(1),
+                group_name.to_string(),
             )
-        });
-
-        match key_sets.as_slice() {
-            // Round-robin serves every sink here, since none of them cares which
-            // stream a row lands on.
-            [] => (Placement::RoundRobin, parallelism, set_by),
-            [keys] => (Placement::ByKey((*keys).clone()), parallelism, set_by),
-            _ => {
-                warn!(
-                    "sinks [{}] share one input but declare different primary keys ({}); \
-                     running them on a single stream, since one exchange cannot key for all of them",
-                    group_name,
-                    key_sets
-                        .iter()
-                        .map(|keys| keys.join("+"))
-                        .collect::<Vec<_>>()
-                        .join(" vs ")
-                );
-                (
-                    Placement::RoundRobin,
-                    Some(1),
-                    Some(format!(
-                        "its fan-out group [{group_name}] runs 1 stream because its sinks \
-                         declare different primary keys"
-                    )),
-                )
-            }
-        }
-    };
-
-    let width = match placement {
-        Placement::Single => Some(1),
-        _ => parallelism,
-    };
-    if let (Some(width), Some(reason)) = (width, &width_reason) {
-        for entry in sinks {
-            let Some(partitions) = &entry.partitions else {
-                continue;
-            };
-            // Its instance count, and the per-partition state behind it, is
-            // what its own `parallelism` asked for — never a sibling's.
-            if let Some(parallelism) = entry.parallelism.filter(|p| *p != width) {
-                streamling_user_bail!(
-                    "sink '{}': its parallelism is {parallelism}, but {reason}",
-                    entry.name
-                );
-            }
-            partitions.check(width, &entry.name, reason)?;
-        }
-    }
-
-    Ok(wrap_with_repartition(
-        plan,
-        &placement,
-        parallelism,
-        group_name.to_string(),
-    ))
-}
-
-/// A plugin that only runs single-stream cannot honor a wider
-/// `parallelism`; say so instead of silently running one stream.
-fn require_single_stream(node: &str, plugin_type: &str, parallelism: Option<usize>) -> Result<()> {
-    if let Some(parallelism) = parallelism.filter(|p| *p > 1) {
-        streamling_user_bail!(
-            "{node}: plugin '{plugin_type}' only runs single-stream, so it cannot run with \
-             parallelism {parallelism} (its library predates partitioned plugins, or it is \
-             registered as a single-stream plugin)"
-        );
-    }
-    Ok(())
-}
-
-/// How a partitioned plugin transform's or sink's INPUT is placed across its
-/// instances, from the placement the plugin declared.
-///
-/// `ByPrimaryKey` resolves like a script transform's key (see
-/// [`script_input_placement`]): a transform's `primary_key` describes its
-/// OUTPUT, so it places the input only when every column exists upstream,
-/// otherwise the upstream node's key does. Unlike a script, the plugin asked
-/// for keyed placement, so when neither key resolves planning fails rather
-/// than falling back to round-robin.
-fn plugin_input_placement(
-    node: &str,
-    declared: &InputPlacement,
-    own_key: &[String],
-    upstream_key: Option<&[String]>,
-    input_field_names: &[String],
-) -> Result<Placement> {
-    match declared {
-        InputPlacement::RoundRobin => Ok(Placement::RoundRobin),
-        InputPlacement::ByColumns(columns) => {
-            let missing: Vec<&String> = columns
-                .iter()
-                .filter(|c| !input_field_names.contains(c))
-                .collect();
-            if !missing.is_empty() {
-                streamling_user_bail!(
-                    "{node}: the plugin places its input by columns {missing:?}, which are not \
-                     in its input schema"
-                );
-            }
-            Ok(Placement::ByKey(columns.clone()))
-        }
-        InputPlacement::ByPrimaryKey => {
-            let chosen = script_input_placement(own_key, upstream_key, input_field_names);
-            if !matches!(chosen.placement, Placement::ByKey(_)) {
-                streamling_user_bail!(
-                    "{node}: the plugin places its input by primary key, but neither its own \
-                     primary key nor its upstream node's is in its input schema; configure a \
-                     `primary_key` whose columns the input has"
-                );
-            }
-            if chosen.used_upstream_key && !chosen.generated_columns.is_empty() {
-                warn!(
-                    "{}: primary key column(s) {:?} are produced by the plugin and are not in \
-                     its input schema; placing its input by the upstream node's key instead",
-                    node, chosen.generated_columns
-                );
-            }
-            Ok(chosen.placement)
         }
     }
 }
@@ -1636,32 +1519,24 @@ impl Streamling {
                         PluginKind::Source,
                         None,
                         opts.clone(),
+                        plugin.parallelism,
                     )
                     .map_err(|e| {
                         e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
-                    let (output_schema, instances, partitions) = match described {
+                    let (output_schema, instances) = match described {
                         // Instances are created during physical planning, one
                         // per stream.
                         Some(partitioned) => {
-                            let partitions = partitioned
-                                .partitions()
-                                .source_width(plugin.parallelism, reference_name)?;
                             partitioned_plugins.push(partitioned.clone());
                             (
                                 partitioned
                                     .output_schema()
                                     .expect("a source description has an output schema"),
                                 PluginInstances::Partitioned(partitioned),
-                                partitions,
                             )
                         }
                         None => {
-                            require_single_stream(
-                                &ctx.format(),
-                                &plugin.r#type,
-                                plugin.parallelism,
-                            )?;
                             // Keying by reference name (no cross-source sharing)
                             if !plugins.contains_key(reference_name) {
                                 let created = create_source_plugin(
@@ -1683,19 +1558,16 @@ impl Streamling {
                                 .output_schema
                                 .clone()
                                 .expect("Source plugin must have output schema");
-                            let instance = PluginInstance {
-                                key: reference_name.clone(),
-                                channels: Arc::new(created.channels.clone()),
-                                exit: created.exit.clone(),
-                            };
-                            (output_schema, PluginInstances::Single(instance), 1)
+                            (
+                                output_schema,
+                                PluginInstances::Single(created.instance(reference_name.clone())),
+                            )
                         }
                     };
                     let plugin_source_provider: Arc<PluginSourceProvider> =
                         Arc::new(PluginSourceProvider::new(
                             output_schema,
                             instances,
-                            partitions,
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
                             shutdown_controller.scope_at(
@@ -2255,19 +2127,13 @@ impl Streamling {
                         PluginKind::Transform,
                         Some(source_plan.schema().inner().clone()),
                         options.clone(),
+                        plugin_transform.parallelism,
                     )
                     .map_err(|e| {
                         e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
                     let (transform_input, output_schema, instances) = match described {
                         Some(partitioned) => {
-                            let input_field_names: Vec<String> = source_plan
-                                .schema()
-                                .inner()
-                                .fields()
-                                .iter()
-                                .map(|f| f.name().clone())
-                                .collect();
                             let own_key = primary_key_opt
                                 .as_deref()
                                 .map(|pk| {
@@ -2282,21 +2148,11 @@ impl Streamling {
                             // Read-only lookup: `propagate` would re-register
                             // the key under this node.
                             let upstream_key = pk_registry.get(from.as_str()).map(|m| m.columns);
-                            let placement = plugin_input_placement(
-                                &ctx.format(),
-                                partitioned
-                                    .input_placement()
-                                    .expect("a transform description has an input placement"),
+                            let placement = partitioned.input_placement(
                                 &own_key,
                                 upstream_key.as_deref(),
-                                &input_field_names,
+                                source_plan.schema().inner(),
                             )?;
-                            if let Some(parallelism) = plugin_transform.parallelism {
-                                partitioned.check_width(
-                                    parallelism,
-                                    &format!("its parallelism is {parallelism}"),
-                                )?;
-                            }
                             // The exchange goes below the rebatcher, as at the
                             // sink edge: rebatching after the split keeps each
                             // instance's batches whole.
@@ -2321,11 +2177,6 @@ impl Streamling {
                             )
                         }
                         None => {
-                            require_single_stream(
-                                &ctx.format(),
-                                r#type,
-                                plugin_transform.parallelism,
-                            )?;
                             let transform_input = wrap_with_rebatch(
                                 source_plan,
                                 batch_size,
@@ -2346,11 +2197,7 @@ impl Streamling {
                                 .output_schema
                                 .clone()
                                 .expect("Transform plugin must have output schema");
-                            let instance = PluginInstance {
-                                key: reference_name.clone(),
-                                channels: Arc::new(initialized_plugin.channels.clone()),
-                                exit: initialized_plugin.exit.clone(),
-                            };
+                            let instance = initialized_plugin.instance(reference_name.clone());
                             // Register transform plugin under its reference name
                             plugins.insert(reference_name.clone(), initialized_plugin);
                             (
@@ -2481,7 +2328,6 @@ impl Streamling {
                             // key on one stream.
                             Placement::ByKey(pk_columns(&pk_metadata_opt)),
                             webhook.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2524,7 +2370,6 @@ impl Streamling {
                             RebatchConfig::new(print_sink.batch_size, batch_flush_interval),
                             Placement::RoundRobin,
                             print_sink.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2564,7 +2409,6 @@ impl Streamling {
                             RebatchConfig::new(blackhole.batch_size, batch_flush_interval),
                             Placement::RoundRobin,
                             blackhole.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2651,7 +2495,6 @@ impl Streamling {
                             ),
                             Placement::ByKey(pk_columns(&pk_metadata_opt)),
                             postgres.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2780,7 +2623,6 @@ impl Streamling {
                             ),
                             Placement::ByKey(pk_columns(&pk_metadata_opt)),
                             postgres.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2823,7 +2665,6 @@ impl Streamling {
                             RebatchConfig::new(memory_sink.batch_size, batch_flush_interval),
                             Placement::RoundRobin,
                             memory_sink.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2894,7 +2735,6 @@ impl Streamling {
                             RebatchConfig::default(),
                             Placement::ByKey(pk_metadata.columns.clone()),
                             kafka_sink.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -2967,7 +2807,6 @@ impl Streamling {
                             ),
                             Placement::ByKey(pk_columns(&pk_metadata_opt)),
                             clickhouse_sink.parallelism,
-                            None,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -3006,47 +2845,30 @@ impl Streamling {
                         PluginKind::Sink,
                         Some(source_schema.clone()),
                         plugin_opts.clone(),
+                        plugin_sink.parallelism,
                     )
                     .map_err(|e| {
                         e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
-                    let (instances, placement, parallelism, partitions) = match described {
+                    let (instances, placement, parallelism) = match described {
                         // One instance per write stream, created when the sink
                         // is planned against its input's width.
                         Some(partitioned) => {
-                            let input_field_names: Vec<String> = source_schema
-                                .fields()
-                                .iter()
-                                .map(|f| f.name().clone())
-                                .collect();
                             // A sink's key is tracked against its input, so
                             // there is no upstream key to fall back to.
-                            let placement = plugin_input_placement(
-                                &ctx.format(),
-                                partitioned
-                                    .input_placement()
-                                    .expect("a sink description has an input placement"),
+                            let placement = partitioned.input_placement(
                                 &pk_columns(&pk_metadata_opt),
                                 None,
-                                &input_field_names,
+                                &source_schema,
                             )?;
-                            if let Some(parallelism) = plugin_sink.parallelism {
-                                partitioned.check_width(
-                                    parallelism,
-                                    &format!("its parallelism is {parallelism}"),
-                                )?;
-                            }
                             partitioned_plugins.push(partitioned.clone());
-                            let partitions = partitioned.partitions();
                             (
                                 PluginInstances::Partitioned(partitioned),
                                 placement,
                                 plugin_sink.parallelism,
-                                Some(partitions),
                             )
                         }
                         None => {
-                            require_single_stream(&ctx.format(), r#type, plugin_sink.parallelism)?;
                             let initialized_plugin = create_sink_plugin(
                                 &app_config,
                                 reference_name.clone(), // name
@@ -3057,22 +2879,13 @@ impl Streamling {
                             .map_err(|e| {
                                 e.context(format!("{}: failed to initialize plugin", ctx.format()))
                             })?;
-                            let instance = PluginInstance {
-                                key: reference_name.clone(),
-                                channels: Arc::new(initialized_plugin.channels.clone()),
-                                exit: initialized_plugin.exit.clone(),
-                            };
+                            let instance = initialized_plugin.instance(reference_name.clone());
                             // Register sink plugin under its reference name for lifecycle management
                             plugins.insert(reference_name.clone(), initialized_plugin);
                             // One instance serves every stream, so its input is
                             // narrowed to one stream — and in a fan-out, so is
                             // every sibling's.
-                            (
-                                PluginInstances::Single(instance),
-                                Placement::Single,
-                                None,
-                                None,
-                            )
+                            (PluginInstances::Single(instance), Placement::Single, None)
                         }
                     };
                     let batch_flush_interval = parse_batch_flush_interval(
@@ -3103,7 +2916,6 @@ impl Streamling {
                             RebatchConfig::new(plugin_sink.batch_size, batch_flush_interval),
                             placement,
                             parallelism,
-                            partitions,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
@@ -3142,7 +2954,7 @@ impl Streamling {
                 // partitioning: the sinks share one input, so they share one
                 // exchange, and it can only be keyed one way.
                 let partitioned_plan =
-                    wrap_multi_sink_with_repartition(source_plan, &sinks, future_name.as_str())?;
+                    wrap_multi_sink_with_repartition(source_plan, &sinks, future_name.as_str());
                 let entries: Vec<MultiSinkEntry> = sinks
                     .into_iter()
                     .map(|e| MultiSinkEntry {
@@ -4331,7 +4143,6 @@ mod tests {
             RebatchConfig::default(),
             placement,
             parallelism,
-            None,
         )
     }
 
@@ -4714,7 +4525,7 @@ mod tests {
             sink_entry("b", by_key(&["id"]), None),
         ];
 
-        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b").unwrap();
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b");
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::ByKey(vec!["id".to_string()]));
@@ -4730,7 +4541,7 @@ mod tests {
             sink_entry("b", Placement::RoundRobin, None),
         ];
 
-        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b").unwrap();
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b");
 
         assert!(
             repartition_node(&plan).is_none(),
@@ -4763,8 +4574,7 @@ mod tests {
             sink_entry("plugin", Placement::Single, None),
         ];
 
-        let plan =
-            wrap_multi_sink_with_repartition(empty_plan(), &sinks, "warehouse, plugin").unwrap();
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "warehouse, plugin");
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::Single);
@@ -4780,7 +4590,7 @@ mod tests {
             sink_entry("b", by_key(&["account"]), None),
         ];
 
-        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b").unwrap();
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "a, b");
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.target_parallelism, Some(1));
@@ -4800,8 +4610,7 @@ mod tests {
             sink_entry("warehouse", by_key(&["id"]), None),
         ];
 
-        let plan =
-            wrap_multi_sink_with_repartition(empty_plan(), &sinks, "printer, warehouse").unwrap();
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "printer, warehouse");
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::ByKey(vec!["id".to_string()]));
@@ -4816,187 +4625,11 @@ mod tests {
             sink_entry("void", Placement::RoundRobin, None),
         ];
 
-        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "printer, void").unwrap();
+        let plan = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "printer, void");
 
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::RoundRobin);
         assert_eq!(node.target_parallelism, Some(4));
-    }
-
-    fn partitioned_plugin_sink(
-        name: &str,
-        placement: Placement,
-        parallelism: Option<usize>,
-        partitions: PartitionRange,
-    ) -> SinkEntry {
-        let mut entry = sink_entry(name, placement, parallelism);
-        entry.partitions = Some(partitions);
-        entry
-    }
-
-    fn at_most(maximum: usize) -> PartitionRange {
-        PartitionRange::new(1, Some(maximum), None).unwrap()
-    }
-
-    /// The plugin sink's own width comes from the group: a sibling asking for
-    /// more streams than the plugin supports has to be named in the error,
-    /// since nothing on the plugin sink itself explains the width.
-    #[test]
-    fn a_fan_out_sibling_setting_an_unsupported_width_is_rejected() {
-        let sinks = vec![
-            partitioned_plugin_sink("plugin", Placement::RoundRobin, None, at_most(2)),
-            sink_entry("warehouse", by_key(&["id"]), Some(8)),
-        ];
-
-        let err = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "plugin, warehouse")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("'plugin'"), "{err}");
-        assert!(err.contains("'warehouse'"), "{err}");
-        assert!(err.contains("8"), "{err}");
-    }
-
-    #[test]
-    fn a_single_stream_sibling_narrows_the_group_below_a_plugin_minimum() {
-        let sinks = vec![
-            partitioned_plugin_sink(
-                "plugin",
-                Placement::RoundRobin,
-                None,
-                PartitionRange::new(2, None, None).unwrap(),
-            ),
-            sink_entry("legacy", Placement::Single, None),
-        ];
-
-        let err = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "plugin, legacy")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("'plugin'"), "{err}");
-        assert!(err.contains("legacy"), "{err}");
-    }
-
-    /// A partitioned plugin sink runs exactly the partitions its
-    /// `parallelism` asks for; a wider sibling cannot silently change that
-    /// (and with it the instances' per-partition state).
-    #[test]
-    fn a_wider_sibling_cannot_override_a_plugin_sinks_parallelism() {
-        let sinks = vec![
-            partitioned_plugin_sink("plugin", Placement::RoundRobin, Some(4), at_most(8)),
-            sink_entry("warehouse", by_key(&["id"]), Some(8)),
-        ];
-
-        let err = wrap_multi_sink_with_repartition(empty_plan(), &sinks, "plugin, warehouse")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("'plugin'"), "{err}");
-        assert!(err.contains("parallelism is 4"), "{err}");
-        assert!(err.contains("'warehouse'"), "{err}");
-    }
-
-    /// A partitioned plugin sink takes part in the group like any parallel
-    /// sink: its placement and `parallelism` shape the shared exchange.
-    #[test]
-    fn a_partitioned_plugin_sink_shapes_its_group() {
-        let sinks = vec![
-            partitioned_plugin_sink("plugin", by_key(&["id"]), Some(4), at_most(4)),
-            sink_entry("printer", Placement::RoundRobin, None),
-        ];
-
-        let plan =
-            wrap_multi_sink_with_repartition(empty_plan(), &sinks, "plugin, printer").unwrap();
-
-        let node = repartition_node(&plan).expect("expected a RepartitionNode");
-        assert_eq!(node.placement, by_key(&["id"]));
-        assert_eq!(node.target_parallelism, Some(4));
-    }
-
-    #[test]
-    fn plugin_placement_by_columns_needs_them_in_the_input() {
-        let input = names(&["id", "account", "_gs_op"]);
-        let placement = plugin_input_placement(
-            "sink 'out'",
-            &InputPlacement::ByColumns(names(&["account"])),
-            &[],
-            None,
-            &input,
-        )
-        .unwrap();
-        assert_eq!(placement, by_key(&["account"]));
-
-        let err = plugin_input_placement(
-            "sink 'out'",
-            &InputPlacement::ByColumns(names(&["missing"])),
-            &[],
-            None,
-            &input,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("missing"), "{err}");
-    }
-
-    /// A plugin transform's `primary_key` is tracked against its OUTPUT, so a
-    /// key naming a column the plugin generates cannot place its input — the
-    /// same trap the script transform fell into. The upstream key places it
-    /// instead.
-    #[test]
-    fn plugin_placement_by_primary_key_falls_back_to_the_upstream_key() {
-        let placement = plugin_input_placement(
-            "transform 'enrich'",
-            &InputPlacement::ByPrimaryKey,
-            &names(&["id", "generated"]),
-            Some(&names(&["id"])),
-            &names(&["id", "payload"]),
-        )
-        .unwrap();
-
-        assert_eq!(placement, by_key(&["id"]));
-    }
-
-    /// The plugin asked for keyed placement; distributing round-robin instead
-    /// would silently break whatever per-key state it keeps.
-    #[test]
-    fn plugin_placement_by_primary_key_never_falls_back_to_round_robin() {
-        let err = plugin_input_placement(
-            "transform 'enrich'",
-            &InputPlacement::ByPrimaryKey,
-            &names(&["generated"]),
-            None,
-            &names(&["payload"]),
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("enrich"), "{err}");
-        assert!(err.contains("primary key"), "{err}");
-    }
-
-    #[test]
-    fn plugin_placement_round_robin_needs_no_key() {
-        assert_eq!(
-            plugin_input_placement(
-                "sink 'out'",
-                &InputPlacement::RoundRobin,
-                &[],
-                None,
-                &names(&["payload"]),
-            )
-            .unwrap(),
-            Placement::RoundRobin
-        );
-    }
-
-    #[test]
-    fn single_stream_plugins_reject_wider_parallelism() {
-        assert!(require_single_stream("sink 'out'", "vendor.sink", None).is_ok());
-        assert!(require_single_stream("sink 'out'", "vendor.sink", Some(1)).is_ok());
-        let err = require_single_stream("sink 'out'", "vendor.sink", Some(2))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("vendor.sink"), "{err}");
     }
 
     #[test]

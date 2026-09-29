@@ -10,11 +10,12 @@ use super::{
 };
 use crate::app_config::AppConfig;
 use crate::error::{Result, StreamlingError};
+use crate::operators::repartition::Placement;
 use crate::telemetry::provider::metric_key;
 use crate::telemetry::recorder::merge_metadata_tags;
 use crate::{streamling_err, streamling_user_bail};
 use abi_stable::traits::{IntoReprC, IntoReprRust};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::fmt;
@@ -27,6 +28,10 @@ use streamling_plugin::{
 };
 use tokio::runtime::Handle;
 use tracing::warn;
+
+/// Why a sink can be planned wider or narrower than it asked for.
+const SHARED_INPUT_WIDTH: &str = "sinks that read the same node share one exchange, which runs \
+     at the widest `parallelism` among them";
 
 /// Bounds the wait for already-created instances to exit when a later
 /// partition of the same node fails to construct. They were never sent
@@ -187,6 +192,8 @@ pub struct PartitionedPlugin {
     labels: Vec<(String, String)>,
     input_placement: Option<InputPlacement>,
     partitions: PartitionRange,
+    /// The node's configured `parallelism`, if any.
+    parallelism: Option<usize>,
     app_config: AppConfig,
     /// Created at most once: shared scans and multiple consumers plan a node
     /// more than once, but it runs one instance per partition.
@@ -222,7 +229,9 @@ fn input_placement(placement: PluginInputPlacement_NE) -> Result<InputPlacement>
 impl PartitionedPlugin {
     /// Describes a plugin without creating it. `None` means the plugin only
     /// runs single-stream, through `create`: its library predates
-    /// partitioning, or it was registered as a single-stream plugin.
+    /// partitioning, or it was registered as a single-stream plugin. Such a
+    /// plugin cannot honor a `parallelism` above 1, which fails here instead
+    /// of silently running one stream.
     ///
     /// Merges the declared labels into the node's metric metadata, as
     /// creating a single-stream plugin does.
@@ -233,13 +242,24 @@ impl PartitionedPlugin {
         kind: PluginKind,
         input_schema: Option<SchemaRef>,
         options: HashMap<String, String>,
+        parallelism: Option<usize>,
     ) -> Result<Option<Arc<Self>>> {
         let plugin_type: PluginId = plugin_type.to_string().into();
+        let single_stream = || {
+            if let Some(parallelism) = parallelism.filter(|p| *p > 1) {
+                streamling_user_bail!(
+                    "plugin '{plugin_type}' only runs single-stream, so it cannot run with \
+                     parallelism {parallelism} (its library predates partitioned plugins, or it \
+                     is registered as a single-stream plugin)"
+                );
+            }
+            Ok(None)
+        };
         let module = require_plugin(&plugin_type)?;
         let (Some(describe), Some(_)) =
             (module.describe_partitioned(), module.create_partitioned())
         else {
-            return Ok(None);
+            return single_stream();
         };
 
         let description = describe(
@@ -250,7 +270,7 @@ impl PartitionedPlugin {
         .into_rust()
         .map_err(|e| streamling_err!("Plugin description failed: {:?}", e))?;
         let Some(description) = description.into_option() else {
-            return Ok(None);
+            return single_stream();
         };
 
         let invalid = |problem: StreamlingError| {
@@ -311,6 +331,7 @@ impl PartitionedPlugin {
             labels,
             input_placement,
             partitions,
+            parallelism,
             app_config: app_config.clone(),
             instances: tokio::sync::Mutex::new(None),
             execution_futures: Mutex::new(Vec::new()),
@@ -321,19 +342,102 @@ impl PartitionedPlugin {
         self.output_schema.clone()
     }
 
-    pub fn input_placement(&self) -> Option<&InputPlacement> {
-        self.input_placement.as_ref()
+    /// How many instances a source runs: its `parallelism`, else its
+    /// preferred count, else 1.
+    pub fn source_width(&self) -> Result<usize> {
+        self.partitions
+            .source_width(self.parallelism, &self.reference_name)
     }
 
-    pub fn partitions(&self) -> PartitionRange {
-        self.partitions
+    /// How the host places this transform's or sink's input rows before
+    /// routing stream `i` to instance `i`, from the placement the plugin
+    /// declared.
+    ///
+    /// `ByPrimaryKey` places by the node's own key only when the input has
+    /// every column of it: a transform's `primary_key` describes its OUTPUT,
+    /// and may name columns the plugin generates. Otherwise the upstream
+    /// node's key places it. The plugin asked for keyed placement, so when
+    /// neither key is in the input, planning fails rather than falling back
+    /// to round-robin.
+    pub fn input_placement(
+        &self,
+        own_key: &[String],
+        upstream_key: Option<&[String]>,
+        input_schema: &Schema,
+    ) -> Result<Placement> {
+        let in_input = |columns: &[String]| {
+            !columns.is_empty()
+                && columns
+                    .iter()
+                    .all(|column| input_schema.field_with_name(column).is_ok())
+        };
+        match &self.input_placement {
+            None => Err(streamling_err!(
+                "{} plugin '{}' has no input to place",
+                self.kind,
+                self.reference_name
+            )),
+            Some(InputPlacement::RoundRobin) => Ok(Placement::RoundRobin),
+            Some(InputPlacement::ByColumns(columns)) => {
+                let missing: Vec<&String> = columns
+                    .iter()
+                    .filter(|column| input_schema.field_with_name(column).is_err())
+                    .collect();
+                if !missing.is_empty() {
+                    streamling_user_bail!(
+                        "plugin '{}' places its input by columns {missing:?}, which are not in \
+                         its input schema",
+                        self.reference_name
+                    );
+                }
+                Ok(Placement::ByKey(columns.clone()))
+            }
+            Some(InputPlacement::ByPrimaryKey) => {
+                if in_input(own_key) {
+                    return Ok(Placement::ByKey(own_key.to_vec()));
+                }
+                let Some(upstream_key) = upstream_key.filter(|key| in_input(key)) else {
+                    streamling_user_bail!(
+                        "plugin '{}' places its input by primary key, but neither its own primary \
+                         key nor its upstream node's is in its input schema; configure a \
+                         `primary_key` whose columns the input has",
+                        self.reference_name
+                    );
+                };
+                if !own_key.is_empty() {
+                    warn!(
+                        "plugin '{}': primary key column(s) {:?} are not all in its input schema; \
+                         placing its input by the upstream node's key {:?} instead",
+                        self.reference_name, own_key, upstream_key
+                    );
+                }
+                Ok(Placement::ByKey(upstream_key.to_vec()))
+            }
+        }
     }
 
-    /// Fails unless this node can run `partitions` partitions; `reason`
-    /// completes "but {reason}" in the error.
-    pub fn check_width(&self, partitions: usize, reason: &str) -> Result<()> {
+    /// Fails unless this node can run `partitions` instances: the width its
+    /// `parallelism` asks for when set, and one it supports.
+    fn check_width(&self, partitions: usize) -> Result<()> {
+        let shared_input = if self.kind == PluginKind::Sink {
+            format!(" ({SHARED_INPUT_WIDTH})")
+        } else {
+            String::new()
+        };
+        let reason = match self.parallelism {
+            Some(parallelism) if parallelism != partitions => streamling_user_bail!(
+                "plugin '{}': its parallelism is {parallelism}, but it is planned to run \
+                 {partitions} streams{shared_input}",
+                self.reference_name
+            ),
+            Some(parallelism) => format!("its parallelism is {parallelism}"),
+            None => format!(
+                "it is planned to run {partitions} streams; set `parallelism` to run it at a \
+                 supported width{shared_input}"
+            ),
+        };
         self.partitions
-            .check(partitions, &self.reference_name, reason)
+            .check(partitions, &self.reference_name, &reason)
     }
 
     /// Creates one instance per partition, or returns the ones already
@@ -357,7 +461,7 @@ impl PartitionedPlugin {
             }
             return Ok(instances.clone());
         }
-        self.check_width(partitions, &format!("it is planned to run {partitions}"))?;
+        self.check_width(partitions)?;
 
         let mut instances = Vec::with_capacity(partitions);
         let mut futures = Vec::with_capacity(partitions);
@@ -517,8 +621,8 @@ async fn roll_back(instances: Vec<PluginInstance>, futures: Vec<(String, Executi
 mod tests {
     use super::*;
     use crate::plugin::test_plugins::{
-        self, FAIL_CREATE_AT, LEGACY_SINK, MAXIMUM, MINIMUM, MISLABEL_AT, NODE, PREFERRED, SINK,
-        SOURCE, log,
+        self, FAIL_CREATE_AT, LEGACY_SINK, MAXIMUM, MINIMUM, MISLABEL_AT, NODE, PLACEMENT,
+        PREFERRED, SINK, SOURCE, SOURCE_PARTITION_COLUMN, TRANSFORM, log,
     };
     use abi_stable::std_types::{RNone, RSome};
     use streamling_plugin::PluginPartitionCount;
@@ -536,17 +640,32 @@ mod tests {
     }
 
     fn describe_sink(node: &str, extra: &[(&str, &str)]) -> Arc<PartitionedPlugin> {
+        describe_node(node, SINK, PluginKind::Sink, extra, None)
+    }
+
+    fn describe_node(
+        node: &str,
+        plugin_type: &str,
+        kind: PluginKind,
+        extra: &[(&str, &str)],
+        parallelism: Option<usize>,
+    ) -> Arc<PartitionedPlugin> {
         test_plugins::install();
         PartitionedPlugin::describe(
             &app_config(),
             node,
-            SINK,
-            PluginKind::Sink,
+            plugin_type,
+            kind,
             Some(test_plugins::source_schema()),
             options(node, extra),
+            parallelism,
         )
         .unwrap()
-        .expect("the test sink is partition-capable")
+        .expect("the test plugin is partition-capable")
+    }
+
+    fn names(columns: &[&str]) -> Vec<String> {
+        columns.iter().map(|c| c.to_string()).collect()
     }
 
     fn keys(instances: &[PluginInstance]) -> Vec<String> {
@@ -633,16 +752,133 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn single_stream_ids_describe_as_none() {
         test_plugins::install();
-        let described = PartitionedPlugin::describe(
-            &app_config(),
-            "legacy",
-            LEGACY_SINK,
-            PluginKind::Sink,
-            Some(test_plugins::source_schema()),
-            options("legacy", &[]),
-        )
-        .unwrap();
-        assert!(described.is_none());
+        let describe = |parallelism| {
+            PartitionedPlugin::describe(
+                &app_config(),
+                "legacy",
+                LEGACY_SINK,
+                PluginKind::Sink,
+                Some(test_plugins::source_schema()),
+                options("legacy", &[]),
+                parallelism,
+            )
+        };
+        assert!(describe(None).unwrap().is_none());
+        assert!(describe(Some(1)).unwrap().is_none());
+
+        let err = describe(Some(2)).unwrap_err().to_string();
+        assert!(err.contains(LEGACY_SINK), "{err}");
+        assert!(err.contains("parallelism 2"), "{err}");
+    }
+
+    /// A sink that shares its input with wider siblings is planned at their
+    /// width, but its instances, and the per-partition state behind them, are
+    /// what its own `parallelism` asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_runs_only_the_width_its_parallelism_asks_for() {
+        let sink = describe_node("fixed_width", SINK, PluginKind::Sink, &[], Some(4));
+
+        let err = sink
+            .instantiate(8, Some(test_plugins::source_schema()))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("parallelism is 4"), "{err}");
+        assert!(err.contains("8"), "{err}");
+        assert!(sink.take_execution_futures().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_by_columns_needs_them_in_the_input() {
+        let schema = test_plugins::source_schema();
+        let by_columns = describe_node(
+            "placed_by_columns",
+            TRANSFORM,
+            PluginKind::Transform,
+            &[(PLACEMENT, SOURCE_PARTITION_COLUMN)],
+            None,
+        );
+        assert_eq!(
+            by_columns.input_placement(&[], None, &schema).unwrap(),
+            Placement::ByKey(names(&[SOURCE_PARTITION_COLUMN]))
+        );
+
+        let by_missing = describe_node(
+            "placed_by_missing_columns",
+            TRANSFORM,
+            PluginKind::Transform,
+            &[(PLACEMENT, "missing")],
+            None,
+        );
+        let err = by_missing
+            .input_placement(&[], None, &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    /// A transform's `primary_key` describes its OUTPUT, so a key naming a
+    /// column the plugin generates cannot place its input; the upstream key
+    /// places it instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_by_primary_key_falls_back_to_the_upstream_key() {
+        let transform = describe_node(
+            "placed_by_upstream_key",
+            TRANSFORM,
+            PluginKind::Transform,
+            &[(PLACEMENT, "by_primary_key")],
+            None,
+        );
+
+        let placement = transform
+            .input_placement(
+                &names(&["id", "generated"]),
+                Some(&names(&["id"])),
+                &test_plugins::source_schema(),
+            )
+            .unwrap();
+
+        assert_eq!(placement, Placement::ByKey(names(&["id"])));
+    }
+
+    /// The plugin asked for keyed placement; distributing round-robin instead
+    /// would silently break whatever per-key state it keeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_by_primary_key_never_falls_back_to_round_robin() {
+        let transform = describe_node(
+            "placed_by_unusable_key",
+            TRANSFORM,
+            PluginKind::Transform,
+            &[(PLACEMENT, "by_primary_key")],
+            None,
+        );
+
+        let err = transform
+            .input_placement(&names(&["generated"]), None, &test_plugins::source_schema())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("placed_by_unusable_key"), "{err}");
+        assert!(err.contains("primary key"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_round_robin_needs_no_key() {
+        let transform = describe_node(
+            "placed_round_robin",
+            TRANSFORM,
+            PluginKind::Transform,
+            &[(PLACEMENT, "round_robin")],
+            None,
+        );
+
+        assert_eq!(
+            transform
+                .input_placement(&[], None, &test_plugins::source_schema())
+                .unwrap(),
+            Placement::RoundRobin
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -655,12 +891,13 @@ mod tests {
             PluginKind::Source,
             None,
             options("described_source", &[(PREFERRED, "3")]),
+            None,
         )
         .unwrap()
         .unwrap();
 
-        assert_eq!(source.partitions().source_width(None, "src").unwrap(), 3);
-        assert!(source.input_placement().is_none());
+        assert_eq!(source.source_width().unwrap(), 3);
+        assert!(source.input_placement.is_none());
         assert_eq!(
             source.output_schema().unwrap().fields(),
             test_plugins::source_schema().fields()

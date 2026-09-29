@@ -1995,7 +1995,7 @@ A partitioned plugin node is configured like any plugin node, plus an optional `
 | Transform | one instance per stream of its input                   | its input is repartitioned into N streams       |
 | Sink      | one instance per stream of its input                   | its input is repartitioned into N streams       |
 
-The resulting width must be within the plugin's `PartitionCount`, or planning fails with an error naming what set the width. A single-stream plugin rejects `parallelism` above 1.
+The resulting width must be within the plugin's `PartitionCount`, or planning fails. A single-stream plugin rejects `parallelism` above 1.
 
 Before stream `i` reaches instance `i`, the host places the input rows as the plugin declared:
 
