@@ -772,7 +772,6 @@ impl TestContextOptions {
     }
 }
 
-/// Initialize tracing for tests
 /// Build the in-repo example plugin (`plugin_examples/basic`) as a cdylib and
 /// return the shared-library path. It lives in its own cargo workspace, so
 /// this is a separate (cached) build.
@@ -803,6 +802,7 @@ pub async fn build_basic_example_plugin() -> std::path::PathBuf {
     .expect("built plugin cdylib not found in plugin_examples/basic/target/debug")
 }
 
+/// Initialize tracing for tests
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
