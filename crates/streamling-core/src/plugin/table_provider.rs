@@ -40,6 +40,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use streamling_plugin::{PluginCheckpointEpoch, PluginMsg};
 use tracing::log::trace;
 use tracing::{debug, error, info, warn};
@@ -607,6 +608,8 @@ struct PluginSink {
     schema: SchemaRef,
     instance: PluginInstance,
     num_records_before_stop: Option<u64>, // for integration tests only!
+    /// See [`PluginSinkProvider::rows_received`].
+    rows_received: Arc<AtomicU64>,
     metric_metadata_id: String,
     /// PostPlugin-stage scope for the metrics and ack forwarders: both serve
     /// the plugin dispatcher's flush, so they drain after it.
@@ -629,6 +632,7 @@ impl PluginSink {
         schema: SchemaRef,
         instance: PluginInstance,
         num_records_before_stop: Option<u64>,
+        rows_received: Arc<AtomicU64>,
         metric_metadata_id: String,
         scope: Arc<crate::shutdown::ComponentScope>,
         awaits_acks: bool,
@@ -637,6 +641,7 @@ impl PluginSink {
             schema,
             instance,
             num_records_before_stop,
+            rows_received,
             metric_metadata_id,
             scope,
             awaits_acks,
@@ -836,6 +841,10 @@ impl DataSink for PluginSink {
                 continue;
             };
             row_count += batch.num_rows();
+            let total_received = self
+                .rows_received
+                .fetch_add(batch.num_rows() as u64, Ordering::SeqCst)
+                + batch.num_rows() as u64;
 
             let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
             trace!(
@@ -903,9 +912,16 @@ impl DataSink for PluginSink {
             // Checkpoint acks and metrics are handled by the dedicated tasks
             // spawned above — nothing to drain per-batch here.
 
+            // Compare against the node-wide count so the stop threshold stays
+            // global across the partition instances' write streams.
             if let Some(num_records_before_stop) = self.num_records_before_stop
-                && row_count >= num_records_before_stop as usize
+                && total_received >= num_records_before_stop
+                && !(num_records_before_stop == 0 && total_received == 0)
             {
+                // Record-limit reached: request process-wide graceful shutdown
+                // so every source drains and ends its stream — the same path
+                // SIGTERM takes (test-only mode).
+                crate::shutdown::request_shutdown();
                 input_ended = true;
             }
         }
@@ -937,6 +953,10 @@ pub struct PluginSinkProvider {
     schema: SchemaRef,
     instances: PluginInstances,
     num_records_before_stop: Option<u64>,
+    /// Global `num_records_before_stop` progress, shared by the `PluginSink`
+    /// of every partition instance: each sees only its own stream, so a count
+    /// of its own would never reach a limit set for the whole node.
+    rows_received: Arc<AtomicU64>,
     metric_metadata_id: String,
     telemetry: Option<Telemetry>,
     /// See [`PluginSink::scope`].
@@ -956,6 +976,7 @@ impl PluginSinkProvider {
             schema,
             instances,
             num_records_before_stop,
+            rows_received: Arc::new(AtomicU64::new(0)),
             metric_metadata_id,
             telemetry,
             scope,
@@ -1005,6 +1026,7 @@ impl TableProvider for PluginSinkProvider {
                     self.schema.clone(),
                     instance,
                     self.num_records_before_stop,
+                    self.rows_received.clone(),
                     self.metric_metadata_id.clone(),
                     self.scope.clone(),
                     awaits_acks,
@@ -1121,6 +1143,7 @@ mod tests {
                 exit: crate::plugin::track_exit(Box::pin(std::future::pending())).1,
             },
             None,
+            Arc::new(AtomicU64::new(0)),
             "plugin::ack_after_last_batch_sink".to_string(),
             crate::shutdown::ComponentScope::detached("test"),
             false,
@@ -1444,6 +1467,46 @@ mod tests {
                 *expected
             );
         }
+        shut_down(&sink).await;
+    }
+
+    /// Each instance writes only its own stream, so `num_records_before_stop`
+    /// must count rows across all of them: counted per instance, a limit
+    /// above any one stream's share would never be reached. No limit is set,
+    /// since reaching one requests the process-wide shutdown, which no unit
+    /// test may flip (see `crate::shutdown`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn record_limit_counts_rows_across_every_instance() {
+        let sink = describe("counted_sink", SINK, PluginKind::Sink, &[]);
+        let provider = PluginSinkProvider::new(
+            source_schema(),
+            PluginInstances::Partitioned(sink.clone()),
+            None,
+            "app::counted_sink".to_string(),
+            None,
+            crate::shutdown::ComponentScope::detached("test"),
+        );
+        let plan = provider
+            .insert_into(
+                &SessionContext::new().state(),
+                test_plugins::input(vec![
+                    vec![batch(&[1, 2], &[])],
+                    vec![batch(&[3], &[])],
+                    vec![batch(&[4, 5, 6], &[])],
+                ]),
+                InsertOp::Append,
+            )
+            .await
+            .unwrap();
+
+        let _: Vec<RecordBatch> = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(provider.rows_received.load(Ordering::SeqCst), 6);
         shut_down(&sink).await;
     }
 

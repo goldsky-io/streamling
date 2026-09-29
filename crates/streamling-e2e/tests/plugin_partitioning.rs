@@ -2,8 +2,10 @@
 //!
 //! Uses the in-repo example plugin (`plugin_examples/basic`). Its partitioned
 //! source emits `rows` rows per partition with ids `partition * 1_000_000 + n`
-//! and completes, so every pipeline here ends on its own.
+//! and completes, so those pipelines end on their own; a pipeline reading
+//! Kafka ends at its record limit.
 
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use streamling_e2e::{build_basic_example_plugin, init_tracing, PipelineOpts, TestContext};
@@ -12,13 +14,12 @@ const PIPELINE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Source partition `p` emits ids `p * ID_STRIDE ..`.
 const ID_STRIDE: i64 = 1_000_000;
 
-async fn run_with_plugin(ctx: &TestContext, pipeline: &str) {
+async fn run_with_plugin(ctx: &TestContext, pipeline: &str, opts: PipelineOpts) {
     let plugin_lib = build_basic_example_plugin().await;
     let status = ctx
         .run_pipeline_with_opts(
             pipeline,
-            PipelineOpts::new()
-                .timeout(PIPELINE_TIMEOUT)
+            opts.timeout(PIPELINE_TIMEOUT)
                 .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
                 .env(
                     "STREAMLING__PLUGIN__PATH",
@@ -28,6 +29,28 @@ async fn run_with_plugin(ctx: &TestContext, pipeline: &str) {
         .await
         .expect("pipeline must run to completion");
     assert!(status.success(), "pipeline must exit 0");
+}
+
+/// Reads the ids a `partitioned_file_sink` node named `out` wrote into
+/// `output_dir`, one file per instance, failing if two instances wrote the
+/// same id.
+fn written_ids(output_dir: &std::path::Path, instances: usize) -> BTreeSet<i64> {
+    let mut seen = BTreeSet::new();
+    for partition in 0..instances {
+        let file = output_dir.join(format!("out-{partition}.csv"));
+        let written = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("instance {partition} must write {file:?}: {e}"));
+        let ids: Vec<i64> = written.lines().map(|l| l.parse().unwrap()).collect();
+        assert!(!ids.is_empty(), "instance {partition} must receive rows");
+        for id in ids {
+            assert!(seen.insert(id), "id {id} was written by two instances");
+        }
+    }
+    assert!(
+        !output_dir.join(format!("out-{instances}.csv")).exists(),
+        "the sink runs {instances} instances"
+    );
+    seen
 }
 
 /// Every id the source emits: `rows` per partition.
@@ -62,7 +85,7 @@ sinks:
     schema: public
     primary_key: id
 "#;
-    run_with_plugin(&ctx, pipeline).await;
+    run_with_plugin(&ctx, pipeline, PipelineOpts::new()).await;
 
     let postgres = &ctx.postgres;
     assert_eq!(
@@ -127,7 +150,7 @@ sinks:
     schema: public
     primary_key: id
 "#;
-    run_with_plugin(&ctx, pipeline).await;
+    run_with_plugin(&ctx, pipeline, PipelineOpts::new()).await;
 
     let postgres = &ctx.postgres;
     for (table, width) in [("widened_rows", 4), ("inherited_rows", 2)] {
@@ -191,22 +214,70 @@ sinks:
 "#,
         output_dir = output_dir.display()
     );
-    run_with_plugin(&ctx, &pipeline).await;
+    run_with_plugin(&ctx, &pipeline, PipelineOpts::new()).await;
 
-    let mut seen = BTreeSet::new();
-    for partition in 0..2 {
-        let file = output_dir.join(format!("out-{partition}.csv"));
-        let written = std::fs::read_to_string(&file)
-            .unwrap_or_else(|e| panic!("instance {partition} must write {file:?}: {e}"));
-        let ids: Vec<i64> = written.lines().map(|l| l.parse().unwrap()).collect();
-        assert!(!ids.is_empty(), "instance {partition} must receive rows");
-        for id in ids {
-            assert!(seen.insert(id), "id {id} was written by two instances");
-        }
-    }
-    assert!(
-        !output_dir.join("out-2.csv").exists(),
-        "the sink runs 2 instances"
+    assert_eq!(written_ids(&output_dir, 2), expected_ids(3, 30));
+}
+
+#[derive(Serialize)]
+struct IdRecord {
+    id: i64,
+}
+
+const ID_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "IdRecord",
+    "fields": [{"name": "id", "type": "long"}]
+}"#;
+
+/// The record limit counts rows across every instance of a partitioned
+/// sink. Each instance sees only its own stream, so counted per instance the
+/// limit is never reached, and a pipeline reading Kafka never stops.
+#[tokio::test]
+async fn test_partitioned_plugin_sink_stops_at_the_record_limit() {
+    init_tracing();
+    let ctx = TestContext::new().await.expect("Failed to create context");
+    const ROWS: i64 = 100;
+
+    ctx.kafka
+        .register_schema(ID_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    let records: Vec<IdRecord> = (0..ROWS).map(|id| IdRecord { id }).collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let output_dir = ctx.temp_dir.path().join("record_limit_sink");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let pipeline = format!(
+        r#"
+sources:
+  numbers:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  out:
+    type: basic_plugin.partitioned_file_sink
+    from: numbers
+    parallelism: 2
+    output_dir: "{output_dir}"
+"#,
+        topic = ctx.kafka_topic,
+        output_dir = output_dir.display()
     );
-    assert_eq!(seen, expected_ids(3, 30));
+    run_with_plugin(
+        &ctx,
+        &pipeline,
+        PipelineOpts::new().record_limit(ROWS as u64),
+    )
+    .await;
+
+    assert_eq!(written_ids(&output_dir, 2), (0..ROWS).collect());
 }
