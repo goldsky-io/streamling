@@ -834,7 +834,13 @@ impl DecimalArbExprRewrite {
             "array_has" | "list_has" | "array_contains" | "list_contains" | "array_position"
             | "list_position" | "array_indexof" | "list_indexof" | "array_positions"
             | "list_positions" => {
-                let (Some(lm), Some((x, xm))) = (list_meta(0), scalar(1)?) else {
+                // The list decides whether this call is ours. `scalar` errors
+                // on a string it cannot read as a number, so it must not run
+                // for a list that is not decimal_arb.
+                let Some(lm) = list_meta(0) else {
+                    return Ok(None);
+                };
+                let Some((x, xm)) = scalar(1)? else {
                     return Ok(None);
                 };
                 let common = common_precision_scale(&[lm, xm]);
@@ -858,7 +864,13 @@ impl DecimalArbExprRewrite {
             // the list's own scale (exact: every element came from it).
             "array_remove" | "array_remove_n" | "array_remove_all" | "list_remove"
             | "list_remove_n" | "list_remove_all" => {
-                let (Some(lm), Some((x, xm))) = (list_meta(0), scalar(1)?) else {
+                // The list decides whether this call is ours. `scalar` errors
+                // on a string it cannot read as a number, so it must not run
+                // for a list that is not decimal_arb.
+                let Some(lm) = list_meta(0) else {
+                    return Ok(None);
+                };
+                let Some((x, xm)) = scalar(1)? else {
                     return Ok(None);
                 };
                 let common = common_precision_scale(&[lm, xm]);
@@ -878,9 +890,11 @@ impl DecimalArbExprRewrite {
             // scale, which the final re-encoding checks.
             "array_replace" | "array_replace_n" | "array_replace_all" | "list_replace"
             | "list_replace_n" | "list_replace_all" => {
-                let (Some(lm), Some((from, fm)), Some((to, tm))) =
-                    (list_meta(0), scalar(1)?, scalar(2)?)
-                else {
+                // List first: `scalar` must not run for a non-decimal_arb list.
+                let Some(lm) = list_meta(0) else {
+                    return Ok(None);
+                };
+                let (Some((from, fm)), Some((to, tm))) = (scalar(1)?, scalar(2)?) else {
                     return Ok(None);
                 };
                 let common = common_precision_scale(&[lm, fm, tm]);
@@ -896,7 +910,13 @@ impl DecimalArbExprRewrite {
             }
             // list, scalar → list at the list's scale.
             "array_append" | "list_append" | "array_push_back" => {
-                let (Some(lm), Some((x, xm))) = (list_meta(0), scalar(1)?) else {
+                // The list decides whether this call is ours. `scalar` errors
+                // on a string it cannot read as a number, so it must not run
+                // for a list that is not decimal_arb.
+                let Some(lm) = list_meta(0) else {
+                    return Ok(None);
+                };
+                let Some((x, xm)) = scalar(1)? else {
                     return Ok(None);
                 };
                 let mut args = sf.args.clone();
@@ -906,7 +926,11 @@ impl DecimalArbExprRewrite {
             }
             // scalar, list → list at the list's scale.
             "array_prepend" | "list_prepend" | "array_push_front" => {
-                let (Some((x, xm)), Some(lm)) = (scalar(0)?, list_meta(1)) else {
+                // List first: `scalar` must not run for a non-decimal_arb list.
+                let Some(lm) = list_meta(1) else {
+                    return Ok(None);
+                };
+                let Some((x, xm)) = scalar(0)? else {
                     return Ok(None);
                 };
                 let mut args = sf.args.clone();
@@ -1706,5 +1730,74 @@ mod tests {
         let field = batches[0].schema().field_with_name("c").unwrap().clone();
         assert_eq!(field.data_type(), &DataType::Int64);
         assert!(!DecimalArbType::is_decimal_arb_field(&field));
+    }
+
+    /// A table with no decimal_arb column at all: `p(id, tags List(Utf8), s Utf8)`.
+    async fn make_plain_session() -> SessionContext {
+        use arrow::array::StringArray;
+        use arrow::datatypes::Field as ArrowField;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let tags = {
+            let mut b = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
+            for row in [vec!["a", "b"], vec!["c"]] {
+                for v in row {
+                    b.values().append_value(v);
+                }
+                b.append(true);
+            }
+            b.finish()
+        };
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(tags),
+                Arc::new(StringArray::from(vec![Some("a"), Some("z")])),
+            ],
+        )
+        .unwrap();
+
+        let state = SessionStateBuilder::new().with_default_features().build();
+        let mut ctx = SessionContext::new_with_state(state);
+        ctx.register_function_rewrite(Arc::new(DecimalArbExprRewrite::new()))
+            .unwrap();
+        ctx.register_batch("p", batch).unwrap();
+        ctx
+    }
+
+    /// The decimal_arb list rewrite must not touch a list that is not
+    /// decimal_arb. It used to build `(list_meta(0), scalar(1)?)` as a tuple,
+    /// so the scalar arm ran — and errored on any string — before the list was
+    /// checked, breaking `array_has(tags, 'a')` in pipelines with no wide
+    /// integers anywhere.
+    #[tokio::test]
+    async fn list_functions_over_non_decimal_arb_lists_still_plan() {
+        let ctx = make_plain_session().await;
+        for sql in [
+            "SELECT id FROM p WHERE array_has(tags, 'a')",
+            "SELECT id FROM p WHERE array_has(tags, s)",
+            "SELECT id FROM p WHERE array_position(tags, 'b') IS NOT NULL",
+            "SELECT array_append(tags, 'z') AS c FROM p",
+            "SELECT array_prepend('z', tags) AS c FROM p",
+            "SELECT array_remove(tags, 'a') AS c FROM p",
+            "SELECT array_replace(tags, 'a', s) AS c FROM p",
+        ] {
+            let df = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("failed to plan `{sql}`: {e}"));
+            df.collect()
+                .await
+                .unwrap_or_else(|e| panic!("failed to run `{sql}`: {e}"));
+        }
     }
 }
