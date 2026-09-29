@@ -139,7 +139,7 @@ register_partitioned_plugin_sink!("my_plugin", "sharded_sink", ShardedSink);
 
 How the host runs it:
 
-- **Width.** `parallelism` on the node sets it. Without it, a source runs `preferred` partitions (else 1) and a transform or sink inherits its input's width. A width outside `minimum..=maximum` fails planning, and so does a sink planned at a width other than its own `parallelism`: sinks that read the same node share one exchange, which runs at the widest `parallelism` among them.
+- **Width.** `parallelism` on the node sets it. Without it, a source runs `preferred` partitions (else 1) and a transform or sink inherits its input's width. A width outside `minimum..=maximum` fails planning, and so does a sink planned at a width other than its own `parallelism`: sinks that read the same node share one exchange, which runs at the widest `parallelism` among them, or on a single stream if any of them is single-stream or they declare different primary keys.
 - **Input placement.** Before routing stream `i` to instance `i`, the host places rows as declared: `ByPrimaryKey` (the node's `primary_key`; for a transform whose key names columns it generates, the upstream node's key), `ByColumns(..)`, or `RoundRobin`.
 - **State.** `state.create()` is scoped to the partition (`{reference_name}[{index}]`); `state.create_shared()` is shared by every instance of the node, and is where a formerly single-stream plugin finds its old state.
 - **Checkpoints.** Each instance sees one copy of every marker on its own stream. A sink instance acks from `process_checkpoint_marker` as usual; the host acks the epoch once every instance flushed it.

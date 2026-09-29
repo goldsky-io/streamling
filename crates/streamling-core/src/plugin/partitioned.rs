@@ -31,7 +31,8 @@ use tracing::warn;
 
 /// Why a sink can be planned wider or narrower than it asked for.
 const SHARED_INPUT_WIDTH: &str = "sinks that read the same node share one exchange, which runs \
-     at the widest `parallelism` among them";
+     at the widest `parallelism` among them, or on a single stream if any of them is \
+     single-stream or they declare different primary keys (see the startup warning)";
 
 /// Bounds the wait for already-created instances to exit when a later
 /// partition of the same node fails to construct. They were never sent
@@ -567,7 +568,8 @@ impl PartitionedPlugin {
         }
         if created.labels != self.labels {
             return Err(streamling_err!(
-                "plugin instance {key} declares different labels ({:?}) than its node described ({:?})",
+                "plugin instance {key} declares different labels ({:?}) than its node described ({:?}); \
+                 labels identify the node, so they must not vary per partition",
                 created.labels,
                 self.labels
             ));

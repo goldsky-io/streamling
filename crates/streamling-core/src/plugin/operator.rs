@@ -371,6 +371,7 @@ impl ExecutionPlan for PluginExec {
         let plugin_label = instance.key.clone();
         let forwarder_scope = self.scope.clone();
         let plugin_output_receiver = instance.channels.output.receiver.clone();
+        let instance_exit = instance.exit.clone();
         let metrics_receiver = instance.channels.metrics.receiver.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
         let metrics_recorder = get_metrics_recorder();
@@ -449,6 +450,7 @@ impl ExecutionPlan for PluginExec {
                         // This means that the plugin can process one batch at a time.
                         // Alternatively, we can handle batch replies in a spawned task
                         loop {
+                            let dispatcher_exited = instance_exit.has_exited();
                             match plugin_output_receiver.try_recv().map(|m| m.into_enum())  {
                                 Ok(Ok(PluginMsg::NextBatch { data })) => {
                                     let mut processed_batch: RecordBatch = data.into();
@@ -502,10 +504,14 @@ impl ExecutionPlan for PluginExec {
                                         .await;
                                     break 'outer;
                                 }
-                                Err(TryRecvError::Empty) => {
+                                Err(TryRecvError::Empty) if !dispatcher_exited => {
                                     tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
                                 }
-                                Err(TryRecvError::Disconnected) => {
+                                // A clean end would read as completion downstream.
+                                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                                    let _ = tx
+                                        .send(Err(crate::plugin::plugin_exited(&plugin_label)))
+                                        .await;
                                     break 'outer;
                                 }
                                 _ => {}
@@ -539,7 +545,7 @@ mod tests {
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
     use crate::plugin::test_plugins::{
-        self, FAIL_BATCHES_AT, LEGACY_TRANSFORM, MAXIMUM, NODE, TRANSFORM,
+        self, FAIL_BATCHES_AT, LEGACY_TRANSFORM, MAXIMUM, NODE, PANIC_MARKERS, TRANSFORM,
         TRANSFORM_PARTITION_COLUMN, batch, ids, marker, shut_down, source_schema,
     };
     use crate::session::SessionManager;
@@ -871,5 +877,48 @@ mod tests {
         let err = first.expect_err("the stream must fail").to_string();
         assert!(err.contains("batch failed on purpose"), "{err}");
         shut_down(&transform).await;
+    }
+
+    /// A panicking hook ends the instance without a failure report, so the
+    /// stream must notice the exit instead of waiting for a reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transform_exit_ends_the_stream_with_an_error() {
+        let transform = describe("panicking_transform", &[(PANIC_MARKERS, "true")]);
+        let instances = transform
+            .instantiate(1, Some(source_schema()))
+            .await
+            .unwrap();
+        let exec = PluginExec::new(
+            test_plugins::input(vec![vec![batch(&[1], &[marker(MARKER_EPOCH)])]]),
+            transform.output_schema().unwrap(),
+            10,
+            instances,
+            metric_id("panicking_transform"),
+            crate::shutdown::ComponentScope::detached("test"),
+        );
+
+        // The run loop polls every instance's execution future; so does this.
+        let executions = futures::future::join_all(
+            transform
+                .take_execution_futures()
+                .into_iter()
+                .map(|(_, execution)| execution),
+        );
+        let first = async {
+            exec.execute(0, Arc::new(TaskContext::default()))
+                .unwrap()
+                .next()
+                .await
+                .expect("the stream must yield the failure")
+        };
+        let (first, exits) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, executions)
+        })
+        .await
+        .expect("the stream must not wait on an instance that exited");
+
+        assert!(exits.iter().all(|exit| exit.is_err()), "{exits:?}");
+        let err = first.expect_err("the stream must fail").to_string();
+        assert!(err.contains("exited"), "{err}");
     }
 }

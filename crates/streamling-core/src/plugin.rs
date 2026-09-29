@@ -659,6 +659,16 @@ pub(crate) fn plugin_failure(
     streamling_err!("plugin {} failed: {}", instance_key, message).into()
 }
 
+/// The stream error a host forwarder raises when a plugin instance's
+/// dispatcher exits (e.g. a panicking hook) without a `PluginMsg::Error`, so
+/// the forwarder would otherwise wait for output that can never arrive.
+pub(crate) fn plugin_exited(instance_key: &str) -> datafusion::error::DataFusionError {
+    plugin_failure(
+        instance_key,
+        "its dispatcher exited without reporting a failure",
+    )
+}
+
 fn plugin_channel_closed(plugin_id: &str) -> crate::error::StreamlingError {
     streamling_err!(
         "plugin '{}' input channel is closed (dispatcher exited); cannot deliver message",
@@ -688,6 +698,13 @@ impl InstanceExit {
     pub async fn exited(&mut self) {
         // An error means the execution future was dropped: exited as well.
         let _ = self.0.wait_for(|exited| *exited).await;
+    }
+
+    /// Whether the dispatcher has exited. Read it BEFORE draining the
+    /// instance's output channel: everything the dispatcher sent precedes its
+    /// exit, so an empty channel after an observed exit is final.
+    pub fn has_exited(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
     }
 }
 

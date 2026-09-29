@@ -181,6 +181,7 @@ impl ExecutionPlan for PluginSourceExec {
 
         let plugin_input_sender = instance.channels.input.sender.clone();
         let plugin_output_receiver = instance.channels.output.receiver.clone();
+        let instance_exit = instance.exit.clone();
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             self.schema.clone(),
@@ -231,6 +232,7 @@ impl ExecutionPlan for PluginSourceExec {
 
             'outer: loop {
                 loop {
+                    let dispatcher_exited = instance_exit.has_exited();
                     if drain_remaining.is_none() && *shutdown_rx.borrow() {
                         let in_flight = plugin_output_receiver.len();
                         info!(
@@ -374,6 +376,17 @@ impl ExecutionPlan for PluginSourceExec {
                             break;
                         }
                     } else {
+                        // Output drained after the dispatcher exited without
+                        // completing (that sends a `Terminate` above) or
+                        // reporting a failure: nothing more can arrive.
+                        if dispatcher_exited {
+                            let _ = tx
+                                .send(Err(crate::plugin::plugin_exited(&plugin_label)))
+                                .await;
+                            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
+                            return Ok(());
+                        }
+
                         // Plugin output idle. Two things must not starve
                         // behind a quiet plugin (an exhausted bounded source,
                         // a long fetch):
@@ -1351,6 +1364,53 @@ mod tests {
         .expect("the failure must reach the stream without waiting for teardown");
         assert!(failure.contains("marker failed on purpose"), "{failure}");
         shut_down(&source).await;
+    }
+
+    /// A panicking hook ends the instance without a failure report, so the
+    /// stream must notice the exit instead of idling on output that can never
+    /// arrive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn source_exit_ends_its_stream_with_an_error() {
+        let source = describe(
+            "panicking_source",
+            SOURCE,
+            PluginKind::Source,
+            &[(test_plugins::PANIC_MARKERS, "true")],
+        );
+        let exec = scan_source("panicking_source", &source).await;
+        let mut stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let deadline = Instant::now() + EXIT_BOUND;
+        while !test_plugins::log("panicking_source[0]").initialized {
+            assert!(Instant::now() < deadline, "instance never initialized");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        send(CHECKPOINT_COORDINATOR_CHANNEL, marker(90_007)).unwrap();
+
+        // The run loop polls every instance's execution future; so does this.
+        let executions = futures::future::join_all(
+            source
+                .take_execution_futures()
+                .into_iter()
+                .map(|(_, execution)| execution),
+        );
+        let failure = async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => break e.to_string(),
+                    None => panic!("the stream ended without reporting the failure"),
+                }
+            }
+        };
+        let (failure, exits) =
+            tokio::time::timeout(EXIT_BOUND, async { tokio::join!(failure, executions) })
+                .await
+                .expect("the stream must not idle on an instance that exited");
+
+        assert!(exits.iter().all(|exit| exit.is_err()), "{exits:?}");
+        assert!(failure.contains("exited"), "{failure}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
