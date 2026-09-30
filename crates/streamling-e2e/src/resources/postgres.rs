@@ -207,7 +207,13 @@ impl PostgresResource {
         for row in rows {
             let values: Vec<String> = (0..row.len())
                 .map(|i| {
-                    let val: Option<String> = row.try_get(i).ok();
+                    let val: Option<String> = row.try_get(i).unwrap_or_else(|error| {
+                        panic!(
+                            "could not decode column {} as text (add a ::text cast to the \
+                                 query): {error}",
+                            i
+                        )
+                    });
                     val.unwrap_or_else(|| "NULL".to_string())
                 })
                 .collect();
@@ -229,7 +235,13 @@ impl PostgresResource {
         for row in rows {
             let values: Vec<String> = (0..row.len())
                 .map(|i| {
-                    let val: Option<String> = row.try_get(i).ok();
+                    let val: Option<String> = row.try_get(i).unwrap_or_else(|error| {
+                        panic!(
+                            "could not decode column {} as text (add a ::text cast to the \
+                                 query): {error}",
+                            i
+                        )
+                    });
                     val.unwrap_or_else(|| "NULL".to_string())
                 })
                 .collect();

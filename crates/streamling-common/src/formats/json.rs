@@ -1,3 +1,4 @@
+use crate::data::COLUMN_NAME_OP;
 use crate::formats::{FromArrowConverter, ToArrowConverter};
 use crate::types::i256::{I256Type, i256_to_bytes, string_to_i256};
 use crate::types::u256::{U256Type, bytes_to_u256, string_to_u256, u256_to_bytes, u256_to_string};
@@ -13,7 +14,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
 use std::sync::Arc;
-use tracing::error;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{error, warn};
 
 use crate::{streamling_err, streamling_user_err};
 
@@ -140,17 +142,29 @@ impl JsonToArrowConverter {
         // Every existing caller passes a schema already known to be decodable (a schema this
         // same converter round-trips through `FromArrowToJsonConverter`, or one built from a
         // fixed set of Arrow types); an unsupported type here is a bug in the caller, not user
-        // input, so this panics instead of returning a `Result`.
-        let decoder = Self::build_decoder(&schema, false)
-            .expect("schema is decodable: not user-supplied here, see fn doc");
+        // input, so this panics instead of returning an error. Callers that build the schema
+        // from user input (a script transform's `schema:` YAML, an upstream source schema)
+        // must use `try_new`.
+        Self::try_new(schema, single_row_mode, field_to_extract)
+            .expect("schema is decodable: not user-supplied here, see fn doc")
+    }
 
-        Self {
+    /// Fallible variant of [`Self::new`] for schemas built from user input: reports a schema
+    /// type arrow_json can't decode as an error naming the offending field(s) instead of
+    /// panicking.
+    pub fn try_new(
+        schema: SchemaRef,
+        single_row_mode: bool,
+        field_to_extract: Option<String>,
+    ) -> Result<Self> {
+        let decoder = Self::build_decoder(&schema, false)?;
+        Ok(Self {
             schema,
             values: Vec::new(),
             decoder,
             single_row_mode,
             field_to_extract,
-        }
+        })
     }
 
     /// Builds the decoder for `schema`. U256/I256 extension fields are decoded as Utf8 (decimal
@@ -193,8 +207,31 @@ impl JsonToArrowConverter {
             .with_coerce_primitive(coerce_primitive)
             .build_decoder()
             .map_err(|e| {
+                // arrow_json names the offending type but not the field. Probe each field on
+                // its own (mirroring the U256/I256 -> Utf8 rewrite above) so the error names
+                // the field(s) the user must change.
+                let offending: Vec<String> = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| {
+                        let field = if U256Type::is_u256_field(f) || I256Type::is_i256_field(f) {
+                            Field::new(f.name(), DataType::Utf8, f.is_nullable())
+                        } else {
+                            f.as_ref().clone()
+                        };
+                        ReaderBuilder::new(Arc::new(Schema::new(vec![field])))
+                            .build_decoder()
+                            .is_err()
+                    })
+                    .map(|f| f.name().to_string())
+                    .collect();
+                let fields_named = if offending.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (offending fields: {})", offending.join(", "))
+                };
                 DataFusionError::from(streamling_user_err!(
-                    "unsupported type in script transform schema: {}",
+                    "unsupported type in script transform schema{fields_named}: {}",
                     e
                 ))
             })
@@ -218,6 +255,33 @@ impl JsonToArrowConverter {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
+        // A key the script returns that the output schema doesn't declare is dropped by
+        // arrow_json. Warn once per process so schema drift (renamed or derived columns)
+        // shows up instead of silently null downstream. `_gs_op` is runtime plumbing
+        // (`collectResults` always emits it) and is excluded.
+        static WARNED_UNKNOWN_KEYS: AtomicBool = AtomicBool::new(false);
+        if !WARNED_UNKNOWN_KEYS.load(Ordering::Relaxed) {
+            let line_end = bytes
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(bytes.len());
+            if let Ok(Value::Object(obj)) = serde_json::from_slice(&bytes[..line_end]) {
+                let unknown: Vec<&String> = obj
+                    .keys()
+                    .filter(|k| k.as_str() != COLUMN_NAME_OP)
+                    .filter(|k| self.schema.field_with_name(k).is_err())
+                    .collect();
+                if !unknown.is_empty() {
+                    warn!(
+                        "script transform output contains keys not in the output schema \
+                         (they are dropped): {:?}",
+                        unknown
+                    );
+                    WARNED_UNKNOWN_KEYS.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
         let map_decode_err = |e: arrow_schema::ArrowError| {
             DataFusionError::from(streamling_user_err!(
                 "script transform output does not match the output schema: {}",
@@ -237,7 +301,16 @@ impl JsonToArrowConverter {
                 batches.push(batch);
             }
             if read == 0 {
-                break;
+                // The decoder made no progress with bytes still on the input. Trailing
+                // whitespace is fine (nothing left to decode); anything else is a malformed
+                // tail that would otherwise be dropped silently.
+                if bytes[offset..].iter().all(|b| b.is_ascii_whitespace()) {
+                    break;
+                }
+                return Err(DataFusionError::from(streamling_user_err!(
+                    "script transform output does not match the output schema: \
+                     could not decode JSON starting at byte offset {offset}"
+                )));
             }
         }
         if let Some(batch) = self.decoder.flush().map_err(map_decode_err)? {
@@ -613,6 +686,55 @@ mod tests {
         assert_eq!(a, &Int32Array::from(vec![1, 2]));
         assert_eq!(b.value(0), "42");
         assert!(b.is_null(1));
+    }
+
+    /// The fallible constructor used by the script transform's `process_batch` reports an
+    /// undecodable schema as an error naming the offending field, instead of panicking the
+    /// process. This is the constructor that sees user-influenced schemas (a transform's
+    /// `schema:` YAML, or an upstream input schema).
+    #[test]
+    fn test_try_new_rejects_unsupported_type_without_panicking() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ok", DataType::Int64, true),
+            Field::new(
+                "bad",
+                DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
+                true,
+            ),
+        ]));
+
+        let err = match JsonToArrowConverter::try_new(schema, true, None) {
+            Ok(_) => panic!("try_new should reject an undecodable schema"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("offending fields: bad"),
+            "error should name the offending field, got: {message}"
+        );
+    }
+
+    /// A segment the decoder can't make progress on (a malformed trailing line) surfaces as
+    /// an error instead of being silently dropped; trailing whitespace after the last line
+    /// stays accepted.
+    #[test]
+    fn test_decode_ndjson_rejects_malformed_tail() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let mut converter = JsonToArrowConverter::new(schema.clone(), true, None)
+            .with_coerce_primitive(true)
+            .unwrap();
+
+        let err = converter.decode_ndjson(b"{\"a\":1}\nnot json").unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the output schema"),
+            "unexpected error: {err}"
+        );
+
+        let mut converter = JsonToArrowConverter::new(schema, true, None)
+            .with_coerce_primitive(true)
+            .unwrap();
+        let batch = converter.decode_ndjson(b"{\"a\":1}\n\n").unwrap();
+        assert_eq!(batch.num_rows(), 1);
     }
 
     /// A schema declaring a type arrow_json's JSON reader doesn't support (here, Interval)

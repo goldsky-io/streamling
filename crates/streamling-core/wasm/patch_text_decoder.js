@@ -19,9 +19,7 @@
 const originalDecode = globalThis.TextDecoder.prototype.decode;
 globalThis.TextDecoder.prototype.decode = function fastDecode(view, options) {
   if (
-    view &&
-    typeof view.byteLength === "number" &&
-    view.buffer &&
+    view instanceof Uint8Array &&
     view.byteLength < view.buffer.byteLength
   ) {
     view = view.slice();

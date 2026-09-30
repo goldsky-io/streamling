@@ -503,7 +503,7 @@ impl WasmRunnerExec {
         // number in a string column) cast into the declared type instead of
         // erroring, since JS scripts commonly return numbers and strings
         // interchangeably.
-        let output_batch = JsonToArrowConverter::new(output_schema.clone(), true, None)
+        let output_batch = JsonToArrowConverter::try_new(output_schema.clone(), true, None)?
             .with_coerce_primitive(true)?
             .decode_ndjson(&output_bytes)?;
         enrich_batch_with_metadata(output_batch, input_metadata).map_err(Into::into)
@@ -702,6 +702,66 @@ mod tests {
             let expected_json: serde_json::Value = serde_json::from_str(expected).unwrap();
             assert_eq!(actual_json, expected_json);
         }
+    }
+
+    /// The `process_batch` decode path must report an input-schema type arrow_json can't
+    /// decode (here `Interval`, which an upstream source schema can carry) as an error, not
+    /// panic the process: the output schema defaults to the input schema when no `schema:`
+    /// is declared.
+    #[tokio::test]
+    async fn test_wasm_undecodable_declared_schema_errors_not_panics() {
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new(
+                "window",
+                arrow_schema::DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(arrow::array::IntervalYearMonthArray::from(vec![Some(1)])),
+            ],
+        )
+        .unwrap();
+
+        ctx.register_batch("test_table", batch).unwrap();
+
+        let script = r#"
+        function invoke(data) {
+            return { id: data.id };
+        }
+        "#;
+
+        let wasm_node = WasmRunnerNode::new(
+            ctx.table("test_table")
+                .await
+                .unwrap()
+                .into_optimized_plan()
+                .unwrap(),
+            "javascript".to_string(),
+            script.to_string(),
+            None,
+            1000,
+            None,
+        );
+
+        let df = ctx.execute_logical_plan(wasm_node.into()).await.unwrap();
+        let err = df.collect().await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("unsupported type in script transform schema")
+                && message.contains("offending fields: window"),
+            "expected a user error naming the offending field, got: {message}"
+        );
     }
 
     /// A script that never returns a declared column must decode that column as null, not
