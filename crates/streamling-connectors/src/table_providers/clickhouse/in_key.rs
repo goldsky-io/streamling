@@ -377,6 +377,52 @@ mod tests {
     }
 
     #[test]
+    fn timeout_halving_is_not_undone_by_a_single_group_regrow() {
+        // A tuple group larger than every limit that completes in time must fail,
+        // not loop between the limit that timed out and its half.
+        let mut p = InKeyPager::new(8, u64::MAX);
+        p.on_timeout();
+        assert_eq!(p.limit(), 4);
+        let step = p.plan(&[batch(&["x"; 5])], &keys(), 0).unwrap();
+        assert!(
+            p.limit() < 8,
+            "regrew to the limit that timed out: {step:?}"
+        );
+    }
+
+    #[test]
+    fn emit_after_timeout_does_not_return_to_the_timed_out_limit() {
+        let mut p = InKeyPager::new(8, u64::MAX);
+        p.on_timeout();
+        let step = p
+            .plan(&[batch(&["a", "b", "c", "d", "e"])], &keys(), 0)
+            .unwrap();
+        assert!(matches!(step, InKeyStep::Emit { .. }), "{step:?}");
+        assert!(
+            p.limit() < 8,
+            "the next page re-tries the limit that timed out"
+        );
+    }
+
+    #[test]
+    fn complete_first_group_that_fits_is_emitted() {
+        // limit == first group: the page is [a, a] plus one lookahead row [b],
+        // which proves the group complete. The group alone fits max_page_bytes.
+        let mut p = InKeyPager::new(4, 200);
+        p.plan(&[batch(&["a", "a", "b", "c", "d"])], &keys(), 500)
+            .unwrap();
+        assert_eq!(p.limit(), 2);
+        let step = p.plan(&[batch(&["a", "a", "b"])], &keys(), 300).unwrap();
+        assert_eq!(
+            step,
+            InKeyStep::Emit {
+                rows: 2,
+                cursor: vec![utf8("a")]
+            }
+        );
+    }
+
+    #[test]
     fn missing_sort_key_column_is_an_error() {
         let mut p = InKeyPager::new(4, u64::MAX);
         let err = p

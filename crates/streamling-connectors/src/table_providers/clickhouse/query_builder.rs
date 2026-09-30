@@ -709,6 +709,52 @@ mod tests {
     }
 
     #[test]
+    fn test_in_key_seek_after_keyset_without_upper_bound_has_one_where() {
+        let pagination_config = ClickHousePaginationConfig {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            page_size: 1000,
+        };
+        let mut builder = ClickHouseQueryBuilder::of(
+            "t_src".to_string(),
+            vec!["block_number".to_string(), "id".to_string()],
+            None,
+            Some(pagination_config),
+        );
+        builder.start_at_page(vec![ScalarValue::Int64(Some(7))]);
+        builder.set_in_key_after(Some(vec![ScalarValue::Utf8(Some("a".to_string()))]));
+        let query = builder.get_query();
+        assert_eq!(query.matches("WHERE").count(), 1, "{query}");
+    }
+
+    #[test]
+    fn test_in_key_page_orders_on_raw_keys_not_output_aliases() {
+        // A hybrid source selects `CAST(`id` AS String) AS `id``. Ordering by the
+        // output name sorts the cast value while the seek compares the raw column,
+        // and a NULL key must sort before the cursor so the seek cannot skip it.
+        let pagination_config = ClickHousePaginationConfig {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            page_size: 1000,
+        };
+        let mut builder = ClickHouseQueryBuilder::of(
+            "t_src".to_string(),
+            vec![
+                "`block_number`".to_string(),
+                "CAST(`id` AS String) AS `id`".to_string(),
+            ],
+            None,
+            Some(pagination_config),
+        );
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(8))));
+        builder.start_at_page(vec![ScalarValue::Int64(Some(7))]);
+        builder.set_in_key_after(Some(vec![]));
+        let query = builder.get_query();
+        assert!(
+            query.ends_with("ORDER BY _gs_key_0 NULLS FIRST, _gs_key_1 NULLS FIRST"),
+            "{query}"
+        );
+    }
+
+    #[test]
     fn test_recovery_uses_enlarged_sort_key_range() {
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: vec!["block_number".to_string(), "id".to_string()],
