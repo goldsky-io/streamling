@@ -499,6 +499,315 @@ sinks:
 }
 
 // ============================================================================
+// Scenario 3b: A single first-key value holds more rows than page_size
+// ============================================================================
+
+/// A single first-sort-key value (a "hot" block) holds more raw rows than
+/// `page_size`, so no first-key range can fit a page — even at the minimum
+/// width of one key. The source must page WITHIN that key on the remaining
+/// sort keys instead of failing with "at min width still exceeds page limits"
+/// (prod: token-metadata-tier1, block 22270037, 1.27M rows > page_size 1M).
+///
+/// The table is a ReplacingMergeTree with every hot id written as 2-3
+/// versions in separate parts (merges stopped), so an in-key page boundary
+/// that split one (block_number, id) tuple's versions across pages would
+/// emit a stale version after the winner (the sink upserts the last write)
+/// or resurrect a tombstoned id.
+#[tokio::test]
+async fn test_clickhouse_source_hot_first_key_exceeds_page_size() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE hot_key_test (
+                block_number UInt64,
+                id String,
+                payload String,
+                insert_timestamp DateTime,
+                is_deleted UInt8
+            ) ENGINE = ReplacingMergeTree(insert_timestamp, is_deleted)
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+    clickhouse
+        .execute("SYSTEM STOP MERGES hot_key_test")
+        .await
+        .expect("Failed to stop merges");
+
+    // Sparse neighbours: blocks 0..10 and 101, one row each.
+    let mut sparse: Vec<String> = (0..10u64)
+        .map(|b| format!("({b}, 's{b}', 'new', toDateTime(1000), 0)"))
+        .collect();
+    sparse.push("(101, 't0', 'new', toDateTime(1000), 0)".to_string());
+    // Hot block 100: 100 ids, each an 'old' then a 'new' version in separate
+    // parts; ids h090..h099 also get a newer tombstone and must be dropped.
+    let old: Vec<String> = (0..100u64)
+        .map(|i| format!("(100, 'h{i:03}', 'old', toDateTime(1000), 0)"))
+        .collect();
+    let new: Vec<String> = (0..100u64)
+        .map(|i| format!("(100, 'h{i:03}', 'new', toDateTime(2000), 0)"))
+        .collect();
+    let tombstones: Vec<String> = (90..100u64)
+        .map(|i| format!("(100, 'h{i:03}', 'new', toDateTime(3000), 1)"))
+        .collect();
+    let raw_rows = (sparse.len() + old.len() + new.len() + tombstones.len()) as u64;
+    for part in [&sparse, &old, &new, &tombstones] {
+        clickhouse
+            .execute(&format!(
+                "INSERT INTO hot_key_test SETTINGS optimize_on_insert = 0 VALUES {}",
+                part.join(", ")
+            ))
+            .await
+            .expect("Failed to insert source data");
+    }
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: hot_key_test
+    columns: "block_number,id,payload"
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: hot_key_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    // page_size 30 < the hot block's 210 raw rows: every range covering block
+    // 100, including the one-key range [100, 101), overflows.
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
+                .record_limit(raw_rows)
+                .timeout(std::time::Duration::from_secs(90)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(
+        status.success(),
+        "a first-key value with more rows than page_size must be paged, not fail the scan"
+    );
+
+    // 11 sparse + 90 live hot ids (h090..h099 tombstoned).
+    let total = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hot_key_results")
+        .await
+        .expect("count query failed");
+    assert_eq!(total, 101, "every live key must arrive exactly once");
+
+    let hot = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hot_key_results WHERE block_number = 100")
+        .await
+        .unwrap();
+    assert_eq!(hot, 90, "hot block must deliver its 90 live ids");
+
+    let stale = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hot_key_results WHERE payload <> 'new'")
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 0,
+        "a page boundary split a tuple's versions: a stale version overwrote the winner"
+    );
+
+    let resurrected = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hot_key_results WHERE id >= 'h090' AND id <= 'h099'")
+        .await
+        .unwrap();
+    assert_eq!(resurrected, 0, "tombstoned hot ids must be dropped");
+}
+
+/// Postgres state-backend env for a pipeline whose checkpoints the test reads.
+fn pg_state_opts(ctx: &TestContext, application_id: &str, state_table: &str) -> PipelineOpts {
+    PipelineOpts::new()
+        .env("STREAMLING__APPLICATION_ID", application_id)
+        .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+            &ctx.postgres.host,
+        )
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+            ctx.postgres.port.to_string(),
+        )
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+            state_table,
+        )
+        .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+        .env("STREAMLING__RECORD_BATCH_SIZE", "10")
+        .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
+        .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
+}
+
+/// A checkpoint taken while paging inside a hot first-key value must carry
+/// the full sort-key tuple cursor, and a restart must resume strictly after
+/// that tuple: the resumed run reads exactly the rows past the cursor — none
+/// at or before it (no duplicate) and none skipped (no loss).
+///
+/// Every row sits in block 7, so any checkpoint run 1 persists before the
+/// scan finishes is necessarily mid-key.
+#[tokio::test]
+async fn test_clickhouse_source_hot_first_key_resumes_mid_key() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE hot_key_resume_test (
+                block_number UInt64,
+                id UInt64,
+                data String
+            ) ENGINE = MergeTree() ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create table");
+    let total_rows: i64 = 3000;
+    let values: Vec<String> = (0..total_rows)
+        .map(|i| format!("(7, {i}, 'row_{i}')"))
+        .collect();
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO hot_key_resume_test (block_number, id, data) VALUES {}",
+            values.join(", ")
+        ))
+        .await
+        .expect("Failed to insert data");
+
+    let state_table = format!("hot_key_ckpt_{}", ctx.test_id.replace("-", "_"));
+    let application_id = format!("hot_key_ckpt_{}", ctx.test_id);
+    let pipeline = |sink_table: &str| {
+        format!(
+            r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: hot_key_resume_test
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: ch_source
+    table: {sink_table}
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#
+        )
+    };
+
+    // Run 1 stops long before the 3000-row hot key is exhausted.
+    let status_1 = ctx
+        .run_pipeline_with_opts(
+            &pipeline("hot_key_ckpt_run1"),
+            pg_state_opts(&ctx, &application_id, &state_table)
+                .record_limit(1000)
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Pipeline run 1 failed");
+    assert!(status_1.success(), "Pipeline run 1 should succeed");
+
+    let split_query = |expr: &str| {
+        format!(
+            "SELECT ({expr})::bigint FROM streamling.\"{state_table}\" \
+             WHERE key LIKE 'clickhouse_source:%'"
+        )
+    };
+    let cursor_len = ctx
+        .postgres
+        .count(&split_query("jsonb_array_length(data->'args')"))
+        .await
+        .expect("run 1 must persist a ClickHouse source checkpoint");
+    assert_eq!(
+        cursor_len, 2,
+        "a mid-hot-key checkpoint must carry the full (block_number, id) cursor"
+    );
+    let cursor_block = ctx
+        .postgres
+        .count(&split_query("data->'args'->0->>'value'"))
+        .await
+        .unwrap();
+    let cursor_id = ctx
+        .postgres
+        .count(&split_query("data->'args'->1->>'value'"))
+        .await
+        .unwrap();
+    assert_eq!(cursor_block, 7, "cursor must sit inside the hot block");
+    assert!(
+        (0..total_rows - 1).contains(&cursor_id),
+        "cursor id {cursor_id} must be mid-key"
+    );
+
+    // Run 2 resumes from the checkpoint and scans to the end.
+    let status_2 = ctx
+        .run_pipeline_with_opts(
+            &pipeline("hot_key_ckpt_run2"),
+            pg_state_opts(&ctx, &application_id, &state_table)
+                .record_limit(total_rows as u64)
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Pipeline run 2 failed");
+    assert!(status_2.success(), "Pipeline run 2 should succeed");
+
+    let replayed = ctx
+        .postgres
+        .count(&format!(
+            "SELECT COUNT(*) FROM public.hot_key_ckpt_run2 WHERE id <= {cursor_id}"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed, 0,
+        "resume must start strictly after the checkpointed tuple (7, {cursor_id})"
+    );
+    let resumed = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hot_key_ckpt_run2")
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed,
+        total_rows - 1 - cursor_id,
+        "resume must deliver every row after (7, {cursor_id})"
+    );
+}
+
+// ============================================================================
 // Scenario 4: Checkpoint flow across sparse sort key ranges
 // ============================================================================
 
