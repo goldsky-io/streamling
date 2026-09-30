@@ -1585,7 +1585,10 @@ impl ExecutionPlan for KafkaSourceExec {
                     .expect("schema_registry_url is required for Avro format");
                 let reader_schema_json = serde_json::to_string(&avro.avro_schema)
                     .expect("reader avro schema serializes to JSON");
+                // The consume loop flushes after at most `record_batch_size` messages and always
+                // takes at least one, so that is the most rows one arrow-avro generation holds.
                 let mut decoder = ConfluentAvroDecoder::new()
+                    .with_batch_size(self.record_batch_size.max(1) as usize)
                     .with_reader_schema(&avro.avro_schema)
                     .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?
                     // Honor `skip_schema_resolution`: when set, decode each message against its own
@@ -3483,6 +3486,13 @@ impl DataSink for KafkaSink {
                 )
             })?;
         }
+
+        info!(
+            "[{}] write_all completed with {} rows (topic '{}')",
+            get_reference_name_from_metric_key(&self.metric_metadata_id),
+            row_count,
+            self.topic
+        );
 
         Ok(row_count as u64)
     }

@@ -533,6 +533,39 @@ impl CheckpointControl {
         }
     }
 
+    /// Wait for the terminal checkpoint on a source's completion path, returning
+    /// whether it finalized. Same ordering requirement as
+    /// [`Self::await_terminal_finalized`].
+    ///
+    /// How long to wait depends on WHY the source is completing:
+    /// - Shutdown requested (SIGTERM): the watchdog is armed, so the wait must
+    ///   be bounded under the shutdown budget.
+    /// - Natural job-mode completion: no deadline is running, and in a
+    ///   multi-source job the shared terminal epoch cannot finalize until the
+    ///   SLOWEST branch completes and its sinks ack — sibling skew can
+    ///   legitimately exceed any SIGTERM-sized budget. Wait until finalized or
+    ///   until a shutdown request arrives (then fall back to the bounded wait).
+    ///   A sink wedged forever with no shutdown request keeps the pipeline
+    ///   alive-but-stalled, exactly as an unacked epoch does on main; the
+    ///   operator-initiated SIGTERM then drains it under the budget.
+    pub async fn await_terminal_finalized_on_completion(&self) -> bool {
+        let mut shutdown = crate::shutdown::subscribe();
+        let finalize_timeout = crate::shutdown::terminal_checkpoint_finalize_timeout();
+        if *shutdown.borrow() {
+            return tokio::time::timeout(finalize_timeout, self.await_terminal_finalized())
+                .await
+                .is_ok();
+        }
+        tokio::select! {
+            _ = self.await_terminal_finalized() => true,
+            _ = shutdown.changed() => {
+                tokio::time::timeout(finalize_timeout, self.await_terminal_finalized())
+                    .await
+                    .is_ok()
+            }
+        }
+    }
+
     /// Sink ids still expected to ack the terminal epoch, sorted. Empty when
     /// no terminal checkpoint was begun or it already finalized. Diagnostic
     /// only — the answer can be stale by the time the caller logs it, so it

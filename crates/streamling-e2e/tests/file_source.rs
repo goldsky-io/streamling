@@ -3,7 +3,8 @@
 //! Streamling reads files from a temp directory; a print sink captures output to
 //! assert. Covers the matrix of mode (bounded, continuous) × layout (flat, nested
 //! subfolders, Hive partitions), plus the synthesized `_gs_op = 'i'` column,
-//! continuous mid-run file pickup, and fail-fast on bad paths.
+//! continuous mid-run file pickup, continuous reads across partitions, and
+//! fail-fast on bad paths.
 //!
 //! The file source uses neither Kafka nor Postgres, but `TestContext` still
 //! provisions them, so these tests require the e2e Docker stack like the rest.
@@ -162,6 +163,76 @@ sinks:
     for op in ops {
         assert_eq!(op.as_str(), Some("i"), "synthesized _gs_op must be 'i'");
     }
+}
+
+/// Continuous file source with `parallelism`: the output partitions share the
+/// discovered files, and every row arrives exactly once across them.
+#[tokio::test]
+async fn file_source_continuous_reads_across_partitions() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    const FILES: u64 = 8;
+    const ROWS_PER_FILE: u64 = 3;
+    let data_dir = ctx.temp_dir.path().join("continuous_partitions_data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    for file in 0..FILES {
+        let mut csv = String::from("id,name\n");
+        for row in 0..ROWS_PER_FILE {
+            let id = file * ROWS_PER_FILE + row + 1;
+            csv.push_str(&format!("{id},name_{id}\n"));
+        }
+        fs::write(data_dir.join(format!("part_{file}.csv")), csv).expect("write csv");
+    }
+
+    let pipeline = format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    parallelism: 2
+    mode:
+      type: continuous
+      poll_interval: 1s
+
+transforms: {{}}
+
+sinks:
+  print_sink:
+    type: print
+    from: file_src
+    sample_every: 1
+"#,
+        path = data_dir.display()
+    );
+
+    // The continuous source never self-terminates, so bound the run by the total
+    // row count: a duplicate would take the place of a missing row.
+    let output = ctx
+        .run_pipeline_with_capture(
+            &pipeline,
+            PipelineOpts::new().record_limit(FILES * ROWS_PER_FILE),
+        )
+        .await
+        .expect("Pipeline should complete successfully");
+
+    let mut ids: Vec<i64> = output
+        .column_values("id")
+        .iter()
+        .filter_map(|value| value.as_i64())
+        .collect();
+    ids.sort_unstable();
+    let expected: Vec<i64> = (1..=(FILES * ROWS_PER_FILE) as i64).collect();
+    assert_eq!(
+        ids, expected,
+        "every row must arrive exactly once across the partitions"
+    );
 }
 
 /// Hive-style partition columns encoded in the path are inferred into the schema.
