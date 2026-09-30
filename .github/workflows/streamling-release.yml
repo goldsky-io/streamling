@@ -394,6 +394,7 @@ jobs:
           set -euo pipefail
           crates=(
             streamling-config
+            streamling-retry
             streamling-common
             streamling-flink-compat
             streamling-plugin-derive
