@@ -498,10 +498,6 @@ sinks:
     );
 }
 
-// ============================================================================
-// Scenario 3b: A single first-key value holds more rows than page_size
-// ============================================================================
-
 /// A single first-sort-key value (a "hot" block) holds more raw rows than
 /// `page_size`, so no first-key range can fit a page — even at the minimum
 /// width of one key. The source must page WITHIN that key on the remaining
@@ -509,10 +505,11 @@ sinks:
 /// (prod: token-metadata-tier1, block 22270037, 1.27M rows > page_size 1M).
 ///
 /// The table is a ReplacingMergeTree with every hot id written as 2-3
-/// versions in separate parts (merges stopped), so an in-key page boundary
-/// that split one (block_number, id) tuple's versions across pages would
-/// emit a stale version after the winner (the sink upserts the last write)
-/// or resurrect a tombstoned id.
+/// versions in separate parts (merges stopped), in groups whose sizes do not
+/// divide the page, so an in-key page boundary that split one
+/// (block_number, id) tuple's versions across pages would emit a stale
+/// version or a tombstoned id. A per-row emission id makes every emitted row
+/// its own sink row, so a split or a duplicate emission is counted.
 #[tokio::test]
 async fn test_clickhouse_source_hot_first_key_exceeds_page_size() {
     init_tracing();
@@ -546,9 +543,14 @@ async fn test_clickhouse_source_hot_first_key_exceeds_page_size() {
         .collect();
     sparse.push("(101, 't0', 'new', toDateTime(1000), 0)".to_string());
     // Hot block 100: 100 ids, each an 'old' then a 'new' version in separate
-    // parts; ids h090..h099 also get a newer tombstone and must be dropped.
+    // parts, every third id also a 'mid' version in between; ids h090..h099
+    // also get a newer tombstone and must be dropped.
     let old: Vec<String> = (0..100u64)
         .map(|i| format!("(100, 'h{i:03}', 'old', toDateTime(1000), 0)"))
+        .collect();
+    let mid: Vec<String> = (0..100u64)
+        .step_by(3)
+        .map(|i| format!("(100, 'h{i:03}', 'mid', toDateTime(1500), 0)"))
         .collect();
     let new: Vec<String> = (0..100u64)
         .map(|i| format!("(100, 'h{i:03}', 'new', toDateTime(2000), 0)"))
@@ -556,8 +558,8 @@ async fn test_clickhouse_source_hot_first_key_exceeds_page_size() {
     let tombstones: Vec<String> = (90..100u64)
         .map(|i| format!("(100, 'h{i:03}', 'new', toDateTime(3000), 1)"))
         .collect();
-    let raw_rows = (sparse.len() + old.len() + new.len() + tombstones.len()) as u64;
-    for part in [&sparse, &old, &new, &tombstones] {
+    let raw_rows = (sparse.len() + old.len() + mid.len() + new.len() + tombstones.len()) as u64;
+    for part in [&sparse, &old, &mid, &new, &tombstones] {
         clickhouse
             .execute(&format!(
                 "INSERT INTO hot_key_test SETTINGS optimize_on_insert = 0 VALUES {}",
@@ -575,19 +577,23 @@ sources:
     columns: "block_number,id,payload"
     primary_key: id
 
-transforms: {}
+transforms:
+  emitted:
+    type: sql
+    primary_key: emission_id
+    sql: "SELECT *, uuid() AS emission_id FROM ch_source"
 
 sinks:
   pg_sink:
     type: postgres
-    from: ch_source
+    from: emitted
     table: hot_key_results
     schema: public
-    primary_key: id
+    primary_key: emission_id
     on_conflict: update
 "#;
 
-    // page_size 30 < the hot block's 210 raw rows: every range covering block
+    // page_size 30 < the hot block's 244 raw rows: every range covering block
     // 100, including the one-key range [100, 101), overflows.
     let status = ctx
         .run_pipeline_with_opts(
@@ -605,13 +611,19 @@ sinks:
         "a first-key value with more rows than page_size must be paged, not fail the scan"
     );
 
-    // 11 sparse + 90 live hot ids (h090..h099 tombstoned).
+    // 11 sparse + 90 live hot ids (h090..h099 tombstoned), each emitted once.
     let total = ctx
         .postgres
         .count("SELECT COUNT(*) FROM public.hot_key_results")
         .await
         .expect("count query failed");
-    assert_eq!(total, 101, "every live key must arrive exactly once");
+    assert_eq!(total, 101, "every live key must be emitted exactly once");
+    let distinct = ctx
+        .postgres
+        .count("SELECT COUNT(DISTINCT id) FROM public.hot_key_results")
+        .await
+        .unwrap();
+    assert_eq!(distinct, 101, "every live key must arrive");
 
     let hot = ctx
         .postgres
@@ -627,7 +639,7 @@ sinks:
         .unwrap();
     assert_eq!(
         stale, 0,
-        "a page boundary split a tuple's versions: a stale version overwrote the winner"
+        "a page boundary split a tuple's versions: a stale version was emitted"
     );
 
     let resurrected = ctx
@@ -638,7 +650,122 @@ sinks:
     assert_eq!(resurrected, 0, "tombstoned hot ids must be dropped");
 }
 
-/// Postgres state-backend env for a pipeline whose checkpoints the test reads.
+/// Paging within a hot first-key value must order, seek and resume on the raw
+/// sort keys whatever the scan selects: `n` is selected through a String cast
+/// alias (lexicographic, while the key is numeric), `tag` is an unselected
+/// Nullable FixedString whose NULL group spans a page boundary, and `m` is an
+/// unselected MATERIALIZED key.
+#[tokio::test]
+async fn test_clickhouse_source_hot_first_key_with_awkward_sort_keys() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE awkward_key_test (
+                block_number UInt64,
+                tag Nullable(FixedString(4)),
+                n UInt64,
+                m String MATERIALIZED toString(n),
+                payload String
+            ) ENGINE = MergeTree ORDER BY (block_number, tag, n, m)
+            SETTINGS allow_nullable_key = 1",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    // Hot block 100: 200 rows, 50 of them with a NULL tag. Sparse neighbours:
+    // blocks 0..10 and 101, one row each.
+    let mut rows: Vec<String> = (0..200u64)
+        .map(|n| {
+            let tag = match n % 4 {
+                0 => "NULL",
+                1 => "'aaaa'",
+                _ => "'bb'",
+            };
+            format!("(100, {tag}, {n}, 'p')")
+        })
+        .collect();
+    rows.extend((0..10u64).map(|b| format!("({b}, 'aaaa', {}, 'p')", 1000 + b)));
+    rows.push("(101, 'aaaa', 2000, 'p')".to_string());
+    let total_rows = rows.len() as i64;
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO awkward_key_test (block_number, tag, n, payload) VALUES {}",
+            rows.join(", ")
+        ))
+        .await
+        .expect("Failed to insert source data");
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: awkward_key_test
+    columns: "block_number,CAST(n AS String) AS n,payload"
+    primary_key: n
+
+transforms:
+  emitted:
+    type: sql
+    primary_key: emission_id
+    sql: "SELECT *, uuid() AS emission_id FROM ch_source"
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: emitted
+    table: awkward_key_results
+    schema: public
+    primary_key: emission_id
+    on_conflict: update
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
+                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
+                .record_limit(total_rows as u64)
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(
+        status.success(),
+        "the hot block must be paged, not fail or stall the scan"
+    );
+
+    let emitted = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.awkward_key_results")
+        .await
+        .expect("count query failed");
+    assert_eq!(
+        emitted, total_rows,
+        "every row must be emitted exactly once"
+    );
+    let delivered = ctx
+        .postgres
+        .count("SELECT COUNT(DISTINCT n) FROM public.awkward_key_results")
+        .await
+        .unwrap();
+    assert_eq!(delivered, total_rows, "every row must arrive: none skipped");
+    let hot = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.awkward_key_results WHERE block_number = 100")
+        .await
+        .unwrap();
+    assert_eq!(hot, 200, "the hot block must deliver all 200 rows");
+}
+
+/// Postgres state backend, checkpointing every second, for a pipeline whose
+/// checkpoints a test reads back.
 fn pg_state_opts(ctx: &TestContext, application_id: &str, state_table: &str) -> PipelineOpts {
     PipelineOpts::new()
         .env("STREAMLING__APPLICATION_ID", application_id)
@@ -651,8 +778,14 @@ fn pg_state_opts(ctx: &TestContext, application_id: &str, state_table: &str) -> 
             "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
             ctx.postgres.port.to_string(),
         )
-        .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
-        .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__USER",
+            &ctx.postgres.user,
+        )
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD",
+            &ctx.postgres.password,
+        )
         .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
         .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
         .env(
@@ -660,6 +793,12 @@ fn pg_state_opts(ctx: &TestContext, application_id: &str, state_table: &str) -> 
             state_table,
         )
         .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+}
+
+/// `page_size` 30 and `sort_key_range` 100 in batches of 10, on top of
+/// `pg_state_opts`.
+fn small_page_opts(ctx: &TestContext, application_id: &str, state_table: &str) -> PipelineOpts {
+    pg_state_opts(ctx, application_id, state_table)
         .env("STREAMLING__RECORD_BATCH_SIZE", "10")
         .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
         .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
@@ -667,8 +806,8 @@ fn pg_state_opts(ctx: &TestContext, application_id: &str, state_table: &str) -> 
 
 /// A checkpoint taken while paging inside a hot first-key value must carry
 /// the full sort-key tuple cursor, and a restart must resume strictly after
-/// that tuple: the resumed run reads exactly the rows past the cursor — none
-/// at or before it (no duplicate) and none skipped (no loss).
+/// that tuple: the resumed run emits exactly the rows past the cursor, once
+/// each — none at or before it (no duplicate) and none skipped (no loss).
 ///
 /// Every row sits in block 7, so any checkpoint run 1 persists before the
 /// scan finishes is necessarily mid-key.
@@ -714,15 +853,19 @@ sources:
     table_name: hot_key_resume_test
     primary_key: id
 
-transforms: {{}}
+transforms:
+  emitted:
+    type: sql
+    primary_key: emission_id
+    sql: "SELECT *, uuid() AS emission_id FROM ch_source"
 
 sinks:
   pg_sink:
     type: postgres
-    from: ch_source
+    from: emitted
     table: {sink_table}
     schema: public
-    primary_key: id
+    primary_key: emission_id
     on_conflict: update
     batch_size: 1
 "#
@@ -733,7 +876,7 @@ sinks:
     let status_1 = ctx
         .run_pipeline_with_opts(
             &pipeline("hot_key_ckpt_run1"),
-            pg_state_opts(&ctx, &application_id, &state_table)
+            small_page_opts(&ctx, &application_id, &state_table)
                 .record_limit(1000)
                 .timeout(std::time::Duration::from_secs(120)),
         )
@@ -776,7 +919,7 @@ sinks:
     let status_2 = ctx
         .run_pipeline_with_opts(
             &pipeline("hot_key_ckpt_run2"),
-            pg_state_opts(&ctx, &application_id, &state_table)
+            small_page_opts(&ctx, &application_id, &state_table)
                 .record_limit(total_rows as u64)
                 .timeout(std::time::Duration::from_secs(120)),
         )
@@ -803,7 +946,7 @@ sinks:
     assert_eq!(
         resumed,
         total_rows - 1 - cursor_id,
-        "resume must deliver every row after (7, {cursor_id})"
+        "resume must emit every row after (7, {cursor_id}) exactly once"
     );
 }
 
@@ -891,31 +1034,9 @@ sinks:
     let status_1 = ctx
         .run_pipeline_with_opts(
             pipeline_run1,
-            PipelineOpts::new()
+            small_page_opts(&ctx, &application_id, &state_table)
                 .record_limit(50)
-                .timeout(std::time::Duration::from_secs(120))
-                .env("STREAMLING__APPLICATION_ID", &application_id)
-                .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
-                .env(
-                    "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
-                    &ctx.postgres.host,
-                )
-                .env(
-                    "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
-                    ctx.postgres.port.to_string(),
-                )
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
-                .env(
-                    "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
-                    &state_table,
-                )
-                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
-                .env("STREAMLING__RECORD_BATCH_SIZE", "10")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100"),
+                .timeout(std::time::Duration::from_secs(120)),
         )
         .await
         .expect("Pipeline run 1 failed");
@@ -968,31 +1089,9 @@ sinks:
     let status_2 = ctx
         .run_pipeline_with_opts(
             pipeline_run2,
-            PipelineOpts::new()
+            small_page_opts(&ctx, &application_id, &state_table)
                 .record_limit(50)
-                .timeout(std::time::Duration::from_secs(120))
-                .env("STREAMLING__APPLICATION_ID", &application_id)
-                .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
-                .env(
-                    "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
-                    &ctx.postgres.host,
-                )
-                .env(
-                    "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
-                    ctx.postgres.port.to_string(),
-                )
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
-                .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
-                .env(
-                    "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
-                    &state_table,
-                )
-                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
-                .env("STREAMLING__RECORD_BATCH_SIZE", "10")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "30")
-                .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100"),
+                .timeout(std::time::Duration::from_secs(120)),
         )
         .await
         .expect("Pipeline run 2 failed");
