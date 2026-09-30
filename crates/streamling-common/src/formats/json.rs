@@ -134,7 +134,26 @@ impl JsonToArrowConverter {
                 .map(|f| {
                     // Legacy leaves become their decimal_arb equivalent first,
                     // so the text rewrite below reaches them too.
-                    let upgraded = upgrade_legacy_wide_int_field(f).ok().flatten();
+                    //
+                    // `new` cannot return an error, so a failure here falls
+                    // back to the field as declared. That is safe rather than
+                    // silent: `convert_batch_to_original_schema` calls the
+                    // same function with `?` for every batch, so a field this
+                    // one could not upgrade fails the first conversion
+                    // loudly instead of reaching the hex decoder's output.
+                    // Log it anyway — the fallback should be unreachable,
+                    // since the upgrade only builds decimal_arb(78, 0).
+                    let upgraded = match upgrade_legacy_wide_int_field(f) {
+                        Ok(upgraded) => upgraded,
+                        Err(e) => {
+                            error!(
+                                "could not upgrade legacy wide-int field '{}' for JSON decoding, \
+                                 leaving it as declared; the first batch conversion will fail: {e}",
+                                f.name()
+                            );
+                            None
+                        }
+                    };
                     decimal_arb_leaves_as_text_field(upgraded.as_ref().unwrap_or(f))
                 })
                 .collect();
