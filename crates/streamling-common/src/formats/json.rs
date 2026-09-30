@@ -3,7 +3,10 @@ use crate::formats::decimal_arb_text::{
     field_contains_decimal_arb,
 };
 use crate::formats::{FromArrowConverter, ToArrowConverter};
-use crate::types::decimal_arb_legacy::upgrade_legacy_wide_int_batch;
+use crate::types::decimal_arb_legacy::{
+    downgrade_legacy_wide_ints, field_contains_legacy_wide_int, upgrade_legacy_wide_int_batch,
+    upgrade_legacy_wide_int_field,
+};
 // U256/I256 are retired — wide integers flow through decimal_arb only.
 use arrow_json::reader::Decoder;
 use arrow_json::writer::JsonFormat;
@@ -109,20 +112,31 @@ impl JsonToArrowConverter {
     /// `single_row_mode` - if true, each JSON string represents a single row, otherwise a JSON array of objects is expected
     /// `field_to_extract` - if set, the field to extract from the JSON object. This allows to "unwrap" a JSON object, e.g. an envelope
     pub fn new(schema: SchemaRef, single_row_mode: bool, field_to_extract: Option<String>) -> Self {
-        // Only decimal_arb fields need Utf8 transformation for JSON
-        // decoding — U256/I256 are retired. The rewrite is recursive:
-        // a decimal_arb nested in a struct/list/map needs it just as much as a
-        // top-level one (see `decimal_arb_leaves_as_utf8`).
+        // decimal_arb leaves decode as Utf8 and convert back afterwards. The
+        // rewrite is recursive: a decimal_arb nested in a struct/list/map
+        // needs it just as much as a top-level one.
+        //
+        // A retired `streamling.u256` / `streamling.i256` leaf needs the same
+        // treatment. The writer upgrades those columns to decimal_arb text on
+        // the way out (`upgrade_legacy_wide_int_batch`), so a script hands
+        // back decimal text; left declared as `FixedSizeBinary(32)` here,
+        // arrow-json reads that text as HEX — 32 wrong bytes for an all-hex
+        // 64-character number, and a hard error for any other width.
         let needs_transform = schema
             .fields()
             .iter()
-            .any(|f| field_contains_decimal_arb(f));
+            .any(|f| field_contains_decimal_arb(f) || field_contains_legacy_wide_int(f));
 
         let decoder = if needs_transform {
             let new_fields: Vec<Field> = schema
                 .fields()
                 .iter()
-                .map(|f| decimal_arb_leaves_as_text_field(f))
+                .map(|f| {
+                    // Legacy leaves become their decimal_arb equivalent first,
+                    // so the text rewrite below reaches them too.
+                    let upgraded = upgrade_legacy_wide_int_field(f).ok().flatten();
+                    decimal_arb_leaves_as_text_field(upgraded.as_ref().unwrap_or(f))
+                })
                 .collect();
             let transformed_schema = Arc::new(Schema::new(new_fields));
             ReaderBuilder::new(transformed_schema)
@@ -148,15 +162,18 @@ impl JsonToArrowConverter {
         }
     }
 
-    /// Convert a decoded batch back to the original schema, converting Utf8
-    /// fields back to decimal_arb where applicable. (U256/I256 are retired —
-    /// those conversions are gone.)
+    /// Convert a decoded batch back to the original schema: the Utf8 leaves
+    /// the decoder produced become decimal_arb again, and a leaf the original
+    /// schema declares as a retired `streamling.u256` / `streamling.i256`
+    /// goes one step further, back to its `FixedSizeBinary(32)` wire shape
+    /// through the value-checked bridge (which rejects a value the wire type
+    /// cannot hold rather than truncating it).
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let needs_transform = self
             .schema
             .fields()
             .iter()
-            .any(|f| field_contains_decimal_arb(f));
+            .any(|f| field_contains_decimal_arb(f) || field_contains_legacy_wide_int(f));
 
         if !needs_transform {
             return Ok(batch);
@@ -164,7 +181,15 @@ impl JsonToArrowConverter {
 
         let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
         for (idx, field) in self.schema.fields().iter().enumerate() {
-            new_columns.push(decimal_arb_leaves_from_text(field, batch.column(idx))?);
+            let upgraded = upgrade_legacy_wide_int_field(field).map_err(DataFusionError::from)?;
+            let target = upgraded.as_ref().unwrap_or(field);
+            let arr = decimal_arb_leaves_from_text(target, batch.column(idx))?;
+            let arr =
+                match downgrade_legacy_wide_ints(field, &arr).map_err(DataFusionError::from)? {
+                    Some(downgraded) => downgraded,
+                    None => arr,
+                };
+            new_columns.push(arr);
         }
 
         RecordBatch::try_new(self.schema.clone(), new_columns)

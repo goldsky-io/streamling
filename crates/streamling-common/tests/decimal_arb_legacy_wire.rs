@@ -326,3 +326,36 @@ fn companion_canton_native_decimal256_signed_avro() {
         );
     }
 }
+
+/// The JSON script boundary has to mirror the IPC one for a retired
+/// `streamling.u256` / `streamling.i256` column. The writer upgrades such a
+/// column to decimal_arb text on the way out, so the script returns decimal
+/// text; if the reader leaves the field declared as `FixedSizeBinary(32)`,
+/// arrow-json reads that text as HEX — 32 wrong bytes for an all-hex
+/// 64-character number, and a hard error for any other width.
+#[test]
+fn legacy_wide_int_round_trips_the_json_script_boundary() {
+    use streamling_common::formats::ToArrowConverter;
+    use streamling_common::formats::json::JsonToArrowConverter;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        legacy_u256_field("balance", true),
+    ]));
+    let decimal = "12345678901234567890123456789012345678";
+
+    let mut conv = JsonToArrowConverter::new(schema, true, None);
+    conv.buffer(format!(r#"{{"id": 1, "balance": "{decimal}"}}"#));
+    let batch = conv.convert_to_batch().unwrap();
+
+    let col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("legacy column keeps its FixedSizeBinary(32) wire shape");
+    let expected = unsigned_be_fixture(&format!(
+        "{:x}",
+        BigUint::parse_bytes(decimal.as_bytes(), 10).unwrap()
+    ));
+    assert_eq!(col.value(0), expected);
+}
