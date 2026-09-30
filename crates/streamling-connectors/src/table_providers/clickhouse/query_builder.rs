@@ -15,6 +15,10 @@ pub struct ClickHouseQueryBuilder {
     pagination_config: Option<ClickHousePaginationConfig>,
     current_keyset: Option<Vec<ScalarValue>>, // `>=` lower bound on the sorting key
     sort_key_range_upper_bound: Option<ScalarValue>, // Upper bound (exclusive) on first sorting key for sort key range pagination
+    /// In-key pagination within one first-key value: `Some(after)` orders the
+    /// page by the full sorting key and, when `after` is non-empty, keeps only
+    /// rows whose remaining sort-key tuple is strictly greater than `after`.
+    in_key_after: Option<Vec<ScalarValue>>,
     /// Name of the ReplacingMergeTree `is_deleted` flag column, parsed from
     /// `engine_full`. When `Some`, `_gs_op` is derived from it (so a custom-named
     /// flag works); when `None` there is no engine-level deletion concept and
@@ -84,6 +88,7 @@ impl ClickHouseQueryBuilder {
             pagination_config: config,
             current_keyset: None,
             sort_key_range_upper_bound: None,
+            in_key_after: None,
             is_deleted_column: None,
         }
     }
@@ -96,6 +101,12 @@ impl ClickHouseQueryBuilder {
 
     pub fn set_sort_key_range_upper_bound(&mut self, value: Option<ScalarValue>) -> &mut Self {
         self.sort_key_range_upper_bound = value;
+        self
+    }
+
+    /// Enter (`Some`) or leave (`None`) in-key pagination; see `in_key_after`.
+    pub fn set_in_key_after(&mut self, after: Option<Vec<ScalarValue>>) -> &mut Self {
+        self.in_key_after = after;
         self
     }
 
@@ -162,12 +173,25 @@ impl ClickHouseQueryBuilder {
             }
         }
 
+        if let (Some(pagination_config), Some(after)) =
+            (&self.pagination_config, &self.in_key_after)
+        {
+            let conditions =
+                Self::build_keyset_conditions(&pagination_config.sorting_keys[1..], after, ">");
+            if !conditions.is_empty() {
+                let connector = if added_conditions { "AND" } else { "WHERE" };
+                cte_query = format!("{} {} ({})", cte_query, connector, conditions);
+            }
+        }
+
         // NB: deliberately NO `ORDER BY` here. Pagination is driven by disjoint
         // half-open `block_number` ranges (the keyset/sort-key-range WHERE bounds
         // above), so determinism comes from the predicate, not row order. An
         // `ORDER BY` on the sorting key would force read-in-order on the main
         // table and make ClickHouse skip a matching projection (read-in-order is
-        // not supported on projections), so it is intentionally omitted.
+        // not supported on projections), so it is intentionally omitted. Only an
+        // in-key page (one first-key value) is ordered, on the outer query, so
+        // its LIMIT cuts at a sort-key tuple boundary.
 
         // Build the final SELECT statement that selects columns from the CTE
         // Remove _gs_op if present since we create our own virtual column
@@ -185,7 +209,14 @@ impl ClickHouseQueryBuilder {
         );
 
         // Combine CTE and final SELECT
-        let query = format!("WITH t AS (\n  {}\n)\n{} FROM t", cte_query, final_select);
+        let mut query = format!("WITH t AS (\n  {}\n)\n{} FROM t", cte_query, final_select);
+        if let (Some(pagination_config), Some(_)) = (&self.pagination_config, &self.in_key_after) {
+            query = format!(
+                "{}\nORDER BY {}",
+                query,
+                pagination_config.sorting_keys.join(", ")
+            );
+        }
 
         self.query = query;
     }
@@ -626,6 +657,55 @@ mod tests {
         // The filter and sort key range upper bound should still be present
         assert!(query.contains("WHERE (address IN ('0x1234'))"));
         assert!(query.contains("AND (block_number < 1000000)"));
+    }
+
+    #[test]
+    fn test_in_key_page_orders_by_full_key_and_seeks_past_cursor() {
+        let pagination_config = ClickHousePaginationConfig {
+            sorting_keys: vec![
+                "block_number".to_string(),
+                "id".to_string(),
+                "log_index".to_string(),
+            ],
+            page_size: 1000,
+        };
+        let mut builder = ClickHouseQueryBuilder::of(
+            "t_src".to_string(),
+            vec!["block_number".to_string(), "id".to_string()],
+            None,
+            Some(pagination_config),
+        );
+        builder.set_sort_key_range_upper_bound(Some(ScalarValue::Int64(Some(8))));
+        builder.start_at_page(vec![ScalarValue::Int64(Some(7))]);
+        builder.set_in_key_after(Some(vec![
+            ScalarValue::Utf8(Some("a'b".to_string())),
+            ScalarValue::Int64(Some(3)),
+        ]));
+        let query = builder.get_query().to_string();
+
+        assert!(query.contains("block_number >= 7"), "{query}");
+        assert!(query.contains("block_number < 8"), "{query}");
+        assert!(
+            query.contains("(id > 'a\\'b') OR (id = 'a\\'b' AND log_index > 3)"),
+            "{query}"
+        );
+        assert!(
+            query.ends_with("FROM t\nORDER BY block_number, id, log_index"),
+            "{query}"
+        );
+
+        // First in-key page: ordered, no tuple seek.
+        builder.set_in_key_after(Some(vec![]));
+        let query = builder.get_query().to_string();
+        assert!(!query.contains("id >"), "{query}");
+        assert!(
+            query.ends_with("ORDER BY block_number, id, log_index"),
+            "{query}"
+        );
+
+        // Range pages stay unordered.
+        builder.set_in_key_after(None);
+        assert!(!builder.get_query().contains("ORDER BY"));
     }
 
     #[test]
