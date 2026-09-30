@@ -743,3 +743,42 @@ async fn containers_carry_decimal_text_to_the_json_sink() {
     let b = query(&ctx, "SELECT greatest(v, NULL) FROM t ORDER BY id").await;
     assert_eq!(decimals(&b), vec![d("2.56"), d("-5.00")]);
 }
+
+/// A `DataType::Null` operand (a Null-typed column, which `is_null_literal`
+/// does not catch) used to make `coerce_all` bail, handing `greatest`/`least`
+/// back to the shimmed builtin. The builtin's own coercion accepts
+/// `(Null, LargeBinary, LargeBinary)`, so it compared canonical bytes: the
+/// sign byte `0xFF` outranks `0x00`, and the answers came back inverted —
+/// `greatest` returned the most negative value and `least` the largest.
+#[tokio::test]
+async fn greatest_least_drop_null_typed_operands() {
+    use arrow::array::NullArray;
+
+    let ctx = session();
+    let (af, aa) = decimal_column("a", 0, &[Some("-5")]);
+    let (bf, ba) = decimal_column("b", 0, &[Some("3")]);
+    let schema = Arc::new(Schema::new(vec![
+        af,
+        bf,
+        Field::new("n", DataType::Null, true),
+    ]));
+    ctx.register_batch(
+        "nt",
+        RecordBatch::try_new(schema, vec![aa, ba, Arc::new(NullArray::new(1))]).unwrap(),
+    )
+    .unwrap();
+
+    // The Null operand is dropped, the rewrite runs, and the result keeps its
+    // decimal_arb metadata — so `decimal_arb_to_string` accepts it at all.
+    let got = query(
+        &ctx,
+        "SELECT decimal_arb_to_string(greatest(n, a, b)) FROM nt",
+    )
+    .await;
+    assert_eq!(strings(&got), vec!["3"]);
+    let got = query(&ctx, "SELECT decimal_arb_to_string(least(n, a, b)) FROM nt").await;
+    assert_eq!(strings(&got), vec!["-5"]);
+    // One decimal operand beside the Null: that operand wins.
+    let got = query(&ctx, "SELECT decimal_arb_to_string(greatest(n, a)) FROM nt").await;
+    assert_eq!(strings(&got), vec!["-5"]);
+}

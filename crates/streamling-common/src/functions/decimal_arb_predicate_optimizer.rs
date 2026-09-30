@@ -298,6 +298,14 @@ impl DecimalArbExprRewrite {
         Self::field_of(expr, schema).is_some_and(|f| DecimalArbType::is_decimal_arb_field(&f))
     }
 
+    /// A `DataType::Null` operand — a Null-typed column or expression, which
+    /// `is_null_literal` does not catch. It carries no value, so like a
+    /// literal NULL it can be dropped from a comparison; left in, it makes
+    /// `coerce_all` bail and hands the whole call back to the builtin.
+    fn is_null_typed(&self, expr: &Expr, schema: &DFSchema) -> bool {
+        Self::field_of(expr, schema).is_some_and(|f| f.data_type() == &DataType::Null)
+    }
+
     /// `(precision, scale)` of `expr` if it resolves to decimal_arb.
     fn precision_scale(&self, expr: &Expr, schema: &DFSchema) -> Option<(u32, u32)> {
         let field = Self::field_of(expr, schema)?;
@@ -1256,7 +1264,7 @@ impl DecimalArbExprRewrite {
                 let args: Vec<Expr> = sf
                     .args
                     .iter()
-                    .filter(|a| !is_null_literal(a))
+                    .filter(|a| !is_null_literal(a) && !self.is_null_typed(a, schema))
                     .cloned()
                     .collect();
                 match self.coerce_all(&args, schema)? {
