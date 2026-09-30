@@ -1,6 +1,7 @@
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
 use crate::types::decimal_arb::DecimalArbType;
+use crate::types::decimal_arb_legacy::{LEGACY_WIDE_INT_PRECISION, legacy_wide_int_kind};
 // The U256/I256 imports are gone; wide-int values flow through
 // decimal_arb. Postgres NUMERIC(78, 0) source columns
 // are auto-promoted to decimal_arb(78, 0) + native_int_kind=u256 in
@@ -181,6 +182,18 @@ pub fn get_postgres_type_info(field: &Field) -> PostgresTypeInfo {
         return PostgresTypeInfo {
             column_type: format!("NUMERIC({}, {})", precision, scale),
             string_cast_sql: Some(format!("numeric({},{})", precision, scale)),
+        };
+    }
+    // A retired `streamling.u256` / `streamling.i256` column from a plugin
+    // source: `build_projection_for_postgres` upgrades it to decimal_arb(78, 0)
+    // text, so it is a NUMERIC like any other wide integer — not the BYTEA the
+    // generic FixedSizeBinary arm below would pick. Without this arm the DDL
+    // pass (which runs over the pre-projection schema) writes BYTEA while the
+    // insert path casts to numeric(78,0), and every insert fails 42804.
+    if legacy_wide_int_kind(field).is_some() {
+        return PostgresTypeInfo {
+            column_type: format!("NUMERIC({}, 0)", LEGACY_WIDE_INT_PRECISION),
+            string_cast_sql: Some(format!("numeric({},0)", LEGACY_WIDE_INT_PRECISION)),
         };
     }
 
@@ -746,6 +759,29 @@ mod tests {
             )),
             "BYTEA"
         );
+    }
+
+    /// The DDL pass runs over the pre-projection schema, where a plugin's
+    /// retired `streamling.u256` column is still `FixedSizeBinary(32)`. It has
+    /// to agree with the insert path, which casts that column to
+    /// `numeric(78,0)`; BYTEA here means every insert fails with 42804.
+    #[test]
+    fn legacy_wide_int_is_numeric_not_bytea() {
+        for ext in ["streamling.u256", "streamling.i256"] {
+            let field = Field::new("balance", DataType::FixedSizeBinary(32), true).with_metadata(
+                std::collections::HashMap::from([(
+                    "ARROW:extension:name".to_string(),
+                    ext.to_string(),
+                )]),
+            );
+            let info = get_postgres_type_info(&field);
+            assert_eq!(info.column_type, "NUMERIC(78, 0)", "{ext}");
+            assert_eq!(
+                info.string_cast_sql,
+                Some("numeric(78,0)".to_string()),
+                "{ext}"
+            );
+        }
     }
 
     #[test]
