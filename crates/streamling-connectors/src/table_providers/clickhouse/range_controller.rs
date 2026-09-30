@@ -68,7 +68,7 @@ impl RangeController {
     /// variance exceeds it, convergence is geometric (each step shrinks >10%), not
     /// a unit creep. `on_complete`'s byte clamp uses the same target so a completed
     /// page can't creep back up to the limit and re-overflow.
-    const BYTE_TARGET_RATIO: f64 = 0.9;
+    pub(super) const BYTE_TARGET_RATIO: f64 = 0.9;
 
     /// Fraction of `page_size` that a probed one-step resize targets for rows.
     /// Symmetric with `BYTE_TARGET_RATIO`: sizing a shrunk range to land at
@@ -289,8 +289,9 @@ impl RangeController {
     }
 
     /// The key at the cursor was fully read by in-key pagination (it overflowed
-    /// even at [`MIN_WIDTH`](Self::MIN_WIDTH)). Advances past exactly that one key;
-    /// width is left as is for the count-first probe to size the next range.
+    /// even at [`MIN_WIDTH`](Self::MIN_WIDTH)). Advances past exactly that one key.
+    /// Width is left as is: after a hot key found mid-scan it is `MIN_WIDTH` and
+    /// regrows through `on_complete`, at most `GROW_CEILING` per page.
     pub fn on_key_paged(&mut self) {
         self.range_start += 1;
     }
