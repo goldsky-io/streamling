@@ -48,7 +48,7 @@ impl RangeController {
     /// `STREAMLING__CLICKHOUSE_SOURCE__GROW_CEILING`.
     const DEFAULT_GROW_CEILING: f64 = 4.0;
 
-    fn grow_ceiling() -> f64 {
+    pub(crate) fn grow_ceiling() -> f64 {
         static GROW_CEILING: OnceCell<f64> = OnceCell::new();
         *GROW_CEILING.get_or_init(|| {
             std::env::var("STREAMLING__CLICKHOUSE_SOURCE__GROW_CEILING")
