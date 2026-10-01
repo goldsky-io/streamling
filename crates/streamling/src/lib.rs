@@ -611,6 +611,8 @@ async fn build_source_providers(
                         // One scope for the hybrid driver, forwarder,
                         // watcher, and both inner phases' helper tasks.
                         scope,
+                        hybrid.empty_columns.clone().unwrap_or_default(),
+                        hybrid.primary_key.clone(),
                     )?;
                     Ok(PreparedSource::Hybrid(Box::new(provider)))
                 }))
@@ -4685,6 +4687,7 @@ sources:
     unbounded_source:
       source_type: kafka
       topic: blocks_live
+    empty_columns: [dataset]
     telemetry:
       labels:
         dataset: v2.evm.blocks
@@ -4693,6 +4696,14 @@ transforms: {}
 sinks: {}
 "#;
         let map = build_metadata_from_yaml(yaml);
+
+        // Assert the empty_columns field parsed from the YAML.
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        let hybrid = match topology.sources.get("blocks").expect("source exists") {
+            topology::Source::hybrid(h) => h,
+            _ => panic!("expected hybrid source"),
+        };
+        assert_eq!(hybrid.empty_columns, Some(vec!["dataset".to_string()]));
 
         // Parent source metadata
         let parent = map.get(&metric_key("test_app", "blocks")).unwrap();

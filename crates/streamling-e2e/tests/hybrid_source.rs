@@ -200,6 +200,196 @@ sinks:
 }
 
 // ============================================================================
+// Scenario 1b: Hybrid source with empty_columns
+// ============================================================================
+
+/// Test that the `empty_columns` hybrid source option replaces the named
+/// column's values with empty strings in BOTH phases (bounded ClickHouse
+/// and unbounded Kafka), while leaving all other columns intact.
+///
+/// Mirrors `test_hybrid_clickhouse_to_kafka` exactly, adding only
+/// `empty_columns: [data]` to the source. After the run, every row in the
+/// Postgres sink should have `data = ''`, but `block`, `id`, and the rest
+/// should be unchanged.
+#[tokio::test]
+async fn test_hybrid_source_empty_columns() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    // Create ClickHouse source table
+    // Note: id must be String to match Kafka schema for hybrid source unification
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_source_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    // Insert some records into ClickHouse (bounded source data)
+    // Using string IDs that match the original test pattern
+    clickhouse
+        .execute(
+            "INSERT INTO hybrid_source_test VALUES
+            (1, 'Alice', 'A', 0, 0),
+            (2, 'Bob', 'B', 0, 0),
+            (3, 'Charlie', 'C', 0, 0)",
+        )
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    // Register schema for Kafka
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Produce some records to Kafka (unbounded source data)
+    // Using string IDs that don't overlap with ClickHouse IDs (Alice, Bob, Charlie)
+    let kafka_records: Vec<TestRecord> = (1..=3)
+        .map(|i| TestRecord {
+            block: 100 + i,
+            id: format!("kafka_user_{}", i),
+            data: format!("kafka_data_{}", i),
+            timestamp: 2000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&kafka_records)
+        .await
+        .expect("Failed to produce Kafka records");
+
+    // Create offset table in ClickHouse for hybrid source to track where Kafka should start
+    // The offset table stores topic/partition/offset for Kafka consumer positioning
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    // Run pipeline: Hybrid source (ClickHouse bounded + Kafka unbounded) → PostgreSQL sink
+    // The `empty_columns: [data]` option empties the `data` column in both phases.
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_source_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets
+    empty_columns: [data]
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: hybrid_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(6) // 3 from ClickHouse + 3 from Kafka
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(status.success(), "Streamling should exit successfully");
+
+    // Verify total record count: 3 from ClickHouse + 3 from Kafka
+    let count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hybrid_results")
+        .await
+        .expect("Failed to query count");
+    assert_eq!(count, 6, "Should have 6 total records (3 CH + 3 Kafka)");
+
+    // The `data` column should be empty for ALL records (both phases)
+    let empty_data_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hybrid_results WHERE data = ''")
+        .await
+        .expect("Failed to query empty data count");
+    assert_eq!(
+        empty_data_count, 6,
+        "All 6 records should have empty data column"
+    );
+
+    // Verify ClickHouse records are present (Alice, Bob, Charlie)
+    let ch_data: Vec<(String,)> = ctx
+        .postgres
+        .query(
+            "SELECT id FROM public.hybrid_results WHERE id IN ('Alice', 'Bob', 'Charlie') ORDER BY id",
+        )
+        .await
+        .expect("Failed to query ClickHouse data");
+    assert_eq!(
+        ch_data.len(),
+        3,
+        "Should have 3 ClickHouse records (Alice, Bob, Charlie)"
+    );
+
+    // Verify Kafka records are present (kafka_user_1, kafka_user_2, kafka_user_3)
+    let kafka_data: Vec<(String,)> = ctx
+        .postgres
+        .query("SELECT id FROM public.hybrid_results WHERE id LIKE 'kafka_user_%' ORDER BY id")
+        .await
+        .expect("Failed to query Kafka data");
+    assert_eq!(
+        kafka_data.len(),
+        3,
+        "Should have 3 Kafka records (kafka_user_1, kafka_user_2, kafka_user_3)"
+    );
+
+    // Other columns should be intact: block values from both phases
+    let block_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hybrid_results WHERE block IN (1,2,3,101,102,103)")
+        .await
+        .expect("Failed to query block count");
+    assert_eq!(
+        block_count, 6,
+        "All 6 records should have intact block values"
+    );
+}
+
+// ============================================================================
 // Scenario 2: Hybrid source with filters
 // ============================================================================
 

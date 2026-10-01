@@ -227,6 +227,11 @@ pub struct HybridSource {
     pub unbounded_source: HybridUnboundedSource,
     pub offset_table: Option<HybridOffsetTable>,
     pub primary_key: Option<String>,
+    /// Columns whose values are replaced with empty values ('' for strings,
+    /// empty bytes for binary) in both phases. The bounded ClickHouse phase
+    /// selects a typed constant instead of reading the column, so the column
+    /// is never read from disk. Only string/binary columns are supported.
+    pub empty_columns: Option<Vec<String>>,
     pub telemetry: Option<Telemetry>,
 }
 

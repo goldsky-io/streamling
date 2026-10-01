@@ -134,6 +134,8 @@ pub struct HybridSourceConfig {
 #[derive(Clone)]
 pub struct HybridTableProvider {
     pub config: HybridSourceConfig,
+    /// Columns emptied in both phases (see topology::HybridSource::empty_columns).
+    pub empty_columns: Vec<String>,
     schema: SchemaRef,
     state_backend: Arc<dyn StateOperatorBackend<HybridSourceState>>,
     pub state: Arc<RwLock<HybridSourceState>>,
@@ -159,6 +161,7 @@ impl Debug for HybridTableProvider {
             .field("reference_name", &self.reference_name)
             .field("config", &self.config)
             .field("schema", &self.schema)
+            .field("empty_columns", &self.empty_columns)
             .finish()
     }
 }
@@ -211,6 +214,7 @@ impl HybridTableProvider {
 
         let provider = Self {
             config,
+            empty_columns: Vec::new(),
             schema,
             state_backend,
             state: Arc::new(RwLock::new(initial_state)),
@@ -247,6 +251,12 @@ impl HybridTableProvider {
         self
     }
 
+    /// Set columns emptied in both phases (see topology::HybridSource::empty_columns).
+    pub fn with_empty_columns(mut self, empty_columns: Vec<String>) -> Self {
+        self.empty_columns = empty_columns;
+        self
+    }
+
     pub fn new_from_topology(
         reference_name: String,
         bounded_sources: Vec<HybridBoundedSource>,
@@ -267,6 +277,8 @@ impl HybridTableProvider {
         // phases' background tasks (Kafka lag reporter, ClickHouse
         // checkpointing) — all drain together at teardown.
         scope: Arc<streamling_core::shutdown::ComponentScope>,
+        empty_columns: Vec<String>,
+        primary_key: Option<String>,
     ) -> DataFusionResult<Self> {
         use crate::table_providers::clickhouse::ClickHouseTableProvider;
         use crate::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -335,6 +347,12 @@ impl HybridTableProvider {
                 }
             };
 
+        validate_empty_columns(
+            &empty_columns,
+            &unbounded_table_provider.schema(),
+            primary_key.as_deref(),
+        )?;
+
         let schema_adapter = ClickHouseSchemaAdapter {
             client: ClickHouseClient::new(app_config.clickhouse_source.connection.clone()),
         };
@@ -359,10 +377,12 @@ impl HybridTableProvider {
                         unbounded_columns.len(),
                         unbounded_columns
                     );
-                    let columns = Some(
-                        schema_adapter
-                            .get_columns(bounded_source.table_name.as_str(), &unbounded_schema)?,
-                    );
+                    let columns = Some(schema_adapter.get_columns(
+                        bounded_source.table_name.as_str(),
+                        app_config.clickhouse_source.connection.database.as_str(),
+                        &unbounded_schema,
+                        &empty_columns,
+                    )?);
                     let clickhouse_provider = Arc::new(
                         ClickHouseTableProvider::new_source(
                             reference_name.clone(),
@@ -431,7 +451,9 @@ impl HybridTableProvider {
             state_backend,
             session_manager,
         )?
-        .with_scope(scope);
+        .with_scope(scope)
+        .with_empty_columns(empty_columns.clone());
+
         debug!("Created HybridTableProvider: {:?}", provider);
 
         Ok(provider)
@@ -1187,6 +1209,17 @@ impl ExecutionPlan for HybridSourceExec {
             })
         });
 
+        // Resolve the indices of emptied columns once for the unbounded
+        // (Kafka) phase substitution. Bounded (ClickHouse) batches are already
+        // emptied by the constant expression in the SELECT.
+        let empty_indices: Vec<usize> = schema_for_main
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| provider.empty_columns.iter().any(|n| n == f.name()))
+            .map(|(i, _)| i)
+            .collect();
+
         scope.spawn(async move {
             // Every exit path from the loop falls through to the
             // post-loop teardown below — `break 'outer` is used uniformly
@@ -1285,6 +1318,31 @@ impl ExecutionPlan for HybridSourceExec {
                                     let _ = tx.send(Err(e)).await;
                                     break 'outer;
                                 }
+                            };
+                            // Replace emptied columns in unbounded (Kafka) batches.
+                            // Bounded (ClickHouse) batches are already emptied by the
+                            // constant expression in the SELECT, so we only substitute
+                            // during the unbounded phase.
+                            let batch = if is_executing_unbounded && !empty_indices.is_empty() {
+                                let sub_result: DataFusionResult<RecordBatch> = (|| {
+                                    let mut columns = batch.columns().to_vec();
+                                    for &i in &empty_indices {
+                                        columns[i] = empty_array_of_type(
+                                            batch.schema().field(i).data_type(),
+                                            batch.num_rows(),
+                                        )?;
+                                    }
+                                    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+                                })();
+                                match sub_result {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e)).await;
+                                        break 'outer;
+                                    }
+                                }
+                            } else {
+                                batch
                             };
                             // Bounded sources (ClickHouse) emit u256/i256 columns as
                             // FixedSizeBinary(32) without extension metadata and in
@@ -1706,6 +1764,147 @@ async fn flush_pending_to_synth_batch(
     }
 }
 
+/// SQL expression that produces an empty constant with the same ClickHouse
+/// type `arrow_field_to_clickhouse` would select for `field`, aliased to the
+/// field's name. The outer SELECT of the pagination query uses this instead
+/// of the column reference, so ClickHouse never reads the column from disk.
+fn empty_column_expression(field: &arrow_schema::Field) -> String {
+    format!(
+        "CAST('' AS {}) AS `{}`",
+        ClickHouseClient::arrow_field_to_clickhouse(field),
+        field.name()
+    )
+}
+
+/// Validate `empty_columns` names against the unbounded (Kafka) schema.
+/// Emptying is only supported for variable-length string/binary columns.
+fn validate_empty_columns(
+    names: &[String],
+    schema: &SchemaRef,
+    primary_key: Option<&str>,
+) -> DataFusionResult<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    // Reject duplicates.
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            streamling_user_bail!("empty_columns contains duplicate entry '{}'", name);
+        }
+    }
+
+    // Reject _gs_op.
+    for name in names {
+        if name == COLUMN_NAME_OP {
+            streamling_user_bail!(
+                "empty_columns cannot include the reserved column '{}'",
+                COLUMN_NAME_OP
+            );
+        }
+    }
+
+    // Reject primary-key columns (sinks key on them).
+    if let Some(pk) = primary_key {
+        let pk_tokens: Vec<&str> = pk.split(',').map(|s| s.trim()).collect();
+        for name in names {
+            if pk_tokens.contains(&name.as_str()) {
+                streamling_user_bail!("empty_columns cannot include primary key column '{}'", name);
+            }
+        }
+    }
+
+    // Every name must exist in the schema and be a supported type.
+    let allowed_types = [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::BinaryView,
+    ];
+    for name in names {
+        let field = schema.fields().iter().find(|f| f.name() == name.as_str());
+        let field = match field {
+            Some(f) => f,
+            None => {
+                let available: Vec<&str> = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| f.name() != COLUMN_NAME_OP)
+                    .map(|f| f.name().as_str())
+                    .collect();
+                streamling_user_bail!(
+                    "empty_columns: column '{}' not found in unbounded source \
+                     schema (available columns: {})",
+                    name,
+                    available.join(", ")
+                );
+            }
+        };
+        if !allowed_types.contains(field.data_type()) {
+            streamling_user_bail!(
+                "empty_columns: column '{}' has type {:?} but only string/binary \
+                 columns (Utf8, LargeUtf8, Utf8View, Binary, LargeBinary, BinaryView) \
+                 can be emptied",
+                name,
+                field.data_type()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// An all-empty array (empty string / empty bytes) of exactly `data_type`,
+/// with `len` rows. Supports only the six variable-length string/binary
+/// types validate_empty_columns allows.
+fn empty_array_of_type(
+    data_type: &arrow_schema::DataType,
+    len: usize,
+) -> DataFusionResult<arrow::array::ArrayRef> {
+    use arrow::array::{
+        BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+        StringViewArray,
+    };
+    let arr: arrow::array::ArrayRef = match data_type {
+        DataType::Utf8 => {
+            let vals: Vec<Option<&str>> = (0..len).map(|_| Some("")).collect();
+            Arc::new(StringArray::from(vals))
+        }
+        DataType::LargeUtf8 => {
+            let vals: Vec<Option<&str>> = (0..len).map(|_| Some("")).collect();
+            Arc::new(LargeStringArray::from(vals))
+        }
+        DataType::Utf8View => {
+            let vals: Vec<Option<&str>> = (0..len).map(|_| Some("")).collect();
+            Arc::new(StringViewArray::from(vals))
+        }
+        DataType::Binary => {
+            let vals: Vec<Option<&[u8]>> = (0..len).map(|_| Some(&b""[..])).collect();
+            Arc::new(BinaryArray::from(vals))
+        }
+        DataType::LargeBinary => {
+            let vals: Vec<Option<&[u8]>> = (0..len).map(|_| Some(&b""[..])).collect();
+            Arc::new(LargeBinaryArray::from(vals))
+        }
+        DataType::BinaryView => {
+            let vals: Vec<Option<&[u8]>> = (0..len).map(|_| Some(&b""[..])).collect();
+            Arc::new(BinaryViewArray::from(vals))
+        }
+        _ => {
+            return Err(streamling_err!(
+                "empty_array_of_type: unsupported type {:?} (only string/binary \
+                 types supported)",
+                data_type
+            )
+            .into());
+        }
+    };
+    Ok(arr)
+}
+
 struct ClickHouseSchemaAdapter {
     client: ClickHouseClient,
 }
@@ -1717,7 +1916,9 @@ impl ClickHouseSchemaAdapter {
     fn get_columns(
         &self,
         table_name: &str,
+        database_name: &str,
         target_schema: &SchemaRef,
+        empty_columns: &[String],
     ) -> Result<Vec<String>, DataFusionError> {
         let table_schema = self
             .client
@@ -1748,26 +1949,66 @@ impl ClickHouseSchemaAdapter {
             all_clickhouse_columns
         );
 
+        // When emptying columns, check that none are sorting keys: emptying a
+        // sorting key would corrupt ReplacingMergeTree dedup.
+        if !empty_columns.is_empty() {
+            let sorting_keys = self
+                .client
+                .fetch_sorting_keys(database_name, table_name)
+                .map_err(|e| {
+                    streamling_err!(
+                        "failed to fetch sorting keys from ClickHouse for table '{}': {}",
+                        table_name,
+                        e
+                    )
+                })?;
+            for col in empty_columns {
+                if sorting_keys.iter().any(|k| k == col) {
+                    streamling_user_bail!(
+                        "cannot empty column '{}' because it is a sorting key of \
+                         ClickHouse table '{}' (emptying a sorting key would corrupt \
+                         ReplacingMergeTree dedup)",
+                        col,
+                        table_name
+                    );
+                }
+            }
+        }
+
+        let empty_set: HashSet<&str> = empty_columns.iter().map(|s| s.as_str()).collect();
         let mut columns = Vec::with_capacity(target_schema.fields().len());
         for target_field in target_schema.fields() {
             // Skip _gs_op as it's a virtual column that ClickHouse query builder adds automatically
             if target_field.name() == COLUMN_NAME_OP {
                 continue;
             }
-            let clickhouse_expression = match table_fields.get(target_field.name().as_str()) {
-                Some(table_field) => {
-                    if table_field.data_type() == target_field.data_type() {
-                        format!("`{}`", target_field.name())
-                    } else {
-                        Self::convert_field_type(table_field, target_field)
-                    }
-                }
-                None => {
+            let clickhouse_expression = if empty_set.contains(target_field.name().as_str()) {
+                // The column must still exist in the ClickHouse table so the
+                // schema is consistent; we just don't read its value.
+                if !table_fields.contains_key(target_field.name().as_str()) {
                     streamling_user_bail!(
                         "column '{}' not found in ClickHouse table '{}'",
                         target_field.name(),
                         table_name
                     );
+                }
+                empty_column_expression(target_field)
+            } else {
+                match table_fields.get(target_field.name().as_str()) {
+                    Some(table_field) => {
+                        if table_field.data_type() == target_field.data_type() {
+                            format!("`{}`", target_field.name())
+                        } else {
+                            Self::convert_field_type(table_field, target_field)
+                        }
+                    }
+                    None => {
+                        streamling_user_bail!(
+                            "column '{}' not found in ClickHouse table '{}'",
+                            target_field.name(),
+                            table_name
+                        );
+                    }
                 }
             };
             columns.push(clickhouse_expression);
@@ -3760,6 +4001,280 @@ mod tests {
             .unwrap()
             .expect("first-run recovery must persist default state");
         assert_eq!(persisted.current_phase, 0);
+    }
+
+    // -- empty_columns: validate_empty_columns ---------------------------------
+
+    fn empty_cols_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("data", DataType::Utf8, false),
+            Field::new("blob", DataType::Binary, false),
+            Field::new("big_text", DataType::LargeUtf8, false),
+            Field::new("view_text", DataType::Utf8View, false),
+            Field::new("big_blob", DataType::LargeBinary, false),
+            Field::new("view_blob", DataType::BinaryView, false),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+        ]))
+    }
+
+    #[test]
+    fn test_validate_empty_columns_happy_path() {
+        let schema = empty_cols_schema();
+        let names = vec!["data".to_string(), "blob".to_string()];
+        assert!(validate_empty_columns(&names, &schema, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_columns_unknown_column() {
+        let schema = empty_cols_schema();
+        let names = vec!["nonexistent".to_string()];
+        let result = validate_empty_columns(&names, &schema, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent"));
+        assert!(err.contains("available columns"));
+    }
+
+    #[test]
+    fn test_validate_empty_columns_rejects_gs_op() {
+        let schema = empty_cols_schema();
+        let names = vec![COLUMN_NAME_OP.to_string()];
+        let result = validate_empty_columns(&names, &schema, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("_gs_op"));
+    }
+
+    #[test]
+    fn test_validate_empty_columns_rejects_non_string_type() {
+        let schema = empty_cols_schema();
+        let names = vec!["id".to_string()];
+        let result = validate_empty_columns(&names, &schema, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("id"));
+        assert!(err.contains("Int64"));
+    }
+
+    #[test]
+    fn test_validate_empty_columns_rejects_primary_key() {
+        let schema = empty_cols_schema();
+        // data is a valid Utf8 column, but primary_key "data" must reject it
+        let names = vec!["data".to_string()];
+        let result = validate_empty_columns(&names, &schema, Some("data"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn test_validate_empty_columns_rejects_composite_primary_key_token() {
+        let schema = empty_cols_schema();
+        // "id,data" — data is a valid column but appears in the PK
+        let names = vec!["data".to_string()];
+        let result = validate_empty_columns(&names, &schema, Some("id, data"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn test_validate_empty_columns_rejects_duplicates() {
+        let schema = empty_cols_schema();
+        let names = vec!["data".to_string(), "data".to_string()];
+        let result = validate_empty_columns(&names, &schema, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_validate_empty_columns_empty_slice_ok() {
+        let schema = empty_cols_schema();
+        assert!(validate_empty_columns(&[], &schema, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_columns_all_six_types_ok() {
+        let schema = empty_cols_schema();
+        let names = vec![
+            "data".to_string(),
+            "blob".to_string(),
+            "big_text".to_string(),
+            "view_text".to_string(),
+            "big_blob".to_string(),
+            "view_blob".to_string(),
+        ];
+        assert!(validate_empty_columns(&names, &schema, None).is_ok());
+    }
+
+    // -- empty_columns: empty_array_of_type -------------------------------------
+
+    #[test]
+    fn test_empty_array_of_type_utf8() {
+        let arr = empty_array_of_type(&DataType::Utf8, 3).unwrap();
+        assert_eq!(arr.data_type(), &DataType::Utf8);
+        assert_eq!(arr.len(), 3);
+        let s = arr
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        for i in 0..3 {
+            assert_eq!(s.value(i), "");
+        }
+    }
+
+    #[test]
+    fn test_empty_array_of_type_large_utf8() {
+        let arr = empty_array_of_type(&DataType::LargeUtf8, 2).unwrap();
+        assert_eq!(arr.data_type(), &DataType::LargeUtf8);
+        assert_eq!(arr.len(), 2);
+        let s = arr
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .unwrap();
+        for i in 0..2 {
+            assert_eq!(s.value(i), "");
+        }
+    }
+
+    #[test]
+    fn test_empty_array_of_type_utf8_view() {
+        let arr = empty_array_of_type(&DataType::Utf8View, 4).unwrap();
+        assert_eq!(arr.data_type(), &DataType::Utf8View);
+        assert_eq!(arr.len(), 4);
+        let s = arr
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+            .unwrap();
+        for i in 0..4 {
+            assert_eq!(s.value(i), "");
+        }
+    }
+
+    #[test]
+    fn test_empty_array_of_type_binary() {
+        let arr = empty_array_of_type(&DataType::Binary, 2).unwrap();
+        assert_eq!(arr.data_type(), &DataType::Binary);
+        assert_eq!(arr.len(), 2);
+        let s = arr
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        for i in 0..2 {
+            assert_eq!(s.value(i), &b""[..]);
+        }
+    }
+
+    #[test]
+    fn test_empty_array_of_type_large_binary() {
+        let arr = empty_array_of_type(&DataType::LargeBinary, 2).unwrap();
+        assert_eq!(arr.data_type(), &DataType::LargeBinary);
+        assert_eq!(arr.len(), 2);
+        let s = arr
+            .as_any()
+            .downcast_ref::<arrow::array::LargeBinaryArray>()
+            .unwrap();
+        for i in 0..2 {
+            assert_eq!(s.value(i), &b""[..]);
+        }
+    }
+
+    #[test]
+    fn test_empty_array_of_type_binary_view() {
+        let arr = empty_array_of_type(&DataType::BinaryView, 3).unwrap();
+        assert_eq!(arr.data_type(), &DataType::BinaryView);
+        assert_eq!(arr.len(), 3);
+        let s = arr
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryViewArray>()
+            .unwrap();
+        for i in 0..3 {
+            assert_eq!(s.value(i), &b""[..]);
+        }
+    }
+
+    #[test]
+    fn test_empty_array_of_type_unsupported_errors() {
+        let result = empty_array_of_type(&DataType::Int64, 1);
+        assert!(result.is_err());
+    }
+
+    // -- empty_columns: substitution behavior ------------------------------------
+
+    #[test]
+    fn test_substitution_replaces_empty_column_keeps_others() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        // Simulate the unbounded-phase substitution: empty the "data" column.
+        let empty_indices: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.name() == "data")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(empty_indices, vec![1]);
+
+        let mut columns = batch.columns().to_vec();
+        for &i in &empty_indices {
+            columns[i] =
+                empty_array_of_type(batch.schema().field(i).data_type(), batch.num_rows()).unwrap();
+        }
+        let replaced = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        // id values intact
+        let id_arr = replaced
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_arr.value(0), 1);
+        assert_eq!(id_arr.value(1), 2);
+        assert_eq!(id_arr.value(2), 3);
+
+        // data all empty
+        let data_arr = replaced
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..3 {
+            assert_eq!(data_arr.value(i), "");
+        }
+    }
+
+    // -- empty_columns: empty_column_expression ----------------------------------
+
+    #[test]
+    fn test_empty_column_expression_utf8() {
+        let field = Field::new("data", DataType::Utf8, false);
+        let expr = empty_column_expression(&field);
+        assert_eq!(expr, "CAST('' AS String) AS `data`");
+    }
+
+    #[test]
+    fn test_empty_column_expression_nullable_utf8() {
+        let field = Field::new("data", DataType::Utf8, true);
+        let expr = empty_column_expression(&field);
+        assert_eq!(expr, "CAST('' AS Nullable(String)) AS `data`");
+    }
+
+    #[test]
+    fn test_empty_column_expression_binary() {
+        let field = Field::new("data", DataType::Binary, false);
+        let expr = empty_column_expression(&field);
+        assert_eq!(expr, "CAST('' AS String) AS `data`");
     }
 }
 
