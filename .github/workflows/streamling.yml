@@ -355,11 +355,11 @@ jobs:
           tags: ${{ steps.generate_tags.outputs.tags }}
           provenance: false
 
-  # TEMPORARY: publishes branch images for maestro/auto-cast-data-types-in-source-filters-cc1c3e36 so it
+  # TEMPORARY: publishes branch images for fix/clickhouse-offload-on-auto-cast so it
   # can be deployed for testing. Drop this job before merging to main.
   build-and-push-image-branch:
     needs: [validate-and-test, build-release-main]
-    if: ${{ always() && github.ref_name == 'maestro/auto-cast-data-types-in-source-filters-cc1c3e36' && needs.validate-and-test.result != 'failure' && needs.build-release-main.result == 'success' }}
+    if: ${{ always() && github.ref_name == 'fix/clickhouse-offload-on-auto-cast' && needs.validate-and-test.result != 'failure' && needs.build-release-main.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       id-token: write
@@ -471,11 +471,11 @@ jobs:
           echo "  - $TAG_SHA"
           echo "  - $TAG_LATEST"
 
-  # TEMPORARY: publishes the branch manifest for maestro/auto-cast-data-types-in-source-filters-cc1c3e36.
+  # TEMPORARY: publishes the branch manifest for fix/clickhouse-offload-on-auto-cast.
   # Drop this job before merging to main.
   create-manifest-branch:
     needs: [build-and-push-image-branch]
-    if: ${{ always() && github.ref_name == 'maestro/auto-cast-data-types-in-source-filters-cc1c3e36' && needs.build-and-push-image-branch.result == 'success' }}
+    if: ${{ always() && github.ref_name == 'fix/clickhouse-offload-on-auto-cast' && needs.build-and-push-image-branch.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
