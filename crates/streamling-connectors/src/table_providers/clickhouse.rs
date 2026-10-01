@@ -327,7 +327,8 @@ pub struct ClickHouseTableProvider {
 struct SourceParams {
     query_builder: ClickHouseQueryBuilder,
     sorting_keys: Vec<String>,
-    initial_split_args: Vec<ScalarValue>,
+    /// The split to start from: `start_at`, the saved checkpoint, or empty.
+    initial_split: ClickHouseSourceSplit,
     state_store: Arc<ClickHouseSourceStateStore>,
     datafusion_buffer_size: usize,
     /// Target rows per emitted batch. A page (which dedup coalesces into one
@@ -534,17 +535,23 @@ impl ClickHouseTableProvider {
 
         // A first-key value over the page limits is paged within on the
         // remaining sort keys, read straight from the table so MATERIALIZED
-        // columns and key expressions resolve whatever the scan selects.
+        // columns and key expressions resolve whatever the scan selects. Their
+        // types are table metadata like the sorting keys, so a failed fetch
+        // fails construction rather than leaving a later hot key unpageable.
         let rest_keys = &sorting_keys[1..];
         let in_key_unsupported = match rest_keys {
             [] => in_key::unsupported_reason(rest_keys, &arrow::datatypes::Schema::empty()),
-            _ => match client.fetch_expressions_schema(table_name, rest_keys) {
-                Ok(types) => in_key::unsupported_reason(rest_keys, &types),
-                Err(e) => Some(format!(
-                    "failed to read the types of sorting keys {:?}: {}",
-                    rest_keys, e
-                )),
-            },
+            _ => {
+                let types = client
+                    .fetch_expressions_schema(table_name, rest_keys)
+                    .streamling_with_context(|| {
+                        format!(
+                            "failed to fetch the types of sorting keys {:?} of ClickHouse table {}.{}",
+                            rest_keys, database_name, table_name
+                        )
+                    })?;
+                in_key::unsupported_reason(rest_keys, &types)
+            }
         };
 
         let sort_key_range = sort_key_range_config
@@ -567,14 +574,15 @@ impl ClickHouseTableProvider {
             reference_name: reference_name.clone(),
             state_backend,
         });
-        let (initial_split_args, has_persisted_split) = match start_at {
+        let (initial_split, has_persisted_split) = match start_at {
             Some(mut start_at) => {
                 // A user start_at is an inclusive first-key bound; only the split's
                 // own checkpoints carry an exclusive in-key tuple cursor.
                 if start_at.len() > 1 {
                     warn!(
-                        "[{}] start_at {:?} has more than one value; only the first sorting-key value is used",
-                        reference_name, start_at
+                        "[{}] start_at {:?} has more than one value; the scan starts at the beginning \
+                         of first sorting-key value {:?} and ignores the rest",
+                        reference_name, start_at, start_at[0]
                     );
                     start_at.truncate(1);
                 }
@@ -582,7 +590,12 @@ impl ClickHouseTableProvider {
                     "Starting ClickHouseTableProvider with user-provided start_at: {:?}",
                     start_at
                 );
-                (start_at, false)
+                let split = ClickHouseSourceSplit {
+                    sorting_keys: sorting_keys.clone(),
+                    args: start_at,
+                    in_key_after: Vec::new(),
+                };
+                (split, false)
             }
             None => match block_on(state_store.load_split()) {
                 Some(split) => {
@@ -596,7 +609,7 @@ impl ClickHouseTableProvider {
                             return Err(streamling_err!(
                                 "saved split {:?} resumes within a first-key value, but table {}.{} \
                                  cannot be paged within one: {}",
-                                split.args,
+                                split,
                                 database_name,
                                 table_name,
                                 reason
@@ -604,11 +617,20 @@ impl ClickHouseTableProvider {
                             .into());
                         }
                     }
-                    (split.args, true)
+                    let split = ClickHouseSourceSplit {
+                        sorting_keys: sorting_keys.clone(),
+                        ..split
+                    };
+                    (split, true)
                 }
                 None => {
                     info!("Starting ClickHouseTableProvider from the beginning (no saved split)");
-                    (Vec::new(), false)
+                    let split = ClickHouseSourceSplit {
+                        sorting_keys: sorting_keys.clone(),
+                        args: Vec::new(),
+                        in_key_after: Vec::new(),
+                    };
+                    (split, false)
                 }
             },
         };
@@ -650,7 +672,7 @@ impl ClickHouseTableProvider {
         let source_params = SourceParams {
             query_builder: query_builder.clone(),
             sorting_keys,
-            initial_split_args,
+            initial_split,
             state_store,
             record_batch_size,
             datafusion_buffer_size,
@@ -828,10 +850,7 @@ impl TableProvider for ClickHouseTableProvider {
                 Boundedness::Bounded,
             )),
             provider: (*self).clone(),
-            split: ClickHouseSourceSplit {
-                sorting_keys: source_params.sorting_keys.clone(),
-                args: source_params.initial_split_args.clone(),
-            },
+            split: source_params.initial_split.clone(),
         });
         Ok(clickhouse_source_exec)
     }
@@ -1458,10 +1477,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .expect("sorting keys must not be empty");
         let rest_keys: Vec<String> = self.split.sorting_keys[1..].to_vec();
         let in_key_unsupported = source_params.in_key_unsupported.clone();
-        let split = Arc::new(Mutex::new(ClickHouseSourceSplit {
-            sorting_keys: self.split.sorting_keys.clone(),
-            args: self.split.args.clone(),
-        }));
+        let split = Arc::new(Mutex::new(self.split.clone()));
         let state_store = source_params.state_store.clone();
         // Version-aware dedup (inferred from engine_full in new_source). The
         // dedup key is the table's full ORDER BY, so all duplicate versions of a
@@ -3576,13 +3592,18 @@ mod tests {
         assert_eq!(delete_indices, vec![0, 1]);
     }
 
+    /// A split of the first two sorting keys holding `args`.
+    fn split_of(args: Vec<ScalarValue>) -> ClickHouseSourceSplit {
+        ClickHouseSourceSplit {
+            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
+            args,
+            in_key_after: Vec::new(),
+        }
+    }
+
     #[test]
     fn split_range_start_reads_first_sorting_key() {
-        // New-format checkpoint stores [range_start].
-        let split = ClickHouseSourceSplit {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            args: vec![ScalarValue::Int64(Some(1000))],
-        };
+        let split = split_of(vec![ScalarValue::Int64(Some(1000))]);
         assert_eq!(split.range_start(), Some(1000));
     }
 
@@ -3783,10 +3804,7 @@ mod tests {
 
     #[test]
     fn split_mid_key_checkpoint_resumes_after_its_tuple() {
-        let mut split = ClickHouseSourceSplit {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            args: vec![],
-        };
+        let mut split = split_of(vec![]);
         let cursor = vec![ScalarValue::Utf8(Some("50".to_string()))];
         split.resume_after_tuple(ScalarValue::Int64(Some(1000)), cursor.clone());
         assert_eq!(split.range_start(), Some(1000));
@@ -3798,36 +3816,48 @@ mod tests {
     }
 
     #[test]
+    fn split_extra_args_are_not_an_in_key_cursor() {
+        // A keyset-era checkpoint, or a multi-value start_at saved before the
+        // first page, stores more than the first sorting-key value in `args`.
+        // Both resume at the start of that whole first-key value.
+        for json in [
+            r#"{"sorting_keys":["block_number","id"],"args":[{"value":1000,"data_type":"Int64"},{"value":50,"data_type":"Int64"}]}"#,
+            r#"{"sorting_keys":["block_number","id"],"args":[{"value":"1000","data_type":"Utf8"},{"value":"50","data_type":"Utf8"}]}"#,
+        ] {
+            let split: ClickHouseSourceSplit = serde_json::from_str(json).unwrap();
+            assert_eq!(split.range_start(), Some(1000), "{json}");
+            assert_eq!(split.in_key_cursor(), None, "{json}");
+        }
+    }
+
+    #[test]
     fn split_first_key_boundary_has_no_in_key_cursor() {
-        let split = ClickHouseSourceSplit {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            args: vec![ScalarValue::Int64(Some(1000))],
-        };
+        let split = split_of(vec![ScalarValue::Int64(Some(1000))]);
         assert_eq!(split.in_key_cursor(), None);
+        // A boundary checkpoint stores no cursor field at all.
+        let json = serde_json::to_string(&split).unwrap();
+        assert!(!json.contains("in_key_after"), "{json}");
     }
 
     #[test]
     fn split_in_key_cursor_survives_json_round_trip() {
-        let split = ClickHouseSourceSplit {
-            sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-            args: vec![
-                ScalarValue::UInt64(Some(22_270_037)),
+        let mut split = split_of(vec![]);
+        split.resume_after_tuple(
+            ScalarValue::UInt64(Some(22_270_037)),
+            vec![
                 ScalarValue::Utf8(Some("0xabc_1".to_string())),
                 ScalarValue::Utf8(None),
             ],
-        };
+        );
         let json = serde_json::to_string(&split).unwrap();
         let back: ClickHouseSourceSplit = serde_json::from_str(&json).unwrap();
         assert_eq!(back.args, split.args);
+        assert_eq!(back.in_key_cursor(), split.in_key_cursor());
     }
 
     #[test]
     fn split_range_start_empty_is_none() {
-        let split = ClickHouseSourceSplit {
-            sorting_keys: vec![],
-            args: vec![],
-        };
-        assert_eq!(split.range_start(), None);
+        assert_eq!(split_of(vec![]).range_start(), None);
     }
 
     #[test]
@@ -5040,15 +5070,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_seeds_exec_split_with_initial_start_args() {
+    async fn test_scan_seeds_exec_split_with_initial_split() {
         use datafusion::execution::context::SessionContext;
         use streamling_state::StateOperatorBackendFactory;
         use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
 
-        let initial_split_args = vec![
+        let mut initial_split = split_of(vec![]);
+        initial_split.resume_after_tuple(
             ScalarValue::Int64(Some(44_608_123)),
-            ScalarValue::Utf8(Some("log_abc_194".to_string())),
-        ];
+            vec![ScalarValue::Utf8(Some("log_abc_194".to_string()))],
+        );
 
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: vec!["block_number".to_string(), "id".to_string()],
@@ -5085,7 +5116,7 @@ mod tests {
             source_params: Some(SourceParams {
                 query_builder,
                 sorting_keys: vec!["block_number".to_string(), "id".to_string()],
-                initial_split_args: initial_split_args.clone(),
+                initial_split: initial_split.clone(),
                 state_store,
                 datafusion_buffer_size: 16,
                 record_batch_size: 1000,
@@ -5113,8 +5144,9 @@ mod tests {
             .expect("scan should return ClickHouseSourceExec");
 
         assert_eq!(
-            source_exec.split.args, initial_split_args,
-            "scan should seed execution split with initial start args"
+            (&source_exec.split.args, source_exec.split.in_key_cursor()),
+            (&initial_split.args, initial_split.in_key_cursor()),
+            "scan should seed the execution split with the initial split"
         );
     }
 
@@ -5619,26 +5651,35 @@ pub struct ClickHouseSourceSplit {
     pub sorting_keys: Vec<String>,
     #[serde(with = "streamling_core::serde::arrow_scalar_value")]
     pub args: Vec<ScalarValue>,
+    /// See [`Self::in_key_cursor`]; empty at a first-key boundary.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "streamling_core::serde::arrow_scalar_value"
+    )]
+    pub in_key_after: Vec<ScalarValue>,
 }
 
 impl ClickHouseSourceSplit {
     /// Checkpoint at a first-key boundary: resume at `key`.
     fn resume_at_key(&mut self, key: ScalarValue) {
         self.args = vec![key];
+        self.in_key_after.clear();
     }
 
     /// Checkpoint while paging within first-key value `key`: resume strictly
     /// after the remaining sort-key tuple `cursor`.
     fn resume_after_tuple(&mut self, key: ScalarValue, cursor: Vec<ScalarValue>) {
-        self.args = std::iter::once(key).chain(cursor).collect();
+        self.args = vec![key];
+        self.in_key_after = cursor;
     }
 
     /// The first sorting-key value to resume scanning from, or `None` if no cursor
     /// has been persisted yet.
     ///
-    /// `args` is `[range_start]` at a first-key boundary, or the full last
-    /// emitted sort-key tuple `[k0, k1, ...]` while paging within the single
-    /// first-key value `k0` (see [`Self::in_key_cursor`]).
+    /// Only `args[0]` is read: a keyset-era checkpoint or a multi-value
+    /// `start_at` holds more values, and those resume at the start of the whole
+    /// first-key value `args[0]`.
     pub fn range_start(&self) -> Option<i128> {
         self.args.first().and_then(scalar_to_i128)
     }
@@ -5648,7 +5689,7 @@ impl ClickHouseSourceSplit {
     /// paging within first-key value `args[0]`; the scan resumes strictly after
     /// `(k0, k1, ...)`. `None` at a first-key boundary.
     pub fn in_key_cursor(&self) -> Option<Vec<ScalarValue>> {
-        (self.args.len() > 1).then(|| self.args[1..].to_vec())
+        (!self.in_key_after.is_empty()).then(|| self.in_key_after.clone())
     }
 }
 

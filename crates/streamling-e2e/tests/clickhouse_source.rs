@@ -892,12 +892,12 @@ sinks:
     };
     let cursor_len = ctx
         .postgres
-        .count(&split_query("jsonb_array_length(data->'args')"))
+        .count(&split_query("jsonb_array_length(data->'in_key_after')"))
         .await
-        .expect("run 1 must persist a ClickHouse source checkpoint");
+        .expect("run 1 must persist a mid-key ClickHouse source checkpoint");
     assert_eq!(
-        cursor_len, 2,
-        "a mid-hot-key checkpoint must carry the full (block_number, id) cursor"
+        cursor_len, 1,
+        "a mid-hot-key checkpoint must carry the remaining (id) cursor"
     );
     let cursor_block = ctx
         .postgres
@@ -906,7 +906,7 @@ sinks:
         .unwrap();
     let cursor_id = ctx
         .postgres
-        .count(&split_query("data->'args'->1->>'value'"))
+        .count(&split_query("data->'in_key_after'->0->>'value'"))
         .await
         .unwrap();
     assert_eq!(cursor_block, 7, "cursor must sit inside the hot block");
@@ -1113,7 +1113,7 @@ sinks:
     if checkpoint_count > 0 {
         let min_block_2: Vec<(i64,)> = ctx
             .postgres
-            .query("SELECT MIN(block_number) FROM public.sparse_ckpt_run2")
+            .query("SELECT MIN(block_number)::bigint FROM public.sparse_ckpt_run2")
             .await
             .expect("Failed to query min block_number");
 
