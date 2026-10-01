@@ -145,14 +145,12 @@ pub fn init_telemetry_provider(
 
         Ok(provider)
     } else {
-        // Prod/default: use resource-level instance id
-        let resource = Resource::builder()
-            .with_service_name("streamling")
-            .with_attribute(KeyValue::new(
-                "service.instance.id",
-                service_instance_id.to_string(),
-            ))
-            .build();
+        let resource = metric_resource(
+            service_instance_id,
+            std::env::var("POD_NAME")
+                .ok()
+                .filter(|name| !name.is_empty()),
+        );
 
         // Build cumulative reader
         let reader = build_periodic_reader_exporter(
@@ -191,6 +189,18 @@ pub fn init_telemetry_provider(
 
         Ok(provider)
     }
+}
+fn metric_resource(service_instance_id: &str, pod_name: Option<String>) -> Resource {
+    let mut resource = Resource::builder()
+        .with_service_name("streamling")
+        .with_attribute(KeyValue::new(
+            "service.instance.id",
+            service_instance_id.to_string(),
+        ));
+    if let Some(pod_name) = pod_name {
+        resource = resource.with_attribute(KeyValue::new("k8s.pod.name", pod_name));
+    }
+    resource.build()
 }
 
 /// Flush and shut down the delta meter provider. Must be called on process
@@ -411,6 +421,25 @@ pub fn get_delta_meter() -> opentelemetry::metrics::Meter {
 mod tests {
     use super::*;
     use opentelemetry_sdk::metrics::InMemoryMetricExporterBuilder;
+    #[test]
+    fn pod_resource_distinguishes_replicas_without_changing_pipeline_identity() {
+        let first = metric_resource("pipeline", Some("pipeline-pod-a".to_string()));
+        let second = metric_resource("pipeline", Some("pipeline-pod-b".to_string()));
+        for resource in [&first, &second] {
+            assert_eq!(
+                resource.get(&opentelemetry::Key::new("service.instance.id")),
+                Some(opentelemetry::Value::from("pipeline"))
+            );
+        }
+        assert_eq!(
+            first.get(&opentelemetry::Key::new("k8s.pod.name")),
+            Some(opentelemetry::Value::from("pipeline-pod-a"))
+        );
+        assert_eq!(
+            second.get(&opentelemetry::Key::new("k8s.pod.name")),
+            Some(opentelemetry::Value::from("pipeline-pod-b"))
+        );
+    }
 
     /// Regression test for short-lived jobs losing billing counts: delta
     /// measurements recorded after the last PeriodicReader tick must still be
