@@ -601,6 +601,12 @@ Note: `script` field accepts any valid **browser** JavaScript or TypeScript snip
 single `input` argument. The input record is passed as `input` argument, and the transformed record must be returned
 from the function.
 
+**Batching**: `batch_size` accumulates that many rows per execution stream before invoking the script, and
+`batch_flush_interval` (e.g. `1s`) caps how long a partially filled batch waits before the script is invoked anyway.
+With `batch_size` set and no interval given, it defaults to `1s` — that default is specific to `script` transforms;
+`handler` and `plugin` transforms leave the interval unset. Omit `batch_size` to invoke the script on each
+upstream batch as it arrives, with no accumulator in between.
+
 ### Sinks
 
 All sinks are implemented as custom DataFusion Table Providers (`TableProvider`) returning a `DataSinkExec`. Sinks
@@ -1008,8 +1014,9 @@ transforms:
 
 The cache is off by default and is used only when both settings are present. The initial lookup
 loads the full table through bounded PostgreSQL cursor pages. Each later `dynamic_table_check`
-batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Index the time
-column so these checks and range reads stay cheap.
+batch reads `MAX(time_column)` and appends only rows newer than the cached maximum. Streamling
+creates an index on the time column for tables it creates; add that index manually only for
+pre-existing tables Streamling did not create.
 
 Configs that omit the setting entirely — including ones written before it existed — get the
 built-in 1000ms default on upgrade. Set `cache_refresh_debounce_ms: 0` (globally or per
