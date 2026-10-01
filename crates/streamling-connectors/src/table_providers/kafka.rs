@@ -278,6 +278,8 @@ impl Drop for SafeKafkaProducers {
 pub struct TopicPartitionOffset {
     pub offset: i64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub message_timestamp_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +315,7 @@ impl From<KafkaTopicPartitionList> for TopicPartitionList {
                 offset: TopicPartitionOffset {
                     offset: topic_partition.offset().to_raw().unwrap(),
                     updated_at: now,
+                    message_timestamp_ms: None,
                 },
             })
             .collect();
@@ -817,6 +820,7 @@ impl KafkaSourceExec {
         reference_name: &str,
         consumer_offsets: &mut BTreeMap<CheckpointEpoch, KafkaTopicPartitionList>,
         committed_offsets: &mut Option<KafkaTopicPartitionList>,
+        message_timestamps: &mut BTreeMap<CheckpointEpoch, HashMap<i32, i64>>,
         epoch: &CheckpointEpoch,
         // Hard bound on the state-backend persistence await (see the timeout
         // at the put_many below). The terminal caller sizes this from its
@@ -903,13 +907,19 @@ impl KafkaSourceExec {
                         // entries are emitted at trace! level so a topic with
                         // many partitions doesn't dump N debug lines here.
                         let puts_started = std::time::Instant::now();
+                        let timestamps = message_timestamps.get(epoch);
                         let topic_partition_list = TopicPartitionList::from(position.clone());
                         let partition_count = topic_partition_list.topic_partitions.len();
                         let entries: Vec<_> = topic_partition_list
                             .topic_partitions
                             .into_iter()
-                            .map(|topic_partition| {
+                            .map(|mut topic_partition| {
                                 trace!("Saving position to state backend: {:?}", topic_partition);
+                                topic_partition.offset.message_timestamp_ms = timestamps
+                                    .and_then(|timestamps| {
+                                        timestamps.get(&topic_partition.partition)
+                                    })
+                                    .copied();
                                 (
                                     topic_partition.state_key(reference_name.to_string()).into(),
                                     topic_partition.offset,
@@ -1016,6 +1026,17 @@ impl KafkaSourceExec {
                         );
 
                         *committed_offsets = Some(position.clone());
+                        for tp in position.elements() {
+                            if let Some(offset) = tp.offset().to_raw() {
+                                info!(
+                                    "Kafka source '{}' committed partition {} at offset {} (epoch {})",
+                                    reference_name,
+                                    tp.partition(),
+                                    offset,
+                                    epoch.0
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Failed to commit position {:?}: {}", position, e);
@@ -1027,6 +1048,7 @@ impl KafkaSourceExec {
             }
         }
 
+        message_timestamps.remove(epoch);
         consumer_offsets.remove(epoch);
         Ok(!broker_commit_failed)
     }
@@ -1210,14 +1232,18 @@ impl KafkaSourceExec {
         state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
         reference_name: String,
         topic_partition_list: KafkaTopicPartitionList,
-    ) -> KafkaTopicPartitionList {
+    ) -> (KafkaTopicPartitionList, HashMap<i32, i64>) {
         let mut state_topic_partition_list = KafkaTopicPartitionList::new();
+        let mut timestamps = HashMap::new();
 
         for topic_partition in TopicPartitionList::from(topic_partition_list).topic_partitions {
             let state_key = StateKey::from(topic_partition.state_key(reference_name.clone()));
             let topic_partition_state = state_backend.get(state_key).await.unwrap();
 
             if let Some(state) = topic_partition_state {
+                if let Some(timestamp) = state.message_timestamp_ms {
+                    timestamps.insert(topic_partition.partition, timestamp);
+                }
                 state_topic_partition_list
                     .add_partition_offset(
                         &topic_partition.topic,
@@ -1228,7 +1254,7 @@ impl KafkaSourceExec {
             }
         }
 
-        state_topic_partition_list
+        (state_topic_partition_list, timestamps)
     }
 }
 
@@ -1360,7 +1386,7 @@ impl KafkaSourceWatchdogState {
 async fn calculate_lag_task(
     reference_name: String,
     metric_metadata_id: String,
-    kafka_topic_partition_list: KafkaTopicPartitionList,
+    topic: String,
     consumer: SafeKafkaConsumer,
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
     metrics_recorder: Arc<MetricsRecorder>,
@@ -1419,51 +1445,69 @@ async fn calculate_lag_task(
             _ = interval.tick() => {
                 trace!("Calculating lag for reference_name: {}", reference_name);
                 let mut lag_results = Vec::new();
-        let topic_partition_list = TopicPartitionList::from(kafka_topic_partition_list.clone());
-
+        let partitions: Vec<i32> = {
+            let metadata = match consumer.fetch_metadata(Some(&topic), Duration::from_secs(5)) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    warn!("Failed to fetch Kafka partitions for topic '{}': {}", topic, e);
+                    continue;
+                }
+            };
+            metadata.topics().iter().flat_map(|t| t.partitions()).map(|p| p.id()).collect()
+        };
         let mut max_lag: Option<i64> = None;
-
-        for topic_partition in topic_partition_list.topic_partitions {
+        for partition_id in partitions {
             // Add yield point for better cancellation responsiveness
             tokio::task::yield_now().await;
 
             trace!(
                 "Calculating lag for reference_name: {}, topic: {}, partition: {}",
-                reference_name, topic_partition.topic, topic_partition.partition
+                reference_name, topic, partition_id
             );
             let (_, high_watermark) = match consumer.fetch_watermarks(
-                &topic_partition.topic,
-                topic_partition.partition,
+                &topic,
+                partition_id,
                 Duration::from_secs(5),
             ) {
                 Ok(watermarks) => watermarks,
                 Err(e) => {
                     error!(
                         "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
-                        topic_partition.topic, topic_partition.partition, e
+                        topic, partition_id, e
                     );
                     continue;
                 }
             };
 
-            let state_key = StateKey::from(topic_partition.state_key(reference_name.to_string()));
-            let tail_at = match state_backend.get(state_key).await {
-                Ok(Some(offset_state)) => offset_state.offset,
-                Ok(None) => {
-                    trace!(
-                        "No offset found in state backend for topic: {}, partition {}; fallback to 0",
-                        topic_partition.topic, topic_partition.partition
-                    );
-                    0
-                }
+            let state_key = StateKey::from(format!("{}:{}:{}", reference_name, topic, partition_id));
+            let offset_state = match state_backend.get(state_key).await {
+                Ok(state) => state,
                 Err(_) => {
                     error!(
                         "Failed to fetch offsets from state backend for topic: {}, partition {}, lag metric will not be reported",
-                        topic_partition.topic, topic_partition.partition,
+                        topic, partition_id,
                     );
                     continue;
                 }
             };
+            let tail_at = offset_state.as_ref().map_or(0, |state| state.offset);
+            let partition = partition_id.to_string();
+            let tags = || vec![("partition", partition.as_str())];
+            metrics_recorder.record_gauge_w_tags(
+                "kafka_consumer_committed_offset", tail_at.max(0) as u64,
+                tags(), &metric_metadata_id,
+            );
+            metrics_recorder.record_gauge_w_tags(
+                "kafka_consumer_high_watermark", high_watermark.max(0) as u64,
+                tags(), &metric_metadata_id,
+            );
+            if let Some(timestamp) = offset_state.and_then(|state| state.message_timestamp_ms) {
+                let age = (now_ms() as i64 - timestamp).max(0) as u64 / 1000;
+                metrics_recorder.record_gauge_w_tags(
+                    "kafka_consumer_committed_message_age_seconds", age,
+                    tags(), &metric_metadata_id,
+                );
+            }
 
             let partition_lag = (high_watermark - tail_at).max(0);
             max_lag = Some(max_lag.unwrap_or(0).max(partition_lag));
@@ -1476,7 +1520,7 @@ async fn calculate_lag_task(
                 tail_at: tail_at as u64,
                 tags: vec![(
                     String::from("partition"),
-                    topic_partition.partition.to_string(),
+                    partition_id.to_string(),
                 )],
             });
         }
@@ -1572,6 +1616,8 @@ impl ExecutionPlan for KafkaSourceExec {
             BTreeMap::new();
         // local cache for the state backend
         let mut committed_offsets: Option<KafkaTopicPartitionList> = None;
+        let mut message_timestamps: BTreeMap<CheckpointEpoch, HashMap<i32, i64>> = BTreeMap::new();
+        let mut latest_message_timestamps: HashMap<i32, i64> = HashMap::new();
 
         let mut converter = match &self.decoding {
             KafkaSourceDecoding::Avro(avro) => {
@@ -1727,7 +1773,7 @@ impl ExecutionPlan for KafkaSourceExec {
                 let lag_task = calculate_lag_task(
                     reference_name.clone(),
                     metric_metadata_id.clone(),
-                    kafka_topic_partition_list.clone(),
+                    topic.clone(),
                     lag_consumer,
                     state_backend.clone(),
                     metrics_recorder.clone(),
@@ -1738,11 +1784,13 @@ impl ExecutionPlan for KafkaSourceExec {
                 );
                 scope.spawn(lag_task);
             }
-            let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
-                state_backend.clone(),
-                reference_name.clone(),
-                kafka_topic_partition_list,
-            ).await;
+            let (kafka_topic_partition_list_to_seek, persisted_timestamps) =
+                Self::find_offsets_in_state_backend(
+                    state_backend.clone(),
+                    reference_name.clone(),
+                    kafka_topic_partition_list,
+                ).await;
+            latest_message_timestamps.extend(persisted_timestamps);
 
             if kafka_topic_partition_list_to_seek.count() > 0 {
                 // One info! summary so the multi-partition case doesn't dump
@@ -1922,6 +1970,9 @@ impl ExecutionPlan for KafkaSourceExec {
                                     }
 
                                     converter.decode_and_buffer(&message).await?;
+                                    if let Some(timestamp) = message.timestamp().to_millis() {
+                                        latest_message_timestamps.insert(message.partition(), timestamp);
+                                    }
                                     watchdog.on_record();
                                     batch_row_count += 1;
                                     metrics_recorder.record_count("input_rows", 1, metric_metadata_id.as_str());
@@ -1998,6 +2049,7 @@ impl ExecutionPlan for KafkaSourceExec {
                                 Ok(position) => {
                                     debug!("Current position: {:?}", position);
                                     consumer_offsets.insert(epoch.clone(), position);
+                                    message_timestamps.insert(epoch.clone(), latest_message_timestamps.clone());
                                 }
                                 Err(e) => {
                                     error!("Failed to get current position: {}", e);
@@ -2023,6 +2075,7 @@ impl ExecutionPlan for KafkaSourceExec {
                                 &reference_name,
                                 &mut consumer_offsets,
                                 &mut committed_offsets,
+                                &mut message_timestamps,
                                 &epoch,
                                 Duration::from_secs(60),
                             ).await?;
@@ -2065,6 +2118,7 @@ impl ExecutionPlan for KafkaSourceExec {
                     match consumer.position() {
                         Ok(position) => {
                             consumer_offsets.insert(terminal.clone(), position);
+                            message_timestamps.insert(terminal.clone(), latest_message_timestamps.clone());
                         }
                         Err(e) => {
                             // Without a recorded position the finalize below
@@ -2144,6 +2198,7 @@ impl ExecutionPlan for KafkaSourceExec {
                         &reference_name,
                         &mut consumer_offsets,
                         &mut committed_offsets,
+                        &mut message_timestamps,
                         &terminal,
                         commit_timeout,
                     )
@@ -2503,6 +2558,7 @@ impl KafkaSourceTableProvider {
             let offset_state = TopicPartitionOffset {
                 offset: *offset as i64,
                 updated_at: now,
+                message_timestamp_ms: None,
             };
             self.state_backend
                 .put(state_key, offset_state)
@@ -3633,6 +3689,21 @@ impl TableProvider for KafkaSinkTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_offset_timestamps_remain_compatible_with_old_state() {
+        let old: TopicPartitionOffset =
+            serde_json::from_str(r#"{"offset":42,"updated_at":100}"#).unwrap();
+        assert_eq!(old.message_timestamp_ms, None);
+
+        let new = TopicPartitionOffset {
+            message_timestamp_ms: Some(1_700_000_000_000),
+            ..old
+        };
+        let restored: TopicPartitionOffset =
+            serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(restored, new);
+    }
 
     /// A topology-level source `filter:` is defined against the source's full
     /// payload schema. When the engine pushes a scan projection that prunes a

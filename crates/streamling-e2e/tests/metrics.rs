@@ -523,6 +523,36 @@ sinks:
         "Kafka consumer lag gauge should report 0 after consuming all records (query: {})",
         query
     );
+
+    for (metric, expected) in [
+        ("committed_offset", total_records as f64),
+        ("high_watermark", total_records as f64),
+    ] {
+        let query = format!(
+            "streamling_kafka_consumer_{}{{id=\"kafka_source\",instance=\"{}\",partition=\"0\"}}",
+            metric, ctx.test_id
+        );
+        assert_eq!(
+            prometheus
+                .query(&query)
+                .await
+                .expect("Failed to query position metric"),
+            Some(expected),
+            "Kafka partition position gauge: {query}"
+        );
+    }
+    let age_query = format!(
+        "streamling_kafka_consumer_committed_message_age_seconds{{id=\"kafka_source\",instance=\"{}\",partition=\"0\"}}",
+        ctx.test_id
+    );
+    assert!(
+        prometheus
+            .query(&age_query)
+            .await
+            .expect("Failed to query committed message age")
+            .is_some(),
+        "Kafka checkpoint should expose the committed message timestamp: {age_query}"
+    );
 }
 
 // =====================================================================
