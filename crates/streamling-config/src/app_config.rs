@@ -491,10 +491,12 @@ pub struct ClickHouseSourceConfig {
     #[serde(flatten)]
     pub connection: ClickHouseConfig,
     pub page_size: Option<usize>,
-    /// Range of the first sorting key (e.g. block_number) to scan per query batch.
-    /// Limits scan width to prevent timeouts on large tables. Automatically halved on timeout.
-    /// Only applies when the first sorting key is a numeric type.
-    /// Default: 1,000,000
+    /// Width of the first range on the first sorting key (e.g. block_number)
+    /// that the source reads. When set, the scan starts at this width and skips
+    /// the up-front row-count probe. After the first page the width adapts to
+    /// `page_size`, query time, and page bytes. When unset, the first width is
+    /// sized from a row-count probe to about `page_size` rows. Values below 100
+    /// are raised to 100. Only applies when the first sorting key is a numeric type.
     #[serde(alias = "block_range")]
     pub sort_key_range: Option<i64>,
 }

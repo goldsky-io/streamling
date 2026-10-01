@@ -109,6 +109,39 @@ fn i128_to_scalar_like(value: i128, template: &ScalarValue) -> ScalarValue {
     }
 }
 
+/// Width of the first range. A configured `sort_key_range` is used as is
+/// (RangeController clamps it into [MIN_WIDTH, max_width]), ignoring
+/// `probed_count`. Otherwise `probed_count` drives the choice: `None` (the
+/// count probe failed or timed out) starts at `MIN_SORT_KEY_RANGE` — a failed
+/// probe usually means the span holds a lot of data, so start small and let
+/// RangeController grow the width; `Some(0)` (the probed window held no rows)
+/// jumps the full `probe_span`, skipping straight over it; `Some(count)`
+/// sizes the range to about `page_size` rows from the density observed over
+/// `probe_span`, capped at `probe_span * RangeController::grow_ceiling()`: the
+/// first range grows at most `grow_ceiling` times past the counted window, the
+/// same limit as per-page growth, so a sparse window can't start the scan at
+/// the whole remaining span.
+fn initial_range_width(
+    sort_key_range: Option<i64>,
+    probed_count: Option<u64>,
+    probe_span: i128,
+    page_size: usize,
+) -> i128 {
+    match sort_key_range {
+        Some(width) => width as i128,
+        None => match probed_count {
+            None => ClickHouseTableProvider::MIN_SORT_KEY_RANGE as i128,
+            Some(0) => probe_span,
+            Some(count) => {
+                let density = count as f64 / probe_span as f64;
+                let width = (page_size as f64 / density)
+                    .min(probe_span as f64 * RangeController::grow_ceiling());
+                width as i128
+            }
+        },
+    }
+}
+
 fn is_timeout_error(error: &DataFusionError) -> bool {
     let error_msg = error.to_string().to_lowercase();
     error_msg.contains("timeout") || error_msg.contains("timed out")
@@ -332,7 +365,7 @@ struct SourceParams {
     /// operators see `record_batch_size`-bounded batches, matching the Kafka
     /// source. Mirrors the global `AppConfig::record_batch_size`.
     record_batch_size: usize,
-    sort_key_range: i64,
+    sort_key_range: Option<i64>,
     table_name: String,
     has_persisted_split: bool,
     /// Inferred ReplacingMergeTree version column. When `Some`, each fully-read
@@ -523,12 +556,10 @@ impl ClickHouseTableProvider {
             .into());
         }
 
-        let sort_key_range = sort_key_range_config
-            .map(|br| br.max(Self::MIN_SORT_KEY_RANGE))
-            .unwrap_or(Self::DEFAULT_SORT_KEY_RANGE);
+        let sort_key_range = sort_key_range_config.map(|br| br.max(Self::MIN_SORT_KEY_RANGE));
 
         info!(
-            "[{}] sort key range pagination configured (sort_key_range={}, page_size={})",
+            "[{}] sort key range pagination configured (sort_key_range={:?}, page_size={})",
             reference_name, sort_key_range, page_size
         );
 
@@ -1428,7 +1459,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .pagination_config()
             .expect("pagination config must be set")
             .page_size;
-        let default_sort_key_range = source_params.sort_key_range;
+        let sort_key_range = source_params.sort_key_range;
         let table_name_for_exec = source_params.table_name.clone();
         let record_batch_size = source_params.record_batch_size;
         let first_sorting_key_name = self
@@ -1543,12 +1574,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
             };
             let template = i128_to_scalar_like(0, &max_val);
 
-            let default_sort_key_range = default_sort_key_range as i128;
             // Let width grow well past the default for sparse filters: cap at the
             // remaining span so an ultra-sparse table can be covered in few queries.
             // The page_size + 1 tripwire still shrinks a too-dense range. The lower
             // floor (one key) lives in RangeController; see RangeController::MIN_WIDTH.
-            let max_width = (max_key - range_start).max(default_sort_key_range);
+            let max_width = (max_key - range_start)
+                .max(sort_key_range.unwrap_or(ClickHouseTableProvider::DEFAULT_SORT_KEY_RANGE) as i128);
 
             let source_query_timeout =
                 Duration::from_secs(ClickHouseTableProvider::source_query_timeout_secs());
@@ -1556,33 +1587,35 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let soft_time_budget = source_query_timeout / 2;
 
             // Up-front count probe: size the first range to ~page_size rows from the
-            // observed density over the remaining span. A probe failure is non-fatal —
-            // fall back to the widest range and let the controller adapt.
+            // density observed over a bounded window of up to DEFAULT_SORT_KEY_RANGE
+            // keys from the cursor, not the whole remaining span. A probe failure is
+            // non-fatal — start at the smallest range and let the controller grow it.
+            // Skipped when sort_key_range is configured, since that value already
+            // fixes the first range's width.
             let where_clause_for_exec = query_builder.where_clause().map(|s| s.to_string());
             let scan_span = (max_key - range_start + 1).max(1);
-            let total_count = match client
-                .fetch_count(
-                    &table_name_for_exec,
-                    where_clause_for_exec.as_deref(),
-                    Some(range_start),
-                    None,
-                    &first_sorting_key_name,
-                )
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("[{}] count probe failed ({}); using widest initial range", reference_name, e);
-                    0
-                }
+            let probe_span = scan_span.min(ClickHouseTableProvider::DEFAULT_SORT_KEY_RANGE as i128);
+            let probed_count = match sort_key_range {
+                Some(_) => None,
+                None => match client
+                    .fetch_count(
+                        &table_name_for_exec,
+                        where_clause_for_exec.as_deref(),
+                        Some(range_start),
+                        Some(range_start + probe_span),
+                        &first_sorting_key_name,
+                    )
+                    .await
+                {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!("[{}] count probe failed ({}); starting at the smallest range", reference_name, e);
+                        None
+                    }
+                },
             };
-            let initial_width = if total_count == 0 {
-                max_width
-            } else {
-                // RangeController clamps this into [MIN_WIDTH, max_width].
-                let density = total_count as f64 / scan_span as f64;
-                (page_size as f64 / density) as i128
-            };
+            let initial_width =
+                initial_range_width(sort_key_range, probed_count, probe_span, page_size);
 
             let mut controller = RangeController::new(
                 page_size as u64,
@@ -1594,8 +1627,8 @@ impl ExecutionPlan for ClickHouseSourceExec {
                 soft_time_budget,
             );
             info!(
-                "[{}] adaptive range pagination (max_key={}, start={}, count={}, initial_width={}, page_size={})",
-                reference_name, max_key, range_start, total_count, controller.width(), page_size
+                "[{}] adaptive range pagination (max_key={}, start={}, count={:?}, probe_span={}, initial_width={}, page_size={}, sort_key_range={:?})",
+                reference_name, max_key, range_start, probed_count, probe_span, controller.width(), page_size, sort_key_range
             );
 
             let mut page_count = 0;
@@ -2513,6 +2546,10 @@ impl ClickHouseClient {
     /// from the *true* density in one step (both bounds — the overflowing
     /// range). Carries no ORDER BY, so a matching projection serves it cheaply;
     /// a slow probe is itself a signal that the filter is scan-bound.
+    ///
+    /// Bounded by the source query timeout (`ClickHouseTableProvider::source_query_timeout_secs()`)
+    /// rather than `send_query`'s longer HTTP timeout, so a stuck count probe fails
+    /// fast instead of blocking pagination for minutes.
     pub async fn fetch_count(
         &self,
         table_name: &str,
@@ -2540,10 +2577,16 @@ impl ClickHouseClient {
             "SELECT count() FROM {}{} FORMAT Arrow",
             table_name, where_sql
         );
-        let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
-        let response_bytes = self
-            .process_http_response(response_result, query.as_str(), "count")
-            .await?;
+        let timeout_secs = ClickHouseTableProvider::source_query_timeout_secs();
+        let response_bytes = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+            self.process_http_response(response_result, query.as_str(), "count")
+                .await
+        })
+        .await
+        .map_err(|_elapsed| {
+            streamling_err!("ClickHouse count query timed out after {}s", timeout_secs)
+        })??;
 
         let mut reader = self.create_arrow_reader(response_bytes, &query)?;
         let batch = reader
@@ -3474,6 +3517,41 @@ mod tests {
             args: vec![ScalarValue::Int64(Some(1000))],
         };
         assert_eq!(split.range_start(), Some(1000));
+    }
+
+    #[test]
+    fn test_initial_range_width() {
+        // A configured width wins even when a count is also given.
+        assert_eq!(
+            initial_range_width(Some(500), Some(1000), 1_000_000, 100),
+            500
+        );
+
+        // No configured width and a failed probe starts at the smallest range.
+        assert_eq!(
+            initial_range_width(None, None, 1_000_000, 100),
+            ClickHouseTableProvider::MIN_SORT_KEY_RANGE as i128
+        );
+
+        // No configured width and an empty probe window jumps the full probe span.
+        assert_eq!(
+            initial_range_width(None, Some(0), 1_000_000, 100),
+            1_000_000
+        );
+
+        // No configured width: size from the probed density.
+        assert_eq!(
+            initial_range_width(None, Some(1000), 1_000_000, 100),
+            100_000
+        );
+
+        // A sparse probe window (10 rows over a 1M-key span) would otherwise
+        // size the first range far past the table; cap it at the same
+        // per-step growth ceiling RangeController enforces.
+        assert_eq!(
+            initial_range_width(None, Some(10), 1_000_000, 10_000_000),
+            (1_000_000_f64 * RangeController::grow_ceiling()) as i128
+        );
     }
 
     #[test]
@@ -5030,7 +5108,7 @@ mod tests {
                 state_store,
                 datafusion_buffer_size: 16,
                 record_batch_size: 1000,
-                sort_key_range: 1_000_000,
+                sort_key_range: Some(1_000_000),
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
                 dedup_version_column: None,
