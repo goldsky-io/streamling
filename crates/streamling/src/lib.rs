@@ -13,7 +13,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use streamling_config::AppConfig;
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
-use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
+use streamling_connectors::table_providers::clickhouse::{
+    ClickHouseTableProvider, clickhouse_user_agent,
+};
 use streamling_connectors::table_providers::file::{FileSourceReadMode, FileSourceTableProvider};
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
@@ -570,6 +572,10 @@ async fn build_source_providers(
                     state_backend_factory.create(app_config.state_backend_namespace());
                 let internal_buffer_size = app_config.internal_buffer_size.as_usize();
                 let record_batch_size = app_config.record_batch_size as usize;
+                let user_agent = clickhouse_user_agent(
+                    application_id,
+                    &app_config.open_telemetry_metrics.global_tags,
+                );
                 Box::pin(build_source_blocking(ctx, move || {
                     let provider = ClickHouseTableProvider::new_source(
                         name,
@@ -582,6 +588,7 @@ async fn build_source_providers(
                         state_backend,
                         internal_buffer_size,
                         record_batch_size,
+                        user_agent,
                     )?;
                     Ok(PreparedSource::Clickhouse(Box::new(provider)))
                 }))
@@ -2689,6 +2696,10 @@ impl Streamling {
                         clickhouse_sink.compression_level,
                         reference_name.clone(),
                         sink_telemetry.clone(),
+                        clickhouse_user_agent(
+                            &application_id,
+                            &app_config.open_telemetry_metrics.global_tags,
+                        ),
                     )?);
                     session_manager.register_table(
                         reference_name.as_str(),

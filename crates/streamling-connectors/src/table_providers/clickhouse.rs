@@ -390,11 +390,12 @@ impl ClickHouseTableProvider {
         state_backend: Arc<dyn StateOperatorBackend<ClickHouseSourceSplit>>,
         datafusion_buffer_size: usize,
         record_batch_size: usize,
+        user_agent: String,
     ) -> Result<Self, DataFusionError> {
         let database_name = config.connection.database.clone();
         let page_size = config.page_size.unwrap_or(Self::DEFAULT_PAGE_SIZE);
         let sort_key_range_config = config.sort_key_range;
-        let client = ClickHouseClient::new(config.connection.clone());
+        let client = ClickHouseClient::new(config.connection.clone()).with_user_agent(user_agent);
 
         // Infer the ReplacingMergeTree version column from engine_full so the
         // scan can deduplicate by max version (keyed on the table's ORDER BY),
@@ -693,11 +694,13 @@ impl ClickHouseTableProvider {
         compression_level_override: Option<GzipCompressionLevel>,
         reference_name: String,
         telemetry: Option<Telemetry>,
+        user_agent: String,
     ) -> Result<Self, DataFusionError> {
         let compression = compression_override.unwrap_or(config.compression);
         let compression_level = compression_level_override.unwrap_or(config.compression_level);
         let client =
-            ClickHouseClient::with_compression(config.clone(), compression, compression_level);
+            ClickHouseClient::with_compression(config.clone(), compression, compression_level)
+                .with_user_agent(user_agent);
 
         let primary_keys: Vec<String> = parse_primary_key_columns(&primary_key)
             .iter()
@@ -2129,12 +2132,55 @@ static SHARED_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build HTTP client for ClickHouse")
 });
 
+/// Default `User-Agent` sent when no pipeline identity is reachable (e.g.
+/// local dev, tests). Production deployments override it via
+/// [`ClickHouseClient::with_user_agent`].
+fn default_user_agent() -> String {
+    format!("streamling/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Builds the `User-Agent` streamling sends on every ClickHouse HTTP request,
+/// so `system.query_log` / `system.part_log` can be attributed to the project
+/// and pipeline that issued it (goldskydb-prod COGS allocation).
+///
+/// `application_id` is always set (required config, defaulted even locally)
+/// and is the per-deployment identity already used for state-backend
+/// namespacing and metric keys — see `AppConfig::application_id`. It is the
+/// deployment name `{project_id_without_prefix}-{pipeline_name}` assigned by
+/// streamling-cloud's `StreamlingOperator::deploy_name`, not a bare pipeline
+/// name, but it is the most specific per-pipeline identity reachable from
+/// this crate without re-deriving that split here.
+///
+/// `global_tags` is `AppConfig::open_telemetry_metrics.global_tags`, a
+/// `key:value,key:value` string. streamling-cloud's agent unconditionally
+/// sets a `project_id:<id>` tag in it for every deployed pipeline
+/// (`streamling-agent/src/env_config.rs`), so `project_id` is reachable
+/// there even though pipeline YAML labels deliberately don't reserve it.
+/// Pipelines with no `project_id` tag (local dev, non-cloud deployments) fall
+/// back to the bare `streamling/<version>` so behavior there is unchanged.
+pub fn clickhouse_user_agent(application_id: &str, global_tags: &str) -> String {
+    let project_id = global_tags.split(',').find_map(|pair| {
+        let (key, value) = pair.trim().split_once(':')?;
+        (key.trim() == "project_id" && !value.trim().is_empty()).then(|| value.trim())
+    });
+    match project_id {
+        Some(project_id) => format!(
+            "{} project_id={} pipeline={}",
+            default_user_agent(),
+            project_id,
+            application_id
+        ),
+        None => default_user_agent(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClickHouseClient {
     creds: ClickHouseConfig,
     http_client: reqwest::Client,
     compression: ClickHouseCompression,
     compression_level: GzipCompressionLevel,
+    user_agent: String,
 }
 
 impl ClickHouseClient {
@@ -2158,7 +2204,15 @@ impl ClickHouseClient {
             http_client: SHARED_HTTP_CLIENT.clone(),
             compression,
             compression_level,
+            user_agent: default_user_agent(),
         }
+    }
+
+    /// Overrides the default `User-Agent` with a pipeline-identified one; see
+    /// [`clickhouse_user_agent`].
+    pub fn with_user_agent(mut self, user_agent: String) -> Self {
+        self.user_agent = user_agent;
+        self
     }
 
     pub async fn send_query(
@@ -2171,6 +2225,7 @@ impl ClickHouseClient {
             .request(method.clone(), &self.creds.url)
             .basic_auth(&self.creds.user, Some(&self.creds.password))
             .header(Self::DATABASE_HEADER, &self.creds.database)
+            .header(reqwest::header::USER_AGENT, &self.user_agent)
             .query(&[(Self::ARROW_STRING_AS_STRING, "1")])
             .timeout(Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS));
 
@@ -2842,6 +2897,7 @@ impl ClickHouseClient {
             .post(&self.creds.url)
             .basic_auth(&self.creds.user, Some(&self.creds.password))
             .header(Self::DATABASE_HEADER, &self.creds.database)
+            .header(reqwest::header::USER_AGENT, &self.user_agent)
             .query(&[
                 ("query", query.as_str()),
                 // Let ClickHouse fill missing columns with their DEFAULT values
@@ -5267,6 +5323,118 @@ mod tests {
             .send_arrow_batch("test_table", &batch, &schema)
             .await
             .expect("send_arrow_batch should succeed without any content-encoding header");
+
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_clickhouse_user_agent_with_project_id() {
+        let ua = clickhouse_user_agent(
+            "proj123-my-pipeline",
+            "image_tag:latest,project_id:project_abc123",
+        );
+        assert_eq!(
+            ua,
+            format!(
+                "streamling/{} project_id=project_abc123 pipeline=proj123-my-pipeline",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_user_agent_without_project_id_falls_back_to_bare_version() {
+        let ua = clickhouse_user_agent("local_app_v1", "");
+        assert_eq!(ua, format!("streamling/{}", env!("CARGO_PKG_VERSION")));
+
+        let ua = clickhouse_user_agent("local_app_v1", "image_tag:latest");
+        assert_eq!(ua, format!("streamling/{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    /// `send_query` (used by every GET/SELECT/DDL/DELETE call) must carry the
+    /// pipeline-identified `User-Agent` set via `with_user_agent`, so
+    /// `system.query_log` can attribute the request to a project.
+    #[tokio::test]
+    async fn test_send_query_sets_pipeline_user_agent() {
+        let mut server = mockito::Server::new_async().await;
+        let expected_ua = clickhouse_user_agent("proj123-my-pipeline", "project_id:project_abc123");
+        let mock = server
+            .mock("GET", "/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("user-agent", expected_ua.as_str())
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client(&server.url()).with_user_agent(expected_ua);
+
+        client
+            .send_query(reqwest::Method::GET, "SELECT 1")
+            .await
+            .expect("send_query should succeed when mock matches the expected User-Agent");
+
+        mock.assert_async().await;
+    }
+
+    /// With no identity attached, `send_query` must fall back to the bare
+    /// `streamling/<version>` User-Agent (default behavior, unchanged for
+    /// local dev / tests).
+    #[tokio::test]
+    async fn test_send_query_defaults_to_bare_version_user_agent() {
+        let mut server = mockito::Server::new_async().await;
+        let expected_ua = format!("streamling/{}", env!("CARGO_PKG_VERSION"));
+        let mock = server
+            .mock("GET", "/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("user-agent", expected_ua.as_str())
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client(&server.url());
+
+        client
+            .send_query(reqwest::Method::GET, "SELECT 1")
+            .await
+            .expect("send_query should succeed when mock matches the default User-Agent");
+
+        mock.assert_async().await;
+    }
+
+    /// `send_arrow_batch` (INSERT) must also carry the pipeline-identified
+    /// `User-Agent`, same as every other ClickHouse request.
+    #[tokio::test]
+    async fn test_send_arrow_batch_sets_pipeline_user_agent() {
+        use arrow::array::Int64Array;
+
+        let mut server = mockito::Server::new_async().await;
+        let expected_ua = clickhouse_user_agent("proj123-my-pipeline", "project_id:project_abc123");
+        let mock = server
+            .mock("POST", "/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("user-agent", expected_ua.as_str())
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client(&server.url()).with_user_agent(expected_ua);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        client
+            .send_arrow_batch("test_table", &batch, &schema)
+            .await
+            .expect("send_arrow_batch should succeed when mock matches the expected User-Agent");
 
         mock.assert_async().await;
     }

@@ -3,7 +3,9 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::table_providers::clickhouse::{ClickHouseClient, ClickHouseTableProvider};
+use crate::table_providers::clickhouse::{
+    ClickHouseClient, ClickHouseTableProvider, clickhouse_user_agent,
+};
 use crate::table_providers::kafka::KafkaSourceTableProvider;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -275,6 +277,10 @@ impl HybridTableProvider {
         let mut bounded_table_providers = Vec::new();
 
         let application_id = app_config.application_id.clone();
+        let clickhouse_user_agent_value = clickhouse_user_agent(
+            &application_id,
+            &app_config.open_telemetry_metrics.global_tags,
+        );
 
         let unbounded_source_topic = unbounded_source.topic.clone();
         let unbounded_table_provider: Arc<dyn TableProvider> =
@@ -336,7 +342,8 @@ impl HybridTableProvider {
             };
 
         let schema_adapter = ClickHouseSchemaAdapter {
-            client: ClickHouseClient::new(app_config.clickhouse_source.connection.clone()),
+            client: ClickHouseClient::new(app_config.clickhouse_source.connection.clone())
+                .with_user_agent(clickhouse_user_agent_value.clone()),
         };
         for (idx, bounded_source) in bounded_sources.into_iter().enumerate() {
             match bounded_source.source_type.as_str() {
@@ -375,6 +382,7 @@ impl HybridTableProvider {
                             state_backend_factory.create(application_id.as_str()),
                             app_config.internal_buffer_size as usize,
                             app_config.record_batch_size as usize,
+                            clickhouse_user_agent_value.clone(),
                         )?
                         .with_scope(scope.clone()),
                     );
@@ -406,7 +414,8 @@ impl HybridTableProvider {
         }
 
         let offset_provider = {
-            let client = ClickHouseClient::new(app_config.clickhouse_source.connection.clone());
+            let client = ClickHouseClient::new(app_config.clickhouse_source.connection.clone())
+                .with_user_agent(clickhouse_user_agent_value.clone());
             Some(Arc::new(ClickHouseOffsetProvider::new(
                 client,
                 offset_table.unwrap_or(HybridOffsetTable::new(unbounded_source_topic)),
