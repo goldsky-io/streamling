@@ -12,13 +12,14 @@ use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::sqlparser::ast::{
     BinaryOperator, Expr as SqlExpr, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator,
+    visit_expressions_mut,
 };
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
-use regex::Regex;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 // ---------------- Shared helpers ----------------
 
@@ -825,154 +826,73 @@ fn rewrite_bigint_expr(e: &mut SqlExpr, u256_cols: &HashSet<String>, i256_cols: 
     rewrite_expr_kind::<I256Kind>(e, i256_cols);
 }
 
-// TRY_CAST DECIMAL is normalized via regex because the AST may not have a TryCast variant.
-fn rewrite_decimal_try_casts(sql: &str) -> String {
-    lazy_static::lazy_static! {
-        static ref DECIMAL_TRY_RE: Regex = Regex::new(
-            r"(?i)TRY_CAST\s*\(\s*(.+?)\s+AS\s+DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)"
-        ).unwrap();
-    }
-    DECIMAL_TRY_RE
-        .replace_all(sql, |caps: &regex::Captures| {
-            let expr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let precision: u8 = caps
-                .get(2)
-                .and_then(|m| m.as_str().parse().ok())
-                .unwrap_or(0);
-            let scale: i8 = caps
-                .get(3)
-                .and_then(|m| m.as_str().parse().ok())
-                .unwrap_or(0);
-            if precision > 76 && scale == 0 {
-                if precision <= 78 {
-                    format!("to_u256({})", expr)
-                } else {
-                    format!("TRY_CAST({} AS VARCHAR)", expr)
-                }
-            } else {
-                caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
-            }
-        })
-        .to_string()
-}
-
-fn parse_cast_varchar(inner: &SqlExpr) -> Option<SqlExpr> {
-    let dialect = GenericDialect {};
-    let inner_sql = inner.to_string();
-    let cast_sql = format!("SELECT CAST({} AS VARCHAR)", inner_sql);
-    let mut stmts = Parser::parse_sql(&dialect, cast_sql.as_str()).ok()?;
-    if stmts.len() != 1 {
-        return None;
-    }
-    if let Statement::Query(query) = stmts.remove(0)
-        && let SetExpr::Select(select) = query.body.as_ref()
-        && let Some(item) = select.projection.first()
-    {
-        return match item {
-            SelectItem::UnnamedExpr(e) => Some(e.clone()),
-            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
-            _ => None,
-        };
-    }
-    None
-}
-
+/// Rewrite a single DECIMAL cast node in place.
+///
+/// Traversal is handled by [`visit_expressions_mut`], which walks bottom-up
+/// (children before parents), so this only inspects the node it is given.
+///
+/// A DECIMAL with more than 76 digits and scale 0 is rewritten:
+/// - up to 78 digits: the whole cast is replaced by `to_u256(inner)`;
+/// - above 78 digits: the target type is widened to VARCHAR, leaving the cast
+///   kind (CAST vs TRY_CAST) and format untouched.
 fn rewrite_decimal_cast_expr(expr: &mut SqlExpr) {
-    match expr {
-        SqlExpr::Cast {
-            expr: inner,
-            data_type,
-            kind: _,
-            format: _,
-            ..
-        } => {
-            // Attempt to parse DECIMAL(p,s) from data_type.to_string()
-            let dt = data_type.to_string();
-            let dt_lower = dt.to_lowercase();
-            // naive parse: decimal(p[, s])
-            if let Some(start) = dt_lower.find("decimal(")
-                && dt_lower.ends_with(')')
-            {
-                // extract inside parens
-                let inside = &dt_lower[start + "decimal(".len()..dt_lower.len() - 1];
-                let parts: Vec<&str> = inside.split(',').map(|s| s.trim()).collect();
-                let (p, s) = match parts.len() {
-                    1 => (parts[0].parse::<u64>().unwrap_or(0), 0i64),
-                    2 => (
-                        parts[0].parse::<u64>().unwrap_or(0),
-                        parts[1].parse::<i64>().unwrap_or(-1),
-                    ),
-                    _ => (0, -1),
-                };
-                if p > 76 && s == 0 {
-                    if p <= 78 {
-                        if let Some(func) = parse_wrapped_fn("to_u256", inner) {
-                            **inner = func;
-                        }
-                        // Replace the Cast node with its inner (now to_u256(inner))
-                        if let Some(replacement) = Some((**inner).clone()) {
-                            *expr = replacement;
-                            return;
-                        }
-                    } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
-                        *expr = cast_varchar;
-                        return;
-                    }
-                }
-            }
-            // Recurse into inner if not rewritten
-            rewrite_decimal_cast_expr(inner);
+    let SqlExpr::Cast {
+        expr: inner,
+        data_type,
+        ..
+    } = expr
+    else {
+        return;
+    };
+
+    // Attempt to parse DECIMAL(p[, s]) from data_type.to_string()
+    let dt_lower = data_type.to_string().to_lowercase();
+    let Some(start) = dt_lower.find("decimal(") else {
+        return;
+    };
+    if !dt_lower.ends_with(')') {
+        return;
+    }
+    // extract inside parens
+    let inside = &dt_lower[start + "decimal(".len()..dt_lower.len() - 1];
+    let parts: Vec<&str> = inside.split(',').map(|s| s.trim()).collect();
+    let (p, s) = match parts.len() {
+        1 => (parts[0].parse::<u64>().unwrap_or(0), 0i64),
+        2 => (
+            parts[0].parse::<u64>().unwrap_or(0),
+            parts[1].parse::<i64>().unwrap_or(-1),
+        ),
+        _ => (0, -1),
+    };
+    if p <= 76 || s != 0 {
+        return;
+    }
+
+    if p <= 78 {
+        // 77/78 digits still fit in UINT256.
+        if let Some(func) = parse_wrapped_fn("to_u256", inner) {
+            *expr = func;
         }
-        SqlExpr::BinaryOp { left, right, .. } => {
-            rewrite_decimal_cast_expr(left);
-            rewrite_decimal_cast_expr(right);
-        }
-        SqlExpr::UnaryOp { expr, .. } => rewrite_decimal_cast_expr(expr),
-        SqlExpr::Nested(inner) => rewrite_decimal_cast_expr(inner),
-        SqlExpr::Function(func) => {
-            // Recurse into function args
-            if let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
-                &mut func.args
-            {
-                for arg in arglist.args.iter_mut() {
-                    if let datafusion::logical_expr::sqlparser::ast::FunctionArg::Unnamed(
-                        datafusion::logical_expr::sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ) = arg
-                    {
-                        rewrite_decimal_cast_expr(e);
-                    }
-                }
-            }
-        }
-        _ => {}
+    } else {
+        // Wider than UINT256: keep the (TRY_)CAST but widen the target to
+        // VARCHAR.
+        *data_type = datafusion::logical_expr::sqlparser::ast::DataType::Varchar(None);
     }
 }
 
 pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
-    let sql = rewrite_decimal_try_casts(sql);
-
     // Now parse AST and handle CAST(... AS DECIMAL(p,s))
-    let Some(mut stmt) = parse_single_statement(&sql) else {
-        return sql;
+    let Some(mut stmt) = parse_single_statement(sql) else {
+        return sql.to_string();
     };
 
-    if let Statement::Query(query) = &mut stmt
-        && let SetExpr::Select(select) = query.body.as_mut()
-    {
-        for item in select.projection.iter_mut() {
-            match item {
-                SelectItem::UnnamedExpr(e) => rewrite_decimal_cast_expr(e),
-                SelectItem::ExprWithAlias { expr, .. } => rewrite_decimal_cast_expr(expr),
-                _ => {}
-            }
-        }
-        if let Some(selection) = select.selection.as_mut() {
-            rewrite_decimal_cast_expr(selection);
-        }
-        if let Some(having) = select.having.as_mut() {
-            rewrite_decimal_cast_expr(having);
-        }
-    }
+    // Visit every expression in the statement bottom-up. This reaches casts
+    // anywhere in the tree — CTEs, JOIN ON, ORDER BY, CASE, BETWEEN, IN — not
+    // just the top-level projection/WHERE/HAVING.
+    let _ = visit_expressions_mut(&mut stmt, |expr| {
+        rewrite_decimal_cast_expr(expr);
+        ControlFlow::<()>::Continue(())
+    });
 
     stmt.to_string()
 }
@@ -981,9 +901,8 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
 /// (e.g. a source `filter:`) whose columns resolve against `schema` instead of a
 /// table in the session catalog.
 pub fn preprocess_bigint_expr(expr_sql: &str, schema: &Schema) -> Result<String> {
-    let sql = rewrite_decimal_try_casts(expr_sql);
     let mut expr = Parser::new(&GenericDialect {})
-        .try_with_sql(&sql)
+        .try_with_sql(expr_sql)
         .and_then(|mut parser| {
             let expr = parser.parse_expr()?;
             parser.expect_token(&Token::EOF)?;
@@ -991,7 +910,10 @@ pub fn preprocess_bigint_expr(expr_sql: &str, schema: &Schema) -> Result<String>
         })
         .map_err(|e| streamling_user_err!("failed to parse expression '{}': {}", expr_sql, e))?;
 
-    rewrite_decimal_cast_expr(&mut expr);
+    let _ = visit_expressions_mut(&mut expr, |expr| {
+        rewrite_decimal_cast_expr(expr);
+        ControlFlow::<()>::Continue(())
+    });
     let (u256_cols, i256_cols) = bigint_columns(schema);
     rewrite_bigint_expr(&mut expr, &u256_cols, &i256_cols);
     Ok(expr.to_string())
@@ -1077,6 +999,33 @@ mod tests {
     }
 
     #[test]
+    fn test_preprocess_try_cast_nested_78() {
+        let sql = "SELECT COALESCE(TRY_CAST(balance AS DECIMAL(78, 0)), 0) FROM accounts";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(result.contains("to_u256(balance)"), "got: {result}");
+    }
+
+    #[test]
+    fn test_preprocess_try_cast_nested_100_preserves_try_cast() {
+        let sql = "SELECT COALESCE(TRY_CAST(balance AS DECIMAL(100, 0)), '') FROM accounts";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(
+            result.contains("TRY_CAST(balance AS VARCHAR)"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_preserves_try_cast_text_inside_string_literal() {
+        let sql = "SELECT 'TRY_CAST(7 AS DECIMAL(78, 0))' AS x FROM accounts";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(
+            result.contains("'TRY_CAST(7 AS DECIMAL(78, 0))'"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
     fn test_preprocess_decimal_76_unchanged() {
         let sql = "SELECT CAST(value AS DECIMAL(76,0)) FROM data";
         let result = preprocess_bigint_decimal_casts(sql);
@@ -1102,6 +1051,34 @@ mod tests {
         let sql = "SELECT cast(balance as decimal(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(result, "SELECT to_u256(balance) FROM accounts");
+    }
+
+    #[test]
+    fn test_preprocess_cast_in_cte_case_and_order_by() {
+        // These positions were missed while only the outer projection/WHERE/HAVING
+        // were walked; the AST visitor must reach them.
+        let sql = "WITH ranked AS (SELECT CAST(a AS DECIMAL(78, 0)) AS v FROM t \
+                   ORDER BY CAST(b AS DECIMAL(100, 0))) \
+                   SELECT CASE WHEN x THEN CAST(c AS DECIMAL(78, 0)) END FROM ranked";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(result.contains("to_u256(a)"), "got: {result}");
+        assert!(
+            result.contains("ORDER BY CAST(b AS VARCHAR)"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("CASE WHEN x THEN to_u256(c) END"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_expr_try_cast_over_78_to_varchar() {
+        let schema = Schema::new(vec![Field::new("status", DataType::Int64, false)]);
+        assert_eq!(
+            preprocess_bigint_expr("TRY_CAST(status AS DECIMAL(100, 0))", &schema).unwrap(),
+            "TRY_CAST(status AS VARCHAR)"
+        );
     }
 
     // Helper functions for test setup
@@ -1928,6 +1905,13 @@ mod tests {
             preprocess_bigint_expr("CAST(status AS DECIMAL(78, 0)) = value", &schema).unwrap(),
             "to_u256(status) = value"
         );
+    }
+
+    #[test]
+    fn test_expr_preserves_try_cast_text_inside_string_literal() {
+        let schema = Schema::new(vec![Field::new("message", DataType::Utf8, false)]);
+        let filter = "message = 'TRY_CAST(7 AS DECIMAL(78, 0))'";
+        assert_eq!(preprocess_bigint_expr(filter, &schema).unwrap(), filter);
     }
 
     #[test]

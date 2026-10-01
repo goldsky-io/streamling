@@ -30,6 +30,70 @@ const BLOCK_SCHEMA: &str = r#"{
     ]
 }"#;
 
+#[tokio::test]
+async fn test_kafka_source_filter_preserves_try_cast_text() {
+    init_tracing();
+    let ctx = TestContext::new().await.expect("Failed to create context");
+    ctx.kafka.register_schema(BLOCK_SCHEMA).await.unwrap();
+    let messages = [
+        "TRY_CAST(7 AS DECIMAL(78, 0))",
+        "to_u256(7)",
+        "TRY_CAST(7 AS DECIMAL(78, 0))",
+    ];
+    let records: Vec<BlockRecord> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| BlockRecord {
+            id: i as i64,
+            block: i as i64,
+            data: message.to_string(),
+        })
+        .collect();
+    ctx.kafka.produce_avro_records(&records).await.unwrap();
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+    filter: "data = 'TRY_CAST(7 AS DECIMAL(78, 0))'"
+transforms: {{}}
+sinks:
+  pg_sink:
+    type: postgres
+    from: kafka_source
+    table: filter_quoted_cast
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#,
+        topic = ctx.kafka_topic,
+    );
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(2)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    assert!(status.success());
+    let rows: Vec<(i64, String)> = ctx
+        .postgres
+        .query("SELECT id, data FROM public.filter_quoted_cast ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(0, messages[0].to_string()), (2, messages[2].to_string())]
+    );
+}
+
 // ============================================================================
 // Scenario 1: Basic numeric filter
 // ============================================================================

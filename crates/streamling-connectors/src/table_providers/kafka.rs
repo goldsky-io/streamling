@@ -4305,6 +4305,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn source_filter_preserves_try_cast_string_literal() {
+            use arrow::array::{BooleanArray, StringArray};
+            use arrow::record_batch::RecordBatch;
+
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "message",
+                DataType::Utf8,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec![
+                    "TRY_CAST(7 AS DECIMAL(78, 0))",
+                    "to_u256(7)",
+                ]))],
+            )
+            .unwrap();
+            let session_manager = test_session_manager();
+            let filter = "message = 'TRY_CAST(7 AS DECIMAL(78, 0))'";
+            let df_schema = DFSchema::try_from(schema.as_ref().clone()).unwrap();
+            let state = session_manager.session_state();
+            // Main plans the original expression directly.
+            let main_expr = state.create_logical_expr(filter, &df_schema).unwrap();
+            let main_predicate = state.create_physical_expr(main_expr, &df_schema).unwrap();
+            let branch_predicate = KafkaSourceTableProvider::prepare_filter_expression(
+                filter,
+                &schema,
+                &session_manager,
+            )
+            .unwrap();
+            let expected = BooleanArray::from(vec![true, false]);
+            for predicate in [main_predicate, branch_predicate] {
+                let result = predicate.evaluate(&batch).unwrap().into_array(2).unwrap();
+                assert_eq!(
+                    result.as_any().downcast_ref::<BooleanArray>().unwrap(),
+                    &expected,
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn bigint_column_filter_casts_integer_literals() {
             use arrow::array::{Array, BooleanArray, FixedSizeBinaryArray, Int64Array};
             use arrow::record_batch::RecordBatch;
