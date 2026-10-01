@@ -1796,6 +1796,8 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // Summed so the byte tripwire can shrink a page that is
                         // fine by rows but too large for a single Arrow column
                         // (see MAX_PAGE_BYTES). The widest column <= this total.
+                        // An in-key page's cursor columns count too: they are
+                        // buffered with the page, so the total is the memory held.
                         let mut total_page_bytes: u64 = 0;
                         let mut stream_failed = false;
                         while let Some(item_result) = stream.next().await {
