@@ -2132,32 +2132,11 @@ static SHARED_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build HTTP client for ClickHouse")
 });
 
-/// Default `User-Agent` sent when no pipeline identity is reachable (e.g.
-/// local dev, tests). Production deployments override it via
-/// [`ClickHouseClient::with_user_agent`].
 fn default_user_agent() -> String {
     format!("streamling/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Builds the `User-Agent` streamling sends on every ClickHouse HTTP request,
-/// so `system.query_log` / `system.part_log` can be attributed to the project
-/// and pipeline that issued it (goldskydb-prod COGS allocation).
-///
-/// `application_id` is always set (required config, defaulted even locally)
-/// and is the per-deployment identity already used for state-backend
-/// namespacing and metric keys — see `AppConfig::application_id`. It is the
-/// deployment name `{project_id_without_prefix}-{pipeline_name}` assigned by
-/// streamling-cloud's `StreamlingOperator::deploy_name`, not a bare pipeline
-/// name, but it is the most specific per-pipeline identity reachable from
-/// this crate without re-deriving that split here.
-///
-/// `global_tags` is `AppConfig::open_telemetry_metrics.global_tags`, a
-/// `key:value,key:value` string. streamling-cloud's agent unconditionally
-/// sets a `project_id:<id>` tag in it for every deployed pipeline
-/// (`streamling-agent/src/env_config.rs`), so `project_id` is reachable
-/// there even though pipeline YAML labels deliberately don't reserve it.
-/// Pipelines with no `project_id` tag (local dev, non-cloud deployments) fall
-/// back to the bare `streamling/<version>` so behavior there is unchanged.
+/// project_id comes from global_tags; streamling-cloud always sets it.
 pub fn clickhouse_user_agent(application_id: &str, global_tags: &str) -> String {
     let project_id = global_tags.split(',').find_map(|pair| {
         let (key, value) = pair.trim().split_once(':')?;
@@ -2208,8 +2187,7 @@ impl ClickHouseClient {
         }
     }
 
-    /// Overrides the default `User-Agent` with a pipeline-identified one; see
-    /// [`clickhouse_user_agent`].
+    /// Overrides the default `User-Agent` with a pipeline-identified one.
     pub fn with_user_agent(mut self, user_agent: String) -> Self {
         self.user_agent = user_agent;
         self
@@ -5351,9 +5329,6 @@ mod tests {
         assert_eq!(ua, format!("streamling/{}", env!("CARGO_PKG_VERSION")));
     }
 
-    /// `send_query` (used by every GET/SELECT/DDL/DELETE call) must carry the
-    /// pipeline-identified `User-Agent` set via `with_user_agent`, so
-    /// `system.query_log` can attribute the request to a project.
     #[tokio::test]
     async fn test_send_query_sets_pipeline_user_agent() {
         let mut server = mockito::Server::new_async().await;
@@ -5378,9 +5353,6 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// With no identity attached, `send_query` must fall back to the bare
-    /// `streamling/<version>` User-Agent (default behavior, unchanged for
-    /// local dev / tests).
     #[tokio::test]
     async fn test_send_query_defaults_to_bare_version_user_agent() {
         let mut server = mockito::Server::new_async().await;
@@ -5405,8 +5377,6 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// `send_arrow_batch` (INSERT) must also carry the pipeline-identified
-    /// `User-Agent`, same as every other ClickHouse request.
     #[tokio::test]
     async fn test_send_arrow_batch_sets_pipeline_user_agent() {
         use arrow::array::Int64Array;
