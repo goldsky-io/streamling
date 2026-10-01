@@ -804,13 +804,56 @@ fn small_page_opts(ctx: &TestContext, application_id: &str, state_table: &str) -
         .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "100")
 }
 
+/// Creates the sink table `table` with the sink's own DDL `columns` and paces
+/// every INSERT into it with a `pg_sleep` trigger, so a run spans several
+/// checkpoint intervals on any machine instead of finishing inside one.
+async fn create_paced_table(ctx: &TestContext, table: &str, columns: &str) {
+    for sql in [
+        format!(r#"CREATE TABLE "public"."{table}" ({columns})"#),
+        format!(
+            "CREATE OR REPLACE FUNCTION public.pace_{table}() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN PERFORM pg_sleep(0.01); RETURN NEW; END; $$"
+        ),
+        format!(
+            "CREATE TRIGGER pace BEFORE INSERT ON public.{table} \
+             FOR EACH ROW EXECUTE FUNCTION public.pace_{table}()"
+        ),
+    ] {
+        ctx.postgres
+            .execute(&sql)
+            .await
+            .expect("Failed to create the paced sink table");
+    }
+}
+
+/// Resolves once `state_table` holds a ClickHouse source checkpoint taken
+/// inside a first-key value, or after two minutes so the test fails on its
+/// assertions instead of hanging.
+async fn wait_for_mid_key_checkpoint(ctx: &TestContext, state_table: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        let saved = ctx
+            .postgres
+            .count(&format!(
+                "SELECT COUNT(*) FROM streamling.\"{state_table}\" \
+                 WHERE key LIKE 'clickhouse_source:%' AND data->'in_key_after' IS NOT NULL"
+            ))
+            .await
+            .unwrap_or(0);
+        if saved > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// A checkpoint taken while paging inside a hot first-key value must carry
 /// the full sort-key tuple cursor, and a restart must resume strictly after
 /// that tuple: the resumed run emits exactly the rows past the cursor, once
 /// each — none at or before it (no duplicate) and none skipped (no loss).
 ///
-/// Every row sits in block 7, so any checkpoint run 1 persists before the
-/// scan finishes is necessarily mid-key.
+/// Every row sits in block 7. Run 1's sink is paced, and run 1 is stopped
+/// once it has saved a mid-key checkpoint, long before the key is exhausted.
 #[tokio::test]
 async fn test_clickhouse_source_hot_first_key_resumes_mid_key() {
     init_tracing();
@@ -872,17 +915,28 @@ sinks:
         )
     };
 
-    // Run 1 stops long before the 3000-row hot key is exhausted.
-    let status_1 = ctx
-        .run_pipeline_with_opts(
+    create_paced_table(
+        &ctx,
+        "hot_key_ckpt_run1",
+        r#""block_number" NUMERIC(20,0), "id" NUMERIC(20,0), "data" TEXT, "emission_id" TEXT, PRIMARY KEY ("emission_id")"#,
+    )
+    .await;
+    let (status_1, _) = ctx
+        .run_pipeline_with_sigterm_when(
             &pipeline("hot_key_ckpt_run1"),
+            // A one-batch channel keeps the paced tail short, so the drain
+            // after SIGTERM finishes inside the shutdown budget.
             small_page_opts(&ctx, &application_id, &state_table)
-                .record_limit(1000)
-                .timeout(std::time::Duration::from_secs(120)),
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1"),
+            wait_for_mid_key_checkpoint(&ctx, &state_table),
+            std::time::Duration::from_secs(30),
         )
         .await
         .expect("Pipeline run 1 failed");
-    assert!(status_1.success(), "Pipeline run 1 should succeed");
+    assert!(
+        status_1.success(),
+        "Pipeline run 1 should drain and exit after SIGTERM"
+    );
 
     let split_query = |expr: &str| {
         format!(
