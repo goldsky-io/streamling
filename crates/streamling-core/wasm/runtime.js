@@ -62,7 +62,14 @@ function invoke() {
     // `results.map(...).join("\n")` builds the whole string in one pass;
     // repeated `+=` concatenation would copy the growing string on every
     // row. arrow_json doesn't need a trailing newline after the last row.
-    const out = fixLoneSurrogates(results.map((row) => JSON.stringify(row)).join("\n"));
+    // Flechette exposes numeric lists as typed arrays; JSON needs regular arrays.
+    const out = fixLoneSurrogates(
+      results.map((row) => JSON.stringify(row, (_key, value) =>
+        ArrayBuffer.isView(value) && !(value instanceof DataView)
+          ? Array.from(value)
+          : value
+      )).join("\n")
+    );
 
     return Host.outputString(out);
   } catch (error) {

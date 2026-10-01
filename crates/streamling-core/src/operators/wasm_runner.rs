@@ -2473,6 +2473,59 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn test_wasm_numeric_lists_preserve_arrays() {
+        use arrow::array::ListArray;
+        use arrow::datatypes::Int32Type;
+
+        // A null child makes flechette use ordinary arrays instead of typed arrays.
+        for last in [Some(4), None] {
+            let values = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(1), Some(2)]),
+                Some(vec![]),
+                Some(vec![Some(3), last]),
+                None,
+            ]));
+            let list_field = Field::new("values", values.data_type().clone(), true);
+            let input_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                list_field.clone(),
+            ]));
+            let input_batch = RecordBatch::try_new(
+                input_schema,
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4])), values],
+            )
+            .unwrap();
+            let output_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                list_field.clone(),
+                Field::new("nested", DataType::Struct(vec![list_field].into()), true),
+            ]));
+            let script = r#"
+        function invoke(data) {
+            return { id: data.id, values: data.values, nested: { values: data.values } };
+        }
+        "#;
+
+            let output_batch = run_process_batch(&input_batch, script, &output_schema).unwrap();
+            let expected: Vec<_> = [
+                serde_json::json!([1, 2]),
+                serde_json::json!([]),
+                serde_json::json!([3, last]),
+                serde_json::Value::Null,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, values)| {
+                serde_json::json!({
+                    "id": i + 1, "values": values, "nested": { "values": values }
+                })
+            })
+            .collect();
+            assert_eq!(to_json_rows(&output_batch), expected);
+        }
+    }
+
     #[tokio::test]
     async fn test_wasm_coercible_value_kinds() {
         // arrow_json's decoder (with `coerce_primitive` on) coerces a value of
