@@ -207,7 +207,41 @@ impl PostgresResource {
         for row in rows {
             let values: Vec<String> = (0..row.len())
                 .map(|i| {
-                    let val: Option<String> = row.try_get(i).ok();
+                    let val: Option<String> = row.try_get(i).unwrap_or_else(|error| {
+                        panic!(
+                            "could not decode column {} as text (add a ::text cast to the \
+                                 query): {error}",
+                            i
+                        )
+                    });
+                    val.unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect();
+            results.push(values);
+        }
+
+        Ok(results)
+    }
+
+    /// Run an arbitrary SQL query and return every row as stringified column
+    /// values (NULL becomes the literal "NULL"). Cast columns to `::text` in
+    /// the query itself so this works for any column type, not just text --
+    /// used for ad-hoc diffing queries (e.g. `EXCEPT`) where the column set
+    /// isn't a fixed Rust struct at compile time.
+    pub async fn query_rows_as_text(&self, sql: &str) -> Result<Vec<Vec<String>>> {
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let values: Vec<String> = (0..row.len())
+                .map(|i| {
+                    let val: Option<String> = row.try_get(i).unwrap_or_else(|error| {
+                        panic!(
+                            "could not decode column {} as text (add a ::text cast to the \
+                                 query): {error}",
+                            i
+                        )
+                    });
                     val.unwrap_or_else(|| "NULL".to_string())
                 })
                 .collect();
