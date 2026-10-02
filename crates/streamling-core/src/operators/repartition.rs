@@ -715,9 +715,20 @@ fn plan_repartition(
                 .iter()
                 .map(|column| {
                     let index = schema.index_of(column).map_err(|_| {
+                        // Name what IS available. Without it this error says a
+                        // column is missing but not from where, and the plan
+                        // node the exchange landed on is not obvious from the
+                        // pipeline definition — the upstream may be a view, a
+                        // plugin node, or an already-projected scan.
+                        let available = schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         streamling_user_err!(
                             "'{name}': cannot partition by primary key column '{column}', \
-                             which is not in the input schema"
+                             which is not in the input schema. Available columns: [{available}]"
                         )
                     })?;
                     Ok(Arc::new(Column::new(column, index)) as PhysicalExprRef)
