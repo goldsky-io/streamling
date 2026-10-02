@@ -80,6 +80,14 @@ fn file_format_for(format: FileSourceFormat) -> Arc<dyn FileFormat> {
         // plain Utf8/Binary types the files were written with. The defaults
         // dropped the metadata, so decimal_arb columns came back as bare
         // LargeBinary and every consumer read them as opaque bytes.
+        //
+        // Both flags are load-bearing. DataFusion applies `force_view_types`
+        // after the metadata step, rewriting `LargeBinary` to `BinaryView`
+        // while keeping the metadata — and `decimal_arb` is defined as
+        // `LargeBinary` + metadata, so with the metadata kept but the storage
+        // type changed the column is still not recognised. The cost is that
+        // every Parquet string/binary column is read as its file-declared
+        // type instead of the view type; DataFusion treats both the same.
         FileSourceFormat::Parquet => Arc::new(
             ParquetFormat::default()
                 .with_skip_metadata(false)

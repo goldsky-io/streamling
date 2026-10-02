@@ -61,6 +61,26 @@ fn decimal_arb_field(name: &str, precision: u32, scale: u32) -> Result<FieldRef>
     Ok(Arc::new(field))
 }
 
+/// `decimal_arb_field` that also carries the input's `native_int_kind` hint
+/// when the result is still integer-shaped (scale 0). `SUM` / `MIN` / `MAX`
+/// over a UInt256-shaped column is UInt256-shaped as far as a ClickHouse sink
+/// is concerned — the sink range-checks every value on write — so the output
+/// keeps the native route its input had instead of being rejected at config
+/// load as a hint-less wide column.
+fn decimal_arb_field_carrying_hint(
+    name: &str,
+    precision: u32,
+    scale: u32,
+    input: &Field,
+) -> Result<FieldRef> {
+    let field = DecimalArbType::field(name, precision, scale, true)?;
+    let field = match DecimalArbType::native_int_kind_from_field(input) {
+        Some(kind) if scale == 0 => DecimalArbType::with_native_int_kind(field, kind)?,
+        _ => field,
+    };
+    Ok(Arc::new(field))
+}
+
 /// Decode a `LargeBinary` row at the given scale into an optional value.
 fn decode_value(
     array: &LargeBinaryArray,
@@ -235,13 +255,12 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
         // `precision_scale_from_field`, not `is_decimal_arb_field`: a UNION of
         // two scales carries the extension name but no `(p, s)` until the
         // optimizer unifies its inputs, and the schema is recomputed then.
-        match arg_fields
-            .first()
-            .and_then(|f| DecimalArbType::precision_scale_from_field(f.as_ref()))
-        {
-            Some((p, s)) => {
+        match arg_fields.first().and_then(|f| {
+            DecimalArbType::precision_scale_from_field(f.as_ref()).map(|ps| (ps, f.as_ref()))
+        }) {
+            Some(((p, s), input)) => {
                 let (p_out, s_out) = sum_output_precision_scale(p, s);
-                decimal_arb_field(self.name(), p_out, s_out)
+                decimal_arb_field_carrying_hint(self.name(), p_out, s_out, input)
             }
             // `LargeBinary` whose `(p, s)` is not known yet (see above): the
             // built-in has no SUM for it, so declare the storage type and let
@@ -912,11 +931,10 @@ impl AggregateUDFImpl for DecimalArbExtremeUdaf {
     /// SingleDistinctToGroupBy rewrite produces those) recognise its input as
     /// decimal_arb instead of falling back to the built-in bytewise extreme.
     fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
-        match arg_fields
-            .first()
-            .and_then(|f| DecimalArbType::precision_scale_from_field(f.as_ref()))
-        {
-            Some((p, s)) => decimal_arb_field(self.name(), p, s),
+        match arg_fields.first().and_then(|f| {
+            DecimalArbType::precision_scale_from_field(f.as_ref()).map(|ps| (ps, f.as_ref()))
+        }) {
+            Some(((p, s), input)) => decimal_arb_field_carrying_hint(self.name(), p, s, input),
             _ => self.builtin.inner().return_field(arg_fields),
         }
     }
@@ -1374,6 +1392,42 @@ impl Accumulator for DistinctAvgAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sum_and_extremes_carry_native_int_kind_for_integer_shaped_input() {
+        use crate::types::decimal_arb::NativeIntKind;
+        let hinted: FieldRef = Arc::new(
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field("v", 78, 0, true).unwrap(),
+                NativeIntKind::U256,
+            )
+            .unwrap(),
+        );
+        let sum = DecimalArbSumUdaf::new()
+            .return_field(std::slice::from_ref(&hinted))
+            .unwrap();
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&sum),
+            Some((78 + SUM_PRECISION_HEADROOM, 0))
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&sum),
+            Some(NativeIntKind::U256)
+        );
+        let max = DecimalArbExtremeUdaf::max_udaf()
+            .return_field(std::slice::from_ref(&hinted))
+            .unwrap();
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&max),
+            Some(NativeIntKind::U256)
+        );
+        // A fractional input keeps its (p, s); the hint has nothing to say.
+        let fractional: FieldRef = Arc::new(DecimalArbType::field("v", 78, 2, true).unwrap());
+        let sum = DecimalArbSumUdaf::new()
+            .return_field(std::slice::from_ref(&fractional))
+            .unwrap();
+        assert_eq!(DecimalArbType::native_int_kind_from_field(&sum), None);
+    }
     use crate::types::decimal_arb::DecimalArbArrayBuilder;
     use std::str::FromStr;
     use std::sync::Arc;

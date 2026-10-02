@@ -41,6 +41,7 @@ fn type_contains_decimal_arb(data_type: &DataType) -> bool {
         | DataType::Map(c, _) => field_contains_decimal_arb(c),
         DataType::Dictionary(_, values) => type_contains_decimal_arb(values),
         DataType::RunEndEncoded(_, values) => field_contains_decimal_arb(values),
+        DataType::Union(fields, _) => fields.iter().any(|(_, f)| field_contains_decimal_arb(f)),
         _ => false,
     }
 }
@@ -233,9 +234,16 @@ pub(crate) fn decimal_arb_leaves_to_text(
                 Arc::new(new_arr) as ArrayRef,
             ))
         }
-        // Unreachable: field_contains_decimal_arb was true but the type is not
-        // a known container — return unchanged rather than erroring.
-        _ => Ok((field.clone(), array.clone())),
+        // `field_contains_decimal_arb` saw a leaf under a layout this walk
+        // does not rebuild (today: a `Union`). Passing the array through here
+        // handed canonical bytes to the text writer, which rendered them as
+        // hex — a wrong value with no error. Refuse instead.
+        other => Err(DataFusionError::from(streamling_err!(
+            "decimal_arb inside a {:?} column ('{}') cannot be serialised as text; \
+             flatten the column in a transform",
+            other,
+            field.name(),
+        ))),
     }
 }
 
@@ -462,6 +470,14 @@ pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> 
                 *sorted,
             )) as ArrayRef)
         }
-        _ => Ok(array.clone()),
+        // Mirror of the forward direction: a decimal_arb leaf under a layout
+        // the walk does not rebuild would otherwise come back as whatever the
+        // text reader produced for it.
+        other => Err(DataFusionError::from(streamling_err!(
+            "decimal_arb inside a {:?} column ('{}') cannot be restored from text; \
+             flatten the column in a transform",
+            other,
+            target.name(),
+        ))),
     }
 }

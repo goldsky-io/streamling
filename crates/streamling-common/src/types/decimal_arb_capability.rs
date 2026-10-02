@@ -54,9 +54,12 @@ pub enum ConnectorKind {
     KafkaProtobuf,
     /// SQS or webhook (JSON-encoded payload). Same as KafkaJson.
     SqsJson,
-    /// Plugin-provided connector. The capability is whatever the plugin
-    /// advertises; this module returns Reject by default for plugins that
-    /// don't override — the opt-in must be explicit.
+    /// Plugin-provided connector. The host hands the batch to the plugin
+    /// unchanged — the column arrives as `LargeBinary` carrying the
+    /// `decimal_arb` extension metadata, exactly as it travels between
+    /// built-in operators — so there is nothing for the host to convert or
+    /// refuse. Whether a given plugin understands the type is the plugin's
+    /// contract, not a config-load decision.
     Plugin,
 }
 
@@ -165,19 +168,28 @@ pub fn capability_for_decimal_arb(
             }
         }
         ConnectorKind::ClickHouse | ConnectorKind::Hybrid => {
-            // A native_int_kind hint at (≤78, 0) routes the
-            // column through ClickHouse's first-class fixed-width
-            // UInt256 / Int256 types — Native without coerce_to: string.
-            // Preserves storage compactness for existing wide-int tables.
+            // An integer-shaped column (scale 0) carrying a native_int_kind
+            // hint routes through ClickHouse's first-class UInt256 / Int256
+            // types whatever its declared precision: the hint says the values
+            // are 256-bit integers, and the sink range-checks every value
+            // against that type on write — one that does not fit fails the
+            // batch loudly instead of being truncated, which is what the
+            // retired u256 path did for Avro `decimal(p > 78, 0)`. An explicit
+            // `coerce_to: string` on the column wins over the hint at any
+            // precision: the operator asked for a String, and it is the way
+            // out for values that do not fit 256 bits.
             use crate::types::decimal_arb::NativeIntKind;
             if scale == 0
-                && precision <= 78
                 && matches!(
                     native_int_kind,
                     Some(NativeIntKind::U256) | Some(NativeIntKind::I256)
                 )
             {
-                return CapabilityResult::Native;
+                return if coerce_to_string {
+                    CapabilityResult::OptInOnly(CoercionDirective::String)
+                } else {
+                    CapabilityResult::Native
+                };
             }
             if precision <= MAX_CLICKHOUSE_DECIMAL_PRECISION {
                 CapabilityResult::Native
@@ -186,8 +198,10 @@ pub fn capability_for_decimal_arb(
             } else {
                 CapabilityResult::Reject(format!(
                     "ClickHouse Decimal precision is capped at {} digits; declared precision {} exceeds the cap. \
-                     Add `coerce_to: string` under this column in the sink YAML to emit as a String column, \
-                     or reduce declared precision to ≤{} if the source data fits.",
+                     Add `coerce_to: string` under this column in the sink YAML to emit as a String column; \
+                     for an integer-shaped column (scale 0) whose values fit 256 bits, pin it to `UInt256` or \
+                     `Int256` in the sink's `schema_override` instead; or reduce declared precision to ≤{} if \
+                     the source data fits.",
                     MAX_CLICKHOUSE_DECIMAL_PRECISION, precision, MAX_CLICKHOUSE_DECIMAL_PRECISION,
                 ))
             }
@@ -221,12 +235,11 @@ pub fn capability_for_decimal_arb(
                 ))
             }
         }
-        ConnectorKind::Plugin => CapabilityResult::Reject(format!(
-            "Plugin connector does not advertise streamling.decimal_arb support \
-             (declared precision {}, scale {}). Implement `supports_decimal_arb` in \
-             the plugin to override.",
-            precision, scale,
-        )),
+        // The host passes batches to a plugin verbatim; a column it could not
+        // carry does not exist. Rejecting here stopped every wide-int → plugin
+        // sink pipeline at startup with a hint pointing at a hook that does
+        // not exist.
+        ConnectorKind::Plugin => CapabilityResult::Native,
     }
 }
 
@@ -314,31 +327,76 @@ fn decimal_arb_view(
     })
 }
 
-/// Collect `(dotted path, precision, scale, hint)` for every decimal_arb leaf
-/// *below* `field` — the top-level field itself is handled by the caller.
+/// One decimal_arb leaf found while walking a column, with the dotted path
+/// used in error messages.
+struct DecimalArbLeaf {
+    path: String,
+    precision: u32,
+    scale: u32,
+    hint: Option<crate::types::decimal_arb::NativeIntKind>,
+    /// The leaf sits inside a `Union` somewhere below the column. Nothing
+    /// serialises decimal_arb through a union today (neither the text bridge
+    /// nor the Avro writer descends into one), so such a column is rejected
+    /// for every connector rather than written as raw bytes.
+    under_union: bool,
+}
+
+/// Collect every decimal_arb leaf *below* `field` — the top-level field itself
+/// is handled by the caller. Descends through every Arrow container that can
+/// hold a field: Struct, the list family (view layouts included), Map, Union,
+/// run-end encoding and dictionary encoding. The walk used to stop at
+/// Struct / List / LargeList / FixedSizeList / Map, so a leaf under any other
+/// layout was never checked and reached the sink unconverted.
 fn collect_nested_decimal_arb(
     field: &arrow_schema::Field,
     path: &str,
-    out: &mut Vec<(
-        String,
-        u32,
-        u32,
-        Option<crate::types::decimal_arb::NativeIntKind>,
-    )>,
+    under_union: bool,
+    out: &mut Vec<DecimalArbLeaf>,
 ) {
-    let mut visit = |child: &arrow_schema::Field| {
+    collect_nested_in_type(field.data_type(), path, under_union, out);
+}
+
+fn collect_nested_in_type(
+    data_type: &arrow_schema::DataType,
+    path: &str,
+    under_union: bool,
+    out: &mut Vec<DecimalArbLeaf>,
+) {
+    use arrow_schema::DataType;
+    fn visit(
+        child: &arrow_schema::Field,
+        path: &str,
+        under_union: bool,
+        out: &mut Vec<DecimalArbLeaf>,
+    ) {
         let child_path = format!("{}.{}", path, child.name());
-        if let Some((p, s, hint)) = decimal_arb_view(child) {
-            out.push((child_path.clone(), p, s, hint));
+        if let Some((precision, scale, hint)) = decimal_arb_view(child) {
+            out.push(DecimalArbLeaf {
+                path: child_path.clone(),
+                precision,
+                scale,
+                hint,
+                under_union,
+            });
         }
-        collect_nested_decimal_arb(child, &child_path, out);
-    };
-    match field.data_type() {
-        arrow_schema::DataType::Struct(children) => children.iter().for_each(|c| visit(c)),
-        arrow_schema::DataType::List(c)
-        | arrow_schema::DataType::LargeList(c)
-        | arrow_schema::DataType::FixedSizeList(c, _)
-        | arrow_schema::DataType::Map(c, _) => visit(c),
+        collect_nested_decimal_arb(child, &child_path, under_union, out);
+    }
+    match data_type {
+        DataType::Struct(children) => children
+            .iter()
+            .for_each(|c| visit(c, path, under_union, out)),
+        DataType::List(c)
+        | DataType::LargeList(c)
+        | DataType::FixedSizeList(c, _)
+        | DataType::ListView(c)
+        | DataType::LargeListView(c)
+        | DataType::Map(c, _) => visit(c, path, under_union, out),
+        DataType::RunEndEncoded(_, values) => visit(values, path, under_union, out),
+        DataType::Union(fields, _) => fields.iter().for_each(|(_, f)| visit(f, path, true, out)),
+        // A dictionary's value type is a bare `DataType`, so it cannot be a
+        // decimal_arb leaf itself (the extension metadata lives on a field);
+        // it can still be a container holding one.
+        DataType::Dictionary(_, values) => collect_nested_in_type(values, path, under_union, out),
         _ => {}
     }
 }
@@ -352,15 +410,14 @@ fn collect_nested_decimal_arb(
 /// directive list, surfacing `DecimalArbConfigErrors` to abort startup.
 /// Non-decimal_arb fields are ignored.
 ///
-/// Leaves nested inside a Struct / List / Map get the same decision as a
-/// top-level column would, under the column's directive: the connectors that
-/// serialise whole containers (JSON, Avro, …) carry the leaf exactly when they
-/// would carry the column, and a plugin that does not advertise decimal_arb
-/// support rejects the leaf as it rejects the column — before, only the
-/// top-level field was checked, so a plugin sink accepted `struct<amount>` and
-/// serialised the leaf as something else. ClickHouse / Hybrid convert
-/// top-level columns only, so a nested leaf is rejected outright there rather
-/// than written as raw bytes.
+/// Leaves nested inside a Struct / List / Map (or any other container layout)
+/// get the same decision as a top-level column would, under the column's
+/// directive: the connectors that serialise whole containers (JSON, Avro, …)
+/// carry the leaf exactly when they would carry the column. ClickHouse /
+/// Hybrid convert top-level columns only, so a nested leaf is rejected
+/// outright there rather than written as raw bytes, and a leaf anywhere inside
+/// a `Union` is rejected for every connector because nothing serialises
+/// decimal_arb through one.
 pub fn validate_pipeline_decimal_arb(
     schema: &Schema,
     kind: ConnectorKind,
@@ -376,12 +433,36 @@ pub fn validate_pipeline_decimal_arb(
 
         let mut leaves = Vec::new();
         if let Some((precision, scale, hint)) = decimal_arb_view(field) {
-            leaves.push((field.name().clone(), precision, scale, hint));
+            leaves.push(DecimalArbLeaf {
+                path: field.name().clone(),
+                precision,
+                scale,
+                hint,
+                under_union: false,
+            });
         }
         let top_level = leaves.len();
-        collect_nested_decimal_arb(field, field.name(), &mut leaves);
+        collect_nested_decimal_arb(field, field.name(), false, &mut leaves);
 
-        for (i, (path, precision, scale, hint)) in leaves.into_iter().enumerate() {
+        for (i, leaf) in leaves.into_iter().enumerate() {
+            let DecimalArbLeaf {
+                path,
+                precision,
+                scale,
+                hint,
+                under_union,
+            } = leaf;
+            if under_union {
+                errors.push(config_load_error(
+                    &path,
+                    kind,
+                    precision,
+                    scale,
+                    "decimal_arb nested inside a union is not supported by any connector; the \
+                     value would be written as raw bytes. Flatten the union in a transform.",
+                ));
+                continue;
+            }
             if i >= top_level && converts_only_top_level(kind) {
                 errors.push(config_load_error(
                     &path,
@@ -614,14 +695,15 @@ mod tests {
     // ---- Plugins / SQS ----
 
     #[test]
-    fn plugin_default_rejects() {
-        let r = capability_for_decimal_arb(ConnectorKind::Plugin, 100, 18, false, None);
-        match r {
-            CapabilityResult::Reject(msg) => {
-                assert!(msg.contains("Plugin"));
-            }
-            other => panic!("expected Reject, got {:?}", other),
-        }
+    fn plugin_passes_decimal_arb_through() {
+        // The host does not convert or refuse anything on the way into a
+        // plugin — the batch arrives as-is — so there is no capability gap
+        // for it to report. Rejecting here stopped every wide-int → plugin
+        // sink pipeline at startup, pointing at a hook that does not exist.
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::Plugin, 100, 18, false, None),
+            CapabilityResult::Native,
+        );
     }
 
     #[test]
@@ -823,7 +905,7 @@ mod tests {
     fn clickhouse_native_int_hint_does_not_bypass_precision_cap_for_fractional_scale() {
         use crate::types::decimal_arb::NativeIntKind;
         // (100, 18) is wide and fractional — the hint is set but should be
-        // ignored (the matrix only honors the hint at scale 0, ≤78).
+        // ignored (the matrix only honors the hint at scale 0).
         // Without coerce_to: string, this stays Reject.
         let r = capability_for_decimal_arb(
             ConnectorKind::ClickHouse,
@@ -839,6 +921,105 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn clickhouse_native_for_hinted_integer_column_at_any_precision() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // Avro `decimal(100, 0)` carries the u256 hint exactly like
+        // `decimal(78, 0)`; the sink range-checks each value on write, so the
+        // declared precision does not gate the native route. (Rejecting here
+        // turned every `decimal(p > 78, 0)` → ClickHouse pipeline that loaded
+        // on the retired u256 path into a config-load failure.)
+        for p in [77, 78, 79, 100] {
+            assert_eq!(
+                capability_for_decimal_arb(
+                    ConnectorKind::ClickHouse,
+                    p,
+                    0,
+                    false,
+                    Some(NativeIntKind::U256)
+                ),
+                CapabilityResult::Native,
+                "precision {p}",
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_coerce_to_string_wins_over_native_int_hint() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // At any precision — below the Decimal cap too, where an unhinted
+        // column would be a native Decimal: the operator asked for a String.
+        for precision in [76, 78, 100] {
+            assert_eq!(
+                capability_for_decimal_arb(
+                    ConnectorKind::ClickHouse,
+                    precision,
+                    0,
+                    true,
+                    Some(NativeIntKind::U256)
+                ),
+                CapabilityResult::OptInOnly(CoercionDirective::String),
+                "precision {precision}"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_sees_leaves_under_every_container_layout() {
+        use arrow_schema::{Fields, UnionFields, UnionMode};
+        use std::sync::Arc;
+        // The walk stopped at Struct / List / LargeList / FixedSizeList / Map,
+        // so a leaf under a list view, a run-end encoding, a dictionary or a
+        // union was never checked — and the text bridge later passed its
+        // bytes through untouched.
+        let leaf = || Arc::new(DecimalArbType::field("amt", 100, 0, true).unwrap());
+        let in_list_view = Field::new("lv", DataType::ListView(leaf()), true);
+        let in_ree = Field::new(
+            "ree",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                leaf(),
+            ),
+            true,
+        );
+        let in_dict = Field::new(
+            "dict",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Struct(Fields::from(vec![leaf()]))),
+            ),
+            true,
+        );
+        let schema = Schema::new(vec![in_list_view, in_ree, in_dict]);
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        let msg = format!("{}", errs);
+        assert_eq!(errs.len(), 3, "{msg}");
+        for path in ["lv.amt", "ree.amt", "dict.amt"] {
+            assert!(msg.contains(path), "{path} missing from: {msg}");
+        }
+
+        // A leaf under a union is rejected even where the connector would
+        // otherwise carry the column natively.
+        let union = Field::new(
+            "u",
+            DataType::Union(
+                UnionFields::try_new(
+                    vec![0, 1],
+                    vec![Arc::new(Field::new("s", DataType::Utf8, true)), leaf()],
+                )
+                .unwrap(),
+                UnionMode::Dense,
+            ),
+            true,
+        );
+        let errs =
+            validate_pipeline_decimal_arb(&Schema::new(vec![union]), ConnectorKind::KafkaJson, &[])
+                .unwrap_err();
+        let msg = format!("{}", errs);
+        assert!(msg.contains("u.amt") && msg.contains("union"), "{msg}");
     }
 
     #[test]

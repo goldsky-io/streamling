@@ -1,7 +1,9 @@
-//! Regression contracts from the pinned companion plugin compatibility audit.
-//! Its current producers still emit FSB32 + streamling.u256, and its generic
-//! JSON sink helper does not understand decimal_arb. Rejecting unsupported
-//! schemas is acceptable; successful numeric-to-hex output is not.
+//! Regression contracts at the plugin boundary. The host hands a plugin its
+//! batches unchanged, so the contract is: a wide integer that reaches a
+//! plugin keeps its value (decimal_arb `LargeBinary` + metadata, or the legacy
+//! `streamling.u256` shape the companion plugins still emit), the host never
+//! blocks a decimal_arb column from a plugin at startup, and the JSON path
+//! never renders a numeric as hex.
 use arrow::{
     array::{ArrayRef, FixedSizeBinaryArray, ListArray, StructArray},
     buffer::OffsetBuffer,
@@ -82,18 +84,23 @@ fn nested_decimal(shape: &str) -> Schema {
 }
 
 #[test]
-fn plugin_rejection_must_apply_to_nested_decimal_leaves() {
+fn plugin_startup_validation_passes_decimal_arb_through() {
+    // The host does not convert or refuse anything on the way into a plugin,
+    // so startup validation has nothing to reject — top-level or nested.
+    // (An unconditional Reject here stopped every wide-int → plugin sink
+    // pipeline at startup, pointing at a hook that does not exist.)
     let top_level = Schema::new(vec![DecimalArbType::field("value", 78, 0, true).unwrap()]);
-    assert!(validate_pipeline_decimal_arb(&top_level, ConnectorKind::Plugin, &[]).is_err());
-    let mut accepted = Vec::new();
+    assert!(validate_pipeline_decimal_arb(&top_level, ConnectorKind::Plugin, &[]).is_ok());
+    let mut rejected = Vec::new();
     for shape in ["struct", "list", "list_struct"] {
-        if validate_pipeline_decimal_arb(&nested_decimal(shape), ConnectorKind::Plugin, &[]).is_ok()
+        if validate_pipeline_decimal_arb(&nested_decimal(shape), ConnectorKind::Plugin, &[])
+            .is_err()
         {
-            accepted.push(shape);
+            rejected.push(shape);
         }
     }
     assert!(
-        accepted.is_empty(),
-        "unsupported nested decimal schemas pass plugin startup validation: {accepted:?}"
+        rejected.is_empty(),
+        "nested decimal schemas must pass plugin startup validation: {rejected:?}"
     );
 }

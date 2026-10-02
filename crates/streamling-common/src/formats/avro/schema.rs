@@ -3,11 +3,11 @@ use crate::formats::avro::arrow_avro::AVRO_DECIMAL_SCALE_META;
 use crate::types::decimal_arb::DecimalArbType;
 // Note: the U256Type/I256Type Arrow types have been retired.
 // The Avro schema → Arrow type mapping routes all wide-precision decimals
-// through `decimal_arb`. For `decimal(p, 0)` where `77 ≤ p ≤ 78` the
-// field also carries a `native_int_kind=u256` hint so a downstream
-// ClickHouse sink can emit `UInt256` storage; there is no native Avro
-// convention for signed-vs-unsigned, so the source path does not infer
-// signedness.
+// through `decimal_arb`. Every integer-shaped `decimal(p > 76, 0)` also
+// carries a `native_int_kind=u256` hint so a downstream ClickHouse sink
+// keeps emitting `UInt256` storage (the routing the retired type had);
+// there is no native Avro convention for signed-vs-unsigned, so the source
+// path does not infer signedness.
 use apache_avro::schema::{
     Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordField, RecordSchema,
     Schema as AvroSchema, UnionSchema,
@@ -64,21 +64,20 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                 return match (decimal_schema.precision, decimal_schema.scale) {
                     // Wide integer-shaped (scale 0) decimals route to
                     // decimal_arb with a u256 native_int_kind hint so a
-                    // downstream ClickHouse sink can emit native `UInt256`
-                    // storage. The historic streamling routing was "all
-                    // decimal(p > 76, 0) → U256Type" — we preserve that
-                    // semantics by always stamping u256 here. The hint is
-                    // only consulted by the ClickHouse capability matrix
-                    // at precision <= 78, so we stamp only over the
-                    // 77..=78 range to avoid leaving dead metadata on
-                    // fields at precision > 78.
+                    // downstream ClickHouse sink keeps emitting native
+                    // `UInt256` storage. This is the historic routing — every
+                    // `decimal(p > 76, 0)` was `U256Type` — kept at every
+                    // precision, because a pipeline reading e.g. a traces
+                    // `value decimal(100, 0)` into ClickHouse must still
+                    // load. What changes is what happens to a value above
+                    // 2^256 − 1: the retired path silently truncated it, the
+                    // ClickHouse sink now range-checks on write and fails the
+                    // batch. Sinks other than ClickHouse ignore the hint.
                     //
-                    // Note: there is no native Avro convention for
-                    // signed-vs-unsigned wide decimals. Pipelines that
-                    // need signed Int256 round-trip must use a
-                    // ClickHouse-side `schema_override` or wait for a
-                    // future YAML-side signed-int directive.
-                    (p, 0) if (77..=78).contains(&p) => {
+                    // There is no Avro convention for signed-vs-unsigned wide
+                    // decimals; a pipeline that needs signed `Int256` pins the
+                    // column with the ClickHouse sink's `schema_override`.
+                    (p, 0) if p > 76 => {
                         DecimalArbType::field(field.name(), p as u32, 0, field.is_nullable())
                             .and_then(|f| {
                                 DecimalArbType::with_native_int_kind(
@@ -86,23 +85,6 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                                     crate::types::decimal_arb::NativeIntKind::U256,
                                 )
                             })
-                            .map(Arc::new)
-                            .unwrap_or_else(|_| {
-                                Arc::new(Field::new(
-                                    field.name(),
-                                    DataType::Utf8,
-                                    field.is_nullable(),
-                                ))
-                            })
-                    }
-                    (p, 0) if p > 78 => {
-                        // Beyond the ClickHouse-native window: plain
-                        // decimal_arb with no hint (downstream sinks land
-                        // it as Decimal(p, 0) or via `coerce_to: string`).
-                        // The historic U256 mapping silently overflowed
-                        // for values > 2^256 − 1 (≈ 1.16e77, ~78 digits);
-                        // the new path is lossless via Decimal(p, 0).
-                        DecimalArbType::field(field.name(), p as u32, 0, field.is_nullable())
                             .map(Arc::new)
                             .unwrap_or_else(|_| {
                                 Arc::new(Field::new(
@@ -687,10 +669,10 @@ mod tests {
         // decimal(p, 0) with p > 76 routes to streamling.decimal_arb now
         // that u256/i256 are retired. The historic streamling routing was
         // "all decimal(p > 76, 0) → U256Type" — we preserve that semantics
-        // by always stamping u256 here (no signed inference; pipelines
-        // needing Int256 round-trip must use a sink schema_override).
-        // The hint is only stamped in 77..=78 (the range the ClickHouse
-        // capability matrix actually consults).
+        // by stamping u256 at every such precision (no signed inference;
+        // pipelines needing Int256 round-trip pin the column with a sink
+        // schema_override). A value above 2^256 − 1 fails the ClickHouse
+        // write loudly instead of being truncated as it was on the old path.
         use crate::types::decimal_arb::NativeIntKind;
         let avro_schema = AvroSchema::parse_str(
             r#"
@@ -741,9 +723,10 @@ mod tests {
             Some(NativeIntKind::U256),
         );
 
-        // p == 79, s == 0 → just past the native-int boundary. The hint is
-        // dropped here, not at p=100 — this pins the precise upper bound of
-        // the `(77..=78)` arm so a future change can't silently widen it.
+        // p == 79 and p == 100, s == 0 → still hinted. A traces `value
+        // decimal(100, 0)` → ClickHouse pipeline loaded as UInt256 on the
+        // retired path and must keep loading; the sink's write-time range
+        // check is what guards values above 2^256 − 1 now.
         let f2 = arrow_schema.field(2);
         assert_eq!(f2.name(), "just_past_native");
         assert!(DecimalArbType::is_decimal_arb_field(f2));
@@ -751,16 +734,11 @@ mod tests {
             DecimalArbType::precision_scale_from_field(f2),
             Some((79, 0)),
         );
-        assert_eq!(DecimalArbType::native_int_kind_from_field(f2), None);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(f2),
+            Some(NativeIntKind::U256),
+        );
 
-        // p == 100, s == 0 → decimal_arb(100, 0) WITHOUT a native_int_kind
-        // hint: the hint is only consulted by the ClickHouse capability
-        // matrix at precision <= 78, so stamping it at precision > 78
-        // would be dead metadata. Wide-precision integer-shaped columns
-        // land at ClickHouse sinks as Decimal(100, 0) or via
-        // `coerce_to: string` (per the capability matrix). The historic
-        // U256 routing silently overflowed at p > 78 (UInt256 fits ≤ 78
-        // digits); the new path preserves the value losslessly.
         let f3 = arrow_schema.field(3);
         assert_eq!(f3.name(), "large_wide");
         assert!(DecimalArbType::is_decimal_arb_field(f3));
@@ -768,7 +746,10 @@ mod tests {
             DecimalArbType::precision_scale_from_field(f3),
             Some((100, 0)),
         );
-        assert_eq!(DecimalArbType::native_int_kind_from_field(f3), None);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(f3),
+            Some(NativeIntKind::U256),
+        );
     }
 
     #[test]
@@ -870,17 +851,19 @@ mod tests {
             arrow_schema.field(3).data_type(),
             &DataType::Decimal256(76, 18)
         );
-        // decimal(100, 0) routes to decimal_arb(100, 0). The
-        // native_int_kind hint is NOT stamped at precision > 78 — the
-        // capability matrix doesn't consult the hint above that ceiling,
-        // so the field carries no dead metadata.
+        // decimal(100, 0) routes to decimal_arb(100, 0) with the u256 hint:
+        // every integer-shaped wide decimal keeps the native UInt256 route
+        // the retired type gave it (the sink range-checks values on write).
         let large_int = arrow_schema.field(4);
         assert!(DecimalArbType::is_decimal_arb_field(large_int));
         assert_eq!(
             DecimalArbType::precision_scale_from_field(large_int),
             Some((100, 0)),
         );
-        assert_eq!(DecimalArbType::native_int_kind_from_field(large_int), None,);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(large_int),
+            Some(crate::types::decimal_arb::NativeIntKind::U256),
+        );
         assert_eq!(arrow_schema.field(5).data_type(), &DataType::Boolean);
     }
 

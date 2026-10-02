@@ -170,8 +170,9 @@ sinks:
 // finding "Avro precision 77 unsigned regression"): the historic Avro
 // reader mapped *all* `decimal(p > 76, 0)` to U256, and inferring i256
 // from p=77 silently re-classified existing unsigned data. With the
-// current routing every `decimal(p, 0)` in 77..=78 carries the u256
-// hint. The Int256 byte-conversion path is still exercised by unit
+// current routing every `decimal(p > 76, 0)` carries the u256 hint; a
+// signed column is pinned to `Int256` through the ClickHouse sink's
+// `schema_override`. The Int256 byte-conversion path is still exercised by unit
 // tests in `streamling-connectors::table_providers::clickhouse::
 // feature_002_byte_conversion_tests` (which construct an i256-hinted
 // field directly). Restoring an end-to-end signed wide-int round-trip

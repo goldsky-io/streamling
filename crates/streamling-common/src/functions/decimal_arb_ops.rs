@@ -133,6 +133,94 @@ fn build_output_field(name: &str, precision: u32, scale: u32) -> Result<FieldRef
     Ok(Arc::new(field))
 }
 
+/// `build_output_field` plus the `native_int_kind` hint, when the result is
+/// still integer-shaped (`scale == 0`). `UInt256 + UInt256` is a
+/// UInt256-shaped value as far as a ClickHouse sink is concerned — the sink
+/// range-checks every value on write — and dropping the hint turned `a + b`
+/// over two such columns into a config-load rejection where the retired
+/// `u256_add` produced a `UInt256` column.
+fn build_output_field_with_hint(
+    name: &str,
+    precision: u32,
+    scale: u32,
+    hint: Option<crate::types::decimal_arb::NativeIntKind>,
+) -> Result<FieldRef> {
+    decimal_arb_field_with_hint(name, precision, scale, true, hint)
+}
+
+/// A decimal_arb field carrying `hint` when the result is integer-shaped; a
+/// fractional result never carries one, whatever its inputs had.
+fn decimal_arb_field_with_hint(
+    name: &str,
+    precision: u32,
+    scale: u32,
+    nullable: bool,
+    hint: Option<crate::types::decimal_arb::NativeIntKind>,
+) -> Result<FieldRef> {
+    let field = DecimalArbType::field(name, precision, scale, nullable)?;
+    let field = match hint {
+        Some(kind) if scale == 0 => DecimalArbType::with_native_int_kind(field, kind)?,
+        _ => field,
+    };
+    Ok(Arc::new(field))
+}
+
+/// The `native_int_kind` a set of decimal_arb inputs agree on.
+///
+/// An input without a hint does not strip the others': the common shape is a
+/// hinted column next to a planner-coerced literal (`balance + 1`,
+/// `COALESCE(value, 0)`), which the retired `u256_add` accepted as a
+/// `UInt256`. Two different hints (`u256` next to `i256`) have no single
+/// native type, so the result carries none. The ClickHouse sink range-checks
+/// every value on write, so a kept hint can only fail loudly, never store a
+/// wrong value.
+pub(crate) fn agreed_native_int_kind<'a>(
+    fields: impl IntoIterator<Item = &'a arrow_schema::Field>,
+) -> Option<crate::types::decimal_arb::NativeIntKind> {
+    let mut agreed = None;
+    for field in fields {
+        match (agreed, DecimalArbType::native_int_kind_from_field(field)) {
+            (_, None) => {}
+            (None, Some(kind)) => agreed = Some(kind),
+            (Some(have), Some(kind)) if have == kind => {}
+            (Some(_), Some(_)) => return None,
+        }
+    }
+    agreed
+}
+
+/// An optional trailing `native_int_kind` literal argument (`'u256'` /
+/// `'i256'`) at `index`: `None` when the call has no such argument, an error
+/// when it is not a known kind or not a literal.
+fn read_native_int_hint_arg(
+    args: &ReturnFieldArgs,
+    index: usize,
+    fn_name: &str,
+) -> Result<Option<crate::types::decimal_arb::NativeIntKind>> {
+    if args.arg_fields.len() <= index {
+        return Ok(None);
+    }
+    match args.scalar_arguments.get(index).copied().flatten() {
+        Some(datafusion::scalar::ScalarValue::Utf8(Some(raw))) => {
+            crate::types::decimal_arb::NativeIntKind::parse(raw)
+                .map(Some)
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::from(streamling_user_err!(
+                        "{}: native_int_kind must be 'u256' or 'i256' (got '{}')",
+                        fn_name,
+                        raw,
+                    ))
+                })
+        }
+        _ => Err(datafusion::error::DataFusionError::from(
+            streamling_user_err!(
+                "{}: native_int_kind must be a string literal at planning time",
+                fn_name,
+            ),
+        )),
+    }
+}
+
 /// Shared invoker for binary `decimal_arb` ops. Decodes inputs at their
 /// column scales, applies `op_fn`, encodes the result at the output scale
 /// (with half-to-even rounding for excess fractional digits), and emits a
@@ -304,7 +392,11 @@ macro_rules! decimal_arb_binary_op {
                 let (p1, s1) = require_decimal_arb_field(args.arg_fields[0].as_ref(), $sql_name)?;
                 let (p2, s2) = require_decimal_arb_field(args.arg_fields[1].as_ref(), $sql_name)?;
                 let (p_out, s_out) = output_precision_scale($kind, p1, s1, p2, s2);
-                build_output_field(self.name(), p_out, s_out)
+                let hint = agreed_native_int_kind([
+                    args.arg_fields[0].as_ref(),
+                    args.arg_fields[1].as_ref(),
+                ]);
+                build_output_field_with_hint(self.name(), p_out, s_out, hint)
             }
             fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
                 invoke_binary(args, $sql_name, $kind, $op)
@@ -430,8 +522,14 @@ impl ScalarUDFImpl for DecimalArbNegFunc {
         Ok(DataType::LargeBinary)
     }
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        let (p, s) = require_decimal_arb_field(args.arg_fields[0].as_ref(), self.name())?;
-        build_output_field(self.name(), p, s)
+        let input = args.arg_fields[0].as_ref();
+        let (p, s) = require_decimal_arb_field(input, self.name())?;
+        // Negating a native integer gives a signed one: `-x` over a `u256` or
+        // an `i256` column is Int256-shaped. A value that does not fit fails
+        // the ClickHouse write loudly, like any other hinted column.
+        let hint = DecimalArbType::native_int_kind_from_field(input)
+            .map(|_| crate::types::decimal_arb::NativeIntKind::I256);
+        build_output_field_with_hint(self.name(), p, s, hint)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         invoke_unary(args, "decimal_arb_neg", |v| -v.clone())
@@ -471,8 +569,11 @@ impl ScalarUDFImpl for DecimalArbAbsFunc {
         Ok(DataType::LargeBinary)
     }
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        let (p, s) = require_decimal_arb_field(args.arg_fields[0].as_ref(), self.name())?;
-        build_output_field(self.name(), p, s)
+        let input = args.arg_fields[0].as_ref();
+        let (p, s) = require_decimal_arb_field(input, self.name())?;
+        // |x| stays within the input's native type.
+        let hint = DecimalArbType::native_int_kind_from_field(input);
+        build_output_field_with_hint(self.name(), p, s, hint)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         invoke_unary(args, "decimal_arb_abs", |v| v.abs())
@@ -815,11 +916,17 @@ impl ToDecimalArbFromStringFunc {
     pub fn new() -> Self {
         Self {
             signature: Signature::one_of(
-                vec![TypeSignature::Exact(vec![
-                    DataType::Utf8,
-                    DataType::Int64,
-                    DataType::Int64,
-                ])],
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Int64]),
+                    // Optional trailing `native_int_kind` literal ('u256' /
+                    // 'i256'); see `read_return_field_hint`.
+                    TypeSignature::Exact(vec![
+                        DataType::Utf8,
+                        DataType::Int64,
+                        DataType::Int64,
+                        DataType::Utf8,
+                    ]),
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -885,6 +992,17 @@ impl ToDecimalArbFromStringFunc {
             )),
         }
     }
+
+    /// The optional trailing `native_int_kind` literal (`'u256'` / `'i256'`),
+    /// stamped on the result so a ClickHouse sink stores the column as the
+    /// native 256-bit type. The SQL preprocessor adds it when rewriting
+    /// `CAST(x AS DECIMAL(77..=78, 0))`, keeping the routing the retired
+    /// `to_u256` gave that cast.
+    fn read_return_field_hint(
+        args: &ReturnFieldArgs,
+    ) -> Result<Option<crate::types::decimal_arb::NativeIntKind>> {
+        read_native_int_hint_arg(args, 3, "to_decimal_arb_from_string")
+    }
 }
 
 impl ScalarUDFImpl for ToDecimalArbFromStringFunc {
@@ -900,11 +1018,14 @@ impl ScalarUDFImpl for ToDecimalArbFromStringFunc {
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
         let precision = Self::read_return_field_literal(&args, 1, "precision")?;
         let scale = Self::read_return_field_literal(&args, 2, "scale")?;
-        build_output_field(self.name(), precision, scale)
+        let hint = Self::read_return_field_hint(&args)?;
+        build_output_field_with_hint(self.name(), precision, scale, hint)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        if args.args.len() != 3 {
-            streamling_user_bail!("to_decimal_arb_from_string requires (text, precision, scale)");
+        if !(3..=4).contains(&args.args.len()) {
+            streamling_user_bail!(
+                "to_decimal_arb_from_string requires (text, precision, scale[, native_int_kind])"
+            );
         }
         let precision = Self::read_literal_arg(&args, 1, "precision")?;
         let scale = Self::read_literal_arg(&args, 2, "scale")?;
@@ -960,11 +1081,17 @@ impl TryToDecimalArbFromStringFunc {
     pub fn new() -> Self {
         Self {
             signature: Signature::one_of(
-                vec![TypeSignature::Exact(vec![
-                    DataType::Utf8,
-                    DataType::Int64,
-                    DataType::Int64,
-                ])],
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Int64]),
+                    // Optional trailing `native_int_kind` literal ('u256' /
+                    // 'i256'); see `read_return_field_hint`.
+                    TypeSignature::Exact(vec![
+                        DataType::Utf8,
+                        DataType::Int64,
+                        DataType::Int64,
+                        DataType::Utf8,
+                    ]),
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -985,13 +1112,14 @@ impl ScalarUDFImpl for TryToDecimalArbFromStringFunc {
         let precision =
             ToDecimalArbFromStringFunc::read_return_field_literal(&args, 1, "precision")?;
         let scale = ToDecimalArbFromStringFunc::read_return_field_literal(&args, 2, "scale")?;
+        let hint = ToDecimalArbFromStringFunc::read_return_field_hint(&args)?;
         // Always nullable: any row may fail to convert.
-        build_output_field(self.name(), precision, scale)
+        build_output_field_with_hint(self.name(), precision, scale, hint)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        if args.args.len() != 3 {
+        if !(3..=4).contains(&args.args.len()) {
             streamling_user_bail!(
-                "try_to_decimal_arb_from_string requires (text, precision, scale)"
+                "try_to_decimal_arb_from_string requires (text, precision, scale[, native_int_kind])"
             );
         }
         let precision = ToDecimalArbFromStringFunc::read_literal_arg(&args, 1, "precision")?;
@@ -1428,9 +1556,10 @@ impl ScalarUDFImpl for ToDecimalArbFromIntFunc {
 
 // ---------- Metadata stamping: with_meta (CASE/COALESCE output) ----------
 
-/// `decimal_arb_with_meta(value, precision_lit, scale_lit)` — passes the
-/// `LargeBinary` value through UNCHANGED but stamps the result field with
-/// decimal_arb `(precision, scale)` metadata.
+/// `decimal_arb_with_meta(value, precision_lit, scale_lit[, native_int_kind])`
+/// — passes the `LargeBinary` value through UNCHANGED but stamps the result
+/// field with decimal_arb `(precision, scale)` metadata, plus the optional
+/// `'u256'` / `'i256'` hint for an integer-shaped result.
 ///
 /// DataFusion derives a `CASE`/`COALESCE` output field as bare `LargeBinary`,
 /// dropping the decimal_arb extension metadata (F2); a downstream sink then
@@ -1454,11 +1583,19 @@ impl DecimalArbWithMetaFunc {
     pub fn new() -> Self {
         Self {
             signature: Signature::one_of(
-                vec![TypeSignature::Exact(vec![
-                    DataType::LargeBinary,
-                    DataType::Int64,
-                    DataType::Int64,
-                ])],
+                vec![
+                    TypeSignature::Exact(vec![
+                        DataType::LargeBinary,
+                        DataType::Int64,
+                        DataType::Int64,
+                    ]),
+                    TypeSignature::Exact(vec![
+                        DataType::LargeBinary,
+                        DataType::Int64,
+                        DataType::Int64,
+                        DataType::Utf8,
+                    ]),
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -1488,12 +1625,10 @@ impl ScalarUDFImpl for DecimalArbWithMetaFunc {
         )?;
         // Preserve the input's nullability (CASE/COALESCE may be nullable).
         let nullable = args.arg_fields[0].is_nullable();
-        Ok(Arc::new(DecimalArbType::field(
-            self.name(),
-            precision,
-            scale,
-            nullable,
-        )?))
+        // The branches' agreed native_int_kind, passed by the rewrite as a
+        // literal because the CASE/COALESCE field being relabelled has none.
+        let hint = read_native_int_hint_arg(&args, 3, self.name())?;
+        decimal_arb_field_with_hint(self.name(), precision, scale, nullable, hint)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         // Passthrough — the value is already decimal_arb canonical bytes.
@@ -1674,12 +1809,13 @@ impl ScalarUDFImpl for DecimalArbRescaleFunc {
         // its shape.
         if let Some(element) = list_element_field(input.data_type()) {
             require_decimal_arb_field(element.as_ref(), self.name())?;
-            let element = Arc::new(DecimalArbType::field(
+            let element = decimal_arb_field_with_hint(
                 element.name(),
                 precision,
                 scale,
                 element.is_nullable(),
-            )?);
+                DecimalArbType::native_int_kind_from_field(element.as_ref()),
+            )?;
             return Ok(Arc::new(
                 arrow_schema::Field::new(
                     self.name(),
@@ -1689,12 +1825,15 @@ impl ScalarUDFImpl for DecimalArbRescaleFunc {
                 .with_metadata(input.metadata().clone()),
             ));
         }
-        Ok(Arc::new(DecimalArbType::field(
+        // A value re-encoded at another integer precision (a UNION branch
+        // widened to the common one) is still the native integer it was.
+        decimal_arb_field_with_hint(
             self.name(),
             precision,
             scale,
             input.is_nullable(),
-        )?))
+            DecimalArbType::native_int_kind_from_field(input.as_ref()),
+        )
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.len() != 3 || args.arg_fields.is_empty() {
@@ -1912,12 +2051,10 @@ impl ScalarUDFImpl for DecimalArbExtremeFunc {
         let (p, s) = self.output_precision_scale(args.arg_fields)?;
         // NULL only when every argument can be NULL.
         let nullable = args.arg_fields.iter().all(|f| f.is_nullable());
-        Ok(Arc::new(DecimalArbType::field(
-            self.name(),
-            p,
-            s,
-            nullable,
-        )?))
+        // The winner is one of the inputs, so it is whatever native integer
+        // they agree on.
+        let hint = agreed_native_int_kind(args.arg_fields.iter().map(|f| f.as_ref()));
+        decimal_arb_field_with_hint(self.name(), p, s, nullable, hint)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.is_empty() {
@@ -2037,7 +2174,12 @@ impl ScalarUDFImpl for DecimalArbArrayExtremeFunc {
             ))
         })?;
         let (p, s) = require_decimal_arb_field(element.as_ref(), self.name())?;
-        Ok(Arc::new(DecimalArbType::field(self.name(), p, s, true)?))
+        build_output_field_with_hint(
+            self.name(),
+            p,
+            s,
+            DecimalArbType::native_int_kind_from_field(element.as_ref()),
+        )
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let element = list_element_field(args.arg_fields[0].data_type()).ok_or_else(|| {
@@ -3672,18 +3814,13 @@ mod tests {
 
     // ------- native_int_kind hint propagation through ops -------
     //
-    // These tests lock the *current* behavior: `build_output_field` calls
-    // `DecimalArbType::field(...)` which produces a fresh field with the
-    // decimal_arb extension keys and no `native_int_kind` hint. So the hint
-    // is dropped on every binary-op output, regardless of whether the two
-    // inputs agreed.
-    //
-    // This is acceptable because the hint exists to round-trip a column's
-    // *origin* (UInt256 / Int256 source) to a matching native sink — once a
-    // value goes through arithmetic, the result is no longer "the original
-    // ClickHouse-side bytes," so dropping the hint and falling back to the
-    // generic `Decimal(p, s)` (or `coerce_to: string`) sink path is the
-    // safe default.
+    // A binary op keeps the hint its operands agree on when the result is
+    // still integer-shaped (scale 0): `UInt256 + UInt256` is a UInt256-shaped
+    // value to a ClickHouse sink, which range-checks every value on write.
+    // Dropping it made `a + b` over two hinted columns a config-load rejection
+    // where the retired `u256_add` produced `UInt256`. An unhinted operand (a
+    // coerced literal) does not strip it; mixed hints and fractional results
+    // carry none.
 
     use crate::types::decimal_arb::NativeIntKind;
 
@@ -3705,16 +3842,81 @@ mod tests {
     }
 
     #[test]
-    fn add_drops_native_int_kind_when_both_inputs_share_u256_hint() {
+    fn add_keeps_native_int_kind_when_both_inputs_share_it() {
         let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
         let rhs = hinted_field("b", 78, 0, NativeIntKind::U256);
         let out = run_add_return_field(lhs, rhs);
         assert_eq!(
+            DecimalArbType::precision_scale_from_field(&out),
+            Some((79, 0)),
+            "Add widens by one digit; the sink's range check, not the precision, guards the value"
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            Some(NativeIntKind::U256),
+        );
+    }
+
+    #[test]
+    fn div_drops_native_int_kind_because_the_result_is_fractional() {
+        let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let rhs = hinted_field("b", 78, 0, NativeIntKind::U256);
+        let arg_fields = vec![lhs, rhs];
+        let out = DecimalArbDivFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &arg_fields,
+                scalar_arguments: &[None, None],
+            })
+            .unwrap();
+        assert_eq!(
             DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
             None,
-            "current behavior: binary-op output does not carry a native_int_kind \
-             hint even when both inputs agreed — the result represents a new \
-             value, not the original ClickHouse UInt256 bytes"
+        );
+    }
+
+    #[test]
+    fn to_decimal_arb_from_string_stamps_requested_native_int_kind() {
+        use datafusion::scalar::ScalarValue;
+        let arg_fields: Vec<FieldRef> = vec![
+            Arc::new(Field::new("t", DataType::Utf8, true)),
+            Arc::new(Field::new("p", DataType::Int64, false)),
+            Arc::new(Field::new("s", DataType::Int64, false)),
+            Arc::new(Field::new("k", DataType::Utf8, false)),
+        ];
+        let p = ScalarValue::Int64(Some(78));
+        let s = ScalarValue::Int64(Some(0));
+        let k = ScalarValue::Utf8(Some("u256".to_string()));
+        let out = ToDecimalArbFromStringFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &arg_fields,
+                scalar_arguments: &[None, Some(&p), Some(&s), Some(&k)],
+            })
+            .unwrap();
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&out),
+            Some((78, 0))
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&out),
+            Some(NativeIntKind::U256)
+        );
+        // Without the trailing literal the result carries no hint.
+        let out = ToDecimalArbFromStringFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &arg_fields[..3],
+                scalar_arguments: &[None, Some(&p), Some(&s)],
+            })
+            .unwrap();
+        assert_eq!(DecimalArbType::native_int_kind_from_field(&out), None);
+        // An unknown kind is a planning error, not a silent no-hint.
+        let bad = ScalarValue::Utf8(Some("u128".to_string()));
+        assert!(
+            ToDecimalArbFromStringFunc::new()
+                .return_field_from_args(ReturnFieldArgs {
+                    arg_fields: &arg_fields,
+                    scalar_arguments: &[None, Some(&p), Some(&s), Some(&bad)],
+                })
+                .is_err()
         );
     }
 
@@ -3731,14 +3933,167 @@ mod tests {
     }
 
     #[test]
-    fn add_drops_native_int_kind_when_only_one_input_is_hinted() {
+    fn add_keeps_native_int_kind_when_only_one_input_is_hinted() {
+        // `balance + 1`: the literal is planner-coerced to an unhinted
+        // decimal_arb(20, 0) and must not strip the column's hint.
         let lhs = hinted_field("a", 78, 0, NativeIntKind::U256);
-        let rhs = Arc::new(DecimalArbType::field("b", 78, 0, true).unwrap());
+        let rhs = Arc::new(DecimalArbType::field("b", 20, 0, true).unwrap());
         let out = run_add_return_field(lhs, rhs);
         assert_eq!(
             DecimalArbType::native_int_kind_from_field_metadata(out.metadata()),
+            Some(NativeIntKind::U256),
+        );
+    }
+
+    fn unary_return_field(func: &dyn ScalarUDFImpl, input: &FieldRef) -> FieldRef {
+        func.return_field_from_args(ReturnFieldArgs {
+            arg_fields: std::slice::from_ref(input),
+            scalar_arguments: &[None],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn neg_turns_any_native_int_kind_into_i256_and_abs_keeps_it() {
+        let u = hinted_field("a", 78, 0, NativeIntKind::U256);
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&unary_return_field(
+                &DecimalArbNegFunc::new(),
+                &u
+            )),
+            Some(NativeIntKind::I256),
+            "-x over an unsigned column is a signed value"
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&unary_return_field(
+                &DecimalArbAbsFunc::new(),
+                &u
+            )),
+            Some(NativeIntKind::U256)
+        );
+        let unhinted = Arc::new(DecimalArbType::field("b", 78, 0, true).unwrap());
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&unary_return_field(
+                &DecimalArbNegFunc::new(),
+                &unhinted
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn with_meta_and_rescale_carry_the_hint_for_an_integer_result() {
+        use datafusion::scalar::ScalarValue;
+        let int_lit = |v: i64| ScalarValue::Int64(Some(v));
+        let lit_fields = [
+            Arc::new(Field::new("p", DataType::Int64, false)),
+            Arc::new(Field::new("s", DataType::Int64, false)),
+            Arc::new(Field::new("k", DataType::Utf8, false)),
+        ];
+        // with_meta: the CASE field it relabels has no metadata, so the
+        // rewrite passes the branches' hint as a literal.
+        let bare: FieldRef = Arc::new(Field::new("case", DataType::LargeBinary, true));
+        let (p, s, kind) = (
+            int_lit(78),
+            int_lit(0),
+            ScalarValue::Utf8(Some("u256".into())),
+        );
+        let four = vec![
+            bare.clone(),
+            lit_fields[0].clone(),
+            lit_fields[1].clone(),
+            lit_fields[2].clone(),
+        ];
+        let out = DecimalArbWithMetaFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &four,
+                scalar_arguments: &[None, Some(&p), Some(&s), Some(&kind)],
+            })
+            .unwrap();
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&out),
+            Some((78, 0))
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&out),
+            Some(NativeIntKind::U256)
+        );
+        // Three arguments: the original form, no hint.
+        let three = vec![bare, lit_fields[0].clone(), lit_fields[1].clone()];
+        let out = DecimalArbWithMetaFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &three,
+                scalar_arguments: &[None, Some(&p), Some(&s)],
+            })
+            .unwrap();
+        assert_eq!(DecimalArbType::native_int_kind_from_field(&out), None);
+
+        // rescale: a UNION branch widened to the common integer precision
+        // keeps its hint; a fractional target drops it.
+        let hinted = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let (wide, frac) = (int_lit(100), int_lit(18));
+        let rescale_args = vec![hinted, lit_fields[0].clone(), lit_fields[1].clone()];
+        let out = DecimalArbRescaleFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &rescale_args,
+                scalar_arguments: &[None, Some(&wide), Some(&s)],
+            })
+            .unwrap();
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&out),
+            Some((100, 0))
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&out),
+            Some(NativeIntKind::U256)
+        );
+        let out = DecimalArbRescaleFunc::new()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &rescale_args,
+                scalar_arguments: &[None, Some(&wide), Some(&frac)],
+            })
+            .unwrap();
+        assert_eq!(DecimalArbType::native_int_kind_from_field(&out), None);
+    }
+
+    #[test]
+    fn greatest_and_array_max_carry_the_agreed_hint() {
+        let a = hinted_field("a", 78, 0, NativeIntKind::U256);
+        let b: FieldRef = Arc::new(DecimalArbType::field("b", 20, 0, true).unwrap());
+        let c = hinted_field("c", 78, 0, NativeIntKind::I256);
+        let greatest = |fields: Vec<FieldRef>| {
+            let scalars = vec![None; fields.len()];
+            DecimalArbExtremeFunc::greatest()
+                .return_field_from_args(ReturnFieldArgs {
+                    arg_fields: &fields,
+                    scalar_arguments: &scalars,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&greatest(vec![a.clone(), b])),
+            Some(NativeIntKind::U256),
+            "an unhinted operand does not strip the hint"
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&greatest(vec![a.clone(), c])),
             None,
-            "single-hinted input does not propagate the hint to the output"
+            "u256 next to i256 has no single native type"
+        );
+        let list: FieldRef = Arc::new(Field::new(
+            "l",
+            DataType::List(Arc::new(a.as_ref().clone().with_name("item"))),
+            true,
+        ));
+        let out = DecimalArbArrayExtremeFunc::max()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: std::slice::from_ref(&list),
+                scalar_arguments: &[None],
+            })
+            .unwrap();
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(&out),
+            Some(NativeIntKind::U256)
         );
     }
 }

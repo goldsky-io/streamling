@@ -64,6 +64,7 @@
 //! (Recursion into sub-expressions is handled by the analyzer; `rewrite` only
 //! inspects the top node, whose children have already been rewritten.)
 
+use crate::functions::decimal_arb_ops::agreed_native_int_kind;
 use crate::functions::decimal_arb_ops::{
     DecimalArbAbsFunc, DecimalArbArrayExtremeFunc, DecimalArbArraySortFunc, DecimalArbEqFunc,
     DecimalArbExtremeFunc, DecimalArbGtFunc, DecimalArbGteFunc, DecimalArbLtFunc,
@@ -72,7 +73,7 @@ use crate::functions::decimal_arb_ops::{
     ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
     ToDecimalArbFromStringFunc,
 };
-use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION};
+use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION, NativeIntKind};
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::Transformed;
@@ -245,14 +246,43 @@ impl DecimalArbExprRewrite {
         })
     }
 
-    /// Wrap `expr` in `decimal_arb_with_meta(expr, p, s)` to restore decimal_arb
-    /// field metadata that CASE/COALESCE planning drops. Only correct when
-    /// `expr`'s bytes already sit at scale `s` — see [`Self::unify`].
-    fn stamp_meta(&self, expr: Expr, precision: u32, scale: u32) -> Expr {
-        Self::call(
-            &self.with_meta,
-            vec![expr, lit(precision as i64), lit(scale as i64)],
-        )
+    /// Wrap `expr` in `decimal_arb_with_meta(expr, p, s[, hint])` to restore
+    /// decimal_arb field metadata that CASE/COALESCE planning drops. Only
+    /// correct when `expr`'s bytes already sit at scale `s` — see
+    /// [`Self::unify`]. `hint` is the branches' agreed `native_int_kind`,
+    /// passed as a literal because the field being relabelled carries none;
+    /// a ClickHouse sink storing the column as `UInt256` would otherwise
+    /// reject `COALESCE(balance, 0)` at config load.
+    fn stamp_meta(
+        &self,
+        expr: Expr,
+        precision: u32,
+        scale: u32,
+        hint: Option<NativeIntKind>,
+    ) -> Expr {
+        let mut args = vec![expr, lit(precision as i64), lit(scale as i64)];
+        if let Some(kind) = hint.filter(|_| scale == 0) {
+            args.push(lit(kind.as_str()));
+        }
+        Self::call(&self.with_meta, args)
+    }
+
+    /// The `native_int_kind` the decimal_arb members of `exprs` agree on; an
+    /// unhinted member (a coerced literal) does not strip it, two different
+    /// hints do.
+    fn native_int_hint(&self, exprs: &[Expr], schema: &DFSchema) -> Option<NativeIntKind> {
+        let fields: Vec<FieldRef> = exprs
+            .iter()
+            .filter_map(|e| Self::field_of(e, schema))
+            .collect();
+        agreed_native_int_kind(fields.iter().map(|f| f.as_ref()))
+    }
+
+    /// The hint of a list expression's decimal_arb elements.
+    fn list_native_int_hint(&self, expr: &Expr, schema: &DFSchema) -> Option<NativeIntKind> {
+        let field = Self::field_of(expr, schema)?;
+        let element = list_element(field.data_type())?;
+        DecimalArbType::native_int_kind_from_field(element)
     }
 
     /// `decimal_arb_rescale(expr, p, s)` — re-encode at scale `s`, value
@@ -832,10 +862,12 @@ impl DecimalArbExprRewrite {
                 let Some((p, s)) = list_meta(0) else {
                     return Ok(None);
                 };
+                let hint = self.list_native_int_hint(&sf.args[0], schema);
                 Ok(Some(Transformed::yes(self.stamp_meta(
                     Expr::ScalarFunction(sf),
                     p,
                     s,
+                    hint,
                 ))))
             }
             // list, scalar → bool / index: compare at a common scale.
@@ -1172,6 +1204,7 @@ impl DecimalArbExprRewrite {
                 if let Some(e) = &case.else_expr {
                     branches.push((**e).clone());
                 }
+                let hint = self.native_int_hint(&branches, schema);
                 match self.unify(branches, schema)? {
                     Some((mut exprs, p, s)) => {
                         let else_expr = if case.else_expr.is_some() {
@@ -1193,6 +1226,7 @@ impl DecimalArbExprRewrite {
                             }),
                             p,
                             s,
+                            hint,
                         )))
                     }
                     None if changed => Ok(Transformed::yes(Expr::Case(case))),
@@ -1203,11 +1237,13 @@ impl DecimalArbExprRewrite {
             // IFNULL coerce LargeBinary to text in DataFusion, so they become
             // COALESCE, which keeps the bytes.
             Expr::ScalarFunction(sf) if matches!(sf.func.name(), "coalesce" | "nvl" | "ifnull") => {
+                let hint = self.native_int_hint(&sf.args, schema);
                 match self.unify(sf.args.clone(), schema)? {
                     Some((args, p, s)) => Ok(Transformed::yes(self.stamp_meta(
                         Self::call(&self.coalesce, args),
                         p,
                         s,
+                        hint,
                     ))),
                     None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
                 }
@@ -1218,6 +1254,7 @@ impl DecimalArbExprRewrite {
                     && sf.args.len() == 3
                     && sf.args[1..].iter().any(|a| self.is_decimal_arb(a, schema)) =>
             {
+                let hint = self.native_int_hint(&sf.args[1..], schema);
                 match self.unify(sf.args[1..].to_vec(), schema)? {
                     Some((branches, p, s)) => {
                         let mut args = vec![sf.args[0].clone()];
@@ -1229,6 +1266,7 @@ impl DecimalArbExprRewrite {
                             }),
                             p,
                             s,
+                            hint,
                         )))
                     }
                     None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
@@ -1242,6 +1280,8 @@ impl DecimalArbExprRewrite {
                     && sf.args.len() == 2
                     && sf.args.iter().any(|a| self.is_decimal_arb(a, schema)) =>
             {
+                // The result is `a`, so it carries `a`'s hint.
+                let hint = self.native_int_hint(&sf.args[..1], schema);
                 match self.unify(sf.args.clone(), schema)? {
                     Some((args, p, s)) => Ok(Transformed::yes(self.stamp_meta(
                         Expr::ScalarFunction(ScalarFunction {
@@ -1250,6 +1290,7 @@ impl DecimalArbExprRewrite {
                         }),
                         p,
                         s,
+                        hint,
                     ))),
                     None => Ok(Transformed::no(Expr::ScalarFunction(sf))),
                 }
@@ -1402,7 +1443,10 @@ impl DecimalArbExprRewrite {
                 match Self::field_of(&expr, schema)
                     .and_then(|f| DecimalArbType::precision_scale_from_field(&f))
                 {
-                    Some((p, s)) => Ok(Transformed::yes(self.stamp_meta(expr, p, s))),
+                    Some((p, s)) => {
+                        let hint = self.native_int_hint(std::slice::from_ref(&expr), schema);
+                        Ok(Transformed::yes(self.stamp_meta(expr, p, s, hint)))
+                    }
                     None => Ok(Transformed::no(expr)),
                 }
             }
@@ -1722,6 +1766,80 @@ mod tests {
             DecimalArbType::is_decimal_arb_field(&field),
             "COALESCE over decimal_arb must retain metadata (F2); got {field:?}"
         );
+    }
+
+    /// `h(id Int64, balance decimal_arb(78, 0) + u256)` — a wide-int column
+    /// as the Avro reader or a Postgres `NUMERIC(78, 0)` source produces it.
+    async fn make_hinted_session() -> SessionContext {
+        let id = Field::new("id", DataType::Int64, false);
+        let balance = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("balance", 78, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![id, balance]));
+        let mut b = DecimalArbArrayBuilder::with_capacity(2, "balance", 78, 0).unwrap();
+        b.append_str("5").unwrap();
+        b.append_null();
+        let (arr, _, _) = b.finish().into_inner();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(arr)],
+        )
+        .unwrap();
+        let state = SessionStateBuilder::new().with_default_features().build();
+        let mut ctx = SessionContext::new_with_state(state);
+        // The production function set: its `DecimalArbBuiltinShim` wrappers
+        // let `coalesce(decimal_arb, 0)` plan (DataFusion checks a builtin's
+        // argument types while building the projection, before this rewrite
+        // runs) so the rewrite can then coerce the literal.
+        for udf in crate::functions::CommonFunctions::functions() {
+            ctx.register_udf(udf);
+        }
+        ctx.register_function_rewrite(Arc::new(DecimalArbExprRewrite::new()))
+            .unwrap();
+        ctx.register_batch("h", batch).unwrap();
+        ctx
+    }
+
+    async fn output_field(ctx: &SessionContext, sql: &str) -> Field {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches[0].schema().field(0).clone()
+    }
+
+    #[tokio::test]
+    async fn branches_over_a_hinted_column_keep_its_native_int_kind() {
+        let ctx = make_hinted_session().await;
+        // The literal is coerced to an unhinted decimal_arb(20, 0); it must
+        // not strip the column's hint, or a ClickHouse sink that stores
+        // `balance` as UInt256 rejects `COALESCE(balance, 0)` at config load.
+        for sql in [
+            "SELECT COALESCE(balance, 0) AS v FROM h",
+            "SELECT CASE WHEN id > 1 THEN balance ELSE 0 END AS v FROM h",
+            "SELECT NULLIF(balance, 0) AS v FROM h",
+            "SELECT GREATEST(balance, 1) AS v FROM h",
+        ] {
+            let field = output_field(&ctx, sql).await;
+            assert_eq!(
+                DecimalArbType::precision_scale_from_field(&field).map(|(_, s)| s),
+                Some(0),
+                "{sql}: {field:?}"
+            );
+            assert_eq!(
+                DecimalArbType::native_int_kind_from_field(&field),
+                Some(NativeIntKind::U256),
+                "{sql}: {field:?}"
+            );
+        }
+        // A fractional result has no native integer type. (The SQL
+        // preprocessor quotes an inexact literal before planning.)
+        let field = output_field(&ctx, "SELECT COALESCE(balance, '0.5') AS v FROM h").await;
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(&field).map(|(_, s)| s),
+            Some(1),
+            "{field:?}"
+        );
+        assert_eq!(DecimalArbType::native_int_kind_from_field(&field), None);
     }
 
     #[tokio::test]

@@ -411,7 +411,6 @@ fn clickhouse_decimal_arb_conversion(
                 native_int_kind,
                 Some(NativeIntKind::U256) | Some(NativeIntKind::I256)
             ) && scale == 0
-                && precision <= 78
             {
                 Ok(Some(ClickHouseDecimalArbConversion::NativeIntBytes))
             } else {
@@ -1042,7 +1041,14 @@ impl TableProvider for ClickHouseTableProvider {
         // declares (Decimal128/256 or canonical String) before the batch is
         // serialized; native-int-hinted columns are left for the byte-level
         // normalizer below.
-        let input_schema = projection_exec.schema();
+        // `schema_override: {col: UInt256 | Int256}` on an integer-shaped
+        // decimal_arb column is the operator pinning its native type: read it
+        // as the hint it is, so the conversion routes the column to the
+        // native-byte path instead of rejecting it.
+        let input_schema = Arc::new(ClickHouseClient::apply_native_int_overrides(
+            projection_exec.schema().as_ref(),
+            sink_params.schema_override.as_ref(),
+        ));
         let projection_exec = build_decimal_arb_projection_for_clickhouse(
             state,
             projection_exec,
@@ -1051,8 +1057,9 @@ impl TableProvider for ClickHouseTableProvider {
         )?;
 
         let input_schema = projection_exec.schema();
-        let schema = Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
+        let schema = Arc::new(ClickHouseClient::normalize_sink_schema(
             input_schema.as_ref(),
+            sink_params.schema_override.as_ref(),
         ));
 
         let clickhouse_sink = Arc::new(ClickHouseSinkExec {
@@ -1354,10 +1361,10 @@ impl DataSink for ClickHouseSinkExec {
                 if let Some(insert_rows) = insert_rows {
                     let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
                     // Build schema without _gs_op for INSERTs
-                    let insert_schema =
-                        Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
-                            insert_batch.schema().as_ref(),
-                        ));
+                    let insert_schema = Arc::new(ClickHouseClient::normalize_sink_schema(
+                        insert_batch.schema().as_ref(),
+                        self.schema_override.as_ref(),
+                    ));
 
                     let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
                     let mut shutdown = streamling_core::shutdown::subscribe();
@@ -2649,6 +2656,61 @@ impl ClickHouseClient {
         Ok(scalar_to_i128(&scalar).unwrap_or(0).max(0) as u64)
     }
 
+    /// The sink's wire schema: `schema_override` native-int pins applied as
+    /// hints, then [`Self::normalize_schema_for_clickhouse`].
+    fn normalize_sink_schema(
+        schema: &arrow::datatypes::Schema,
+        schema_override: Option<&std::collections::HashMap<String, String>>,
+    ) -> arrow::datatypes::Schema {
+        Self::normalize_schema_for_clickhouse(&Self::apply_native_int_overrides(
+            schema,
+            schema_override,
+        ))
+    }
+
+    /// Read `schema_override: {column: UInt256 | Int256}` — under a
+    /// `Nullable(...)` / `LowCardinality(...)` wrapper, followed by any column
+    /// clause the DDL copies verbatim (`DEFAULT`, `CODEC`) — as the
+    /// `native_int_kind` hint it expresses for
+    /// an integer-shaped (scale 0) decimal_arb column, and stamp it on the
+    /// field (replacing any hint the source set). An operator pinning a
+    /// column this way — a signed `NUMERIC(78, 0)` source that must land as
+    /// `Int256`, or a column whose hint was lost on the way — gets the
+    /// native-byte path and the config-load validator's agreement. Before,
+    /// the override only changed the `CREATE TABLE` text while the validator
+    /// and the data path still rejected the column. Other overrides and
+    /// non-decimal_arb columns are untouched.
+    pub fn apply_native_int_overrides(
+        schema: &arrow::datatypes::Schema,
+        schema_override: Option<&std::collections::HashMap<String, String>>,
+    ) -> arrow::datatypes::Schema {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        let Some(overrides) = schema_override else {
+            return schema.clone();
+        };
+        let fields: Vec<arrow::datatypes::FieldRef> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let Some(kind) = overrides
+                    .get(field.name())
+                    .and_then(|ch_type| native_int_kind_from_clickhouse_type(ch_type))
+                else {
+                    return Arc::clone(field);
+                };
+                match DecimalArbType::precision_scale_from_field(field) {
+                    Some((_, 0)) => {
+                        DecimalArbType::with_native_int_kind(field.as_ref().clone(), kind)
+                            .map(Arc::new)
+                            .unwrap_or_else(|_| Arc::clone(field))
+                    }
+                    _ => Arc::clone(field),
+                }
+            })
+            .collect();
+        arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone())
+    }
+
     /// Normalize schema for ClickHouse Arrow IPC: convert view types to standard types
     fn normalize_schema_for_clickhouse(
         schema: &arrow::datatypes::Schema,
@@ -2698,13 +2760,12 @@ impl ClickHouseClient {
                 }
 
                 if DecimalArbType::is_decimal_arb_field(field)
-                    && let (Some((precision, scale)), Some(kind)) = (
+                    && let (Some((_, scale)), Some(kind)) = (
                         DecimalArbType::precision_scale_from_field(field),
                         DecimalArbType::native_int_kind_from_field(field),
                     )
                     && scale == 0
                     && matches!(kind, NativeIntKind::U256 | NativeIntKind::I256)
-                    && precision <= 78
                 {
                     return Arc::new(
                         Field::new(
@@ -2818,7 +2879,16 @@ impl ClickHouseClient {
                     // Convert canonical decimal_arb bytes (sign byte + BE
                     // magnitude) into 32-byte little-endian for ClickHouse.
                     (DataType::LargeBinary, DataType::FixedSizeBinary(32)) => {
-                        decimal_arb_to_clickhouse_native(column.as_ref(), original_field)
+                        // The hint comes from the sink schema's field: a
+                        // `schema_override` pin is stamped there, not on the
+                        // batch the plan produced.
+                        let hinted = Arc::new(
+                            original_field
+                                .as_ref()
+                                .clone()
+                                .with_metadata(normalized_field.metadata().clone()),
+                        );
+                        decimal_arb_to_clickhouse_native(column.as_ref(), &hinted)
                             .map_err(DataFusionError::from)
                     }
                     // Retired big-endian `streamling.u256` / `streamling.i256`
@@ -3355,12 +3425,8 @@ impl ClickHouseClient {
                 native_int_kind,
             ) {
                 CapabilityResult::Native => match native_int_kind {
-                    Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
-                        "UInt256".to_string()
-                    }
-                    Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
-                        "Int256".to_string()
-                    }
+                    Some(NativeIntKind::U256) if scale == 0 => "UInt256".to_string(),
+                    Some(NativeIntKind::I256) if scale == 0 => "Int256".to_string(),
                     _ => format!("Decimal({}, {})", precision, scale),
                 },
                 CapabilityResult::OptInOnly(_) => "String".to_string(),
@@ -4352,6 +4418,133 @@ mod tests {
     }
 
     // ------- hard-rejection: clickhouse_column_type -------
+
+    #[test]
+    fn schema_override_native_int_pin_becomes_the_hint() {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        // A signed NUMERIC(78, 0) source arrives hinted u256; the operator
+        // pins it to Int256. A hint-less wide integer column (e.g. a SUM
+        // result) gets UInt256. A fractional column and a non-decimal_arb
+        // column are left alone, as is a column with no override.
+        let signed = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("signed", 78, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        let total = DecimalArbType::field("total", 94, 0, true).unwrap();
+        let price = DecimalArbType::field("price", 100, 18, true).unwrap();
+        let id = arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false);
+        let untouched = DecimalArbType::field("untouched", 78, 0, true).unwrap();
+        let schema = Schema::new(vec![signed, total, price, id, untouched]);
+        let overrides: std::collections::HashMap<String, String> = [
+            ("signed", "Nullable(Int256)"),
+            ("total", "UInt256"),
+            ("price", "UInt256"),
+            ("id", "UInt256"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let stamped = ClickHouseClient::apply_native_int_overrides(&schema, Some(&overrides));
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(stamped.field(0)),
+            Some(NativeIntKind::I256)
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(stamped.field(1)),
+            Some(NativeIntKind::U256)
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(stamped.field(2)),
+            None,
+            "a fractional column is not an integer"
+        );
+        assert_eq!(stamped.field(3), schema.field(3));
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(stamped.field(4)),
+            None
+        );
+        // Without overrides the schema is returned as-is.
+        assert_eq!(
+            ClickHouseClient::apply_native_int_overrides(&schema, None),
+            schema
+        );
+
+        // The pin flows through to the wire schema and the DDL: the signed
+        // column is normalised to FixedSizeBinary(32) and typed Int256.
+        let wire = ClickHouseClient::normalize_sink_schema(&schema, Some(&overrides));
+        assert_eq!(
+            wire.field(0).data_type(),
+            &arrow::datatypes::DataType::FixedSizeBinary(32)
+        );
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(wire.field(0), None).unwrap(),
+            "Nullable(Int256)"
+        );
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(wire.field(1), None).unwrap(),
+            "Nullable(UInt256)"
+        );
+    }
+
+    #[test]
+    fn native_int_kind_from_clickhouse_type_reads_nullable_and_case() {
+        use streamling_core::types::decimal_arb::NativeIntKind;
+        assert_eq!(
+            native_int_kind_from_clickhouse_type("UInt256"),
+            Some(NativeIntKind::U256)
+        );
+        assert_eq!(
+            native_int_kind_from_clickhouse_type(" Nullable( Int256 ) "),
+            Some(NativeIntKind::I256)
+        );
+        assert_eq!(
+            native_int_kind_from_clickhouse_type("nullable(uint256)"),
+            Some(NativeIntKind::U256)
+        );
+        assert_eq!(native_int_kind_from_clickhouse_type("Decimal(78, 0)"), None);
+        assert_eq!(native_int_kind_from_clickhouse_type("UInt64"), None);
+        // A pin is a DDL fragment: the column clauses and the wrappers the
+        // DDL copies verbatim do not hide the type.
+        assert_eq!(
+            native_int_kind_from_clickhouse_type("UInt256 DEFAULT 0 CODEC(ZSTD)"),
+            Some(NativeIntKind::U256)
+        );
+        assert_eq!(
+            native_int_kind_from_clickhouse_type("Nullable(Int256) COMMENT 'signed'"),
+            Some(NativeIntKind::I256)
+        );
+        assert_eq!(
+            native_int_kind_from_clickhouse_type("LowCardinality(Nullable(UInt256))"),
+            Some(NativeIntKind::U256)
+        );
+        assert_eq!(
+            native_int_kind_from_clickhouse_type("Decimal(78, 0) DEFAULT 0"),
+            None
+        );
+    }
+
+    #[test]
+    fn hinted_integer_column_is_native_at_any_precision() {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        // Avro decimal(100, 0) carries the u256 hint; the sink's write-time
+        // range check guards the value, not the declared precision.
+        let wide = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("amount", 100, 0, false).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        assert_eq!(
+            ClickHouseClient::clickhouse_column_type(&wide, None).unwrap(),
+            "UInt256"
+        );
+        let wire = ClickHouseClient::normalize_schema_for_clickhouse(&Schema::new(vec![wide]));
+        assert_eq!(
+            wire.field(0).data_type(),
+            &arrow::datatypes::DataType::FixedSizeBinary(32)
+        );
+    }
 
     #[test]
     fn clickhouse_column_type_native_for_decimal_arb_within_cap() {
@@ -5849,6 +6042,54 @@ pub fn decimal_arb_to_clickhouse_native(
         })?;
     }
     Ok(Arc::new(builder.finish()))
+}
+
+/// The native-int kind a `schema_override` entry pins a column to: `UInt256`
+/// / `Int256`, in any case, under `Nullable(...)` / `LowCardinality(...)`
+/// wrappers, and followed by any column clause the DDL copies verbatim
+/// (`DEFAULT 0`, `CODEC(ZSTD)`, `COMMENT '…'`); `None` for every other type.
+fn native_int_kind_from_clickhouse_type(
+    ch_type: &str,
+) -> Option<streamling_core::types::decimal_arb::NativeIntKind> {
+    use streamling_core::types::decimal_arb::NativeIntKind;
+    // The type is the first token; whitespace inside its parentheses
+    // (`Nullable( Int256 )`) does not end it, whitespace after them does.
+    let trimmed = ch_type.trim();
+    let mut depth = 0_i32;
+    let mut end = trimmed.len();
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let mut inner: String = trimmed[..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    loop {
+        let peeled = ["nullable(", "lowcardinality("].iter().find_map(|wrapper| {
+            inner
+                .strip_prefix(wrapper)
+                .and_then(|rest| rest.strip_suffix(')'))
+                .map(str::to_owned)
+        });
+        match peeled {
+            Some(peeled) => inner = peeled,
+            None => break,
+        }
+    }
+    match inner.as_str() {
+        "uint256" => Some(NativeIntKind::U256),
+        "int256" => Some(NativeIntKind::I256),
+        _ => None,
+    }
 }
 
 /// Convert one canonical decimal_arb byte slice to a 32-byte LE buffer

@@ -546,6 +546,22 @@ fn function_args_mut(func: &mut Function) -> Vec<&mut SqlExpr> {
     }
 }
 
+/// The trailing `native_int_kind` argument for a `CAST(… AS DECIMAL(p, s))`
+/// rewrite. `DECIMAL(77..=78, 0)` was the documented way to get a `u256`
+/// column before the type was retired — it became `to_u256(x)`, which a
+/// ClickHouse sink stored as `UInt256`. The decimal_arb constructor keeps that
+/// routing by stamping the `u256` hint for the same window; without it the
+/// cast result is a hint-less `decimal_arb(78, 0)` that the ClickHouse sink
+/// rejects at config load. Wider or fractional casts carry no hint, as before
+/// (they went to `String` on the retired path).
+fn native_int_hint_arg(precision: u32, scale: i32) -> String {
+    if (77..=78).contains(&precision) && scale == 0 {
+        ", 'u256'".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// UDFs that produce decimal_arb whatever their arguments.
 const DECIMAL_ARB_CONSTRUCTORS: &[&str] = &[
     "to_decimal_arb_from_string",
@@ -892,8 +908,11 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                     format!("TRY_CAST({expr} AS VARCHAR)")
                 };
                 format!(
-                    "try_to_decimal_arb_from_string({}, {}, {})",
-                    text, precision, scale
+                    "try_to_decimal_arb_from_string({}, {}, {}{})",
+                    text,
+                    precision,
+                    scale,
+                    native_int_hint_arg(precision, scale)
                 )
             } else {
                 caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
@@ -955,9 +974,14 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
             Some(text) => format!("'{text}'"),
             None => format!("CAST({inner} AS VARCHAR)"),
         };
+        let hint = u32::try_from(precision)
+            .ok()
+            .zip(i32::try_from(scale).ok())
+            .map(|(p, s)| native_int_hint_arg(p, s))
+            .unwrap_or_default();
         let call_sql = format!(
-            "SELECT {}({}, {}, {})",
-            function, inner_sql, precision, scale
+            "SELECT {}({}, {}, {}{})",
+            function, inner_sql, precision, scale, hint
         );
         let mut stmts = Parser::parse_sql(&dialect, call_sql.as_str()).ok()?;
         if stmts.len() != 1 {
@@ -1087,11 +1111,14 @@ mod tests {
         // CAST AS DECIMAL(78, 0) routes through the decimal_arb cast
         // UDF. The legacy `to_u256` fast path
         // is retired alongside the U256/I256 extension types.
+        // `DECIMAL(77..=78, 0)` keeps the u256 routing the retired `to_u256`
+        // gave it, as a trailing hint argument, so a ClickHouse sink still
+        // stores the column as `UInt256`.
         let sql = "SELECT CAST(balance AS DECIMAL(78, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
         );
     }
 
@@ -1102,7 +1129,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(value AS VARCHAR), 77, 0) FROM data"
+            "SELECT to_decimal_arb_from_string(CAST(value AS VARCHAR), 77, 0, 'u256') FROM data"
         );
     }
 
@@ -1152,7 +1179,7 @@ mod tests {
         // TRY_CAST is non-throwing, so it takes the `try_` constructor.
         assert_eq!(
             result,
-            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
         );
     }
 
@@ -1164,13 +1191,13 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT try_to_decimal_arb_from_string('18446744073709551617', 77, 0) FROM t"
+            "SELECT try_to_decimal_arb_from_string('18446744073709551617', 77, 0, 'u256') FROM t"
         );
         let sql = "SELECT CAST(18446744073709551617 AS DECIMAL(77, 0)) FROM t";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string('18446744073709551617', 77, 0) FROM t"
+            "SELECT to_decimal_arb_from_string('18446744073709551617', 77, 0, 'u256') FROM t"
         );
     }
 
@@ -1213,7 +1240,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(a AS VARCHAR), 78, 0), \
+            "SELECT to_decimal_arb_from_string(CAST(a AS VARCHAR), 78, 0, 'u256'), \
              to_decimal_arb_from_string(CAST(b AS VARCHAR), 100, 0) FROM t"
         );
     }
@@ -1224,7 +1251,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0) FROM accounts"
+            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
         );
     }
 

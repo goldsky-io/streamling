@@ -2496,8 +2496,17 @@ impl Streamling {
                             .parsed_batch_flush_interval()
                             .map_err(|e| streamling_user_err!("{}: {e:#}", ctx.format()))?,
                     });
+                    // A `schema_override` of `UInt256` / `Int256` on an
+                    // integer-shaped decimal_arb column is the operator pinning
+                    // its native type; the validator has to see it as the hint
+                    // it is, or it rejects a column the sink would carry.
+                    let validated_schema =
+                        streamling_connectors::table_providers::clickhouse::ClickHouseClient::apply_native_int_overrides(
+                            &source_schema,
+                            clickhouse_sink.schema_override.as_ref(),
+                        );
                     validate_sink_decimal_arb(
-                        &source_schema,
+                        &validated_schema,
                         streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
                         app_config.clickhouse_sink.connection.columns.as_deref(),
                         &reference_name,
@@ -4313,16 +4322,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_sink_decimal_arb_plugin_rejects_by_default() {
+    fn validate_sink_decimal_arb_plugin_passes_through() {
+        // The host hands the batch to the plugin unchanged; a wide-int
+        // pipeline into a plugin sink must start, as it did before the type
+        // was retired.
         let schema = arb_schema(50, 10);
-        let err = validate_sink_decimal_arb(
+        validate_sink_decimal_arb(
             &schema,
             streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
             None,
             "my_plugin",
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("my_plugin"));
+        .expect("plugin sinks carry decimal_arb as-is");
     }
 
     #[test]

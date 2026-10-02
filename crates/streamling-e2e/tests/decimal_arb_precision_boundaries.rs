@@ -267,8 +267,8 @@ async fn decarb_leading_zero_unscaled_bytes() {
 async fn decarb_value_exceeds_u256_range_78_digits() {
     init_tracing();
     let ctx = TestContext::new().await.unwrap();
-    // 2^256 - 1 = 78 digits, beyond the 77..=78 u256-hint window's safe range
-    // for some sinks; Postgres NUMERIC should still take it losslessly.
+    // 2^256 - 1 = 78 digits, the top of the UInt256 range a ClickHouse sink
+    // would check against; Postgres NUMERIC takes it losslessly either way.
     let v = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
     let rows = ingest_to_pg(&ctx, 100, 0, "NUMERIC(100,0)", &[(1, v)]).await;
     assert_eq!(

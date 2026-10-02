@@ -1893,12 +1893,8 @@ impl ClickHouseSchemaAdapter {
                 native_int_kind,
             ) {
                 CapabilityResult::Native => match native_int_kind {
-                    Some(NativeIntKind::U256) if scale == 0 && precision <= 78 => {
-                        "UInt256".to_string()
-                    }
-                    Some(NativeIntKind::I256) if scale == 0 && precision <= 78 => {
-                        "Int256".to_string()
-                    }
+                    Some(NativeIntKind::U256) if scale == 0 => "UInt256".to_string(),
+                    Some(NativeIntKind::I256) if scale == 0 => "Int256".to_string(),
                     _ => format!("Decimal({}, {})", precision, scale),
                 },
                 CapabilityResult::OptInOnly(_) => "String".to_string(),
@@ -1931,9 +1927,8 @@ impl ClickHouseSchemaAdapter {
     /// hint still routes to `String`).
     fn clickhouse_read_type(target_field: &Field) -> String {
         use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
-        if let Some((precision, scale)) = DecimalArbType::precision_scale_from_field(target_field)
+        if let Some((_, scale)) = DecimalArbType::precision_scale_from_field(target_field)
             && scale == 0
-            && precision <= 78
         {
             match DecimalArbType::native_int_kind_from_field(target_field) {
                 Some(NativeIntKind::U256) => return "UInt256".to_string(),

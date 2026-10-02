@@ -2,14 +2,14 @@
 //! the Kafka(Avro) -> ClickHouse sink, exercising every materialization the
 //! ClickHouse table provider can emit for a decimal column:
 //!
-//!   - native `UInt256` (decimal(77..=78, 0) -> u256 hint),
+//!   - native `UInt256` (every decimal(p > 76, 0) -> u256 hint),
 //!   - `String` via the `coerce_to: string` opt-in (wide decimal_arb,
 //!     p > 76 with a non-zero scale, which ClickHouse Decimal cannot hold),
 //!   - narrow `Decimal(p, s)` / `Decimal256` (p <= 76).
 //!
 //! The goal is to surface runtime errors and silent corruption at the
 //! representation-switch boundaries (Decimal128 <= 38 < Decimal256 <= 76 <
-//! decimal_arb, and the 77..=78 u256-hint window). Some assertions document
+//! decimal_arb, and the u256 hint on integer-shaped columns). Some assertions document
 //! EXPECTED failures (findings) — every test still compiles and runs a real
 //! pipeline against produced input.
 
@@ -229,11 +229,14 @@ async fn dec78_scale0_uint256_zero() {
 }
 
 // ===========================================================================
-// 4. decimal(90, 0) wide (no native u256 hint because p > 78) WITHOUT
-//    coerce_to:string -> EXPECTED config-load rejection.
+// 4. decimal(90, 0) wide WITHOUT coerce_to:string -> lands as native UInt256.
+//    Every integer-shaped `decimal(p > 76, 0)` carries the u256 hint — the
+//    routing the retired u256 type had — so a pipeline that loaded before the
+//    migration still loads. A value above 2^256 - 1 now fails the write
+//    loudly instead of being truncated (test 5 covers the String route).
 // ===========================================================================
 #[tokio::test]
-async fn dec90_scale0_no_coerce_rejected_at_config_load() {
+async fn dec90_scale0_no_coerce_lands_as_uint256() {
     init_tracing();
     let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
         .await
@@ -245,22 +248,21 @@ async fn dec90_scale0_no_coerce_rejected_at_config_load() {
         .await
         .unwrap();
 
-    let yaml = pipeline_yaml(&ctx.kafka_topic, "dec90_reject");
-    let out = ctx
-        .run_pipeline_raw(&yaml, opts_with_clickhouse(&ctx, 1))
+    let yaml = pipeline_yaml(&ctx.kafka_topic, "dec90_native");
+    let status = ctx
+        .run_pipeline_with_opts(&yaml, opts_with_clickhouse(&ctx, 1))
         .await
-        .expect("pipeline binary should run");
-
+        .expect("pipeline run");
     assert!(
-        !out.status.success(),
-        "wide decimal_arb(90,0) without coerce_to:string must be rejected. stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
+        status.success(),
+        "decimal(90,0) without coerce_to:string must load on the native UInt256 route"
     );
-    let combined = format!("{}\n{}", out.stdout, out.stderr);
-    assert!(
-        combined.contains("amount"),
-        "rejection should name the offending column: {combined}"
+
+    assert_eq!(amount_column_type(&ctx, "dec90_native").await, "UInt256");
+    let rows = read_back(&ctx, "dec90_native").await;
+    assert_eq!(
+        rows[0].amount, "123",
+        "value must round-trip through UInt256"
     );
 }
 
