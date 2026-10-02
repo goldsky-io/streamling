@@ -149,7 +149,7 @@ pub fn bind_arrow_value_to_query<'q>(
             // value is the UNSCALED integer; place the point `scale` from the right.
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             let unscaled = arr.value(index).to_string();
-            let formatted = unscaled_to_numeric_string(&unscaled, *scale as usize);
+            let formatted = unscaled_to_numeric_string(&unscaled, *scale);
             q.bind(formatted)
         }
         DataType::Decimal256(_precision, scale) => {
@@ -157,7 +157,7 @@ pub fn bind_arrow_value_to_query<'q>(
             // value is the UNSCALED integer; place the point `scale` from the right.
             let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
             let unscaled = arr.value(index).to_string();
-            let formatted = unscaled_to_numeric_string(&unscaled, *scale as usize);
+            let formatted = unscaled_to_numeric_string(&unscaled, *scale);
             q.bind(formatted)
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
@@ -233,13 +233,30 @@ pub fn bind_arrow_value_to_query<'q>(
 /// unscaled integer as if it were already the integer part), which inflated the
 /// magnitude by 10^scale: it both wrote wrong values and overflowed otherwise
 /// wide-enough NUMERIC columns for high-scale / all-fractional decimals (F3).
-fn unscaled_to_numeric_string(unscaled: &str, scale: usize) -> String {
+pub(crate) fn unscaled_to_numeric_string(unscaled: &str, scale: i8) -> String {
     if scale == 0 {
         return unscaled.to_string();
     }
     let (sign, digits) = match unscaled.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", unscaled),
+    };
+    if digits.bytes().all(|b| b == b'0') {
+        // Never emit "-0", "-0.000…" or "000" for a zero magnitude.
+        return if scale > 0 {
+            format!("0.{}", "0".repeat(scale as usize))
+        } else {
+            "0".to_string()
+        };
+    }
+    // Arrow allows a negative scale: the value is `unscaled × 10^-scale`,
+    // an integer with trailing zeros. `scale as usize` on it would have
+    // asked for ~1.8e19 zeros.
+    let Ok(scale) = usize::try_from(scale) else {
+        return format!(
+            "{sign}{digits}{}",
+            "0".repeat(scale.unsigned_abs() as usize)
+        );
     };
     let body = if digits.len() > scale {
         // Has integer digits: split `scale` from the right.
@@ -249,12 +266,7 @@ fn unscaled_to_numeric_string(unscaled: &str, scale: usize) -> String {
         // Magnitude < 1: pad with leading zeros after "0.".
         format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
     };
-    // Never emit "-0.000…" for a zero magnitude.
-    if sign == "-" && digits.bytes().all(|b| b == b'0') {
-        body
-    } else {
-        format!("{sign}{body}")
-    }
+    format!("{sign}{body}")
 }
 
 #[cfg(test)]
@@ -357,6 +369,11 @@ mod tests {
         // zero
         assert_eq!(unscaled_to_numeric_string("0", 2), "0.00");
         assert_eq!(unscaled_to_numeric_string("0", 0), "0");
+        assert_eq!(unscaled_to_numeric_string("-0", 2), "0.00");
+        // A negative scale (Arrow allows it) scales the integer up.
+        assert_eq!(unscaled_to_numeric_string("12", -2), "1200");
+        assert_eq!(unscaled_to_numeric_string("-12", -2), "-1200");
+        assert_eq!(unscaled_to_numeric_string("0", -2), "0");
 
         // negatives
         assert_eq!(unscaled_to_numeric_string("-12345", 2), "-123.45");

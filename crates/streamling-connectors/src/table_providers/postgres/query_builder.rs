@@ -261,13 +261,22 @@ impl PostgresQueryBuilder {
         query_template.replace("$VALUES_PLACEHOLDER", &values_clause)
     }
 
-    /// Build DELETE query for rows matching primary key values
-    /// Returns (query_string, num_placeholders_per_row)
+    /// Build DELETE query for rows matching primary key values.
+    ///
+    /// `cast_map` is the same column → SQL-cast map the INSERT path uses
+    /// (see [`Self::build_cast_map`]). Every key the binder sends as text —
+    /// `UInt64`, `Decimal128`/`Decimal256`, `decimal_arb` — needs the
+    /// `::numeric(p, s)` cast here too: sqlx declares a Rust `String`
+    /// parameter as `text`, and Postgres has no `numeric = text` operator, so
+    /// an uncast placeholder failed at prepare with `operator does not exist`
+    /// and the sink retried the DELETE forever. BIGINT and other natively
+    /// bound keys get a bare placeholder, as before.
     pub fn build_delete_query(
         schema: &str,
         table: &str,
         primary_key_columns: &[String],
         num_rows: usize,
+        cast_map: &std::collections::HashMap<String, Option<String>>,
     ) -> String {
         if primary_key_columns.is_empty() {
             // Without primary key, we can't safely delete - this shouldn't happen
@@ -285,9 +294,13 @@ impl PostgresQueryBuilder {
         let mut values = Vec::new();
 
         for _ in 0..num_rows {
-            let row_placeholders: Vec<String> = (0..primary_key_columns.len())
-                .map(|_| {
-                    let ph = format!("${}", placeholder_num);
+            let row_placeholders: Vec<String> = primary_key_columns
+                .iter()
+                .map(|column| {
+                    let ph = match cast_map.get(column).and_then(|cast| cast.as_deref()) {
+                        Some(cast_type) => format!("${}::{}", placeholder_num, cast_type),
+                        None => format!("${}", placeholder_num),
+                    };
                     placeholder_num += 1;
                     ph
                 })
@@ -309,6 +322,45 @@ impl PostgresQueryBuilder {
 mod tests {
     use super::*;
     use arrow_schema::DataType;
+
+    #[test]
+    fn test_build_delete_query_casts_text_bound_keys() {
+        use arrow_schema::{Field, Schema, SchemaRef};
+        use std::sync::Arc;
+        // A UInt64 / Decimal / decimal_arb key is bound as a Rust `String`,
+        // which sqlx types as `text`; without the cast Postgres rejects the
+        // statement at prepare (`operator does not exist: numeric = text`).
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let pk = vec!["id".to_string(), "amount".to_string()];
+        let cast_map = PostgresQueryBuilder::build_cast_map(&schema, &pk);
+        let id_cast = cast_map["id"].clone().expect("UInt64 binds as text");
+        let amount_cast = cast_map["amount"]
+            .clone()
+            .expect("Decimal128 binds as text");
+        let query = PostgresQueryBuilder::build_delete_query("public", "t", &pk, 2, &cast_map);
+        assert_eq!(
+            query,
+            format!(
+                r#"DELETE FROM "public"."t" WHERE ("id", "amount") IN (($1::{id_cast}, $2::{amount_cast}), ($3::{id_cast}, $4::{amount_cast}))"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_build_delete_query_natively_bound_key_has_bare_placeholder() {
+        use arrow_schema::{Field, Schema, SchemaRef};
+        use std::sync::Arc;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let pk = vec!["id".to_string()];
+        let cast_map = PostgresQueryBuilder::build_cast_map(&schema, &pk);
+        let query = PostgresQueryBuilder::build_delete_query("public", "t", &pk, 1, &cast_map);
+        assert_eq!(query, r#"DELETE FROM "public"."t" WHERE ("id") IN (($1))"#);
+    }
 
     #[test]
     fn test_build_upsert_query_with_primary_key() {
