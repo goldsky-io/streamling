@@ -2992,33 +2992,60 @@ impl ClickHouseClient {
 
         for (column, original_field) in batch.columns().iter().zip(original_schema.fields().iter())
         {
-            // A decimal_arb target column is fetched from ClickHouse either as
-            // native UInt256/Int256 (FixedSizeBinary(32), for native_int_kind
-            // hints) or as canonical decimal text (Utf8, the wide/`coerce_to:
-            // string` path). Reinterpret each into decimal_arb; everything else
+            // A decimal_arb target column is fetched from ClickHouse as native
+            // UInt256/Int256 (FixedSizeBinary(32), for native_int_kind hints),
+            // as the native `Decimal(p, s)` the sink itself writes within the
+            // Decimal cap (Arrow Decimal128 / Decimal256), or as canonical
+            // decimal text (Utf8, the wide / `coerce_to: string` path).
+            // Reinterpret each into decimal_arb. A retired `streamling.u256` /
+            // `i256` target (a plugin schema that still declares it) gets the
+            // native bytes flipped to its big-endian wire form. Everything else
             // passes through unchanged.
             let mut converted: Option<(ArrayRef, &FieldRef)> = None;
-            if let Some(tf) = target_by_name.get(original_field.name().as_str()).copied()
-                && DecimalArbType::is_decimal_arb_field(tf)
-            {
-                match original_field.data_type() {
-                    DataType::FixedSizeBinary(32)
-                        if DecimalArbType::native_int_kind_from_field(tf).is_some() =>
-                    {
-                        converted = Some((
-                            clickhouse_native_to_decimal_arb(column.as_ref(), tf)
-                                .map_err(DataFusionError::from)?,
-                            tf,
-                        ));
+            if let Some(tf) = target_by_name.get(original_field.name().as_str()).copied() {
+                if DecimalArbType::is_decimal_arb_field(tf) {
+                    match original_field.data_type() {
+                        DataType::FixedSizeBinary(32)
+                            if DecimalArbType::native_int_kind_from_field(tf).is_some() =>
+                        {
+                            converted = Some((
+                                clickhouse_native_to_decimal_arb(column.as_ref(), tf)
+                                    .map_err(DataFusionError::from)?,
+                                tf,
+                            ));
+                        }
+                        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+                            converted = Some((
+                                clickhouse_decimal_to_decimal_arb(column.as_ref(), tf)
+                                    .map_err(DataFusionError::from)?,
+                                tf,
+                            ));
+                        }
+                        DataType::Utf8 | DataType::LargeUtf8 => {
+                            converted = Some((
+                                clickhouse_string_to_decimal_arb(column.as_ref(), tf)
+                                    .map_err(DataFusionError::from)?,
+                                tf,
+                            ));
+                        }
+                        _ => {}
                     }
-                    DataType::Utf8 | DataType::LargeUtf8 => {
-                        converted = Some((
-                            clickhouse_string_to_decimal_arb(column.as_ref(), tf)
-                                .map_err(DataFusionError::from)?,
-                            tf,
-                        ));
-                    }
-                    _ => {}
+                } else if matches!(original_field.data_type(), DataType::FixedSizeBinary(32))
+                    && streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind(tf)
+                        .is_some()
+                    && streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind(
+                        original_field,
+                    )
+                    .is_none()
+                {
+                    // ClickHouse ships UInt256 / Int256 little-endian; the
+                    // legacy wire form is big-endian. Without the flip `1`
+                    // arrives as 2^248.
+                    converted = Some((
+                        reverse_fixed_size_binary_32(column.as_ref(), tf)
+                            .map_err(DataFusionError::from)?,
+                        tf,
+                    ));
                 }
             }
 
@@ -4494,6 +4521,83 @@ mod tests {
             ClickHouseClient::clickhouse_column_type(wire.field(1), None).unwrap(),
             "Nullable(UInt256)"
         );
+    }
+
+    #[test]
+    fn normalize_from_clickhouse_reads_native_decimal_and_legacy_targets() {
+        use arrow::array::{Array, Decimal128Array, FixedSizeBinaryArray, LargeBinaryArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::collections::HashMap;
+        use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
+        use streamling_core::types::decimal_arb_legacy::LEGACY_U256_EXTENSION_NAME;
+
+        // Within the Decimal cap the history column is fetched as the native
+        // Decimal(p, s) the sink itself writes.
+        let target_dec = DecimalArbType::field("amount", 20, 2, true).unwrap();
+        let dec = Decimal128Array::from(vec![Some(150_i128), None, Some(-7)])
+            .with_precision_and_scale(20, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(20, 2),
+                true,
+            )])),
+            vec![Arc::new(dec)],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![target_dec.clone()]));
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+        assert_eq!(out.schema().field(0), &target_dec);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let text = |i: usize| {
+            DecimalArbValue::from_canonical_bytes_at_scale(col.value(i), 2)
+                .unwrap()
+                .to_canonical_string()
+        };
+        assert_eq!(text(0), "1.50");
+        assert!(col.is_null(1));
+        assert_eq!(text(2), "-0.07");
+
+        // A retired streamling.u256 target: ClickHouse ships little-endian,
+        // the legacy wire form is big-endian.
+        let legacy =
+            Field::new("v", DataType::FixedSizeBinary(32), true).with_metadata(HashMap::from([(
+                "ARROW:extension:name".to_string(),
+                LEGACY_U256_EXTENSION_NAME.to_string(),
+            )]));
+        let mut le = [0_u8; 32];
+        le[0] = 1;
+        let fsb = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(le.to_vec()), None].into_iter(),
+            32,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                DataType::FixedSizeBinary(32),
+                true,
+            )])),
+            vec![Arc::new(fsb)],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![legacy.clone()]));
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+        assert_eq!(out.schema().field(0), &legacy);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let mut be = [0_u8; 32];
+        be[31] = 1;
+        assert_eq!(col.value(0), &be);
+        assert!(col.is_null(1));
     }
 
     #[test]
@@ -6211,6 +6315,85 @@ fn canonical_to_clickhouse_le(
 /// ClickHouse numeric type. Parses each cell with `DecimalArbValue::from_str` and
 /// re-encodes at the target field's declared scale. Inverse of the sink's
 /// `CanonicalString` emission.
+/// Reinterpret a ClickHouse `Decimal(p, s)` column — fetched as Arrow
+/// `Decimal128` / `Decimal256` — as the decimal_arb column `field` declares.
+/// This is the band the sink itself writes as a native Decimal, so a hybrid
+/// source reading its own history table back lands here.
+pub fn clickhouse_decimal_to_decimal_arb(
+    array: &dyn arrow::array::Array,
+    field: &arrow::datatypes::Field,
+) -> streamling_core::error::Result<ArrayRef> {
+    use arrow::array::{Decimal128Array, Decimal256Array};
+    use arrow::datatypes::DataType;
+    use streamling_core::types::decimal_arb::{DecimalArbArray, DecimalArbType};
+    let (precision, scale) = DecimalArbType::precision_scale_from_field(field)
+        .ok_or_else(|| streamling_err!("column '{}' is not a decimal_arb field", field.name()))?;
+    let downcast_err = || {
+        streamling_err!(
+            "column '{}': expected a Decimal128 / Decimal256 array, got {:?}",
+            field.name(),
+            array.data_type()
+        )
+    };
+    let converted = match array.data_type() {
+        DataType::Decimal128(_, source_scale) => DecimalArbArray::from_decimal128(
+            array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(downcast_err)?,
+            *source_scale,
+            precision,
+            scale,
+            field.name(),
+        )?,
+        DataType::Decimal256(_, source_scale) => DecimalArbArray::from_decimal256(
+            array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(downcast_err)?,
+            *source_scale,
+            precision,
+            scale,
+            field.name(),
+        )?,
+        _ => return Err(downcast_err()),
+    };
+    Ok(Arc::new(converted.into_inner().0))
+}
+
+/// Flip every 32-byte value between ClickHouse's little-endian native
+/// integers and the big-endian wire form a retired `streamling.u256` /
+/// `i256` target declares. Nulls are kept.
+fn reverse_fixed_size_binary_32(
+    array: &dyn arrow::array::Array,
+    target: &arrow::datatypes::Field,
+) -> streamling_core::error::Result<ArrayRef> {
+    use arrow::array::{Array, FixedSizeBinaryArray};
+    let fsb = array
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .filter(|a| a.value_length() == 32)
+        .ok_or_else(|| {
+            streamling_err!(
+                "column '{}': expected FixedSizeBinary(32), got {:?}",
+                target.name(),
+                array.data_type()
+            )
+        })?;
+    let reversed = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (0..fsb.len()).map(|i| {
+            (!fsb.is_null(i)).then(|| {
+                let mut value = fsb.value(i).to_vec();
+                value.reverse();
+                value
+            })
+        }),
+        32,
+    )
+    .map_err(|e| streamling_err!("column '{}': {}", target.name(), e))?;
+    Ok(Arc::new(reversed))
+}
+
 pub fn clickhouse_string_to_decimal_arb(
     column: &dyn arrow::array::Array,
     field: &arrow_schema::FieldRef,

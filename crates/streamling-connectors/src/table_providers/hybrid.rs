@@ -516,14 +516,16 @@ impl HybridTableProvider {
     }
 
     /// A bounded ClickHouse column whose unbounded (target) field is
-    /// `decimal_arb` is fetched in one of two encodings, both reinterpreted into
-    /// decimal_arb by `normalize_batch_from_clickhouse`:
+    /// `decimal_arb` is fetched in one of three encodings, each reinterpreted
+    /// into decimal_arb by `normalize_batch_from_clickhouse`:
     /// - native `UInt256`/`Int256` → Arrow `FixedSizeBinary(32)` (only when the
-    ///   target carries a `native_int_kind` hint), or
+    ///   target carries a `native_int_kind` hint),
+    /// - native `Decimal(p, s)` → Arrow `Decimal128`/`Decimal256` (the band
+    ///   within the Decimal cap, which the sink itself writes that way), or
     /// - canonical decimal text → `Utf8`/`LargeUtf8` (the wide / `coerce_to:
     ///   string` path that has no native ClickHouse numeric type).
     ///
-    /// Either is compatible with the `decimal_arb` `LargeBinary` target.
+    /// Each is compatible with the `decimal_arb` `LargeBinary` target.
     fn clickhouse_reads_as_decimal_arb(
         bounded_type: &arrow_schema::DataType,
         unbounded_field: &Field,
@@ -537,6 +539,7 @@ impl HybridTableProvider {
             DataType::FixedSizeBinary(32) => {
                 DecimalArbType::native_int_kind_from_field(unbounded_field).is_some()
             }
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => true,
             DataType::Utf8 | DataType::LargeUtf8 => true,
             _ => false,
         }
@@ -2130,6 +2133,26 @@ mod tests {
             SessionManager::new(100, 10, DynamicTableRegistry::new(), 1)
                 .expect("session manager initialisation failed")
         });
+
+    #[test]
+    fn clickhouse_reads_as_decimal_arb_accepts_the_native_decimal_band() {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        // The sink writes a decimal_arb within the Decimal cap as a native
+        // Decimal(p, s); reading that history back must be admitted.
+        let narrow = DecimalArbType::field("amount", 20, 2, true).unwrap();
+        assert!(HybridTableProvider::clickhouse_reads_as_decimal_arb(
+            &DataType::Decimal128(20, 2),
+            &narrow
+        ));
+        assert!(HybridTableProvider::clickhouse_reads_as_decimal_arb(
+            &DataType::Decimal256(76, 18),
+            &narrow
+        ));
+        assert!(!HybridTableProvider::clickhouse_reads_as_decimal_arb(
+            &DataType::Int64,
+            &narrow
+        ));
+    }
 
     #[test]
     fn clickhouse_read_type_reads_a_hinted_wide_int_as_text() {

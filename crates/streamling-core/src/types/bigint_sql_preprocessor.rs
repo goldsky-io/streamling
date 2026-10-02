@@ -380,6 +380,39 @@ fn rewrite_expr_for_decimal_arb_cast(e: &mut SqlExpr, decimal_arb_cols: &HashSet
         SqlExpr::Nested(inner) => {
             rewrite_expr_for_decimal_arb_cast(inner.as_mut(), decimal_arb_cols);
         }
+        // The retired rewrite descended into CASE; `CASE … THEN CAST(col AS
+        // TEXT)` left unlowered fails planning ("Unsupported CAST from
+        // LargeBinary to Utf8View").
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                rewrite_expr_for_decimal_arb_cast(operand.as_mut(), decimal_arb_cols);
+            }
+            for when in conditions.iter_mut() {
+                rewrite_expr_for_decimal_arb_cast(&mut when.condition, decimal_arb_cols);
+                rewrite_expr_for_decimal_arb_cast(&mut when.result, decimal_arb_cols);
+            }
+            if let Some(else_result) = else_result {
+                rewrite_expr_for_decimal_arb_cast(else_result.as_mut(), decimal_arb_cols);
+            }
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_expr_for_decimal_arb_cast(expr.as_mut(), decimal_arb_cols);
+            rewrite_expr_for_decimal_arb_cast(low.as_mut(), decimal_arb_cols);
+            rewrite_expr_for_decimal_arb_cast(high.as_mut(), decimal_arb_cols);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            rewrite_expr_for_decimal_arb_cast(expr.as_mut(), decimal_arb_cols);
+            for member in list.iter_mut() {
+                rewrite_expr_for_decimal_arb_cast(member, decimal_arb_cols);
+            }
+        }
         SqlExpr::Function(func) => {
             if let datafusion::logical_expr::sqlparser::ast::FunctionArguments::List(arglist) =
                 &mut func.args
@@ -1411,6 +1444,26 @@ mod tests {
     // u256/i256 path is retired as part of the same feature; once those
     // types are deleted in Phase 8 there is no remaining FSB(32)-based
     // wide-int route.
+
+    #[tokio::test]
+    async fn cast_decimal_arb_as_text_is_lowered_inside_case_between_and_in() {
+        let ctx = setup_session_context();
+        register_decimal_arb_table(&ctx, "t", vec![("gas_used", None)]);
+        for sql in [
+            "SELECT CASE WHEN gas_used > 1 THEN CAST(gas_used AS TEXT) ELSE 'x' END AS g FROM t",
+            "SELECT * FROM t WHERE CAST(gas_used AS TEXT) BETWEEN '1' AND '2'",
+            "SELECT * FROM t WHERE CAST(gas_used AS TEXT) IN ('1', '2')",
+        ] {
+            let rewritten = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+                .await
+                .unwrap();
+            assert!(
+                rewritten.contains("decimal_arb_to_string(gas_used)")
+                    && !rewritten.to_lowercase().contains("cast(gas_used as text"),
+                "{sql}\n -> {rewritten}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_cast_decimal_arb_as_text() {

@@ -385,15 +385,26 @@ pub fn postgres_type_to_arrow_type(pg_type: &str) -> Result<DataType> {
         "numeric" | "decimal" => {
             if pg_type_lower.contains('(') {
                 let (precision, scale) = parse_numeric_params(&pg_type_lower, pg_type)?;
-                if precision <= 38 {
-                    Ok(DataType::Decimal128(precision as u8, scale as i8))
-                } else if precision <= 76 {
-                    Ok(DataType::Decimal256(precision as u8, scale as i8))
-                } else {
+                if precision > 76 {
                     // Storage type only — caller must attach extension metadata
                     // via `postgres_type_to_arrow_field` to make this a full
                     // `decimal_arb` field.
-                    Ok(DecimalArbType::new())
+                    return Ok(DecimalArbType::new());
+                }
+                // Postgres allows any scale in [-1000, 1000]; Arrow decimals
+                // carry it as i8. `scale as i8` turned NUMERIC(76, 500) into
+                // Decimal256(76, -12) and corrupted every value.
+                let scale = i8::try_from(scale).map_err(|_| {
+                    StreamlingError::user(format!(
+                        "unsupported PostgreSQL type '{}': scale {} is outside the range Arrow \
+                         decimals support (-128..=127)",
+                        pg_type, scale
+                    ))
+                })?;
+                if precision <= 38 {
+                    Ok(DataType::Decimal128(precision as u8, scale))
+                } else {
+                    Ok(DataType::Decimal256(precision as u8, scale))
                 }
             } else {
                 // Default precision and scale for NUMERIC without parameters
@@ -850,6 +861,22 @@ mod tests {
     // The U256/I256 → NUMERIC(78, 0) tests were deleted along with the
     // retired types. Wide-integer fields now arrive as decimal_arb
     // and route through the decimal_arb branch in get_postgres_type_info.
+    #[test]
+    fn numeric_scale_outside_i8_is_an_error_not_a_truncation() {
+        let err = postgres_type_to_arrow_type("numeric(76, 500)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scale 500"), "{err}");
+        assert_eq!(
+            postgres_type_to_arrow_type("numeric(76, 18)").unwrap(),
+            DataType::Decimal256(76, 18)
+        );
+        assert_eq!(
+            postgres_type_to_arrow_type("numeric(10, -2)").unwrap(),
+            DataType::Decimal128(10, -2)
+        );
+    }
+
     #[test]
     fn test_decimal_arb_78_0_maps_to_numeric_78_0() {
         let field =

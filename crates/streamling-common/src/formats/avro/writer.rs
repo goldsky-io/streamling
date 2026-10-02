@@ -585,6 +585,40 @@ mod tests {
     };
     use std::sync::Arc;
 
+    /// Zero's canonical payload is a lone sign byte; on the Avro wire it must
+    /// be the one-byte `0x00`, never an empty payload (Java's
+    /// `new BigInteger(new byte[0])` throws). num-bigint's
+    /// `to_signed_bytes_be` yields `[0]` for zero, so the encoder already
+    /// does — pinned here.
+    #[test]
+    fn decimal_arb_zero_encodes_as_one_avro_byte() {
+        use crate::types::decimal_arb::DecimalArbArrayBuilder;
+        let mut b = DecimalArbArrayBuilder::with_capacity(3, "v", 10, 2).unwrap();
+        for s in ["0", "0.00", "-0.00"] {
+            b.append_str(s).unwrap();
+        }
+        let (raw, _, _) = b.finish().into_inner();
+        for i in 0..3 {
+            assert_eq!(
+                decimal_arb_canonical_to_avro_bytes(raw.value(i)),
+                vec![0x00],
+                "row {i}"
+            );
+        }
+        let mut b = DecimalArbArrayBuilder::with_capacity(2, "v", 10, 0).unwrap();
+        b.append_str("1").unwrap();
+        b.append_str("-1").unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        assert_eq!(
+            decimal_arb_canonical_to_avro_bytes(raw.value(0)),
+            vec![0x01]
+        );
+        assert_eq!(
+            decimal_arb_canonical_to_avro_bytes(raw.value(1)),
+            vec![0xff]
+        );
+    }
+
     /// A decimal nested inside a struct must keep its `decimal` logicalType in the
     /// generated Avro schema. Regression guard for F7: the struct path used
     /// `Schema::canonical_form()`, which strips logicalType and demoted nested
