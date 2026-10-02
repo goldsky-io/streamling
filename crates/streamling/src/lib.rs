@@ -65,13 +65,14 @@ pub mod error_format;
 mod topology_sort;
 pub mod validate;
 use streamling_core::plugin::operator::PluginNode;
+use streamling_core::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
 use streamling_core::plugin::side_output::{
     register_plugin_side_outputs, shutdown_plugin_side_outputs,
 };
 use streamling_core::plugin::table_provider::{PluginSinkProvider, PluginSourceProvider};
 use streamling_core::plugin::{
-    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, InitializedPlugin, create_sink_plugin,
-    create_source_plugin, create_transform_plugin, terminate_all_plugins,
+    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, ExecutionFuture, InitializedPlugin,
+    create_sink_plugin, create_source_plugin, create_transform_plugin, terminate_all_plugins,
 };
 use streamling_core::side_output::SupportsSideOutputs;
 use streamling_core::sql_parse::extract_table_references_from_sql;
@@ -1154,6 +1155,9 @@ impl Streamling {
 
         // Unified registry of initialized plugins keyed by a stable id.
         let mut plugins: BTreeMap<String, InitializedPlugin> = BTreeMap::new();
+        // Partition-capable plugins, whose instances are created during
+        // physical planning; their execution futures are collected after it.
+        let mut partitioned_plugins: Vec<Arc<PartitionedPlugin>> = Vec::new();
 
         let mut checkpoint_coordinator = CheckpointCoordinator::new();
         // Control handle shared with bounded sources (to begin the terminal
@@ -1508,32 +1512,66 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let opts = plugin.options.clone().unwrap_or_default();
+                    let opts =
+                        Self::convert_plugin_options(plugin.options.clone().unwrap_or_default());
                     let primary_key_opt = &plugin.primary_key;
 
-                    // Keying by reference name (no cross-source sharing)
-                    if !plugins.contains_key(reference_name) {
-                        let created = create_source_plugin(
-                            &app_config,
-                            reference_name.clone(),
-                            plugin.r#type.clone(),
-                            Self::convert_plugin_options(opts.clone()),
-                        )
-                        .map_err(|e| {
-                            e.context(format!("{}: failed to initialize plugin", ctx.format()))
-                        })?;
-                        plugins.insert(reference_name.clone(), created);
-                    }
-                    let created = plugins.get(reference_name).expect("plugin must exist");
-                    let channels = created.channels.clone();
-                    let output_schema = created
-                        .output_schema
-                        .clone()
-                        .expect("Source plugin must have output schema");
+                    let described = PartitionedPlugin::describe(
+                        &app_config,
+                        reference_name,
+                        &plugin.r#type,
+                        PluginKind::Source,
+                        None,
+                        opts.clone(),
+                        plugin.parallelism,
+                    )
+                    .map_err(|e| {
+                        e.context(format!("{}: failed to describe plugin", ctx.format()))
+                    })?;
+                    let (output_schema, instances) = match described {
+                        // Instances are created during physical planning, one
+                        // per stream.
+                        Some(partitioned) => {
+                            partitioned_plugins.push(partitioned.clone());
+                            (
+                                partitioned
+                                    .output_schema()
+                                    .expect("a source description has an output schema"),
+                                PluginInstances::Partitioned(partitioned),
+                            )
+                        }
+                        None => {
+                            // Keying by reference name (no cross-source sharing)
+                            if !plugins.contains_key(reference_name) {
+                                let created = create_source_plugin(
+                                    &app_config,
+                                    reference_name.clone(),
+                                    plugin.r#type.clone(),
+                                    opts,
+                                )
+                                .map_err(|e| {
+                                    e.context(format!(
+                                        "{}: failed to initialize plugin",
+                                        ctx.format()
+                                    ))
+                                })?;
+                                plugins.insert(reference_name.clone(), created);
+                            }
+                            let created = plugins.get(reference_name).expect("plugin must exist");
+                            let output_schema = created
+                                .output_schema
+                                .clone()
+                                .expect("Source plugin must have output schema");
+                            (
+                                output_schema,
+                                PluginInstances::Single(created.instance(reference_name.clone())),
+                            )
+                        }
+                    };
                     let plugin_source_provider: Arc<PluginSourceProvider> =
                         Arc::new(PluginSourceProvider::new(
                             output_schema,
-                            Arc::new(channels),
+                            instances,
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
                             shutdown_controller.scope_at(
@@ -2084,37 +2122,102 @@ impl Streamling {
                             streamling_user_err!("{}: source '{}' not found", ctx.format(), from)
                         })?
                         .clone();
+                    let options = Self::convert_plugin_options(options.clone().unwrap_or_default());
 
-                    let transform_input = wrap_with_rebatch(
-                        source_plan.clone(),
-                        batch_size,
-                        batch_flush_interval,
-                        reference_name.clone(),
-                    );
-
-                    let initialized_plugin = create_transform_plugin(
+                    let described = PartitionedPlugin::describe(
                         &app_config,
-                        reference_name.clone(), // name
-                        r#type.clone(),         // plugin_type
-                        Self::convert_plugin_options(options.clone().unwrap_or_default()),
-                        transform_input.schema().inner().clone(),
+                        &reference_name,
+                        r#type,
+                        PluginKind::Transform,
+                        Some(source_plan.schema().inner().clone()),
+                        options.clone(),
+                        plugin_transform.parallelism,
                     )
                     .map_err(|e| {
-                        e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                        e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
-                    let output_schema = Arc::new(DFSchema::try_from(
-                        initialized_plugin
-                            .output_schema
-                            .as_ref()
-                            .expect("Transform plugin must have output schema")
-                            .as_ref()
-                            .clone(),
-                    )?);
+                    let (transform_input, output_schema, instances) = match described {
+                        Some(partitioned) => {
+                            let own_key = primary_key_opt
+                                .as_deref()
+                                .map(|pk| {
+                                    PrimaryKeyMetadata::from_str(
+                                        pk,
+                                        PrimaryKeySource::TopologyDefined,
+                                        reference_name.clone(),
+                                    )
+                                    .columns
+                                })
+                                .unwrap_or_default();
+                            // Read-only lookup: `propagate` would re-register
+                            // the key under this node.
+                            let upstream_key = pk_registry.get(from.as_str()).map(|m| m.columns);
+                            let placement = partitioned.input_placement(
+                                &own_key,
+                                upstream_key.as_deref(),
+                                source_plan.schema().inner(),
+                            )?;
+                            // The exchange goes below the rebatcher, as at the
+                            // sink edge: rebatching after the split keeps each
+                            // instance's batches whole.
+                            let transform_input = wrap_with_rebatch(
+                                wrap_with_repartition(
+                                    source_plan,
+                                    &placement,
+                                    plugin_transform.parallelism,
+                                    reference_name.clone(),
+                                ),
+                                batch_size,
+                                batch_flush_interval,
+                                reference_name.clone(),
+                            );
+                            partitioned_plugins.push(partitioned.clone());
+                            (
+                                transform_input,
+                                partitioned
+                                    .output_schema()
+                                    .expect("a transform description has an output schema"),
+                                PluginInstances::Partitioned(partitioned),
+                            )
+                        }
+                        None => {
+                            let transform_input = wrap_with_rebatch(
+                                source_plan,
+                                batch_size,
+                                batch_flush_interval,
+                                reference_name.clone(),
+                            );
+                            let initialized_plugin = create_transform_plugin(
+                                &app_config,
+                                reference_name.clone(), // name
+                                r#type.clone(),         // plugin_type
+                                options,
+                                transform_input.schema().inner().clone(),
+                            )
+                            .map_err(|e| {
+                                e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                            })?;
+                            let output_schema = initialized_plugin
+                                .output_schema
+                                .clone()
+                                .expect("Transform plugin must have output schema");
+                            let instance = initialized_plugin.instance(reference_name.clone());
+                            // Register transform plugin under its reference name
+                            plugins.insert(reference_name.clone(), initialized_plugin);
+                            (
+                                transform_input,
+                                output_schema,
+                                PluginInstances::Single(instance),
+                            )
+                        }
+                    };
+                    let output_schema =
+                        Arc::new(DFSchema::try_from(output_schema.as_ref().clone())?);
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(PluginNode::new(
                             transform_input,
                             output_schema,
-                            Arc::new(initialized_plugin.channels.clone()),
+                            instances,
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
                             shutdown_controller.scope_at(
@@ -2151,9 +2254,6 @@ impl Streamling {
                     let logical_plan_with_telemetry = LogicalPlan::Extension(Extension {
                         node: wrapping_node,
                     });
-
-                    // Register transform plugin under its reference name
-                    plugins.insert(reference_name.clone(), initialized_plugin);
 
                     // also register this as a view in case another transform (e.g. SQL) refers to it
                     let view = ViewTable::new(logical_plan_with_telemetry.clone(), None);
@@ -2727,7 +2827,7 @@ impl Streamling {
                     let (source_plan, source_schema) =
                         Self::find_plan_and_schema(&pipeline_plans, from.as_str())?;
 
-                    pk_registry.track_primary_key_for_transform_or_sink(
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
                         primary_key_opt,
                         from.clone(),
                         reference_name.clone(),
@@ -2741,24 +2841,65 @@ impl Streamling {
                             serde_yaml::Value::String(pk.clone()),
                         );
                     }
+                    let plugin_opts = Self::convert_plugin_options(plugin_opts);
 
-                    let initialized_plugin = create_sink_plugin(
+                    let described = PartitionedPlugin::describe(
                         &app_config,
-                        reference_name.clone(), // name
-                        r#type.clone(),         // plugin_type
-                        Self::convert_plugin_options(plugin_opts),
-                        source_schema.clone(),
+                        &reference_name,
+                        r#type,
+                        PluginKind::Sink,
+                        Some(source_schema.clone()),
+                        plugin_opts.clone(),
+                        plugin_sink.parallelism,
                     )
                     .map_err(|e| {
-                        e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                        e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
+                    let (instances, placement, parallelism) = match described {
+                        // One instance per write stream, created when the sink
+                        // is planned against its input's width.
+                        Some(partitioned) => {
+                            // A sink's key is tracked against its input, so
+                            // there is no upstream key to fall back to.
+                            let placement = partitioned.input_placement(
+                                &pk_columns(&pk_metadata_opt),
+                                None,
+                                &source_schema,
+                            )?;
+                            partitioned_plugins.push(partitioned.clone());
+                            (
+                                PluginInstances::Partitioned(partitioned),
+                                placement,
+                                plugin_sink.parallelism,
+                            )
+                        }
+                        None => {
+                            let initialized_plugin = create_sink_plugin(
+                                &app_config,
+                                reference_name.clone(), // name
+                                r#type.clone(),         // plugin_type
+                                plugin_opts,
+                                source_schema.clone(),
+                            )
+                            .map_err(|e| {
+                                e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                            })?;
+                            let instance = initialized_plugin.instance(reference_name.clone());
+                            // Register sink plugin under its reference name for lifecycle management
+                            plugins.insert(reference_name.clone(), initialized_plugin);
+                            // One instance serves every stream, so its input is
+                            // narrowed to one stream — and in a fan-out, so is
+                            // every sibling's.
+                            (PluginInstances::Single(instance), Placement::Single, None)
+                        }
+                    };
                     let batch_flush_interval = parse_batch_flush_interval(
                         &plugin_sink.batch_flush_interval,
                         &ctx.format(),
                     )?;
                     let plugin_sink_provider = Arc::new(PluginSinkProvider::new(
                         source_schema.clone(),
-                        Arc::new(initialized_plugin.channels.clone()),
+                        instances,
                         app_config.num_records_before_stop,
                         metric_key(&application_id, reference_name.as_str()),
                         sink_telemetry.clone(),
@@ -2778,18 +2919,11 @@ impl Streamling {
                             reference_name.clone(),
                             plugin_sink_provider,
                             RebatchConfig::new(plugin_sink.batch_size, batch_flush_interval),
-                            // A plugin acks epochs from inside the plugin, on a
-                            // channel poll decoupled from the marker that triggered
-                            // it, so the per-stream ack gate cannot see its markers.
-                            // The plugin ABI has no partition dimension either.
-                            Placement::Single,
-                            None,
+                            placement,
+                            parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
-
-                    // Register sink plugin under its reference name for lifecycle management
-                    plugins.insert(reference_name.clone(), initialized_plugin);
                 }
             }
         }
@@ -2801,8 +2935,6 @@ impl Streamling {
         // (`merge_metadata_tags`), so the seeded samples land on the final
         // label set instead of an orphan pre-merge series.
         get_metrics_recorder().seed_elapsed_compute_series();
-
-        let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 
         // A plain `for` loop, NOT `.for_each`: plan-build failures below must
         // propagate as typed, contextualized errors via `?` — inside a
@@ -2877,75 +3009,62 @@ impl Streamling {
                 })?
             };
 
-            if !dry_run {
-                let session_manager = session_manager.clone();
-                let checkpoint_control = checkpoint_control.clone();
-                let sink_future = async move {
-                    // `DataFrame::collect`, split so the planned physical
-                    // plan can be logged before execution starts.
-                    let df = session_manager.new_df(sink_plan);
-                    let task_ctx = Arc::new(df.task_ctx());
-                    let result = match df.create_physical_plan().await {
-                        Ok(plan) => {
-                            info!(
-                                "Pipeline physical plan:\n{}",
-                                displayable(plan.as_ref()).indent(true)
-                            );
-                            collect(plan, task_ctx).await
-                        }
-                        Err(err) => Err(err),
-                    };
-                    match &result {
-                        Ok(_) => {
-                            // The sink has SUCCESSFULLY drained its input and
-                            // will not ack any further checkpoint epochs. Tell
-                            // the coordinator so it drops these sinks from the
-                            // expected-ack set and can finalize in-flight
-                            // epochs the remaining live sinks already acked,
-                            // instead of blocking on a sink that is gone (the
-                            // multi-source completion case).
-                            for sink_name in &sink_names {
-                                checkpoint_control.sink_completed(sink_name);
-                            }
-                        }
-                        Err(err) => {
-                            // A FAILED sink must NOT be deregistered: its
-                            // missing acks are the coordinator's only signal
-                            // that the epochs it touched are not durable.
-                            // Removing it would let those epochs (including
-                            // the terminal one) finalize as if the data had
-                            // been written. The pipeline is failing anyway —
-                            // let the epochs stall and the error propagate.
-                            error!(
-                                "Sink future [{}] completed with error: {}",
-                                future_name, err
-                            );
+            // Planned here rather than inside the sink future: physical
+            // planning creates partitioned plugins' instances (one per
+            // stream, once the widths are known), and every instance must be
+            // in `plugin_set` below so teardown terminates and drains it —
+            // dry runs included. Planning also catches type coercion and
+            // other SQL errors that only manifest at physical planning time.
+            let df = session_manager.new_df(sink_plan);
+            let task_ctx = Arc::new(df.task_ctx());
+            let physical_plan = df
+                .create_physical_plan()
+                .await
+                .streamling_with_context(|| {
+                    format!(
+                        "failed to plan sink [{future_name}]: the query plan would fail at runtime"
+                    )
+                })?;
+            if dry_run {
+                continue;
+            }
+            info!(
+                "Pipeline physical plan:\n{}",
+                displayable(physical_plan.as_ref()).indent(true)
+            );
+            let checkpoint_control = checkpoint_control.clone();
+            let sink_future = async move {
+                let result = collect(physical_plan, task_ctx).await;
+                match &result {
+                    Ok(_) => {
+                        // The sink has SUCCESSFULLY drained its input and
+                        // will not ack any further checkpoint epochs. Tell
+                        // the coordinator so it drops these sinks from the
+                        // expected-ack set and can finalize in-flight
+                        // epochs the remaining live sinks already acked,
+                        // instead of blocking on a sink that is gone (the
+                        // multi-source completion case).
+                        for sink_name in &sink_names {
+                            checkpoint_control.sink_completed(sink_name);
                         }
                     }
-                    result
-                };
-                sink_futures.push(sink_future);
-            } else {
-                dry_run_plans.push((future_name, sink_plan));
-            }
-        }
-
-        // During dry_run, create physical plans to catch type coercion
-        // and other SQL errors that only manifest at physical planning time.
-        if dry_run {
-            for (name, plan) in dry_run_plans {
-                session_manager
-                    .new_df(plan)
-                    .create_physical_plan()
-                    .await
-                    .streamling_with_context(|| {
-                        format!(
-                            "SQL validation failed for sink [{}]: \
-                             the query plan contains type errors that would crash at runtime",
-                            name
-                        )
-                    })?;
-            }
+                    Err(err) => {
+                        // A FAILED sink must NOT be deregistered: its
+                        // missing acks are the coordinator's only signal
+                        // that the epochs it touched are not durable.
+                        // Removing it would let those epochs (including
+                        // the terminal one) finalize as if the data had
+                        // been written. The pipeline is failing anyway —
+                        // let the epochs stall and the error propagate.
+                        error!(
+                            "Sink future [{}] completed with error: {}",
+                            future_name, err
+                        );
+                    }
+                }
+                result
+            };
+            sink_futures.push(sink_future);
         }
 
         // Start checkpoint coordinator only if not in dry_run mode
@@ -3000,14 +3119,25 @@ impl Streamling {
         type NamedPluginFuture = std::pin::Pin<
             Box<dyn std::future::Future<Output = (String, std::result::Result<(), String>)> + Send>,
         >;
-        let mut pending_plugins: std::collections::BTreeSet<String> =
-            plugins.keys().cloned().collect();
-        let mut plugin_set: futures::stream::FuturesUnordered<NamedPluginFuture> = plugins
+        // Every instance exists by now: single-stream plugins were created
+        // while the topology was built, partition instances while the sinks
+        // were planned. Each is keyed by its own instance key.
+        let plugin_futures: Vec<(String, ExecutionFuture)> = plugins
             .into_iter()
-            .map(|(plugin_id, p)| {
-                let fut = p.execution_future;
-                Box::pin(async move { (plugin_id, fut.await) }) as _
-            })
+            .map(|(plugin_id, p)| (plugin_id, p.execution_future))
+            .chain(
+                partitioned_plugins
+                    .iter()
+                    .flat_map(|plugin| plugin.take_execution_futures()),
+            )
+            .collect();
+        let mut pending_plugins: std::collections::BTreeSet<String> = plugin_futures
+            .iter()
+            .map(|(plugin_id, _)| plugin_id.clone())
+            .collect();
+        let mut plugin_set: futures::stream::FuturesUnordered<NamedPluginFuture> = plugin_futures
+            .into_iter()
+            .map(|(plugin_id, fut)| Box::pin(async move { (plugin_id, fut.await) }) as _)
             .collect();
 
         // Drive to completion. The terminal condition is "all sinks drained"

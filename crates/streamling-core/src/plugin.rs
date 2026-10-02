@@ -1,9 +1,12 @@
 pub mod diagnostics;
 pub mod operator;
+pub mod partitioned;
 mod preprocessor;
 pub mod side_output;
 pub mod table_provider;
 mod telemetry;
+#[cfg(test)]
+mod test_plugins;
 pub mod udf;
 
 pub use preprocessor::build_plugin_preprocessors;
@@ -299,7 +302,17 @@ pub fn load_and_initialize_plugin(path: &str, app_config: &AppConfig) -> Result<
     let plugin_path = Path::new(path);
     info!("Loading plugin from: {:?}", plugin_path);
 
-    let plugin_module = Arc::new(load_plugin_module(plugin_path)?);
+    initialize_plugin_module(load_plugin_module(plugin_path)?, app_config, path)
+}
+
+/// Registers every plugin a loaded module provides and hands the module the
+/// host's shutdown signal. `path` names the module in logs.
+fn initialize_plugin_module(
+    plugin_module: PluginModuleRef,
+    app_config: &AppConfig,
+    path: &str,
+) -> Result<()> {
+    let plugin_module = Arc::new(plugin_module);
 
     let logging_config = create_logging(app_config);
     let init_fn = plugin_module.init();
@@ -637,6 +650,25 @@ pub fn send_to_plugin_blocking<T>(
     }
 }
 
+/// The stream error a host forwarder raises when a plugin instance reports,
+/// through `PluginMsg::Error`, that it failed.
+pub(crate) fn plugin_failure(
+    instance_key: &str,
+    message: &str,
+) -> datafusion::error::DataFusionError {
+    streamling_err!("plugin {} failed: {}", instance_key, message).into()
+}
+
+/// The stream error a host forwarder raises when a plugin instance's
+/// dispatcher exits (e.g. a panicking hook) without a `PluginMsg::Error`, so
+/// the forwarder would otherwise wait for output that can never arrive.
+pub(crate) fn plugin_exited(instance_key: &str) -> datafusion::error::DataFusionError {
+    plugin_failure(
+        instance_key,
+        "its dispatcher exited without reporting a failure",
+    )
+}
+
 fn plugin_channel_closed(plugin_id: &str) -> crate::error::StreamlingError {
     streamling_err!(
         "plugin '{}' input channel is closed (dispatcher exited); cannot deliver message",
@@ -655,9 +687,43 @@ fn create_logging(app_config: &AppConfig) -> PluginLogging {
 pub type ExecutionFuture =
     Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send + 'static>>;
 
+/// Resolves once a plugin instance's dispatcher has exited.
+///
+/// Observed through its execution future, which the run loop polls; an
+/// execution future that is dropped unpolled counts as exited.
+#[derive(Clone, Debug)]
+pub struct InstanceExit(tokio::sync::watch::Receiver<bool>);
+
+impl InstanceExit {
+    pub async fn exited(&mut self) {
+        // An error means the execution future was dropped: exited as well.
+        let _ = self.0.wait_for(|exited| *exited).await;
+    }
+
+    /// Whether the dispatcher has exited. Read it BEFORE draining the
+    /// instance's output channel: everything the dispatcher sent precedes its
+    /// exit, so an empty channel after an observed exit is final.
+    pub fn has_exited(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
+}
+
+/// Wraps `execution_future` so the returned [`InstanceExit`] resolves when it
+/// completes.
+pub(crate) fn track_exit(execution_future: ExecutionFuture) -> (ExecutionFuture, InstanceExit) {
+    let (exited, exit) = tokio::sync::watch::channel(false);
+    let tracked = Box::pin(async move {
+        let result = execution_future.await;
+        let _ = exited.send(true);
+        result
+    });
+    (tracked, InstanceExit(exit))
+}
+
 pub struct InitializedPlugin {
     pub plugin_id: String,
     pub execution_future: ExecutionFuture,
+    pub exit: InstanceExit,
     pub channels: PluginChannels,
     /// Expected to be defined for sources and transforms, but not for sinks.
     pub output_schema: Option<SchemaRef>,
@@ -676,12 +742,23 @@ impl InitializedPlugin {
             streamling_user_bail!("Output schema must contain the column '{}'", COLUMN_NAME_OP);
         }
 
+        let (execution_future, exit) = track_exit(execution_future);
         Ok(InitializedPlugin {
             plugin_id,
             execution_future,
+            exit,
             channels,
             output_schema,
         })
+    }
+
+    /// This plugin as the single instance of node `reference_name`.
+    pub fn instance(&self, reference_name: String) -> partitioned::PluginInstance {
+        partitioned::PluginInstance {
+            key: reference_name,
+            channels: Arc::new(self.channels.clone()),
+            exit: self.exit.clone(),
+        }
     }
 }
 
@@ -881,9 +958,11 @@ pub fn create_preprocessor_plugin(
     let mapped_future = result
         .execution_future
         .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let (execution_future, exit) = track_exit(Box::pin(mapped_future));
     Ok(InitializedPlugin {
         plugin_id: plugin_type.to_string(),
-        execution_future: Box::pin(mapped_future),
+        execution_future,
+        exit,
         channels: plugin_channels,
         output_schema: None,
     })

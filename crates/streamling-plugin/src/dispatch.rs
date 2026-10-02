@@ -35,23 +35,40 @@ enum InitOutcome {
     Terminate,
 }
 
-/// Block until the host sends the first control message. Returns whether it
+/// Wait until the host sends the first control message. Returns whether it
 /// was `Init` (proceed to initialize) or `Terminate` (skip initialize and
 /// shut down cleanly). Any other message, malformed wrapper, or channel
 /// disconnect is treated as an error.
-fn wait_for_initialization(channels: &PluginChannels) -> Result<InitOutcome, PluginError> {
-    match channels.input.receiver.recv().map(|m| m.into_enum()) {
-        Ok(Ok(PluginMsg::Init)) => Ok(InitOutcome::Init),
-        Ok(Ok(PluginMsg::Terminate)) => Ok(InitOutcome::Terminate),
-        Ok(Ok(_other)) => Err(PluginError::Execution(
-            "Expected Init message as first message".to_string(),
-        )),
-        Ok(Err(_unwrap_err)) => Err(PluginError::Execution(
-            "Malformed message wrapper during initialization".to_string(),
-        )),
-        Err(_recv_err) => Err(PluginError::Execution(
-            "Channel disconnected during initialization".to_string(),
-        )),
+///
+/// Polls rather than blocking on `recv()`: a plugin sharing the host's runtime
+/// has one dispatcher per partition waiting here at once, and the host sends
+/// each `Init` from a task on that same runtime — blocked workers could leave
+/// none free to send it.
+async fn wait_for_initialization(
+    channels: &PluginChannels,
+    runtime: &PluginAsyncRuntimeObj,
+) -> Result<InitOutcome, PluginError> {
+    loop {
+        match channels.input.receiver.try_recv().map(|m| m.into_enum()) {
+            Ok(Ok(PluginMsg::Init)) => return Ok(InitOutcome::Init),
+            Ok(Ok(PluginMsg::Terminate)) => return Ok(InitOutcome::Terminate),
+            Ok(Ok(_other)) => {
+                return Err(PluginError::Execution(
+                    "Expected Init message as first message".to_string(),
+                ));
+            }
+            Ok(Err(_unwrap_err)) => {
+                return Err(PluginError::Execution(
+                    "Malformed message wrapper during initialization".to_string(),
+                ));
+            }
+            Err(TryRecvError::Empty) => runtime.sleep(IDLE_POLL_INTERVAL.into()).await,
+            Err(TryRecvError::Disconnected) => {
+                return Err(PluginError::Execution(
+                    "Channel disconnected during initialization".to_string(),
+                ));
+            }
+        }
     }
 }
 
@@ -210,6 +227,11 @@ async fn handle_control_messages(
 /// Not acking/forwarding markers here is load-bearing: an epoch covering
 /// dropped batches must never finalize, so its offsets stay uncommitted and
 /// the dropped data replays on restart — at-least-once holds.
+///
+/// Terminate only arrives at teardown, so the failure is also reported right
+/// away as `PluginMsg::Error` on the output channel, which the host turns
+/// into a stream error that starts the pipeline's drain. A host predating
+/// that ignores the message and learns of the failure at teardown, as before.
 async fn drain_discard_after_failure<F>(
     channels: &PluginChannels,
     runtime: &PluginAsyncRuntimeObj,
@@ -227,9 +249,21 @@ where
     let mut terminate = Some(terminate);
     let mut dropped_batches: u64 = 0;
     let mut swallowed_checkpoints: u64 = 0;
+    // Retried between drain iterations rather than awaited: the host may be
+    // blocked writing into our full input channel before it reads output
+    // again, so only draining can make room for the report.
+    let mut unsent_report = Some(NonExhaustive::new(PluginMsg::Error {
+        message: RString::from(error.to_string()),
+    }));
 
     loop {
         beacon.beat();
+        if let Some(report) = unsent_report.take() {
+            match channels.output.sender.try_send(report) {
+                Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+                Err(crossbeam_channel::TrySendError::Full(report)) => unsent_report = Some(report),
+            }
+        }
         match channels.input.receiver.try_recv().map(|m| m.into_enum()) {
             Ok(Ok(PluginMsg::NextBatch { .. })) => {
                 dropped_batches += 1;
@@ -284,7 +318,7 @@ impl SourcePluginDispatcher {
         // host guarantees `initialize()` does not run when termination comes
         // first, so plugins can open network connections, DB clients, etc. there
         // without worrying about hermetic-validation environments.
-        match wait_for_initialization(&self.channels)? {
+        match wait_for_initialization(&self.channels, &runtime).await? {
             InitOutcome::Terminate => {
                 self.source_plugin.terminate().await?;
                 return Ok(());
@@ -407,7 +441,7 @@ impl TransformPluginDispatcher {
     pub async fn start(&self, runtime: PluginAsyncRuntimeObj) -> Result<(), PluginError> {
         // See SourcePluginDispatcher::start for the rationale behind short-
         // circuiting on Terminate before calling `initialize()`.
-        match wait_for_initialization(&self.channels)? {
+        match wait_for_initialization(&self.channels, &runtime).await? {
             InitOutcome::Terminate => {
                 self.transform_plugin.terminate().await?;
                 return Ok(());
@@ -557,7 +591,7 @@ impl SinkPluginDispatcher {
     pub async fn start(&self, runtime: PluginAsyncRuntimeObj) -> Result<(), PluginError> {
         // See SourcePluginDispatcher::start for the rationale behind short-
         // circuiting on Terminate before calling `initialize()`.
-        match wait_for_initialization(&self.channels)? {
+        match wait_for_initialization(&self.channels, &runtime).await? {
             InitOutcome::Terminate => {
                 self.sink_plugin.terminate().await?;
                 return Ok(());
@@ -1307,6 +1341,56 @@ mod tests {
         );
     }
 
+    /// A failed plugin keeps draining until Terminate, which the host only
+    /// sends at teardown — so the failure must also be reported on the output
+    /// channel right away, or the host learns about it only at the very end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sink_failure_is_reported_before_terminate() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin: Arc<dyn SinkPlugin> = Arc::new(FailingInitSink {
+            recorder,
+            running: AtomicBool::new(true),
+        });
+        let dispatcher = SinkPluginDispatcher::new(channels.clone(), plugin);
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let running = tokio::spawn(async move { dispatcher.start(runtime).await });
+
+        let report = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(message) = channels.output.receiver.try_recv() {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failure must be reported without waiting for Terminate");
+        match report.into_enum() {
+            Ok(PluginMsg::Error { message }) => assert!(
+                message
+                    .as_str()
+                    .contains("failed to check if datasource exists"),
+                "{message}"
+            ),
+            other => panic!("expected PluginMsg::Error, got {other:?}"),
+        }
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Terminate))
+            .unwrap();
+        let result = running.await.unwrap();
+        assert!(result.is_err(), "the original error still surfaces at exit");
+    }
+
     struct FailingMarkerTransform {
         recorder: Arc<LifecycleRecorder>,
         running: AtomicBool,
@@ -1400,6 +1484,40 @@ mod tests {
             1,
             "terminate() should run once (best effort) when Terminate arrives"
         );
+    }
+
+    /// Waiting for `Init` must not block the runtime thread: a plugin that
+    /// shares the host's runtime has one instance per partition waiting at
+    /// once, and `Init` for each is sent from host tasks on that runtime.
+    #[test]
+    fn waiting_for_init_leaves_the_runtime_free() {
+        let (finished, finished_receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let channels = make_channels();
+                let recorder = Arc::new(LifecycleRecorder::default());
+                let plugin: Arc<dyn SinkPlugin> = Arc::new(RecordingSink::new(recorder));
+                let dispatcher = SinkPluginDispatcher::new(channels.clone(), plugin);
+                let host = async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    for msg in [PluginMsg::Init, PluginMsg::Terminate] {
+                        channels.input.sender.send(NonExhaustive::new(msg)).unwrap();
+                    }
+                };
+                let plugin_runtime = DirectTokioProxy::new().into_async_runtime_obj();
+                let (result, ()) = tokio::join!(dispatcher.start(plugin_runtime), host);
+                result.unwrap();
+            });
+            finished.send(()).unwrap();
+        });
+
+        finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dispatcher blocked the only runtime thread while waiting for Init");
     }
 
     #[tokio::test]
