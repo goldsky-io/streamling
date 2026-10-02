@@ -46,17 +46,44 @@ pub fn legacy_wide_int_kind(field: &Field) -> Option<NativeIntKind> {
 
 /// Does `field`, or any field nested below it, carry a legacy wide-int type?
 pub fn field_contains_legacy_wide_int(field: &Field) -> bool {
-    if legacy_wide_int_kind(field).is_some() {
-        return true;
-    }
-    match field.data_type() {
+    legacy_wide_int_kind(field).is_some() || type_contains_legacy_wide_int(field.data_type())
+}
+
+/// Every container layout, not only the ones the upgrade walks rebuild: a
+/// leaf under a union, a list view, a run-end encoding or a dictionary must be
+/// seen so the walk can refuse it loudly instead of passing the raw
+/// big-endian bytes through under a type the sink misreads.
+fn type_contains_legacy_wide_int(data_type: &DataType) -> bool {
+    match data_type {
         DataType::Struct(children) => children.iter().any(|c| field_contains_legacy_wide_int(c)),
         DataType::List(c)
         | DataType::LargeList(c)
         | DataType::FixedSizeList(c, _)
-        | DataType::Map(c, _) => field_contains_legacy_wide_int(c),
+        | DataType::ListView(c)
+        | DataType::LargeListView(c)
+        | DataType::Map(c, _)
+        | DataType::RunEndEncoded(_, c) => field_contains_legacy_wide_int(c),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, f)| field_contains_legacy_wide_int(f)),
+        DataType::Dictionary(_, values) => type_contains_legacy_wide_int(values),
         _ => false,
     }
+}
+
+/// The guard found a legacy leaf under a layout the walk does not rebuild.
+fn unrebuildable_layout(
+    field: &Field,
+    layout: &DataType,
+    what: &str,
+) -> crate::error::StreamlingError {
+    streamling_err!(
+        "legacy wide-int column '{}' sits under a {:?}, which the {} does not rebuild; \
+         flatten the column in a transform",
+        field.name(),
+        layout,
+        what,
+    )
 }
 
 /// The `decimal_arb(78, 0)` field a legacy wide-int field upgrades to, hinted
@@ -145,7 +172,7 @@ pub fn upgrade_legacy_wide_int_field(field: &Field) -> Result<Option<Field>> {
         DataType::LargeList(c) => retype(DataType::LargeList(upgrade_child(c)?)),
         DataType::FixedSizeList(c, n) => retype(DataType::FixedSizeList(upgrade_child(c)?, *n)),
         DataType::Map(c, sorted) => retype(DataType::Map(upgrade_child(c)?, *sorted)),
-        _ => return Ok(None),
+        other => return Err(unrebuildable_layout(field, other, "decimal_arb upgrade")),
     }))
 }
 
@@ -265,7 +292,7 @@ pub fn upgrade_legacy_wide_ints(
             );
             (retype(DataType::Map(f, *sorted)), Arc::new(ma) as ArrayRef)
         }
-        _ => return Ok(None),
+        other => return Err(unrebuildable_layout(field, other, "decimal_arb upgrade")),
     }))
 }
 
@@ -463,7 +490,7 @@ pub fn downgrade_legacy_wide_ints(target: &Field, array: &ArrayRef) -> Result<Op
                 *sorted,
             )) as ArrayRef
         }
-        _ => return Ok(None),
+        other => return Err(unrebuildable_layout(target, other, "legacy re-encoding")),
     }))
 }
 
@@ -504,6 +531,63 @@ mod tests {
             EXTENSION_TYPE_NAME_KEY.to_string(),
             ext.to_string(),
         )]))
+    }
+
+    #[test]
+    fn legacy_leaf_under_an_unrebuildable_layout_is_an_error_not_a_pass_through() {
+        use arrow_schema::{UnionFields, UnionMode};
+        // The walk stopped at Struct / List / Map, so a u256 leaf under a
+        // union (or a list view, a run-end encoding, a dictionary) was never
+        // upgraded and the sink received raw big-endian bytes.
+        let leaf = legacy_field("amt", LEGACY_U256_EXTENSION_NAME);
+        let union = Field::new(
+            "u",
+            DataType::Union(
+                UnionFields::try_new(
+                    vec![0, 1],
+                    vec![leaf.clone(), Field::new("other", DataType::Int64, true)],
+                )
+                .unwrap(),
+                UnionMode::Sparse,
+            ),
+            true,
+        );
+        let list_view = Field::new("lv", DataType::ListView(Arc::new(leaf.clone())), true);
+        let ree = Field::new(
+            "ree",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(leaf.clone()),
+            ),
+            true,
+        );
+        let dict = Field::new(
+            "d",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Struct(vec![leaf].into())),
+            ),
+            true,
+        );
+        for field in [&union, &list_view, &ree, &dict] {
+            assert!(field_contains_legacy_wide_int(field), "{}", field.name());
+            let err = upgrade_legacy_wide_int_field(field)
+                .expect_err(field.name())
+                .to_string();
+            assert!(err.contains("does not rebuild"), "{}: {err}", field.name());
+        }
+        // A legacy-free union is nobody's business.
+        let plain = Field::new(
+            "p",
+            DataType::Union(
+                UnionFields::try_new(vec![0], vec![Field::new("x", DataType::Int64, true)])
+                    .unwrap(),
+                UnionMode::Sparse,
+            ),
+            true,
+        );
+        assert!(!field_contains_legacy_wide_int(&plain));
+        assert!(upgrade_legacy_wide_int_field(&plain).unwrap().is_none());
     }
 
     fn be32(v: i128) -> [u8; 32] {

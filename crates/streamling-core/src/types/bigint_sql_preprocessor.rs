@@ -730,17 +730,27 @@ impl DecimalArbNames {
 /// `CAST(… AS DECIMAL(p[, s]))` beyond DataFusion's native precision routes
 /// to decimal_arb.
 fn is_wide_decimal_type(data_type: &SqlDataType) -> bool {
+    wide_decimal_precision_scale(data_type).is_some()
+}
+
+/// `(precision, scale)` of a `DECIMAL` / `NUMERIC` / `DEC` / `BIGNUMERIC` /
+/// `BIGDECIMAL` type beyond DataFusion's native precision (76); a missing
+/// scale is 0. The spellings are one type to the planner.
+fn wide_decimal_precision_scale(data_type: &SqlDataType) -> Option<(u64, u64)> {
     let info = match data_type {
         SqlDataType::Decimal(info)
         | SqlDataType::Numeric(info)
         | SqlDataType::Dec(info)
         | SqlDataType::BigNumeric(info)
         | SqlDataType::BigDecimal(info) => info,
-        _ => return false,
+        _ => return None,
     };
     match info {
-        ExactNumberInfo::Precision(p) | ExactNumberInfo::PrecisionAndScale(p, _) => *p > 76,
-        ExactNumberInfo::None => false,
+        ExactNumberInfo::Precision(p) if *p > 76 => Some((*p, 0)),
+        // sqlparser allows a negative scale; decimal_arb does not, so such a
+        // cast is left to the planner.
+        ExactNumberInfo::PrecisionAndScale(p, s) if *p > 76 => Some((*p, u64::try_from(*s).ok()?)),
+        _ => None,
     }
 }
 
@@ -873,7 +883,7 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     // First, normalize TRY_CAST DECIMAL via regex (AST may not have TryCast variant)
     lazy_static::lazy_static! {
         static ref DECIMAL_TRY_RE: Regex = Regex::new(
-            r"(?i)TRY_CAST\s*\(\s*(.+?)\s+AS\s+DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)"
+            r"(?i)TRY_CAST\s*\(\s*(.+?)\s+AS\s+(?:DECIMAL|NUMERIC|DEC|BIGNUMERIC|BIGDECIMAL)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)"
         ).unwrap();
         /// An unquoted SQL numeric literal (optionally signed, fractional,
         /// exponent), as it appears inside `TRY_CAST(<literal> AS …)`.
@@ -1010,40 +1020,22 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                 array: _,
             } => {
                 let non_throwing = matches!(kind, CastKind::TryCast | CastKind::SafeCast);
-                // Attempt to parse DECIMAL(p,s) from data_type.to_string()
-                let dt = data_type.to_string();
-                let dt_lower = dt.to_lowercase();
-                // naive parse: decimal(p[, s])
-                if let Some(start) = dt_lower.find("decimal(")
-                    && dt_lower.ends_with(')')
-                {
-                    // extract inside parens
-                    let inside = &dt_lower[start + "decimal(".len()..dt_lower.len() - 1];
-                    let parts: Vec<&str> = inside.split(',').map(|s| s.trim()).collect();
-                    let (p, s) = match parts.len() {
-                        1 => (parts[0].parse::<u64>().unwrap_or(0), 0i64),
-                        2 => (
-                            parts[0].parse::<u64>().unwrap_or(0),
-                            parts[1].parse::<i64>().unwrap_or(-1),
-                        ),
-                        _ => (0, -1),
-                    };
-                    if p > 76 && s >= 0 {
-                        // All wide-precision CASTs route through the
-                        // decimal_arb cast UDF. The
-                        // legacy `to_u256` fast path for (p ≤ 78, 0) is
-                        // retired alongside the U256/I256 types — those
-                        // values now flow through decimal_arb end-to-end.
-                        if let Some(call) =
-                            parse_to_decimal_arb_from_string(inner, p, s as u64, non_throwing)
-                        {
-                            *expr = call;
-                            return;
-                        } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
-                            // Defensive fallback — should not fire in practice.
-                            *expr = cast_varchar;
-                            return;
-                        }
+                // Read the target type from the AST: sniffing the printed
+                // type for `decimal(` missed `NUMERIC(78, 0)` and `DEC(78, 0)`,
+                // which DataFusion then failed to plan (Decimal128 caps at 38).
+                if let Some((p, s)) = wide_decimal_precision_scale(data_type) {
+                    // All wide-precision CASTs route through the decimal_arb
+                    // cast UDF. The legacy `to_u256` fast path for (p ≤ 78, 0)
+                    // is retired alongside the U256/I256 types — those values
+                    // now flow through decimal_arb end-to-end.
+                    if let Some(call) = parse_to_decimal_arb_from_string(inner, p, s, non_throwing)
+                    {
+                        *expr = call;
+                        return;
+                    } else if let Some(cast_varchar) = parse_cast_varchar(inner) {
+                        // Defensive fallback — should not fire in practice.
+                        *expr = cast_varchar;
+                        return;
                     }
                 }
                 // Recurse into inner if not rewritten
@@ -1070,23 +1062,16 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         }
     }
 
-    if let Statement::Query(query) = &mut stmt
-        && let SetExpr::Select(select) = query.body.as_mut()
-    {
-        for item in select.projection.iter_mut() {
-            match item {
-                SelectItem::UnnamedExpr(e) => rewrite_expr(e),
-                SelectItem::ExprWithAlias { expr, .. } => rewrite_expr(expr),
-                _ => {}
-            }
-        }
-        if let Some(selection) = select.selection.as_mut() {
-            rewrite_expr(selection);
-        }
-        if let Some(having) = select.having.as_mut() {
-            rewrite_expr(having);
-        }
-    }
+    // Every expression in the statement — CTE bodies, derived tables,
+    // subqueries, set-operation branches, ORDER BY — not only the outer
+    // SELECT's projection, WHERE and HAVING, so `CAST … DECIMAL(78, 0)` plans
+    // wherever it is written. `rewrite_expr` recurses into the children it
+    // knows; the visitor reaches the rest, and a rewritten CAST is a function
+    // call the second visit leaves alone.
+    let _ = visit_expressions_mut(&mut stmt, |expr: &mut SqlExpr| {
+        rewrite_expr(expr);
+        ControlFlow::<()>::Continue(())
+    });
 
     stmt.to_string()
 }
@@ -1105,6 +1090,46 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use std::sync::Arc;
+
+    #[test]
+    fn wide_cast_rewrite_reads_every_decimal_spelling_and_the_whole_statement() {
+        // NUMERIC / DEC are the same type as DECIMAL to the planner; the
+        // printed-type sniff for `decimal(` left them to fail planning.
+        assert_eq!(
+            preprocess_bigint_decimal_casts("SELECT CAST(balance AS NUMERIC(78, 0)) FROM accounts"),
+            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+        );
+        assert_eq!(
+            preprocess_bigint_decimal_casts("SELECT CAST(balance AS DEC(100, 2)) FROM accounts"),
+            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 100, 2) FROM accounts"
+        );
+        assert_eq!(
+            preprocess_bigint_decimal_casts(
+                "SELECT TRY_CAST(balance AS NUMERIC(78)) FROM accounts"
+            ),
+            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+        );
+        // Narrow spellings stay native.
+        assert_eq!(
+            preprocess_bigint_decimal_casts("SELECT CAST(balance AS NUMERIC(38, 2)) FROM accounts"),
+            "SELECT CAST(balance AS NUMERIC(38,2)) FROM accounts"
+        );
+        // The rewrite used to visit only the outer SELECT's projection,
+        // WHERE and HAVING.
+        for sql in [
+            "WITH w AS (SELECT CAST(x AS DECIMAL(78, 0)) AS v FROM t) SELECT v FROM w",
+            "SELECT v FROM (SELECT CAST(x AS DECIMAL(78, 0)) AS v FROM t) AS s",
+            "SELECT x FROM t WHERE x IN (SELECT CAST(y AS DECIMAL(78, 0)) FROM u)",
+            "SELECT CAST(x AS DECIMAL(78, 0)) FROM t UNION ALL SELECT CAST(y AS DECIMAL(78, 0)) FROM u",
+            "SELECT x FROM t ORDER BY CAST(x AS DECIMAL(78, 0))",
+        ] {
+            let out = preprocess_bigint_decimal_casts(sql);
+            assert!(
+                !out.contains("DECIMAL(78, 0)") && out.contains("to_decimal_arb_from_string("),
+                "{sql}\n -> {out}"
+            );
+        }
+    }
 
     #[test]
     fn test_preprocess_decimal_78_routes_to_decimal_arb() {

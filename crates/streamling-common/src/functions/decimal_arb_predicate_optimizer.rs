@@ -105,6 +105,17 @@ fn is_null_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(v, _) if v.is_null())
 }
 
+/// A NULL literal, possibly under casts or an alias (`CAST(NULL AS VARCHAR)`,
+/// `NULL::text`): typed, but still no value.
+fn is_null_valued(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(v, _) => v.is_null(),
+        Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => is_null_valued(expr),
+        Expr::Alias(alias) => is_null_valued(&alias.expr),
+        _ => false,
+    }
+}
+
 /// The text of a non-null string literal, if `expr` is one.
 pub(crate) fn text_literal(expr: &Expr) -> Option<&str> {
     match expr {
@@ -386,9 +397,10 @@ impl DecimalArbExprRewrite {
                 vec![operand, lit(INT_COERCE_PRECISION), lit(0_i64)],
             )),
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                if is_null_literal(&operand) {
-                    // A typed NULL: DataFusion's null coercion yields NULL, which
-                    // is the right answer.
+                if is_null_valued(&operand) {
+                    // A typed NULL (`NULL`, `CAST(NULL AS VARCHAR)`): DataFusion's
+                    // null coercion yields NULL, which is the right answer; the
+                    // retired u256 columns compared the same way.
                     return Ok(None);
                 }
                 match text_literal(&operand) {
@@ -1632,6 +1644,22 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[tokio::test]
+    async fn comparison_with_a_typed_null_string_is_unknown_not_a_planning_error() {
+        let ctx = make_session().await;
+        for sql in [
+            "SELECT id FROM t WHERE amount = CAST(NULL AS VARCHAR)",
+            "SELECT id FROM t WHERE amount > TRY_CAST(NULL AS VARCHAR)",
+        ] {
+            let got = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                got.iter().map(|b| b.num_rows()).sum::<usize>(),
+                0,
+                "{sql}: UNKNOWN matches no row"
+            );
+        }
     }
 
     #[tokio::test]

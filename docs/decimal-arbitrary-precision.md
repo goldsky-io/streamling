@@ -161,6 +161,12 @@ What is not supported today:
   the schema probe — but is not implemented. Workaround:
   pair ClickHouse `UInt256` sources with a Kafka/Postgres source
   if you need the hint to propagate to a downstream ClickHouse sink.
+  For the same reason the hybrid source reads a hinted (or wide)
+  `decimal_arb` column from its ClickHouse history table as decimal
+  text and parses it back: the hint says how a sink writes the
+  column, and the history table of a `u256`-hinted stream may be
+  `Int256`, `Decimal(100, 0)` or `String` — a `CAST(… AS UInt256)`
+  there would wrap every negative value inside ClickHouse.
 - **A source `schema:` map cannot declare a `decimal_arb` column** —
   a Kafka JSON source's `schema:` block maps a column name to an Arrow
   type string, and that grammar only produces `Decimal128(p, s)` or

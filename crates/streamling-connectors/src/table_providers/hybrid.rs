@@ -1918,23 +1918,22 @@ impl ClickHouseSchemaAdapter {
     }
 
     /// ClickHouse type to CAST a bounded-source column to so it lines up with
-    /// the target (unbounded) field. For `decimal_arb` columns carrying a
-    /// `native_int_kind` hint — the wide blockchain-integer case — CAST to the
-    /// native `UInt256`/`Int256` so ClickHouse ships the raw 32-byte value as
-    /// Arrow `FixedSizeBinary(32)`, which `normalize_batch_from_clickhouse`
-    /// reinterprets as `decimal_arb` on read. Every other field keeps the
-    /// existing `arrow_field_to_clickhouse` mapping (wide decimal_arb without a
-    /// hint still routes to `String`).
+    /// the target (unbounded) field. A `decimal_arb` target carrying a
+    /// `native_int_kind` hint reads through `String`: the hint says how a sink
+    /// *writes* the column, not what the history table holds — a Kafka
+    /// `decimal(100, 0)` stream is hinted `u256` while its ClickHouse history
+    /// may be `Int256`, `Decimal(100, 0)` or `String`, and the `FORMAT Arrow`
+    /// probe cannot tell those apart — and `CAST(x AS UInt256)` on an `Int256`
+    /// column wraps every negative value to 2^256 − |x| inside ClickHouse,
+    /// before a byte reaches us. Decimal text is exact for every numeric
+    /// column type, and `normalize_batch_from_clickhouse` parses it back at
+    /// the target's scale. Every other field keeps the
+    /// `arrow_field_to_clickhouse` mapping: a decimal_arb within the Decimal
+    /// cap reads as `Decimal(p, s)`, a wider one without a hint as `String`.
     fn clickhouse_read_type(target_field: &Field) -> String {
-        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
-        if let Some((_, scale)) = DecimalArbType::precision_scale_from_field(target_field)
-            && scale == 0
-        {
-            match DecimalArbType::native_int_kind_from_field(target_field) {
-                Some(NativeIntKind::U256) => return "UInt256".to_string(),
-                Some(NativeIntKind::I256) => return "Int256".to_string(),
-                _ => {}
-            }
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        if DecimalArbType::native_int_kind_from_field(target_field).is_some() {
+            return "String".to_string();
         }
         ClickHouseClient::arrow_field_to_clickhouse(target_field)
     }
@@ -2158,6 +2157,33 @@ mod tests {
             SessionManager::new(100, 10, DynamicTableRegistry::new(), 1)
                 .expect("session manager initialisation failed")
         });
+
+    #[test]
+    fn clickhouse_read_type_reads_a_hinted_wide_int_as_text() {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        // The hint says how a sink writes the column; the history table of a
+        // u256-hinted `decimal(100, 0)` stream may well be Int256, and
+        // `CAST(x AS UInt256)` wraps its negatives inside ClickHouse.
+        let hinted = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("amount", 100, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::clickhouse_read_type(&hinted),
+            "String"
+        );
+        let narrow = DecimalArbType::field("amount", 76, 18, true).unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::clickhouse_read_type(&narrow),
+            "Decimal(76, 18)"
+        );
+        let wide = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::clickhouse_read_type(&wide),
+            "String"
+        );
+    }
 
     #[test]
     fn convert_field_type_casts_numeric_to_target_type() {
