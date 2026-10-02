@@ -541,6 +541,25 @@ impl TestContext {
         signal_after: std::time::Duration,
         exit_deadline: std::time::Duration,
     ) -> Result<(ExitStatus, String)> {
+        self.run_pipeline_with_sigterm_when(
+            pipeline_yaml,
+            opts,
+            tokio::time::sleep(signal_after),
+            exit_deadline,
+        )
+        .await
+    }
+
+    /// Like [`Self::run_pipeline_with_sigterm`], but signals once `signal_when`
+    /// resolves. Wait on the pipeline's observed progress whenever a fixed delay
+    /// would stop it somewhere else on a faster machine.
+    pub async fn run_pipeline_with_sigterm_when(
+        &self,
+        pipeline_yaml: &str,
+        opts: PipelineOpts,
+        signal_when: impl std::future::Future<Output = ()>,
+        exit_deadline: std::time::Duration,
+    ) -> Result<(ExitStatus, String)> {
         let pipeline_path = self.temp_dir.path().join("pipeline.yaml");
         std::fs::write(&pipeline_path, pipeline_yaml)?;
 
@@ -553,11 +572,11 @@ impl TestContext {
         }
         env_vars.extend(opts.extra_env);
 
-        streamling::run_streamling_with_sigterm(
+        streamling::run_streamling_with_sigterm_when(
             &pipeline_path,
             self.config.streamling_bin.as_deref(),
             &env_vars,
-            signal_after,
+            signal_when,
             exit_deadline,
         )
         .await

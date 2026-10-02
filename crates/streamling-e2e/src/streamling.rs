@@ -193,6 +193,26 @@ pub async fn run_streamling_with_sigterm(
     signal_after: std::time::Duration,
     exit_deadline: std::time::Duration,
 ) -> Result<(ExitStatus, String)> {
+    run_streamling_with_sigterm_when(
+        pipeline_path,
+        binary_path,
+        env_vars,
+        tokio::time::sleep(signal_after),
+        exit_deadline,
+    )
+    .await
+}
+
+/// Like [`run_streamling_with_sigterm`], but signals once `signal_when`
+/// resolves. Waiting on the pipeline's observed progress stops it at the same
+/// point on any machine, where a fixed delay a fast host outruns does not.
+pub async fn run_streamling_with_sigterm_when(
+    pipeline_path: &Path,
+    binary_path: Option<&Path>,
+    env_vars: &[(String, String)],
+    signal_when: impl std::future::Future<Output = ()>,
+    exit_deadline: std::time::Duration,
+) -> Result<(ExitStatus, String)> {
     let streamling_dir = find_streamling_dir();
     let (program, args) = construct_program_with_args(binary_path);
 
@@ -218,9 +238,8 @@ pub async fn run_streamling_with_sigterm(
     cmd.stderr(std::process::Stdio::piped());
 
     info!(
-        "Running streamling with pipeline: {} (SIGTERM after {:?}, exit deadline {:?})",
+        "Running streamling with pipeline: {} (exit deadline {:?} after SIGTERM)",
         pipeline_path.display(),
-        signal_after,
         exit_deadline
     );
 
@@ -261,7 +280,7 @@ pub async fn run_streamling_with_sigterm(
             .status();
     };
 
-    tokio::time::sleep(signal_after).await;
+    signal_when.await;
     info!("Sending SIGTERM to streamling process group {}", pid);
     send_group_signal("-TERM");
 

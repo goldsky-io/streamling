@@ -554,6 +554,9 @@ pub struct ConfluentAvroDecoder {
     /// still coerced to `target_schema` (by field name) afterward. This mirrors the vendored path,
     /// where `skip_schema_resolution` fed the raw writer value straight to the converter.
     resolve_against_reader: bool,
+    /// Max rows per arrow-avro generation; `None` keeps arrow-avro's default (1024). A full
+    /// decoder consumes nothing, so `decode` errors instead of dropping the frame.
+    batch_size: Option<usize>,
 }
 
 /// Strip high-precision decimals, then if the root is a union, unwrap it to its record branch.
@@ -638,6 +641,7 @@ impl ConfluentAvroDecoder {
             reader_full_name: None,
             writer_aliases: BTreeSet::new(),
             resolve_against_reader: true,
+            batch_size: None,
         }
     }
 
@@ -646,6 +650,14 @@ impl ConfluentAvroDecoder {
     /// its writer schema with no resolution, and the batch is coerced to the target by field name.
     pub fn with_schema_resolution(mut self, enabled: bool) -> Self {
         self.resolve_against_reader = enabled;
+        self.decoder = None;
+        self
+    }
+
+    /// Cap rows per arrow-avro generation (default: arrow-avro's 1024). Set it to the most rows
+    /// the caller feeds between flushes: past the cap, `decode` errors rather than dropping rows.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
         self.decoder = None;
         self
     }
@@ -751,6 +763,9 @@ impl ConfluentAvroDecoder {
     fn ensure_decoder(&mut self) -> Result<&mut Decoder> {
         if self.decoder.is_none() {
             let mut builder = ReaderBuilder::new().with_writer_schema_store(self.store.clone());
+            if let Some(n) = self.batch_size {
+                builder = builder.with_batch_size(n);
+            }
             // When resolution is disabled (`skip_schema_resolution`), don't set a reader schema:
             // arrow-avro then decodes each message against its own writer schema with no resolution.
             // The batch is still coerced to `target_schema` (by name) in `flush_inner`.
@@ -799,7 +814,8 @@ impl ConfluentAvroDecoder {
         // For union-rooted writer schemas, strip the leading union-branch varint so the body lines
         // up with the unwrapped record schema registered in the store. Looked up per writer id so
         // mixed union/plain framings in one subject each decode correctly.
-        if let Some(&record_index) = self.union_record_indices.get(&id) {
+        let reframed: Vec<u8>;
+        let frame: &[u8] = if let Some(&record_index) = self.union_record_indices.get(&id) {
             let body = &framed[5..];
             let (branch, consumed) = read_avro_long(body)?;
             if branch != record_index {
@@ -808,17 +824,29 @@ impl ConfluentAvroDecoder {
                      (top-level null / non-record values are unsupported)"
                 )));
             }
-            let mut reframed = Vec::with_capacity(framed.len() - consumed);
-            reframed.extend_from_slice(&framed[..5]);
-            reframed.extend_from_slice(&body[consumed..]);
-            return self
-                .ensure_decoder()?
-                .decode(&reframed)
-                .map_err(|e| DataFusionError::Internal(format!("arrow-avro decode failed: {e}")));
+            let mut buf = Vec::with_capacity(framed.len() - consumed);
+            buf.extend_from_slice(&framed[..5]);
+            buf.extend_from_slice(&body[consumed..]);
+            reframed = buf;
+            &reframed
+        } else {
+            framed
+        };
+
+        let decoder = self.ensure_decoder()?;
+        let consumed = decoder
+            .decode(frame)
+            .map_err(|e| DataFusionError::Internal(format!("arrow-avro decode failed: {e}")))?;
+        // One frame is exactly one record. arrow-avro consumes nothing once its batch is full and
+        // stops short on a truncated body; either way the rest of this message would be lost.
+        if consumed != frame.len() {
+            return Err(DataFusionError::Internal(format!(
+                "arrow-avro consumed {consumed} of {} bytes for schema id {id} (decoder full: {})",
+                frame.len(),
+                decoder.batch_is_full()
+            )));
         }
-        self.ensure_decoder()?
-            .decode(framed)
-            .map_err(|e| DataFusionError::Internal(format!("arrow-avro decode failed: {e}")))
+        Ok(consumed)
     }
 
     /// Flush the live arrow `Decoder` (if any) into a target-coerced batch. Does not touch the
@@ -1674,5 +1702,82 @@ mod tests {
             "123.4567",
             "scaled high-precision decimal decodes as a decimal_arb value, not raw bytes"
         );
+    }
+
+    // STRM-6578: arrow-avro caps a decoder at `batch_size` rows (default 1024) and consumes 0
+    // bytes past that. The Kafka source feeds up to `record_batch_size` messages per flush and
+    // appends one `_gs_op` per message, so the cap must match and overflow must be loud.
+    const ONE_LONG: &str = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+
+    fn one_long_decoder(batch_size: usize) -> (ConfluentAvroDecoder, AvroWriterSchema) {
+        let schema = AvroWriterSchema::parse_str(ONE_LONG).unwrap();
+        let mut decoder = ConfluentAvroDecoder::new()
+            .with_batch_size(batch_size)
+            .with_reader_schema(&schema)
+            .unwrap();
+        decoder.register_writer_schema(1, ONE_LONG).unwrap();
+        (decoder, schema)
+    }
+
+    fn one_long_frame(schema: &AvroWriterSchema, id: i64) -> Vec<u8> {
+        let mut rec = Record::new(schema).unwrap();
+        rec.put("id", Value::Long(id));
+        confluent_frame(1, &to_avro_datum(schema, rec).unwrap())
+    }
+
+    #[test]
+    fn decodes_every_message_past_arrow_avro_default_batch_size() {
+        let n = 1025usize;
+        let (mut decoder, schema) = one_long_decoder(n);
+        for i in 0..n {
+            let frame = one_long_frame(&schema, i as i64);
+            assert_eq!(decoder.decode(&frame).unwrap(), frame.len(), "message {i}");
+        }
+        assert_eq!(decoder.flush().unwrap().expect("batch").num_rows(), n);
+    }
+
+    // What the Kafka source does after the loop above: append one `_gs_op` per message.
+    #[test]
+    fn per_message_op_column_matches_payload_rows_above_1024() {
+        use arrow::array::StringArray;
+        use arrow_schema::Schema;
+
+        let record_batch_size = 1025usize;
+        let (mut decoder, schema) = one_long_decoder(record_batch_size);
+        let mut row_kinds = Vec::new();
+        for i in 0..record_batch_size {
+            decoder.decode(&one_long_frame(&schema, i as i64)).unwrap();
+            row_kinds.push("INSERT");
+        }
+        let payload = decoder.flush().unwrap().expect("batch");
+
+        let mut fields: Vec<Field> = payload
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new("_gs_op", DataType::Utf8, false));
+        let mut columns = payload.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(row_kinds)));
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .unwrap_or_else(|e| panic!("payload rows = {}: {e}", payload.num_rows()));
+        assert_eq!(batch.num_rows(), record_batch_size);
+    }
+
+    #[test]
+    fn decode_past_batch_size_is_an_error_not_a_silent_drop() {
+        let (mut decoder, schema) = one_long_decoder(1);
+        decoder.decode(&one_long_frame(&schema, 0)).unwrap();
+        let err = decoder
+            .decode(&one_long_frame(&schema, 1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("consumed 0 of") && err.contains("decoder full: true"),
+            "{err}"
+        );
+        assert_eq!(decoder.flush().unwrap().expect("batch").num_rows(), 1);
     }
 }

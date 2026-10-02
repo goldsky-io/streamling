@@ -114,6 +114,10 @@ impl BatchAccumulator {
             // If empty batch has checkpoint metadata, add it to accumulated batches
             if has_checkpoint_data {
                 self.accumulated_batches.push_back(batch);
+                // Nothing precedes it, so releasing now cannot ack ahead of data.
+                if self.current_row_count == 0 {
+                    return self.flush();
+                }
             }
             return None;
         }
@@ -399,14 +403,26 @@ impl AsyncBatchAccumulator {
             // Macro for processing a single batch from the input stream
             macro_rules! handle_batch {
                 ($batch:expr) => {
-                    if let Some(batches) = self.accumulator.push($batch) {
+                    let batch = $batch;
+                    // A batch carrying checkpoint messages drains the accumulator
+                    // rather than waiting for `batch_size` rows or a flush
+                    // interval that may not be configured at all. The source that
+                    // sent the marker can hold its stream open until the epoch
+                    // finalizes, so holding it back here deadlocks the pipeline
+                    // instead of merely delaying a checkpoint. Markers arrive once
+                    // an epoch, so the partial flush costs next to nothing.
+                    let carries_checkpoint =
+                        !extract_checkpoint_messages(batch.schema().metadata()).is_empty();
+                    if let Some(batches) = self.accumulator.push(batch) {
                         yield_merged!(batches);
-                        while self.accumulator.should_flush_by_size() {
-                            if let Some(batches) = self.accumulator.flush() {
-                                yield_merged!(batches);
-                            } else {
-                                break;
-                            }
+                    }
+                    while (carries_checkpoint && !self.accumulator.is_empty())
+                        || self.accumulator.should_flush_by_size()
+                    {
+                        if let Some(batches) = self.accumulator.flush() {
+                            yield_merged!(batches);
+                        } else {
+                            break;
                         }
                     }
                 };
@@ -611,21 +627,11 @@ mod tests {
         let empty_batch_with_checkpoint =
             enrich_batch_with_metadata(empty_batch, metadata).unwrap();
 
-        // Empty batch with checkpoint data should be added to accumulated batches
-        // (not returned immediately) to ensure checkpoint is only acknowledged after data is written
-        let result = accumulator.push(empty_batch_with_checkpoint);
-        assert!(
-            result.is_none(),
-            "Empty batch with checkpoint data should be added to accumulated batches"
-        );
-
-        // Verify it was added to accumulated batches
-        assert_eq!(accumulator.accumulated_batches.len(), 1);
-
-        // Flush to get the checkpoint batch
-        let flushed = accumulator.flush();
-        assert!(flushed.is_some(), "Should flush the checkpoint batch");
-        let batches = flushed.unwrap();
+        // With no data pending there is nothing the marker could be acked ahead
+        // of, so it is released immediately instead of waiting for the timer.
+        let batches = accumulator
+            .push(empty_batch_with_checkpoint)
+            .expect("Empty batch with checkpoint data should be released immediately");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 0);
 
@@ -1039,10 +1045,62 @@ mod tests {
         assert_eq!(batch.num_rows(), 5);
     }
 
+    /// With no flush interval there is no timer to move a marker along, so a
+    /// batch carrying one has to drain the accumulator as it arrives. The source
+    /// that sent it can hold its stream open until the epoch finalizes, so
+    /// waiting here for `batch_size` rows that never come deadlocks the pipeline
+    /// — which is what a `script` transform with `batch_size` and no interval hit.
+    #[tokio::test]
+    async fn test_async_accumulator_flushes_checkpoint_batches_without_a_timer() {
+        use crate::checkpoints::checkpoint_management::{
+            CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+        };
+        use crate::utils::batch::enrich_batch_with_metadata;
+
+        // A batch size far above the rows pushed: nothing but the marker can
+        // flush them.
+        let accumulator = AsyncBatchAccumulator::new(1000, None);
+
+        let mut metadata = std::collections::HashMap::new();
+        enrich_batch_metadata_with_checkpoints(
+            &mut metadata,
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(7),
+                created_at_ms: 1000,
+            }],
+        );
+        let checkpoint_batch = enrich_batch_with_metadata(create_test_batch(0), metadata).unwrap();
+
+        // The input never ends, so the end-of-stream flush cannot be what
+        // delivers the marker.
+        let input = Box::pin(
+            stream::iter(vec![Ok(create_test_batch(3)), Ok(checkpoint_batch)])
+                .chain(stream::pending()),
+        );
+        let mut output_stream = Box::pin(accumulator.process_stream(input));
+
+        let flushed = timeout(Duration::from_millis(500), output_stream.next())
+            .await
+            .expect("a marker must flush without waiting for more rows")
+            .expect("Stream should produce at least one batch")
+            .expect("Batch should not be an error");
+
+        assert_eq!(
+            flushed.num_rows(),
+            3,
+            "the rows accumulated before the marker must go downstream with it"
+        );
+        assert_eq!(
+            extract_checkpoint_messages(flushed.schema().metadata()).len(),
+            1,
+            "the marker must ride the flushed batch"
+        );
+    }
+
     #[tokio::test]
     async fn test_async_accumulator_flushes_checkpoint_only_batches_on_timer() {
-        // Verify that checkpoint-only (empty) batches are flushed on timer tick.
-        // This ensures checkpoint acknowledgments are not delayed during idle periods.
+        // Verify that a checkpoint-only (empty) batch parked behind pending data
+        // is flushed on a timer tick, so acks are not delayed during idle periods.
         use crate::checkpoints::checkpoint_management::{
             CheckpointEpoch, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
         };
@@ -1063,16 +1121,21 @@ mod tests {
         );
         let checkpoint_batch = enrich_batch_with_metadata(empty, metadata).unwrap();
 
-        // Stream that sends the checkpoint batch, then goes idle
-        let input = Box::pin(stream::unfold(Some(checkpoint_batch), |state| async move {
-            match state {
-                Some(batch) => Some((Ok(batch), None)),
-                None => {
-                    sleep(Duration::from_secs(10)).await;
-                    None
+        // A data row parks the marker behind it, then the stream goes idle, so
+        // only the timer can release either.
+        let input = Box::pin(stream::unfold(
+            (0, Some(checkpoint_batch)),
+            |(step, checkpoint)| async move {
+                match step {
+                    0 => Some((Ok(create_test_batch(5)), (1, checkpoint))),
+                    1 => Some((Ok(checkpoint.unwrap()), (2, None))),
+                    _ => {
+                        sleep(Duration::from_secs(10)).await;
+                        None
+                    }
                 }
-            }
-        }));
+            },
+        ));
 
         let mut output_stream = Box::pin(accumulator.process_stream(input));
 
@@ -1088,6 +1151,89 @@ mod tests {
             checkpoint_messages.len(),
             1,
             "Checkpoint metadata should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_marker_only_batch_released_when_no_data_is_pending() {
+        for batch_size in [0, 5, usize::MAX] {
+            let mut accumulator = BatchAccumulator::new(batch_size, None);
+
+            let flushed = accumulator
+                .push(create_test_batch_with_checkpoint(0, 1))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "marker-only batch must be released immediately (batch_size {batch_size})"
+                    )
+                });
+
+            assert_eq!(flushed.len(), 1);
+            assert_eq!(flushed[0].num_rows(), 0);
+            assert_eq!(
+                extract_checkpoint_messages(flushed[0].schema().metadata()).len(),
+                1
+            );
+            assert!(accumulator.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_accumulator_releases_marker_only_batch_without_threshold_or_timer() {
+        let accumulator = AsyncBatchAccumulator::new(0, None);
+
+        // Marker, then silence: nothing but the size trigger can release it.
+        let input = Box::pin(stream::unfold(
+            Some(create_test_batch_with_checkpoint(0, 1)),
+            |state| async move {
+                match state {
+                    Some(batch) => Some((Ok(batch), None)),
+                    None => {
+                        sleep(Duration::from_secs(10)).await;
+                        None
+                    }
+                }
+            },
+        ));
+
+        let mut output = Box::pin(accumulator.process_stream(input));
+        let batch = timeout(Duration::from_millis(200), output.next())
+            .await
+            .expect("marker-only batch must be yielded without waiting for data")
+            .expect("stream should produce a batch")
+            .expect("batch should not be an error");
+
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(
+            extract_checkpoint_messages(batch.schema().metadata()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_marker_only_batch_waits_behind_pending_data() {
+        let mut accumulator = BatchAccumulator::new(5, None);
+
+        assert!(accumulator.push(create_test_batch(2)).is_none());
+        assert!(
+            accumulator
+                .push(create_test_batch_with_checkpoint(0, 1))
+                .is_none(),
+            "marker must wait behind pending data while below the size threshold"
+        );
+
+        let flushed = accumulator.flush().expect("flush must drain the queue");
+        let total_rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+        assert!(
+            !extract_checkpoint_messages(flushed.back().unwrap().schema().metadata()).is_empty(),
+            "the parked marker must be flushed behind the data it follows"
+        );
+        assert!(
+            flushed
+                .iter()
+                .take(flushed.len() - 1)
+                .all(|b| extract_checkpoint_messages(b.schema().metadata()).is_empty()),
+            "no batch ahead of the marker may carry checkpoint metadata"
         );
     }
 

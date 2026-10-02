@@ -256,10 +256,9 @@ pub struct FileSource {
     pub format: FileSourceFormat,
     #[serde(default)]
     pub mode: FileSourceMode,
-    /// Number of concurrent scan partitions the discovered files are split
-    /// across. Bounded mode only; defaults to the session's target partitions.
-    /// A continuous file source is single-stream (one watermark cursor) and
-    /// rejects any value above 1.
+    /// Number of output partitions the discovered files are read across.
+    /// Bounded mode defaults to the session's target partitions; continuous
+    /// mode defaults to 1.
     pub parallelism: Option<usize>,
     pub primary_key: Option<String>,
     pub telemetry: Option<Telemetry>,
@@ -279,8 +278,11 @@ fn default_file_poll_interval() -> String {
 ///   never self-terminates and so is not allowed under `job_mode`. When the mode
 ///   is omitted entirely (or given without `poll_interval`), `poll_interval`
 ///   defaults to [`DEFAULT_FILE_POLL_INTERVAL`].
-/// - `Bounded` lists the matching files once via DataFusion's `ListingTable`,
-///   reads them to completion, and lets the job terminate.
+/// - `Bounded` lists the matching files once, reads them to completion across
+///   `parallelism` partitions, and lets the job terminate. Progress is
+///   checkpointed per file, so a restarted job resumes where the last finalized
+///   checkpoint left it; rerunning a finished job is a no-op until its state is
+///   cleared.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum FileSourceMode {
@@ -581,6 +583,7 @@ pub struct ScriptTransform {
     pub parallelism: Option<usize>,
     /// Rows accumulated per execution stream before invoking WASM.
     pub batch_size: Option<usize>,
+    pub batch_flush_interval: Option<String>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -1284,6 +1287,34 @@ sinks: {}
             }
             _ => panic!("expected dynamic_table transform"),
         }
+    }
+
+    #[test]
+    fn script_transform_parses_batch_flush_interval() {
+        let yaml = r#"
+primary_key: id
+from: raw
+language: typescript
+script: "function process(input) { return input; }"
+batch_size: 100
+batch_flush_interval: 1s
+"#;
+        let transform: ScriptTransform = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(transform.batch_size, Some(100));
+        assert_eq!(transform.batch_flush_interval.as_deref(), Some("1s"));
+    }
+
+    #[test]
+    fn script_transform_batch_flush_interval_defaults_to_none() {
+        let yaml = r#"
+primary_key: id
+from: raw
+language: typescript
+script: "function process(input) { return input; }"
+"#;
+        let transform: ScriptTransform = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(transform.batch_flush_interval, None);
+        assert_eq!(transform.batch_size, None);
     }
 
     #[test]
