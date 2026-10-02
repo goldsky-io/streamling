@@ -2229,6 +2229,17 @@ The following table shows all supported components and the metrics they emit:
 |                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being discarded per time window |
 |                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)       |
 
+Kafka sources also export `streamling_kafka_consumer_committed_offset`,
+`streamling_kafka_consumer_high_watermark`, and
+`streamling_kafka_consumer_messages_lag` gauges with `id` (source), `instance`
+(pipeline), and `partition` labels. Offsets are next-to-read positions; lag is
+the nonnegative difference between the high watermark and committed offset.
+`streamling_kafka_consumer_committed_message_age_seconds` reports the age of
+the last message covered by the checkpoint when Kafka provides a timestamp.
+It is absent for checkpoints created before timestamp tracking or partitions
+without timestamped messages. Each successful checkpoint also logs its
+committed partition and offset.
+
 **Note**
 
 All metrics include the following standard tags for filtering and aggregation:
