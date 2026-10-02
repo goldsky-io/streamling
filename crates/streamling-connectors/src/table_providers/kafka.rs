@@ -563,6 +563,16 @@ fn json_payload_to_string(
     })
 }
 
+/// Do two Avro schemas differ in anything the encoder cares about?
+///
+/// Compared as serialised JSON, not with `Schema`'s `PartialEq`: that
+/// implementation follows Parsing Canonical Form, which strips `logicalType`
+/// and would call a plain `bytes` field and a `decimal` field equal — the one
+/// difference this check exists to see.
+fn avro_schemas_differ(a: &AvroSchema, b: &AvroSchema) -> bool {
+    serde_json::to_value(a).ok() != serde_json::to_value(b).ok()
+}
+
 struct KafkaCommon {}
 
 impl KafkaCommon {
@@ -3265,26 +3275,39 @@ impl KafkaSink {
             }
         }
 
-        // Ensure the schema exists in the schema registry
-        // Only need to do it after the initial topic creation
+        // Make sure the schema this sink encodes with is the subject's latest
+        // version. The encoder fetches the registered schema itself, so a
+        // subject left holding an older shape — a wide-int column registered
+        // as plain `bytes` before the decimal_arb migration gave it a
+        // `decimal` logicalType — made every record fail validation on the
+        // first encode, forever (the subject was never re-registered). When
+        // the registered schema differs, register ours as a new version; the
+        // registry's compatibility check decides whether that is allowed.
         if self.format == KafkaFormat::Avro {
             let schema_registry_settings =
                 self.config.get_schema_registry_settings().ok_or_else(|| {
                     streamling_user_err!("schema_registry_url is required for Avro format")
                 })?;
-            let existing_avro_schema = KafkaCommon::fetch_avro_schema(&self.config, &self.topic);
-
-            if existing_avro_schema.is_ok() {
-                debug!(
-                    "Schema already exists in schema registry for topic: {}",
-                    self.topic
-                );
-                return Ok(());
-            }
-
             let avro_schema = to_avro(&self.topic, &self.schema.fields);
             let avro_schema =
                 post_process_avro_schema_for_writing(avro_schema, self.primary_key.clone());
+
+            if let Ok((existing, existing_id)) =
+                KafkaCommon::fetch_avro_schema(&self.config, &self.topic)
+            {
+                if !avro_schemas_differ(&existing, &avro_schema) {
+                    debug!(
+                        "Schema already registered for topic {} (id {}); nothing to register",
+                        self.topic, existing_id
+                    );
+                    return Ok(());
+                }
+                info!(
+                    "Registered Avro schema for topic {} (id {}) differs from the schema this \
+                     sink writes; registering a new version",
+                    self.topic, existing_id
+                );
+            }
 
             let subject = self
                 .subject_name_strategy
@@ -3306,7 +3329,10 @@ impl KafkaSink {
 
             let registered_schema = registered_schema.streamling_with_context(|| {
                 format!(
-                    "failed to register schema with Schema Registry (topic: {}, subject: {})",
+                    "failed to register schema with Schema Registry (topic: {}, subject: {}). \
+                     A schema already registered for this subject must be compatible with the \
+                     one this sink writes under the subject's compatibility level — wide \
+                     integers are now written as `bytes` with a `decimal` logicalType",
                     self.topic, subject
                 )
             })?;
@@ -3622,6 +3648,26 @@ impl TableProvider for KafkaSinkTableProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn avro_schemas_differ_sees_a_logical_type() {
+        // `Schema::eq` is Parsing-Canonical-Form equality and ignores
+        // logicalType, so it cannot tell the pre-migration `bytes` field
+        // from the decimal it became.
+        let plain = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[{"name":"v","type":"bytes"}]}"#,
+        )
+        .unwrap();
+        let decimal = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[{"name":"v","type":{"type":"bytes","logicalType":"decimal","precision":78,"scale":0}}]}"#,
+        )
+        .unwrap();
+        assert!(super::avro_schemas_differ(&plain, &decimal));
+        assert!(!super::avro_schemas_differ(&decimal, &decimal.clone()));
+        let reparsed = apache_avro::Schema::parse_str(&decimal.canonical_form()).unwrap();
+        // Canonical form drops the logical type: the two really do differ
+        // for the encoder, and the check says so.
+        assert!(super::avro_schemas_differ(&decimal, &reparsed));
+    }
     use super::*;
 
     /// A topology-level source `filter:` is defined against the source's full
