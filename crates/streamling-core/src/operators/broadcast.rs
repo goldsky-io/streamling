@@ -143,6 +143,10 @@ pub struct MultiSinkEntry {
 pub struct MultiSinkLogicalNode {
     pub input: LogicalPlan,
     pub sinks: Vec<MultiSinkEntry>,
+    /// `metric_metadata_id` (metric_key form) of the producer feeding this
+    /// fan-out, threaded into the `BroadcastStream` so per-sink blocked-send time
+    /// is attributed to the producer via `node_wait{state="blocked"}`.
+    pub upstream_metadata_id: Option<Arc<str>>,
     /// Key into [`MULTI_SINK_SCOPES`]. Logical nodes must be Hash/Eq, so the
     /// non-comparable scope is smuggled by id (same idiom as `PluginNode`'s
     /// channel registry).
@@ -159,6 +163,7 @@ impl MultiSinkLogicalNode {
     pub fn new(
         input: LogicalPlan,
         sinks: Vec<MultiSinkEntry>,
+        upstream_metadata_id: Option<Arc<str>>,
         scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let scope_id = format!("multi_sink_scope_{}", uuid::Uuid::new_v4());
@@ -169,6 +174,7 @@ impl MultiSinkLogicalNode {
         Self {
             input,
             sinks,
+            upstream_metadata_id,
             scope_id,
         }
     }
@@ -229,6 +235,7 @@ impl UserDefinedLogicalNodeCore for MultiSinkLogicalNode {
         Ok(Self {
             input: inputs.swap_remove(0),
             sinks,
+            upstream_metadata_id: self.upstream_metadata_id.clone(),
             scope_id: self.scope_id.clone(),
         })
     }
@@ -342,6 +349,7 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
                     sink_names,
                     sink_rebatch_configs,
                     internal_buffer_size,
+                    multi_sink_node.upstream_metadata_id.clone(),
                     multi_sink_node.scope(),
                 ));
                 Some(exec)
@@ -352,7 +360,7 @@ impl ExtensionPlanner for MultiSinkExtensionPlanner {
     }
 }
 
-struct MultiSinkExec {
+pub(crate) struct MultiSinkExec {
     input: Arc<dyn ExecutionPlan>,
     sinks: Vec<Arc<dyn ExecutionPlan>>,
     /// Pre-computed at plan time via `Arc::ptr_eq` — before the physical
@@ -365,6 +373,9 @@ struct MultiSinkExec {
     sink_rebatch_configs: Vec<RebatchConfig>,
     cache: Arc<PlanProperties>,
     internal_buffer_size: usize,
+    /// `metric_metadata_id` of the producer feeding this fan-out, passed to the
+    /// `BroadcastStream` so blocked-send time is attributed to the producer.
+    upstream_metadata_id: Option<Arc<str>>,
     /// DataPath-stage scope: the broadcast driver ends when the source stream
     /// ends, which shutdown forces before the drain runs — the scope adds
     /// drain-ladder tracking on top.
@@ -372,13 +383,15 @@ struct MultiSinkExec {
 }
 
 impl MultiSinkExec {
-    fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         sinks: Vec<Arc<dyn ExecutionPlan>>,
         sink_has_transforms: Vec<bool>,
         sink_names: Vec<String>,
         sink_rebatch_configs: Vec<RebatchConfig>,
         internal_buffer_size: usize,
+        upstream_metadata_id: Option<Arc<str>>,
         scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let cache = Self::compute_properties(input.schema());
@@ -390,6 +403,7 @@ impl MultiSinkExec {
             sink_rebatch_configs,
             cache: Arc::new(cache),
             internal_buffer_size,
+            upstream_metadata_id,
             scope,
         }
     }
@@ -492,6 +506,7 @@ impl ExecutionPlan for MultiSinkExec {
             self.sink_names.clone(),
             self.sink_rebatch_configs.clone(),
             self.internal_buffer_size,
+            self.upstream_metadata_id.clone(),
             self.scope.clone(),
         )))
     }
@@ -539,10 +554,10 @@ impl ExecutionPlan for MultiSinkExec {
                 Arc::clone(&context),
             )?;
 
-            let broadcast_stream = Arc::new(BroadcastStream::new(
-                self.schema(),
-                self.internal_buffer_size,
-            ));
+            let broadcast_stream = Arc::new(
+                BroadcastStream::new(self.schema(), self.internal_buffer_size)
+                    .with_upstream_metadata_id(self.upstream_metadata_id.clone()),
+            );
 
             // Scoped to this partition: its broadcast stops once every sink has
             // finished *this* partition's stream, independent of the others.
@@ -553,8 +568,10 @@ impl ExecutionPlan for MultiSinkExec {
                 let has_transforms = self.sink_has_transforms[i];
                 let sink_name = self.sink_names.get(i).cloned().unwrap_or_default();
                 let rebatch_config = self.sink_rebatch_configs[i].clone();
+                // Attribute this consumer's blocked-send time to the sink it feeds
+                // so a single slow sink can be pinpointed in a multi-sink topology.
                 let broadcast_consumer: SendableRecordBatchStream =
-                    Box::pin(broadcast_stream.add_consumer());
+                    Box::pin(broadcast_stream.add_consumer(sink_name.clone()));
                 let task_context = context.clone();
                 let broadcast_schema = self.schema();
 
@@ -668,7 +685,9 @@ impl ExecutionPlan for MultiSinkExec {
                 sink_handles.push(handle);
             }
 
-            output_consumers.push(broadcast_stream.add_consumer());
+            // The passthrough output is not a sink; opt out of blocked-send
+            // attribution with an empty downstream id.
+            output_consumers.push(broadcast_stream.add_consumer(String::new()));
 
             // Start broadcasting after all consumers (sinks + output) are registered
             broadcast_stream.start(data, &self.scope);
@@ -856,6 +875,7 @@ mod tests {
             names.iter().map(|n| n.to_string()).collect(),
             names.iter().map(|_| RebatchConfig::default()).collect(),
             10,
+            None,
             crate::shutdown::ComponentScope::detached("test"),
         );
         (exec, collectors)
