@@ -433,6 +433,114 @@ sinks:
     );
 }
 
+/// Every concurrent write stream must own its own producer.
+///
+/// A producer shared across the streams deadlocks checkpointing under load:
+/// `flush()` waits for the whole out-queue to drain, so a stream flushing its
+/// marker also waits on rows its siblings are still enqueueing, and the epoch
+/// is never acked. `parallelism: 3` must therefore create 3 producers — one per
+/// `write_all` stream — not one for the sink.
+#[tokio::test]
+async fn test_kafka_sink_producer_per_write_stream() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let output_topic = ctx
+        .create_kafka_topic("per_stream")
+        .await
+        .expect("Failed to create output topic");
+
+    let records_to_produce = 60;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let parallelism = 3;
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {input_topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  kafka_sink:
+    type: kafka
+    from: kafka_source
+    topic: {output_topic}
+    topic_partitions: 3
+    data_format: avro
+    parallelism: {parallelism}
+"#,
+        input_topic = ctx.kafka_topic,
+        output_topic = output_topic.topic,
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(std::time::Duration::from_secs(60))
+                .env("RUST_LOG", "streamling_connectors=info,info"),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(
+        output.status.success(),
+        "Streamling should exit successfully"
+    );
+
+    let logs = format!("{}\n{}", output.stdout, output.stderr);
+    let producers_created = logs
+        .lines()
+        .filter(|line| {
+            line.contains("Creating Kafka producer for topic") && line.contains(&output_topic.topic)
+        })
+        .count();
+
+    assert_eq!(
+        producers_created, parallelism,
+        "expected one producer per write stream, got {producers_created}.\nLogs:\n{logs}"
+    );
+
+    // The sink sizes each producer's out-queue by this count, so a stale value
+    // would silently hand every stream the whole sink's buffer budget.
+    let budget_split_by = logs
+        .lines()
+        .filter(|line| {
+            line.contains("Creating Kafka producer for topic")
+                && line.contains(&format!("write_streams={parallelism}"))
+        })
+        .count();
+    assert_eq!(
+        budget_split_by, parallelism,
+        "every producer must be sized for {parallelism} write streams.\nLogs:\n{logs}"
+    );
+}
+
 // ============================================================================
 // Scenario 4: Pre-existing topic skips create_topics (no Create perm needed)
 // ============================================================================
