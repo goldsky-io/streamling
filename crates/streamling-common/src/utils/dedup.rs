@@ -479,8 +479,14 @@ fn hash_array_value(hasher: &mut impl Hasher, array: &ArrayRef, index: usize) {
                 .unwrap()
                 .value(index),
         ),
-        DataType::Binary | DataType::LargeBinary => {
+        DataType::Binary => {
             let b = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            hasher.write(b.value(index));
+        }
+        // decimal_arb primary keys are LargeBinary; downcasting them to
+        // `BinaryArray` panicked on the first deduplicated batch.
+        DataType::LargeBinary => {
+            let b = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
             hasher.write(b.value(index));
         }
         // Anything else (timestamps, decimals, dictionaries, lists, etc.) goes
