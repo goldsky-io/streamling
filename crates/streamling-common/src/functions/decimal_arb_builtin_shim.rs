@@ -28,7 +28,6 @@ use datafusion::logical_expr::{
 };
 use std::sync::Arc;
 
-/// Is `dt` decimal_arb storage, or a list of it?
 /// Is `field` decimal_arb, or a list whose element is?
 fn involves_decimal_arb(field: &arrow_schema::Field) -> bool {
     if DecimalArbType::is_decimal_arb_field(field) {
@@ -42,37 +41,7 @@ fn involves_decimal_arb(field: &arrow_schema::Field) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::logical_expr::ReturnFieldArgs;
-
-    #[test]
-    fn bare_large_binary_fails_at_planning_not_on_the_first_batch() {
-        let shim = DecimalArbBuiltinShim::new(datafusion::functions::core::coalesce());
-        let bytea: FieldRef = Arc::new(arrow_schema::Field::new("b", DataType::LargeBinary, true));
-        let int: FieldRef = Arc::new(arrow_schema::Field::new("i", DataType::Int64, true));
-        let fields = vec![bytea, int.clone()];
-        let err = shim
-            .return_field_from_args(ReturnFieldArgs {
-                arg_fields: &fields,
-                scalar_arguments: &[None, None],
-            })
-            .expect_err("a plain bytea next to an Int64 is the builtin's error to report");
-        assert!(err.to_string().contains("coalesce"), "{err}");
-        // A decimal_arb argument keeps the provisional field for the rewrite.
-        let decimal: FieldRef = Arc::new(DecimalArbType::field("d", 20, 2, true).unwrap());
-        let fields = vec![decimal, int];
-        let out = shim
-            .return_field_from_args(ReturnFieldArgs {
-                arg_fields: &fields,
-                scalar_arguments: &[None, None],
-            })
-            .unwrap();
-        assert!(DecimalArbType::is_decimal_arb_field(&out));
-    }
-}
-
+/// Is `dt` decimal_arb storage, or a list of it?
 fn involves_large_binary(dt: &DataType) -> bool {
     match dt {
         DataType::LargeBinary => true,
@@ -247,5 +216,36 @@ impl ScalarUDFImpl for DecimalArbBuiltinShim {
     }
     fn documentation(&self) -> Option<&Documentation> {
         self.inner.documentation()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::ReturnFieldArgs;
+
+    #[test]
+    fn bare_large_binary_fails_at_planning_not_on_the_first_batch() {
+        let shim = DecimalArbBuiltinShim::new(datafusion::functions::core::coalesce());
+        let bytea: FieldRef = Arc::new(arrow_schema::Field::new("b", DataType::LargeBinary, true));
+        let int: FieldRef = Arc::new(arrow_schema::Field::new("i", DataType::Int64, true));
+        let fields = vec![bytea, int.clone()];
+        let err = shim
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &fields,
+                scalar_arguments: &[None, None],
+            })
+            .expect_err("a plain bytea next to an Int64 is the builtin's error to report");
+        assert!(err.to_string().contains("coalesce"), "{err}");
+        // A decimal_arb argument keeps the provisional field for the rewrite.
+        let decimal: FieldRef = Arc::new(DecimalArbType::field("d", 20, 2, true).unwrap());
+        let fields = vec![decimal, int];
+        let out = shim
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &fields,
+                scalar_arguments: &[None, None],
+            })
+            .unwrap();
+        assert!(DecimalArbType::is_decimal_arb_field(&out));
     }
 }
