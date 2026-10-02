@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use crate::telemetry::recorder::get_metrics_recorder;
+use crate::telemetry::node_flow::{record_backpressure_wait, send_batch_with_metrics};
+use crate::telemetry::recorder::{get_metrics_recorder, try_get_metrics_recorder};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct ExternalHandlerConfig {
@@ -241,6 +242,9 @@ impl ExecutionPlan for ExternalHandlerExec {
         );
 
         let input_stream = self.input.execute(partition, context)?;
+        let metrics_recorder = try_get_metrics_recorder();
+        let metric_metadata_id = self.config.metric_metadata_id.clone();
+        let tags = [("execution_kind", "native")];
 
         let buffer_size = self.config.buffer_size as usize;
 
@@ -276,10 +280,30 @@ impl ExecutionPlan for ExternalHandlerExec {
                 for item in batches {
                     match item {
                         Ok(Some(modified_batch)) => {
-                            tx.send(Ok(modified_batch)).await.unwrap();
+                            let num_rows = modified_batch.num_rows() as u64;
+                            if !send_batch_with_metrics(
+                                &tx,
+                                Ok(modified_batch),
+                                num_rows,
+                                metrics_recorder.as_deref(),
+                                &metric_metadata_id,
+                                &tags,
+                            )
+                            .await
+                            {
+                                return Ok(());
+                            }
                         }
                         Err(e) => {
-                            tx.send(Err(e)).await.unwrap();
+                            let send_start = Instant::now();
+                            let _ = tx.send(Err(e)).await;
+                            record_backpressure_wait(
+                                metrics_recorder.as_deref(),
+                                &metric_metadata_id,
+                                &tags,
+                                send_start,
+                            );
+                            return Ok(());
                         }
                         _ => {}
                     }

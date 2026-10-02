@@ -5,7 +5,10 @@ use crate::checkpoints::checkpoint_management::{
     extract_checkpoint_messages, now_ms,
 };
 use crate::plugin::telemetry::process_plugin_metrics;
-use crate::telemetry::recorder::get_metrics_recorder;
+use crate::telemetry::node_flow::{
+    record_backpressure_wait, record_batch_emptiness, record_idle_wait, record_inflight_buffered,
+};
+use crate::telemetry::recorder::try_get_metrics_recorder;
 use crate::utils::batch::enrich_batch_with_metadata;
 use abi_stable::nonexhaustive_enum::NonExhaustive;
 use arrow_schema::SchemaRef;
@@ -30,6 +33,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use streamling_plugin::{PluginChannels, PluginCheckpointEpoch, PluginMsg};
 use tracing::debug;
 use tracing::log::trace;
@@ -340,7 +344,7 @@ impl ExecutionPlan for PluginExec {
         let plugin_output_receiver = self.plugin_channels.output.receiver.clone();
         let metrics_receiver = self.plugin_channels.metrics.receiver.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
-        let metrics_recorder = get_metrics_recorder();
+        let metrics_recorder = try_get_metrics_recorder();
         builder.spawn(async move {
             // PostPlugin-stage scope: exits on channel disconnect at plugin
             // teardown; drained after the dispatcher flush it serves.
@@ -354,10 +358,25 @@ impl ExecutionPlan for PluginExec {
             let mut checkpoint_buffer: Vec<CheckpointMessage> = Vec::new();
             // Track created_at_ms for epochs so we can preserve timing through plugin round-trip
             let mut epoch_created_at: HashMap<u64, u64> = HashMap::new();
+            let mut empty_streak = 0u64;
+            let tags = [("execution_kind", "plugin")];
 
             let mut stream = data;
 
-            'outer: while let Some(batch) = stream.next().await {
+            'outer: loop {
+                let idle_wait_start = Instant::now();
+                let next_batch = stream.next().await;
+                record_idle_wait(
+                    metrics_recorder.as_deref(),
+                    &metric_metadata_id,
+                    &tags,
+                    idle_wait_start,
+                );
+
+                let Some(batch) = next_batch else {
+                    break;
+                };
+
                 match batch {
                     Ok(batch) => {
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
@@ -372,6 +391,7 @@ impl ExecutionPlan for PluginExec {
                                         "Sending extracted checkpoint Marker with epoch {} to plugin",
                                         epoch.0
                                     );
+                                    let send_start = Instant::now();
                                     crate::plugin::send_to_plugin(
                                         &plugin_input_sender,
                                         NonExhaustive::new(PluginMsg::CheckpointMarker {
@@ -380,12 +400,25 @@ impl ExecutionPlan for PluginExec {
                                         &plugin_label,
                                     )
                                     .await?;
+                                    record_backpressure_wait(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        send_start,
+                                    );
+                                    record_inflight_buffered(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        (checkpoint_buffer.len() + epoch_created_at.len()) as u64,
+                                    );
                                 }
                                 CheckpointMessage::Finalizer(epoch) => {
                                     debug!(
                                         "Sending extracted checkpoint Finalizer with epoch {} to plugin",
                                         epoch.0
                                     );
+                                    let send_start = Instant::now();
                                     crate::plugin::send_to_plugin(
                                         &plugin_input_sender,
                                         NonExhaustive::new(PluginMsg::CheckpointFinalizer {
@@ -394,6 +427,12 @@ impl ExecutionPlan for PluginExec {
                                         &plugin_label,
                                     )
                                     .await?;
+                                    record_backpressure_wait(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        send_start,
+                                    );
                                 }
                                 _ => {
                                     // ignore other messages
@@ -401,12 +440,19 @@ impl ExecutionPlan for PluginExec {
                             }
                         }
 
+                        let send_start = Instant::now();
                         crate::plugin::send_to_plugin(
                             &plugin_input_sender,
                             NonExhaustive::new(PluginMsg::NextBatch { data: batch.into() }),
                             &plugin_label,
                         )
                         .await?;
+                        record_backpressure_wait(
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &tags,
+                            send_start,
+                        );
 
                         // TODO: should this be parallelized?
                         // Right now it processes batches sequentially:
@@ -418,6 +464,13 @@ impl ExecutionPlan for PluginExec {
                             match plugin_output_receiver.try_recv().map(|m| m.into_enum())  {
                                 Ok(Ok(PluginMsg::NextBatch { data })) => {
                                     let mut processed_batch: RecordBatch = data.into();
+                                    record_batch_emptiness(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        processed_batch.num_rows(),
+                                        &mut empty_streak,
+                                    );
 
                                     // Attach buffered checkpoint messages to batch metadata
                                     if !checkpoint_buffer.is_empty() {
@@ -434,7 +487,28 @@ impl ExecutionPlan for PluginExec {
                                         checkpoint_buffer.clear();
                                     }
 
+                                    // `checkpoint_buffer` was just cleared; `epoch_created_at`
+                                    // still tracks epochs the plugin has not echoed back.
+                                    record_inflight_buffered(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        epoch_created_at.len() as u64,
+                                    );
+                                    let send_start = Instant::now();
                                     tx.send(Ok(processed_batch)).await.unwrap(); // handle send error
+                                    record_backpressure_wait(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        send_start,
+                                    );
+                                    record_inflight_buffered(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        epoch_created_at.len() as u64,
+                                    );
                                     break;
                                 }
                                 Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
@@ -451,6 +525,12 @@ impl ExecutionPlan for PluginExec {
                                         epoch: CheckpointEpoch(epoch.0),
                                         created_at_ms,
                                     });
+                                    record_inflight_buffered(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        (checkpoint_buffer.len() + epoch_created_at.len()) as u64,
+                                    );
                                 }
                                 Ok(Ok(PluginMsg::CheckpointFinalizer { epoch })) => {
                                     debug!(
@@ -458,6 +538,12 @@ impl ExecutionPlan for PluginExec {
                                         epoch.0
                                     );
                                     checkpoint_buffer.push(CheckpointMessage::Finalizer(CheckpointEpoch(epoch.0)));
+                                    record_inflight_buffered(
+                                        metrics_recorder.as_deref(),
+                                        &metric_metadata_id,
+                                        &tags,
+                                        (checkpoint_buffer.len() + epoch_created_at.len()) as u64,
+                                    );
                                 }
                                 Err(TryRecvError::Empty) => {
                                     tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
@@ -471,7 +557,14 @@ impl ExecutionPlan for PluginExec {
                     }
                     Err(e) => {
                         debug!("PluginExec [{}]: Error from input stream, transform will terminate: {}", metric_metadata_id, e);
+                        let send_start = Instant::now();
                         let _ = tx.send(Err(e)).await;
+                        record_backpressure_wait(
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &tags,
+                            send_start,
+                        );
                         break;
                     }
                 }
