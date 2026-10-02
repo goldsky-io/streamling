@@ -18,7 +18,7 @@ use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 // ---------------- Shared helpers ----------------
@@ -235,13 +235,29 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         )
     })?;
 
-    let arrow_schema = table_provider.schema();
+    let decimal_columns = |schema: &arrow_schema::Schema| -> HashSet<String> {
+        schema
+            .fields()
+            .iter()
+            .filter(|f| crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(f))
+            .map(|f| f.name().to_string())
+            .collect()
+    };
     let mut decimal_arb_cols: HashSet<String> = HashSet::new();
-    for field in arrow_schema.fields() {
-        if crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(field) {
-            decimal_arb_cols.insert(field.name().to_string());
+    let mut by_qualifier: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut record_table = |table: &str, columns: HashSet<String>| {
+        decimal_arb_cols.extend(columns.iter().cloned());
+        // Keyed by the full name and by the last segment, so `schema.t.c`,
+        // `t.c` and an alias (added below) all resolve.
+        by_qualifier.insert(table.to_string(), columns.clone());
+        if let Some(last) = table.rsplit('.').next() {
+            by_qualifier.insert(last.to_string(), columns);
         }
-    }
+    };
+    record_table(
+        &tables[0],
+        decimal_columns(table_provider.schema().as_ref()),
+    );
     // Joined tables contribute their decimal_arb columns too; one that
     // cannot be resolved here is left for DataFusion to report.
     for table in tables.iter().skip(1) {
@@ -253,12 +269,17 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         let Ok(Some(provider)) = schema.table(table_name).await else {
             continue;
         };
-        for field in provider.schema().fields() {
-            if crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(field) {
-                decimal_arb_cols.insert(field.name().to_string());
-            }
-        }
+        record_table(table, decimal_columns(provider.schema().as_ref()));
     }
+    // Every alias a table is given resolves to that table's columns.
+    let mut aliases = TableAliases {
+        by_qualifier: &mut by_qualifier,
+    };
+    let _ = stmt.visit(&mut aliases);
+    let scope = DecimalArbNames {
+        names: decimal_arb_cols,
+        by_qualifier,
+    };
 
     // Walk the SQL AST and apply the decimal_arb CAST-to-string rewrite.
     // DataFusion has no native cast from LargeBinary
@@ -272,7 +293,7 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
 
     fn rewrite_setexpr(
         expr: &mut datafusion::logical_expr::sqlparser::ast::SetExpr,
-        decimal_arb_cols: &HashSet<String>,
+        decimal_arb_cols: &DecimalArbNames,
     ) {
         match expr {
             SetExpr::Select(select) => {
@@ -309,13 +330,13 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         // is no longer needed once BigIntKind binary-op rewriting is gone).
         if let Some(with) = &mut query.with {
             for cte in &mut with.cte_tables {
-                rewrite_setexpr(&mut cte.query.body, &decimal_arb_cols);
+                rewrite_setexpr(&mut cte.query.body, &scope);
             }
         }
-        rewrite_setexpr(&mut query.body, &decimal_arb_cols);
+        rewrite_setexpr(&mut query.body, &scope);
     }
 
-    let names = DecimalArbNames::collect(&stmt, decimal_arb_cols);
+    let names = DecimalArbNames::collect(&stmt, scope);
     quote_inexact_literals_near_decimal_arb(&mut stmt, &names);
 
     Ok(stmt.to_string())
@@ -331,7 +352,7 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
 /// TEXT)` where `col` is a decimal_arb column). More complex inner
 /// expressions (e.g. `CAST(col_a + col_b AS TEXT)`) fall through; users
 /// can wrap with `decimal_arb_to_string(...)` explicitly for those.
-fn rewrite_expr_for_decimal_arb_cast(e: &mut SqlExpr, decimal_arb_cols: &HashSet<String>) {
+fn rewrite_expr_for_decimal_arb_cast(e: &mut SqlExpr, decimal_arb_cols: &DecimalArbNames) {
     match e {
         SqlExpr::Cast {
             expr, data_type, ..
@@ -352,17 +373,17 @@ fn rewrite_expr_for_decimal_arb_cast(e: &mut SqlExpr, decimal_arb_cols: &HashSet
             );
             if is_text_target {
                 let stripped = clone_strip_nested(expr);
-                if let SqlExpr::Identifier(ident) = &stripped
-                    && decimal_arb_cols.contains(&ident.value)
-                {
+                let is_decimal_column = match &stripped {
+                    SqlExpr::Identifier(ident) => {
+                        decimal_arb_cols.column_is_decimal(std::slice::from_ref(ident))
+                    }
+                    SqlExpr::CompoundIdentifier(idents) => {
+                        decimal_arb_cols.column_is_decimal(idents)
+                    }
+                    _ => false,
+                };
+                if is_decimal_column {
                     // Rewrite the whole Cast node to decimal_arb_to_string(col)
-                    *e = build_decimal_arb_to_string_call(stripped);
-                    return;
-                }
-                if let SqlExpr::CompoundIdentifier(idents) = &stripped
-                    && let Some(last) = idents.last()
-                    && decimal_arb_cols.contains(&last.value)
-                {
                     *e = build_decimal_arb_to_string_call(stripped);
                     return;
                 }
@@ -681,31 +702,53 @@ const DECIMAL_ARB_ARGUMENT_FUNCTIONS: &[&str] = &[
 /// Column names known to hold decimal_arb: the referenced tables' columns
 /// plus every projection alias (in CTEs and derived tables too) whose
 /// expression is decimal_arb-valued.
-struct DecimalArbNames(HashSet<String>);
+struct DecimalArbNames {
+    /// Column and alias names known to be decimal_arb-valued, from every
+    /// referenced table and every projection alias.
+    names: HashSet<String>,
+    /// The decimal_arb columns of each referenced table, keyed by the table's
+    /// name (full and last segment) and by every alias it is given, so a
+    /// qualified reference is resolved against its own table: `p.amt` next
+    /// to a decimal_arb `q.amt` is not decimal_arb.
+    by_qualifier: HashMap<String, HashSet<String>>,
+}
 
 impl DecimalArbNames {
-    fn collect(stmt: &Statement, seed: HashSet<String>) -> Self {
-        let mut names = Self(seed);
+    fn collect(stmt: &Statement, mut names: Self) -> Self {
         // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
         // FROM a)`), so collect until nothing new appears.
         loop {
-            let before = names.0.len();
+            let before = names.names.len();
             let mut collector = AliasCollector { names: &mut names };
             let _ = stmt.visit(&mut collector);
-            if names.0.len() == before {
+            if names.names.len() == before {
                 break;
             }
         }
         names
     }
 
+    /// A (possibly qualified) column reference. A qualifier that names a
+    /// referenced table or one of its aliases decides by that table's own
+    /// columns; any other qualifier (a CTE, a derived table) and a bare name
+    /// fall back to the name set.
+    fn column_is_decimal(&self, parts: &[datafusion::logical_expr::sqlparser::ast::Ident]) -> bool {
+        let Some(column) = parts.last() else {
+            return false;
+        };
+        if parts.len() >= 2
+            && let Some(columns) = self.by_qualifier.get(&parts[parts.len() - 2].value)
+        {
+            return columns.contains(&column.value);
+        }
+        self.names.contains(&column.value)
+    }
+
     /// Is `expr` decimal_arb-valued, as far as names and shapes can tell?
     fn is_decimal(&self, expr: &SqlExpr) -> bool {
         match expr {
-            SqlExpr::Identifier(ident) => self.0.contains(&ident.value),
-            SqlExpr::CompoundIdentifier(parts) => {
-                parts.last().is_some_and(|p| self.0.contains(&p.value))
-            }
+            SqlExpr::Identifier(ident) => self.column_is_decimal(std::slice::from_ref(ident)),
+            SqlExpr::CompoundIdentifier(parts) => self.column_is_decimal(parts),
             SqlExpr::Nested(inner) => self.is_decimal(inner),
             SqlExpr::UnaryOp {
                 op: UnaryOperator::Minus | UnaryOperator::Plus,
@@ -744,7 +787,7 @@ impl DecimalArbNames {
                 SelectItem::UnnamedExpr(expr) => expr,
                 SelectItem::ExprWithAlias { expr, alias } => {
                     if self.is_decimal(expr) {
-                        self.0.insert(alias.value.clone());
+                        self.names.insert(alias.value.clone());
                     }
                     expr
                 }
@@ -754,7 +797,7 @@ impl DecimalArbNames {
                 && let Some(column) = alias.columns.get(i)
                 && self.is_decimal(expr)
             {
-                self.0.insert(column.name.value.clone());
+                self.names.insert(column.name.value.clone());
             }
         }
     }
@@ -837,6 +880,40 @@ impl Visitor for AliasCollector<'_> {
 
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
         self.names.record_select(select, None);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Maps every alias of a referenced table (`FROM transfers t`, `JOIN q AS
+/// x`) to that table's decimal_arb columns.
+struct TableAliases<'a> {
+    by_qualifier: &'a mut HashMap<String, HashSet<String>>,
+}
+
+impl Visitor for TableAliases<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table {
+            name,
+            alias: Some(alias),
+            ..
+        } = table_factor
+        {
+            let full = name.to_string();
+            let columns = self
+                .by_qualifier
+                .get(&full)
+                .or_else(|| {
+                    full.rsplit('.')
+                        .next()
+                        .and_then(|last| self.by_qualifier.get(last))
+                })
+                .cloned();
+            if let Some(columns) = columns {
+                self.by_qualifier.insert(alias.name.value.clone(), columns);
+            }
+        }
         ControlFlow::Continue(())
     }
 }
@@ -1444,6 +1521,43 @@ mod tests {
     // u256/i256 path is retired as part of the same feature; once those
     // types are deleted in Phase 8 there is no remaining FSB(32)-based
     // wide-int route.
+
+    #[tokio::test]
+    async fn qualified_column_resolves_against_its_own_table() {
+        // `p.amt` is a plain Decimal; only `q.amt` is decimal_arb. Matching a
+        // qualified reference by its last segment alone quoted the literal
+        // next to `p.amt` and lowered its CAST — and `p.amt - '…'` does not
+        // plan (DataFusion has no Utf8 arithmetic coercion). (JOINs are not
+        // accepted by this preprocessor; the two tables meet in a UNION.)
+        let ctx = setup_session_context();
+        register_decimal_arb_table(&ctx, "q", vec![("id", None), ("amt", None)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amt", DataType::Decimal128(38, 2), true),
+        ]));
+        ctx.register_table(
+            "p",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        let sql = "SELECT CAST(p.amt AS TEXT), p.amt - 9999999999999999999999.5 FROM p \
+                   UNION ALL SELECT CAST(x.amt AS TEXT), x.amt - 1.5 FROM q AS x";
+        let out = preprocess_bigint_binary_ops_with_schema(&ctx, sql)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("p.amt - 9999999999999999999999.5"),
+            "plain-Decimal operand must keep its literal: {out}"
+        );
+        assert!(
+            out.contains("x.amt - '1.5'"),
+            "decimal_arb alias operand is quoted: {out}"
+        );
+        assert!(
+            out.contains("CAST(p.amt AS TEXT)") && out.contains("decimal_arb_to_string(x.amt)"),
+            "only the decimal_arb column's CAST is lowered: {out}"
+        );
+    }
 
     #[tokio::test]
     async fn cast_decimal_arb_as_text_is_lowered_inside_case_between_and_in() {

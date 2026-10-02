@@ -64,7 +64,6 @@
 //! (Recursion into sub-expressions is handled by the analyzer; `rewrite` only
 //! inspects the top node, whose children have already been rewritten.)
 
-use crate::functions::decimal_arb_ops::agreed_native_int_kind;
 use crate::functions::decimal_arb_ops::{
     DecimalArbAbsFunc, DecimalArbArrayExtremeFunc, DecimalArbArraySortFunc, DecimalArbEqFunc,
     DecimalArbExtremeFunc, DecimalArbGtFunc, DecimalArbGteFunc, DecimalArbLtFunc,
@@ -73,7 +72,8 @@ use crate::functions::decimal_arb_ops::{
     ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
     ToDecimalArbFromStringFunc,
 };
-use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION, NativeIntKind};
+use crate::functions::decimal_arb_ops::{agreed_native_int_kind, common_precision_scale};
+use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, NativeIntKind};
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::Transformed;
@@ -131,18 +131,6 @@ pub(crate) fn exact_precision_scale(value: &DecimalArbValue) -> (u32, u32) {
     let scale = value.fractional_digit_count() as u32;
     let int_digits = value.integer_digit_count() as u32;
     ((int_digits + scale).max(1), scale)
-}
-
-/// Common `(precision, scale)` for a set of decimal_arb fields: the widest
-/// scale present, with enough integer digits for every member.
-fn common_precision_scale(metas: &[(u32, u32)]) -> (u32, u32) {
-    let s_out = metas.iter().map(|(_, s)| *s).max().unwrap_or(0);
-    let int_max = metas
-        .iter()
-        .map(|(p, s)| p.saturating_sub(*s))
-        .max()
-        .unwrap_or(0);
-    ((int_max + s_out).clamp(1, MAX_PRECISION), s_out)
 }
 
 /// The element field of a `List` / `LargeList` / `FixedSizeList` type.
@@ -483,7 +471,7 @@ impl DecimalArbExprRewrite {
         if metas.is_empty() {
             return Ok(None);
         }
-        let (p_out, s_out) = common_precision_scale(&metas);
+        let (p_out, s_out) = common_precision_scale(&metas)?;
         let exprs = items
             .into_iter()
             .map(|item| match item {
@@ -895,7 +883,7 @@ impl DecimalArbExprRewrite {
                 let Some((x, xm)) = scalar(1)? else {
                     return Ok(None);
                 };
-                let common = common_precision_scale(&[lm, xm]);
+                let common = common_precision_scale(&[lm, xm])?;
                 let mut args = sf.args.clone();
                 args[0] = self.at_scale(args[0].clone(), lm, common);
                 args[1] = self.at_scale(x, xm, common);
@@ -906,7 +894,7 @@ impl DecimalArbExprRewrite {
                 let (Some(lm), Some(rm)) = (list_meta(0), list_meta(1)) else {
                     return Ok(None);
                 };
-                let common = common_precision_scale(&[lm, rm]);
+                let common = common_precision_scale(&[lm, rm])?;
                 let mut args = sf.args.clone();
                 args[0] = self.at_scale(args[0].clone(), lm, common);
                 args[1] = self.at_scale(args[1].clone(), rm, common);
@@ -925,7 +913,7 @@ impl DecimalArbExprRewrite {
                 let Some((x, xm)) = scalar(1)? else {
                     return Ok(None);
                 };
-                let common = common_precision_scale(&[lm, xm]);
+                let common = common_precision_scale(&[lm, xm])?;
                 let mut args = sf.args.clone();
                 args[0] = self.at_scale(args[0].clone(), lm, common);
                 args[1] = self.at_scale(x, xm, common);
@@ -949,7 +937,7 @@ impl DecimalArbExprRewrite {
                 let (Some((from, fm)), Some((to, tm))) = (scalar(1)?, scalar(2)?) else {
                     return Ok(None);
                 };
-                let common = common_precision_scale(&[lm, fm, tm]);
+                let common = common_precision_scale(&[lm, fm, tm])?;
                 let mut args = sf.args.clone();
                 args[0] = self.at_scale(args[0].clone(), lm, common);
                 args[1] = self.at_scale(from, fm, common);
@@ -1010,7 +998,7 @@ impl DecimalArbExprRewrite {
                 if metas.len() != sf.args.len() {
                     return Ok(None);
                 }
-                let common = common_precision_scale(&metas);
+                let common = common_precision_scale(&metas)?;
                 let args = sf
                     .args
                     .iter()
@@ -1401,7 +1389,7 @@ impl DecimalArbExprRewrite {
                     if lm == rm {
                         return untouched(left, right);
                     }
-                    let common = common_precision_scale(&[lm, rm]);
+                    let common = common_precision_scale(&[lm, rm])?;
                     return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
                         Box::new(self.at_scale(*left, lm, common)),
                         op,

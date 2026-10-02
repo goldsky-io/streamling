@@ -38,6 +38,24 @@ fn input_is_decimal_arb(args: &AccumulatorArgs) -> Result<bool> {
     Ok(DecimalArbType::precision_scale_from_field(&field).is_some())
 }
 
+/// SUM / AVG have no builtin for binary input, so a `LargeBinary` without
+/// decimal_arb metadata (a plain bytea column) must fail here, at planning,
+/// with the column named — not on the first batch inside the delegated
+/// builtin with a downcast error.
+fn reject_bare_large_binary(args: &AccumulatorArgs, what: &str) -> Result<()> {
+    let field = args.exprs[0].return_field(args.schema)?;
+    if matches!(field.data_type(), DataType::LargeBinary)
+        && DecimalArbType::precision_scale_from_field(&field).is_none()
+    {
+        streamling_user_bail!(
+            "{what}: column '{}' is a LargeBinary without decimal_arb metadata; there is no \
+             {what} over binary input",
+            field.name(),
+        );
+    }
+    Ok(())
+}
+
 /// SUM widens precision by 16 digits and preserves scale. 16 extra digits
 /// supports up to ~10^16 rows in the worst case before hitting
 /// MAX_PRECISION; beyond that, accumulation raises an overflow error.
@@ -296,6 +314,7 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
         }
     }
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        reject_bare_large_binary(&args, "decimal_arb sum")?;
         if input_is_decimal_arb(&args)? {
             let (p, s) = require_decimal_arb(
                 args.exprs[0].return_field(args.schema)?.as_ref(),
@@ -337,6 +356,7 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
+        reject_bare_large_binary(&args, "decimal_arb sum")?;
         if input_is_decimal_arb(&args)? {
             // Never reached because groups_accumulator_supported returns
             // false for decimal_arb; but be explicit if invoked anyway.
@@ -353,6 +373,7 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
         // the decimal_arb branch; for everything else delegate to the
         // built-in (which returns a retract-capable accumulator and
         // avoids O(window_size) recompute per step).
+        reject_bare_large_binary(&args, "decimal_arb sum")?;
         if input_is_decimal_arb(&args)? {
             streamling_user_bail!("decimal_arb sum does not support sliding-window aggregation")
         }
@@ -1194,6 +1215,7 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
         }
     }
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        reject_bare_large_binary(&args, "decimal_arb avg")?;
         if input_is_decimal_arb(&args)? {
             let (p, s) = require_decimal_arb(
                 args.exprs[0].return_field(args.schema)?.as_ref(),
@@ -1234,6 +1256,7 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
+        reject_bare_large_binary(&args, "decimal_arb avg")?;
         if input_is_decimal_arb(&args)? {
             streamling_user_bail!("decimal_arb avg does not provide a groups accumulator")
         }
@@ -1245,6 +1268,7 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
         // aggregation — bail clearly instead of falling through to the
         // default non-retracting accumulator. For everything else delegate
         // to the built-in's retract-capable sliding accumulator.
+        reject_bare_large_binary(&args, "decimal_arb avg")?;
         if input_is_decimal_arb(&args)? {
             streamling_user_bail!("decimal_arb avg does not support sliding-window aggregation")
         }

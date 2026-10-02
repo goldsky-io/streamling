@@ -1974,14 +1974,37 @@ impl ExtremeKind {
 
 /// Common `(precision, scale)` for a set of decimal_arb fields: the widest
 /// scale present, with enough integer digits for every member.
-fn common_precision_scale(metas: &[(u32, u32)]) -> (u32, u32) {
+///
+/// A plan error, not a clamp, when that needs more than `MAX_PRECISION`
+/// digits: a clamped target admits fewer integer digits than one member
+/// declares, and the rescale that follows would then reject individual rows
+/// deep in execution for values each member represents fine.
+pub(crate) fn common_precision_scale(metas: &[(u32, u32)]) -> Result<(u32, u32)> {
     let s_out = metas.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let int_max = metas
         .iter()
         .map(|(p, s)| p.saturating_sub(*s))
         .max()
         .unwrap_or(0);
-    ((int_max + s_out).clamp(1, MAX_PRECISION), s_out)
+    let precision = int_max
+        .checked_add(s_out)
+        .filter(|p| *p <= MAX_PRECISION)
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "decimal_arb: unifying columns declared as {} needs precision {} ({} integer \
+                 digits + scale {}), above the maximum {}; narrow one of them first",
+                metas
+                    .iter()
+                    .map(|(p, s)| format!("({p}, {s})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                u64::from(int_max) + u64::from(s_out),
+                int_max,
+                s_out,
+                MAX_PRECISION,
+            ))
+        })?;
+    Ok((precision.max(1), s_out))
 }
 
 /// `decimal_arb_greatest(a, b, …)` / `decimal_arb_least(a, b, …)` — the
@@ -2018,7 +2041,7 @@ impl DecimalArbExtremeFunc {
             .iter()
             .map(|f| require_decimal_arb_field(f.as_ref(), self.name()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(common_precision_scale(&metas))
+        common_precision_scale(&metas)
     }
 }
 
@@ -4054,6 +4077,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(DecimalArbType::native_int_kind_from_field(&out), None);
+    }
+
+    #[test]
+    fn common_precision_scale_errors_past_the_cap_instead_of_clamping() {
+        assert_eq!(
+            common_precision_scale(&[(20, 2), (10, 4)]).unwrap(),
+            (22, 4)
+        );
+        assert_eq!(
+            common_precision_scale(&[(78, 0), (78, 0)]).unwrap(),
+            (78, 0)
+        );
+        // 65535 integer digits + scale 32767 does not fit; a clamped (65535,
+        // 32767) target would have rejected rows of the first member at run
+        // time.
+        let err = common_precision_scale(&[(65535, 0), (65535, 32767)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("above the maximum"), "{err}");
     }
 
     #[test]

@@ -274,3 +274,34 @@ async fn supported_window_subquery_numeric_order() {
 async fn supported_window_native_control() {
     ordered_window(true).await;
 }
+
+/// SUM / AVG have no builtin for binary input; a plain bytea column must be
+/// refused when the plan is built, with the column named, not inside the
+/// delegated builtin on the first batch.
+#[tokio::test]
+async fn sum_over_a_plain_bytea_column_fails_at_planning_with_the_column_named() {
+    let sm = session();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "raw",
+        DataType::LargeBinary,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(LargeBinaryArray::from(vec![Some(
+            b"\x01".as_slice(),
+        )]))],
+    )
+    .unwrap();
+    sm.session_context().register_batch("bytes", batch).unwrap();
+    for sql in ["SELECT sum(raw) FROM bytes", "SELECT avg(raw) FROM bytes"] {
+        let err = match sm.session_context().sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => df.collect().await.expect_err(sql).to_string(),
+        };
+        assert!(
+            err.contains("without decimal_arb metadata") && err.contains("raw"),
+            "{sql}: {err}"
+        );
+    }
+}

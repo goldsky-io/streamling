@@ -31,9 +31,11 @@
 //! decorrelated joins already exist when it looks.
 
 use crate::functions::decimal_arb_ops::DecimalArbRescaleFunc;
+use crate::functions::decimal_arb_ops::common_precision_scale;
 use crate::functions::decimal_arb_predicate_optimizer::DecimalArbExprRewrite;
-use crate::types::decimal_arb::{DecimalArbType, MAX_PRECISION};
+use crate::types::decimal_arb::DecimalArbType;
 use arrow_schema::{DataType, Field};
+use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema};
 use datafusion::error::Result;
@@ -61,16 +63,44 @@ impl Default for DecimalArbScaleUnifyRule {
     }
 }
 
-/// Common `(precision, scale)` for a set of decimal_arb fields: the widest
-/// scale present, with enough integer digits for every member.
-fn common_precision_scale(metas: &[(u32, u32)]) -> (u32, u32) {
-    let s_out = metas.iter().map(|(_, s)| *s).max().unwrap_or(0);
-    let int_max = metas
-        .iter()
-        .map(|(p, s)| p.saturating_sub(*s))
-        .max()
-        .unwrap_or(0);
-    ((int_max + s_out).clamp(1, MAX_PRECISION), s_out)
+/// A `LargeBinary` that carries no extension type at all: a decimal_arb that
+/// lost its metadata somewhere upstream. Its bytes sit at an unknown scale,
+/// so nothing can rescale them — the only honest outcome is a plan error.
+fn bare_large_binary(field: &arrow_schema::Field) -> bool {
+    matches!(field.data_type(), arrow_schema::DataType::LargeBinary)
+        && !field
+            .metadata()
+            .contains_key(arrow_schema::extension::EXTENSION_TYPE_NAME_KEY)
+}
+
+/// Does `plan` produce column `name` as a NULL literal? Type coercion turns
+/// `SELECT NULL` next to a decimal_arb (a UNION branch, a `NOT IN (SELECT
+/// NULL …)` subquery) into `CAST(NULL AS LargeBinary)`: a bare LargeBinary
+/// with no bytes at any scale, not a column that lost its metadata.
+fn projects_null(plan: &LogicalPlan, name: &str) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => projection
+            .schema
+            .fields()
+            .iter()
+            .zip(&projection.expr)
+            .any(|(field, expr)| field.name() == name && is_null_valued(expr)),
+        // SubqueryAlias, Limit, Sort, Filter, Distinct … keep the column.
+        other => match other.inputs().as_slice() {
+            [input] => projects_null(input, name),
+            _ => false,
+        },
+    }
+}
+
+fn is_null_valued(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => value.is_null(),
+        Expr::Alias(alias) => is_null_valued(&alias.expr),
+        Expr::Cast(cast) => is_null_valued(&cast.expr),
+        Expr::TryCast(cast) => is_null_valued(&cast.expr),
+        _ => false,
+    }
 }
 
 impl DecimalArbScaleUnifyRule {
@@ -117,19 +147,33 @@ impl DecimalArbScaleUnifyRule {
         // there and they disagree on (precision, scale); otherwise leave it.
         let mut targets: Vec<Option<(u32, u32)>> = Vec::with_capacity(n_cols);
         for i in 0..n_cols {
-            let metas: Option<Vec<(u32, u32)>> = union
+            let fields: Vec<Option<&arrow_schema::Field>> = union
                 .inputs
                 .iter()
-                .map(|input| {
-                    input
-                        .schema()
-                        .fields()
-                        .get(i)
-                        .and_then(|f| DecimalArbType::precision_scale_from_field(f.as_ref()))
-                })
+                .map(|input| input.schema().fields().get(i).map(|f| f.as_ref()))
                 .collect();
-            targets.push(match metas {
-                Some(m) if m.windows(2).any(|w| w[0] != w[1]) => Some(common_precision_scale(&m)),
+            let metas: Vec<Option<(u32, u32)>> = fields
+                .iter()
+                .map(|f| f.and_then(DecimalArbType::precision_scale_from_field))
+                .collect();
+            // A branch that lost its decimal_arb metadata next to branches
+            // that kept it cannot be rescaled, and the union's output field
+            // would read its bytes at another branch's scale.
+            if metas.iter().any(Option::is_some)
+                && let Some(branch) = fields.iter().position(|f| f.is_some_and(bare_large_binary))
+                && !fields[branch].is_some_and(|f| projects_null(&union.inputs[branch], f.name()))
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "decimal_arb: UNION column '{}' is decimal_arb in one branch but a LargeBinary \
+                     without decimal_arb metadata in branch {} (1-based); its bytes sit at an \
+                     unknown scale and cannot be unified — restore the metadata on that branch \
+                     (for example with to_decimal_arb_from_string or decimal_arb_restamp)",
+                    union.schema.field(i).name(),
+                    branch + 1,
+                )));
+            }
+            targets.push(match metas.into_iter().collect::<Option<Vec<_>>>() {
+                Some(m) if m.windows(2).any(|w| w[0] != w[1]) => Some(common_precision_scale(&m)?),
                 _ => None,
             });
         }
@@ -190,13 +234,29 @@ impl DecimalArbScaleUnifyRule {
                 .ok()
                 .and_then(|(_, f)| DecimalArbType::precision_scale_from_field(f.as_ref()))
         };
+        let bare = |expr: &Expr, side: &LogicalPlan| {
+            expr.to_field(side.schema().as_ref())
+                .ok()
+                .is_some_and(|(_, f)| bare_large_binary(f.as_ref()))
+                && !matches!(expr, Expr::Column(c) if projects_null(side, &c.name))
+        };
+        let lost_metadata = |decimal: &Expr, other: &Expr| {
+            DataFusionError::Plan(format!(
+                "decimal_arb: join key `{other}` is a LargeBinary without decimal_arb metadata \
+                 while `{decimal}` is decimal_arb; raw byte equality would never match — \
+                 restore the metadata on that side (for example with \
+                 to_decimal_arb_from_string or decimal_arb_restamp)"
+            ))
+        };
 
         let mut changed = false;
         let mut new_on = Vec::with_capacity(on.len());
         for (l, r) in on {
             match (meta(&l, &left), meta(&r, &right)) {
+                (Some(_), None) if bare(&r, &right) => return Err(lost_metadata(&l, &r)),
+                (None, Some(_)) if bare(&l, &left) => return Err(lost_metadata(&r, &l)),
                 (Some(a), Some(b)) if a != b => {
-                    let target = common_precision_scale(&[a, b]);
+                    let target = common_precision_scale(&[a, b])?;
                     let l = if a == target {
                         l
                     } else {
@@ -339,5 +399,86 @@ impl OptimizerRule for DecimalArbScaleUnifyRule {
             other => Transformed::no(other),
         };
         plan.transform_data(|plan| self.late_comparisons(plan))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    /// `a(v decimal_arb(20, 2))` and `b(v LargeBinary)` — the same column
+    /// name, one branch having lost its decimal_arb metadata upstream.
+    fn session() -> SessionContext {
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rule(Arc::new(DecimalArbScaleUnifyRule::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let decimal = Arc::new(Schema::new(vec![
+            DecimalArbType::field("v", 20, 2, true).unwrap(),
+        ]));
+        let bare = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::LargeBinary,
+            true,
+        )]));
+        ctx.register_table(
+            "a",
+            Arc::new(MemTable::try_new(decimal, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "b",
+            Arc::new(MemTable::try_new(bare, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    async fn plan_error(ctx: &SessionContext, sql: &str) -> String {
+        let df = ctx.sql(sql).await.unwrap();
+        match df.into_optimized_plan() {
+            Ok(plan) => panic!("{sql}: expected a plan error, got {plan}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn union_branch_that_lost_its_metadata_is_a_plan_error() {
+        // Left alone, the union's output field would take branch 1's scale
+        // and read branch 2's bytes at it — silently off by a power of ten.
+        let ctx = session();
+        let err = plan_error(&ctx, "SELECT v FROM a UNION ALL SELECT v FROM b").await;
+        assert!(
+            err.contains("without decimal_arb metadata in branch 2"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_branch_or_key_is_not_a_lost_metadata_error() {
+        // `SELECT NULL` is coerced to `CAST(NULL AS LargeBinary)` next to a
+        // decimal_arb column: no bytes at any scale, nothing to unify.
+        let ctx = session();
+        for sql in [
+            "SELECT v FROM a UNION ALL SELECT NULL FROM b",
+            "SELECT v FROM a WHERE v NOT IN (SELECT NULL FROM b)",
+        ] {
+            let df = ctx.sql(sql).await.unwrap();
+            df.into_optimized_plan()
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn join_key_that_lost_its_metadata_is_a_plan_error() {
+        let ctx = session();
+        let err = plan_error(&ctx, "SELECT a.v FROM a JOIN b ON a.v = b.v").await;
+        assert!(err.contains("join key"), "{err}");
     }
 }

@@ -78,17 +78,16 @@ impl OptimizerRule for DecimalArbSortRewriteRule {
                 nulls_first,
             } = sort_expr;
 
-            // Resolve the expression's Field in the input schema. If we
-            // can't resolve, leave it untouched — let the rest of the
-            // pipeline decide whether to error.
-            let Ok((_, field)) = expr.to_field(input_schema.as_ref()) else {
-                new_exprs.push(SortExpr {
-                    expr,
-                    asc,
-                    nulls_first,
-                });
-                continue;
-            };
+            // Resolve the expression's Field in the input schema. An
+            // unresolvable sort expression is a planning bug; passing it
+            // through would leave a decimal_arb ORDER BY to DataFusion's
+            // bytewise sort, which misorders every negative, silently.
+            let (_, field) = expr.to_field(input_schema.as_ref()).map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "decimal_arb sort: cannot resolve ORDER BY expression `{expr}` against the \
+                     input schema: {e}"
+                ))
+            })?;
 
             if !DecimalArbType::is_decimal_arb_field(field.as_ref()) {
                 new_exprs.push(SortExpr {
