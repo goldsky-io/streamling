@@ -92,6 +92,7 @@ pub struct HybridBoundedSource {
     pub table_name: String,
     pub columns: Option<String>,
     pub filter: Option<String>,
+    /// See `ClickhouseSource::start_at`.
     pub start_at: Option<String>,
 }
 
@@ -214,6 +215,9 @@ pub struct KafkaSource {
 pub struct ClickhouseSource {
     pub table_name: String,
     pub filter: Option<String>,
+    /// First sorting-key value to start the scan at, inclusive: the scan reads
+    /// that whole first-key value. Only the first comma-separated value is
+    /// used. A saved checkpoint is ignored while this is set.
     pub start_at: Option<String>,
     pub columns: Option<String>,
     pub primary_key: Option<String>,

@@ -68,7 +68,7 @@ impl RangeController {
     /// variance exceeds it, convergence is geometric (each step shrinks >10%), not
     /// a unit creep. `on_complete`'s byte clamp uses the same target so a completed
     /// page can't creep back up to the limit and re-overflow.
-    const BYTE_TARGET_RATIO: f64 = 0.9;
+    pub(super) const BYTE_TARGET_RATIO: f64 = 0.9;
 
     /// Fraction of `page_size` that a probed one-step resize targets for rows.
     /// Symmetric with `BYTE_TARGET_RATIO`: sizing a shrunk range to land at
@@ -126,8 +126,8 @@ impl RangeController {
     }
 
     /// True when width is at its floor and can't shrink further. If a page still
-    /// overflows here, a single key holds more than `page_size` rows and the caller
-    /// must surface it rather than lose data.
+    /// overflows here, a single key holds more than a page and the caller must page
+    /// within it (see `InKeyPager`) rather than lose data.
     pub fn at_min_width(&self) -> bool {
         self.width <= Self::MIN_WIDTH
     }
@@ -287,6 +287,14 @@ impl RangeController {
     pub fn on_timeout(&mut self) {
         self.on_overflow(None);
     }
+
+    /// The key at the cursor was fully read by in-key pagination (it overflowed
+    /// even at [`MIN_WIDTH`](Self::MIN_WIDTH)). Advances past exactly that one key.
+    /// Width is left as is: after a hot key found mid-scan it is `MIN_WIDTH` and
+    /// regrows through `on_complete`, at most `GROW_CEILING` per page.
+    pub fn on_key_paged(&mut self) {
+        self.range_start += 1;
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +405,15 @@ mod tests {
             "shrink floors at 1 so the cursor always advances"
         );
         assert!(c.at_min_width(), "width 1 is the minimum");
+    }
+
+    #[test]
+    fn key_paged_advances_exactly_one_key() {
+        let mut c = controller();
+        c.on_overflow(Some(1_000_000));
+        c.on_key_paged();
+        assert_eq!(c.range_start(), 1);
+        assert_eq!(c.current_range(), (1, 2));
     }
 
     #[test]
