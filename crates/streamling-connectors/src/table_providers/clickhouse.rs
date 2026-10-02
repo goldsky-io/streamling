@@ -390,12 +390,11 @@ impl ClickHouseTableProvider {
         state_backend: Arc<dyn StateOperatorBackend<ClickHouseSourceSplit>>,
         datafusion_buffer_size: usize,
         record_batch_size: usize,
-        user_agent: String,
     ) -> Result<Self, DataFusionError> {
         let database_name = config.connection.database.clone();
         let page_size = config.page_size.unwrap_or(Self::DEFAULT_PAGE_SIZE);
         let sort_key_range_config = config.sort_key_range;
-        let client = ClickHouseClient::new(config.connection.clone()).with_user_agent(user_agent);
+        let client = ClickHouseClient::new(config.connection.clone());
 
         // Infer the ReplacingMergeTree version column from engine_full so the
         // scan can deduplicate by max version (keyed on the table's ORDER BY),
@@ -694,13 +693,11 @@ impl ClickHouseTableProvider {
         compression_level_override: Option<GzipCompressionLevel>,
         reference_name: String,
         telemetry: Option<Telemetry>,
-        user_agent: String,
     ) -> Result<Self, DataFusionError> {
         let compression = compression_override.unwrap_or(config.compression);
         let compression_level = compression_level_override.unwrap_or(config.compression_level);
         let client =
-            ClickHouseClient::with_compression(config.clone(), compression, compression_level)
-                .with_user_agent(user_agent);
+            ClickHouseClient::with_compression(config.clone(), compression, compression_level);
 
         let primary_keys: Vec<String> = parse_primary_key_columns(&primary_key)
             .iter()
@@ -2132,21 +2129,12 @@ static SHARED_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build HTTP client for ClickHouse")
 });
 
-fn default_user_agent() -> String {
-    format!("streamling/{}", env!("CARGO_PKG_VERSION"))
-}
-
-pub fn clickhouse_user_agent(application_id: &str) -> String {
-    format!("{} app={}", default_user_agent(), application_id)
-}
-
 #[derive(Clone, Debug)]
 pub struct ClickHouseClient {
     creds: ClickHouseConfig,
     http_client: reqwest::Client,
     compression: ClickHouseCompression,
     compression_level: GzipCompressionLevel,
-    user_agent: String,
 }
 
 impl ClickHouseClient {
@@ -2170,13 +2158,7 @@ impl ClickHouseClient {
             http_client: SHARED_HTTP_CLIENT.clone(),
             compression,
             compression_level,
-            user_agent: default_user_agent(),
         }
-    }
-
-    pub fn with_user_agent(mut self, user_agent: String) -> Self {
-        self.user_agent = user_agent;
-        self
     }
 
     pub async fn send_query(
@@ -2189,7 +2171,6 @@ impl ClickHouseClient {
             .request(method.clone(), &self.creds.url)
             .basic_auth(&self.creds.user, Some(&self.creds.password))
             .header(Self::DATABASE_HEADER, &self.creds.database)
-            .header(reqwest::header::USER_AGENT, &self.user_agent)
             .query(&[(Self::ARROW_STRING_AS_STRING, "1")])
             .timeout(Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS));
 
@@ -2861,7 +2842,6 @@ impl ClickHouseClient {
             .post(&self.creds.url)
             .basic_auth(&self.creds.user, Some(&self.creds.password))
             .header(Self::DATABASE_HEADER, &self.creds.database)
-            .header(reqwest::header::USER_AGENT, &self.user_agent)
             .query(&[
                 ("query", query.as_str()),
                 // Let ClickHouse fill missing columns with their DEFAULT values
@@ -5287,71 +5267,6 @@ mod tests {
             .send_arrow_batch("test_table", &batch, &schema)
             .await
             .expect("send_arrow_batch should succeed without any content-encoding header");
-
-        mock.assert_async().await;
-    }
-
-    #[test]
-    fn test_clickhouse_user_agent_includes_application_id() {
-        let ua = clickhouse_user_agent("my-app-123");
-        assert_eq!(
-            ua,
-            format!("streamling/{} app=my-app-123", env!("CARGO_PKG_VERSION"))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_send_query_sets_user_agent() {
-        let mut server = mockito::Server::new_async().await;
-        let expected_ua = clickhouse_user_agent("my-app-123");
-        let mock = server
-            .mock("GET", "/")
-            .match_query(mockito::Matcher::Any)
-            .match_header("user-agent", expected_ua.as_str())
-            .with_status(200)
-            .with_body("")
-            .expect(1)
-            .create_async()
-            .await;
-
-        let client = create_test_client(&server.url()).with_user_agent(expected_ua);
-
-        client
-            .send_query(reqwest::Method::GET, "SELECT 1")
-            .await
-            .expect("send_query should succeed when mock matches the expected User-Agent");
-
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_send_arrow_batch_sets_user_agent() {
-        use arrow::array::Int64Array;
-
-        let mut server = mockito::Server::new_async().await;
-        let expected_ua = clickhouse_user_agent("my-app-123");
-        let mock = server
-            .mock("POST", "/")
-            .match_query(mockito::Matcher::Any)
-            .match_header("user-agent", expected_ua.as_str())
-            .with_status(200)
-            .with_body("")
-            .expect(1)
-            .create_async()
-            .await;
-
-        let client = create_test_client(&server.url()).with_user_agent(expected_ua);
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-
-        client
-            .send_arrow_batch("test_table", &batch, &schema)
-            .await
-            .expect("send_arrow_batch should succeed when mock matches the expected User-Agent");
 
         mock.assert_async().await;
     }
