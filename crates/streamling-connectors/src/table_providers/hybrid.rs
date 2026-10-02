@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::table_providers::clickhouse::{ClickHouseClient, ClickHouseTableProvider};
+use crate::table_providers::clickhouse::{ClickHouseClient, ClickHouseTableProvider, run_blocking};
 use crate::table_providers::kafka::KafkaSourceTableProvider;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -1274,28 +1274,27 @@ impl ExecutionPlan for HybridSourceExec {
                     };
                     match batch_result {
                         Ok(batch) => {
-                            // Inner phases do not reliably honor the pushed-down
-                            // projection (the bounded ClickHouse scan ignores it
-                            // and emits every column, in ClickHouse order), so
-                            // align each batch to the declared (projected)
-                            // schema by name before anything downstream sees it.
-                            let batch = match align_batch_to_schema(&batch, &schema_for_main) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    break 'outer;
-                                }
-                            };
-                            // Bounded sources (ClickHouse) emit u256/i256 columns as
-                            // FixedSizeBinary(32) without extension metadata and in
-                            // little-endian. Reverse the bytes and adopt the target
-                            // schema's metadata so downstream arithmetic UDFs (which
-                            // assume big-endian + metadata) see correct values.
-                            // No-op for sources that already match (e.g. Kafka/Avro).
-                            let normalized = match ClickHouseClient::normalize_batch_from_clickhouse(
-                                &batch,
-                                &schema_for_main,
-                            ) {
+                            let schema_clone = schema_for_main.clone();
+                            let normalized = match run_blocking(move || {
+                                // Inner phases do not reliably honor the pushed-down
+                                // projection (the bounded ClickHouse scan ignores it
+                                // and emits every column, in ClickHouse order), so
+                                // align each batch to the declared (projected)
+                                // schema by name before anything downstream sees it.
+                                let batch = align_batch_to_schema(&batch, &schema_clone)?;
+                                // Bounded sources (ClickHouse) emit u256/i256 columns as
+                                // FixedSizeBinary(32) without extension metadata and in
+                                // little-endian. Reverse the bytes and adopt the target
+                                // schema's metadata so downstream arithmetic UDFs (which
+                                // assume big-endian + metadata) see correct values.
+                                // No-op for sources that already match (e.g. Kafka/Avro).
+                                ClickHouseClient::normalize_batch_from_clickhouse(
+                                    &batch,
+                                    &schema_clone,
+                                )
+                            })
+                            .await
+                            {
                                 Ok(b) => b,
                                 Err(e) => {
                                     let _ = tx.send(Err(e)).await;

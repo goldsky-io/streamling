@@ -19,7 +19,6 @@ use streamling_core::types::{i256::I256Type, u256::U256Type};
 use streamling_core::utils::dedup::{TombstoneRule, deduplicate_record_batches_by_version};
 use streamling_core::utils::parse_primary_key_columns;
 
-use async_stream;
 use datafusion::arrow::ipc::reader::FileReader;
 use datafusion::arrow::ipc::writer::FileWriter;
 use datafusion::common::ScalarValue;
@@ -107,6 +106,39 @@ fn i128_to_scalar_like(value: i128, template: &ScalarValue) -> ScalarValue {
             "unsupported scalar type for sort key range arithmetic: {:?}",
             other
         ),
+    }
+}
+
+/// Width of the first range. A configured `sort_key_range` is used as is
+/// (RangeController clamps it into [MIN_WIDTH, max_width]), ignoring
+/// `probed_count`. Otherwise `probed_count` drives the choice: `None` (the
+/// count probe failed or timed out) starts at `MIN_SORT_KEY_RANGE` — a failed
+/// probe usually means the span holds a lot of data, so start small and let
+/// RangeController grow the width; `Some(0)` (the probed window held no rows)
+/// jumps the full `probe_span`, skipping straight over it; `Some(count)`
+/// sizes the range to about `page_size` rows from the density observed over
+/// `probe_span`, capped at `probe_span * RangeController::grow_ceiling()`: the
+/// first range grows at most `grow_ceiling` times past the counted window, the
+/// same limit as per-page growth, so a sparse window can't start the scan at
+/// the whole remaining span.
+fn initial_range_width(
+    sort_key_range: Option<i64>,
+    probed_count: Option<u64>,
+    probe_span: i128,
+    page_size: usize,
+) -> i128 {
+    match sort_key_range {
+        Some(width) => width as i128,
+        None => match probed_count {
+            None => ClickHouseTableProvider::MIN_SORT_KEY_RANGE as i128,
+            Some(0) => probe_span,
+            Some(count) => {
+                let density = count as f64 / probe_span as f64;
+                let width = (page_size as f64 / density)
+                    .min(probe_span as f64 * RangeController::grow_ceiling());
+                width as i128
+            }
+        },
     }
 }
 
@@ -333,7 +365,7 @@ struct SourceParams {
     /// operators see `record_batch_size`-bounded batches, matching the Kafka
     /// source. Mirrors the global `AppConfig::record_batch_size`.
     record_batch_size: usize,
-    sort_key_range: i64,
+    sort_key_range: Option<i64>,
     table_name: String,
     has_persisted_split: bool,
     /// Inferred ReplacingMergeTree version column. When `Some`, each fully-read
@@ -524,12 +556,10 @@ impl ClickHouseTableProvider {
             .into());
         }
 
-        let sort_key_range = sort_key_range_config
-            .map(|br| br.max(Self::MIN_SORT_KEY_RANGE))
-            .unwrap_or(Self::DEFAULT_SORT_KEY_RANGE);
+        let sort_key_range = sort_key_range_config.map(|br| br.max(Self::MIN_SORT_KEY_RANGE));
 
         info!(
-            "[{}] sort key range pagination configured (sort_key_range={}, page_size={})",
+            "[{}] sort key range pagination configured (sort_key_range={:?}, page_size={})",
             reference_name, sort_key_range, page_size
         );
 
@@ -1152,10 +1182,12 @@ impl DataSink for ClickHouseSinkExec {
 
             let start_at = Instant::now();
 
-            let normalized_batch = match ClickHouseClient::normalize_batch_for_clickhouse(
-                &batch,
-                &normalized_schema,
-            ) {
+            let normalized_schema_clone = normalized_schema.clone();
+            let normalized_batch = match run_blocking(move || {
+                ClickHouseClient::normalize_batch_for_clickhouse(&batch, &normalized_schema_clone)
+            })
+            .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
@@ -1165,7 +1197,6 @@ impl DataSink for ClickHouseSinkExec {
                     return Err(e);
                 }
             };
-            drop(batch);
 
             // Deduplication is handled by WrappingDataSink before batches reach this sink.
 
@@ -1195,17 +1226,45 @@ impl DataSink for ClickHouseSinkExec {
                 }
             } else {
                 // append_only_mode=false: split rows by _gs_op into inserts vs deletes
-                let (insert_rows, delete_indices) = split_rows_by_operation(&normalized_batch)?;
+                let primary_keys_clone = primary_keys.clone();
+                let (insert, delete_count, delete_batch) = run_blocking(move || {
+                    let (insert_rows, delete_indices) = split_rows_by_operation(&normalized_batch)?;
 
-                // Process inserts/updates: strip _gs_op, then send via Arrow IPC
-                if let Some(insert_rows) = insert_rows {
-                    let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
-                    // Build schema without _gs_op for INSERTs
-                    let insert_schema =
-                        Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
-                            insert_batch.schema().as_ref(),
-                        ));
+                    // Process inserts/updates: strip _gs_op, then build the
+                    // insert schema without it.
+                    let insert = if let Some(insert_rows) = insert_rows {
+                        let insert_batch = ClickHouseClient::strip_gs_op_column(&insert_rows)?;
+                        // Build schema without _gs_op for INSERTs
+                        let insert_schema =
+                            Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(
+                                insert_batch.schema().as_ref(),
+                            ));
+                        Some((insert_batch, insert_schema))
+                    } else {
+                        None
+                    };
 
+                    let delete_count = delete_indices.len();
+                    // Only build the delete batch when there are delete rows
+                    // and primary keys are configured.
+                    let delete_batch =
+                        if !delete_indices.is_empty() && !primary_keys_clone.is_empty() {
+                            let indices_array = arrow::array::UInt32Array::from(delete_indices);
+                            // See the safe_take_record_batch comment in `split_rows_by_operation`.
+                            Some(streamling_core::utils::arrow::safe_take_record_batch(
+                                &normalized_batch,
+                                &indices_array,
+                            )?)
+                        } else {
+                            None
+                        };
+
+                    Ok::<_, DataFusionError>((insert, delete_count, delete_batch))
+                })
+                .await?;
+
+                // Process inserts/updates: send the stripped batch via Arrow IPC
+                if let Some((insert_batch, insert_schema)) = insert {
                     let operation_name = format!("{}: INSERT into '{}'", node_label, table_name);
                     let mut shutdown = streamling_core::shutdown::subscribe();
                     match retry_forever_with_backoff_until_cancelled(
@@ -1231,22 +1290,14 @@ impl DataSink for ClickHouseSinkExec {
                 }
 
                 // Process deletes: extract PK columns and issue ALTER TABLE DELETE
-                if !delete_indices.is_empty() && primary_keys.is_empty() {
+                if delete_count > 0 && primary_keys.is_empty() {
                     warn!(
                         "{}: dropping {} delete rows for table '{}' because no primary keys are configured",
-                        node_label,
-                        delete_indices.len(),
-                        table_name
+                        node_label, delete_count, table_name
                     );
                 }
-                if !delete_indices.is_empty() && !primary_keys.is_empty() {
-                    let indices_array = arrow::array::UInt32Array::from(delete_indices);
-                    // See the safe_take_record_batch comment in `split_rows_by_operation`.
-                    let delete_batch = streamling_core::utils::arrow::safe_take_record_batch(
-                        &normalized_batch,
-                        &indices_array,
-                    )?;
 
+                if let Some(delete_batch) = delete_batch {
                     let operation_name = format!("{}: DELETE from '{}'", node_label, table_name);
                     let client_for_delete = client.clone();
                     let table_for_delete = table_name.clone();
@@ -1408,7 +1459,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .pagination_config()
             .expect("pagination config must be set")
             .page_size;
-        let default_sort_key_range = source_params.sort_key_range;
+        let sort_key_range = source_params.sort_key_range;
         let table_name_for_exec = source_params.table_name.clone();
         let record_batch_size = source_params.record_batch_size;
         let first_sorting_key_name = self
@@ -1523,12 +1574,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
             };
             let template = i128_to_scalar_like(0, &max_val);
 
-            let default_sort_key_range = default_sort_key_range as i128;
             // Let width grow well past the default for sparse filters: cap at the
             // remaining span so an ultra-sparse table can be covered in few queries.
             // The page_size + 1 tripwire still shrinks a too-dense range. The lower
             // floor (one key) lives in RangeController; see RangeController::MIN_WIDTH.
-            let max_width = (max_key - range_start).max(default_sort_key_range);
+            let max_width = (max_key - range_start)
+                .max(sort_key_range.unwrap_or(ClickHouseTableProvider::DEFAULT_SORT_KEY_RANGE) as i128);
 
             let source_query_timeout =
                 Duration::from_secs(ClickHouseTableProvider::source_query_timeout_secs());
@@ -1536,33 +1587,35 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let soft_time_budget = source_query_timeout / 2;
 
             // Up-front count probe: size the first range to ~page_size rows from the
-            // observed density over the remaining span. A probe failure is non-fatal —
-            // fall back to the widest range and let the controller adapt.
+            // density observed over a bounded window of up to DEFAULT_SORT_KEY_RANGE
+            // keys from the cursor, not the whole remaining span. A probe failure is
+            // non-fatal — start at the smallest range and let the controller grow it.
+            // Skipped when sort_key_range is configured, since that value already
+            // fixes the first range's width.
             let where_clause_for_exec = query_builder.where_clause().map(|s| s.to_string());
             let scan_span = (max_key - range_start + 1).max(1);
-            let total_count = match client
-                .fetch_count(
-                    &table_name_for_exec,
-                    where_clause_for_exec.as_deref(),
-                    Some(range_start),
-                    None,
-                    &first_sorting_key_name,
-                )
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("[{}] count probe failed ({}); using widest initial range", reference_name, e);
-                    0
-                }
+            let probe_span = scan_span.min(ClickHouseTableProvider::DEFAULT_SORT_KEY_RANGE as i128);
+            let probed_count = match sort_key_range {
+                Some(_) => None,
+                None => match client
+                    .fetch_count(
+                        &table_name_for_exec,
+                        where_clause_for_exec.as_deref(),
+                        Some(range_start),
+                        Some(range_start + probe_span),
+                        &first_sorting_key_name,
+                    )
+                    .await
+                {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!("[{}] count probe failed ({}); starting at the smallest range", reference_name, e);
+                        None
+                    }
+                },
             };
-            let initial_width = if total_count == 0 {
-                max_width
-            } else {
-                // RangeController clamps this into [MIN_WIDTH, max_width].
-                let density = total_count as f64 / scan_span as f64;
-                (page_size as f64 / density) as i128
-            };
+            let initial_width =
+                initial_range_width(sort_key_range, probed_count, probe_span, page_size);
 
             let mut controller = RangeController::new(
                 page_size as u64,
@@ -1574,8 +1627,8 @@ impl ExecutionPlan for ClickHouseSourceExec {
                 soft_time_budget,
             );
             info!(
-                "[{}] adaptive range pagination (max_key={}, start={}, count={}, initial_width={}, page_size={})",
-                reference_name, max_key, range_start, total_count, controller.width(), page_size
+                "[{}] adaptive range pagination (max_key={}, start={}, count={:?}, probe_span={}, initial_width={}, page_size={}, sort_key_range={:?})",
+                reference_name, max_key, range_start, probed_count, probe_span, controller.width(), page_size, sort_key_range
             );
 
             let mut page_count = 0;
@@ -1814,15 +1867,21 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             let (mut emit_batches, deduped_to_empty): (Vec<RecordBatch>, bool) =
                                 match &dedup_version_column {
                                     Some(version_col) => {
-                                        match deduplicate_record_batches_by_version(
-                                            &batches,
-                                            &dedup_key,
-                                            version_col,
-                                            Some(&TombstoneRule {
-                                                column: "_gs_op".to_string(),
-                                                value: "d".to_string(),
-                                            }),
-                                        ) {
+                                        let dedup_key_owned = dedup_key.clone();
+                                        let version_col_owned = version_col.clone();
+                                        match run_blocking(move || {
+                                            deduplicate_record_batches_by_version(
+                                                &batches,
+                                                &dedup_key_owned,
+                                                &version_col_owned,
+                                                Some(&TombstoneRule {
+                                                    column: "_gs_op".to_string(),
+                                                    value: "d".to_string(),
+                                                }),
+                                            )
+                                        })
+                                        .await
+                                        {
                                             Ok(deduped) if deduped.num_rows() == 0 => {
                                                 (Vec::new(), true)
                                             }
@@ -2053,21 +2112,10 @@ impl ClickHouseSourceExec {
             .process_http_response(response_result, query.as_str(), "run")
             .await?;
 
-        let record_batch_stream = async_stream::stream! {
-            let reader = match client.create_arrow_reader(response_bytes, query.as_str()) {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(ArrowError::ExternalError(e.into()));
-                    return;
-                }
-            };
-            for batch_result in reader {
-                yield batch_result;
-            }
-        };
+        let batches = decode_arrow_ipc_blocking(client, response_bytes, query).await;
 
         trace!("Created async record batch stream");
-        Ok(Box::pin(record_batch_stream))
+        Ok(Box::pin(futures::stream::iter(batches)))
     }
 
     pub fn extract_keyset_from_batch(
@@ -2097,6 +2145,41 @@ impl ClickHouseSourceExec {
 
         Ok(keyset_values)
     }
+}
+
+/// Decodes a ClickHouse Arrow IPC response on the blocking pool, so a large page
+/// does not hold a tokio worker thread while it decodes.
+async fn decode_arrow_ipc_blocking(
+    client: ClickHouseClient,
+    response_bytes: Vec<u8>,
+    query: String,
+) -> Vec<arrow::error::Result<RecordBatch>> {
+    let join_result = tokio::task::spawn_blocking(move || {
+        match client.create_arrow_reader(response_bytes, &query) {
+            Ok(reader) => reader.collect(),
+            Err(e) => vec![Err(ArrowError::ExternalError(e.into()))],
+        }
+    })
+    .await;
+    match join_result {
+        Ok(batches) => batches,
+        Err(join_err) => vec![Err(ArrowError::ExternalError(Box::new(join_err)))],
+    }
+}
+
+/// Runs CPU-heavy work on the blocking pool so it does not hold a tokio
+/// worker thread. A failed or cancelled task becomes an error of the
+/// caller's type.
+pub(crate) async fn run_blocking<T, E>(
+    f: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
+) -> std::result::Result<T, E>
+where
+    T: Send + 'static,
+    E: From<StreamlingError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(E::from(streamling_err!("blocking task failed: {}", e))))
 }
 
 /// The one `reqwest::Client` behind every [`ClickHouseClient`] in the process.
@@ -2463,6 +2546,10 @@ impl ClickHouseClient {
     /// from the *true* density in one step (both bounds — the overflowing
     /// range). Carries no ORDER BY, so a matching projection serves it cheaply;
     /// a slow probe is itself a signal that the filter is scan-bound.
+    ///
+    /// Bounded by the source query timeout (`ClickHouseTableProvider::source_query_timeout_secs()`)
+    /// rather than `send_query`'s longer HTTP timeout, so a stuck count probe fails
+    /// fast instead of blocking pagination for minutes.
     pub async fn fetch_count(
         &self,
         table_name: &str,
@@ -2490,10 +2577,16 @@ impl ClickHouseClient {
             "SELECT count() FROM {}{} FORMAT Arrow",
             table_name, where_sql
         );
-        let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
-        let response_bytes = self
-            .process_http_response(response_result, query.as_str(), "count")
-            .await?;
+        let timeout_secs = ClickHouseTableProvider::source_query_timeout_secs();
+        let response_bytes = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+            self.process_http_response(response_result, query.as_str(), "count")
+                .await
+        })
+        .await
+        .map_err(|_elapsed| {
+            streamling_err!("ClickHouse count query timed out after {}s", timeout_secs)
+        })??;
 
         let mut reader = self.create_arrow_reader(response_bytes, &query)?;
         let batch = reader
@@ -2894,55 +2987,74 @@ impl ClickHouseClient {
             return Ok(());
         }
 
-        // Build all value tuples first
-        let mut value_tuples = Vec::with_capacity(delete_batch.num_rows());
-        for row_idx in 0..delete_batch.num_rows() {
-            let mut values = Vec::with_capacity(primary_keys.len());
-            for pk in primary_keys {
-                let col = delete_batch.column_by_name(pk).ok_or_else(|| {
-                    streamling_err!("primary key column '{}' not found in delete batch", pk)
-                })?;
-                let scalar =
-                    ScalarValue::try_from_array(col, row_idx).streamling_with_context(|| {
-                        format!(
-                            "failed to extract primary key value for column '{}' at row {}",
-                            pk, row_idx
-                        )
+        let table_name_owned = table_name.to_string();
+        let pks_owned = primary_keys.to_vec();
+        let batch_clone = delete_batch.clone();
+        // Build the per-row value tuples, the pk_clause, and the chunked
+        // ALTER TABLE ... DELETE WHERE ... query strings off the async thread.
+        let queries = run_blocking(move || {
+            // Build all value tuples first
+            let mut value_tuples = Vec::with_capacity(batch_clone.num_rows());
+            for row_idx in 0..batch_clone.num_rows() {
+                let mut values = Vec::with_capacity(pks_owned.len());
+                for pk in &pks_owned {
+                    let col = batch_clone.column_by_name(pk).ok_or_else(|| {
+                        streamling_err!("primary key column '{}' not found in delete batch", pk)
                     })?;
-                values.push(Self::scalar_to_clickhouse_literal(&scalar));
+                    let scalar = ScalarValue::try_from_array(col, row_idx)
+                        .streamling_with_context(|| {
+                            format!(
+                                "failed to extract primary key value for column '{}' at row {}",
+                                pk, row_idx
+                            )
+                        })?;
+                    values.push(Self::scalar_to_clickhouse_literal(&scalar));
+                }
+                if pks_owned.len() == 1 {
+                    value_tuples.push(values[0].clone());
+                } else {
+                    value_tuples.push(format!("({})", values.join(", ")));
+                }
             }
-            if primary_keys.len() == 1 {
-                value_tuples.push(values[0].clone());
+
+            let pk_clause = if pks_owned.len() == 1 {
+                format!("`{}`", pks_owned[0])
             } else {
-                value_tuples.push(format!("({})", values.join(", ")));
-            }
-        }
+                format!(
+                    "({})",
+                    pks_owned
+                        .iter()
+                        .map(|pk| format!("`{}`", pk))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
 
-        let pk_clause = if primary_keys.len() == 1 {
-            format!("`{}`", primary_keys[0])
-        } else {
-            format!(
-                "({})",
-                primary_keys
-                    .iter()
-                    .map(|pk| format!("`{}`", pk))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+            // Chunk deletes to stay well under ClickHouse's max_query_size (256KB default).
+            // 1000 rows per chunk is conservative and safe for most PK sizes.
+            const DELETE_CHUNK_SIZE: usize = 1000;
 
-        // Chunk deletes to stay well under ClickHouse's max_query_size (256KB default).
-        // 1000 rows per chunk is conservative and safe for most PK sizes.
-        const DELETE_CHUNK_SIZE: usize = 1000;
+            let queries: Vec<(String, usize)> = value_tuples
+                .chunks(DELETE_CHUNK_SIZE)
+                .map(|chunk| {
+                    let where_clause = format!("{} IN ({})", pk_clause, chunk.join(", "));
+                    let query = format!(
+                        "ALTER TABLE {} DELETE WHERE {}",
+                        table_name_owned, where_clause
+                    );
+                    (query, chunk.len())
+                })
+                .collect();
 
-        for chunk in value_tuples.chunks(DELETE_CHUNK_SIZE) {
-            let where_clause = format!("{} IN ({})", pk_clause, chunk.join(", "));
-            let query = format!("ALTER TABLE {} DELETE WHERE {}", table_name, where_clause);
+            Ok::<_, StreamlingError>(queries)
+        })
+        .await?;
 
+        for (query, chunk_len) in queries {
             debug!(
                 "ClickHouse DELETE for table {} ({} rows in this chunk, {} total)",
                 table_name,
-                chunk.len(),
+                chunk_len,
                 delete_batch.num_rows()
             );
 
@@ -3405,6 +3517,41 @@ mod tests {
             args: vec![ScalarValue::Int64(Some(1000))],
         };
         assert_eq!(split.range_start(), Some(1000));
+    }
+
+    #[test]
+    fn test_initial_range_width() {
+        // A configured width wins even when a count is also given.
+        assert_eq!(
+            initial_range_width(Some(500), Some(1000), 1_000_000, 100),
+            500
+        );
+
+        // No configured width and a failed probe starts at the smallest range.
+        assert_eq!(
+            initial_range_width(None, None, 1_000_000, 100),
+            ClickHouseTableProvider::MIN_SORT_KEY_RANGE as i128
+        );
+
+        // No configured width and an empty probe window jumps the full probe span.
+        assert_eq!(
+            initial_range_width(None, Some(0), 1_000_000, 100),
+            1_000_000
+        );
+
+        // No configured width: size from the probed density.
+        assert_eq!(
+            initial_range_width(None, Some(1000), 1_000_000, 100),
+            100_000
+        );
+
+        // A sparse probe window (10 rows over a 1M-key span) would otherwise
+        // size the first range far past the table; cap it at the same
+        // per-step growth ceiling RangeController enforces.
+        assert_eq!(
+            initial_range_width(None, Some(10), 1_000_000, 10_000_000),
+            (1_000_000_f64 * RangeController::grow_ceiling()) as i128
+        );
     }
 
     #[test]
@@ -4836,6 +4983,81 @@ mod tests {
         assert_eq!(row_count, 3, "should have received 3 rows");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn decode_arrow_ipc_runs_off_the_runtime_thread() {
+        use arrow::array::StringArray;
+        use arrow::ipc::writer::FileWriter;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a multi-MB Arrow IPC body: one batch with ~500_000 string rows.
+        let values: Vec<String> = (0..500_000).map(|i| format!("0x{:064x}", i)).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .unwrap();
+        let mut body = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut body, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // A task spawned on the runtime can only run while the decoding future
+        // yields control back. With spawn_blocking the worker thread is free;
+        // an inline synchronous decode would hold it for the whole decode.
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        // Test-only helper task; the disallowed-methods lint targets production code.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        let batches = decode_arrow_ipc_blocking(
+            create_test_client("http://localhost:1"),
+            body,
+            "q".to_string(),
+        )
+        .await;
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "runtime thread was not free to run other tasks while decoding"
+        );
+        let total_rows: usize = batches
+            .into_iter()
+            .map(|r| r.expect("decode failed").num_rows())
+            .sum();
+        assert_eq!(total_rows, 500_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_runs_off_the_runtime_thread() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        // Test-only helper task; the disallowed-methods lint targets production code.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        let value = run_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok::<_, StreamlingError>(7)
+        })
+        .await
+        .expect("run_blocking failed");
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "runtime thread was not free to run other tasks while run_blocking worked"
+        );
+        assert_eq!(value, 7);
+    }
+
     #[tokio::test]
     async fn test_scan_seeds_exec_split_with_initial_start_args() {
         use datafusion::execution::context::SessionContext;
@@ -4886,7 +5108,7 @@ mod tests {
                 state_store,
                 datafusion_buffer_size: 16,
                 record_batch_size: 1000,
-                sort_key_range: 1_000_000,
+                sort_key_range: Some(1_000_000),
                 table_name: "test_table".to_string(),
                 has_persisted_split: false,
                 dedup_version_column: None,
