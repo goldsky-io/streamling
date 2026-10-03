@@ -24,7 +24,7 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 - [Common patterns](#common-patterns)
 - [Development setup](#development-setup)
 - [Reference](#reference)
-- [Engine SQL UDFs](docs/sql-udfs.md)
+- [Engine SQL functions](docs/sql-udfs.md)
 - [Topology](#topology)
 - [Dynamic Tables](#dynamic-tables)
 - [Side Outputs](#side-outputs)
@@ -296,7 +296,8 @@ Recommended environment variables when running locally:
 
 The sections below are the full connector and runtime reference. New here? Start with [Quick start](#quick-start).
 
-For functions available to SQL transforms, see the [engine SQL UDF reference](docs/sql-udfs.md).
+For functions available to SQL transforms, see the [engine SQL function reference](docs/sql-udfs.md): Streamling's
+own functions, the Flink-compatible string and JSON functions, and `dynamic_table_check`.
 Plugin-provided SQL functions depend on which plugins the deployment loads.
 
 ## Topology
