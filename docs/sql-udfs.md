@@ -138,7 +138,7 @@ Source: [`json_objects_to_clickhouse_tuples.rs`](../crates/streamling-common/src
 
 **Rust doc summary:** Splits a string into an array of substrings based on a separator.
 
-Split text on separator (space by default).
+Split text on separator (space by default). Literal arguments are read as one-row arrays, so mixing literal and column arguments fails on batches of more than one row. To split a column, omit the separator (spaces) or use DataFusion's `string_to_array`.
 
 ```sql
 SELECT _gs_split_string_to_array('a-b', '-');
@@ -154,7 +154,7 @@ Source: [`split_string_to_array.rs`](../crates/streamling-common/src/functions/s
 
 **Rust doc summary:** Generates a series of numbers from start to stop with an optional step.
 
-Inclusive integer series; step defaults to 1, must not be zero.
+Inclusive integer series; step defaults to 1 and must not be zero, and a negative step counts down. Literal arguments are read as one-row arrays, so mixing literal and column arguments fails on batches of more than one row. For a literal start with a column stop, use DataFusion's built-in `generate_series`.
 
 ```sql
 SELECT _gs_generate_series(1, 5, 2);
@@ -308,10 +308,10 @@ Source: [`keccak256.rs`](../crates/streamling-common/src/functions/keccak256.rs)
 
 **Rust doc summary:** Converts numbers between different bases.
 
-Convert an Utf8 number between bases 2–36; both bases must be either Int32 or Utf8.
+Convert an Utf8 number between bases 2–36; an invalid number or a base outside 2–36 returns NULL. Bases are read as Int32 only when `from_base` is an Int32 column; otherwise both bases must be Utf8, so pass literal bases as strings (`'16'`, not `16`). Pass all three arguments as literals or all three as columns: literal bases combined with a `number` column are one-row arrays and fail on batches of more than one row.
 
 ```sql
-SELECT _gs_conv_base('FF', 16, 10);
+SELECT _gs_conv_base('FF', '16', '10'); -- '255'
 ```
 
 Source: [`conv_base.rs`](../crates/streamling-common/src/functions/conv_base.rs) (`ConvBaseFunc`).
