@@ -4302,6 +4302,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn bigint_column_filter_casts_integer_literals() {
+            use arrow::array::{Array, BooleanArray, Int64Array, RecordBatch};
+            use streamling_core::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType};
+
+            let value_field =
+                DecimalArbType::field("value", 78, 0, false).expect("decimal_arb field");
+            let schema: SchemaRef = Arc::new(Schema::new(vec![
+                Field::new("status", DataType::Int64, false),
+                value_field,
+            ]));
+
+            let (values, _, _) = {
+                let mut b =
+                    DecimalArbArrayBuilder::with_capacity(3, "value", 78, 0).expect("builder");
+                for v in ["0", "7", "0"] {
+                    b.append_str(v).expect("append");
+                }
+                b.finish().into_inner()
+            };
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 1, 0])), Arc::new(values)],
+            )
+            .expect("batch");
+
+            let predicate = KafkaSourceTableProvider::prepare_filter_expression(
+                "value > 0 AND status = 1",
+                &schema,
+                &test_session_manager(),
+            )
+            .expect("literal compared to a decimal_arb column should be auto-cast");
+            let result = predicate
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(result, &BooleanArray::from(vec![false, true, false]));
+        }
+
+        #[tokio::test]
         async fn validate_filter_columns_with_existing_columns() {
             let schema = test_schema();
             let session_manager = test_session_manager();
