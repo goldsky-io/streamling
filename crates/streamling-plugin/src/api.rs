@@ -86,6 +86,47 @@ use streamling_state::{
 
 pub static STREAMLING_COLUMN_NAME_OP: &str = "_gs_op";
 
+/// Creates a plugin's state backends, each keyed by a reference name.
+///
+/// # State of a partition-aware plugin
+///
+/// A plugin registered with `register_partitioned_plugin_*!` always gets a
+/// [`Self::for_partition`] factory: at every width, and on a host that
+/// predates partitioned plugins too, which runs it as partition 0 of 1. Its
+/// two constructors key state differently from a single-stream plugin's:
+///
+/// | | single-stream plugin | partition-aware plugin, instance `i` |
+/// |---|---|---|
+/// | [`Self::create`] | `{reference_name}` | `{reference_name}[i]` |
+/// | [`Self::create_shared`] | `{reference_name}` | `{reference_name}` |
+///
+/// ⚠️ So converting a single-stream plugin to partition-aware moves its
+/// `create()` state from `{reference_name}` to `{reference_name}[0]`, even at
+/// width 1 and on an old host. Nothing fails: every running pipeline restarts
+/// with empty state (a source from its configured start). Decide where each
+/// piece of state lives before converting:
+///
+/// - **Node-wide: [`Self::create_shared`].** Always an option. It is the key
+///   the single-stream plugin wrote, at every width, so existing pipelines keep
+///   their state and changing the width needs no migration. The instances
+///   share it, so they must coordinate their writes: one writer, a distinct
+///   `_kv` key per partition, or one value they agree on (e.g. a low watermark
+///   across partitions, written once per checkpoint). Every instance of a node
+///   runs in one process, so they can coordinate in memory.
+/// - **Per partition: [`Self::create`].** For state that belongs to one
+///   partition's slice of the stream. It is never redistributed: when the width
+///   changes, an index keeps its key but may own a different slice, indices
+///   past the new width are orphaned, and new ones start empty. Use it only
+///   when the slice an index owns cannot change (e.g. one native shard per
+///   partition) or the state can be rebuilt.
+/// - **Migrate once.** An instance that finds no `create()` state can seed it
+///   from what the single-stream plugin left under `create_shared()` (default
+///   key), provided that state can be split between partitions.
+///
+/// A plugin that is partition-aware from its first release has no old state,
+/// but the width question stands: whatever lives under `create()` must survive
+/// `parallelism` changing. Changing hosts never moves state: a partition-aware
+/// plugin gets the same keys at width 1 on either.
 pub struct PluginStateBackendFactory {
     factories: StateBackendFactories,
     application_namespace: String,
@@ -127,6 +168,10 @@ impl PluginStateBackendFactory {
     /// State owned by this instance. For a partition instance it is keyed by
     /// the partition (`{reference_name}[{index}]`), so instances never see
     /// each other's state; otherwise it is the node's state.
+    ///
+    /// ⚠️ For a plugin converted from single-stream this is not where its
+    /// existing state is, and a width change does not move it. See the type's
+    /// docs before using it in a partition-aware plugin.
     pub fn create<V>(&self) -> Arc<PluginStateBackend<V>>
     where
         V: Serialize + for<'de> Deserialize<'de> + Send + Sync + Unpin + Clone + Debug + 'static,
@@ -140,8 +185,10 @@ impl PluginStateBackendFactory {
 
     /// State shared by every partition instance of the node, for coordinated
     /// node-wide bookkeeping. Instances write it concurrently, so they must
-    /// coordinate (e.g. through distinct `_kv` keys). It is also where a
-    /// plugin that used to be single-stream finds the state it wrote then.
+    /// coordinate (e.g. through distinct `_kv` keys). Its default key is the
+    /// one a single-stream plugin's [`Self::create`] uses, so it is where a
+    /// plugin that used to be single-stream finds the state it wrote then, and
+    /// the one choice that is compatible at every width. See the type's docs.
     pub fn create_shared<V>(&self) -> Arc<PluginStateBackend<V>>
     where
         V: Serialize + for<'de> Deserialize<'de> + Send + Sync + Unpin + Clone + Debug + 'static,
@@ -445,6 +492,9 @@ pub struct SinkDescription {
 /// instance: validate options and report metadata only. It must not open
 /// connections that outlive the call or reserve durable resources; read-only
 /// schema discovery is fine. `create` is then called once per partition.
+///
+/// Before converting a single-stream plugin, decide where its state lives:
+/// its `create()` state moves (see [`PluginStateBackendFactory`]).
 pub trait PartitionedSourcePlugin: SourcePlugin + Sized + 'static {
     fn describe(
         options: &HashMap<String, String>,
@@ -461,7 +511,7 @@ pub trait PartitionedSourcePlugin: SourcePlugin + Sized + 'static {
 
 /// A transform that runs as one instance per physical stream. Register it
 /// with `register_partitioned_plugin_transform!`. See
-/// [`PartitionedSourcePlugin`] for the `describe` contract.
+/// [`PartitionedSourcePlugin`] for the `describe` contract and state.
 pub trait PartitionedTransformPlugin: TransformPlugin + Sized + 'static {
     fn describe(
         input_schema: SchemaRef,
@@ -480,7 +530,7 @@ pub trait PartitionedTransformPlugin: TransformPlugin + Sized + 'static {
 
 /// A sink that runs as one instance per physical stream. Register it with
 /// `register_partitioned_plugin_sink!`. See [`PartitionedSourcePlugin`] for
-/// the `describe` contract.
+/// the `describe` contract and state.
 pub trait PartitionedSinkPlugin: SinkPlugin + Sized + 'static {
     fn describe(
         input_schema: SchemaRef,

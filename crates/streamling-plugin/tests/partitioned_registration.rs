@@ -27,6 +27,9 @@ const PARTITIONED_SOURCE: &str = "test.partitioned_source";
 const PARTITIONED_TRANSFORM: &str = "test.partitioned_transform";
 const PARTITIONED_SINK: &str = "test.partitioned_sink";
 const PARTITION_LABEL: &str = "partition";
+const STATE_LABEL: &str = "state";
+const MINIMUM_PARTITIONS_OPTION: &str = "minimum_partitions";
+const PARALLELISM_OPTION: &str = "parallelism";
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -36,9 +39,11 @@ fn schema() -> SchemaRef {
 }
 
 /// One type serves every registration here: it reports the partition it was
-/// created for as a label, so the tests can see which context reached it.
+/// created for, and the key of its `create()` state, as labels, so the tests
+/// can see which context reached it.
 struct TestPlugin {
     context: Option<PluginInstanceContext>,
+    state_key: Option<String>,
 }
 
 impl TestPlugin {
@@ -48,7 +53,28 @@ impl TestPlugin {
         _: PluginMetricsRecorder,
         _: HashMap<String, String>,
     ) -> Self {
-        TestPlugin { context: None }
+        TestPlugin {
+            context: None,
+            state_key: None,
+        }
+    }
+
+    fn partitioned(
+        context: PluginInstanceContext,
+        state: PluginStateBackendFactory,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError> {
+        // A partitioned host never passes `parallelism`, so neither may the
+        // single-stream fallback.
+        if options.contains_key(PARALLELISM_OPTION) {
+            return Err(PluginInitializationError::Configuration(
+                "saw the parallelism option".into(),
+            ));
+        }
+        Ok(TestPlugin {
+            context: Some(context),
+            state_key: Some(format!("{:?}", state.create::<u64>())),
+        })
     }
 
     fn partition_labels(&self) -> Vec<PluginLabel> {
@@ -60,6 +86,11 @@ impl TestPlugin {
                     format!("{}/{}", c.partition_index, c.partition_count),
                 )
             })
+            .chain(
+                self.state_key
+                    .iter()
+                    .map(|key| PluginLabel::new(STATE_LABEL, key.clone())),
+            )
             .collect()
     }
 }
@@ -139,12 +170,15 @@ impl SinkPlugin for TestPlugin {
 
 impl PartitionedSourcePlugin for TestPlugin {
     fn describe(
-        _: &HashMap<String, String>,
+        options: &HashMap<String, String>,
     ) -> Result<SourceDescription, streamling_plugin::PluginInitializationError> {
         Ok(SourceDescription {
             output_schema: schema(),
             labels: Vec::new(),
             partition_count: PartitionCount {
+                minimum: options
+                    .get(MINIMUM_PARTITIONS_OPTION)
+                    .map_or(1, |m| m.parse().unwrap()),
                 preferred: Some(3),
                 ..PartitionCount::default()
             },
@@ -154,13 +188,11 @@ impl PartitionedSourcePlugin for TestPlugin {
     fn create(
         context: PluginInstanceContext,
         _: PluginAsyncRuntimeObj,
-        _: PluginStateBackendFactory,
+        state: PluginStateBackendFactory,
         _: PluginMetricsRecorder,
-        _: HashMap<String, String>,
+        options: HashMap<String, String>,
     ) -> Result<Self, streamling_plugin::PluginInitializationError> {
-        Ok(TestPlugin {
-            context: Some(context),
-        })
+        TestPlugin::partitioned(context, state, options)
     }
 }
 
@@ -181,13 +213,11 @@ impl PartitionedTransformPlugin for TestPlugin {
         context: PluginInstanceContext,
         _: SchemaRef,
         _: PluginAsyncRuntimeObj,
-        _: PluginStateBackendFactory,
+        state: PluginStateBackendFactory,
         _: PluginMetricsRecorder,
-        _: HashMap<String, String>,
+        options: HashMap<String, String>,
     ) -> Result<Self, streamling_plugin::PluginInitializationError> {
-        Ok(TestPlugin {
-            context: Some(context),
-        })
+        TestPlugin::partitioned(context, state, options)
     }
 }
 
@@ -207,13 +237,11 @@ impl PartitionedSinkPlugin for TestPlugin {
         context: PluginInstanceContext,
         _: SchemaRef,
         _: PluginAsyncRuntimeObj,
-        _: PluginStateBackendFactory,
+        state: PluginStateBackendFactory,
         _: PluginMetricsRecorder,
-        _: HashMap<String, String>,
+        options: HashMap<String, String>,
     ) -> Result<Self, streamling_plugin::PluginInitializationError> {
-        Ok(TestPlugin {
-            context: Some(context),
-        })
+        TestPlugin::partitioned(context, state, options)
     }
 }
 
@@ -225,6 +253,15 @@ init_plugin!();
 
 fn no_options() -> PluginOptions {
     PluginOptions::new(HashMap::new())
+}
+
+fn options(entries: &[(&str, &str)]) -> PluginOptions {
+    PluginOptions::new(
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    )
 }
 
 fn input_schema() -> ROption<SafeArrowSchema> {
@@ -259,25 +296,33 @@ fn runtime() -> PluginAsyncRuntimeObj {
     DirectTokioProxy::new().into_async_runtime_obj()
 }
 
-/// Terminates the created instance and returns the partition it reported.
-async fn reported_partition(
+/// Terminates the created instance and returns the labels it reported.
+async fn reported_labels(
     result: RResult<PluginResult, PluginInitializationError>,
     channels: &PluginChannels,
-) -> String {
+) -> HashMap<String, String> {
     let result = result.unwrap();
-    let partition = result
+    let labels = result
         .labels
         .iter()
-        .find(|l| l.key.as_str() == PARTITION_LABEL)
-        .map(|l| l.value.to_string())
-        .expect("instance must report its partition");
+        .map(|l| (l.key.to_string(), l.value.to_string()))
+        .collect();
     channels
         .input
         .sender
         .send(NonExhaustive::new(PluginMsg::Terminate))
         .unwrap();
     assert!(matches!(result.execution_future.await, RResult::ROk(())));
-    partition
+    labels
+}
+
+/// The configuration error a creation failed with.
+fn configuration_error(result: RResult<PluginResult, PluginInitializationError>) -> String {
+    match result {
+        RResult::RErr(PluginInitializationError::Configuration(message)) => message.to_string(),
+        RResult::RErr(other) => panic!("expected a configuration error, got {other:?}"),
+        RResult::ROk(_) => panic!("expected a configuration error, got an instance"),
+    }
 }
 
 #[test]
@@ -361,35 +406,114 @@ async fn create_partitioned_dispatches_each_kind_with_its_context() {
             state_backend_config(),
             channels.clone(),
         );
-        assert_eq!(reported_partition(result, &channels).await, "1/2", "{id}");
+        assert_eq!(
+            reported_labels(result, &channels).await[PARTITION_LABEL],
+            "1/2",
+            "{id}"
+        );
     }
 }
 
+/// Only a host that predates partitioned plugins calls `create` for a
+/// partition-aware id. It must get what a partitioned host runs at width 1,
+/// down to the state keys, so neither engine moves the plugin's state.
 #[tokio::test(flavor = "multi_thread")]
-async fn create_refuses_partitioned_ids() {
+async fn create_runs_partitioned_ids_as_partition_0_of_1() {
+    let module = get_module();
+    let (create, create_partitioned) = (module.create(), module.create_partitioned().unwrap());
+
+    for (id, has_input) in [
+        (PARTITIONED_SOURCE, false),
+        (PARTITIONED_TRANSFORM, true),
+        (PARTITIONED_SINK, true),
+    ] {
+        let input = || if has_input { input_schema() } else { RNone };
+        let channels = test_channels();
+        let single_stream = reported_labels(
+            create(
+                RString::from(id),
+                input(),
+                no_options(),
+                runtime(),
+                state_backend_config(),
+                channels.clone(),
+            ),
+            &channels,
+        )
+        .await;
+        let channels = test_channels();
+        let width_one = reported_labels(
+            create_partitioned(
+                RString::from(id),
+                input(),
+                no_options(),
+                context(0, 1),
+                runtime(),
+                state_backend_config(),
+                channels.clone(),
+            ),
+            &channels,
+        )
+        .await;
+
+        assert_eq!(single_stream[PARTITION_LABEL], "0/1", "{id}");
+        assert!(
+            single_stream[STATE_LABEL].contains(r#"reference_name: "node[0]""#),
+            "{id}: {single_stream:?}"
+        );
+        assert_eq!(single_stream, width_one, "{id}");
+    }
+}
+
+/// `parallelism` reaches a plugin as an option only on a host that predates
+/// partitioned plugins, so it means a width that host cannot run.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_refuses_a_width_one_stream_cannot_honor() {
     let create = get_module().create();
 
-    for (id, input) in [
-        (PARTITIONED_SOURCE, RNone),
-        (PARTITIONED_TRANSFORM, input_schema()),
-        (PARTITIONED_SINK, input_schema()),
-    ] {
-        let result = create(
-            RString::from(id),
-            input,
-            no_options(),
+    for width in ["2", "0", "many"] {
+        let message = configuration_error(create(
+            PARTITIONED_SOURCE.into(),
+            RNone,
+            options(&[(PARALLELISM_OPTION, width)]),
             runtime(),
             state_backend_config(),
             test_channels(),
+        ));
+        assert!(
+            message.contains(PARTITIONED_SOURCE)
+                && message.contains(&format!("parallelism {width}")),
+            "{message}"
         );
-        match result {
-            RResult::RErr(PluginInitializationError::Configuration(message)) => {
-                assert!(message.contains(id), "{message}")
-            }
-            RResult::RErr(other) => panic!("{id}: expected a configuration error, got {other:?}"),
-            RResult::ROk(_) => panic!("{id} must only be created through `create_partitioned`"),
-        }
     }
+
+    let message = configuration_error(create(
+        PARTITIONED_SOURCE.into(),
+        RNone,
+        options(&[(MINIMUM_PARTITIONS_OPTION, "2")]),
+        runtime(),
+        state_backend_config(),
+        test_channels(),
+    ));
+    assert!(message.contains("at least 2 partitions"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_accepts_parallelism_1_without_passing_it_on() {
+    let channels = test_channels();
+    let result = (get_module().create())(
+        PARTITIONED_TRANSFORM.into(),
+        input_schema(),
+        options(&[(PARALLELISM_OPTION, "1")]),
+        runtime(),
+        state_backend_config(),
+        channels.clone(),
+    );
+
+    assert_eq!(
+        reported_labels(result, &channels).await[PARTITION_LABEL],
+        "0/1"
+    );
 }
 
 #[test]

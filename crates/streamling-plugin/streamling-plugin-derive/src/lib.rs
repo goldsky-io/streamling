@@ -348,8 +348,10 @@ enum PartitionedKind {
 }
 
 /// Registers a partition-aware plugin: `describe_partitioned` and
-/// `create_partitioned` dispatch to its `Partitioned*Plugin` impl, and the
-/// single-stream `create` refuses it.
+/// `create_partitioned` dispatch to its `Partitioned*Plugin` impl. The
+/// single-stream `create`, which only a host that predates partitioned plugins
+/// calls for it, runs it as partition 0 of 1
+/// (`streamling_plugin::create_partitioned_*_as_single_stream`).
 fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStream {
     let PluginComponent {
         namespace,
@@ -360,12 +362,22 @@ fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStrea
 
     let (component_id, plugin_id) = generate_plugin_identifiers(&namespace, &name);
 
-    let create_arm = quote! {
-        #component_id => Err(PluginInitializationError::Configuration(RString::from(format!(
-            "plugin {} is partition-aware and needs a host that supports partitioned plugins",
-            plugin_id
-        ))))
-        .into_c(),
+    let create_arm = match kind {
+        PartitionedKind::Source => quote! {
+            #component_id => streamling_plugin::create_partitioned_source_as_single_stream::<#component_type>(
+                plugin_id, options, runtime, state_backend_config, message_channels,
+            ),
+        },
+        PartitionedKind::Transform => quote! {
+            #component_id => streamling_plugin::create_partitioned_transform_as_single_stream::<#component_type>(
+                plugin_id, input_schema, options, runtime, state_backend_config, message_channels,
+            ),
+        },
+        PartitionedKind::Sink => quote! {
+            #component_id => streamling_plugin::create_partitioned_sink_as_single_stream::<#component_type>(
+                plugin_id, input_schema, options, runtime, state_backend_config, message_channels,
+            ),
+        },
     };
     let (describe_arm, create_partitioned_arm) = match kind {
         PartitionedKind::Source => (
@@ -414,7 +426,11 @@ fn register_partitioned(input: TokenStream, kind: PartitionedKind) -> TokenStrea
 }
 
 /// Registers a type implementing `PartitionedSourcePlugin`: one instance runs
-/// per physical stream. Same arguments as `register_plugin_source!`.
+/// per physical stream. Same arguments as `register_plugin_source!`. A host
+/// that predates partitioned plugins runs it as partition 0 of 1.
+///
+/// ⚠️ Converting a single-stream plugin moves the state its
+/// `PluginStateBackendFactory::create` returns; see that type's docs.
 #[proc_macro]
 pub fn register_partitioned_plugin_source(input: TokenStream) -> TokenStream {
     register_partitioned(input, PartitionedKind::Source)
@@ -422,6 +438,7 @@ pub fn register_partitioned_plugin_source(input: TokenStream) -> TokenStream {
 
 /// Registers a type implementing `PartitionedTransformPlugin`: one instance
 /// runs per physical stream. Same arguments as `register_plugin_transform!`.
+/// Compatibility and state as `register_partitioned_plugin_source!`.
 #[proc_macro]
 pub fn register_partitioned_plugin_transform(input: TokenStream) -> TokenStream {
     register_partitioned(input, PartitionedKind::Transform)
@@ -429,6 +446,7 @@ pub fn register_partitioned_plugin_transform(input: TokenStream) -> TokenStream 
 
 /// Registers a type implementing `PartitionedSinkPlugin`: one instance runs
 /// per physical stream. Same arguments as `register_plugin_sink!`.
+/// Compatibility and state as `register_partitioned_plugin_source!`.
 #[proc_macro]
 pub fn register_partitioned_plugin_sink(input: TokenStream) -> TokenStream {
     register_partitioned(input, PartitionedKind::Sink)
@@ -866,7 +884,7 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
             }).into_c()
         }
 
-        // A library registering only partition-aware plugins uses none of these.
+        // Not every registration reads every parameter (a source never reads `input_schema`).
         #[allow(unused_variables)]
         extern "C" fn create(
             plugin_id: RString,

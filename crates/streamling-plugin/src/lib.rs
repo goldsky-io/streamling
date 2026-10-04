@@ -47,7 +47,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 pub use streamling_plugin_derive::*;
 pub use streamling_state::{StateKey, StateOperatorBackend};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// A single identity label for a plugin instance. Plugins use this to declare *what they
 /// are* — typically derived from their options at `create` time (e.g. a Kafka plugin
@@ -827,6 +827,171 @@ pub fn create_partitioned_sink<T: PartitionedSinkPlugin>(
         state_backend_factory,
         message_channels,
     )
+}
+
+/// The `parallelism` node field. A host that supports partitioned plugins
+/// reads it as a typed field and never passes it to a plugin; a host that
+/// predates them passes it through as an option.
+const PARALLELISM_OPTION: &str = "parallelism";
+
+/// The options for running a partition-aware plugin on a host that predates
+/// partitioned plugins. Such a host creates one instance through `create`, so
+/// it runs as partition 0 of 1: exactly what a partitioned host runs at width
+/// 1, down to the state keys (see [`PluginStateBackendFactory`]). A plugin can
+/// therefore ship before the engine, and the engine can be rolled back under
+/// it.
+///
+/// Refuses what one stream cannot honor instead of narrowing it silently: a
+/// requested `parallelism` other than 1, and a plugin whose `describe` needs
+/// more than one partition. Drops the `parallelism` option, which a plugin
+/// never sees on a partitioned host either.
+fn single_stream_options(
+    id: &RString,
+    options: PluginOptions,
+    partition_count: impl FnOnce(
+        &HashMap<String, String>,
+    ) -> Result<PartitionCount, PluginInitializationError>,
+) -> Result<PluginOptions, PluginInitializationError> {
+    let refuse = |why: String| {
+        Err(PluginInitializationError::Configuration(RString::from(
+            format!(
+                "plugin {id} {why}, which needs a streamling engine that supports partitioned plugins"
+            ),
+        )))
+    };
+    let mut options = options.as_rust();
+    if let Some(width) = options
+        .remove(PARALLELISM_OPTION)
+        .filter(|w| w.trim().parse::<u32>() != Ok(1))
+    {
+        return refuse(format!("is configured with parallelism {width}"));
+    }
+    // Rationale: see `source_generator`.
+    let count = std::panic::catch_unwind(AssertUnwindSafe(|| partition_count(&options)))
+        .unwrap_or_else(|payload| {
+            Err(PluginInitializationError::Configuration(RString::from(
+                panic_payload_to_string(payload),
+            )))
+        })?;
+    if count.minimum > 1 {
+        return refuse(format!("needs at least {} partitions", count.minimum));
+    }
+    if let Some(preferred) = count.preferred.filter(|p| *p > 1) {
+        warn!(
+            "plugin {id} runs as one stream: this streamling engine predates partitioned \
+             plugins (one that supports them runs it on {preferred} by default)"
+        );
+    }
+    Ok(PluginOptions::new(options))
+}
+
+/// [`single_stream_options`] for a transform or sink, whose `describe` also
+/// takes the input schema.
+fn single_stream_input(
+    id: &RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    partition_count: impl FnOnce(
+        SchemaRef,
+        &HashMap<String, String>,
+    ) -> Result<PartitionCount, PluginInitializationError>,
+) -> Result<(ROption<SafeArrowSchema>, PluginOptions), PluginInitializationError> {
+    let schema = required_input_schema(input_schema)?;
+    let options = single_stream_options(id, options, |o| partition_count(schema.clone(), o))?;
+    Ok((RSome(schema.into()), options))
+}
+
+fn single_stream_context(config: &PluginStateBackendConfig) -> PluginInstanceContext {
+    PluginInstanceContext {
+        reference_name: config.plugin_reference_name.clone(),
+        partition_index: 0,
+        partition_count: 1,
+    }
+}
+
+/// `create` for a plugin registered with `register_partitioned_plugin_source!`,
+/// which only a host that predates partitioned plugins calls: runs it as
+/// partition 0 of 1 (see `single_stream_options`).
+pub fn create_partitioned_source_as_single_stream<T: PartitionedSourcePlugin>(
+    id: RString,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    match single_stream_options(&id, options, |o| Ok(T::describe(o)?.partition_count)) {
+        Ok(options) => {
+            let context = single_stream_context(&state_backend_config);
+            create_partitioned_source::<T>(
+                id,
+                options,
+                context,
+                runtime,
+                state_backend_config,
+                message_channels,
+            )
+        }
+        Err(e) => RResult::RErr(e),
+    }
+}
+
+/// `create` for a plugin registered with
+/// `register_partitioned_plugin_transform!`: partition 0 of 1, as
+/// [`create_partitioned_source_as_single_stream`].
+pub fn create_partitioned_transform_as_single_stream<T: PartitionedTransformPlugin>(
+    id: RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    match single_stream_input(&id, input_schema, options, |schema, o| {
+        Ok(T::describe(schema, o)?.partition_count)
+    }) {
+        Ok((input_schema, options)) => {
+            let context = single_stream_context(&state_backend_config);
+            create_partitioned_transform::<T>(
+                id,
+                input_schema,
+                options,
+                context,
+                runtime,
+                state_backend_config,
+                message_channels,
+            )
+        }
+        Err(e) => RResult::RErr(e),
+    }
+}
+
+/// `create` for a plugin registered with `register_partitioned_plugin_sink!`:
+/// partition 0 of 1, as [`create_partitioned_source_as_single_stream`].
+pub fn create_partitioned_sink_as_single_stream<T: PartitionedSinkPlugin>(
+    id: RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    match single_stream_input(&id, input_schema, options, |schema, o| {
+        Ok(T::describe(schema, o)?.partition_count)
+    }) {
+        Ok((input_schema, options)) => {
+            let context = single_stream_context(&state_backend_config);
+            create_partitioned_sink::<T>(
+                id,
+                input_schema,
+                options,
+                context,
+                runtime,
+                state_backend_config,
+                message_channels,
+            )
+        }
+        Err(e) => RResult::RErr(e),
+    }
 }
 
 /// Descriptor for a single UDF provided by a plugin.

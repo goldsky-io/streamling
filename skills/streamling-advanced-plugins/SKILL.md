@@ -141,10 +141,27 @@ How the host runs it:
 
 - **Width.** `parallelism` on the node sets it. Without it, a source runs `preferred` partitions (else 1) and a transform or sink inherits its input's width. A width outside `minimum..=maximum` fails planning, and so does a sink planned at a width other than its own `parallelism`: sinks that read the same node share one exchange, which runs at the widest `parallelism` among them, or on a single stream if any of them is single-stream or they declare different primary keys.
 - **Input placement.** Before routing stream `i` to instance `i`, the host places rows as declared: `ByPrimaryKey` (the node's `primary_key`; for a transform whose key names columns it generates, the upstream node's key), `ByColumns(..)`, or `RoundRobin`.
-- **State.** `state.create()` is scoped to the partition (`{reference_name}[{index}]`); `state.create_shared()` is shared by every instance of the node, and is where a formerly single-stream plugin finds its old state.
+- **State.** `state.create()` is scoped to the partition (`{reference_name}[{index}]`); `state.create_shared()` is shared by every instance of the node (`{reference_name}`, the key a single-stream plugin's `create()` uses). See *State: decide before converting* below.
 - **Checkpoints.** Each instance sees one copy of every marker on its own stream. A sink instance acks from `process_checkpoint_marker` as usual; the host acks the epoch once every instance flushed it.
 - **Failures.** An error from a hook is reported to the host right away, which fails the pipeline and drains it.
-- **Compatibility.** A host that predates partitioned plugins refuses to create a partition-aware plugin. A single-stream plugin rejects `parallelism` above 1.
+- **Compatibility.** A host that predates partitioned plugins creates a partition-aware plugin through the single-stream `create`, as partition 0 of 1: exactly what a partitioned host runs at width 1, with the same state keys. So a plugin can ship before the engine, and the engine can be rolled back under it. Such a host passes `parallelism` through as an option, so the plugin refuses one other than 1 there, and refuses to start if its `describe` asks for a `minimum` above 1; a `preferred` width above 1 only logs a warning. Keep `streamling-plugin` on the same 0.x minor: abi_stable treats a 0.x minor bump as breaking, and an old host then refuses the whole library. A single-stream plugin rejects `parallelism` above 1.
+
+### State: decide before converting
+
+A partition-aware plugin always gets a partition-scoped state factory, at every width and on an old host too:
+
+| | single-stream plugin | partition-aware plugin, instance `i` |
+|---|---|---|
+| `state.create()` | `{reference_name}` | `{reference_name}[i]` |
+| `state.create_shared()` | `{reference_name}` | `{reference_name}` |
+
+⚠️ Converting a single-stream plugin therefore moves its `create()` state to `{reference_name}[0]`, even at width 1. Nothing fails: every running pipeline restarts with empty state (a source from its configured start). Decide per piece of state:
+
+- **Node-wide, `create_shared()`.** Always an option: the key the single-stream plugin wrote, at every width, so existing pipelines keep their state and width changes need no migration. The instances must coordinate writes (one writer, a distinct `_kv` key per partition, or one value they agree on, like a low watermark across partitions written once per checkpoint). Every instance of a node runs in one process, so they can coordinate in memory.
+- **Per partition, `create()`.** Never redistributed: when `parallelism` changes, an index keeps its key but may own a different slice, indices past the new width are orphaned, and new ones start empty. Use it only when the slice an index owns cannot change (one native shard per partition) or the state can be rebuilt.
+- **Migrate once.** An instance that finds no `create()` state can seed it from the old state under `create_shared()`, if that state can be split between partitions.
+
+The same table is in the `PluginStateBackendFactory` docs.
 
 ## Registering many kinds in one crate
 
