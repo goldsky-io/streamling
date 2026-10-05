@@ -555,7 +555,9 @@ const PLUGIN_BLOCKING_SEND_BOUND: Duration = Duration::from_secs(5);
 /// abandoned with an error, so the caller's drain can wind down instead of
 /// holding a runtime worker hostage until the watchdog hard-exits. A
 /// disconnected channel (dispatcher already exited) errors immediately — the
-/// `.unwrap()`s this replaces panicked the host there.
+/// `.unwrap()`s this replaces panicked the host there. A full channel whose
+/// dispatcher exited errors too: the host holds the channel open, so it never
+/// disconnects, and nothing would ever drain it.
 ///
 /// On a multi-thread runtime each blocking slice runs under `block_in_place`
 /// so sibling tasks migrate off the worker; on a current-thread runtime
@@ -564,9 +566,10 @@ pub async fn send_to_plugin<T>(
     sender: &crossbeam_channel::RSender<T>,
     msg: T,
     plugin_id: &str,
+    exit: &InstanceExit,
 ) -> Result<()> {
     let rx = crate::shutdown::subscribe();
-    send_to_plugin_with(sender, msg, plugin_id, move || *rx.borrow(), {
+    send_to_plugin_with(sender, msg, plugin_id, exit, move || *rx.borrow(), {
         PLUGIN_SHUTDOWN_SEND_GRACE
     })
     .await
@@ -579,6 +582,7 @@ async fn send_to_plugin_with<T>(
     sender: &crossbeam_channel::RSender<T>,
     msg: T,
     plugin_id: &str,
+    exit: &InstanceExit,
     is_shutting_down: impl Fn() -> bool,
     shutdown_grace: Duration,
 ) -> Result<()> {
@@ -608,6 +612,15 @@ async fn send_to_plugin_with<T>(
                 return Err(plugin_channel_closed(plugin_id));
             }
         };
+        // Only a full channel checks for an exit: a send that fits cannot
+        // wedge, and failing it would turn a source forwarder racing its
+        // instance's clean completion into a stream error.
+        if exit.has_exited() {
+            return Err(streamling_err!(
+                "plugin '{}' dispatcher exited with its input channel full; cannot deliver message",
+                plugin_id
+            ));
+        }
         if is_shutting_down() {
             let deadline =
                 *grace_deadline.get_or_insert_with(|| std::time::Instant::now() + shutdown_grace);
@@ -1014,7 +1027,8 @@ mod tests {
     async fn send_to_plugin_errors_on_disconnected_channel() {
         let (rtx, rrx) = crossbeam_channel::bounded::<u32>(1);
         drop(rrx);
-        let err = send_to_plugin_with(&rtx, 7u32, "p", || false, Duration::from_secs(1))
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
+        let err = send_to_plugin_with(&rtx, 7u32, "p", &exit, || false, Duration::from_secs(1))
             .await
             .expect_err("disconnected channel must error");
         assert!(err.to_string().contains("closed"), "got: {err}");
@@ -1027,8 +1041,9 @@ mod tests {
         let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
         rtx.try_send(1).unwrap(); // fill the single slot; nothing ever drains it
 
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
         let start = std::time::Instant::now();
-        let err = send_to_plugin_with(&rtx, 2u32, "p", || true, Duration::from_millis(300))
+        let err = send_to_plugin_with(&rtx, 2u32, "p", &exit, || true, Duration::from_millis(300))
             .await
             .expect_err("wedged channel must be abandoned");
         assert!(err.to_string().contains("abandoning"), "got: {err}");
@@ -1051,12 +1066,33 @@ mod tests {
             let v = rrx.recv().unwrap();
             (v, rrx)
         });
-        send_to_plugin_with(&rtx, 2u32, "p", || false, Duration::from_millis(100))
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
+        send_to_plugin_with(&rtx, 2u32, "p", &exit, || false, Duration::from_millis(100))
             .await
             .expect("send must succeed once a slot frees up");
         let (first, rrx) = drainer.join().unwrap();
         assert_eq!(first, 1);
         assert_eq!(rrx.recv().unwrap(), 2);
+    }
+
+    /// A transform or sink whose `is_running()` goes false returns from its
+    /// dispatcher cleanly while the host keeps the channel open, so nothing
+    /// drains it again: a full channel must fail the send, not wait forever.
+    #[tokio::test]
+    async fn send_to_plugin_errors_on_full_channel_once_dispatcher_exited() {
+        let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
+        rtx.try_send(1).unwrap();
+        let (execution, exit) = track_exit(Box::pin(async { Ok(()) }));
+        execution.await.unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_to_plugin_with(&rtx, 2u32, "p", &exit, || false, Duration::from_secs(1)),
+        )
+        .await
+        .expect("must not wait on a dispatcher that exited")
+        .expect_err("an exited dispatcher must fail the send");
+        assert!(err.to_string().contains("exited"), "got: {err}");
     }
 
     /// Regression: the panic hook calls

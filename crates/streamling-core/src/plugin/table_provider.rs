@@ -448,6 +448,7 @@ impl ExecutionPlan for PluginSourceExec {
                                     epoch: PluginCheckpointEpoch(epoch.0),
                                 }),
                                 &plugin_label,
+                                &instance_exit,
                             )
                             .await?;
                         }
@@ -462,6 +463,7 @@ impl ExecutionPlan for PluginSourceExec {
                                     epoch: PluginCheckpointEpoch(epoch.0),
                                 }),
                                 &plugin_label,
+                                &instance_exit,
                             )
                             .await?;
                         }
@@ -856,6 +858,7 @@ impl DataSink for PluginSink {
                 &self.instance.channels.input.sender,
                 NonExhaustive::new(PluginMsg::NextBatch { data: batch.into() }),
                 &self.instance.key,
+                &self.instance.exit,
             )
             .await?;
 
@@ -876,6 +879,7 @@ impl DataSink for PluginSink {
                                 epoch: PluginCheckpointEpoch(epoch.0),
                             }),
                             &self.instance.key,
+                            &self.instance.exit,
                         )
                         .await?;
                     }
@@ -900,6 +904,7 @@ impl DataSink for PluginSink {
                                 epoch: PluginCheckpointEpoch(epoch.0),
                             }),
                             &self.instance.key,
+                            &self.instance.exit,
                         )
                         .await?;
                     }

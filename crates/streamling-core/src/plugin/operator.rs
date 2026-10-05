@@ -413,6 +413,7 @@ impl ExecutionPlan for PluginExec {
                                             epoch: PluginCheckpointEpoch(epoch.0),
                                         }),
                                         &plugin_label,
+                                        &instance_exit,
                                     )
                                     .await?;
                                 }
@@ -427,6 +428,7 @@ impl ExecutionPlan for PluginExec {
                                             epoch: PluginCheckpointEpoch(epoch.0),
                                         }),
                                         &plugin_label,
+                                        &instance_exit,
                                     )
                                     .await?;
                                 }
@@ -440,6 +442,7 @@ impl ExecutionPlan for PluginExec {
                             &plugin_input_sender,
                             NonExhaustive::new(PluginMsg::NextBatch { data: batch.into() }),
                             &plugin_label,
+                            &instance_exit,
                         )
                         .await?;
 
