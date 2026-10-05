@@ -9,12 +9,21 @@ on:
       - "rust-toolchain.toml"
       - "Dockerfile*"
       - ".github/workflows/streamling.yml"
+      - "scripts/generate-sql-udf-reference.py"
+      - "docs/sql-udfs.md"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  check-sql-udfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check generated SQL function reference
+        run: python3 scripts/generate-sql-udf-reference.py --check
+
   changes:
     runs-on: ubuntu-latest
     outputs:

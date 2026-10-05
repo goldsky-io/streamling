@@ -48,24 +48,64 @@ DETAILS = {
     "_gs_byte_to_hex": ("bytes", "Utf8", "Hex-encode Binary bytes; NULL remains NULL.", "SELECT _gs_byte_to_hex(_gs_hex_to_byte('deadbeef'));"),
     "reverse_bytes32": ("bytes", "FixedSizeBinary(32)", "Reverse the 32 bytes, preserving input field metadata and NULL values.", "SELECT reverse_bytes32(hash) FROM events;"),
     "_gs_map_to_array_struct": ("map", "List<Struct<key: Utf8, value: Utf8>>", "Convert a `Map<Utf8, Utf8>` with non-nullable key/value fields to an array of key/value structs; expects the exact Arrow map layout.", "SELECT _gs_map_to_array_struct(params) FROM events;"),
-    "to_u256": ("value", "U256 (FixedSizeBinary(32))", "Convert Utf8/LargeUtf8 decimal text, Int8/16/32/64, UInt8/16/32/64 or already-encoded 32 bytes to U256; rejects NULL and negative integers.", "SELECT u256_to_string(to_u256('123'));"),
-    "u256_to_string": ("value", "Utf8", "Decode U256 big-endian 32-byte value as decimal text.", "SELECT u256_to_string(to_u256('123'));"),
-    "to_i256": ("value", "I256 (FixedSizeBinary(32))", "Convert Utf8/LargeUtf8 text, Int8/16/32/64, UInt8/16/32/64 or already-encoded 32 bytes to signed I256; rejects NULL.", "SELECT i256_to_string(to_i256('-123'));"),
-    "i256_to_string": ("value", "Utf8", "Decode signed I256 big-endian 32-byte value as decimal text.", "SELECT i256_to_string(to_i256('-123'));"),
-    "to_int64": ("value", "Int64 or NULL", "Convert I256 to Int64; negative overflow returns NULL. Nonnegative values up to UInt64 max are bit-reinterpreted as signed Int64; larger values return NULL.", "SELECT to_int64(to_i256('-123'));"),
-    "i256_neg": ("value", "I256", "Negate I256; NULL values are rejected.", "SELECT i256_to_string(i256_neg(to_i256('12')));"),
-    "i256_abs": ("value", "I256", "Absolute value of I256; NULL values are rejected.", "SELECT i256_to_string(i256_abs(to_i256('-12')));"),
     "uuid7": ("", "Utf8", "Generate a fresh UUID version 7 per row.", "SELECT uuid7();"),
 }
 
-for family in ("u256", "i256"):
-    for operation in ("add", "sub", "mul", "div", "mod"):
-        name = f"{family}_{operation}"
-        DETAILS[name] = (
-            "left, right", family.upper(),
-            f"{operation.capitalize()} two {family.upper()} values; rejects NULL operands. Division and modulo reject zero divisors; arithmetic errors on overflow where applicable.",
-            f"SELECT {family}_to_string({name}(to_{family}('12'), to_{family}('3')));",
-        )
+DECIMAL_DECLARATION = (
+    "Precision and scale must be non-null Int64 literals, with 1 <= precision <= 65535 "
+    "and 0 <= scale <= precision. NULL values remain NULL; invalid or non-fitting values error."
+)
+
+DETAILS.update({
+    "decimal_arb_to_string": ("value", "Utf8", "Render a decimal_arb value as canonical decimal text; NULL remains NULL.", "SELECT decimal_arb_to_string(amount) FROM events;"),
+    "decimal_arb_rescale": ("value, precision, scale", "decimal_arb or same list kind", "Losslessly re-encode a decimal_arb value or List/LargeList/FixedSizeList of decimal_arb at a new precision and scale; excess significant fractional digits are rejected, not rounded. " + DECIMAL_DECLARATION, "SELECT decimal_arb_rescale(amount, 100, 4) FROM events;"),
+    "decimal_arb_restamp": ("value, template", "same type as value, with restored metadata", "Pass value buffers through unchanged, restoring decimal_arb metadata from template at matching leaf positions in scalars, structs, lists and maps. Does not rescale or validate the numeric bytes; intended for planner-generated expressions.", "SELECT decimal_arb_restamp(amount, amount) FROM events;"),
+    "decimal_arb_to_sort_key": ("value", "LargeBinary", "Encode a numeric-order sort key for a decimal_arb value; NULL remains NULL. Used by the ORDER BY rewrite, not a decimal_arb result.", "SELECT decimal_arb_to_sort_key(amount) FROM events;"),
+    "to_decimal_arb_from_string": ("text, precision, scale[, native_int_kind]", "decimal_arb", "Parse Utf8 decimal text. Optional native_int_kind is a non-null Utf8 literal 'u256' or 'i256'; it hints native integer sink routing when scale is 0 and is omitted from the result metadata otherwise. " + DECIMAL_DECLARATION, "SELECT to_decimal_arb_from_string('123.45', 100, 2);"),
+    "try_to_decimal_arb_from_string": ("text, precision, scale[, native_int_kind]", "decimal_arb or NULL", "Like to_decimal_arb_from_string, but malformed or non-fitting values become NULL. Invalid declarations still error; precision/scale must be Int64 literals, and the optional native_int_kind literal obeys the same rules.", "SELECT try_to_decimal_arb_from_string('bad', 100, 2); -- NULL"),
+    "to_decimal_arb_from_int": ("value, precision, scale", "decimal_arb", "Convert an Int8/16/32/64 or UInt8/16/32/64 value exactly. " + DECIMAL_DECLARATION, "SELECT to_decimal_arb_from_int(123, 100, 2);"),
+    "legacy_wide_int_to_decimal_arb": ("value", "decimal_arb(78, 0)", "Upgrade a FixedSizeBinary(32) value carrying retired streamling.u256 or streamling.i256 metadata; preserves the native integer hint and NULL values. Untagged bytes are rejected.", "SELECT legacy_wide_int_to_decimal_arb(amount) FROM events;"),
+})
+for operation in ("add", "sub", "mul", "div", "mod"):
+    name = f"decimal_arb_{operation}"
+    extra = " A zero divisor errors." if operation in ("div", "mod") else ""
+    if operation == "div":
+        extra += " Result scale is max(left scale, 18), rounded half-even once."
+    DETAILS[name] = ("left, right", "decimal_arb",
+                     f"{operation.capitalize()} two decimal_arb values; NULL operands yield NULL. Output precision/scale widen according to the operation (precision capped at 65535)." + extra,
+                     f"SELECT decimal_arb_to_string({name}(amount, amount)) FROM events;")
+for operation, description in (("neg", "Negate"), ("abs", "Take the absolute value of")):
+    name = f"decimal_arb_{operation}"
+    DETAILS[name] = ("value", "decimal_arb", f"{description} a decimal_arb value, preserving precision/scale; NULL remains NULL.", f"SELECT {name}(amount) FROM events;")
+for operation, comparison in (("eq", "="), ("neq", "<>"), ("lt", "<"), ("lte", "<="), ("gt", ">"), ("gte", ">=")):
+    name = f"decimal_arb_{operation}"
+    DETAILS[name] = ("left, right", "Boolean", f"Numeric comparison (`{comparison}`) of decimal_arb values at their declared scales; NULL operands yield NULL.", f"SELECT {name}(amount, amount) FROM events;")
+for operation, description in (("greatest", "largest"), ("least", "smallest")):
+    name = f"decimal_arb_{operation}"
+    DETAILS[name] = ("value[, next, ...]", "decimal_arb", f"Numerically {description} non-NULL argument (at least one required); NULL only when all arguments are NULL. Inputs may have different scales; result uses a common precision/scale.", f"SELECT {name}(amount, amount) FROM events;")
+for operation, description in (("min", "smallest"), ("max", "largest")):
+    name = f"decimal_arb_array_{operation}"
+    DETAILS[name] = ("list", "decimal_arb", f"Numerically {description} non-NULL element of a List/LargeList/FixedSizeList of decimal_arb; empty, NULL or all-NULL lists yield NULL. Preserves element precision/scale.", f"SELECT {name}(amounts) FROM events;")
+DETAILS["decimal_arb_array_sort"] = (
+    "list[, order[, nulls]]", "same list type",
+    "Sort a List/LargeList of decimal_arb numerically without re-encoding elements. Optional string literals: order is 'ASC' (default) or 'DESC'; nulls is 'NULLS FIRST' (default) or 'NULLS LAST'. NULL lists remain NULL.",
+    "SELECT decimal_arb_array_sort(amounts, 'DESC', 'NULLS LAST') FROM events;")
+for bits in (128, 256):
+    DETAILS[f"to_decimal_arb_from_decimal{bits}"] = (
+        "value", "decimal_arb", f"Losslessly widen Decimal{bits} with nonnegative scale, preserving precision/scale and NULL values.",
+        f"SELECT to_decimal_arb_from_decimal{bits}(amount) FROM events;")
+    DETAILS[f"decimal_arb_to_decimal{bits}"] = (
+        "value, precision, scale", f"Decimal{bits}(precision, scale)",
+        f"Narrow decimal_arb to Decimal{bits}; precision/scale must be Int64 literals valid for the target Arrow decimal. Values are half-even rounded to the target scale; values outside the target precision error. NULL remains NULL.",
+        f"SELECT decimal_arb_to_decimal{bits}(amount, {38 if bits == 128 else 76}, 2) FROM events;")
+
+DECIMAL_AGGREGATE_DETAILS = {
+    "sum": ("value", "decimal_arb", "Sum non-NULL decimal_arb values; widens precision by 16 (capped at 65535), preserving scale. Empty/all-NULL groups yield NULL.", "SELECT sum(amount) FROM events;"),
+    "min": ("value", "decimal_arb", "Numerically smallest non-NULL decimal_arb value, preserving precision/scale. Empty/all-NULL groups yield NULL.", "SELECT min(amount) FROM events;"),
+    "max": ("value", "decimal_arb", "Numerically largest non-NULL decimal_arb value, preserving precision/scale. Empty/all-NULL groups yield NULL.", "SELECT max(amount) FROM events;"),
+    "avg": ("value", "decimal_arb", "Average non-NULL decimal_arb values; widens precision and scale by 1 (capped at 65535), with half-even rounding. Empty/all-NULL groups yield NULL.", "SELECT avg(amount) FROM events;"),
+    "array_agg": ("value", "List<decimal_arb>", "Collect values using DataFusion's array_agg behavior, preserving decimal_arb element metadata. Numeric ordering is supplied by the session rewrite.", "SELECT array_agg(amount) FROM events;"),
+}
 
 # Execution checks supplement broad Any signatures and the exact Arrow input schema.
 RUNTIME_TYPES = {
@@ -99,6 +139,31 @@ RUNTIME_TYPES = {
     "json_object_absent_on_null": "an even number of values (key, value, ...)",
     "json_value": "string, string, then 0 or 5 string literals",
 }
+RUNTIME_TYPES.update({
+    name: "decimal_arb (LargeBinary with extension metadata)"
+    for name in DETAILS if name.startswith("decimal_arb_")
+})
+RUNTIME_TYPES.update({
+    name: "two decimal_arb values" for name in DETAILS
+    if name.startswith("decimal_arb_") and name.rsplit("_", 1)[-1] in
+    {"add", "sub", "mul", "div", "mod", "eq", "neq", "lt", "lte", "gt", "gte"}
+})
+RUNTIME_TYPES.update({
+    "decimal_arb_rescale": "decimal_arb or list of decimal_arb, Int64 literal, Int64 literal",
+    "decimal_arb_restamp": "two Arrow values (matching metadata template shape)",
+    "decimal_arb_greatest": "one or more decimal_arb values",
+    "decimal_arb_least": "one or more decimal_arb values",
+    "decimal_arb_array_min": "List / LargeList / FixedSizeList of decimal_arb",
+    "decimal_arb_array_max": "List / LargeList / FixedSizeList of decimal_arb",
+    "decimal_arb_array_sort": "List / LargeList of decimal_arb[, string literal[, string literal]]",
+    "decimal_arb_to_decimal128": "decimal_arb, Int64 literal, Int64 literal",
+    "decimal_arb_to_decimal256": "decimal_arb, Int64 literal, Int64 literal",
+    "to_decimal_arb_from_decimal128": "Decimal128 with nonnegative scale",
+    "to_decimal_arb_from_decimal256": "Decimal256 with nonnegative scale",
+    "legacy_wide_int_to_decimal_arb": "FixedSizeBinary(32) with streamling.u256 / streamling.i256 metadata",
+})
+RUNTIME_TYPES.update({name: "decimal_arb (or DataFusion built-in input types)"
+                      for name in DECIMAL_AGGREGATE_DETAILS})
 
 # Functions registered on every session outside CommonFunctions, keyed by the
 # lowercase callable name: params, return type, behavior, SQL example.
@@ -226,10 +291,6 @@ def parse_signature(kind: str, expr: str, symbol: str) -> str:
                 names.append("List<Utf8> (non-null items)")
             elif "DataType::FixedSizeBinary(32)" in value:
                 names.append("FixedSizeBinary(32)")
-            elif "U256Type::new()" in value:
-                names.append("U256")
-            elif "I256Type::new()" in value:
-                names.append("I256")
             else:
                 typ = re.fullmatch(r"\s*DataType::(\w+)\s*", value)
                 if not typ:
@@ -250,10 +311,14 @@ def source_signature(text: str, symbol: str, factory: bool) -> str:
         assert match, symbol
         return create_udf_signature(text, symbol, balanced(body, match.end() - 1))
 
-    if symbol.endswith("Func") and re.search(rf"impl_[ui]256_binary_op!\({symbol},", text):
-        kind = "U256" if symbol.startswith("U") else "I256"
-        return f"({kind}, {kind})"
-    body = text[text.index("impl " + symbol + " {"):]
+    body = rust_block(text, rf"^impl {symbol} \{{")
+    if symbol == "ToDecimalArbFromIntFunc":
+        kinds = re.search(r"let int_kinds = \[([^]]+)\]", body)
+        signature = re.search(r"TypeSignature::Exact\(vec!\[t, ([^]]+)\]\)", body)
+        if not kinds or not signature or "int_kinds" not in body:
+            raise ValueError("Unrecognized integer decimal_arb signature")
+        return " or ".join(parse_signature("exact", f"vec![DataType::{kind}, {signature.group(1)}]", symbol)
+                           for kind in re.findall(r"DataType::(\w+)", kinds.group(1)))
     match = re.search(r"signature:\s*Signature::(\w+)\s*\(", body)
     if not match:
         raise ValueError(f"Missing signature for {symbol}")
@@ -265,12 +330,10 @@ def rust_doc_summary(text: str, symbol: str, sql_name: str) -> str:
     # Some historical docs describe a narrower case, or claim overflow raises
     # an error when the implementation returns NULL. The reviewed annotations
     # below are authoritative for those cases.
-    if sql_name in {"array_filter", "array_filter_first", "array_filter_in", "to_int64"}:
+    if sql_name in {"array_filter", "array_filter_first", "array_filter_in"}:
         return ""
     declaration = rf"(?:pub struct {symbol}\b|pub fn {symbol}\()"
     match = re.search(r"(?P<docs>(?:^///[^\n]*\n)+)(?:#\[[^\n]*\]\n)*" + declaration, text, re.M)
-    if not match and symbol == "ArrayEnumerateFunc":
-        match = re.search(r"(?P<docs>(?:^//![^\n]*\n)+)", text, re.M)
     if not match:
         return ""
     lines = [re.sub(r"^//[/!] ?", "", line).strip() for line in match.group("docs").splitlines()]
@@ -285,38 +348,99 @@ def rust_doc_summary(text: str, symbol: str, sql_name: str) -> str:
     return summary
 
 
+def common_expressions():
+    block = rust_block(REGISTRY.read_text(), r"\bfn functions\(")
+    block = re.sub(r"//[^\n]*", "", block)
+    body = block.split("vec![", 1)[1].rsplit("]", 1)[0]
+    depth, start = 0, 0
+    for i, ch in enumerate(body):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            if body[start:i].strip():
+                yield body[start:i].strip()
+            start = i + 1
+    if body[start:].strip():
+        yield body[start:].strip()
+
+
+def variant_name(text: str, symbol: str, constructor: str) -> str:
+    inherent = rust_block(text, rf"^impl {symbol} \{{")
+    method = rust_block(inherent, rf"\bfn {constructor}\(")
+    variant = re.search(r"Self::new\((\w+::\w+)\)", method)
+    if not variant:
+        raise ValueError(f"Unrecognized constructor {symbol}::{constructor}")
+    implementation = rust_block(text, rf"^impl (?:Scalar|Aggregate)UDFImpl for {symbol} \{{")
+    name_body = rust_block(implementation, r"\bfn name\(")
+    if "self.extreme.name()" in name_body:
+        name_body = rust_block(text, rf"^impl {variant.group(1).split('::')[0]} \{{")
+    matches = re.findall(rf'\b{variant.group(1)} => "(\w+)"', name_body)
+    if len(set(matches)) != 1:
+        raise ValueError(f"Unrecognized name for {symbol}::{constructor}")
+    return matches[0]
+
+
 def registered():
-    registry = REGISTRY.read_text()
-    block = registry.split("pub fn functions() -> Vec<ScalarUDF>", 1)[1].split("\n        ]", 1)[0]
-    entries = re.findall(r"ScalarUDF::from\((?:\w+::)?(\w+)::new\(\)\)|(create_\w+_udf)\(\)", block)
-    expressions = [
-        line.strip().rstrip(",")
-        for line in block.splitlines()
-        if line.strip() not in ("{", "vec![") and not line.lstrip().startswith("//")
-    ]
-    if len(expressions) != len(entries):
-        raise ValueError("Unrecognized registration in CommonFunctions::functions()")
     sources = {p.stem: p.read_text() for p in SOURCE.glob("*.rs")}
-    for implementation, factory in entries:
-        symbol = implementation or factory
+    for expr in common_expressions():
+        if expr.startswith("DecimalArbBuiltinShim::wrap("):
+            shim_builtin(expr)  # Reject unfamiliar wrappers instead of silently omitting them.
+            continue
+        match = re.fullmatch(r"ScalarUDF::from\((?:\w+::)?(\w+)::(\w+)\(\)\)", expr)
+        factory = re.fullmatch(r"(create_\w+_udf)\(\)", expr)
+        if not match and not factory:
+            raise ValueError(f"Unrecognized registration in CommonFunctions::functions(): {expr}")
+        symbol = match.group(1) if match else factory.group(1)
         candidates = [(module, text) for module, text in sources.items()
                       if (re.search(rf"\bimpl ScalarUDFImpl for {symbol}\b", text)
-                          or re.search(rf"\bimpl_[ui]256_binary_op!\({symbol},", text)
+                          or re.search(rf"\bdecimal_arb_(?:binary|cmp)_op!\(\s*{symbol},", text)
                           or re.search(rf"\bpub fn {symbol}\(", text))]
         if len(candidates) != 1:
             raise ValueError(f"Expected exactly one source for {symbol}, got {[module for module, _ in candidates]}")
         module, text = candidates[0]
-        if factory:
-            body = text[text.index("pub fn " + symbol + "("):]
-            name = re.search(r'\bcreate_udf\s*\(\s*"([\w]+)"', body).group(1)
+        macro = re.search(rf'(decimal_arb_(?:binary|cmp)_op)!\(\s*{symbol},\s*"(\w+)"', text)
+        if macro:
+            name = macro.group(2)
+            template = rust_block(text, rf"\bmacro_rules! {macro.group(1)}\b")
+            signature = re.search(r"signature:\s*Signature::(\w+)\s*\(", template)
+            sig = parse_signature(signature.group(1), balanced(template, signature.end() - 1), symbol)
         else:
-            macro = re.search(rf'impl_[ui]256_binary_op!\({symbol},\s*"(\w+)"', text)
-            if macro:
-                name = macro.group(1)
+            if factory:
+                body = text[text.index("pub fn " + symbol + "("):]
+                name = re.search(r'\bcreate_udf\s*\(\s*"([\w]+)"', body).group(1)
+            elif match.group(2) != "new":
+                name = variant_name(text, symbol, match.group(2))
             else:
-                body = text[text.index("impl ScalarUDFImpl for " + symbol):]
-                name = re.search(r'fn name\(&self\).*?"(\w+)"', body, re.S).group(1)
-        yield name, symbol, module, source_signature(text, symbol, bool(factory)), rust_doc_summary(text, symbol, name)
+                names = fixed_name(text, symbol)
+                if len(names) != 1:
+                    raise ValueError(f"Missing fixed name for {symbol}")
+                name = names[0]
+            sig = source_signature(text, symbol, bool(factory))
+        yield name, symbol, module, sig, rust_doc_summary(text, symbol, name)
+
+
+def shim_builtin(expr: str) -> str:
+    match = re.fullmatch(r"DecimalArbBuiltinShim::wrap\(\s*datafusion::(?:\w+::)+(\w+)\(\),?\s*\)", expr)
+    if not match:
+        raise ValueError(f"Unrecognized builtin shim: {expr}")
+    return match.group(1).removesuffix("_udf")
+
+
+def decimal_aggregates():
+    path = SOURCE / "decimal_arb_aggregates.rs"
+    text = path.read_text()
+    manager = rust_block(SESSION.read_text(), r"^impl SessionManager \{")
+    session = rust_block(manager, r"\bpub fn new\(")
+    calls = re.findall(r"ctx\.register_udaf\((\w+)::(\w+)\(\)\);", session)
+    if len(calls) != session.count("ctx.register_udaf("):
+        raise ValueError("Unrecognized decimal_arb aggregate registration")
+    for symbol, constructor in calls:
+        names = fixed_name(text, symbol)
+        name = names[0] if names else variant_name(text, symbol, constructor)
+        sig = "DataFusion array_agg signature" if symbol == "DecimalArbArrayAggUdaf" else impl_signature(text, symbol)
+        yield [name], [], path, symbol, sig
 
 
 def rust_block(text: str, header: str) -> str | None:
@@ -399,7 +523,7 @@ def session_functions():
     """Yield the non-CommonFunctions layers in their session registration order."""
     session = SESSION.read_text()
     calls = ["register_json_functions(&ctx)", "register_string_aliases(&ctx)",
-             "StreamlingFunctions::functions(", "register_plugin_udfs(&ctx)"]
+             "StreamlingFunctions::functions(", "ctx.register_udaf(", "register_plugin_udfs(&ctx)"]
     positions = [session.find(call) for call in calls]
     if -1 in positions or positions != sorted(positions):
         raise ValueError("Session function registration order changed; update this generator")
@@ -475,8 +599,14 @@ def render() -> str:
     if len(names) != len(set(names)) or set(names) != set(DETAILS):
         raise ValueError(f"Registry/documentation mismatch: missing={set(names) - set(DETAILS)}, stale={set(DETAILS) - set(names)}; duplicates={len(names) - len(set(names))}")
     core_rows, string_rows, json_rows, aggregate_rows, aliases = session_functions()
+    decimal_rows = list(decimal_aggregates())
+    shims = [shim_builtin(expr) for expr in common_expressions()
+             if expr.startswith("DecimalArbBuiltinShim::wrap(")]
+    if len(shims) != len(set(shims)):
+        raise ValueError("Duplicate decimal_arb builtin shim")
 
     callable_names = names + [name for row in (*core_rows, *string_rows, *json_rows, *aggregate_rows) for name in row[0]]
+    callable_names += [name for row in decimal_rows for name in row[0]] + shims
     callable_names += [alias for canonical, names_ in aliases for alias in names_ if alias == alias.lower() and alias != canonical]
     duplicates = sorted({name for name in callable_names if callable_names.count(name) > 1})
     if duplicates:
@@ -489,6 +619,7 @@ def render() -> str:
         "# Engine SQL function reference",
         "",
         "<!-- Generated by python3 scripts/generate-sql-udf-reference.py; do not edit directly. -->",
+        "<!-- CI checks freshness with python3 scripts/generate-sql-udf-reference.py --check. -->",
         "",
         "Every Streamling SQL session starts with DataFusion's built-in functions and then registers,",
         "in order (`crates/streamling-core/src/session.rs`):",
@@ -496,7 +627,8 @@ def render() -> str:
         "1. [Flink-compatible JSON functions](#flink-compatible-json-functions) and [aggregates](#flink-compatible-json-aggregates) (`register_json_functions`).",
         "2. [Flink-compatible string functions](#flink-compatible-string-functions) and [aliases of DataFusion built-ins](#flink-compatible-aliases-of-datafusion-built-ins) (`register_string_aliases`).",
         "3. [Streamling functions](#streamling-functions) (`CommonFunctions::functions()`) and [session functions](#session-functions) (`StreamlingFunctions::functions()`).",
-        "4. Plugin-provided functions, which depend on which plugins a deployment loads and are not listed here.",
+        "4. [Decimal-aware aggregates](#decimal-aware-aggregates), overriding the corresponding DataFusion aggregates.",
+        "5. Plugin-provided functions, which depend on which plugins a deployment loads and are not listed here.",
         "",
         "A later registration replaces an earlier function with the same name, so several functions below",
         "replace DataFusion built-ins; their entries say so. Unquoted SQL function names are lowercased",
@@ -510,8 +642,11 @@ def render() -> str:
         "runtime checks where necessary. `Any` in a DataFusion signature means the planner",
         "accepts any type, *not* that the implementation can process all types. The runtime",
         "constraints below each function narrow that signature. `String` and *string* mean",
-        "Utf8, LargeUtf8 or Utf8View. `U256` and `I256` are tagged",
-        "`FixedSizeBinary(32)` values (big-endian), normally produced by `to_u256` and `to_i256`.",
+        "Utf8, LargeUtf8 or Utf8View. `decimal_arb` is a `LargeBinary` extension type",
+        "with precision/scale metadata, not arbitrary bytes. Construct it with `to_decimal_arb_from_string`",
+        "or `CAST(... AS DECIMAL(p, s))` for precision greater than 76.",
+        "The retired `to_u256`, `u256_*`, `to_i256`, `i256_*` and `to_int64` functions are no longer registered.",
+        "See [arbitrary-precision decimals](decimal-arbitrary-precision.md) for operators, casts and precision rules.",
         "",
         "## Streamling functions",
         "",
@@ -524,6 +659,19 @@ def render() -> str:
         params, result, description, example = DETAILS[name]
         out += entry(name, params, result, signature, description, example,
                      SOURCE / f"{module}.rs", symbol, rust_docs=rust_docs)
+    out += [
+        "## Decimal-aware builtin shims", "",
+        "`CommonFunctions::functions()` also wraps these DataFusion built-ins to let decimal_arb",
+        "arguments reach the session's analyzer rewrites. Non-decimal inputs keep DataFusion behavior;",
+        "mixed decimal calls that reach execution without a rewrite error rather than using bytewise behavior.",
+        "These remain built-in functions, not additional decimal_arb UDF names.", "",
+        ", ".join(f"`{name}`" for name in shims) + ".", "",
+        "Source: [`decimal_arb_builtin_shim.rs`](../crates/streamling-common/src/functions/decimal_arb_builtin_shim.rs).", "",
+    ]
+    out += session_section("Decimal-aware aggregates", [
+        "Registered in `session.rs` after the scalar functions. Decimal inputs use the contracts below;",
+        "other supported input types delegate to the corresponding DataFusion built-in aggregate.",
+    ], decimal_rows, DECIMAL_AGGREGATE_DETAILS)
 
     out += session_section("Session functions", [
         "Registered by `StreamlingFunctions::functions()` in `crates/streamling-core/src/functions.rs`; it needs the session's dynamic table registry.",
@@ -566,7 +714,7 @@ def main() -> None:
             parser.error(f"{OUTPUT.relative_to(ROOT)} is stale; regenerate it")
     else:
         OUTPUT.write_text(content)
-        documented = len(DETAILS) + len(SESSION_DETAILS) + len(FLINK_STRING_DETAILS) + len(FLINK_JSON_DETAILS) + len(FLINK_JSON_AGGREGATE_DETAILS)
+        documented = len(DETAILS) + len(SESSION_DETAILS) + len(FLINK_STRING_DETAILS) + len(FLINK_JSON_DETAILS) + len(FLINK_JSON_AGGREGATE_DETAILS) + len(DECIMAL_AGGREGATE_DETAILS)
         print(f"Generated {OUTPUT.relative_to(ROOT)} ({documented} functions)")
 
 
