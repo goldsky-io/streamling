@@ -42,7 +42,7 @@ pub(crate) const ROWS: &str = "rows";
 pub(crate) const MINIMUM: &str = "minimum";
 pub(crate) const MAXIMUM: &str = "maximum";
 pub(crate) const PREFERRED: &str = "preferred";
-/// `by_primary_key`, `round_robin`, or comma-separated column names.
+/// `by_primary_key`, `round_robin`, `forward`, or comma-separated column names.
 pub(crate) const PLACEMENT: &str = "placement";
 /// Partition index whose creation fails.
 pub(crate) const FAIL_CREATE_AT: &str = "fail_create_at";
@@ -147,6 +147,7 @@ impl TestOptions {
             None => default,
             Some("by_primary_key") => InputPlacement::ByPrimaryKey,
             Some("round_robin") => InputPlacement::RoundRobin,
+            Some("forward") => InputPlacement::Forward,
             Some(columns) => {
                 InputPlacement::ByColumns(columns.split(',').map(str::to_string).collect())
             }

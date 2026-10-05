@@ -453,8 +453,18 @@ pub enum InputPlacement {
     ByPrimaryKey,
     /// All rows sharing these columns' values land on one instance.
     ByColumns(Vec<String>),
-    /// Any instance will do.
+    /// Any instance will do. The host may deal whole batches across instances
+    /// (when the node's `parallelism` differs from its input's width), so rows
+    /// of one key, such as an insert and the delete that undoes it, can reach
+    /// different instances and leave them in any order.
     RoundRobin,
+    /// Instance `i` reads input stream `i`, with no exchange in between: the
+    /// node runs as wide as its input, and each stream's rows reach their
+    /// instance in order. For a stateless or per-stream transform over an
+    /// already partitioned input. The host rejects a `parallelism` on the node,
+    /// which would need an exchange. Transforms only: sinks that read one node
+    /// share one exchange.
+    Forward,
 }
 
 /// What a partitioned source reports about itself before any instance exists.

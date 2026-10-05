@@ -221,6 +221,7 @@ fn input_placement(placement: PluginInputPlacement_NE) -> Result<InputPlacement>
             columns.iter().map(|c| c.to_string()).collect(),
         )),
         Ok(PluginInputPlacement::RoundRobin) => Ok(InputPlacement::RoundRobin),
+        Ok(PluginInputPlacement::Forward) => Ok(InputPlacement::Forward),
         Err(_) => Err(streamling_err!(
             "it declares an input placement this version of streamling does not support"
         )),
@@ -313,6 +314,18 @@ impl PartitionedPlugin {
                     "it places its input by an empty column list"
                 )));
             }
+            (PluginKind::Sink, Some(InputPlacement::Forward)) => {
+                return Err(invalid(streamling_err!(
+                    "a sink cannot read its input `Forward`: sinks that read one node share one \
+                     exchange"
+                )));
+            }
+            (PluginKind::Transform, Some(InputPlacement::Forward)) if parallelism.is_some() => {
+                streamling_user_bail!(
+                    "plugin '{reference_name}' reads its input stream for stream (`Forward`), so \
+                     it runs as wide as its input; remove its `parallelism`"
+                );
+            }
             _ => {}
         }
         let partitions = PartitionRange::try_from(description.partition_count).map_err(invalid)?;
@@ -379,6 +392,9 @@ impl PartitionedPlugin {
                 self.reference_name
             )),
             Some(InputPlacement::RoundRobin) => Ok(Placement::RoundRobin),
+            // Round-robin without a `parallelism`, which `describe` rejects for
+            // `Forward`, plans no exchange: stream `i` stays on instance `i`.
+            Some(InputPlacement::Forward) => Ok(Placement::RoundRobin),
             Some(InputPlacement::ByColumns(columns)) => {
                 let missing: Vec<&String> = columns
                     .iter()
@@ -432,6 +448,10 @@ impl PartitionedPlugin {
                 self.reference_name
             ),
             Some(parallelism) => format!("its parallelism is {parallelism}"),
+            None if self.input_placement == Some(InputPlacement::Forward) => format!(
+                "it reads its input stream for stream (`Forward`), so it runs as wide as its \
+                 input: {partitions} streams"
+            ),
             None => format!(
                 "it is planned to run {partitions} streams; set `parallelism` to run it at a \
                  supported width{shared_input}"
@@ -881,6 +901,79 @@ mod tests {
                 .unwrap(),
             Placement::RoundRobin
         );
+    }
+
+    /// `Forward` must never reach an exchange: round-robin with no
+    /// `parallelism` plans none, and `describe` refuses one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_forward_plans_no_exchange_and_refuses_a_parallelism() {
+        let forward = &[(PLACEMENT, "forward")];
+        let transform = describe_node("forward", TRANSFORM, PluginKind::Transform, forward, None);
+        assert_eq!(
+            transform
+                .input_placement(&[], None, &test_plugins::source_schema())
+                .unwrap(),
+            Placement::RoundRobin
+        );
+
+        for parallelism in [1, 4] {
+            test_plugins::install();
+            let err = PartitionedPlugin::describe(
+                &app_config(),
+                "forward_widened",
+                TRANSFORM,
+                PluginKind::Transform,
+                Some(test_plugins::source_schema()),
+                options("forward_widened", forward),
+                Some(parallelism),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("forward_widened"), "{err}");
+            assert!(err.contains("remove its `parallelism`"), "{err}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_forward_is_for_transforms_only() {
+        test_plugins::install();
+        let err = PartitionedPlugin::describe(
+            &app_config(),
+            "forward_sink",
+            SINK,
+            PluginKind::Sink,
+            Some(test_plugins::source_schema()),
+            options("forward_sink", &[(PLACEMENT, "forward")]),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("invalid description"), "{err}");
+        assert!(err.contains("share one exchange"), "{err}");
+    }
+
+    /// A `Forward` transform cannot be widened or narrowed to a width it
+    /// supports, so the error must not suggest a `parallelism`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placement_forward_runs_as_wide_as_its_input() {
+        let transform = describe_node(
+            "forward_too_wide",
+            TRANSFORM,
+            PluginKind::Transform,
+            &[(PLACEMENT, "forward"), (MAXIMUM, "2")],
+            None,
+        );
+
+        let err = transform
+            .instantiate(3, Some(test_plugins::source_schema()))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("as wide as its input: 3 streams"), "{err}");
+        assert!(!err.contains("set `parallelism`"), "{err}");
+        assert!(transform.take_execution_futures().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

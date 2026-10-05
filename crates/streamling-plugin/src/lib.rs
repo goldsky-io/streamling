@@ -179,6 +179,9 @@ pub enum PluginInputPlacement {
     ByColumns { columns: RVec<RString> },
     /// Any instance will do.
     RoundRobin,
+    /// Instance `i` reads input stream `i`, with no exchange in between: see
+    /// `InputPlacement::Forward`.
+    Forward,
 }
 
 /// Planning-time constraints on how many partitions a plugin node can run
@@ -662,6 +665,7 @@ impl From<InputPlacement> for PluginInputPlacement_NE {
                 columns: columns.into_iter().map(RString::from).collect(),
             },
             InputPlacement::RoundRobin => PluginInputPlacement::RoundRobin,
+            InputPlacement::Forward => PluginInputPlacement::Forward,
         })
     }
 }
@@ -1539,6 +1543,16 @@ mod partitioned_generator_tests {
             .send(NonExhaustive::new(PluginMsg::Terminate))
             .unwrap();
         assert!(matches!(result.execution_future.await, RResult::ROk(())));
+    }
+
+    #[test]
+    fn forward_placement_crosses_the_ffi_boundary() {
+        assert_eq!(
+            PluginInputPlacement_NE::from(InputPlacement::Forward)
+                .into_enum()
+                .unwrap(),
+            PluginInputPlacement::Forward
+        );
     }
 
     #[test]

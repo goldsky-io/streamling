@@ -4692,6 +4692,20 @@ mod tests {
         assert_eq!(node.placement, Placement::ByKey(vec!["id".to_string()]));
     }
 
+    /// A `Forward` plugin transform is planned as round-robin with no
+    /// `parallelism`, and relies on this to keep stream `i` on instance `i`.
+    #[test]
+    fn round_robin_without_a_parallelism_plans_no_exchange() {
+        let plan = wrap_with_repartition(
+            empty_plan(),
+            &Placement::RoundRobin,
+            None,
+            "forward".to_string(),
+        );
+
+        assert!(repartition_node(&plan).is_none());
+    }
+
     /// Print and blackhole neither dedupe nor depend on ordering, so a group of
     /// them widens round-robin — no primary key required.
     #[test]
