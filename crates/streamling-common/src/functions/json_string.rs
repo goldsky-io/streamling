@@ -81,7 +81,15 @@ impl ScalarUDFImpl for JsonStringFunc {
 
         // Batch convert entire column at once for efficiency
         let mut builder = StringBuilder::new();
-        let field = Field::new("v", array.data_type().clone(), true);
+        // Keep the argument's field metadata: a decimal_arb is only
+        // recognisable by its extension keys, and without them the writer
+        // rendered the canonical bytes as hex.
+        let metadata = args
+            .arg_fields
+            .first()
+            .map(|f| f.metadata().clone())
+            .unwrap_or_default();
+        let field = Field::new("v", array.data_type().clone(), true).with_metadata(metadata);
         let schema = Arc::new(Schema::new(vec![field]));
         let converter = FromArrowToJsonConverter::new();
 

@@ -13,7 +13,7 @@ use async_ffi::FutureExt;
 use crossbeam_channel::TryRecvError;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::ffi::IDLE_POLL_INTERVAL;
 
@@ -56,6 +56,61 @@ fn wait_for_initialization(channels: &PluginChannels) -> Result<InitOutcome, Plu
 }
 
 use crate::ffi::{PluginCheckpointEpoch, PluginMetricsRecorder};
+
+/// How often the dispatch loops emit their liveness heartbeat at most. Loop
+/// iterations are far more frequent than this (the idle arm yields, it does
+/// not sleep), so the throttle keeps the metrics channel traffic negligible.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Emits dispatcher liveness markers on the plugin metrics channel: a
+/// throttled heartbeat while the dispatch loop spins, and enter/exit
+/// breadcrumbs around the checkpoint-marker hook (the one hook that runs
+/// arbitrary plugin flush/retry code and has wedged in practice). Emission is
+/// `try_send` under the hood, so a full channel drops a marker instead of
+/// ever blocking the dispatcher. The host intercepts these metric names for
+/// shutdown liveness attribution; they never reach user-facing telemetry.
+struct LivenessBeacon {
+    recorder: PluginMetricsRecorder,
+    last_beat: Option<std::time::Instant>,
+}
+
+impl LivenessBeacon {
+    fn new(channels: &PluginChannels) -> Self {
+        LivenessBeacon {
+            recorder: PluginMetricsRecorder::new(channels.metrics.sender.clone()),
+            last_beat: None,
+        }
+    }
+
+    /// Throttled heartbeat: emits on the first call, then at most once per
+    /// [`HEARTBEAT_INTERVAL`].
+    fn beat(&mut self) {
+        if self
+            .last_beat
+            .is_none_or(|t| t.elapsed() >= HEARTBEAT_INTERVAL)
+        {
+            self.recorder
+                .record_count(crate::ffi::DISPATCHER_HEARTBEAT_METRIC, 1);
+            self.last_beat = Some(std::time::Instant::now());
+        }
+    }
+
+    fn hook_enter(&self, hook: &str) {
+        self.recorder.record_count_w_tags(
+            crate::ffi::DISPATCHER_HOOK_ENTER_METRIC,
+            1,
+            vec![(crate::ffi::DISPATCHER_HOOK_TAG, hook)],
+        );
+    }
+
+    /// Balances [`Self::hook_enter`]. Only call on hook success: an erroring
+    /// hook leaves the enter breadcrumb unbalanced on purpose, so the host
+    /// still attributes a dispatcher that died inside the hook.
+    fn hook_exit(&self) {
+        self.recorder
+            .record_count(crate::ffi::DISPATCHER_HOOK_EXIT_METRIC, 1);
+    }
+}
 
 /// Handle checkpoint marker message for any plugin type
 async fn handle_checkpoint_marker(
@@ -125,6 +180,10 @@ async fn handle_control_messages(
             }
             Ok(Ok(PluginMsg::Terminate)) => {
                 source_plugin.terminate().await?;
+                // Bounded wait for tasks spawned via `shutdown::spawn` so
+                // buffered work they hold is flushed before the library goes
+                // quiet. No-op when nothing was tracked.
+                crate::shutdown::drain_tracked().await;
             }
             Err(e) => {
                 return Err(PluginError::Execution(format!(
@@ -135,6 +194,74 @@ async fn handle_control_messages(
         }
     }
     Ok(())
+}
+
+/// After a sink/transform plugin fails, keep consuming its input channel —
+/// dropping data batches and swallowing checkpoint messages WITHOUT acking or
+/// forwarding — until `Terminate` arrives (or the channel disconnects), then
+/// surface the original error.
+///
+/// Exiting immediately on the error instead leaves a full input channel
+/// behind: the host-side writer stays blocked on it, the plugin's stream
+/// cannot end, `Terminate` cannot be delivered, and the failing drain rides
+/// the watchdog into a hard exit (observed in the field as "input channel
+/// still full 5s after ..." followed by a blown drain-budget slice).
+///
+/// Not acking/forwarding markers here is load-bearing: an epoch covering
+/// dropped batches must never finalize, so its offsets stay uncommitted and
+/// the dropped data replays on restart — at-least-once holds.
+async fn drain_discard_after_failure<F>(
+    channels: &PluginChannels,
+    runtime: &PluginAsyncRuntimeObj,
+    error: PluginError,
+    terminate: F,
+) -> Result<(), PluginError>
+where
+    F: std::future::Future<Output = Result<(), PluginError>>,
+{
+    error!(
+        "Plugin failed; discarding queued input until Terminate so the channel cannot wedge the drain: {:?}",
+        error
+    );
+    let mut beacon = LivenessBeacon::new(channels);
+    let mut terminate = Some(terminate);
+    let mut dropped_batches: u64 = 0;
+    let mut swallowed_checkpoints: u64 = 0;
+
+    loop {
+        beacon.beat();
+        match channels.input.receiver.try_recv().map(|m| m.into_enum()) {
+            Ok(Ok(PluginMsg::NextBatch { .. })) => {
+                dropped_batches += 1;
+            }
+            Ok(Ok(PluginMsg::CheckpointMarker { .. }))
+            | Ok(Ok(PluginMsg::CheckpointFinalizer { .. })) => {
+                swallowed_checkpoints += 1;
+            }
+            Ok(Ok(PluginMsg::Terminate)) => {
+                // Best effort — the plugin already failed, and its cleanup
+                // outcome must not mask the original error.
+                if let Some(fut) = terminate.take()
+                    && let Err(te) = fut.await
+                {
+                    warn!("Plugin terminate() after failure also errored: {:?}", te);
+                }
+                crate::shutdown::drain_tracked().await;
+                break;
+            }
+            Err(TryRecvError::Empty) => {
+                runtime.yield_now().await;
+            }
+            Err(TryRecvError::Disconnected) => break,
+            _ => {}
+        }
+    }
+
+    error!(
+        "Plugin drained after failure: dropped {} data batch(es), swallowed {} checkpoint message(s) without acking (their epochs stay uncommitted; the data replays on restart)",
+        dropped_batches, swallowed_checkpoints
+    );
+    Err(error)
 }
 
 pub struct SourcePluginDispatcher {
@@ -168,8 +295,10 @@ impl SourcePluginDispatcher {
             return Ok(());
         }
         self.source_plugin.initialize().await?;
+        let mut beacon = LivenessBeacon::new(&self.channels);
 
         loop {
+            beacon.beat();
             // Generation loop
             // The idea is to continuously generate batches from the source plugin
             // and send them to the output channel, BUT it needs to occasionally check
@@ -221,7 +350,41 @@ impl SourcePluginDispatcher {
 
             runtime.spawn(generate_batch_future).await;
 
-            handle_control_messages(&self.channels, &self.source_plugin, &runtime).await?;
+            // A failing checkpoint hook must not exit with a possibly-full
+            // input channel behind it — the host-side control writer would
+            // stay blocked and the drain would wedge (same rationale as the
+            // sink/transform hook paths above).
+            if let Err(e) =
+                handle_control_messages(&self.channels, &self.source_plugin, &runtime).await
+            {
+                return drain_discard_after_failure(
+                    &self.channels,
+                    &runtime,
+                    e,
+                    self.source_plugin.terminate(),
+                )
+                .await;
+            }
+        }
+
+        // The source stopped on its own (`is_running()` went false — bounded
+        // work complete, or a Terminate was processed). Tell the host so it
+        // can end this source's record-batch stream: without the signal a
+        // bounded job's sinks never see end-of-stream and the pipeline cannot
+        // complete. Output-direction Terminate is the completion signal (see
+        // its doc on `PluginMsg` for why no new variant can be added). Best
+        // effort — on the host-initiated Terminate path the stream is already
+        // being torn down and the message is redundant; a host predating this
+        // meaning ignores it.
+        if let Err(e) = self
+            .channels
+            .output
+            .send_with_retry(&runtime, "Source complete", || {
+                NonExhaustive::new(PluginMsg::Terminate)
+            })
+            .await
+        {
+            warn!("Failed to notify host of source completion: {:?}", e);
         }
 
         Ok(())
@@ -254,9 +417,24 @@ impl TransformPluginDispatcher {
         if !self.transform_plugin.is_running() {
             return Ok(());
         }
-        self.transform_plugin.initialize().await?;
+        // See the sink dispatcher: plugin-error paths drain the input channel
+        // before surfacing the error, so a failed transform cannot wedge the
+        // host-side writer (and swallowed markers are deliberately NOT
+        // forwarded — a marker riding past dropped data would let its epoch
+        // finalize over lost rows).
+        if let Err(e) = self.transform_plugin.initialize().await {
+            return drain_discard_after_failure(
+                &self.channels,
+                &runtime,
+                e,
+                self.transform_plugin.terminate(),
+            )
+            .await;
+        }
+        let mut beacon = LivenessBeacon::new(&self.channels);
 
         loop {
+            beacon.beat();
             if !self.transform_plugin.is_running() {
                 break;
             }
@@ -271,7 +449,18 @@ impl TransformPluginDispatcher {
                 Ok(Ok(PluginMsg::NextBatch { data })) => {
                     let batch: RecordBatch = data.into();
 
-                    let processed_batch = self.transform_plugin.process_batch(batch).await?;
+                    let processed_batch = match self.transform_plugin.process_batch(batch).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return drain_discard_after_failure(
+                                &self.channels,
+                                &runtime,
+                                e,
+                                self.transform_plugin.terminate(),
+                            )
+                            .await;
+                        }
+                    };
 
                     let transform_plugin = self.transform_plugin.clone();
                     let retry_callback =
@@ -298,19 +487,42 @@ impl TransformPluginDispatcher {
                         .await?;
                 }
                 Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
-                    self.transform_plugin
+                    beacon.hook_enter("checkpoint_marker");
+                    if let Err(e) = self
+                        .transform_plugin
                         .process_checkpoint_marker(epoch.into())
-                        .await?;
+                        .await
+                    {
+                        return drain_discard_after_failure(
+                            &self.channels,
+                            &runtime,
+                            e,
+                            self.transform_plugin.terminate(),
+                        )
+                        .await;
+                    }
+                    beacon.hook_exit();
                     handle_checkpoint_marker(&self.channels, epoch, &runtime).await?;
                 }
                 Ok(Ok(PluginMsg::CheckpointFinalizer { epoch })) => {
-                    self.transform_plugin
+                    if let Err(e) = self
+                        .transform_plugin
                         .process_checkpoint_finalizer(epoch.into())
-                        .await?;
+                        .await
+                    {
+                        return drain_discard_after_failure(
+                            &self.channels,
+                            &runtime,
+                            e,
+                            self.transform_plugin.terminate(),
+                        )
+                        .await;
+                    }
                     handle_checkpoint_finalizer(&self.channels, epoch, &runtime).await?;
                 }
                 Ok(Ok(PluginMsg::Terminate)) => {
                     self.transform_plugin.terminate().await?;
+                    crate::shutdown::drain_tracked().await;
                 }
                 Err(TryRecvError::Empty) => {
                     runtime.sleep(IDLE_POLL_INTERVAL.into()).await;
@@ -355,9 +567,23 @@ impl SinkPluginDispatcher {
         if !self.sink_plugin.is_running() {
             return Ok(());
         }
-        self.sink_plugin.initialize().await?;
+        // Every plugin-error path below (initialize included — sink prechecks
+        // run there while data batches queue up on the input channel) goes
+        // through drain_discard_after_failure rather than returning directly:
+        // exiting with a full input channel wedges the whole drain.
+        if let Err(e) = self.sink_plugin.initialize().await {
+            return drain_discard_after_failure(
+                &self.channels,
+                &runtime,
+                e,
+                self.sink_plugin.terminate(),
+            )
+            .await;
+        }
+        let mut beacon = LivenessBeacon::new(&self.channels);
 
         loop {
+            beacon.beat();
             if !self.sink_plugin.is_running() {
                 break;
             }
@@ -383,25 +609,55 @@ impl SinkPluginDispatcher {
                                 .record_latency("elapsed_compute", duration);
                         }
                         Err(e) => {
-                            // Propagate error to cause pipeline failure
-                            // Any retry mechanism should be handled by the plugin itself
-                            return Err(e);
+                            // Propagate the error to fail the pipeline — but
+                            // only after the input channel is drained. Any
+                            // retry mechanism is the plugin's own business.
+                            return drain_discard_after_failure(
+                                &self.channels,
+                                &runtime,
+                                e,
+                                self.sink_plugin.terminate(),
+                            )
+                            .await;
                         }
                     }
                 }
                 Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
-                    self.sink_plugin
+                    beacon.hook_enter("checkpoint_marker");
+                    if let Err(e) = self
+                        .sink_plugin
                         .process_checkpoint_marker(epoch.into())
-                        .await?;
+                        .await
+                    {
+                        return drain_discard_after_failure(
+                            &self.channels,
+                            &runtime,
+                            e,
+                            self.sink_plugin.terminate(),
+                        )
+                        .await;
+                    }
+                    beacon.hook_exit();
                     handle_checkpoint_ack(&self.channels, epoch, &runtime).await?;
                 }
                 Ok(Ok(PluginMsg::CheckpointFinalizer { epoch })) => {
-                    self.sink_plugin
+                    if let Err(e) = self
+                        .sink_plugin
                         .process_checkpoint_finalizer(epoch.into())
-                        .await?
+                        .await
+                    {
+                        return drain_discard_after_failure(
+                            &self.channels,
+                            &runtime,
+                            e,
+                            self.sink_plugin.terminate(),
+                        )
+                        .await;
+                    }
                 }
                 Ok(Ok(PluginMsg::Terminate)) => {
                     self.sink_plugin.terminate().await?;
+                    crate::shutdown::drain_tracked().await;
                 }
                 Err(TryRecvError::Empty) => {
                     runtime.sleep(IDLE_POLL_INTERVAL.into()).await;
@@ -896,6 +1152,253 @@ mod tests {
             recorder.terminate_count(),
             1,
             "terminate() must be called exactly once on Terminate-before-Init"
+        );
+    }
+
+    /// The sink dispatcher must emit its liveness markers on the metrics
+    /// channel: a heartbeat once the loop starts, and balanced enter/exit
+    /// breadcrumbs around a successful checkpoint-marker hook. The host's
+    /// shutdown diagnostics attribute wedged drains from exactly these.
+    #[tokio::test]
+    async fn sink_dispatcher_emits_liveness_markers() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin: Arc<dyn SinkPlugin> = Arc::new(RecordingSink::new(recorder.clone()));
+        let dispatcher = SinkPluginDispatcher::new(channels.clone(), plugin);
+
+        for msg in [
+            PluginMsg::Init,
+            PluginMsg::CheckpointMarker {
+                epoch: crate::ffi::PluginCheckpointEpoch(1),
+            },
+            PluginMsg::Terminate,
+        ] {
+            channels.input.sender.send(NonExhaustive::new(msg)).unwrap();
+        }
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        dispatcher.start(runtime).await.unwrap();
+
+        let mut names: Vec<String> = Vec::new();
+        let mut enter_hook_tag = None;
+        while let Ok(metric) = channels.metrics.receiver.try_recv() {
+            if let Ok(crate::ffi::PluginMetric::Count { name, tags, .. }) = metric.into_enum() {
+                if name.as_str() == crate::ffi::DISPATCHER_HOOK_ENTER_METRIC {
+                    enter_hook_tag = tags
+                        .iter()
+                        .find(|kv| kv.0.as_str() == crate::ffi::DISPATCHER_HOOK_TAG)
+                        .map(|kv| kv.1.to_string());
+                }
+                names.push(name.to_string());
+            }
+        }
+
+        let pos = |wanted: &str| names.iter().position(|n| n == wanted);
+        let heartbeat = pos(crate::ffi::DISPATCHER_HEARTBEAT_METRIC);
+        let enter = pos(crate::ffi::DISPATCHER_HOOK_ENTER_METRIC);
+        let exit = pos(crate::ffi::DISPATCHER_HOOK_EXIT_METRIC);
+        assert!(heartbeat.is_some(), "expected a heartbeat, got: {names:?}");
+        assert!(
+            enter.is_some() && exit.is_some() && enter < exit,
+            "expected balanced enter/exit breadcrumbs, got: {names:?}"
+        );
+        assert_eq!(
+            enter_hook_tag.as_deref(),
+            Some("checkpoint_marker"),
+            "enter breadcrumb must name the hook"
+        );
+    }
+
+    struct FailingInitSink {
+        recorder: Arc<LifecycleRecorder>,
+        running: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for FailingInitSink {
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            self.recorder.terminated.fetch_add(1, Ordering::SeqCst);
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SinkPlugin for FailingInitSink {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Err(PluginError::Internal(
+                "failed to check if datasource exists".to_string(),
+            ))
+        }
+        async fn process_batch(&self, _data: RecordBatch) -> Result<(), PluginError> {
+            panic!("must not be called after initialize failed");
+        }
+        async fn process_checkpoint_marker(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            panic!("must not be called after initialize failed");
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            panic!("must not be called after initialize failed");
+        }
+    }
+
+    // The F8 contract: a failed sink must drain its input channel (dropping
+    // data, swallowing markers WITHOUT acking) until Terminate, then surface
+    // the original error. Exiting with a full channel wedges the host-side
+    // writer and the drain rides the watchdog. An acked marker here would be
+    // worse: its epoch could finalize over the dropped data.
+    #[tokio::test]
+    async fn sink_failure_drains_input_without_acking() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin: Arc<dyn SinkPlugin> = Arc::new(FailingInitSink {
+            recorder: recorder.clone(),
+            running: AtomicBool::new(true),
+        });
+        let dispatcher = SinkPluginDispatcher::new(channels.clone(), plugin);
+
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(arrow::array::Int64Array::from(vec![1_i64])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        for msg in [
+            PluginMsg::Init,
+            PluginMsg::NextBatch { data: batch.into() },
+            PluginMsg::CheckpointMarker {
+                epoch: crate::ffi::PluginCheckpointEpoch(7),
+            },
+            PluginMsg::Terminate,
+        ] {
+            channels.input.sender.send(NonExhaustive::new(msg)).unwrap();
+        }
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let result = dispatcher.start(runtime).await;
+
+        let err = result.expect_err("the original plugin error must surface");
+        assert!(
+            err.to_string()
+                .contains("failed to check if datasource exists"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            channels.input.receiver.is_empty(),
+            "input channel must be fully drained after failure"
+        );
+        while let Ok(msg) = channels.output.receiver.try_recv() {
+            assert!(
+                !matches!(msg.into_enum(), Ok(PluginMsg::CheckpointAck { .. })),
+                "no marker may be acked after the sink failed"
+            );
+        }
+        assert_eq!(
+            recorder.terminated.load(Ordering::SeqCst),
+            1,
+            "terminate() should run once (best effort) when Terminate arrives"
+        );
+    }
+
+    struct FailingMarkerTransform {
+        recorder: Arc<LifecycleRecorder>,
+        running: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for FailingMarkerTransform {
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            self.recorder.terminated.fetch_add(1, Ordering::SeqCst);
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TransformPlugin for FailingMarkerTransform {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            self.recorder.initialized.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(empty_schema())
+        }
+        async fn process_batch(&self, data: RecordBatch) -> Result<RecordBatch, PluginError> {
+            Ok(data)
+        }
+        async fn process_checkpoint_marker(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Err(PluginError::Internal("marker hook failed".to_string()))
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    // The F8 contract extended to checkpoint hooks: a transform whose marker
+    // hook fails must drain its input channel (not exit with it possibly
+    // full) and must NOT forward the failing marker — a forwarded marker
+    // would let its epoch finalize over data the failed plugin dropped.
+    #[tokio::test]
+    async fn transform_marker_failure_drains_input_without_forwarding() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let plugin: Arc<dyn TransformPlugin> = Arc::new(FailingMarkerTransform {
+            recorder: recorder.clone(),
+            running: AtomicBool::new(true),
+        });
+        let dispatcher = TransformPluginDispatcher::new(channels.clone(), plugin);
+
+        for msg in [
+            PluginMsg::Init,
+            PluginMsg::CheckpointMarker {
+                epoch: crate::ffi::PluginCheckpointEpoch(3),
+            },
+            PluginMsg::CheckpointMarker {
+                epoch: crate::ffi::PluginCheckpointEpoch(4),
+            },
+            PluginMsg::Terminate,
+        ] {
+            channels.input.sender.send(NonExhaustive::new(msg)).unwrap();
+        }
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let result = dispatcher.start(runtime).await;
+
+        let err = result.expect_err("the original marker-hook error must surface");
+        assert!(
+            err.to_string().contains("marker hook failed"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            channels.input.receiver.is_empty(),
+            "input channel must be fully drained after the marker-hook failure"
+        );
+        while let Ok(msg) = channels.output.receiver.try_recv() {
+            assert!(
+                !matches!(msg.into_enum(), Ok(PluginMsg::CheckpointMarker { .. })),
+                "no marker may be forwarded after the transform failed"
+            );
+        }
+        assert_eq!(
+            recorder.terminated.load(Ordering::SeqCst),
+            1,
+            "terminate() should run once (best effort) when Terminate arrives"
         );
     }
 

@@ -2,7 +2,7 @@ use crate::error::{Result, ResultExt};
 use crate::topology::{AggregateColumn, AggregateFunction, GroupByColumn};
 use crate::utils::pg::{
     PostgresConnection, arrow_field_to_postgres_type, create_schema_and_table_if_needed,
-    postgres_type_to_arrow_type,
+    postgres_type_to_arrow_field,
 };
 use crate::{streamling_bail, streamling_user_bail};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -369,6 +369,32 @@ EXECUTE FUNCTION {function_name}();"#,
         ))
     }
 
+    /// The output field for `name`: the `type_overrides` entry as a complete
+    /// field, else `data_type`. The override must become a field, not a
+    /// storage type: `numeric(p > 76)` is decimal_arb only with its extension
+    /// metadata, and a bare `LargeBinary` lands in Postgres as BYTEA.
+    fn output_field(
+        &self,
+        name: &str,
+        data_type: impl FnOnce() -> Result<DataType>,
+        nullable: bool,
+    ) -> Result<Field> {
+        match self.type_overrides.get(name) {
+            Some(override_type) => postgres_type_to_arrow_field(override_type, name, nullable),
+            None => Ok(Field::new(name, data_type()?, nullable)),
+        }
+    }
+
+    /// The Arrow type of input column `col_name`.
+    fn input_type(&self, col_name: &str) -> Result<DataType> {
+        Ok(self
+            .input_schema
+            .field_with_unqualified_name(col_name)
+            .streamling_with_context(|| format!("column '{}' not found in input schema", col_name))?
+            .data_type()
+            .clone())
+    }
+
     /// Builds an Arrow Schema for the aggregation target table.
     ///
     /// This schema differs from `agg_schema` (DataFusion's logical output schema) because:
@@ -400,18 +426,11 @@ EXECUTE FUNCTION {function_name}();"#,
                                 format!("column '{}' not found in schema", output_name)
                             })?;
 
-                        let data_type =
-                            if let Some(override_type) = self.type_overrides.get(output_name) {
-                                postgres_type_to_arrow_type(override_type)?
-                            } else {
-                                field.data_type().clone()
-                            };
-
-                        fields.push(Field::new(
-                            output_name.clone(),
-                            data_type,
+                        fields.push(self.output_field(
+                            output_name,
+                            || Ok(field.data_type().clone()),
                             field.is_nullable(),
-                        ));
+                        )?);
                     }
                     _ => {
                         streamling_user_bail!("unsupported group expr: {:?}", expr);
@@ -452,49 +471,26 @@ EXECUTE FUNCTION {function_name}();"#,
             match func_name {
                 "count" => {
                     // COUNT always returns BIGINT, not nullable
-                    let data_type =
-                        if let Some(override_type) = self.type_overrides.get(&agg_field_name) {
-                            postgres_type_to_arrow_type(override_type)?
-                        } else {
-                            DataType::Int64
-                        };
-                    fields.push(Field::new(agg_field_name, data_type, false));
+                    fields.push(self.output_field(
+                        &agg_field_name,
+                        || Ok(DataType::Int64),
+                        false,
+                    )?);
                 }
                 "sum" => {
                     // SUM type depends on input column type or override, not nullable
-                    let data_type =
-                        if let Some(override_type) = self.type_overrides.get(&agg_field_name) {
-                            postgres_type_to_arrow_type(override_type)?
-                        } else {
-                            let field = self
-                                .input_schema
-                                .field_with_unqualified_name(&col_name)
-                                .streamling_with_context(|| {
-                                    format!("column '{}' not found in input schema", col_name)
-                                })?;
-                            field.data_type().clone()
-                        };
-                    fields.push(Field::new(agg_field_name, data_type, false));
+                    fields.push(self.output_field(
+                        &agg_field_name,
+                        || self.input_type(&col_name),
+                        false,
+                    )?);
                 }
                 "avg" => {
-                    // AVG splits into sum and count, both not nullable
-                    let sum_data_type =
-                        if let Some(override_type) = self.type_overrides.get(&agg_field_name) {
-                            postgres_type_to_arrow_type(override_type)?
-                        } else {
-                            let field = self
-                                .input_schema
-                                .field_with_unqualified_name(&col_name)
-                                .streamling_with_context(|| {
-                                    format!("column '{}' not found in input schema", col_name)
-                                })?;
-                            field.data_type().clone()
-                        };
-                    fields.push(Field::new(
-                        format!("{}_sum", agg_field_name),
-                        sum_data_type,
-                        false,
-                    ));
+                    // AVG splits into sum and count, both not nullable. The
+                    // override names the aggregate; it types the sum half.
+                    let sum =
+                        self.output_field(&agg_field_name, || self.input_type(&col_name), false)?;
+                    fields.push(sum.with_name(format!("{}_sum", agg_field_name)));
                     fields.push(Field::new(
                         format!("{}_count", agg_field_name),
                         DataType::Int64,
@@ -503,19 +499,11 @@ EXECUTE FUNCTION {function_name}();"#,
                 }
                 "min" | "max" => {
                     // MIN/MAX type matches input column type or override, nullable
-                    let data_type =
-                        if let Some(override_type) = self.type_overrides.get(&agg_field_name) {
-                            postgres_type_to_arrow_type(override_type)?
-                        } else {
-                            let field = self
-                                .input_schema
-                                .field_with_unqualified_name(&col_name)
-                                .streamling_with_context(|| {
-                                    format!("column '{}' not found in input schema", col_name)
-                                })?;
-                            field.data_type().clone()
-                        };
-                    fields.push(Field::new(agg_field_name, data_type, true));
+                    fields.push(self.output_field(
+                        &agg_field_name,
+                        || self.input_type(&col_name),
+                        true,
+                    )?);
                 }
                 _ => {
                     streamling_user_bail!("unsupported aggregate function: {}", func_name);
@@ -1437,6 +1425,56 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("unsupported PostgreSQL type"));
+    }
+
+    #[tokio::test]
+    async fn wide_numeric_type_override_is_a_decimal_arb_field_not_bare_bytes() {
+        use crate::topology::{AggregateColumn, AggregateFunction};
+        use crate::types::decimal_arb::{DecimalArbType, NativeIntKind};
+
+        let _ = create_test_context().await;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("market", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let df_schema = Arc::new(DFSchema::try_from((*schema).clone()).unwrap());
+
+        let mut aggregate = IndexMap::new();
+        aggregate.insert(
+            "total".to_string(),
+            AggregateColumn {
+                from: Some("amount".to_string()),
+                function: AggregateFunction::Sum,
+                pg_type: Some("numeric(78, 0)".to_string()),
+            },
+        );
+
+        let aggregator = PostgresAggregator::try_new(
+            &IndexMap::new(),
+            &aggregate,
+            df_schema,
+            "test_table".to_string(),
+            "id".to_string(),
+            "test_agg".to_string(),
+            "public".to_string(),
+        )
+        .unwrap();
+
+        let target = aggregator.build_target_schema().unwrap();
+        let total = target.field_with_name("total").unwrap();
+        // The storage type alone (`postgres_type_to_arrow_type`) is a bare
+        // LargeBinary, which the sink would create as BYTEA; the override
+        // must carry the decimal_arb metadata, and NUMERIC(78, 0)'s u256 hint.
+        assert!(DecimalArbType::is_decimal_arb_field(total), "{total:?}");
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(total),
+            Some((78, 0))
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(total),
+            Some(NativeIntKind::U256)
+        );
     }
 
     #[tokio::test]

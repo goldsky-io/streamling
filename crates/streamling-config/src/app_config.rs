@@ -7,6 +7,8 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Formatter;
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 fn default_sslmode() -> String {
@@ -32,6 +34,12 @@ pub struct PostgresStateBackendConfig {
     pub max_connections: Option<u32>,
     pub state_schema_name: Option<String>,
     pub state_table_name: Option<String>,
+    /// Ceiling on waiting for a pool connection, in seconds. When unset, the
+    /// engine derives it from the shutdown budget at startup (see the state
+    /// backend construction in `streamling`) so a state-backend outage is
+    /// always reportable inside the drain window — sqlx's own 30s default
+    /// out-waits every budget below ~42s of grace.
+    pub acquire_timeout_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresStateBackendConfig {
@@ -303,8 +311,30 @@ impl std::fmt::Debug for KafkaConfig {
 impl KafkaConfig {
     /// Returns schema registry settings if a schema registry URL is configured.
     /// Returns None if no schema registry URL is set (e.g., when using JSON format).
+    ///
+    /// Cached per (url, username, password) for the life of the process:
+    /// building one constructs a `reqwest::Client`, which parses the system CA
+    /// bundle, and every Kafka source asks for one at startup. `SrSettings`
+    /// clones around an `Arc`'d client, so the clones share a connection pool.
     pub fn get_schema_registry_settings(&self) -> Option<SrSettings> {
         let url = self.schema_registry_url.as_ref()?;
+        let key = (
+            url.clone(),
+            self.schema_registry_username.clone(),
+            self.schema_registry_password.clone(),
+        );
+
+        // Held across the build on purpose: sources are constructed
+        // concurrently, and a check-then-insert would let them all miss at
+        // once and build a client each.
+        let mut cache = SCHEMA_REGISTRY_SETTINGS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(settings) = cache.get(&key) {
+            return Some(settings.clone());
+        }
+
         let mut builder = SrSettings::new_builder(url.clone());
 
         if let (Some(username), Some(password)) = (
@@ -314,13 +344,19 @@ impl KafkaConfig {
             builder.set_basic_authorization(username, Some(password.as_str()));
         }
 
-        Some(
-            builder
-                .build()
-                .expect("failed to build schema registry settings from KafkaConfig"),
-        )
+        let settings = builder
+            .build()
+            .expect("failed to build schema registry settings from KafkaConfig");
+        cache.insert(key, settings.clone());
+        Some(settings)
     }
 }
+
+/// Process-wide cache behind [`KafkaConfig::get_schema_registry_settings`],
+/// keyed by (url, username, password).
+type SchemaRegistryKey = (String, Option<String>, Option<String>);
+static SCHEMA_REGISTRY_SETTINGS: OnceLock<Mutex<HashMap<SchemaRegistryKey, SrSettings>>> =
+    OnceLock::new();
 
 /// Compression codec applied by the Kafka sink's producer (librdkafka
 /// `compression.type`). Defaults to `lz4`, which is the historical built-in
@@ -432,6 +468,61 @@ impl<'de> SerdeDeserialize<'de> for GzipCompressionLevel {
     }
 }
 
+/// Per-column directive on a sink (or hybrid). Today only `coerce_to`
+/// is recognized; the YAML grammar reserves room for future variants.
+///
+/// Example:
+///
+/// ```yaml
+/// sinks:
+///   analytics:
+///     type: clickhouse
+///     columns:
+///       - name: amount
+///         coerce_to: string
+/// ```
+///
+/// `coerce_to: string` is the opt-in for emitting a wide-precision
+/// decimal_arb column to a destination that cannot hold it natively
+/// (e.g. ClickHouse `Decimal` capped at 76 digits). Without the
+/// directive, the pipeline is rejected at config load.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnDirective {
+    pub name: String,
+    /// Optional coercion the sink applies when emitting this column.
+    pub coerce_to: Option<CoercionTarget>,
+}
+
+/// Allowed values for `coerce_to:`. Only `string` exists in v1 — future
+/// variants would land here.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoercionTarget {
+    /// Emit the column as a string field on the destination, encoded as
+    /// canonical decimal text. Required for wide-precision decimal_arb
+    /// columns flowing into ClickHouse / Protobuf / other destinations
+    /// that lack native arbitrary-precision decimals.
+    String,
+}
+
+impl ColumnDirective {
+    /// Look up directives for a specific column name in a list. Returns
+    /// `None` if the column has no entry; this is the "no opt-in" case
+    /// and the connector capability matrix decides what to do.
+    pub fn find<'a>(
+        directives: Option<&'a [ColumnDirective]>,
+        column: &str,
+    ) -> Option<&'a ColumnDirective> {
+        directives?.iter().find(|d| d.name == column)
+    }
+
+    /// Convenience: returns true iff this directive sets `coerce_to: string`.
+    pub fn coerces_to_string(&self) -> bool {
+        matches!(self.coerce_to, Some(CoercionTarget::String))
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -448,6 +539,14 @@ pub struct ClickHouseConfig {
     /// default level 3), and `"lz4"` (frame format has no level knob).
     #[serde(default)]
     pub compression_level: GzipCompressionLevel,
+    /// Per-column directives applied to outgoing rows on the sink side.
+    /// See [`ColumnDirective`] for the supported keys.
+    ///
+    /// Accepts either a YAML/JSON list of directives (config-file shape) or
+    /// a JSON-encoded string of the same (env-var shape, e.g.
+    /// `STREAMLING__CLICKHOUSE_SINK__COLUMNS='[{"name":"amount","coerce_to":"string"}]'`).
+    #[serde(default, deserialize_with = "deserialize_optional_column_directives")]
+    pub columns: Option<Vec<ColumnDirective>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -537,6 +636,41 @@ impl std::fmt::Debug for ClickHouseSourceConfig {
             .field("connection", &self.connection)
             .field("page_size", &self.page_size)
             .finish()
+    }
+}
+
+/// Tunables for the `file` source.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileSourceConfig {
+    /// How many discovered files are sampled to detect the Hive partition
+    /// layout. The sample has to agree on the layout, so a larger value catches
+    /// a mixed prefix at the cost of a longer listing before the first scan.
+    #[serde(
+        default = "default_partition_sample_size",
+        deserialize_with = "deserialize_partition_sample_size"
+    )]
+    pub partition_sample_size: NonZeroUsize,
+}
+
+fn default_partition_sample_size() -> NonZeroUsize {
+    NonZeroUsize::new(10).expect("10 is non-zero")
+}
+
+/// The config crate doesn't attach the key path to deserialization errors, so
+/// serde's own `NonZeroUsize` error wouldn't say which setting is wrong.
+fn deserialize_partition_sample_size<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    NonZeroUsize::new(usize::deserialize(deserializer)?)
+        .ok_or_else(|| D::Error::custom("file_source.partition_sample_size must be at least 1"))
+}
+
+impl Default for FileSourceConfig {
+    fn default() -> Self {
+        Self {
+            partition_sample_size: default_partition_sample_size(),
+        }
     }
 }
 
@@ -800,6 +934,49 @@ where
     }
 }
 
+/// Accepts either a YAML/JSON sequence of [`ColumnDirective`] entries (the
+/// normal config-file shape) or a JSON-encoded string of the same
+/// (the env-var shape — env vars are always strings, so a list of
+/// structs has to be encoded as JSON text).
+///
+/// Example env-var: `STREAMLING__CLICKHOUSE_SINK__COLUMNS='[{"name":"amount","coerce_to":"string"}]'`
+fn deserialize_optional_column_directives<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ColumnDirective>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(SerdeDeserialize)]
+    #[serde(untagged)]
+    enum ListOrString {
+        List(Vec<ColumnDirective>),
+        String(String),
+        Null,
+    }
+
+    match Option::<ListOrString>::deserialize(deserializer)? {
+        None | Some(ListOrString::Null) => Ok(None),
+        Some(ListOrString::List(list)) => Ok(Some(list)),
+        Some(ListOrString::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::from_str::<Vec<ColumnDirective>>(trimmed)
+                    .map(Some)
+                    .map_err(|e| {
+                        D::Error::custom(format!(
+                            "failed to parse columns as JSON list of ColumnDirective: {}",
+                            e
+                        ))
+                    })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenTelemetryMetricsConfig {
     pub ingestion_endpoint: String,
@@ -858,6 +1035,8 @@ pub struct AppConfig {
     pub kafka_sink: KafkaConfig,
     pub clickhouse_source: ClickHouseSourceConfig,
     pub clickhouse_sink: ClickHouseSinkConfig,
+    #[serde(default)]
+    pub file_source: FileSourceConfig,
     pub print_sink: PrintSinkConfig,
     pub postgres_sink: PostgresSinkConfig,
     pub open_telemetry_metrics: OpenTelemetryMetricsConfig,
@@ -889,6 +1068,40 @@ pub struct AppConfig {
     /// Set via STREAMLING__JOB_MODE env var by streamling-agent when `job: true`.
     #[serde(default)]
     pub job_mode: bool,
+    /// How a graceful shutdown treats in-flight data. Set via
+    /// STREAMLING__DRAIN_POLICY (`auto` | `drain` | `fast`).
+    #[serde(default)]
+    pub drain_policy: DrainPolicy,
+}
+
+/// Shutdown drain policy: whether a graceful shutdown fully drains and
+/// durably checkpoints the in-flight tail, or exits fast and lets the tail
+/// replay on restart.
+///
+/// The trade-off is duplicate-vs-latency, and it splits cleanly by topology:
+/// bounded work (job mode, hybrid backfills, bounded table/file scans) never
+/// restarts after completing, so its tail has no replay to recover it — it
+/// MUST drain. Plain streaming restarts by definition, so at-least-once
+/// replay covers its tail and the operator may prefer a fast exit (the
+/// duplicate window equals the drained tail, visible only on non-idempotent
+/// sinks).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DrainPolicy {
+    /// Derive from the topology: drain when the pipeline has bounded work
+    /// (job mode, or any hybrid / ClickHouse / bounded file source),
+    /// fast-exit for plain streaming.
+    #[default]
+    Auto,
+    /// Always drain: on shutdown, mint a terminal checkpoint so the drained
+    /// tail's offsets commit before exit and a restart does not replay it.
+    Drain,
+    /// Exit fast: skip the terminal checkpoint (source offsets stay
+    /// uncommitted; the drained tail replays on restart) and cap the plugin
+    /// flush wait. Sinks still flush what they consumed, scopes still drain,
+    /// and the consumer still unsubscribes — this is a clean exit 0, not a
+    /// kill. Ignored (with a warning) when the pipeline has bounded work.
+    Fast,
 }
 
 impl AppConfig {
@@ -1296,6 +1509,40 @@ mod tests {
         );
     }
 
+    /// A zero sample reads no paths, so a Hive-partitioned source would silently
+    /// lose its partition columns.
+    #[test]
+    fn file_source_rejects_zero_partition_sample_size_at_load() {
+        let _guard = env_guard();
+
+        let name = "STREAMLING__FILE_SOURCE__PARTITION_SAMPLE_SIZE";
+        let previous = std::env::var(name).ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var(name, "0");
+        }
+
+        let result = std::panic::catch_unwind(AppConfig::load);
+
+        // SAFETY: see above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let err = result
+            .expect("test body panicked")
+            .expect_err("a zero partition_sample_size must fail the load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("partition_sample_size"),
+            "the error must name the field, got: {rendered}"
+        );
+    }
+
     /// Verifies the full path: STREAMLING__HTTP_SECRET_HEADER__* and STREAMLING__HTTP_SECRET_VALUE__* env
     /// vars are picked up by the Environment source and land in the respective HashMaps under
     /// lowercased, normalized keys.
@@ -1439,6 +1686,123 @@ password: ""
             err.to_string()
                 .contains("expected `none`, `gzip`, `zstd`, or `lz4`"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ------- ColumnDirective YAML parsing -------
+
+    #[test]
+    fn parse_clickhouse_config_with_column_directives() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns:
+  - name: amount
+    coerce_to: string
+  - name: id
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        let cols = cfg.columns.expect("columns parsed");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "amount");
+        assert_eq!(cols[0].coerce_to, Some(CoercionTarget::String));
+        assert!(cols[0].coerces_to_string());
+        assert_eq!(cols[1].name, "id");
+        assert_eq!(cols[1].coerce_to, None);
+        assert!(!cols[1].coerces_to_string());
+    }
+
+    #[test]
+    fn parse_clickhouse_columns_from_json_string() {
+        // Env-var shape: a JSON-encoded list-of-directives string.
+        // Mirrors `STREAMLING__CLICKHOUSE_SINK__COLUMNS='[...]'`.
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns: '[{"name":"amount","coerce_to":"string"},{"name":"id"}]'
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        let cols = cfg.columns.expect("columns parsed from JSON string");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "amount");
+        assert!(cols[0].coerces_to_string());
+        assert_eq!(cols[1].name, "id");
+        assert!(!cols[1].coerces_to_string());
+    }
+
+    #[test]
+    fn parse_clickhouse_columns_empty_string_is_none() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns: ""
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.columns.is_none());
+    }
+
+    #[test]
+    fn parse_clickhouse_columns_invalid_json_fails() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+columns: "not json"
+"#;
+        let err = serde_yaml::from_str::<ClickHouseConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("JSON"),
+            "error should mention JSON parsing: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_clickhouse_config_without_columns_is_optional() {
+        let yaml = r#"
+url: http://localhost:8123
+database: analytics
+user: default
+password: ""
+"#;
+        let cfg: ClickHouseConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.columns.is_none());
+    }
+
+    #[test]
+    fn column_directive_rejects_unknown_keys() {
+        // CONN-002 in AGENTS.md: sink configs use deny_unknown_fields so
+        // typos surface at config load.
+        let yaml = r#"
+name: amount
+coerce_to: string
+extra_typo: oops
+"#;
+        let err = serde_yaml::from_str::<ColumnDirective>(yaml).unwrap_err();
+        assert!(format!("{}", err).contains("extra_typo"));
+    }
+
+    #[test]
+    fn column_directive_rejects_unknown_coerce_to_value() {
+        let yaml = r#"
+name: amount
+coerce_to: bigint_truncated
+"#;
+        // `bigint_truncated` is not in the CoercionTarget enum (only
+        // `string` exists). The parser should reject it.
+        let err = serde_yaml::from_str::<ColumnDirective>(yaml).unwrap_err();
+        assert!(
+            format!("{}", err).contains("bigint_truncated")
+                || format!("{}", err).contains("variant"),
+            "expected error to mention the rejected variant; got: {}",
+            err,
         );
     }
 
@@ -1629,5 +1993,23 @@ password: ""
             config.client_statement_timeout(),
             Some(std::time::Duration::from_secs(u64::MAX))
         );
+    }
+
+    #[test]
+    fn column_directive_find_by_name() {
+        let directives = vec![
+            ColumnDirective {
+                name: "amount".to_string(),
+                coerce_to: Some(CoercionTarget::String),
+            },
+            ColumnDirective {
+                name: "id".to_string(),
+                coerce_to: None,
+            },
+        ];
+        assert!(ColumnDirective::find(Some(&directives), "amount").is_some());
+        assert!(ColumnDirective::find(Some(&directives), "id").is_some());
+        assert!(ColumnDirective::find(Some(&directives), "missing").is_none());
+        assert!(ColumnDirective::find(None, "amount").is_none());
     }
 }

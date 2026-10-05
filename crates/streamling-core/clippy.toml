@@ -1,0 +1,17 @@
+# Raw `tokio::spawn` creates a detached task no drain can wait on — the
+# orphan-task bug class from shutdown-investigation.md (Part 4). Spawn through
+# `crate::shutdown::ComponentScope::spawn` so the task is tracked and
+# cancelled by the shutdown drain ladder. Existing call sites carry
+# `#[allow(clippy::disallowed_methods)]` as marked debt for the Phase 3 core
+# port (they predate the controller and don't yet see a scope); new code must
+# not add to them.
+disallowed-methods = [
+    { path = "tokio::task::spawn", reason = "detached tasks outlive shutdown; use ComponentScope::spawn (crate::shutdown) so the drain ladder tracks the task" },
+    { path = "tokio::runtime::Handle::spawn", reason = "detached tasks outlive shutdown, and Handle::spawn bypasses the tokio::task::spawn deny; use ComponentScope::spawn (crate::shutdown) so the drain ladder tracks the task" },
+    { path = "tokio::task::JoinSet::spawn", reason = "JoinSet tasks are aborted on drop, not drained; use ComponentScope::spawn (crate::shutdown) so teardown waits for them instead of cutting them mid-write" },
+    # Host-side blocking sends into plugin channels park a tokio worker when
+    # the peer wedges (shutdown-investigation.md §1.2). Use
+    # crate::plugin::send_to_plugin (async, shutdown-aware) or a bounded
+    # send_timeout/try_send.
+    { path = "abi_stable::external_types::crossbeam_channel::RSender::send", reason = "blocking send parks a tokio worker when the plugin wedges; use plugin::send_to_plugin or a bounded send_timeout/try_send" },
+]

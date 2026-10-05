@@ -43,6 +43,9 @@ impl Preprocessor for PluginPreprocessorAdapter {
         .map_err(|e| PreprocessorError::PluginError(format!("{}", e)))?;
 
         // Spawn the execution future so the dispatcher starts running immediately.
+        // Sanctioned: structured concurrency — `execution_handle` is awaited
+        // at the end of this function (runs pre-pipeline, no controller yet).
+        #[allow(clippy::disallowed_methods)]
         let execution_handle = tokio::spawn(plugin.execution_future);
 
         // Drop the channel halves we don't use. The host only sends on input and
@@ -62,19 +65,34 @@ impl Preprocessor for PluginPreprocessorAdapter {
             receiver: output_receiver,
         } = output;
 
-        // Send Topology config
+        // Send Topology config. Bounded: the channel is freshly created, so a
+        // refused send means the dispatcher never started consuming — error
+        // out instead of parking startup (§1.2).
         input_sender
-            .send(NonExhaustive::new(PluginMsg::Topology {
-                config: config.into_c(),
-            }))
+            .send_timeout(
+                NonExhaustive::new(PluginMsg::Topology {
+                    config: config.into_c(),
+                }),
+                std::time::Duration::from_secs(5),
+            )
             .map_err(|e| {
                 PreprocessorError::PluginError(format!("Failed to send Topology: {}", e))
             })?;
 
-        // Wait for Topology response
-        let response = output_receiver.recv().map_err(|e| {
-            PreprocessorError::PluginError(format!("Failed to receive topology response: {}", e))
-        })?;
+        // Wait for the Topology response, bounded: a preprocessor that never
+        // responds (bug, wedged API call inside the plugin) used to stall
+        // startup forever — and no signal handling exists yet at this point,
+        // so SIGTERM was unobservable.
+        // Generous bound: dataset preprocessors legitimately make API calls.
+        const TOPOLOGY_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let response = output_receiver
+            .recv_timeout(TOPOLOGY_RESPONSE_TIMEOUT)
+            .map_err(|e| {
+                PreprocessorError::PluginError(format!(
+                    "Failed to receive topology response from preprocessor '{}' within {:?}: {}",
+                    self.plugin_type, TOPOLOGY_RESPONSE_TIMEOUT, e
+                ))
+            })?;
 
         let result_config = match response.into_enum() {
             Ok(PluginMsg::Topology { config }) => config.into_string(),
@@ -94,8 +112,13 @@ impl Preprocessor for PluginPreprocessorAdapter {
             }
         };
 
-        // Send Terminate
-        let _ = input_sender.send(NonExhaustive::new(PluginMsg::Terminate));
+        // Send Terminate. Bounded: a preprocessor wedged mid-Topology with a
+        // full input channel must not park startup forever (§1.2) — the
+        // execution-future await below has its own error path.
+        let _ = input_sender.send_timeout(
+            NonExhaustive::new(PluginMsg::Terminate),
+            std::time::Duration::from_secs(5),
+        );
 
         // Await execution future
         execution_handle

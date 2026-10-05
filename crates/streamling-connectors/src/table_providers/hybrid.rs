@@ -26,7 +26,7 @@ use streamling_core::checkpoints::checkpoint_management::{
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
 };
 use streamling_core::data::COLUMN_NAME_OP;
-use streamling_core::error::ResultExt;
+use streamling_core::error::{ResultExt, StreamlingError};
 use streamling_core::operators::wrapping::WrappingSourceTableProvider;
 use streamling_core::session::SessionManager;
 use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
@@ -161,6 +161,10 @@ pub struct HybridTableProvider {
     /// follower partitions end their streams instead of waiting for an
     /// unbounded phase that will never start (job mode, shutdown, error).
     terminated: Arc<AtomicBool>,
+    /// The run loop's shutdown scope: the hybrid driver, marker forwarder,
+    /// and shutdown watcher spawn through it so the teardown drain ladder
+    /// tracks them. `None` in tests (direct construction).
+    scope: Arc<streamling_core::shutdown::ComponentScope>,
 }
 impl Debug for HybridTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,6 +233,7 @@ impl HybridTableProvider {
             shutdown_rx: None,
             unbounded_parallelism: 1,
             terminated: Arc::new(AtomicBool::new(false)),
+            scope: streamling_core::shutdown::ComponentScope::detached("hybrid-source"),
         };
 
         Ok(provider)
@@ -269,6 +274,13 @@ impl HybridTableProvider {
         self.state.read().await.current_phase >= self.config.bounded_sources.len()
     }
 
+    /// Attach the run loop's shutdown scope so the hybrid's helper tasks are
+    /// tracked by the teardown drain ladder. Builder-style, applied before the
+    /// provider is wrapped in an `Arc`.
+    pub fn with_scope(mut self, scope: Arc<streamling_core::shutdown::ComponentScope>) -> Self {
+        self.scope = scope;
+        self
+    }
     pub fn new_from_topology(
         reference_name: String,
         bounded_sources: Vec<HybridBoundedSource>,
@@ -280,11 +292,15 @@ impl HybridTableProvider {
         // The same `Telemetry` is forwarded to both inner phases (bounded
         // ClickHouse + unbounded Kafka). The user is responsible for
         // choosing a column name that exists in both schemas; if it doesn't
-        // exist on one side, that phase's `EventTimeReader` will warn-once
-        // per R5a and the other phase keeps emitting normally. Each inner
-        // phase emits under its own `metric_key_hybrid_src_*` suffix (R9),
+        // exist on one side, that phase's `EventTimeReader` warns once and
+        // the other phase keeps emitting normally. Each inner
+        // phase emits under its own `metric_key_hybrid_src_*` suffix,
         // so bounded vs unbounded series are tag-distinguishable downstream.
         telemetry: Option<&Telemetry>,
+        // One scope covers the hybrid's own helper tasks and both inner
+        // phases' background tasks (Kafka lag reporter, ClickHouse
+        // checkpointing) — all drain together at teardown.
+        scope: Arc<streamling_core::shutdown::ComponentScope>,
     ) -> DataFusionResult<Self> {
         use crate::table_providers::clickhouse::ClickHouseTableProvider;
         use crate::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -319,7 +335,6 @@ impl HybridTableProvider {
                         false,
                         state_backend_factory.create(application_id.as_str()),
                         session_manager.clone(),
-                        app_config.num_records_before_stop,
                         unbounded_source
                             .validate_writer_schema_ordering
                             .unwrap_or(true),
@@ -339,7 +354,8 @@ impl HybridTableProvider {
                             "hybrid source '{}': failed to create Kafka source",
                             reference_name
                         )
-                    })?,
+                    })?
+                    .with_scope(scope.clone()),
                 );
                 let effective_parallelism = kafka_table_provider.parallelism();
                 (
@@ -389,18 +405,21 @@ impl HybridTableProvider {
                         schema_adapter
                             .get_columns(bounded_source.table_name.as_str(), &unbounded_schema)?,
                     );
-                    let clickhouse_provider = Arc::new(ClickHouseTableProvider::new_source(
-                        reference_name.clone(),
-                        metric_key(&application_id, &reference_name),
-                        bounded_source.table_name.as_str(),
-                        app_config.clickhouse_source.clone(),
-                        start_at,
-                        bounded_source.filter,
-                        columns,
-                        state_backend_factory.create(application_id.as_str()),
-                        app_config.internal_buffer_size as usize,
-                        app_config.record_batch_size as usize,
-                    )?);
+                    let clickhouse_provider = Arc::new(
+                        ClickHouseTableProvider::new_source(
+                            reference_name.clone(),
+                            metric_key(&application_id, &reference_name),
+                            bounded_source.table_name.as_str(),
+                            app_config.clickhouse_source.clone(),
+                            start_at,
+                            bounded_source.filter,
+                            columns,
+                            state_backend_factory.create(application_id.as_str()),
+                            app_config.internal_buffer_size as usize,
+                            app_config.record_batch_size as usize,
+                        )?
+                        .with_scope(scope.clone()),
+                    );
                     debug!(
                         "Clickhouse schema for bounded source: {:?}",
                         clickhouse_provider.schema()
@@ -454,7 +473,8 @@ impl HybridTableProvider {
             state_backend,
             session_manager,
         )?
-        .with_unbounded_parallelism(effective_unbounded_parallelism);
+        .with_unbounded_parallelism(effective_unbounded_parallelism)
+        .with_scope(scope);
         debug!("Created HybridTableProvider: {:?}", provider);
 
         Ok(provider)
@@ -482,21 +502,17 @@ impl HybridTableProvider {
                 .fields()
                 .iter()
                 .filter(|field| field.name() != COLUMN_NAME_OP)
-                .map(|field| (field.name().clone(), field.data_type().clone()))
+                .cloned()
                 .collect::<Vec<_>>()
         };
 
         let bounded_fields = get_fields(&bounded_schema);
         let unbounded_fields = get_fields(&unbounded_schema);
 
-        let bounded_column_names: Vec<String> = bounded_fields
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
-        let unbounded_column_names: Vec<String> = unbounded_fields
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
+        let bounded_column_names: Vec<String> =
+            bounded_fields.iter().map(|f| f.name().clone()).collect();
+        let unbounded_column_names: Vec<String> =
+            unbounded_fields.iter().map(|f| f.name().clone()).collect();
         debug!(
             "Hybrid source schema validation - bounded source columns ({}): {:?}",
             bounded_column_names.len(),
@@ -508,28 +524,68 @@ impl HybridTableProvider {
             unbounded_column_names
         );
 
-        for (col_name, col_type) in &unbounded_fields {
-            match bounded_fields.iter().find(|(name, _)| name == col_name) {
-                Some((_, bounded_type)) => {
-                    if !Self::is_compatible_data_type(bounded_type, col_type) {
+        for unbounded_field in &unbounded_fields {
+            match bounded_fields
+                .iter()
+                .find(|f| f.name() == unbounded_field.name())
+            {
+                Some(bounded_field) => {
+                    let compatible = Self::is_compatible_data_type(
+                        bounded_field.data_type(),
+                        unbounded_field.data_type(),
+                    ) || Self::clickhouse_reads_as_decimal_arb(
+                        bounded_field.data_type(),
+                        unbounded_field,
+                    );
+                    if !compatible {
                         streamling_user_bail!(
                             "column '{}' type mismatch: bounded source has {:?}, unbounded source has {:?}",
-                            col_name,
-                            bounded_type,
-                            col_type
+                            unbounded_field.name(),
+                            bounded_field.data_type(),
+                            unbounded_field.data_type()
                         );
                     }
                 }
                 None => {
                     streamling_user_bail!(
                         "unbounded source column '{}' not found in bounded source",
-                        col_name
+                        unbounded_field.name()
                     );
                 }
             }
         }
 
         Ok(unbounded_schema)
+    }
+
+    /// A bounded ClickHouse column whose unbounded (target) field is
+    /// `decimal_arb` is fetched in one of three encodings, each reinterpreted
+    /// into decimal_arb by `normalize_batch_from_clickhouse`:
+    /// - native `UInt256`/`Int256` → Arrow `FixedSizeBinary(32)` (only when the
+    ///   target carries a `native_int_kind` hint),
+    /// - native `Decimal(p, s)` → Arrow `Decimal128`/`Decimal256` (the band
+    ///   within the Decimal cap, which the sink itself writes that way), or
+    /// - canonical decimal text → `Utf8`/`LargeUtf8` (the wide / `coerce_to:
+    ///   string` path that has no native ClickHouse numeric type).
+    ///
+    /// Each is compatible with the `decimal_arb` `LargeBinary` target.
+    fn clickhouse_reads_as_decimal_arb(
+        bounded_type: &arrow_schema::DataType,
+        unbounded_field: &Field,
+    ) -> bool {
+        use arrow_schema::DataType;
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        if !DecimalArbType::is_decimal_arb_field(unbounded_field) {
+            return false;
+        }
+        match bounded_type {
+            DataType::FixedSizeBinary(32) => {
+                DecimalArbType::native_int_kind_from_field(unbounded_field).is_some()
+            }
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => true,
+            DataType::Utf8 | DataType::LargeUtf8 => true,
+            _ => false,
+        }
     }
 
     fn is_compatible_data_type(
@@ -925,7 +981,7 @@ impl TableProvider for HybridTableProvider {
             projection.cloned(),
             filters.to_vec(),
             limit,
-        )))
+        )?))
     }
 }
 
@@ -934,6 +990,12 @@ pub struct HybridSourceExec {
     inner: Arc<dyn ExecutionPlan>,
     provider: HybridTableProvider,
     cached_properties: Arc<PlanProperties>,
+    /// The schema this exec actually emits: the provider schema with the
+    /// pushed-down projection applied. Reporting the full provider schema
+    /// while a projection is in force makes DataFusion pair projection
+    /// expressions against full-schema fields by index and fail planning
+    /// ("Input field name X does not match with the projection expression Y").
+    schema: SchemaRef,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -946,7 +1008,12 @@ impl HybridSourceExec {
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
         limit: Option<usize>,
-    ) -> Self {
+    ) -> DataFusionResult<Self> {
+        let schema: SchemaRef = match projection.as_ref() {
+            Some(indices) => Arc::new(provider.schema.project(indices)?),
+            None => provider.schema.clone(),
+        };
+
         // The plan's width is the unbounded phase's, NOT the current phase's.
         // A plan is partitioned once and keeps that width for its lifetime, so
         // it cannot narrow to the single-stream ClickHouse replay and widen
@@ -955,7 +1022,7 @@ impl HybridSourceExec {
         // followers idle (carrying checkpoint markers only) until the unbounded
         // phase starts.
         let cached_properties = PlanProperties::new(
-            EquivalenceProperties::new(provider.schema.clone()),
+            EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(provider.unbounded_parallelism.max(1)),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Unbounded {
@@ -963,15 +1030,59 @@ impl HybridSourceExec {
             },
         );
 
-        Self {
+        Ok(Self {
             inner,
             provider,
             cached_properties: Arc::new(cached_properties),
+            schema,
             projection,
             filters,
             limit,
-        }
+        })
     }
+}
+
+/// Align a batch to `target` by selecting the target's columns by NAME.
+///
+/// Inner phase plans do not reliably honor the projection pushed into the
+/// hybrid scan (the bounded ClickHouse provider ignores it entirely and emits
+/// every column, in ClickHouse DESCRIBE order rather than the hybrid/Kafka
+/// schema order), so the hybrid exec — which declares `target` as its output
+/// schema — must reshape each batch itself. Name-based selection is
+/// deliberately insensitive to both column order and extra columns.
+fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> DataFusionResult<RecordBatch> {
+    let batch_schema = batch.schema();
+    // Fast path: already the exact target shape (names, in order).
+    if batch_schema.fields().len() == target.fields().len()
+        && batch_schema
+            .fields()
+            .iter()
+            .zip(target.fields())
+            .all(|(a, b)| a.name() == b.name())
+    {
+        return Ok(batch.clone());
+    }
+
+    let indices = target
+        .fields()
+        .iter()
+        .map(|field| {
+            batch_schema.index_of(field.name()).map_err(|_| {
+                DataFusionError::from(streamling_err!(
+                    "hybrid source: column '{}' required by the query is missing from an \
+                     inner phase batch (batch columns: {:?})",
+                    field.name(),
+                    batch_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                ))
+            })
+        })
+        .collect::<DataFusionResult<Vec<usize>>>()?;
+
+    batch.project(&indices).map_err(Into::into)
 }
 
 impl DisplayAs for HybridSourceExec {
@@ -992,7 +1103,7 @@ impl ExecutionPlan for HybridSourceExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.provider.schema.clone()
+        self.schema.clone()
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1016,7 +1127,7 @@ impl ExecutionPlan for HybridSourceExec {
             self.projection.clone(),
             self.filters.clone(),
             self.limit,
-        )))
+        )?))
     }
 
     fn execute(
@@ -1075,7 +1186,8 @@ impl ExecutionPlan for HybridSourceExec {
         // to stay responsive to shutdown (same pattern as
         // `ClickHouseSourceExec::execute`'s `checkpointing_task`).
         let pending_for_drain = pending_markers.clone();
-        let forwarder_handle = tokio::spawn(async move {
+        let scope = provider.scope.clone();
+        let forwarder_handle = scope.spawn(async move {
             loop {
                 let rx = hybrid_marker_rx.clone();
                 let recv = tokio::task::spawn_blocking(move || {
@@ -1147,7 +1259,7 @@ impl ExecutionPlan for HybridSourceExec {
         let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
             let provider_for_shutdown = provider.clone();
             let ref_name = reference_name_for_spawn.clone();
-            tokio::spawn(async move {
+            scope.spawn(async move {
                 while !*sd.borrow() {
                     if sd.changed().await.is_err() {
                         return;
@@ -1161,7 +1273,7 @@ impl ExecutionPlan for HybridSourceExec {
             })
         });
 
-        tokio::spawn(async move {
+        scope.spawn(async move {
             // Only partition 0 drives the phase machine. `current_phase` is one
             // scalar behind one lock, and `advance_to_next_phase` seeds the
             // Kafka offsets exactly once at the handoff — N advancers would
@@ -1169,7 +1281,6 @@ impl ExecutionPlan for HybridSourceExec {
             // already moved past the seeded offsets. The followers are Kafka
             // consumer instances of the unbounded phase and nothing else.
             let is_phase_driver = partition == 0;
-
             // Every exit path from the loop falls through to the
             // post-loop teardown below — `break 'outer` is used uniformly
             // (instead of `return`) so the forwarder is signalled to
@@ -1272,6 +1383,18 @@ impl ExecutionPlan for HybridSourceExec {
                     };
                     match batch_result {
                         Ok(batch) => {
+                            // Inner phases do not reliably honor the pushed-down
+                            // projection (the bounded ClickHouse scan ignores it
+                            // and emits every column, in ClickHouse order), so
+                            // align each batch to the declared (projected)
+                            // schema by name before anything downstream sees it.
+                            let batch = match align_batch_to_schema(&batch, &schema_for_main) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    break 'outer;
+                                }
+                            };
                             // Bounded sources (ClickHouse) emit u256/i256 columns as
                             // FixedSizeBinary(32) without extension metadata and in
                             // little-endian. Reverse the bytes and adopt the target
@@ -1610,25 +1733,10 @@ fn merge_pending_markers(
     }
 }
 
-/// The bound on how long a completing source waits for the terminal checkpoint
-/// to finalize. On timeout the terminal Finalizer is SKIPPED (never emitted
-/// for an unconfirmed epoch — see `emit_terminal_checkpoint`); this bound only
-/// keeps a sink that never acks from hanging the source task.
-///
-/// Derived from the run loop's shared shutdown budget
-/// (`streamling_core::shutdown::shutdown_budget`, the same value the watchdog
-/// is armed with), minus a margin so this wait always expires BEFORE the
-/// watchdog hard-exits the process. The minimum-floor is itself capped at
-/// budget − 2s so a deliberately tiny budget can never invert the invariant:
-/// for budgets ≤ 2s the timeout collapses to zero, which expires immediately
-/// and takes the safe branch (Finalizer skipped).
-fn terminal_checkpoint_finalize_timeout() -> Duration {
-    const MARGIN_SECS: u64 = 10;
-    const MIN_TIMEOUT_SECS: u64 = 5;
-    let budget = streamling_core::shutdown::shutdown_budget().as_secs();
-    let capped_floor = MIN_TIMEOUT_SECS.min(budget.saturating_sub(2));
-    Duration::from_secs(budget.saturating_sub(MARGIN_SECS).max(capped_floor))
-}
+// The finalize-timeout bound lives in `streamling_core::shutdown`
+// (`terminal_checkpoint_finalize_timeout`) so every terminal-checkpoint
+// emitter (this source and the Kafka streaming shutdown path) shares it.
+use streamling_core::shutdown::terminal_checkpoint_finalize_timeout;
 
 /// Emit the terminal checkpoint round-trip inline on the data stream, so both
 /// the marker and the finalizer keep a consistent cut and reach inline
@@ -1671,35 +1779,8 @@ async fn emit_terminal_checkpoint(
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
     // here does not block their consumption of the marker batch.
-    //
-    // How long to wait depends on WHY we are completing:
-    // - Shutdown requested (SIGTERM): the watchdog is armed, so the wait must
-    //   be bounded under the shutdown budget.
-    // - Natural job-mode completion: no deadline is running, and in a
-    //   multi-source job the shared terminal epoch cannot finalize until the
-    //   SLOWEST branch completes and its sinks ack — sibling skew can
-    //   legitimately exceed any SIGTERM-sized budget. Wait until finalized or
-    //   until a shutdown request arrives (then fall back to the bounded wait).
-    //   A sink wedged forever with no shutdown request keeps the pipeline
-    //   alive-but-stalled, exactly as an unacked epoch does on main; the
-    //   operator-initiated SIGTERM then drains it under the budget.
-    let mut shutdown = streamling_core::shutdown::subscribe();
-    let finalize_timeout = terminal_checkpoint_finalize_timeout();
-    let finalized = if *shutdown.borrow() {
-        tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
-            .await
-            .is_ok()
-    } else {
-        tokio::select! {
-            _ = control.await_terminal_finalized() => true,
-            _ = shutdown.changed() => {
-                tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
-                    .await
-                    .is_ok()
-            }
-        }
-    };
-    if !finalized {
+    if !control.await_terminal_finalized_on_completion().await {
+        let finalize_timeout = terminal_checkpoint_finalize_timeout();
         // At least one live sink never confirmed its writes. Do NOT emit the
         // Finalizer: it tells inline consumers to commit/truncate past the
         // terminal epoch, and doing that for an epoch that never finalized
@@ -1763,7 +1844,10 @@ async fn flush_pending_to_synth_batch(
     // Finalizer twice (once forwarded from the checkpoint channel by the
     // forwarder task, once pushed inline by `emit_terminal_checkpoint`).
     // Consumers are idempotent for duplicate Finalizers, but there is no
-    // reason to make them exercise that property.
+    // reason to make them exercise that property. Note the dedup is
+    // PER-CALL only — a marker flushed here and again by a later call is
+    // not caught, so consumer idempotency stays the contract; this filter
+    // is a courtesy, not a delivery guarantee.
     let mut seen_marker = HashSet::new();
     let mut seen_finalizer = HashSet::new();
     let to_flush: Vec<CheckpointMessage> = drained
@@ -1875,8 +1959,105 @@ impl ClickHouseSchemaAdapter {
         Ok(columns)
     }
 
+    /// Directive-aware top-level type-mapping entry point for the
+    /// Hybrid connector (ClickHouse-backed).
+    ///
+    /// Mirrors [`ClickHouseClient::clickhouse_column_type`] but tags the
+    /// capability lookup with [`ConnectorKind::Hybrid`] so error messages
+    /// surface the right connector to the user.
+    ///
+    /// Returns:
+    /// - `Ok("Decimal(p, s)")` for `decimal_arb` columns where the
+    ///   declared precision (≤76) fits ClickHouse's native decimal range.
+    /// - `Ok("String")` for wider `decimal_arb` columns when the user has
+    ///   set `coerce_to: string` on this column (an explicit opt-in).
+    /// - `Err(...)` for wider `decimal_arb` columns without the opt-in
+    ///   (the pipeline is rejected at config load with an actionable
+    ///   error naming the column, the destination, the declared
+    ///   `(precision, scale)`, and the remediation hint).
+    /// - For all other types, delegates to
+    ///   [`ClickHouseClient::arrow_field_to_clickhouse`].
+    ///
+    /// Short-circuits before the `LargeBinary` fallback inside
+    /// `arrow_field_to_clickhouse` so wide-precision decimal_arb columns
+    /// never silently route to `String`.
+    ///
+    /// Currently only consumed by unit tests; the pipeline-startup
+    /// validator wiring is a deferred follow-up tracked alongside
+    /// `clickhouse_column_type`.
+    #[allow(dead_code)]
+    pub fn hybrid_column_type(
+        field: &arrow::datatypes::Field,
+        directive: Option<&streamling_config::ColumnDirective>,
+    ) -> std::result::Result<String, StreamlingError> {
+        use streamling_core::types::decimal_arb_capability::{
+            CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
+        };
+
+        if let Some((precision, scale)) =
+            streamling_core::types::decimal_arb::DecimalArbType::precision_scale_from_field(field)
+        {
+            use streamling_core::types::decimal_arb::NativeIntKind;
+            let coerce_to_string = directive.map(|d| d.coerces_to_string()).unwrap_or(false);
+            let native_int_kind =
+                streamling_core::types::decimal_arb::DecimalArbType::native_int_kind_from_field(
+                    field,
+                );
+            let ch_type = match capability_for_decimal_arb(
+                ConnectorKind::Hybrid,
+                precision,
+                scale,
+                coerce_to_string,
+                native_int_kind,
+            ) {
+                CapabilityResult::Native => match native_int_kind {
+                    Some(NativeIntKind::U256) if scale == 0 => "UInt256".to_string(),
+                    Some(NativeIntKind::I256) if scale == 0 => "Int256".to_string(),
+                    _ => format!("Decimal({}, {})", precision, scale),
+                },
+                CapabilityResult::OptInOnly(_) => "String".to_string(),
+                CapabilityResult::Reject(reason) => {
+                    return Err(config_load_error(
+                        field.name(),
+                        ConnectorKind::Hybrid,
+                        precision,
+                        scale,
+                        &reason,
+                    ));
+                }
+            };
+            // Same Nullable(...) rule as every other column type.
+            return Ok(ClickHouseClient::nullable_wrapped(field, ch_type));
+        }
+
+        // Non-decimal_arb fields: delegate to the existing ClickHouse
+        // mapping which covers every Arrow type the Hybrid sink supports.
+        Ok(ClickHouseClient::arrow_field_to_clickhouse(field))
+    }
+
+    /// ClickHouse type to CAST a bounded-source column to so it lines up with
+    /// the target (unbounded) field. A `decimal_arb` target carrying a
+    /// `native_int_kind` hint reads through `String`: the hint says how a sink
+    /// *writes* the column, not what the history table holds — a Kafka
+    /// `decimal(100, 0)` stream is hinted `u256` while its ClickHouse history
+    /// may be `Int256`, `Decimal(100, 0)` or `String`, and the `FORMAT Arrow`
+    /// probe cannot tell those apart — and `CAST(x AS UInt256)` on an `Int256`
+    /// column wraps every negative value to 2^256 − |x| inside ClickHouse,
+    /// before a byte reaches us. Decimal text is exact for every numeric
+    /// column type, and `normalize_batch_from_clickhouse` parses it back at
+    /// the target's scale. Every other field keeps the
+    /// `arrow_field_to_clickhouse` mapping: a decimal_arb within the Decimal
+    /// cap reads as `Decimal(p, s)`, a wider one without a hint as `String`.
+    fn clickhouse_read_type(target_field: &Field) -> String {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        if DecimalArbType::native_int_kind_from_field(target_field).is_some() {
+            return "String".to_string();
+        }
+        ClickHouseClient::arrow_field_to_clickhouse(target_field)
+    }
+
     fn convert_field_type(table_field: &Field, target_field: &Field) -> String {
-        let mut clickhouse_type = ClickHouseClient::arrow_field_to_clickhouse(target_field);
+        let mut clickhouse_type = Self::clickhouse_read_type(target_field);
         let can_be_nullable = !clickhouse_type.starts_with("Array(")
             && !clickhouse_type.starts_with("Tuple(")
             && !clickhouse_type.starts_with("Map(");
@@ -2096,6 +2277,53 @@ mod tests {
         });
 
     #[test]
+    fn clickhouse_reads_as_decimal_arb_accepts_the_native_decimal_band() {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        // The sink writes a decimal_arb within the Decimal cap as a native
+        // Decimal(p, s); reading that history back must be admitted.
+        let narrow = DecimalArbType::field("amount", 20, 2, true).unwrap();
+        assert!(HybridTableProvider::clickhouse_reads_as_decimal_arb(
+            &DataType::Decimal128(20, 2),
+            &narrow
+        ));
+        assert!(HybridTableProvider::clickhouse_reads_as_decimal_arb(
+            &DataType::Decimal256(76, 18),
+            &narrow
+        ));
+        assert!(!HybridTableProvider::clickhouse_reads_as_decimal_arb(
+            &DataType::Int64,
+            &narrow
+        ));
+    }
+
+    #[test]
+    fn clickhouse_read_type_reads_a_hinted_wide_int_as_text() {
+        use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+        // The hint says how a sink writes the column; the history table of a
+        // u256-hinted `decimal(100, 0)` stream may well be Int256, and
+        // `CAST(x AS UInt256)` wraps its negatives inside ClickHouse.
+        let hinted = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("amount", 100, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::clickhouse_read_type(&hinted),
+            "String"
+        );
+        let narrow = DecimalArbType::field("amount", 76, 18, true).unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::clickhouse_read_type(&narrow),
+            "Decimal(76, 18)"
+        );
+        let wide = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::clickhouse_read_type(&wide),
+            "String"
+        );
+    }
+
+    #[test]
     fn convert_field_type_casts_numeric_to_target_type() {
         let source = Field::new("src_block", DataType::UInt64, false);
         let target = Field::new("block", DataType::Int64, false);
@@ -2175,6 +2403,82 @@ mod tests {
             expr,
             "CAST(toDecimal256(`src_amount`, 0) AS String) AS `amount_big`"
         );
+    }
+
+    // ------- hard-rejection: hybrid_column_type -------
+
+    #[test]
+    fn hybrid_column_type_native_for_decimal_arb_within_cap() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 50, 5, false)
+                .unwrap();
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
+        assert_eq!(out, "Decimal(50, 5)");
+    }
+
+    #[test]
+    fn hybrid_column_type_keeps_nullability_for_decimal_arb() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 50, 5, true)
+                .unwrap();
+        assert_eq!(
+            ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap(),
+            "Nullable(Decimal(50, 5))"
+        );
+    }
+
+    #[test]
+    fn hybrid_column_type_rejects_wide_decimal_arb_without_opt_in() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let err = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("amount"), "error must name the column: {msg}");
+        // ConnectorKind::Hybrid Display is "hybrid"; the Hybrid sink is
+        // ClickHouse-backed so either identifier is acceptable, but at
+        // minimum the connector name must surface to the user.
+        assert!(
+            msg.contains("hybrid") || msg.contains("clickhouse"),
+            "error must identify the connector: {msg}"
+        );
+        assert!(
+            msg.contains("76"),
+            "error must mention the 76-digit cap: {msg}"
+        );
+        assert!(
+            msg.contains("coerce_to: string"),
+            "error must point at the remediation: {msg}"
+        );
+    }
+
+    #[test]
+    fn hybrid_column_type_routes_to_string_with_opt_in() {
+        let field =
+            streamling_core::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false)
+                .unwrap();
+        let directive = streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        };
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, Some(&directive)).unwrap();
+        assert_eq!(out, "String");
+    }
+
+    #[test]
+    fn hybrid_column_type_passes_non_decimal_arb_through() {
+        // Hybrid (ClickHouse-backed) maps Boolean to UInt8 via the
+        // existing `arrow_field_to_clickhouse` helper. The directive-aware
+        // wrapper must delegate to it for non-decimal_arb fields.
+        let field = Field::new("flag", DataType::Boolean, false);
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
+        let baseline = ClickHouseClient::arrow_field_to_clickhouse(&field);
+        assert_eq!(out, baseline);
+
+        // Existing Decimal128 path: the wrapper delegates correctly.
+        let field = Field::new("price", DataType::Decimal128(20, 5), false);
+        let out = ClickHouseSchemaAdapter::hybrid_column_type(&field, None).unwrap();
+        assert_eq!(out, "Decimal(20, 5)");
     }
 
     #[test]
@@ -2933,6 +3237,268 @@ mod tests {
             state.completed_phases.iter().all(|&c| c),
             "All bounded phases should be marked complete"
         );
+    }
+
+    /// A bounded phase that behaves like the real ClickHouse provider: its
+    /// scan IGNORES the pushed-down projection and emits one full-width batch
+    /// whose column order differs from the hybrid (unbounded/Kafka) schema.
+    #[derive(Debug)]
+    struct ReorderedBatchMockProvider {
+        schema: SchemaRef,
+        partitions: usize,
+    }
+
+    impl ReorderedBatchMockProvider {
+        /// Schema is create_test_schema() reversed: [name, id] vs [id, name].
+        fn new() -> Self {
+            Self::wide(1)
+        }
+
+        /// Same, but every one of `partitions` output partitions emits the batch.
+        fn wide(partitions: usize) -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![
+                    Field::new("name", DataType::Utf8, false),
+                    Field::new("id", DataType::Int32, false),
+                ])),
+                partitions,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for ReorderedBatchMockProvider {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ReorderedBatchMockExec {
+                schema: self.schema.clone(),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(self.schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(self.partitions),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }))
+        }
+    }
+
+    /// Emits exactly one [name, id] batch, then ends.
+    #[derive(Debug)]
+    struct ReorderedBatchMockExec {
+        schema: SchemaRef,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ReorderedBatchMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ReorderedBatchMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ReorderedBatchMockExec {
+        fn name(&self) -> &str {
+            "ReorderedBatchMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            use datafusion::arrow::array::{Int32Array, StringArray};
+            let batch = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "b"])),
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                ],
+            )
+            .expect("mock batch must build");
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::once(async move { Ok(batch) }),
+                ),
+            ))
+        }
+    }
+
+    /// Reproduces the production planner assertion ("Input field name
+    /// reward_type does not match with the projection expression
+    /// block_timestamp"): a scan given a projection must report the PROJECTED
+    /// schema. Reporting the provider's full schema makes DataFusion pair
+    /// projection expressions against full-schema fields by index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_with_projection_reports_projected_schema() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend("test_scan_projection_schema").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_scan_projection_schema".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let expected = Arc::new(create_test_schema().project(&projection).unwrap());
+        assert_eq!(
+            plan.schema(),
+            expected,
+            "plan must report the projected schema, not the full provider schema"
+        );
+    }
+
+    /// The bounded ClickHouse provider ignores the pushed-down projection and
+    /// emits full-width batches in ITS OWN column order. The hybrid exec must
+    /// still deliver batches shaped exactly like its declared (projected)
+    /// schema, aligning columns by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_with_projection_aligns_reordered_phase_batches() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(ReorderedBatchMockProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend("test_execute_projection_align").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_execute_projection_align".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let context = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        let batches: Vec<_> = stream.collect().await;
+
+        let expected_schema = Arc::new(create_test_schema().project(&projection).unwrap());
+        let mut saw_data = false;
+        for batch in batches {
+            let batch = batch.expect("stream batch should not be an error");
+            if batch.num_rows() == 0 {
+                continue; // synthetic marker-flush batches are empty
+            }
+            saw_data = true;
+            assert_eq!(
+                batch.schema(),
+                expected_schema,
+                "batches must match the declared projected schema"
+            );
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("projected column must be the utf8 'name' column");
+            assert_eq!(names.value(0), "a");
+            assert_eq!(names.value(1), "b");
+        }
+        assert!(saw_data, "the bounded phase's batch must be forwarded");
+    }
+
+    /// Follower partitions (1..N) forward the unbounded phase's batches through
+    /// the same projection alignment as partition 0. Without it, a projected
+    /// scan of a wide hybrid would emit full-width batches on every partition
+    /// but the first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_partition_aligns_unbounded_batches_to_the_projection() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(ReorderedBatchMockProvider::wide(3)),
+            offset_provider: None,
+            job_mode: false,
+        };
+        let state_backend = create_state_backend("hybrid_parallelism_projection").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_parallel_projection".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+        .with_unbounded_parallelism(3);
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let context = Arc::new(TaskContext::default());
+        let streams: Vec<_> = (0..3)
+            .map(|p| plan.execute(p, context.clone()).expect("execute"))
+            .collect();
+
+        let expected_schema = Arc::new(create_test_schema().project(&projection).unwrap());
+        for (p, stream) in streams.into_iter().enumerate() {
+            let batches = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+                .await
+                .unwrap_or_else(|_| panic!("partition {p} never ended"));
+            let data: Vec<_> = batches
+                .into_iter()
+                .map(|b| b.unwrap_or_else(|e| panic!("partition {p} produced an error: {e}")))
+                .filter(|b| b.num_rows() > 0)
+                .collect();
+            assert_eq!(
+                data.len(),
+                1,
+                "partition {p} must forward its unbounded batch"
+            );
+            assert_eq!(
+                data[0].schema(),
+                expected_schema,
+                "partition {p} must emit the declared projected schema"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

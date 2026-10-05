@@ -6,10 +6,9 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use streamling_core::checkpoints::channels::send;
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
-    report_marker_at_sink, send_checkpoint_ack,
+    CheckpointMessage, extract_checkpoint_messages, now_ms, report_marker_at_sink,
+    send_checkpoint_ack,
 };
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
 use streamling_core::streamling_err;
@@ -57,7 +56,6 @@ pub struct BatchProcessorContext {
     pub primary_key_indices: Vec<usize>,
     pub column_names: Vec<String>,
     pub column_indices: Vec<usize>,
-    pub source_name: String,
     pub node_label: String,
     pub records_processed: Arc<Mutex<u64>>,
     pub num_records_before_stop: Option<u64>,
@@ -201,11 +199,18 @@ async fn execute_delete_slice(
         return Ok(());
     }
 
+    // Same casts as the INSERT path: a text-bound key (UInt64, Decimal,
+    // decimal_arb) needs `::numeric(p, s)` or Postgres rejects the statement.
+    let cast_map = PostgresQueryBuilder::build_cast_map(
+        &context.original_schema,
+        &context.primary_key_columns,
+    );
     let query = PostgresQueryBuilder::build_delete_query(
         &context.schema_name,
         &context.table,
         &context.primary_key_columns,
         slice.num_rows(),
+        &cast_map,
     );
 
     let columns: Vec<_> = (0..slice.num_columns())
@@ -359,11 +364,10 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
             context.table,
         );
         if current_count >= limit {
-            let source_name = context.source_name.clone();
-            let _ = send(
-                CHECKPOINT_COORDINATOR_CHANNEL,
-                CheckpointMessage::SourceComplete(source_name),
-            );
+            // Record-limit reached: request process-wide graceful shutdown so
+            // every source drains and ends its stream — the same path SIGTERM
+            // takes (test-only mode).
+            streamling_core::shutdown::request_shutdown();
             Ok(false)
         } else {
             Ok(true)
@@ -403,7 +407,6 @@ mod tests {
             primary_key_indices: vec![0],
             column_names: vec!["id".to_string(), "name".to_string()],
             column_indices: vec![0, 1],
-            source_name: "test".to_string(),
             node_label: "postgres sink 'test_sink'".to_string(),
             records_processed: Arc::new(Mutex::new(0u64)),
             num_records_before_stop: None,
@@ -445,7 +448,6 @@ mod tests {
             primary_key_indices: vec![],
             column_names: vec!["id".to_string()],
             column_indices: vec![0],
-            source_name: "test".to_string(),
             node_label: "postgres sink 'test_sink'".to_string(),
             records_processed: Arc::new(Mutex::new(0u64)),
             num_records_before_stop: None,

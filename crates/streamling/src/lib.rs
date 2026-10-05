@@ -7,14 +7,14 @@ use datafusion::datasource::{ViewTable, provider_as_source};
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, dml::InsertOp};
 use datafusion::physical_plan::{collect, displayable};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use streamling_config::AppConfig;
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
 use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
-use streamling_connectors::table_providers::file::{
-    FileSourceTableProvider, build_bounded_file_source_provider,
-};
+use streamling_connectors::table_providers::file::{FileSourceReadMode, FileSourceTableProvider};
 use streamling_connectors::table_providers::http::HttpTableProvider;
 use streamling_connectors::table_providers::hybrid::HybridTableProvider;
 use streamling_connectors::table_providers::kafka::{KafkaFormat, KafkaSourceTableProvider};
@@ -22,7 +22,9 @@ use streamling_connectors::table_providers::memory::MemoryTableProvider;
 use streamling_connectors::table_providers::postgres::PostgresSinkTableProvider;
 use streamling_connectors::table_providers::postgres::query_builder::validate_update_where;
 use streamling_connectors::table_providers::print::PrintTableProvider;
-use streamling_core::checkpoints::checkpoint_management::CheckpointCoordinator;
+use streamling_core::checkpoints::checkpoint_management::{
+    CheckpointControl, CheckpointCoordinator,
+};
 use streamling_core::error::{Result, ResultExt};
 use streamling_core::node_context::{NodeContext, TopologyNodeType, init_node_registry};
 use streamling_core::operators::broadcast::{MultiSinkEntry, MultiSinkLogicalNode};
@@ -66,8 +68,8 @@ use streamling_core::plugin::side_output::{
 };
 use streamling_core::plugin::table_provider::{PluginSinkProvider, PluginSourceProvider};
 use streamling_core::plugin::{
-    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, ExecutionFuture, InitializedPlugin,
-    create_sink_plugin, create_source_plugin, create_transform_plugin, terminate_all_plugins,
+    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, InitializedPlugin, create_sink_plugin,
+    create_source_plugin, create_transform_plugin, terminate_all_plugins,
 };
 use streamling_core::side_output::SupportsSideOutputs;
 use streamling_core::sql_parse::extract_table_references_from_sql;
@@ -397,6 +399,299 @@ fn secret_name_to_resolve(secret_name: Option<&str>, dry_run: bool) -> Option<&s
     if dry_run { None } else { secret_name }
 }
 
+/// Caps the burst of schema-registry fetches and ClickHouse probes a wide
+/// topology fires at startup.
+const MAX_CONCURRENT_SOURCE_BUILDS: usize = 8;
+
+/// A source provider built ahead of registration by [`build_source_providers`].
+///
+/// Owned rather than `Arc`ed, because registration still applies the by-value
+/// builders (`with_scope`, `with_checkpoint_control`, `with_shutdown`) and
+/// wraps the result itself; only the constructor moves off the sequential
+/// path. Boxed to keep the variants a uniform size (`large_enum_variant`).
+///
+/// Plugin sources are not prepared: their construction is a fast FFI call into
+/// process-wide registries, so it stays sequential.
+enum PreparedSource {
+    Kafka(Box<KafkaSourceTableProvider>),
+    Clickhouse(Box<ClickHouseTableProvider>),
+    Hybrid(Box<HybridTableProvider>),
+    File(Arc<dyn TableProvider>),
+}
+
+impl PreparedSource {
+    fn into_kafka(self) -> Option<KafkaSourceTableProvider> {
+        match self {
+            PreparedSource::Kafka(provider) => Some(*provider),
+            _ => None,
+        }
+    }
+
+    fn into_clickhouse(self) -> Option<ClickHouseTableProvider> {
+        match self {
+            PreparedSource::Clickhouse(provider) => Some(*provider),
+            _ => None,
+        }
+    }
+
+    fn into_hybrid(self) -> Option<HybridTableProvider> {
+        match self {
+            PreparedSource::Hybrid(provider) => Some(*provider),
+            _ => None,
+        }
+    }
+
+    fn into_file(self) -> Option<Arc<dyn TableProvider>> {
+        match self {
+            PreparedSource::File(provider) => Some(provider),
+            _ => None,
+        }
+    }
+}
+
+/// Runs a synchronous source constructor on the blocking pool.
+///
+/// The Kafka, ClickHouse and hybrid constructors block internally (`block_on`
+/// around the schema-registry fetch and the ClickHouse probes), which is
+/// harmless on a blocking thread and keeps them off the runtime workers.
+///
+/// No `ComponentScope`: the join handle is awaited here, so nothing outlives
+/// the call for the drain ladder to track.
+async fn build_source_blocking<F>(ctx: String, build: F) -> Result<PreparedSource>
+where
+    F: FnOnce() -> Result<PreparedSource> + Send + 'static,
+{
+    tokio::task::spawn_blocking(build)
+        .await
+        .map_err(|e| streamling_err!("{}: source construction task failed: {}", ctx, e))?
+}
+
+/// Builds the non-plugin source providers of `topology` concurrently.
+///
+/// Construction is where startup talks to the outside world: a schema-registry
+/// fetch per Kafka phase and several ClickHouse probes per bounded phase, each
+/// a blocking round trip. Sequentially a six-source pipeline paid for ~30 of
+/// them before planning started; here it pays for the slowest source.
+///
+/// Failures are reported in source-name order, so which error a broken
+/// topology surfaces does not depend on scheduling.
+#[allow(clippy::too_many_arguments)]
+async fn build_source_providers(
+    topology: &PipelineTopology,
+    node_contexts: &HashMap<String, NodeContext>,
+    app_config: &AppConfig,
+    application_id: &str,
+    state_backend_factory: &Arc<StateBackendFactories>,
+    session_manager: &SessionManager,
+    shutdown_controller: &streamling_core::shutdown::ShutdownController,
+    checkpoint_control: &CheckpointControl,
+) -> Result<HashMap<String, PreparedSource>> {
+    use futures::StreamExt as _;
+
+    type BuildFuture = Pin<Box<dyn Future<Output = Result<PreparedSource>>>>;
+
+    // Name order, so the synchronous validation below also fails predictably.
+    let mut source_names: Vec<&String> = topology.sources.keys().collect();
+    source_names.sort();
+
+    let mut builds: Vec<(String, BuildFuture)> = Vec::new();
+    for reference_name in source_names {
+        let source = &topology.sources[reference_name];
+        let ctx = node_contexts
+            .get(reference_name)
+            .expect("node context must exist")
+            .format();
+        let name = reference_name.clone();
+        let build: BuildFuture = match source {
+            topology::Source::kafka(kafka) => {
+                let record_batch_interval_ms =
+                    parse_batch_flush_interval(&kafka.batch_flush_interval, reference_name)?
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(app_config.record_batch_interval_ms);
+                let record_batch_size = kafka.batch_size.unwrap_or(app_config.record_batch_size);
+                let data_format: KafkaFormat =
+                    kafka.data_format.as_deref().unwrap_or("avro").parse()?;
+                let kafka = kafka.clone();
+                let metric_id = metric_key(application_id, reference_name.as_str());
+                let kafka_config = app_config.kafka_source.clone();
+                let state_backend =
+                    state_backend_factory.create(app_config.state_backend_namespace());
+                let session_manager = session_manager.clone();
+                let internal_buffer_size = app_config.internal_buffer_size;
+                Box::pin(build_source_blocking(ctx.clone(), move || {
+                    KafkaSourceTableProvider::new(
+                        name,
+                        metric_id,
+                        kafka_config,
+                        kafka.topic,
+                        kafka.starting_offsets,
+                        kafka.filter,
+                        record_batch_interval_ms,
+                        record_batch_size,
+                        internal_buffer_size,
+                        kafka.include_metadata.unwrap_or(false),
+                        state_backend,
+                        session_manager,
+                        kafka.validate_writer_schema_ordering.unwrap_or(true),
+                        kafka.schema_id_overrides.unwrap_or_default(),
+                        kafka.skip_schema_resolution.unwrap_or(false),
+                        kafka
+                            .skip_schema_resolution_for_reader_schema_ids
+                            .unwrap_or_default(),
+                        data_format,
+                        kafka.schema,
+                        kafka.parallelism.unwrap_or(1),
+                    )
+                    // Convert via `StreamlingError::from` (not `streamling_with_context`)
+                    // so a user-facing schema error (e.g. unsupported JSON dtype) is
+                    // recovered from the `DataFusionError::External` wrapper and stays
+                    // user-facing. Otherwise `--validate` would misreport it as internal.
+                    .map_err(|e| {
+                        streamling_core::error::StreamlingError::from(e)
+                            .context(format!("{}: failed to create Kafka source", ctx))
+                    })
+                    .map(|provider| PreparedSource::Kafka(Box::new(provider)))
+                }))
+            }
+            topology::Source::clickhouse(clickhouse) => {
+                let start_at: Option<Vec<ScalarValue>> = clickhouse
+                    .start_at
+                    .clone()
+                    .map(|start_at| start_at.split(',').map(ScalarValue::from).collect());
+                let columns: Option<Vec<String>> = clickhouse
+                    .columns
+                    .clone()
+                    .map(|columns| columns.split(',').map(|s| s.to_string()).collect());
+                let table_name = clickhouse.table_name.clone();
+                let filter = clickhouse.filter.clone();
+                let metric_id = metric_key(application_id, reference_name.as_str());
+                let config = app_config.clickhouse_source.clone();
+                let state_backend =
+                    state_backend_factory.create(app_config.state_backend_namespace());
+                let internal_buffer_size = app_config.internal_buffer_size.as_usize();
+                let record_batch_size = app_config.record_batch_size as usize;
+                Box::pin(build_source_blocking(ctx, move || {
+                    let provider = ClickHouseTableProvider::new_source(
+                        name,
+                        metric_id,
+                        table_name.as_str(),
+                        config,
+                        start_at,
+                        filter,
+                        columns,
+                        state_backend,
+                        internal_buffer_size,
+                        record_batch_size,
+                    )?;
+                    Ok(PreparedSource::Clickhouse(Box::new(provider)))
+                }))
+            }
+            topology::Source::hybrid(hybrid) => {
+                let hybrid = hybrid.clone();
+                let app_config = app_config.clone();
+                let state_backend_factory = Arc::clone(state_backend_factory);
+                let session_manager = session_manager.clone();
+                // Out here because the controller is not shared with the build
+                // tasks; a scope is just an `Arc` handle.
+                let scope = shutdown_controller.scope(format!("hybrid-source:{reference_name}"));
+                Box::pin(build_source_blocking(ctx, move || {
+                    let provider = HybridTableProvider::new_from_topology(
+                        name,
+                        hybrid.bounded_sources,
+                        hybrid.unbounded_source,
+                        hybrid.offset_table,
+                        &app_config,
+                        state_backend_factory.as_ref(),
+                        session_manager,
+                        // Per-phase event-time config flows directly to the
+                        // inner WrappingSourceTableProviders (one per bounded
+                        // phase + one for unbounded), each carrying its own
+                        // `metric_key_hybrid_src_*` suffix. R9 falls out.
+                        hybrid.telemetry.as_ref(),
+                        // One scope for the hybrid driver, forwarder,
+                        // watcher, and both inner phases' helper tasks.
+                        scope,
+                    )?;
+                    Ok(PreparedSource::Hybrid(Box::new(provider)))
+                }))
+            }
+            topology::Source::file(file) => {
+                let file = file.clone();
+                let session_manager = session_manager.clone();
+                let state_backend_factory = Arc::clone(state_backend_factory);
+                let namespace = app_config.state_backend_namespace().to_string();
+                let num_records_before_stop = app_config.num_records_before_stop;
+                let internal_buffer_size = app_config.internal_buffer_size;
+                let file_source_config = app_config.file_source.clone();
+                let checkpoint_control = checkpoint_control.clone();
+                Box::pin(async move {
+                    let mode = match &file.mode {
+                        // A bounded file source is bounded work, so the drain
+                        // policy always drains it: the control handle is wired
+                        // unconditionally and closes the source with a terminal
+                        // checkpoint.
+                        topology::FileSourceMode::Bounded => FileSourceReadMode::Bounded {
+                            parallelism: file.parallelism,
+                            state_backend: state_backend_factory.create(&namespace),
+                            checkpoint_control: Some(checkpoint_control),
+                        },
+                        topology::FileSourceMode::Continuous { poll_interval } => {
+                            // Parsed in the task, not before it: a bad interval
+                            // then races its siblings like any other error and
+                            // the name-order sort still picks the winner.
+                            let poll_interval =
+                                humantime::parse_duration(poll_interval).map_err(|e| {
+                                    streamling_user_err!(
+                                        "{}: invalid poll_interval '{}': {}",
+                                        ctx,
+                                        poll_interval,
+                                        e
+                                    )
+                                })?;
+                            FileSourceReadMode::Continuous {
+                                poll_interval,
+                                // Unlike bounded, one stream unless asked: a wider
+                                // source widens every pipeline that reads it.
+                                parallelism: file.parallelism.unwrap_or(1),
+                                state_backend: state_backend_factory.create(&namespace),
+                            }
+                        }
+                    };
+                    let provider: Arc<dyn TableProvider> = FileSourceTableProvider::try_new(
+                        &name,
+                        &file.path,
+                        file.format,
+                        mode,
+                        &session_manager,
+                        num_records_before_stop,
+                        internal_buffer_size,
+                        &file_source_config,
+                    )
+                    .await
+                    .map_err(|e| e.context(format!("{}: failed to create file source", ctx)))?;
+                    Ok(PreparedSource::File(provider))
+                })
+            }
+            topology::Source::plugin(_) => continue,
+        };
+        builds.push((reference_name.clone(), build));
+    }
+
+    let mut results: Vec<(String, Result<PreparedSource>)> = futures::stream::iter(builds)
+        .map(|(name, build)| async move { (name, build.await) })
+        .buffer_unordered(MAX_CONCURRENT_SOURCE_BUILDS)
+        .collect()
+        .await;
+
+    // Report the first failure in name order, not in completion order.
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut prepared = HashMap::with_capacity(results.len());
+    for (name, result) in results {
+        prepared.insert(name, result?);
+    }
+    Ok(prepared)
+}
+
 /// Parse an optional human-readable duration string (e.g. "1s", "500ms") into `Option<Duration>`.
 fn parse_batch_flush_interval(
     interval: &Option<String>,
@@ -410,6 +705,18 @@ fn parse_batch_flush_interval(
             })
         })
         .transpose()
+}
+
+/// Without a timer a partial batch, and any marker behind it, waits for rows a filtered stream may never deliver.
+const DEFAULT_SCRIPT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+fn script_batch_flush_interval(
+    batch_size: Option<usize>,
+    configured: Option<Duration>,
+) -> Option<Duration> {
+    configured.or_else(|| {
+        matches!(batch_size, Some(n) if n > 0).then_some(DEFAULT_SCRIPT_BATCH_FLUSH_INTERVAL)
+    })
 }
 
 fn wrap_with_rebatch(
@@ -429,6 +736,39 @@ fn wrap_with_rebatch(
     } else {
         plan
     }
+}
+
+/// Walk a sink's resolved schema and reject any decimal_arb column the
+/// connector cannot carry. Surfaces every Reject error at once (not just
+/// the first), prefixed with the sink's reference name so the user knows
+/// which YAML block to fix.
+fn validate_sink_decimal_arb(
+    schema: &arrow_schema::Schema,
+    kind: streamling_common::types::decimal_arb_capability::ConnectorKind,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+    sink_name: &str,
+) -> Result<()> {
+    use streamling_common::types::decimal_arb_capability::{
+        ColumnDirectiveView, validate_pipeline_decimal_arb,
+    };
+    let views: Vec<ColumnDirectiveView<'_>> = directives
+        .into_iter()
+        .flatten()
+        .map(|d| ColumnDirectiveView {
+            name: d.name.as_str(),
+            coerce_to_string: d.coerces_to_string(),
+        })
+        .collect();
+    if let Err(errs) = validate_pipeline_decimal_arb(schema, kind, &views) {
+        let joined = errs
+            .into_inner()
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        streamling_user_bail!("sink '{}': {}", sink_name, joined);
+    }
+    Ok(())
 }
 
 pub struct Streamling {
@@ -496,16 +836,6 @@ fn validate_parallelism(topology: &PipelineTopology) -> Result<usize> {
 
     for (name, source) in &topology.sources {
         check("source", name, source.parallelism())?;
-        if let topology::Source::file(file) = source
-            && file.parallelism.is_some_and(|p| p > 1)
-            && matches!(file.mode, topology::FileSourceMode::Continuous { .. })
-        {
-            streamling_user_bail!(
-                "source '{name}': a continuous file source is single-stream (one \
-                 watermark cursor and one checkpoint drain point) and cannot run \
-                 with parallelism > 1; use mode: bounded to read in parallel"
-            );
-        }
     }
     for (name, transform) in &topology.transforms {
         check("transform", name, transform.parallelism())?;
@@ -814,9 +1144,26 @@ impl Streamling {
         let node_consumers = Self::find_source_consumers(&pipeline_topology);
         debug!("Node consumer analysis: {:?}", node_consumers);
 
-        let state_backend_factory =
-            StateBackendFactories::new(app_config.clone().state_backend.clone())
-                .map_err(|e| streamling_err!("failed to create state backend factory: {:?}", e))?;
+        // Unless explicitly configured, derive the state backend's pool
+        // acquire timeout from the shutdown budget so the two cannot be
+        // chosen independently: sqlx's 30s default out-waited every budget
+        // under ~42s of grace, so a backend outage during the terminal
+        // commit force-exited on the watchdog with nothing naming the cause.
+        // Half the budget (capped at the backend's own 5s default, floored
+        // at 1s) leaves the caller's error arm room to report inside even
+        // the smallest (5s) budget.
+        let mut state_backend_config = app_config.state_backend.clone();
+        if let Some(pg) = state_backend_config.postgres.as_mut()
+            && pg.acquire_timeout_secs.is_none()
+        {
+            pg.acquire_timeout_secs = Some((Self::shutdown_budget().as_secs() / 2).clamp(1, 5));
+        }
+        // `Arc` because the concurrent source builders
+        // (`build_source_providers`) share it.
+        let state_backend_factory = Arc::new(
+            StateBackendFactories::new(state_backend_config)
+                .map_err(|e| streamling_err!("failed to create state backend factory: {:?}", e))?,
+        );
 
         let dynamic_table_backend_factory =
             DynamicTableBackendFactory::new(app_config.dynamic_table_backend.clone());
@@ -847,6 +1194,12 @@ impl Streamling {
         // observes it and drains front-to-back, and deep call sites (sink
         // retry loops) subscribe to it directly.
         let shutdown_rx = streamling_core::shutdown::subscribe();
+        // Structured-shutdown controller (Phase 2): ported components get a
+        // ComponentScope and spawn helper tasks through it, so the teardown
+        // drain ladder can cancel and await them. Bridged to the global watch
+        // in both directions — a SIGTERM flip cancels every scope token.
+        let shutdown_controller =
+            streamling_core::shutdown::ShutdownController::new(Self::shutdown_budget());
         let mut checkpoint_sink_names: Vec<String> = Vec::new();
 
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
@@ -860,6 +1213,19 @@ impl Streamling {
         initialize_metrics_recorder(metric_metadata_mapping);
 
         let scan_sharing_registry = SharedSourceRegistry::new();
+        // Shared-scan broadcast drivers spawn through this scope; they end
+        // when their source stream ends, which shutdown forces.
+        scan_sharing_registry.set_scope(shutdown_controller.scope("shared-scans"));
+
+        // Whether a graceful shutdown drains and terminally checkpoints the
+        // in-flight tail, or exits fast and lets it replay. Derived from the
+        // topology (or forced via STREAMLING__DRAIN_POLICY); logged inside so
+        // every shutdown's behavior is explained up front in the logs.
+        let drain_on_shutdown = Self::resolve_drain_policy(
+            self.app_config.drain_policy,
+            self.app_config.job_mode,
+            &pipeline_topology,
+        );
 
         let mut sink_futures = Vec::new();
         let mut sources_to_sinks: SourceToSinkMapping = SourceToSinkMapping::new();
@@ -869,7 +1235,27 @@ impl Streamling {
         )> = Vec::new();
 
         let pipeline_topology_clone = pipeline_topology.clone();
-        for (reference_name, source) in &pipeline_topology_clone.sources {
+
+        // Only construction — the part that waits on the network — runs
+        // concurrently. Registration below mutates shared state (session
+        // catalog, primary-key registry, side outputs) and is cheap, so it
+        // stays sequential, in name order.
+        let mut prepared_sources = build_source_providers(
+            &pipeline_topology_clone,
+            &node_contexts,
+            &app_config,
+            &application_id,
+            &state_backend_factory,
+            &session_manager,
+            &shutdown_controller,
+            &checkpoint_control,
+        )
+        .await?;
+
+        let mut source_names: Vec<&String> = pipeline_topology_clone.sources.keys().collect();
+        source_names.sort();
+        for reference_name in source_names {
+            let source = &pipeline_topology_clone.sources[reference_name];
             // MultiSink already accounted for in consumer count
             let consumer_count = node_consumers.get(reference_name).copied().unwrap_or(0);
             let scan_sharing = if consumer_count > 1 {
@@ -889,54 +1275,32 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let topic = &kafka.topic;
-                    let starting_offsets = &kafka.starting_offsets;
-                    let include_metadata = kafka.include_metadata;
-                    let filter = &kafka.filter;
                     let primary_key_opt = &kafka.primary_key;
 
-                    let record_batch_interval_ms =
-                        parse_batch_flush_interval(&kafka.batch_flush_interval, reference_name)?
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(app_config.record_batch_interval_ms);
-                    let record_batch_size =
-                        kafka.batch_size.unwrap_or(app_config.record_batch_size);
-                    let data_format: KafkaFormat =
-                        kafka.data_format.as_deref().unwrap_or("avro").parse()?;
+                    let kafka_source_provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_kafka)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: Kafka source was not prepared", ctx.format())
+                        })?;
+                    // Terminal checkpointing on graceful exit: the drained
+                    // tail's offsets commit before the stream ends, instead
+                    // of replaying on every streaming restart. Only under the
+                    // drain policy — the fast policy leaves the control
+                    // unwired, so the source skips the terminal epoch and the
+                    // finalize wait entirely and the tail replays on restart.
+                    let kafka_source_provider = if drain_on_shutdown {
+                        kafka_source_provider.with_checkpoint_control(checkpoint_control.clone())
+                    } else {
+                        kafka_source_provider
+                    };
                     let kafka_source_provider = Arc::new(
-                        KafkaSourceTableProvider::new(
-                            reference_name.clone(),
-                            metric_key(&application_id, reference_name.as_str()),
-                            app_config.kafka_source.clone(),
-                            topic.clone(),
-                            starting_offsets.clone(),
-                            filter.clone(),
-                            record_batch_interval_ms,
-                            record_batch_size,
-                            app_config.internal_buffer_size,
-                            include_metadata.unwrap_or(false),
-                            state_backend_factory.create(app_config.state_backend_namespace()),
-                            session_manager.clone(),
-                            app_config.num_records_before_stop,
-                            kafka.validate_writer_schema_ordering.unwrap_or(true),
-                            kafka.schema_id_overrides.clone().unwrap_or_default(),
-                            kafka.skip_schema_resolution.unwrap_or(false),
-                            kafka
-                                .skip_schema_resolution_for_reader_schema_ids
-                                .clone()
-                                .unwrap_or_default(),
-                            data_format,
-                            kafka.schema.clone(),
-                            kafka.parallelism.unwrap_or(1),
-                        )
-                        // Convert via `StreamlingError::from` (not `streamling_with_context`)
-                        // so a user-facing schema error (e.g. unsupported JSON dtype) is
-                        // recovered from the `DataFusionError::External` wrapper and stays
-                        // user-facing. Otherwise `--validate` would misreport it as internal.
-                        .map_err(|e| {
-                            streamling_core::error::StreamlingError::from(e)
-                                .context(format!("{}: failed to create Kafka source", ctx.format()))
-                        })?,
+                        kafka_source_provider
+                            // Helper tasks (lag reporter) spawn through the scope
+                            // so the teardown drain ladder tracks them.
+                            .with_scope(
+                                shutdown_controller.scope(format!("kafka-source:{reference_name}")),
+                            ),
                     );
                     let extracted_pk = kafka_source_provider.get_extracted_primary_key();
 
@@ -992,30 +1356,23 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let table_name = &clickhouse.table_name;
-                    let filter = &clickhouse.filter;
-                    let start_at = &clickhouse.start_at;
-                    let columns = &clickhouse.columns;
                     let primary_key_opt = &clickhouse.primary_key;
 
-                    let start_at = start_at
-                        .clone()
-                        .map(|start_at| start_at.split(',').map(ScalarValue::from).collect());
-                    let columns = columns
-                        .clone()
-                        .map(|columns| columns.split(",").map(|s| s.to_string()).collect());
-                    let clickhouse_source_provider = Arc::new(ClickHouseTableProvider::new_source(
-                        reference_name.clone(),
-                        metric_key(&application_id, reference_name.as_str()),
-                        table_name.as_str(),
-                        app_config.clickhouse_source.clone(),
-                        start_at,
-                        filter.clone(),
-                        columns,
-                        state_backend_factory.create(app_config.state_backend_namespace()),
-                        app_config.internal_buffer_size.as_usize(),
-                        app_config.record_batch_size as usize,
-                    )?);
+                    let clickhouse_source_provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_clickhouse)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: ClickHouse source was not prepared", ctx.format())
+                        })?;
+                    let clickhouse_source_provider = Arc::new(
+                        clickhouse_source_provider
+                            // The source exec's checkpointing task spawns through the
+                            // scope so the teardown drain ladder tracks it.
+                            .with_scope(
+                                shutdown_controller
+                                    .scope(format!("clickhouse-source:{reference_name}")),
+                            ),
+                    );
                     let extracted_pk = clickhouse_source_provider.get_extracted_primary_key();
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
@@ -1070,33 +1427,23 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let bounded_sources = &hybrid.bounded_sources;
-                    let unbounded_source = &hybrid.unbounded_source;
-                    let offset_table = &hybrid.offset_table;
                     let primary_key_opt = &hybrid.primary_key;
 
+                    let hybrid_source_provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_hybrid)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: hybrid source was not prepared", ctx.format())
+                        })?;
                     let hybrid_source_provider = Arc::new(
-                        HybridTableProvider::new_from_topology(
-                            reference_name.clone(),
-                            bounded_sources.clone(),
-                            unbounded_source.clone(),
-                            offset_table.clone(),
-                            &app_config,
-                            &state_backend_factory,
-                            session_manager.clone(),
-                            // Per-phase event-time config flows directly to the
-                            // inner WrappingSourceTableProviders (one per bounded
-                            // phase + one for unbounded), each carrying its own
-                            // `metric_key_hybrid_src_*` suffix. R9 falls out.
-                            hybrid.telemetry.as_ref(),
-                        )?
-                        // In job mode this source emits the terminal checkpoint
-                        // when its bounded phases complete; in streaming mode it
-                        // does so on shutdown. Give it the control handle (to gate
-                        // teardown on that epoch finalizing) and the shutdown
-                        // signal (to drain rather than drop on SIGTERM).
-                        .with_checkpoint_control(checkpoint_control.clone())
-                        .with_shutdown(shutdown_rx.clone()),
+                        hybrid_source_provider
+                            // In job mode this source emits the terminal checkpoint
+                            // when its bounded phases complete; in streaming mode it
+                            // does so on shutdown. Give it the control handle (to gate
+                            // teardown on that epoch finalizing) and the shutdown
+                            // signal (to drain rather than drop on SIGTERM).
+                            .with_checkpoint_control(checkpoint_control.clone())
+                            .with_shutdown(shutdown_rx.clone()),
                     );
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
@@ -1144,44 +1491,12 @@ impl Streamling {
                         .get(reference_name)
                         .expect("node context must exist");
 
-                    let provider: Arc<dyn TableProvider> = match &file.mode {
-                        topology::FileSourceMode::Bounded => build_bounded_file_source_provider(
-                            reference_name,
-                            &file.path,
-                            file.format,
-                            &session_manager,
-                            file.parallelism,
-                        )
-                        .await
-                        .map_err(|e| {
-                            e.context(format!("{}: failed to create file source", ctx.format()))
-                        })?,
-                        topology::FileSourceMode::Continuous { poll_interval } => {
-                            let interval =
-                                humantime::parse_duration(poll_interval).map_err(|e| {
-                                    streamling_user_err!(
-                                        "{}: invalid poll_interval '{}': {}",
-                                        ctx.format(),
-                                        poll_interval,
-                                        e
-                                    )
-                                })?;
-                            FileSourceTableProvider::try_new(
-                                reference_name,
-                                &file.path,
-                                file.format,
-                                interval,
-                                &session_manager,
-                                state_backend_factory.create(app_config.state_backend_namespace()),
-                                app_config.num_records_before_stop,
-                                app_config.internal_buffer_size,
-                            )
-                            .await
-                            .map_err(|e| {
-                                e.context(format!("{}: failed to create file source", ctx.format()))
-                            })?
-                        }
-                    };
+                    let provider = prepared_sources
+                        .remove(reference_name)
+                        .and_then(PreparedSource::into_file)
+                        .ok_or_else(|| {
+                            streamling_err!("{}: file source was not prepared", ctx.format())
+                        })?;
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
                         provider,
@@ -1250,6 +1565,10 @@ impl Streamling {
                             Arc::new(channels),
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
+                            shutdown_controller.scope_at(
+                                format!("plugin-forwarders:{reference_name}"),
+                                streamling_core::shutdown::DrainStage::PostPlugin,
+                            ),
                         ));
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
@@ -1311,6 +1630,10 @@ impl Streamling {
                 &app_config.plugin.side_output_options,
                 &application_id,
                 DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY,
+                &shutdown_controller.scope_at(
+                    "plugin-side-outputs",
+                    streamling_core::shutdown::DrainStage::PostPlugin,
+                ),
             )?;
 
             // Forward side outputs to hybrid inner sources so they see pre-filter
@@ -1630,6 +1953,13 @@ impl Streamling {
                     let schema = &script_transform.schema;
                     let parallelism = script_transform.parallelism;
                     let batch_size = script_transform.batch_size;
+                    let batch_flush_interval = script_batch_flush_interval(
+                        batch_size,
+                        parse_batch_flush_interval(
+                            &script_transform.batch_flush_interval,
+                            &ctx.format(),
+                        )?,
+                    );
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
@@ -1700,7 +2030,7 @@ impl Streamling {
                             reference_name.clone(),
                         ),
                         batch_size,
-                        None,
+                        batch_flush_interval,
                         reference_name.clone(),
                     );
                     let wasm_node = WasmRunnerNode::with_options(
@@ -1816,6 +2146,10 @@ impl Streamling {
                             Arc::new(initialized_plugin.channels.clone()),
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
+                            shutdown_controller.scope_at(
+                                format!("plugin-forwarders:{reference_name}"),
+                                streamling_core::shutdown::DrainStage::PostPlugin,
+                            ),
                         )),
                     });
 
@@ -1954,7 +2288,6 @@ impl Streamling {
                         sample_every.unwrap_or(app_config.print_sink.sample_every),
                         num_records_before_stop.or(app_config.num_records_before_stop),
                         source_schema.clone(),
-                        from.clone(),
                         metric_key(&application_id, reference_name.as_str()),
                         sink_telemetry.clone(),
                     ));
@@ -1994,7 +2327,6 @@ impl Streamling {
                     let blackhole_sink_provider = Arc::new(BlackholeTableProvider::new(
                         source_schema.clone(),
                         app_config.num_records_before_stop,
-                        from.clone(),
                         metric_key(&application_id, reference_name.as_str()),
                         sink_telemetry.clone(),
                     ));
@@ -2037,6 +2369,13 @@ impl Streamling {
                         validate_update_where(uw, &source_schema, &reference_name)?;
                     }
 
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+                        None,
+                        &reference_name,
+                    )?;
+
                     // Per-sink connection: two postgres sinks in one pipeline can
                     // target two different databases (STRM-6516). Falls back to the
                     // global postgres_sink block when no per-sink keys are set.
@@ -2053,7 +2392,6 @@ impl Streamling {
                         table.clone(),
                         schema.clone(),
                         app_config.num_records_before_stop,
-                        from.clone(),
                         pk_metadata_opt.as_ref().map(|pk| pk.to_str()),
                         on_conflict.clone(),
                         update_where.clone(),
@@ -2175,6 +2513,13 @@ impl Streamling {
                             .await?;
                     }
 
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+                        None,
+                        &reference_name,
+                    )?;
+
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
@@ -2182,7 +2527,6 @@ impl Streamling {
                         landing_table.clone(),
                         schema.clone(),
                         app_config.num_records_before_stop,
-                        from.clone(),
                         Some(primary_key),
                         "update".to_string(),
                         None, // update_where (not applicable for aggregation sink)
@@ -2251,7 +2595,6 @@ impl Streamling {
                     let memory_sink_provider = Arc::new(MemoryTableProvider::new_with_options(
                         source_schema.clone(),
                         app_config.num_records_before_stop,
-                        from.clone(),
                         reference_name.clone(), // reference_name for registry lookups
                         exclude_gs_op.unwrap_or(false),
                         metric_key(&application_id, reference_name.as_str()), // metric id
@@ -2306,6 +2649,13 @@ impl Streamling {
                         &source_schema,
                     )?;
 
+                    let kafka_kind = match data_format.to_lowercase().as_str() {
+                        "avro" => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaAvro { declared_bytes: None },
+                        "json" => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+                        _ => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+                    };
+                    validate_sink_decimal_arb(&source_schema, kafka_kind, None, &reference_name)?;
+
                     let kafka_sink_provider = Arc::new(KafkaSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema,
@@ -2314,7 +2664,6 @@ impl Streamling {
                         topic_partitions,
                         data_format.parse()?,
                         app_config.num_records_before_stop,
-                        from.clone(),
                         Some(pk_metadata.to_str()),
                         batch_size,
                         batch_flush_interval_ms,
@@ -2377,6 +2726,21 @@ impl Streamling {
                             .parsed_batch_flush_interval()
                             .map_err(|e| streamling_user_err!("{}: {e:#}", ctx.format()))?,
                     });
+                    // A `schema_override` of `UInt256` / `Int256` on an
+                    // integer-shaped decimal_arb column is the operator pinning
+                    // its native type; the validator has to see it as the hint
+                    // it is, or it rejects a column the sink would carry.
+                    let validated_schema =
+                        streamling_connectors::table_providers::clickhouse::ClickHouseClient::apply_native_int_overrides(
+                            &source_schema,
+                            clickhouse_sink.schema_override.as_ref(),
+                        );
+                    validate_sink_decimal_arb(
+                        &validated_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+                        app_config.clickhouse_sink.connection.columns.as_deref(),
+                        &reference_name,
+                    )?;
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),
                         table.as_str(),
@@ -2386,7 +2750,6 @@ impl Streamling {
                             .as_ref()
                             .map(|pk| pk.to_str())
                             .unwrap_or_default(),
-                        from.clone(),
                         clickhouse_sink.append_only_mode,
                         clickhouse_sink.deduplicate,
                         clickhouse_sink.version_column_name.clone(),
@@ -2435,6 +2798,13 @@ impl Streamling {
                         &source_schema,
                     )?;
 
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
+                        None,
+                        &reference_name,
+                    )?;
+
                     let mut plugin_opts = options.clone().unwrap_or_default();
                     if let Some(pk) = primary_key_opt {
                         plugin_opts.insert(
@@ -2463,6 +2833,10 @@ impl Streamling {
                         app_config.num_records_before_stop,
                         metric_key(&application_id, reference_name.as_str()),
                         sink_telemetry.clone(),
+                        shutdown_controller.scope_at(
+                            format!("plugin-forwarders:{reference_name}"),
+                            streamling_core::shutdown::DrainStage::PostPlugin,
+                        ),
                     ));
 
                     session_manager
@@ -2501,7 +2875,11 @@ impl Streamling {
 
         let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 
-        for (_, (source_plan, mut sinks)) in sources_to_sinks.into_iter() {
+        // A plain `for` loop, NOT `.for_each`: plan-build failures below must
+        // propagate as typed, contextualized errors via `?` — inside a
+        // closure they could only unwrap, panicking the run loop on a
+        // sink/source schema mismatch instead of failing it.
+        for (_, (source_plan, mut sinks)) in sources_to_sinks {
             let future_name = sinks
                 .iter()
                 .map(|e| e.name.as_str())
@@ -2529,7 +2907,11 @@ impl Streamling {
                     })
                     .collect();
                 LogicalPlan::Extension(Extension {
-                    node: Arc::new(MultiSinkLogicalNode::new(partitioned_plan, entries)),
+                    node: Arc::new(MultiSinkLogicalNode::new(
+                        partitioned_plan,
+                        entries,
+                        shutdown_controller.scope(format!("multi-sink:{future_name}")),
+                    )),
                 })
             } else {
                 // Single sink: wrap once at the logical level with this
@@ -2556,18 +2938,13 @@ impl Streamling {
                     provider_as_source(entry.provider.clone()),
                     InsertOp::Append,
                 )
+                .and_then(|b| b.build())
                 .map_err(|e| {
-                    streamling_core::error::StreamlingError::from(e).context(format!(
-                        "failed to build insert plan for sink [{}]",
-                        entry.name
-                    ))
-                })?
-                .build()
-                .map_err(|e| {
-                    streamling_core::error::StreamlingError::from(e).context(format!(
-                        "failed to build insert plan for sink [{}]",
-                        entry.name
-                    ))
+                    streamling_err!(
+                        "failed to build insert plan for sink [{}]: {}",
+                        entry.name,
+                        e
+                    )
                 })?
             };
 
@@ -2655,21 +3032,54 @@ impl Streamling {
         // replaces the per-component signal handlers (notably the plugin
         // watcher that used to kill plugins first, inverting the drain order).
         if !dry_run {
+            // The trigger task itself: it initiates the drain, so it cannot be
+            // tracked by it. Exits right after flipping the signal.
+            #[allow(clippy::disallowed_methods)]
             tokio::spawn(async move {
                 Self::wait_for_shutdown_signal().await;
                 info!("Shutdown signal received; draining pipeline front-to-back");
                 streamling_core::shutdown::request_shutdown();
                 Self::arm_shutdown_watchdog(Self::shutdown_budget());
             });
+
+            // Host-runtime liveness canary: this task touches a timestamp
+            // twice a second and a plain OS thread watches the touch's age.
+            // If every host tokio worker parks (a plugin UDF making a
+            // blocking call, or a legacy shared-runtime plugin wedging
+            // inside a hook), the age grows and the monitor says so —
+            // turning "is the host runtime starved?" into a measurement.
+            // Detached on purpose: it must keep observing THROUGH the drain,
+            // so it cannot be tracked (and cancelled) by it; it dies with
+            // the runtime.
+            #[allow(clippy::disallowed_methods)]
+            tokio::spawn(async {
+                loop {
+                    streamling_core::plugin::diagnostics::touch_canary();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+            Self::spawn_canary_monitor();
         }
 
         // Plugin dispatchers run as detached tasks; their execution futures are
         // join wrappers. We keep them in a set so that AFTER the sinks drain we
         // can send Terminate and AWAIT the dispatchers finishing their flush,
         // rather than dropping them and letting the runtime cancel them
-        // mid-flush at process exit (the job-mode tail-loss bug).
-        let mut plugin_set: futures::stream::FuturesUnordered<ExecutionFuture> =
-            plugins.into_values().map(|p| p.execution_future).collect();
+        // mid-flush at process exit (the job-mode tail-loss bug). Each future
+        // carries its plugin id so a drain overrun can name the dispatcher(s)
+        // still wedged instead of just counting them.
+        type NamedPluginFuture = std::pin::Pin<
+            Box<dyn std::future::Future<Output = (String, std::result::Result<(), String>)> + Send>,
+        >;
+        let mut pending_plugins: std::collections::BTreeSet<String> =
+            plugins.keys().cloned().collect();
+        let mut plugin_set: futures::stream::FuturesUnordered<NamedPluginFuture> = plugins
+            .into_iter()
+            .map(|(plugin_id, p)| {
+                let fut = p.execution_future;
+                Box::pin(async move { (plugin_id, fut.await) }) as _
+            })
+            .collect();
 
         // Drive to completion. The terminal condition is "all sinks drained"
         // (every source ended its stream, via bounded completion or shutdown).
@@ -2713,14 +3123,18 @@ impl Streamling {
                             fail_drain(e.into(), &mut first_error);
                         }
                     }
-                    Some(plugin_res) = plugin_set.next() => {
+                    Some((plugin_id, plugin_res)) = plugin_set.next() => {
+                        pending_plugins.remove(&plugin_id);
                         match plugin_res {
                             Ok(()) => {
-                                debug!("A plugin future completed; continuing to drain sinks");
+                                debug!(
+                                    "Plugin '{}' completed; continuing to drain sinks",
+                                    plugin_id
+                                );
                             }
                             Err(msg) => {
                                 fail_drain(
-                                    streamling_err!("Plugin error: {}", msg),
+                                    streamling_err!("Plugin '{}' error: {}", plugin_id, msg),
                                     &mut first_error,
                                 );
                             }
@@ -2768,6 +3182,19 @@ impl Streamling {
             // Ensure sources observe shutdown even on a clean job-mode completion
             // (so any lingering helper tasks — lag reporters — wind down).
             streamling_core::shutdown::request_shutdown();
+            // Drain the controller's data-path scopes (cancel + await tracked
+            // helper tasks, front-to-back, each bounded by a slice of the
+            // remaining budget). Wedged tasks are logged and left to the
+            // watchdog — never aborted. PostPlugin scopes (plugin ack/metrics
+            // forwarders) are NOT touched here: they serve the plugin
+            // dispatchers' flush below and drain right before the coordinator
+            // stops.
+            shutdown_controller
+                .drain(
+                    streamling_core::shutdown::controller::DrainStage::DataPath,
+                    Some(deadline),
+                )
+                .await;
         }
 
         // Issue SourceComplete to plugin sources so the checkpoint channels are
@@ -2791,24 +3218,110 @@ impl Streamling {
         // Terminate plugins, then AWAIT their dispatchers finishing their drain
         // (bounded) so the last buffered batches are flushed durably before the
         // runtime is dropped. This is the fix for the plugin/pubsub tail loss.
-        terminate_all_plugins()?;
+        // The whole plugin phase (Terminate sends, per-plugin sliced, plus the
+        // dispatcher drain) is bounded by the global plugin drain budget
+        // (STREAMLING__PLUGIN_DRAIN_BUDGET_SECS, default 60s — §5.4 Q2),
+        // additionally capped by the watchdog's remaining time so it can
+        // never outlive the hard exit. Under the fast-exit drain policy the
+        // flush wait is further capped: plugins still get a real chance to
+        // flush, but a slow one is left behind (its unacked checkpoints keep
+        // the replayed tail covering it) instead of holding the exit.
+        const FAST_EXIT_PLUGIN_FLUSH_CAP: Duration = Duration::from_secs(5);
+        let configured_plugin_budget = if drain_on_shutdown {
+            streamling_core::shutdown::plugin_drain_budget()
+        } else {
+            streamling_core::shutdown::plugin_drain_budget().min(FAST_EXIT_PLUGIN_FLUSH_CAP)
+        };
+        let plugin_budget = remaining().min(configured_plugin_budget);
+        terminate_all_plugins(Some(plugin_budget))?;
+        // A plugin error surfacing HERE can, by construction, surface nowhere
+        // else: a failed dispatcher holds its error until Terminate arrives
+        // (the drain-discard contract), and Terminate is only sent during
+        // this teardown — after the run loop computed `app_result`. The
+        // failure is real (the plugin dropped data on the way out; its epochs
+        // were never acked, so the tail replays on restart), so it must reach
+        // the exit code exactly like an engine sink failing during a drain
+        // does — otherwise the two chaos twins disagree: a wedged engine sink
+        // exits 1 while the identical wedged PLUGIN sink exits 0.
+        let mut teardown_plugin_error: Option<streamling_core::error::StreamlingError> = None;
         if !plugin_set.is_empty() {
             use futures::StreamExt as _;
+            let pending = &mut pending_plugins;
+            let first_error = &mut teardown_plugin_error;
             let drain = async {
-                while let Some(res) = plugin_set.next().await {
-                    if let Err(msg) = res {
-                        warn!("Plugin exited with error during drain: {}", msg);
+                while let Some((plugin_id, res)) = plugin_set.next().await {
+                    pending.remove(&plugin_id);
+                    match res {
+                        Ok(()) => debug!("Plugin '{}' dispatcher drained", plugin_id),
+                        Err(msg) => {
+                            warn!(
+                                "Plugin '{}' exited with error during drain: {}",
+                                plugin_id, msg
+                            );
+                            if first_error.is_none() {
+                                *first_error = Some(streamling_err!(
+                                    "Plugin '{}' failed during drain (its unflushed tail replays on restart): {}",
+                                    plugin_id,
+                                    msg
+                                ));
+                            }
+                        }
                     }
                 }
             };
-            match timeout(remaining(), drain).await {
+            // Bound first, match second: the drain future borrows
+            // `teardown_plugin_error` (via `first_error`), and the Err arm
+            // below writes to it — the future must be dropped before the arm
+            // runs, which a match on the awaited result guarantees.
+            let drained = timeout(plugin_budget.min(remaining()), drain).await;
+            match drained {
                 Ok(()) => info!("All plugin dispatchers drained cleanly"),
-                Err(_) => warn!(
-                    "Plugin drain exceeded the shutdown budget; {} dispatcher(s) may not have flushed",
-                    plugin_set.len()
-                ),
+                Err(_) => {
+                    let culprits =
+                        streamling_core::plugin::diagnostics::describe_pending(&pending_plugins);
+                    warn!(
+                        "Plugin drain exceeded the shutdown budget; dispatcher(s) that may not have flushed: {}",
+                        culprits
+                    );
+                    // Make the giveup visible on the metrics channel too —
+                    // exit codes reach a Job controller, but a fleet is
+                    // monitored through metrics, and without this series a
+                    // shutdown that lost its tail looked purely successful.
+                    // main()'s final force_flush exports it before exit.
+                    streamling_core::telemetry::recorder::get_control_plane_metrics_recorder(
+                        "shutdown",
+                    )
+                    .record_count(
+                        "shutdown_unflushed_plugin_dispatchers",
+                        pending_plugins.len() as u64,
+                    );
+                    // Under the drain policy an unflushed dispatcher is a
+                    // broken contract, and exit 0 is the strongest possible
+                    // claim that it flushed — a Job controller would record
+                    // the unflushed sink as success. Propagate the decision
+                    // this warning already states to the exit code. Under
+                    // fast-exit, leaving a slow plugin behind is the policy
+                    // working as designed (its unacked checkpoints keep the
+                    // replayed tail covering it), so the exit stays clean.
+                    if drain_on_shutdown && teardown_plugin_error.is_none() {
+                        teardown_plugin_error = Some(streamling_err!(
+                            "Plugin drain exceeded the shutdown budget; dispatcher(s) that may not have flushed: {} (their unflushed tails replay on restart)",
+                            culprits
+                        ));
+                    }
+                }
             }
         }
+
+        // The plugin dispatchers have drained: their channels are closed, so
+        // the PostPlugin scopes (ack/metrics forwarders) can now wind down —
+        // after the flush they serve, before the coordinator they feed stops.
+        shutdown_controller
+            .drain(
+                streamling_core::shutdown::controller::DrainStage::PostPlugin,
+                Some(std::time::Instant::now() + remaining()),
+            )
+            .await;
 
         // Stop the checkpoint coordinator only if it was started (not dry_run).
         if !dry_run {
@@ -2821,6 +3334,12 @@ impl Streamling {
         }
 
         app_result?;
+        // Only reached when the run itself succeeded: a plugin that failed
+        // during the teardown drain still fails the pipeline (see the note at
+        // the teardown drain above), without masking an earlier app error.
+        if let Some(e) = teardown_plugin_error {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -2830,6 +3349,105 @@ impl Streamling {
     /// same value and they can never drift.
     fn shutdown_budget() -> Duration {
         streamling_core::shutdown::shutdown_budget()
+    }
+
+    /// Resolve the effective drain policy: `true` = drain (terminal
+    /// checkpoint on shutdown, full plugin flush budget), `false` = fast exit
+    /// (skip the terminal checkpoint, cap the plugin flush).
+    ///
+    /// Pipelines with bounded work always drain, even when `fast` was
+    /// requested: a bounded scan or completed job never restarts, so its tail
+    /// has no replay to recover it — dropping it is data loss, not a
+    /// duplicate window. `auto` (the default) drains exactly those pipelines
+    /// and fast-exits plain streaming, whose tail replays on restart.
+    ///
+    /// A plugin source's boundedness is opaque to the host — its options are
+    /// an arbitrary map the dylib interprets (e.g. `start_block`/`end_block`
+    /// make solana_source bounded), and plugins have been able to end their
+    /// own stream since bounded sources were supported. `auto` therefore
+    /// fails safe and drains any topology with a plugin source: a duplicate
+    /// window is recoverable, a dropped bounded tail is not. Explicit `fast`
+    /// is still honored for plugin sources (with a warning), since the
+    /// operator may know the source is purely streaming.
+    ///
+    /// Logs the resolution and its reason so every shutdown's behavior is
+    /// explained up front.
+    fn resolve_drain_policy(
+        requested: streamling_config::app_config::DrainPolicy,
+        job_mode: bool,
+        pipeline_topology: &topology::PipelineTopology,
+    ) -> bool {
+        use streamling_config::app_config::DrainPolicy;
+
+        let bounded_work = job_mode
+            || pipeline_topology.sources.values().any(|source| {
+                matches!(
+                    source,
+                    topology::Source::hybrid(_) | topology::Source::clickhouse(_)
+                ) || matches!(
+                    source,
+                    topology::Source::file(f) if f.mode == topology::FileSourceMode::Bounded
+                )
+            });
+        // Possibly-bounded: the host cannot prove the tail replays.
+        let opaque_plugin_source = pipeline_topology
+            .sources
+            .values()
+            .any(|source| matches!(source, topology::Source::plugin(_)));
+
+        match (requested, bounded_work) {
+            (DrainPolicy::Drain, _) => {
+                info!("Drain policy: drain (explicit) — shutdown terminally checkpoints the tail");
+                true
+            }
+            (DrainPolicy::Fast, true) => {
+                warn!(
+                    "Drain policy 'fast' requested, but the pipeline has bounded work \
+                     (job mode or a hybrid/clickhouse/bounded-file source) whose tail \
+                     has no replay to recover it; draining instead"
+                );
+                true
+            }
+            (DrainPolicy::Fast, false) => {
+                if opaque_plugin_source {
+                    warn!(
+                        "Drain policy 'fast' requested on a topology with a plugin source, \
+                         whose boundedness the host cannot verify; if the plugin source is \
+                         bounded (e.g. a block-range scan), its drained tail has NO replay \
+                         and 'fast' drops it. Honoring the explicit request"
+                    );
+                }
+                info!(
+                    "Drain policy: fast (explicit) — shutdown skips the terminal checkpoint; \
+                     the drained tail replays on restart"
+                );
+                false
+            }
+            (DrainPolicy::Auto, true) => {
+                info!(
+                    "Drain policy: drain (auto: pipeline has bounded work) — \
+                     shutdown terminally checkpoints the tail"
+                );
+                true
+            }
+            (DrainPolicy::Auto, false) if opaque_plugin_source => {
+                info!(
+                    "Drain policy: drain (auto: plugin source may be bounded work) — the \
+                     host cannot prove a plugin source's drained tail replays, so shutdown \
+                     terminally checkpoints it. Set STREAMLING__DRAIN_POLICY=fast if every \
+                     plugin source is purely streaming"
+                );
+                true
+            }
+            (DrainPolicy::Auto, false) => {
+                info!(
+                    "Drain policy: fast (auto: plain streaming topology) — shutdown skips \
+                     the terminal checkpoint; the drained tail replays on restart. \
+                     Set STREAMLING__DRAIN_POLICY=drain to terminally checkpoint instead"
+                );
+                false
+            }
+        }
     }
 
     /// Arm a last-resort watchdog: a plain OS thread that hard-exits the process
@@ -2849,6 +3467,10 @@ impl Streamling {
         static WATCHDOG_DEADLINE: OnceLock<std::time::Instant> = OnceLock::new();
         *WATCHDOG_DEADLINE.get_or_init(|| {
             let deadline = std::time::Instant::now() + budget;
+            // Publish it as the process-wide budget clock: every bounded wait
+            // in the engine and in plugin dylibs paces itself by the time left
+            // before this fires.
+            streamling_core::shutdown::set_hard_exit_deadline(deadline);
             let spawn_result = std::thread::Builder::new()
                 .name("shutdown-watchdog".to_string())
                 .spawn(move || {
@@ -2859,6 +3481,12 @@ impl Streamling {
                         "[streamling] shutdown budget of {:?} exceeded; forcing process exit",
                         budget
                     );
+                    // Last-words attribution: which plugin dispatchers were
+                    // heard from when, and whether one is sitting inside a
+                    // hook. Runtime-free by construction (try_recv +
+                    // try_lock + eprintln), so it works even when the async
+                    // drain logging died with the runtime.
+                    streamling_core::plugin::diagnostics::dump_to_stderr();
                     std::process::exit(1);
                 });
             if let Err(e) = spawn_result {
@@ -2873,6 +3501,59 @@ impl Streamling {
             }
             deadline
         })
+    }
+
+    /// Spawn the OS-thread side of the host-runtime canary: checks every 2s
+    /// how stale the canary task's last touch is, and reports (rate-limited)
+    /// when it exceeds 3s — the signature of a starved host runtime. An OS
+    /// thread by construction, for the same reason as the watchdog: it must
+    /// keep observing precisely when the tokio workers cannot run.
+    ///
+    /// Idempotent — later calls are no-ops. The thread never exits; it is a
+    /// detached observer that dies with the process.
+    fn spawn_canary_monitor() {
+        use std::sync::OnceLock;
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let spawn_result = std::thread::Builder::new()
+                .name("host-runtime-canary".to_string())
+                .spawn(|| {
+                    const STALE_AFTER: Duration = Duration::from_secs(3);
+                    const WARN_EVERY: Duration = Duration::from_secs(30);
+                    let mut last_warn: Option<std::time::Instant> = None;
+                    loop {
+                        std::thread::sleep(Duration::from_secs(2));
+                        let Some(age) = streamling_core::plugin::diagnostics::canary_age() else {
+                            continue;
+                        };
+                        if age > STALE_AFTER && last_warn.is_none_or(|t| t.elapsed() >= WARN_EVERY)
+                        {
+                            // Both channels on purpose: if the runtime is
+                            // starved, async-flushed tracing may be starved
+                            // with it, but the warn! still lands whenever the
+                            // stall is partial or recovers.
+                            eprintln!(
+                                "[streamling] host runtime canary is {:.1}s stale — tokio workers \
+                                 appear starved (a blocking call inside a UDF or a plugin sharing \
+                                 the host runtime is the usual cause)",
+                                age.as_secs_f64()
+                            );
+                            warn!(
+                                canary_age_secs = age.as_secs_f64(),
+                                "host runtime canary is stale; tokio workers appear starved"
+                            );
+                            last_warn = Some(std::time::Instant::now());
+                        }
+                    }
+                });
+            if let Err(e) = spawn_result {
+                warn!(
+                    "failed to spawn host-runtime canary monitor thread: {}; \
+                     runtime-starvation detection is disabled",
+                    e
+                );
+            }
+        });
     }
 
     /// Await SIGTERM / SIGINT / Ctrl-C — the single shutdown trigger for the
@@ -3671,6 +4352,103 @@ mod tests {
         );
     }
 
+    async fn rendered_script_plan(
+        batch_size: Option<usize>,
+        batch_flush_interval: Option<Duration>,
+    ) -> String {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan,
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            batch_size,
+            batch_flush_interval,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        displayable(
+            session_manager
+                .new_df(logical_plan)
+                .create_physical_plan()
+                .await
+                .unwrap()
+                .as_ref(),
+        )
+        .indent(true)
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn script_transform_batch_flush_interval_reaches_rebatch_node() {
+        let rendered = rendered_script_plan(Some(2), Some(Duration::from_secs(1))).await;
+        assert!(
+            rendered.contains("RebatchExec(batch_size=2, interval=1s, partitions=4)"),
+            "expected the flush interval in plan:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_batch_size_alone_defaults_the_flush_interval() {
+        let defaulted =
+            rendered_script_plan(Some(100), script_batch_flush_interval(Some(100), None)).await;
+        assert!(
+            defaulted.contains("RebatchExec(batch_size=100, interval=1s, partitions=4)"),
+            "expected the default flush interval in plan:\n{defaulted}"
+        );
+
+        let explicit = rendered_script_plan(
+            Some(100),
+            script_batch_flush_interval(Some(100), Some(Duration::from_millis(500))),
+        )
+        .await;
+        assert!(
+            explicit.contains("RebatchExec(batch_size=100, interval=500ms, partitions=4)"),
+            "an explicit interval must win:\n{explicit}"
+        );
+
+        assert_eq!(script_batch_flush_interval(Some(0), None), None);
+        assert_eq!(script_batch_flush_interval(None, None), None);
+    }
+
     fn empty_plan() -> LogicalPlan {
         LogicalPlanBuilder::empty(true).build().unwrap()
     }
@@ -3798,6 +4576,108 @@ mod tests {
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::RoundRobin);
         assert_eq!(node.target_parallelism, Some(4));
+    }
+
+    // ----- validate_sink_decimal_arb -----
+
+    fn arb_schema(precision: u32, scale: u32) -> arrow_schema::Schema {
+        let f = streamling_common::types::decimal_arb::DecimalArbType::field(
+            "amount", precision, scale, false,
+        )
+        .unwrap();
+        arrow_schema::Schema::new(vec![f])
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_postgres_native() {
+        let schema = arb_schema(100, 18);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+            None,
+            "pg_sink",
+        )
+        .expect("Postgres at p=100 should be Native");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_clickhouse_rejects_without_directive() {
+        let schema = arb_schema(100, 18);
+        let err = validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            None,
+            "ch_sink",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ch_sink"), "error names sink: {}", msg);
+        assert!(msg.contains("amount"), "error names column: {}", msg);
+        assert!(
+            msg.contains("coerce_to: string"),
+            "error suggests directive: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_clickhouse_passes_with_directive() {
+        let schema = arb_schema(100, 18);
+        let directives = vec![streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        }];
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            Some(&directives),
+            "ch_sink",
+        )
+        .expect("ClickHouse with coerce_to: string should be OptInOnly (OK)");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_kafka_json_native() {
+        let schema = arb_schema(200, 50);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+            None,
+            "kafka_sink",
+        )
+        .expect("Kafka JSON should accept any precision");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_plugin_passes_through() {
+        // The host hands the batch to the plugin unchanged; a wide-int
+        // pipeline into a plugin sink must start, as it did before the type
+        // was retired.
+        let schema = arb_schema(50, 10);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
+            None,
+            "my_plugin",
+        )
+        .expect("plugin sinks carry decimal_arb as-is");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_no_decimal_arb_columns_passes() {
+        // Schema with only plain types — no decimal_arb fields, validator is a no-op.
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            None,
+            "any_sink",
+        )
+        .expect("schema without decimal_arb columns is always OK");
     }
 
     #[test]
@@ -4204,6 +5084,151 @@ sinks: {}
     }
 
     // ------------------------------------------------------------------
+    // Drain-policy resolution: bounded work always drains; plain streaming
+    // fast-exits under `auto` and may be forced either way.
+    // ------------------------------------------------------------------
+
+    fn streaming_topology() -> topology::PipelineTopology {
+        topology::PipelineTopology::load_from_string(
+            r#"
+sources:
+  blocks:
+    type: kafka
+    topic: blocks_live
+transforms: {}
+sinks: {}
+"#,
+        )
+        .unwrap()
+    }
+
+    fn hybrid_topology() -> topology::PipelineTopology {
+        topology::PipelineTopology::load_from_string(
+            r#"
+sources:
+  blocks:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: blocks_historic
+    unbounded_source:
+      source_type: kafka
+      topic: blocks_live
+transforms: {}
+sinks: {}
+"#,
+        )
+        .unwrap()
+    }
+
+    fn plugin_topology() -> topology::PipelineTopology {
+        topology::PipelineTopology::load_from_string(
+            r#"
+sources:
+  blocks:
+    type: solana_source
+    options:
+      start_block: "1000"
+      end_block: "2000"
+transforms: {}
+sinks: {}
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn drain_policy_auto_fast_exits_plain_streaming() {
+        use streamling_config::app_config::DrainPolicy;
+        assert!(!Streamling::resolve_drain_policy(
+            DrainPolicy::Auto,
+            false,
+            &streaming_topology()
+        ));
+    }
+
+    #[test]
+    fn drain_policy_auto_drains_bounded_work() {
+        use streamling_config::app_config::DrainPolicy;
+        // Hybrid source → drain, even without job mode.
+        assert!(Streamling::resolve_drain_policy(
+            DrainPolicy::Auto,
+            false,
+            &hybrid_topology()
+        ));
+        // Job mode → drain, regardless of source kinds.
+        assert!(Streamling::resolve_drain_policy(
+            DrainPolicy::Auto,
+            true,
+            &streaming_topology()
+        ));
+    }
+
+    #[test]
+    fn drain_policy_auto_drains_plugin_sources() {
+        use streamling_config::app_config::DrainPolicy;
+        // A plugin source's boundedness is opaque to the host, so `auto`
+        // fails safe and drains even without job mode: a bounded plugin
+        // source's drained tail has no replay to recover it.
+        assert!(Streamling::resolve_drain_policy(
+            DrainPolicy::Auto,
+            false,
+            &plugin_topology()
+        ));
+        // Explicit fast is still honored — the operator may know the plugin
+        // source is purely streaming.
+        assert!(!Streamling::resolve_drain_policy(
+            DrainPolicy::Fast,
+            false,
+            &plugin_topology()
+        ));
+    }
+
+    #[test]
+    fn drain_policy_explicit_forcing() {
+        use streamling_config::app_config::DrainPolicy;
+        // Explicit drain wins on a streaming topology.
+        assert!(Streamling::resolve_drain_policy(
+            DrainPolicy::Drain,
+            false,
+            &streaming_topology()
+        ));
+        // Explicit fast is honored on a streaming topology…
+        assert!(!Streamling::resolve_drain_policy(
+            DrainPolicy::Fast,
+            false,
+            &streaming_topology()
+        ));
+        // …but clamped to drain when the pipeline has bounded work: a
+        // completed job's tail has no replay to recover it.
+        assert!(Streamling::resolve_drain_policy(
+            DrainPolicy::Fast,
+            false,
+            &hybrid_topology()
+        ));
+        assert!(Streamling::resolve_drain_policy(
+            DrainPolicy::Fast,
+            true,
+            &streaming_topology()
+        ));
+    }
+
+    #[test]
+    fn drain_policy_env_name_deserializes() {
+        // The env override surface feeds lowercase strings through serde;
+        // pin the accepted names so a rename cannot silently break the knob.
+        for (name, expected) in [
+            ("auto", streamling_config::app_config::DrainPolicy::Auto),
+            ("drain", streamling_config::app_config::DrainPolicy::Drain),
+            ("fast", streamling_config::app_config::DrainPolicy::Fast),
+        ] {
+            let parsed: streamling_config::app_config::DrainPolicy =
+                serde_yaml::from_str(name).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // STRM-6281: Kafka sinks require a resolvable, non-empty primary key
     // ------------------------------------------------------------------
 
@@ -4344,5 +5369,194 @@ sinks: {}
             .expect("propagated primary key should be accepted");
         assert_eq!(pk.columns, vec!["id".to_string()]);
         assert_eq!(pk.source, PrimaryKeySource::Propagated);
+    }
+}
+
+#[cfg(test)]
+mod source_build_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use streamling_config::StateBackendConfig;
+
+    static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "streamling-source-build-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_csv(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "id,num").unwrap();
+        writeln!(file, "1,10").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn bounded_file_source(path: &str) -> String {
+        format!(
+            "    type: file\n    path: {path}\n    format: csv\n    mode:\n      type: bounded\n    primary_key: id\n"
+        )
+    }
+
+    /// A ClickHouse source pointed at a port nothing listens on. Its
+    /// constructor is one of the synchronous ones, so it exercises the
+    /// blocking-pool path rather than the file source's inline async one, and
+    /// a refused connection fails it without waiting out a connect timeout.
+    const UNREACHABLE_CLICKHOUSE: &str = "http://127.0.0.1:1";
+
+    fn clickhouse_source(table: &str) -> String {
+        format!("    type: clickhouse\n    table_name: {table}\n    primary_key: id\n")
+    }
+
+    async fn build(topology_yaml: &str) -> Result<HashMap<String, PreparedSource>> {
+        build_with(topology_yaml, |_| {}).await
+    }
+
+    async fn build_with(
+        topology_yaml: &str,
+        configure: impl FnOnce(&mut AppConfig),
+    ) -> Result<HashMap<String, PreparedSource>> {
+        let topology = PipelineTopology::load_from_string(topology_yaml).unwrap();
+        let mut app_config = AppConfig::load().expect("embedded config must load");
+        app_config.state_backend = StateBackendConfig::default();
+        configure(&mut app_config);
+        let node_contexts = Streamling::build_node_contexts(&topology);
+        let state_backend_factory =
+            Arc::new(StateBackendFactories::new(app_config.state_backend.clone()).unwrap());
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        let shutdown_controller =
+            streamling_core::shutdown::ShutdownController::new(std::time::Duration::from_secs(5));
+        let checkpoint_control = CheckpointCoordinator::new().control();
+        build_source_providers(
+            &topology,
+            &node_contexts,
+            &app_config,
+            "test_app",
+            &state_backend_factory,
+            &session_manager,
+            &shutdown_controller,
+            &checkpoint_control,
+        )
+        .await
+    }
+
+    /// Every non-plugin source comes back prepared, keyed by reference name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepares_every_non_plugin_source() {
+        let dir = scratch_dir();
+        let a = write_csv(&dir, "a.csv");
+        let b = write_csv(&dir, "b.csv");
+        let yaml = format!(
+            "sources:\n  b_second:\n{}  a_first:\n{}transforms: {{}}\nsinks:\n  out_a:\n    type: print\n    from: a_first\n  out_b:\n    type: print\n    from: b_second\n",
+            bounded_file_source(&b),
+            bounded_file_source(&a),
+        );
+
+        let prepared = build(&yaml).await.expect("both file sources must build");
+
+        assert_eq!(prepared.len(), 2);
+        assert!(matches!(
+            prepared.get("a_first"),
+            Some(PreparedSource::File(_))
+        ));
+        assert!(matches!(
+            prepared.get("b_second"),
+            Some(PreparedSource::File(_))
+        ));
+    }
+
+    /// With several failing sources the reported error is the first one in
+    /// name order, not whichever build happened to finish first. `a_bad`
+    /// fails only after async I/O (missing file); `b_bad` fails synchronously
+    /// on its poll interval, so without the ordering it would win the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reports_the_first_failure_in_name_order() {
+        let dir = scratch_dir();
+        let missing = dir.join("does-not-exist.csv");
+        let yaml = format!(
+            "sources:\n  b_bad:\n    type: file\n    path: {}\n    format: csv\n    mode:\n      type: continuous\n      poll_interval: not-a-duration\n    primary_key: id\n  a_bad:\n{}transforms: {{}}\nsinks:\n  out_a:\n    type: print\n    from: a_bad\n  out_b:\n    type: print\n    from: b_bad\n",
+            missing.display(),
+            bounded_file_source(&missing.to_string_lossy()),
+        );
+
+        let message = match build(&yaml).await {
+            Ok(_) => panic!("both sources must fail to build"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("a_bad"),
+            "expected the first source in name order to be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("not-a-duration"),
+            "the later source's error must not be the one reported, got: {message}"
+        );
+    }
+
+    /// A constructor that runs on the blocking pool reports its failure as a
+    /// normal build error. The `spawn_blocking` wrapper has its own failure
+    /// mode — a panicking or cancelled task resolves as a `JoinError`, not as
+    /// the constructor's `Result` — so the path needs its own coverage; the
+    /// file-source tests above only reach the inline async one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reports_a_blocking_pool_build_failure() {
+        let yaml = format!(
+            "sources:\n  ch:\n{}transforms: {{}}\nsinks:\n  out:\n    type: print\n    from: ch\n",
+            clickhouse_source("some_table"),
+        );
+
+        let message = match build_with(&yaml, |config| {
+            config.clickhouse_source.connection.url = UNREACHABLE_CLICKHOUSE.to_string();
+        })
+        .await
+        {
+            Ok(_) => panic!("an unreachable ClickHouse must fail the build"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("some_table"),
+            "the constructor's own error should survive the blocking task, got: {message}"
+        );
+        assert!(
+            !message.contains("source construction task failed"),
+            "a refused connection is a build error, not a join failure, got: {message}"
+        );
+    }
+
+    /// Name ordering holds across the two build paths, not just within one:
+    /// `a_ch` fails on the blocking pool, `b_file` inline. Whichever finishes
+    /// first, the reported error is `a_ch`'s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orders_failures_across_both_build_paths() {
+        let dir = scratch_dir();
+        let missing = dir.join("does-not-exist.csv");
+        let yaml = format!(
+            "sources:\n  b_file:\n{}  a_ch:\n{}transforms: {{}}\nsinks:\n  out_a:\n    type: print\n    from: a_ch\n  out_b:\n    type: print\n    from: b_file\n",
+            bounded_file_source(&missing.to_string_lossy()),
+            clickhouse_source("some_table"),
+        );
+
+        let message = match build_with(&yaml, |config| {
+            config.clickhouse_source.connection.url = UNREACHABLE_CLICKHOUSE.to_string();
+        })
+        .await
+        {
+            Ok(_) => panic!("both sources must fail to build"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("some_table"),
+            "expected the blocking-pool source, first in name order, got: {message}"
+        );
     }
 }

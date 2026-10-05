@@ -64,8 +64,12 @@ impl PartialOrd for PluginNode {
     }
 }
 
+/// Channels AND the forwarder scope ride the registry together: logical nodes
+/// must be Hash/Eq, so non-comparable runtime state is smuggled by id.
+type PluginRuntimeState = (Arc<PluginChannels>, Arc<crate::shutdown::ComponentScope>);
+
 lazy_static::lazy_static! {
-    static ref PLUGIN_CHANNELS: Mutex<HashMap<String, Arc<PluginChannels>>> =
+    static ref PLUGIN_CHANNELS: Mutex<HashMap<String, PluginRuntimeState>> =
         Mutex::new(HashMap::new());
 }
 
@@ -76,6 +80,7 @@ impl PluginNode {
         plugin_channels: Arc<PluginChannels>,
         internal_buffer_size: u32,
         metric_metadata_id: String,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         // Registry is keyed by metric_key(app_id, id) = "{app_id}::{id}".
         // A bare reference name misses the lookup and every plugin metric is dropped.
@@ -88,7 +93,7 @@ impl PluginNode {
         PLUGIN_CHANNELS
             .lock()
             .unwrap()
-            .insert(id.clone(), plugin_channels);
+            .insert(id.clone(), (plugin_channels, scope));
 
         Self {
             input,
@@ -105,6 +110,17 @@ impl PluginNode {
             .unwrap()
             .get(&self.plugin_channel_id)
             .unwrap()
+            .0
+            .clone()
+    }
+
+    pub fn scope(&self) -> Arc<crate::shutdown::ComponentScope> {
+        PLUGIN_CHANNELS
+            .lock()
+            .unwrap()
+            .get(&self.plugin_channel_id)
+            .unwrap()
+            .1
             .clone()
     }
 }
@@ -187,6 +203,7 @@ impl ExtensionPlanner for PluginExtensionPlanner {
                     plugin_node.internal_buffer_size,
                     plugin_node.plugin_channels(),
                     plugin_node.metric_metadata_id.clone(),
+                    plugin_node.scope(),
                 ));
                 Some(plugin_exec)
             } else {
@@ -203,6 +220,7 @@ struct PluginExec {
     plugin_channels: Arc<PluginChannels>,
     cache: Arc<PlanProperties>,
     metric_metadata_id: String,
+    scope: Arc<crate::shutdown::ComponentScope>,
 }
 
 impl PluginExec {
@@ -212,6 +230,7 @@ impl PluginExec {
         internal_buffer_size: u32,
         plugin_channels: Arc<PluginChannels>,
         metric_metadata_id: String,
+        scope: Arc<crate::shutdown::ComponentScope>,
     ) -> Self {
         let cache = Self::compute_properties(output_schema.clone());
         Self {
@@ -221,6 +240,7 @@ impl PluginExec {
             plugin_channels,
             cache: Arc::new(cache),
             metric_metadata_id,
+            scope,
         }
     }
 
@@ -285,6 +305,7 @@ impl ExecutionPlan for PluginExec {
             self.internal_buffer_size,
             self.plugin_channels.clone(),
             self.metric_metadata_id.clone(),
+            self.scope.clone(),
         )))
     }
 
@@ -307,19 +328,28 @@ impl ExecutionPlan for PluginExec {
         let tx = builder.tx();
 
         // Initialize the plugin
-        self.plugin_channels
-            .input
-            .sender
-            .send(NonExhaustive::new(PluginMsg::Init))
-            .unwrap();
+        crate::plugin::send_to_plugin_blocking(
+            &self.plugin_channels.input.sender,
+            NonExhaustive::new(PluginMsg::Init),
+            &self.metric_metadata_id,
+        )?;
 
         let plugin_input_sender = self.plugin_channels.input.sender.clone();
+        let plugin_label = self.metric_metadata_id.clone();
+        let forwarder_scope = self.scope.clone();
         let plugin_output_receiver = self.plugin_channels.output.receiver.clone();
         let metrics_receiver = self.plugin_channels.metrics.receiver.clone();
         let metric_metadata_id = self.metric_metadata_id.clone();
         let metrics_recorder = get_metrics_recorder();
         builder.spawn(async move {
-            tokio::spawn(process_plugin_metrics(metrics_receiver,metrics_recorder.clone(), metric_metadata_id.clone()));
+            // PostPlugin-stage scope: exits on channel disconnect at plugin
+            // teardown; drained after the dispatcher flush it serves.
+            forwarder_scope.spawn(process_plugin_metrics(
+                metrics_receiver,
+                metrics_recorder.clone(),
+                metric_metadata_id.clone(),
+                forwarder_scope.stage_token().clone(),
+            ));
 
             let mut checkpoint_buffer: Vec<CheckpointMessage> = Vec::new();
             // Track created_at_ms for epochs so we can preserve timing through plugin round-trip
@@ -342,22 +372,28 @@ impl ExecutionPlan for PluginExec {
                                         "Sending extracted checkpoint Marker with epoch {} to plugin",
                                         epoch.0
                                     );
-                                    plugin_input_sender
-                                        .send(NonExhaustive::new(PluginMsg::CheckpointMarker {
+                                    crate::plugin::send_to_plugin(
+                                        &plugin_input_sender,
+                                        NonExhaustive::new(PluginMsg::CheckpointMarker {
                                             epoch: PluginCheckpointEpoch(epoch.0),
-                                        }))
-                                        .unwrap();
+                                        }),
+                                        &plugin_label,
+                                    )
+                                    .await?;
                                 }
                                 CheckpointMessage::Finalizer(epoch) => {
                                     debug!(
                                         "Sending extracted checkpoint Finalizer with epoch {} to plugin",
                                         epoch.0
                                     );
-                                    plugin_input_sender
-                                        .send(NonExhaustive::new(PluginMsg::CheckpointFinalizer {
+                                    crate::plugin::send_to_plugin(
+                                        &plugin_input_sender,
+                                        NonExhaustive::new(PluginMsg::CheckpointFinalizer {
                                             epoch: PluginCheckpointEpoch(epoch.0),
-                                        }))
-                                        .unwrap();
+                                        }),
+                                        &plugin_label,
+                                    )
+                                    .await?;
                                 }
                                 _ => {
                                     // ignore other messages
@@ -365,11 +401,12 @@ impl ExecutionPlan for PluginExec {
                             }
                         }
 
-                        plugin_input_sender
-                            .send(NonExhaustive::new(PluginMsg::NextBatch {
-                                data: batch.into(),
-                            }))
-                            .unwrap();
+                        crate::plugin::send_to_plugin(
+                            &plugin_input_sender,
+                            NonExhaustive::new(PluginMsg::NextBatch { data: batch.into() }),
+                            &plugin_label,
+                        )
+                        .await?;
 
                         // TODO: should this be parallelized?
                         // Right now it processes batches sequentially:

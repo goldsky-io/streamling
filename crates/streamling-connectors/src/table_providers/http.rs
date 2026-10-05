@@ -19,10 +19,8 @@ use streamling_core::operators::parallel_sink::ParallelSinkExec;
 
 use std::time::Instant;
 use streamling_config::ExternalHttpHandlerConfig;
-use streamling_core::checkpoints::channels::send;
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, extract_checkpoint_messages, now_ms,
-    process_checkpoint_acks,
+    extract_checkpoint_messages, now_ms, process_checkpoint_acks,
 };
 use streamling_core::operators::external_handlers::{
     ExternalHandlerClient, ExternalHandlerExecutionOutcome,
@@ -193,21 +191,17 @@ impl DataSink for HttpSink {
                 && total_received >= num_records_before_stop
                 && !(num_records_before_stop == 0 && total_received == 0)
             {
-                // Notify the coordinator (and sources) that the sink has received the expected rows
-                let _ = send(
-                    CHECKPOINT_COORDINATOR_CHANNEL,
-                    CheckpointMessage::SourceComplete(self.source_name.clone()),
-                );
+                // Record-limit reached: request process-wide graceful shutdown
+                // so every source drains and ends its stream — the same path
+                // SIGTERM takes (test-only mode).
+                streamling_core::shutdown::request_shutdown();
                 break;
             }
         }
 
         // In tests, if the stream ends without reaching the limit, still notify completion
         if self.num_records_before_stop.is_some() {
-            let _ = send(
-                CHECKPOINT_COORDINATOR_CHANNEL,
-                CheckpointMessage::SourceComplete(self.source_name.clone()),
-            );
+            streamling_core::shutdown::request_shutdown();
         }
 
         Ok(row_count)
