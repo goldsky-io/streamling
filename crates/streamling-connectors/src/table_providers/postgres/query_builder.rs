@@ -261,13 +261,22 @@ impl PostgresQueryBuilder {
         query_template.replace("$VALUES_PLACEHOLDER", &values_clause)
     }
 
-    /// Build DELETE query for rows matching primary key values
-    /// Returns (query_string, num_placeholders_per_row)
+    /// Build DELETE query for rows matching primary key values.
+    ///
+    /// `cast_map` is the same column → SQL-cast map the INSERT path uses
+    /// (see [`Self::build_cast_map`]). Every key the binder sends as text —
+    /// `UInt64`, `Decimal128`/`Decimal256`, `decimal_arb` — needs the
+    /// `::numeric(p, s)` cast here too: sqlx declares a Rust `String`
+    /// parameter as `text`, and Postgres has no `numeric = text` operator, so
+    /// an uncast placeholder failed at prepare with `operator does not exist`
+    /// and the sink retried the DELETE forever. BIGINT and other natively
+    /// bound keys get a bare placeholder, as before.
     pub fn build_delete_query(
         schema: &str,
         table: &str,
         primary_key_columns: &[String],
         num_rows: usize,
+        cast_map: &std::collections::HashMap<String, Option<String>>,
     ) -> String {
         if primary_key_columns.is_empty() {
             // Without primary key, we can't safely delete - this shouldn't happen
@@ -285,9 +294,13 @@ impl PostgresQueryBuilder {
         let mut values = Vec::new();
 
         for _ in 0..num_rows {
-            let row_placeholders: Vec<String> = (0..primary_key_columns.len())
-                .map(|_| {
-                    let ph = format!("${}", placeholder_num);
+            let row_placeholders: Vec<String> = primary_key_columns
+                .iter()
+                .map(|column| {
+                    let ph = match cast_map.get(column).and_then(|cast| cast.as_deref()) {
+                        Some(cast_type) => format!("${}::{}", placeholder_num, cast_type),
+                        None => format!("${}", placeholder_num),
+                    };
                     placeholder_num += 1;
                     ph
                 })
@@ -309,6 +322,45 @@ impl PostgresQueryBuilder {
 mod tests {
     use super::*;
     use arrow_schema::DataType;
+
+    #[test]
+    fn test_build_delete_query_casts_text_bound_keys() {
+        use arrow_schema::{Field, Schema, SchemaRef};
+        use std::sync::Arc;
+        // A UInt64 / Decimal / decimal_arb key is bound as a Rust `String`,
+        // which sqlx types as `text`; without the cast Postgres rejects the
+        // statement at prepare (`operator does not exist: numeric = text`).
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let pk = vec!["id".to_string(), "amount".to_string()];
+        let cast_map = PostgresQueryBuilder::build_cast_map(&schema, &pk);
+        let id_cast = cast_map["id"].clone().expect("UInt64 binds as text");
+        let amount_cast = cast_map["amount"]
+            .clone()
+            .expect("Decimal128 binds as text");
+        let query = PostgresQueryBuilder::build_delete_query("public", "t", &pk, 2, &cast_map);
+        assert_eq!(
+            query,
+            format!(
+                r#"DELETE FROM "public"."t" WHERE ("id", "amount") IN (($1::{id_cast}, $2::{amount_cast}), ($3::{id_cast}, $4::{amount_cast}))"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_build_delete_query_natively_bound_key_has_bare_placeholder() {
+        use arrow_schema::{Field, Schema, SchemaRef};
+        use std::sync::Arc;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let pk = vec!["id".to_string()];
+        let cast_map = PostgresQueryBuilder::build_cast_map(&schema, &pk);
+        let query = PostgresQueryBuilder::build_delete_query("public", "t", &pk, 1, &cast_map);
+        assert_eq!(query, r#"DELETE FROM "public"."t" WHERE ("id") IN (($1))"#);
+    }
 
     #[test]
     fn test_build_upsert_query_with_primary_key() {
@@ -503,38 +555,10 @@ mod tests {
         assert_eq!(cast_map.get("id"), Some(&None));
     }
 
-    #[test]
-    fn test_build_cast_map_u256_i256() {
-        use arrow_schema::{Field, Schema};
-        use std::sync::Arc;
-        use streamling_core::types::{i256::I256Type, u256::U256Type};
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("u256_value", U256Type::new(), false).with_metadata(U256Type::metadata()),
-            Field::new("i256_value", I256Type::new(), false).with_metadata(I256Type::metadata()),
-        ]));
-
-        let column_names = vec![
-            "id".to_string(),
-            "u256_value".to_string(),
-            "i256_value".to_string(),
-        ];
-        let cast_map = PostgresQueryBuilder::build_cast_map(&schema, &column_names);
-
-        // u256_value should get numeric(78,0) cast
-        assert_eq!(
-            cast_map.get("u256_value"),
-            Some(&Some("numeric(78,0)".to_string()))
-        );
-        // i256_value should get numeric(78,0) cast
-        assert_eq!(
-            cast_map.get("i256_value"),
-            Some(&Some("numeric(78,0)".to_string()))
-        );
-        // id (Int64) should not need a cast
-        assert_eq!(cast_map.get("id"), Some(&None));
-    }
+    // The U256/I256 cast_map test was deleted with
+    // the retired types. Wide-int columns now route via decimal_arb +
+    // native_int_kind; the cast_map for decimal_arb is covered by
+    // test_build_cast_map_decimal256 (the decimal_arb branch is identical).
 
     #[test]
     fn test_build_complete_upsert_query_with_numeric_casts() {
