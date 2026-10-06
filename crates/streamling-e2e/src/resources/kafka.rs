@@ -594,6 +594,33 @@ impl KafkaResource {
         Ok((results, highest_offset))
     }
 
+    /// The offset `group_id` has committed on partition 0 of the topic, or
+    /// `None` if it has not committed one.
+    pub async fn committed_offset(&self, group_id: &str) -> Result<Option<i64>> {
+        const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+        let consumer: rdkafka::consumer::BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &self.broker)
+            .set("group.id", group_id)
+            .set("enable.auto.commit", "false")
+            .create()
+            .map_err(|e| E2eError::Kafka(e.to_string()))?;
+        let mut partitions = rdkafka::TopicPartitionList::new();
+        partitions.add_partition(&self.topic, 0);
+        let committed = tokio::task::spawn_blocking(move || {
+            consumer.committed_offsets(partitions, FETCH_TIMEOUT)
+        })
+        .await
+        .map_err(|e| E2eError::Kafka(e.to_string()))?
+        .map_err(|e| E2eError::Kafka(e.to_string()))?;
+        Ok(committed
+            .elements()
+            .first()
+            .and_then(|partition| match partition.offset() {
+                rdkafka::Offset::Offset(offset) => Some(offset),
+                _ => None,
+            }))
+    }
+
     /// Delete the topic (can be called explicitly if needed)
     #[allow(dead_code)]
     pub async fn cleanup(&self) -> Result<()> {
