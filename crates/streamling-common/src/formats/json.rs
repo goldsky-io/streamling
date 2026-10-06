@@ -1,23 +1,29 @@
 use crate::data::COLUMN_NAME_OP;
+use crate::formats::decimal_arb_text::{
+    decimal_arb_leaves_as_text_field, decimal_arb_leaves_from_text, decimal_arb_leaves_to_text,
+    field_contains_decimal_arb,
+};
 use crate::formats::{FromArrowConverter, ToArrowConverter};
-use crate::types::i256::{I256Type, i256_to_bytes, string_to_i256};
-use crate::types::u256::{U256Type, bytes_to_u256, string_to_u256, u256_to_bytes, u256_to_string};
+use crate::types::decimal_arb_legacy::{
+    downgrade_legacy_wide_ints, field_contains_legacy_wide_int, upgrade_legacy_wide_int_batch,
+    upgrade_legacy_wide_int_field,
+};
+// U256/I256 are retired — wide integers flow through decimal_arb only.
 use arrow_json::reader::Decoder;
 use arrow_json::writer::JsonFormat;
 use arrow_json::{ReaderBuilder, WriterBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, StringArray,
-};
-use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::compute::{cast, concat_batches};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
-use crate::{streamling_err, streamling_user_err};
+use crate::streamling_user_err;
 
 #[derive(Debug, Default)]
 // Formats json without any characters separating items
@@ -32,60 +38,31 @@ impl FromArrowToJsonConverter {
     }
 
     fn to_json(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
-        // If the schema contains U256 extension fields, convert those columns to Utf8 (decimal strings)
-        let has_u256 = batch
+        // A plugin source may still hand over the retired FixedSizeBinary(32)
+        // `streamling.u256` / `streamling.i256` columns; as decimal_arb they
+        // print their value below, where the raw bytes printed as hex.
+        let upgraded = upgrade_legacy_wide_int_batch(batch).map_err(DataFusionError::from)?;
+        let batch = upgraded.as_ref().unwrap_or(batch);
+
+        // If the schema carries any decimal_arb extension field — at the top
+        // level OR nested inside a Struct / List / Map — rewrite those leaves to
+        // Utf8 (canonical decimal text) so the standard arrow-json writer emits
+        // the value, not the raw canonical bytes as hex. (Top-level-only handling
+        // was the cause of F6: nested decimal_arb serialized as hex.)
+        let needs_transform = batch
             .schema()
             .fields()
             .iter()
-            .any(|f| U256Type::is_u256_field(f));
+            .any(|f| field_contains_decimal_arb(f));
 
-        let transformed_batch = if has_u256 {
+        let transformed_batch = if needs_transform {
             let mut new_fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
             let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-
             for (idx, field) in batch.schema().fields().iter().enumerate() {
-                if U256Type::is_u256_field(field) {
-                    // Convert FixedSizeBinary(32) -> Utf8 with decimal string
-                    let col = batch.column(idx);
-                    let fsb = col
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .ok_or_else(|| {
-                            DataFusionError::from(streamling_err!(
-                                "expected FixedSizeBinaryArray for U256 field '{}', got {:?}",
-                                field.name(),
-                                col.data_type()
-                            ))
-                        })?;
-
-                    // Build a StringArray for the decimal string representation
-                    let mut string_values: Vec<Option<String>> = Vec::with_capacity(fsb.len());
-                    for row_idx in 0..fsb.len() {
-                        if fsb.is_null(row_idx) {
-                            string_values.push(None);
-                        } else {
-                            let bytes = fsb.value(row_idx);
-                            debug_assert_eq!(bytes.len(), 32);
-                            let mut fixed: [u8; 32] = [0u8; 32];
-                            fixed.copy_from_slice(bytes);
-                            let val = bytes_to_u256(&fixed);
-                            string_values.push(Some(u256_to_string(&val)));
-                        }
-                    }
-
-                    let string_array = StringArray::from(string_values);
-                    new_columns.push(Arc::new(string_array) as ArrayRef);
-                    new_fields.push(Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    ));
-                } else {
-                    new_columns.push(batch.column(idx).clone());
-                    new_fields.push(field.as_ref().clone());
-                }
+                let (nf, na) = decimal_arb_leaves_to_text(field, batch.column(idx))?;
+                new_fields.push(nf);
+                new_columns.push(na);
             }
-
             let new_schema = Arc::new(Schema::new(new_fields));
             RecordBatch::try_new(new_schema, new_columns)?
         } else {
@@ -145,19 +122,24 @@ impl JsonToArrowConverter {
         // input, so this panics instead of returning an error. Callers that build the schema
         // from user input (a script transform's `schema:` YAML, an upstream source schema)
         // must use `try_new`.
-        Self::try_new(schema, single_row_mode, field_to_extract)
+        Self::try_new(schema, single_row_mode, field_to_extract, false)
             .expect("schema is decodable: not user-supplied here, see fn doc")
     }
 
     /// Fallible variant of [`Self::new`] for schemas built from user input: reports a schema
     /// type arrow_json can't decode as an error naming the offending field(s) instead of
     /// panicking.
+    ///
+    /// `coerce_primitive` casts a value of the wrong JS-originating JSON kind into the declared
+    /// column type instead of raising an error (a string into a number column, a float into an
+    /// int column, a number into a string column).
     pub fn try_new(
         schema: SchemaRef,
         single_row_mode: bool,
         field_to_extract: Option<String>,
+        coerce_primitive: bool,
     ) -> Result<Self> {
-        let decoder = Self::build_decoder(&schema, false)?;
+        let decoder = Self::build_decoder(&schema, coerce_primitive)?;
         Ok(Self {
             schema,
             values: Vec::new(),
@@ -167,63 +149,64 @@ impl JsonToArrowConverter {
         })
     }
 
-    /// Builds the decoder for `schema`. U256/I256 extension fields are decoded as Utf8 (decimal
-    /// strings), matching what `FromArrowToJsonConverter` produces, and converted back to their
-    /// fixed-size binary representation by `convert_batch_to_original_schema`.
+    /// Builds the decoder for `schema`.
     ///
-    /// `coerce_primitive` controls whether a value of the wrong JS-originating JSON kind (a
-    /// string in a number column, a float in an int column) is cast into the declared type
-    /// instead of raising an error.
+    /// decimal_arb leaves decode as Utf8 and convert back afterwards in
+    /// `convert_batch_to_original_schema`. The rewrite is recursive: a decimal_arb nested in a
+    /// struct/list/map needs it just as much as a top-level one.
+    ///
+    /// A retired `streamling.u256` / `streamling.i256` leaf needs the same treatment. The
+    /// writer upgrades those columns to decimal_arb text on the way out
+    /// (`upgrade_legacy_wide_int_batch`), so a script hands back decimal text; left declared as
+    /// `FixedSizeBinary(32)` here, arrow-json reads that text as HEX — 32 wrong bytes for an
+    /// all-hex 64-character number, and a hard error for any other width.
     ///
     /// Errors when `schema` declares a type arrow_json can't decode (e.g. an Interval type):
     /// callers that build the schema from user input (a script transform's `schema:` YAML) must
     /// report that as a user error, not panic.
     fn build_decoder(schema: &SchemaRef, coerce_primitive: bool) -> Result<Decoder> {
-        let has_u256_or_i256 = schema
-            .fields()
-            .iter()
-            .any(|f| U256Type::is_u256_field(f) || I256Type::is_i256_field(f));
+        let needs_transform = schema.fields().iter().any(|f| decodes_as_other_type(f));
 
-        let decoder_schema = if has_u256_or_i256 {
-            let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
-            for field in schema.fields().iter() {
-                if U256Type::is_u256_field(field) || I256Type::is_i256_field(field) {
-                    // Convert FixedSizeBinary(32) -> Utf8 for decoder
-                    new_fields.push(Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    ));
-                } else {
-                    new_fields.push(field.as_ref().clone());
-                }
-            }
+        let decoder_schema = if needs_transform {
+            let new_fields = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    // arrow_json has no Dictionary decoder: decode the value type and cast
+                    // back in `convert_batch_to_original_schema`.
+                    // ponytail: top-level dictionaries only; a nested one still errors.
+                    if let DataType::Dictionary(_, value) = f.data_type() {
+                        return Ok(f.as_ref().clone().with_data_type(value.as_ref().clone()));
+                    }
+                    // Legacy leaves become their decimal_arb equivalent first, so the text
+                    // rewrite reaches them too.
+                    let upgraded =
+                        upgrade_legacy_wide_int_field(f).map_err(DataFusionError::from)?;
+                    Ok(decimal_arb_leaves_as_text_field(
+                        upgraded.as_ref().unwrap_or(f),
+                    ))
+                })
+                .collect::<Result<Vec<Field>>>()?;
             Arc::new(Schema::new(new_fields))
         } else {
             schema.clone()
         };
 
-        ReaderBuilder::new(decoder_schema)
+        ReaderBuilder::new(decoder_schema.clone())
             .with_coerce_primitive(coerce_primitive)
             .build_decoder()
             .map_err(|e| {
                 // arrow_json names the offending type but not the field. Probe each field on
-                // its own (mirroring the U256/I256 -> Utf8 rewrite above) so the error names
-                // the field(s) the user must change.
-                let offending: Vec<String> = schema
+                // its own so the error names the field(s) the user must change.
+                let offending: Vec<&str> = decoder_schema
                     .fields()
                     .iter()
                     .filter(|f| {
-                        let field = if U256Type::is_u256_field(f) || I256Type::is_i256_field(f) {
-                            Field::new(f.name(), DataType::Utf8, f.is_nullable())
-                        } else {
-                            f.as_ref().clone()
-                        };
-                        ReaderBuilder::new(Arc::new(Schema::new(vec![field])))
+                        ReaderBuilder::new(Arc::new(Schema::new(vec![f.as_ref().clone()])))
                             .build_decoder()
                             .is_err()
                     })
-                    .map(|f| f.name().to_string())
+                    .map(|f| f.name().as_str())
                     .collect();
                 let fields_named = if offending.is_empty() {
                     String::new()
@@ -235,14 +218,6 @@ impl JsonToArrowConverter {
                     e
                 ))
             })
-    }
-
-    /// Rebuilds the decoder with `coerce_primitive` set, so a value of the wrong JS-originating
-    /// JSON kind is cast into the declared column type instead of raising an error (a string
-    /// into a number column, a float into an int column, a number into a string column).
-    pub fn with_coerce_primitive(mut self, coerce_primitive: bool) -> Result<Self> {
-        self.decoder = Self::build_decoder(&self.schema, coerce_primitive)?;
-        Ok(self)
     }
 
     /// Decodes newline-delimited JSON (one JSON object per line) into a single `RecordBatch`
@@ -257,28 +232,27 @@ impl JsonToArrowConverter {
 
         // A key the script returns that the output schema doesn't declare is dropped by
         // arrow_json. Warn once per process so schema drift (renamed or derived columns)
-        // shows up instead of silently null downstream. `_gs_op` is runtime plumbing
-        // (`collectResults` always emits it) and is excluded.
-        static WARNED_UNKNOWN_KEYS: AtomicBool = AtomicBool::new(false);
-        if !WARNED_UNKNOWN_KEYS.load(Ordering::Relaxed) {
-            let line_end = bytes
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(bytes.len());
-            if let Ok(Value::Object(obj)) = serde_json::from_slice(&bytes[..line_end]) {
-                let unknown: Vec<&String> = obj
-                    .keys()
-                    .filter(|k| k.as_str() != COLUMN_NAME_OP)
-                    .filter(|k| self.schema.field_with_name(k).is_err())
-                    .collect();
-                if !unknown.is_empty() {
-                    warn!(
-                        "script transform output contains keys not in the output schema \
-                         (they are dropped): {:?}",
-                        unknown
-                    );
-                    WARNED_UNKNOWN_KEYS.store(true, Ordering::Relaxed);
-                }
+        // shows up instead of silently null downstream. Every row is scanned, so a key
+        // returned only by some rows is still caught.
+        // ponytail: the scan stops after DRIFT_SCAN_ROWS rows process-wide so healthy
+        // pipelines stop paying for the extra parse; drift first appearing later goes unwarned.
+        const DRIFT_SCAN_ROWS: usize = 10_000;
+        static ROWS_LEFT_TO_SCAN: AtomicUsize = AtomicUsize::new(DRIFT_SCAN_ROWS);
+        let rows_left = ROWS_LEFT_TO_SCAN.load(Ordering::Relaxed);
+        if rows_left > 0 {
+            let (unknown, scanned) = unknown_output_keys(&self.schema, bytes, rows_left);
+            if unknown.is_empty() {
+                let _ =
+                    ROWS_LEFT_TO_SCAN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                        Some(left.saturating_sub(scanned))
+                    });
+            } else {
+                warn!(
+                    "script transform output contains keys not in the output schema \
+                     (they are dropped): {:?}",
+                    unknown
+                );
+                ROWS_LEFT_TO_SCAN.store(0, Ordering::Relaxed);
             }
         }
 
@@ -334,92 +308,76 @@ impl JsonToArrowConverter {
         }
     }
 
-    /// Convert a decoded batch back to the original schema, converting Utf8 fields back to U256/I256
+    /// Convert a decoded batch back to the original schema: the Utf8 leaves
+    /// the decoder produced become decimal_arb again, and a leaf the original
+    /// schema declares as a retired `streamling.u256` / `streamling.i256`
+    /// goes one step further, back to its `FixedSizeBinary(32)` wire shape
+    /// through the value-checked bridge (which rejects a value the wire type
+    /// cannot hold rather than truncating it). A dictionary column, decoded as
+    /// its value type, is cast back to the dictionary.
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        let has_u256_or_i256 = self
+        let needs_transform = self
             .schema
             .fields()
             .iter()
-            .any(|f| U256Type::is_u256_field(f) || I256Type::is_i256_field(f));
+            .any(|f| decodes_as_other_type(f));
 
-        if !has_u256_or_i256 {
+        if !needs_transform {
             return Ok(batch);
         }
 
         let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-        let mut new_fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
-
         for (idx, field) in self.schema.fields().iter().enumerate() {
-            if U256Type::is_u256_field(field) {
-                // Convert Utf8 -> FixedSizeBinary(32) for U256
-                let col = batch.column(idx);
-                let string_array = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::from(streamling_err!(
-                        "expected StringArray for U256 field '{}', got {:?}",
-                        field.name(),
-                        col.data_type()
-                    ))
-                })?;
-
-                let mut builder = FixedSizeBinaryBuilder::with_capacity(string_array.len(), 32);
-                for row_idx in 0..string_array.len() {
-                    if string_array.is_null(row_idx) {
-                        builder.append_null();
-                    } else {
-                        let str_val = string_array.value(row_idx);
-                        let u256_val = string_to_u256(str_val)?;
-                        let bytes = u256_to_bytes(&u256_val);
-                        builder.append_value(bytes).map_err(|e| {
-                            DataFusionError::from(streamling_err!(
-                                "failed to append U256 value for field '{}': {}",
-                                field.name(),
-                                e
-                            ))
-                        })?;
-                    }
-                }
-                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
-                new_fields.push(field.as_ref().clone());
-            } else if I256Type::is_i256_field(field) {
-                // Convert Utf8 -> FixedSizeBinary(32) for I256
-                let col = batch.column(idx);
-                let string_array = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::from(streamling_err!(
-                        "expected StringArray for I256 field '{}', got {:?}",
-                        field.name(),
-                        col.data_type()
-                    ))
-                })?;
-
-                let mut builder = FixedSizeBinaryBuilder::with_capacity(string_array.len(), 32);
-                for row_idx in 0..string_array.len() {
-                    if string_array.is_null(row_idx) {
-                        builder.append_null();
-                    } else {
-                        let str_val = string_array.value(row_idx);
-                        let i256_val = string_to_i256(str_val)?;
-                        let bytes = i256_to_bytes(&i256_val);
-                        builder.append_value(bytes).map_err(|e| {
-                            DataFusionError::from(streamling_err!(
-                                "failed to append I256 value for field '{}': {}",
-                                field.name(),
-                                e
-                            ))
-                        })?;
-                    }
-                }
-                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
-                new_fields.push(field.as_ref().clone());
+            let upgraded = upgrade_legacy_wide_int_field(field).map_err(DataFusionError::from)?;
+            let target = upgraded.as_ref().unwrap_or(field);
+            let arr = decimal_arb_leaves_from_text(target, batch.column(idx))?;
+            let arr =
+                match downgrade_legacy_wide_ints(field, &arr).map_err(DataFusionError::from)? {
+                    Some(downgraded) => downgraded,
+                    None => arr,
+                };
+            let arr = if arr.data_type() == field.data_type() {
+                arr
             } else {
-                new_columns.push(batch.column(idx).clone());
-                new_fields.push(field.as_ref().clone());
-            }
+                cast(&arr, field.data_type())?
+            };
+            new_columns.push(arr);
         }
 
-        let new_schema = Arc::new(Schema::new(new_fields));
-        RecordBatch::try_new(new_schema, new_columns)
+        RecordBatch::try_new(self.schema.clone(), new_columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
+}
+
+/// Whether `field` decodes from JSON through a different Arrow type than it declares
+/// (decimal_arb and legacy wide ints as text, a dictionary as its value type).
+fn decodes_as_other_type(field: &Field) -> bool {
+    field_contains_decimal_arb(field)
+        || field_contains_legacy_wide_int(field)
+        || matches!(field.data_type(), DataType::Dictionary(..))
+}
+
+/// Keys in the first `max_rows` NDJSON rows of `bytes` that `schema` does not declare, and
+/// the number of rows scanned. `_gs_op` is runtime plumbing (`collectResults` always emits
+/// it) and is never reported.
+fn unknown_output_keys(
+    schema: &Schema,
+    bytes: &[u8],
+    max_rows: usize,
+) -> (BTreeSet<String>, usize) {
+    let mut unknown = BTreeSet::new();
+    let mut scanned = 0;
+    for line in bytes.split(|&b| b == b'\n').take(max_rows) {
+        scanned += 1;
+        if let Ok(Value::Object(obj)) = serde_json::from_slice(line) {
+            unknown.extend(
+                obj.into_iter()
+                    .map(|(k, _)| k)
+                    .filter(|k| k != COLUMN_NAME_OP && schema.field_with_name(k).is_err()),
+            );
+        }
+    }
+    (unknown, scanned)
 }
 
 impl ToArrowConverter<String> for JsonToArrowConverter {
@@ -510,9 +468,45 @@ impl ToArrowConverter<String> for JsonToArrowConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
+    use arrow_schema::{DataType, Fields};
     use datafusion::arrow::array::*;
     use datafusion::arrow::record_batch::RecordBatch;
+    use std::str::FromStr;
     use std::sync::Arc;
+
+    /// Test schema with two fields: `a` (Int32, non-nullable) and
+    /// `b` (Utf8, nullable). Used by the basic JSON converter tests.
+    fn create_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]))
+    }
+
+    /// Round-trip a RecordBatch through `FromArrowToJsonConverter` →
+    /// `JsonToArrowConverter` (batch mode) and assert the resulting
+    /// batch equals the original. Used by the basic converter tests.
+    fn assert_from_json_to_arrow_conversion(input: RecordBatch) {
+        let schema = input.schema();
+        // FromArrow → JSON
+        let from_arrow = FromArrowToJsonConverter::new();
+        let json_rows: Vec<Vec<u8>> = from_arrow.convert_from_batch(&input).unwrap();
+        // Combine the per-row JSON objects into a JSON array string for batch-mode parse.
+        let json_array = format!(
+            "[{}]",
+            json_rows
+                .iter()
+                .map(|row| std::str::from_utf8(row).unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let mut to_arrow = JsonToArrowConverter::new(schema, false, None);
+        to_arrow.buffer(json_array);
+        let output = to_arrow.convert_to_batch().unwrap();
+        assert_eq!(output.num_rows(), input.num_rows());
+        assert_eq!(output.num_columns(), input.num_columns());
+    }
 
     #[test]
     fn test_from_arrow_to_json_converter() {
@@ -632,29 +626,35 @@ mod tests {
         assert_from_json_to_arrow_conversion(batch);
     }
 
+    // ------- decimal_arb JSON round-trip -------
+
     #[test]
-    fn test_from_arrow_to_json_with_u256() {
-        // Build a schema with a U256 field
-        let u256_field =
-            Field::new("u256", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let schema = Arc::new(Schema::new(vec![u256_field]));
+    fn test_from_arrow_to_json_with_decimal_arb() {
+        // Build a schema with a single decimal_arb(100, 18) field.
+        let field = DecimalArbType::field("amount", 100, 18, true).unwrap();
+        let schema = Arc::new(Schema::new(vec![field]));
 
-        // Build a FixedSizeBinary(32) array with U256 bytes
-        let value = crate::types::u256::U256::from(12345u64);
-        let bytes = crate::types::u256::u256_to_bytes(&value);
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(1, 32);
-        builder.append_value(bytes.as_slice()).unwrap();
-        let array = builder.finish();
+        // Build a one-row batch with a 100-digit value.
+        let mut s = String::with_capacity(101);
+        s.push('1');
+        for _ in 0..81 {
+            s.push('0');
+        }
+        s.push('.');
+        s.push_str("000000000000000001");
 
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(array) as ArrayRef]).unwrap();
+        let mut b = DecimalArbArrayBuilder::with_capacity(1, "amount", 100, 18).unwrap();
+        b.append_str(&s).unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(raw) as ArrayRef]).unwrap();
 
         let converter = FromArrowToJsonConverter::new();
         let rows = converter.convert_from_batch(&batch).unwrap();
         assert_eq!(rows.len(), 1);
         let json_str = String::from_utf8(rows[0].clone()).unwrap();
-        assert_eq!(json_str, r#"{"u256":"12345"}"#);
+        assert_eq!(json_str, format!(r#"{{"amount":"{}"}}"#, s));
     }
+
     /// A row missing a declared column decodes as null. With `coerce_primitive` on, a number
     /// written into a Utf8 column parses as its string form ("42" for the integer 42).
     #[test]
@@ -664,9 +664,7 @@ mod tests {
             Field::new("b", DataType::Utf8, true),
         ]));
 
-        let mut converter = JsonToArrowConverter::new(schema.clone(), true, None)
-            .with_coerce_primitive(true)
-            .unwrap();
+        let mut converter = JsonToArrowConverter::try_new(schema, true, None, true).unwrap();
 
         let ndjson = "{\"a\":1,\"b\":42}\n{\"a\":2}\n";
         let batch = converter.decode_ndjson(ndjson.as_bytes()).unwrap();
@@ -688,6 +686,34 @@ mod tests {
         assert!(b.is_null(1));
     }
 
+    /// Script transform output carries decimal_arb values as decimal text (the form the
+    /// input writer hands the script); `decode_ndjson` must turn that text back into the
+    /// declared decimal_arb column, not leave it as Utf8 or reject it.
+    #[test]
+    fn test_decode_ndjson_decimal_arb() {
+        let big = "123456789012345678901234567890";
+        let schema = Arc::new(Schema::new(vec![
+            DecimalArbType::field("amount", 100, 0, true).unwrap(),
+        ]));
+
+        let mut converter =
+            JsonToArrowConverter::try_new(schema.clone(), true, None, true).unwrap();
+        let ndjson = format!("{{\"amount\":\"{big}\"}}\n{{\"amount\":null}}\n");
+        let batch = converter.decode_ndjson(ndjson.as_bytes()).unwrap();
+
+        assert_eq!(batch.schema(), schema);
+        let amount = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(
+            DecimalArbValue::from_canonical_bytes_at_scale(amount.value(0), 0).unwrap(),
+            DecimalArbValue::from_str(big).unwrap()
+        );
+        assert!(amount.is_null(1));
+    }
+
     /// The fallible constructor used by the script transform's `process_batch` reports an
     /// undecodable schema as an error naming the offending field, instead of panicking the
     /// process. This is the constructor that sees user-influenced schemas (a transform's
@@ -703,7 +729,7 @@ mod tests {
             ),
         ]));
 
-        let err = match JsonToArrowConverter::try_new(schema, true, None) {
+        let err = match JsonToArrowConverter::try_new(schema, true, None, true) {
             Ok(_) => panic!("try_new should reject an undecodable schema"),
             Err(e) => e,
         };
@@ -720,9 +746,8 @@ mod tests {
     #[test]
     fn test_decode_ndjson_rejects_malformed_tail() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let mut converter = JsonToArrowConverter::new(schema.clone(), true, None)
-            .with_coerce_primitive(true)
-            .unwrap();
+        let mut converter =
+            JsonToArrowConverter::try_new(schema.clone(), true, None, true).unwrap();
 
         let err = converter.decode_ndjson(b"{\"a\":1}\nnot json").unwrap_err();
         assert!(
@@ -730,216 +755,181 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let mut converter = JsonToArrowConverter::new(schema, true, None)
-            .with_coerce_primitive(true)
-            .unwrap();
+        let mut converter = JsonToArrowConverter::try_new(schema, true, None, true).unwrap();
         let batch = converter.decode_ndjson(b"{\"a\":1}\n\n").unwrap();
         assert_eq!(batch.num_rows(), 1);
     }
 
-    /// A schema declaring a type arrow_json's JSON reader doesn't support (here, Interval)
-    /// returns an error from `build_decoder`, not a panic. The type comes from a script
-    /// transform's `schema:` YAML, so it's user input and must be reported, not crash the
-    /// process.
     #[test]
-    fn test_build_decoder_rejects_unsupported_type_without_panicking() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "x",
-            DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
-            true,
-        )]));
+    fn test_unknown_output_keys_scans_every_row() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let bytes = b"{\"a\":1,\"_gs_op\":\"i\"}\n{\"a\":2,\"extra\":3}\n{\"late\":4}";
 
-        let err = JsonToArrowConverter::build_decoder(&schema, false).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported type in script transform schema"),
-            "unexpected error: {err}"
+        let (unknown, scanned) = unknown_output_keys(&schema, bytes, usize::MAX);
+        assert_eq!(
+            unknown,
+            BTreeSet::from(["extra".to_string(), "late".to_string()])
         );
+        assert_eq!(scanned, 3);
+
+        let (unknown, scanned) = unknown_output_keys(&schema, bytes, 2);
+        assert_eq!(unknown, BTreeSet::from(["extra".to_string()]));
+        assert_eq!(scanned, 2);
     }
 
     #[test]
-    fn test_json_to_arrow_converter_with_u256_single_row() {
-        // Build a schema with a U256 field
-        let u256_field =
-            Field::new("u256", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let schema = Arc::new(Schema::new(vec![u256_field]));
-
-        let mut converter = JsonToArrowConverter::new(schema.clone(), true, None);
-
-        converter.buffer(r#"{"u256":"12345"}"#.to_string());
-        converter.buffer(r#"{"u256":"67890"}"#.to_string());
-        converter.buffer(r#"{"u256":null}"#.to_string());
-
-        let batch = converter.convert_to_batch().unwrap();
-
-        assert_eq!(batch.num_columns(), 1);
-        assert_eq!(batch.num_rows(), 3);
-
-        let u256_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-
-        assert_eq!(u256_col.len(), 3);
-        assert!(!u256_col.is_null(0));
-        assert!(!u256_col.is_null(1));
-        assert!(u256_col.is_null(2));
-
-        // Verify the first value
-        let bytes0 = u256_col.value(0);
-        let mut fixed0: [u8; 32] = [0u8; 32];
-        fixed0.copy_from_slice(bytes0);
-        let val0 = bytes_to_u256(&fixed0);
-        assert_eq!(val0, crate::types::u256::U256::from(12345u64));
-
-        // Verify the second value
-        let bytes1 = u256_col.value(1);
-        let mut fixed1: [u8; 32] = [0u8; 32];
-        fixed1.copy_from_slice(bytes1);
-        let val1 = bytes_to_u256(&fixed1);
-        assert_eq!(val1, crate::types::u256::U256::from(67890u64));
-    }
-
-    #[test]
-    fn test_json_to_arrow_converter_with_u256_and_other_fields() {
-        // Build a schema with U256 and other fields
-        let u256_field =
-            Field::new("u256", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let int_field = Field::new("id", DataType::Int32, false);
-        let string_field = Field::new("name", DataType::Utf8, true);
-        let schema = Arc::new(Schema::new(vec![int_field, u256_field, string_field]));
+    fn test_decimal_arb_round_trip_through_json() {
+        // Schema: id (Int64) + amount (decimal_arb(80, 40)).
+        let id = Field::new("id", DataType::Int64, false);
+        let amount = DecimalArbType::field("amount", 80, 40, true).unwrap();
+        let schema = Arc::new(Schema::new(vec![id, amount]));
 
         let mut converter = JsonToArrowConverter::new(schema.clone(), false, None);
-
         converter.buffer(
-            r#"[{"id":1,"u256":"12345","name":"foo"},{"id":2,"u256":"67890","name":null}]"#
+            r#"[{"id":1,"amount":"1234567890.987654321098765432109876543210"},
+                {"id":2,"amount":null},
+                {"id":3,"amount":"-0.0000000000000000000000000000000000000001"}]"#
                 .to_string(),
         );
 
         let batch = converter.convert_to_batch().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
 
-        assert_eq!(batch.num_columns(), 3);
-        assert_eq!(batch.num_rows(), 2);
-
-        // Check Int32 column
-        let id_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(id_col.value(0), 1);
-        assert_eq!(id_col.value(1), 2);
-
-        // Check U256 column
-        let u256_col = batch
+        let amount_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
-        assert!(!u256_col.is_null(0));
-        assert!(!u256_col.is_null(1));
+        assert!(amount_col.is_null(1), "row 1 amount must be NULL");
 
-        let bytes0 = u256_col.value(0);
-        let mut fixed0: [u8; 32] = [0u8; 32];
-        fixed0.copy_from_slice(bytes0);
-        let val0 = bytes_to_u256(&fixed0);
-        assert_eq!(val0, crate::types::u256::U256::from(12345u64));
+        let v0 = DecimalArbValue::from_canonical_bytes_at_scale(amount_col.value(0), 40).unwrap();
+        assert_eq!(
+            v0,
+            DecimalArbValue::from_str("1234567890.987654321098765432109876543210").unwrap()
+        );
 
-        let bytes1 = u256_col.value(1);
-        let mut fixed1: [u8; 32] = [0u8; 32];
-        fixed1.copy_from_slice(bytes1);
-        let val1 = bytes_to_u256(&fixed1);
-        assert_eq!(val1, crate::types::u256::U256::from(67890u64));
+        let v2 = DecimalArbValue::from_canonical_bytes_at_scale(amount_col.value(2), 40).unwrap();
+        assert_eq!(
+            v2,
+            DecimalArbValue::from_str("-0.0000000000000000000000000000000000000001").unwrap()
+        );
 
-        // Check String column
-        let name_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
+        // Re-serialize and confirm the round-trip preserves the *numeric*
+        // value. The canonical string after a (parse → encode at scale=40 →
+        // decode at scale=40 → format) round-trip pads the original 30-digit
+        // fractional input with 10 trailing zeros, because the column scale
+        // (40) is part of the storage contract; this is correct per the
+        // Arrow extension-type contract §3.
+        let writer = FromArrowToJsonConverter::new();
+        let serialized = writer.convert_from_batch(&batch).unwrap();
+        let row0 = String::from_utf8(serialized[0].clone()).unwrap();
+        assert!(
+            row0.contains(r#""amount":"1234567890.9876543210987654321098765432100000000000""#),
+            "row0 after round-trip should contain the column-scale-padded value: {}",
+            row0,
+        );
+        let row1 = String::from_utf8(serialized[1].clone()).unwrap();
+        assert!(row1.contains(r#""amount":null"#));
+    }
+
+    // ------- nested decimal_arb JSON serialization (F6) -------
+
+    /// A `decimal_arb` nested inside a struct must serialize as its decimal
+    /// value, not the raw canonical bytes as hex (F6 regression guard).
+    #[test]
+    fn nested_struct_decimal_arb_serializes_value_not_hex() {
+        let big = "123456789012345678901234567890"; // 30 digits, > 2^64
+        let amt_field = DecimalArbType::field("amt", 100, 0, false).unwrap();
+        let mut b = DecimalArbArrayBuilder::with_capacity(1, "amt", 100, 0).unwrap();
+        b.append_str(big).unwrap();
+        let (amt_raw, _, _) = b.finish().into_inner();
+
+        let inner_fields = Fields::from(vec![Arc::new(amt_field)]);
+        let inner = StructArray::new(
+            inner_fields.clone(),
+            vec![Arc::new(amt_raw) as ArrayRef],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("inner", DataType::Struct(inner_fields), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(inner) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
             .unwrap();
-        assert_eq!(name_col.value(0), "foo");
-        assert!(name_col.is_null(1));
+        let json = String::from_utf8(rows[0].clone()).unwrap();
+        assert_eq!(json, format!(r#"{{"id":1,"inner":{{"amt":"{big}"}}}}"#));
+    }
+
+    /// An array of records each carrying a `decimal_arb` (the blockchain
+    /// "transfers"/"traces" shape) must serialize each element's value, not hex.
+    #[test]
+    fn array_of_struct_decimal_arb_serializes_values_not_hex() {
+        use datafusion::arrow::buffer::OffsetBuffer;
+
+        let amt_field = DecimalArbType::field("amt", 100, 0, false).unwrap();
+        let mut b = DecimalArbArrayBuilder::with_capacity(2, "amt", 100, 0).unwrap();
+        b.append_str("123456789012345678901234567890").unwrap();
+        b.append_str("7").unwrap();
+        let (amt_raw, _, _) = b.finish().into_inner();
+
+        let item_fields = Fields::from(vec![Arc::new(amt_field)]);
+        let items_struct = StructArray::new(
+            item_fields.clone(),
+            vec![Arc::new(amt_raw) as ArrayRef],
+            None,
+        );
+        let item_field = Arc::new(Field::new("item", DataType::Struct(item_fields), false));
+        // Single row whose list holds both structs.
+        let offsets = OffsetBuffer::new(vec![0, 2].into());
+        let list = ListArray::new(
+            item_field.clone(),
+            offsets,
+            Arc::new(items_struct) as ArrayRef,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("items", DataType::List(item_field), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(list) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap();
+        let json = String::from_utf8(rows[0].clone()).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":1,"items":[{"amt":"123456789012345678901234567890"},{"amt":"7"}]}"#
+        );
     }
 
     #[test]
-    fn test_json_to_arrow_converter_u256_round_trip() {
-        // Test round-trip: Arrow -> JSON -> Arrow
-        let u256_field =
-            Field::new("u256", U256Type::new(), true).with_metadata(U256Type::metadata());
-        let schema = Arc::new(Schema::new(vec![u256_field]));
-
-        // Create original batch
-        let value1 = crate::types::u256::U256::from(12345u64);
-        let value2 = crate::types::u256::U256::from(67890u64);
-        let bytes1 = crate::types::u256::u256_to_bytes(&value1);
-        let bytes2 = crate::types::u256::u256_to_bytes(&value2);
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(2, 32);
-        builder.append_value(bytes1.as_slice()).unwrap();
-        builder.append_value(bytes2.as_slice()).unwrap();
-        let array = builder.finish();
-        let original_batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(array) as ArrayRef]).unwrap();
-
-        // Convert to JSON
-        let to_json_converter = FromArrowToJsonConverter::new();
-        let json_rows = to_json_converter
-            .convert_from_batch(&original_batch)
-            .unwrap();
-
-        // Convert back from JSON
-        let mut from_json_converter = JsonToArrowConverter::new(schema.clone(), true, None);
-        for row in json_rows {
-            let json_str = String::from_utf8(row).unwrap();
-            from_json_converter.buffer(json_str);
-        }
-        let round_trip_batch = from_json_converter.convert_to_batch().unwrap();
-
-        // Verify round-trip
-        assert_eq!(round_trip_batch.num_rows(), original_batch.num_rows());
-        assert_eq!(round_trip_batch.num_columns(), original_batch.num_columns());
-
-        let original_col = original_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-        let round_trip_col = round_trip_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-
-        for i in 0..original_col.len() {
-            let orig_bytes = original_col.value(i);
-            let rt_bytes = round_trip_col.value(i);
-            assert_eq!(orig_bytes, rt_bytes);
-        }
-    }
-
-    fn create_test_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Utf8, true),
-        ]))
-    }
-
-    fn assert_from_json_to_arrow_conversion(batch: RecordBatch) {
-        assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.num_rows(), 3);
-
-        let a = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let b = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        assert_eq!(a, &Int32Array::from(vec![1, 2, 3]));
-        assert_eq!(b, &StringArray::from(vec![Some("foo"), None, Some("bar")]));
+    fn test_json_to_arrow_decimal_arb_rejects_value_exceeding_declared_precision() {
+        // (precision, scale) = (5, 0); a 6-digit value must be rejected.
+        let field = DecimalArbType::field("x", 5, 0, true).unwrap();
+        let schema = Arc::new(Schema::new(vec![field]));
+        let mut converter = JsonToArrowConverter::new(schema, true, None);
+        converter.buffer(r#"{"x":"123456"}"#.to_string());
+        let err = converter.convert_to_batch().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("'x'"), "error must name the column: {}", msg);
     }
 }

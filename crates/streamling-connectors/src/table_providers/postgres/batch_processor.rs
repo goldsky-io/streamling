@@ -199,11 +199,18 @@ async fn execute_delete_slice(
         return Ok(());
     }
 
+    // Same casts as the INSERT path: a text-bound key (UInt64, Decimal,
+    // decimal_arb) needs `::numeric(p, s)` or Postgres rejects the statement.
+    let cast_map = PostgresQueryBuilder::build_cast_map(
+        &context.original_schema,
+        &context.primary_key_columns,
+    );
     let query = PostgresQueryBuilder::build_delete_query(
         &context.schema_name,
         &context.table,
         &context.primary_key_columns,
         slice.num_rows(),
+        &cast_map,
     );
 
     let columns: Vec<_> = (0..slice.num_columns())

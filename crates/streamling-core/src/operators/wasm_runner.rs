@@ -503,8 +503,7 @@ impl WasmRunnerExec {
         // number in a string column) cast into the declared type instead of
         // erroring, since JS scripts commonly return numbers and strings
         // interchangeably.
-        let output_batch = JsonToArrowConverter::try_new(output_schema.clone(), true, None)?
-            .with_coerce_primitive(true)?
+        let output_batch = JsonToArrowConverter::try_new(output_schema.clone(), true, None, true)?
             .decode_ndjson(&output_bytes)?;
         enrich_batch_with_metadata(output_batch, input_metadata).map_err(Into::into)
     }
@@ -2977,5 +2976,43 @@ mod tests {
             .unwrap();
         assert_eq!(code_col.value(0), 10);
         assert_eq!(code_col.value(1), 20);
+    }
+
+    #[tokio::test]
+    async fn test_wasm_dictionary_input_column_without_declared_schema() {
+        // With no `schema:`, the output schema is the input schema. A dictionary column
+        // (e.g. a Hive partition column, `Dictionary(UInt16, Utf8)`) has no arrow_json
+        // decoder, so it must decode as its value type and come back as the dictionary.
+        let dict_type = arrow_schema::DataType::Dictionary(
+            Box::new(arrow_schema::DataType::UInt16),
+            Box::new(arrow_schema::DataType::Utf8),
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("dt", dict_type.clone(), true),
+        ]));
+        let dt: arrow::array::DictionaryArray<arrow::datatypes::UInt16Type> =
+            vec![Some("2026-01-01"), None].into_iter().collect();
+        let input_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(dt)],
+        )
+        .unwrap();
+
+        let script = r#"
+        function invoke(data) {
+            return { id: data.id, dt: data.dt };
+        }
+        "#;
+
+        let batch = run_process_batch(&input_batch, script, &schema).unwrap();
+
+        let dt_col = batch.column_by_name("dt").unwrap();
+        assert_eq!(dt_col.data_type(), &dict_type);
+        let dt_values = arrow::compute::cast(dt_col, &arrow_schema::DataType::Utf8).unwrap();
+        assert_eq!(
+            dt_values.as_any().downcast_ref::<StringArray>().unwrap(),
+            &StringArray::from(vec![Some("2026-01-01"), None])
+        );
     }
 }

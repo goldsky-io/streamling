@@ -15,7 +15,7 @@ import "./patch_text_decoder.js";
 import { tableFromIPC } from "@uwdata/flechette";
 
 // JSON.stringify throws on BigInt; writing it as a string lets the Rust
-// decoder parse it into int64/U256 columns.
+// decoder parse it into int64/decimal_arb columns.
 BigInt.prototype.toJSON = function () {
   return this.toString();
 };

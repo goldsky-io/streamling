@@ -160,17 +160,16 @@ pub fn extract_value_from_array(array: &Arc<dyn Array>, index: usize) -> Result<
 
             timestamp_format::format_timestamp(timestamp_seconds, nanos)
         }
-        DataType::Decimal128(_precision, _scale) => {
+        // Same rendering as the bind path: the unscaled integer with the
+        // decimal point inserted at `scale`. `format!("{}", unscaled)` wrote
+        // `1234` for a `Decimal128(10, 2)` holding 12.34.
+        DataType::Decimal128(_, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let val = arr.value(index);
-            // Convert decimal128 to string representation
-            // Need to scale properly based on scale parameter
-            format!("{}", val) // Placeholder - should scale properly
+            super::value_binding::unscaled_to_numeric_string(&arr.value(index).to_string(), *scale)
         }
-        DataType::Decimal256(_precision, _scale) => {
+        DataType::Decimal256(_, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            let val = arr.value(index);
-            format!("{}", val) // Placeholder
+            super::value_binding::unscaled_to_numeric_string(&arr.value(index).to_string(), *scale)
         }
         _ => {
             return Err(streamling_err!(
