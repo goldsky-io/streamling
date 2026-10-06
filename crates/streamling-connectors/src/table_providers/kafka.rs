@@ -1497,7 +1497,7 @@ async fn calculate_lag_task(
     // pipeline gets cancelled at runtime teardown, where its consumer's
     // rd_kafka_destroy can no longer be deferred to a blocking thread.
     let mut global_shutdown_rx = cancel.is_none().then(streamling_core::shutdown::subscribe);
-    let mut lags = BTreeMap::new();
+    let mut lags = Arc::new(BTreeMap::new());
 
     loop {
         let already_cancelled = match (&cancel, &global_shutdown_rx) {
@@ -1535,7 +1535,7 @@ async fn calculate_lag_task(
             },
             _ = interval.tick() => {
                 trace!("Calculating lag for reference_name: {}", reference_name);
-                lags = owned_partition_lags(
+                lags = Arc::new(owned_partition_lags(
                     &reference_name,
                     &topic,
                     &assignments.owned(),
@@ -1543,13 +1543,13 @@ async fn calculate_lag_task(
                     &state_backend,
                     &lags,
                 )
-                .await;
+                .await);
                 if let Some(lag_gauge) = &lag_gauge {
                     lag_gauge.replace(lags.iter().map(|(partition, lag)| {
                         (vec![("partition", partition.to_string())], *lag as u64)
                     }));
                 }
-                partition_lags.send_replace(Some(Arc::new(lags.clone())));
+                partition_lags.send_replace(Some(lags.clone()));
             }
         }
     }
@@ -1809,6 +1809,34 @@ impl ExecutionPlan for KafkaSourceExec {
         let partition_lags = self.partition_lags.clone();
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
+            // Only the instance that was handed the lag consumer reports lag
+            // (one per source, not one per parallel instance); it spawns
+            // through the scope so the drain ladder tracks it. Spawn before
+            // this instance's own assignment: it may own no partition (more
+            // consumers in the group than partitions) while its siblings do.
+            if let Some(lag_consumer) = lag_consumer {
+                let lag_gauge = metrics_recorder
+                    .resolve_snapshot_gauge(KAFKA_CONSUMER_LAG_METRIC, &metric_metadata_id);
+                if lag_gauge.is_none() {
+                    warn!(
+                        "Kafka source '{}': metric '{}' is denied or metadata_id '{}' is not registered; lag will not be exported",
+                        reference_name, KAFKA_CONSUMER_LAG_METRIC, metric_metadata_id
+                    );
+                }
+                let lag_task = calculate_lag_task(
+                    reference_name.clone(),
+                    topic.clone(),
+                    assignments.clone(),
+                    lag_consumer,
+                    state_backend.clone(),
+                    lag_gauge,
+                    kafka_lag_reporter_interval,
+                    partition_lags.clone(),
+                    shutdown_rx.clone(),
+                    Some(scope.token().clone()),
+                );
+                scope.spawn(lag_task);
+            }
             let mut watchdog = KafkaSourceWatchdogState::new(
                 stall_watchdog_timeout,
                 partition_lags.subscribe(),
@@ -1845,32 +1873,6 @@ impl ExecutionPlan for KafkaSourceExec {
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
-            // Only the instance that was handed the lag consumer reports lag
-            // (one per source, not one per parallel instance); it spawns
-            // through the scope so the drain ladder tracks it.
-            if let Some(lag_consumer) = lag_consumer {
-                let lag_gauge = metrics_recorder
-                    .resolve_snapshot_gauge(KAFKA_CONSUMER_LAG_METRIC, &metric_metadata_id);
-                if lag_gauge.is_none() {
-                    warn!(
-                        "Kafka source '{}': metric '{}' is denied or metadata_id '{}' is not registered; lag will not be exported",
-                        reference_name, KAFKA_CONSUMER_LAG_METRIC, metric_metadata_id
-                    );
-                }
-                let lag_task = calculate_lag_task(
-                    reference_name.clone(),
-                    topic.clone(),
-                    assignments.clone(),
-                    lag_consumer,
-                    state_backend.clone(),
-                    lag_gauge,
-                    kafka_lag_reporter_interval,
-                    partition_lags.clone(),
-                    shutdown_rx.clone(),
-                    Some(scope.token().clone()),
-                );
-                scope.spawn(lag_task);
-            }
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
