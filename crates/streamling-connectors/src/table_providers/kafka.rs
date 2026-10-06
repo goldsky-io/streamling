@@ -255,9 +255,10 @@ impl PartitionAssignments {
         self.lock().values().flatten().copied().collect()
     }
 
-    /// Partitions owned by one instance.
-    fn of(&self, instance: usize) -> BTreeSet<i32> {
-        self.lock().get(&instance).cloned().unwrap_or_default()
+    /// Max known lag over the partitions one instance owns; see [`own_max_lag`].
+    fn own_max_lag(&self, instance: usize, lags: &BTreeMap<i32, i64>) -> Option<i64> {
+        static NONE_OWNED: BTreeSet<i32> = BTreeSet::new();
+        own_max_lag(lags, self.lock().get(&instance).unwrap_or(&NONE_OWNED))
     }
 }
 
@@ -1404,7 +1405,7 @@ impl KafkaSourceWatchdogState {
             .lag_rx
             .borrow()
             .as_deref()
-            .and_then(|lags| own_max_lag(lags, &self.assignments.of(self.instance)));
+            .and_then(|lags| self.assignments.own_max_lag(self.instance, lags));
 
         if self.max_observed_lag.is_some() {
             self.lag_unavailable_since = None;
@@ -1497,7 +1498,6 @@ async fn calculate_lag_task(
     // pipeline gets cancelled at runtime teardown, where its consumer's
     // rd_kafka_destroy can no longer be deferred to a blocking thread.
     let mut global_shutdown_rx = cancel.is_none().then(streamling_core::shutdown::subscribe);
-    let mut lags = Arc::new(BTreeMap::new());
 
     loop {
         let already_cancelled = match (&cancel, &global_shutdown_rx) {
@@ -1535,21 +1535,22 @@ async fn calculate_lag_task(
             },
             _ = interval.tick() => {
                 trace!("Calculating lag for reference_name: {}", reference_name);
-                lags = Arc::new(owned_partition_lags(
-                    &reference_name,
-                    &topic,
-                    &assignments.owned(),
-                    &consumer,
-                    &state_backend,
-                    &lags,
-                )
-                .await);
+                let lags = Arc::new(
+                    owned_partition_lags(
+                        &reference_name,
+                        &topic,
+                        &assignments.owned(),
+                        &consumer,
+                        &state_backend,
+                    )
+                    .await,
+                );
                 if let Some(lag_gauge) = &lag_gauge {
                     lag_gauge.replace(lags.iter().map(|(partition, lag)| {
                         (vec![("partition", partition.to_string())], *lag as u64)
                     }));
                 }
-                partition_lags.send_replace(Some(lags.clone()));
+                partition_lags.send_replace(Some(lags));
             }
         }
     }
@@ -1559,15 +1560,15 @@ async fn calculate_lag_task(
 }
 
 /// Lag (high watermark minus the committed offset in the state backend) of
-/// each `owned` partition. A partition whose lag cannot be read this tick
-/// keeps its `previous` value; partitions no longer owned are dropped.
+/// each `owned` partition. A partition whose lag cannot be read this tick is
+/// left out, so the gauge and the stall watchdog see it as unknown rather
+/// than as a stale value.
 async fn owned_partition_lags(
     reference_name: &str,
     topic: &str,
     owned: &BTreeSet<i32>,
     consumer: &SafeKafkaConsumer,
     state_backend: &Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
-    previous: &BTreeMap<i32, i64>,
 ) -> BTreeMap<i32, i64> {
     let mut lags = BTreeMap::new();
     for &partition in owned {
@@ -1586,10 +1587,9 @@ async fn owned_partition_lags(
             Ok((_, high_watermark)) => high_watermark,
             Err(e) => {
                 error!(
-                    "Failed to fetch watermarks for topic: {}, partition {}: {:?}; reporting the previous lag",
+                    "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
                     topic, partition, e
                 );
-                lags.extend(previous.get(&partition).map(|lag| (partition, *lag)));
                 continue;
             }
         };
@@ -1606,10 +1606,9 @@ async fn owned_partition_lags(
             }
             Err(_) => {
                 error!(
-                    "Failed to fetch offsets from state backend for topic: {}, partition {}; reporting the previous lag",
+                    "Failed to fetch offsets from state backend for topic: {}, partition {}; lag metric will not be reported",
                     topic, partition,
                 );
-                lags.extend(previous.get(&partition).map(|lag| (partition, *lag)));
                 continue;
             }
         };
@@ -4381,8 +4380,10 @@ mod tests {
         assignments.set(0, [0, 1].into());
         assignments.set(1, [2].into());
         assert_eq!(assignments.owned(), [0, 1, 2].into());
-        assert_eq!(assignments.of(1), [2].into());
-        assert_eq!(assignments.of(7), BTreeSet::new());
+        let lags = [(0, 5), (1, 9), (2, 3)].into();
+        assert_eq!(assignments.own_max_lag(1, &lags), Some(3));
+        // An instance with no recorded assignment owns nothing.
+        assert_eq!(assignments.own_max_lag(7, &lags), Some(0));
 
         // A rebalance replaces an instance's assignment, it never accumulates.
         assignments.set(0, [1].into());

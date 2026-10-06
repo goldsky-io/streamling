@@ -649,8 +649,9 @@ sinks:
     let rebalanced = tokio::select! {
         exit = &mut replica_a => panic!("replica a exited early: {exit:?}"),
         exit = &mut replica_b => panic!("replica b exited early: {exit:?}"),
-        // Wait for b to own partitions, then for the reports to settle.
-        observation = wait_for(|o| o.1.is_some_and(|b| b > 0) && o.0.zip(o.1).is_some_and(|(a, b)| a + b == 4)) => observation,
+        // Rebalances settle over several ticks; wait for the end state and
+        // let the asserts below report the last observation if it never comes.
+        observation = wait_for(|o| *o == (Some(2), Some(2), Some(4), Some(1))) => observation,
     };
 
     let (a_partitions, b_partitions, partitions, reporters_per_partition) = rebalanced;
