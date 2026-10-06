@@ -1,3 +1,4 @@
+use crate::data::COLUMN_NAME_OP;
 use crate::formats::decimal_arb_text::{
     decimal_arb_leaves_as_text_field, decimal_arb_leaves_from_text, decimal_arb_leaves_to_text,
     field_contains_decimal_arb,
@@ -11,13 +12,16 @@ use crate::types::decimal_arb_legacy::{
 use arrow_json::reader::Decoder;
 use arrow_json::writer::JsonFormat;
 use arrow_json::{ReaderBuilder, WriterBuilder};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::compute::{cast, concat_batches};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use tracing::error;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::{error, warn};
 
 use crate::streamling_user_err;
 
@@ -112,66 +116,189 @@ impl JsonToArrowConverter {
     /// `single_row_mode` - if true, each JSON string represents a single row, otherwise a JSON array of objects is expected
     /// `field_to_extract` - if set, the field to extract from the JSON object. This allows to "unwrap" a JSON object, e.g. an envelope
     pub fn new(schema: SchemaRef, single_row_mode: bool, field_to_extract: Option<String>) -> Self {
-        // decimal_arb leaves decode as Utf8 and convert back afterwards. The
-        // rewrite is recursive: a decimal_arb nested in a struct/list/map
-        // needs it just as much as a top-level one.
-        //
-        // A retired `streamling.u256` / `streamling.i256` leaf needs the same
-        // treatment. The writer upgrades those columns to decimal_arb text on
-        // the way out (`upgrade_legacy_wide_int_batch`), so a script hands
-        // back decimal text; left declared as `FixedSizeBinary(32)` here,
-        // arrow-json reads that text as HEX — 32 wrong bytes for an all-hex
-        // 64-character number, and a hard error for any other width.
-        let needs_transform = schema
-            .fields()
-            .iter()
-            .any(|f| field_contains_decimal_arb(f) || field_contains_legacy_wide_int(f));
+        // Every existing caller passes a schema already known to be decodable (a schema this
+        // same converter round-trips through `FromArrowToJsonConverter`, or one built from a
+        // fixed set of Arrow types); an unsupported type here is a bug in the caller, not user
+        // input, so this panics instead of returning an error. Callers that build the schema
+        // from user input (a script transform's `schema:` YAML, an upstream source schema)
+        // must use `try_new`.
+        Self::try_new(schema, single_row_mode, field_to_extract, false)
+            .expect("schema is decodable: not user-supplied here, see fn doc")
+    }
 
-        let decoder = if needs_transform {
-            let new_fields: Vec<Field> = schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    // Legacy leaves become their decimal_arb equivalent first,
-                    // so the text rewrite below reaches them too.
-                    //
-                    // `new` cannot return an error, so a failure here falls
-                    // back to the field as declared. That is safe rather than
-                    // silent: `convert_batch_to_original_schema` calls the
-                    // same function with `?` for every batch, so a field this
-                    // one could not upgrade fails the first conversion
-                    // loudly instead of reaching the hex decoder's output.
-                    // Log it anyway — the fallback should be unreachable,
-                    // since the upgrade only builds decimal_arb(78, 0).
-                    let upgraded = match upgrade_legacy_wide_int_field(f) {
-                        Ok(upgraded) => upgraded,
-                        Err(e) => {
-                            error!(
-                                "could not upgrade legacy wide-int field '{}' for JSON decoding, \
-                                 leaving it as declared; the first batch conversion will fail: {e}",
-                                f.name()
-                            );
-                            None
-                        }
-                    };
-                    decimal_arb_leaves_as_text_field(upgraded.as_ref().unwrap_or(f))
-                })
-                .collect();
-            let transformed_schema = Arc::new(Schema::new(new_fields));
-            ReaderBuilder::new(transformed_schema)
-                .build_decoder()
-                .unwrap()
-        } else {
-            ReaderBuilder::new(schema.clone()).build_decoder().unwrap()
-        };
-
-        Self {
+    /// Fallible variant of [`Self::new`] for schemas built from user input: reports a schema
+    /// type arrow_json can't decode as an error naming the offending field(s) instead of
+    /// panicking.
+    ///
+    /// `coerce_primitive` casts a value of the wrong JS-originating JSON kind into the declared
+    /// column type instead of raising an error (a string into a number column, a float into an
+    /// int column, a number into a string column).
+    pub fn try_new(
+        schema: SchemaRef,
+        single_row_mode: bool,
+        field_to_extract: Option<String>,
+        coerce_primitive: bool,
+    ) -> Result<Self> {
+        let decoder = Self::build_decoder(&schema, coerce_primitive)?;
+        Ok(Self {
             schema,
             values: Vec::new(),
             decoder,
             single_row_mode,
             field_to_extract,
+        })
+    }
+
+    /// Builds the decoder for `schema`.
+    ///
+    /// decimal_arb leaves decode as Utf8 and convert back afterwards in
+    /// `convert_batch_to_original_schema`. The rewrite is recursive: a decimal_arb nested in a
+    /// struct/list/map needs it just as much as a top-level one.
+    ///
+    /// A retired `streamling.u256` / `streamling.i256` leaf needs the same treatment. The
+    /// writer upgrades those columns to decimal_arb text on the way out
+    /// (`upgrade_legacy_wide_int_batch`), so a script hands back decimal text; left declared as
+    /// `FixedSizeBinary(32)` here, arrow-json reads that text as HEX — 32 wrong bytes for an
+    /// all-hex 64-character number, and a hard error for any other width.
+    ///
+    /// Errors when `schema` declares a type arrow_json can't decode (e.g. an Interval type):
+    /// callers that build the schema from user input (a script transform's `schema:` YAML) must
+    /// report that as a user error, not panic.
+    fn build_decoder(schema: &SchemaRef, coerce_primitive: bool) -> Result<Decoder> {
+        let needs_transform = schema.fields().iter().any(|f| decodes_as_other_type(f));
+
+        let decoder_schema = if needs_transform {
+            let new_fields = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    // arrow_json has no Dictionary decoder: decode the value type and cast
+                    // back in `convert_batch_to_original_schema`.
+                    // ponytail: top-level dictionaries only; a nested one still errors.
+                    if let DataType::Dictionary(_, value) = f.data_type() {
+                        return Ok(f.as_ref().clone().with_data_type(value.as_ref().clone()));
+                    }
+                    // Legacy leaves become their decimal_arb equivalent first, so the text
+                    // rewrite reaches them too.
+                    let upgraded =
+                        upgrade_legacy_wide_int_field(f).map_err(DataFusionError::from)?;
+                    Ok(decimal_arb_leaves_as_text_field(
+                        upgraded.as_ref().unwrap_or(f),
+                    ))
+                })
+                .collect::<Result<Vec<Field>>>()?;
+            Arc::new(Schema::new(new_fields))
+        } else {
+            schema.clone()
+        };
+
+        ReaderBuilder::new(decoder_schema.clone())
+            .with_coerce_primitive(coerce_primitive)
+            .build_decoder()
+            .map_err(|e| {
+                // arrow_json names the offending type but not the field. Probe each field on
+                // its own so the error names the field(s) the user must change.
+                let offending: Vec<&str> = decoder_schema
+                    .fields()
+                    .iter()
+                    .filter(|f| {
+                        ReaderBuilder::new(Arc::new(Schema::new(vec![f.as_ref().clone()])))
+                            .build_decoder()
+                            .is_err()
+                    })
+                    .map(|f| f.name().as_str())
+                    .collect();
+                let fields_named = if offending.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (offending fields: {})", offending.join(", "))
+                };
+                DataFusionError::from(streamling_user_err!(
+                    "unsupported type in script transform schema{fields_named}: {}",
+                    e
+                ))
+            })
+    }
+
+    /// Decodes newline-delimited JSON (one JSON object per line) into a single `RecordBatch`
+    /// against this converter's schema. Used to decode WASM script transform output, where the
+    /// JS runtime writes one JSON object per output row.
+    ///
+    /// A declared column missing from a row decodes as null. Empty input returns an empty batch.
+    pub fn decode_ndjson(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
+        if bytes.is_empty() {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
+
+        // A key the script returns that the output schema doesn't declare is dropped by
+        // arrow_json. Warn once per process so schema drift (renamed or derived columns)
+        // shows up instead of silently null downstream. Every row is scanned, so a key
+        // returned only by some rows is still caught.
+        // ponytail: the scan stops after DRIFT_SCAN_ROWS rows process-wide so healthy
+        // pipelines stop paying for the extra parse; drift first appearing later goes unwarned.
+        const DRIFT_SCAN_ROWS: usize = 10_000;
+        static ROWS_LEFT_TO_SCAN: AtomicUsize = AtomicUsize::new(DRIFT_SCAN_ROWS);
+        let rows_left = ROWS_LEFT_TO_SCAN.load(Ordering::Relaxed);
+        if rows_left > 0 {
+            let (unknown, scanned) = unknown_output_keys(&self.schema, bytes, rows_left);
+            if unknown.is_empty() {
+                let _ =
+                    ROWS_LEFT_TO_SCAN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                        Some(left.saturating_sub(scanned))
+                    });
+            } else {
+                warn!(
+                    "script transform output contains keys not in the output schema \
+                     (they are dropped): {:?}",
+                    unknown
+                );
+                ROWS_LEFT_TO_SCAN.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let map_decode_err = |e: arrow_schema::ArrowError| {
+            DataFusionError::from(streamling_user_err!(
+                "script transform output does not match the output schema: {}",
+                e
+            ))
+        };
+
+        let mut batches = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let read = self
+                .decoder
+                .decode(&bytes[offset..])
+                .map_err(map_decode_err)?;
+            offset += read;
+            if let Some(batch) = self.decoder.flush().map_err(map_decode_err)? {
+                batches.push(batch);
+            }
+            if read == 0 {
+                // The decoder made no progress with bytes still on the input. Trailing
+                // whitespace is fine (nothing left to decode); anything else is a malformed
+                // tail that would otherwise be dropped silently.
+                if bytes[offset..].iter().all(|b| b.is_ascii_whitespace()) {
+                    break;
+                }
+                return Err(DataFusionError::from(streamling_user_err!(
+                    "script transform output does not match the output schema: \
+                     could not decode JSON starting at byte offset {offset}"
+                )));
+            }
+        }
+        if let Some(batch) = self.decoder.flush().map_err(map_decode_err)? {
+            batches.push(batch);
+        }
+
+        let batch = if batches.is_empty() {
+            RecordBatch::new_empty(self.schema.clone())
+        } else {
+            let decoder_schema = batches[0].schema();
+            concat_batches(&decoder_schema, &batches)?
+        };
+
+        self.convert_batch_to_original_schema(batch)
     }
 
     fn extract_field_from(field: String, value: &Value) -> Result<Value> {
@@ -186,13 +313,14 @@ impl JsonToArrowConverter {
     /// schema declares as a retired `streamling.u256` / `streamling.i256`
     /// goes one step further, back to its `FixedSizeBinary(32)` wire shape
     /// through the value-checked bridge (which rejects a value the wire type
-    /// cannot hold rather than truncating it).
+    /// cannot hold rather than truncating it). A dictionary column, decoded as
+    /// its value type, is cast back to the dictionary.
     fn convert_batch_to_original_schema(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let needs_transform = self
             .schema
             .fields()
             .iter()
-            .any(|f| field_contains_decimal_arb(f) || field_contains_legacy_wide_int(f));
+            .any(|f| decodes_as_other_type(f));
 
         if !needs_transform {
             return Ok(batch);
@@ -208,12 +336,48 @@ impl JsonToArrowConverter {
                     Some(downgraded) => downgraded,
                     None => arr,
                 };
+            let arr = if arr.data_type() == field.data_type() {
+                arr
+            } else {
+                cast(&arr, field.data_type())?
+            };
             new_columns.push(arr);
         }
 
         RecordBatch::try_new(self.schema.clone(), new_columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
+}
+
+/// Whether `field` decodes from JSON through a different Arrow type than it declares
+/// (decimal_arb and legacy wide ints as text, a dictionary as its value type).
+fn decodes_as_other_type(field: &Field) -> bool {
+    field_contains_decimal_arb(field)
+        || field_contains_legacy_wide_int(field)
+        || matches!(field.data_type(), DataType::Dictionary(..))
+}
+
+/// Keys in the first `max_rows` NDJSON rows of `bytes` that `schema` does not declare, and
+/// the number of rows scanned. `_gs_op` is runtime plumbing (`collectResults` always emits
+/// it) and is never reported.
+fn unknown_output_keys(
+    schema: &Schema,
+    bytes: &[u8],
+    max_rows: usize,
+) -> (BTreeSet<String>, usize) {
+    let mut unknown = BTreeSet::new();
+    let mut scanned = 0;
+    for line in bytes.split(|&b| b == b'\n').take(max_rows) {
+        scanned += 1;
+        if let Ok(Value::Object(obj)) = serde_json::from_slice(line) {
+            unknown.extend(
+                obj.into_iter()
+                    .map(|(k, _)| k)
+                    .filter(|k| k != COLUMN_NAME_OP && schema.field_with_name(k).is_err()),
+            );
+        }
+    }
+    (unknown, scanned)
 }
 
 impl ToArrowConverter<String> for JsonToArrowConverter {
@@ -489,6 +653,128 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let json_str = String::from_utf8(rows[0].clone()).unwrap();
         assert_eq!(json_str, format!(r#"{{"amount":"{}"}}"#, s));
+    }
+
+    /// A row missing a declared column decodes as null. With `coerce_primitive` on, a number
+    /// written into a Utf8 column parses as its string form ("42" for the integer 42).
+    #[test]
+    fn test_decode_ndjson() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+
+        let mut converter = JsonToArrowConverter::try_new(schema, true, None, true).unwrap();
+
+        let ndjson = "{\"a\":1,\"b\":42}\n{\"a\":2}\n";
+        let batch = converter.decode_ndjson(ndjson.as_bytes()).unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        let a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(a, &Int32Array::from(vec![1, 2]));
+        assert_eq!(b.value(0), "42");
+        assert!(b.is_null(1));
+    }
+
+    /// Script transform output carries decimal_arb values as decimal text (the form the
+    /// input writer hands the script); `decode_ndjson` must turn that text back into the
+    /// declared decimal_arb column, not leave it as Utf8 or reject it.
+    #[test]
+    fn test_decode_ndjson_decimal_arb() {
+        let big = "123456789012345678901234567890";
+        let schema = Arc::new(Schema::new(vec![
+            DecimalArbType::field("amount", 100, 0, true).unwrap(),
+        ]));
+
+        let mut converter =
+            JsonToArrowConverter::try_new(schema.clone(), true, None, true).unwrap();
+        let ndjson = format!("{{\"amount\":\"{big}\"}}\n{{\"amount\":null}}\n");
+        let batch = converter.decode_ndjson(ndjson.as_bytes()).unwrap();
+
+        assert_eq!(batch.schema(), schema);
+        let amount = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(
+            DecimalArbValue::from_canonical_bytes_at_scale(amount.value(0), 0).unwrap(),
+            DecimalArbValue::from_str(big).unwrap()
+        );
+        assert!(amount.is_null(1));
+    }
+
+    /// The fallible constructor used by the script transform's `process_batch` reports an
+    /// undecodable schema as an error naming the offending field, instead of panicking the
+    /// process. This is the constructor that sees user-influenced schemas (a transform's
+    /// `schema:` YAML, or an upstream input schema).
+    #[test]
+    fn test_try_new_rejects_unsupported_type_without_panicking() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ok", DataType::Int64, true),
+            Field::new(
+                "bad",
+                DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
+                true,
+            ),
+        ]));
+
+        let err = match JsonToArrowConverter::try_new(schema, true, None, true) {
+            Ok(_) => panic!("try_new should reject an undecodable schema"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("offending fields: bad"),
+            "error should name the offending field, got: {message}"
+        );
+    }
+
+    /// A segment the decoder can't make progress on (a malformed trailing line) surfaces as
+    /// an error instead of being silently dropped; trailing whitespace after the last line
+    /// stays accepted.
+    #[test]
+    fn test_decode_ndjson_rejects_malformed_tail() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let mut converter =
+            JsonToArrowConverter::try_new(schema.clone(), true, None, true).unwrap();
+
+        let err = converter.decode_ndjson(b"{\"a\":1}\nnot json").unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the output schema"),
+            "unexpected error: {err}"
+        );
+
+        let mut converter = JsonToArrowConverter::try_new(schema, true, None, true).unwrap();
+        let batch = converter.decode_ndjson(b"{\"a\":1}\n\n").unwrap();
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_unknown_output_keys_scans_every_row() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let bytes = b"{\"a\":1,\"_gs_op\":\"i\"}\n{\"a\":2,\"extra\":3}\n{\"late\":4}";
+
+        let (unknown, scanned) = unknown_output_keys(&schema, bytes, usize::MAX);
+        assert_eq!(
+            unknown,
+            BTreeSet::from(["extra".to_string(), "late".to_string()])
+        );
+        assert_eq!(scanned, 3);
+
+        let (unknown, scanned) = unknown_output_keys(&schema, bytes, 2);
+        assert_eq!(unknown, BTreeSet::from(["extra".to_string()]));
+        assert_eq!(scanned, 2);
     }
 
     #[test]

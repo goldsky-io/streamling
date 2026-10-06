@@ -1,53 +1,50 @@
-import { tableFromIPC, tableToIPC, tableFromArrays } from "@uwdata/flechette";
+// Runtime for user-provided JS/TS script transforms. Reads Arrow IPC input
+// bytes from the host, runs the user's `invoke(row)` function once per input
+// row, and writes the result back to the host.
+//
+// Runs the user function over every input row, collects the returned row
+// objects, and writes them as newline-delimited JSON (one JSON object per
+// output row) via `Host.outputString`. The Rust side knows the output schema
+// (declared `schema:` or the input schema) and decodes this JSON directly
+// against it with arrow_json.
+//
+// `patch_text_decoder.js` is imported first so its `TextDecoder.prototype.decode`
+// patch is installed before flechette's own module-scope decoder is created
+// (flechette builds a `TextDecoder` at module load, in util/strings.js).
+import "./patch_text_decoder.js";
+import { tableFromIPC } from "@uwdata/flechette";
 
-// Custom base64 encoding function (btoa equivalent)
-function btoa(str) {
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let result = "";
-  let i = 0;
-  while (i < str.length) {
-    const a = str.charCodeAt(i++);
-    const hasB = i < str.length;
-    const b = hasB ? str.charCodeAt(i++) : 0;
-    const hasC = i < str.length;
-    const c = hasC ? str.charCodeAt(i++) : 0;
-    const bitmap = (a << 16) | (b << 8) | c;
-    result += chars.charAt((bitmap >> 18) & 63);
-    result += chars.charAt((bitmap >> 12) & 63);
-    if (hasB) {
-      result += chars.charAt((bitmap >> 6) & 63);
-    } else {
-      result += "=";
-    }
-    if (hasC) {
-      result += chars.charAt(bitmap & 63);
-    } else {
-      result += "=";
-    }
+// JSON.stringify throws on BigInt; writing it as a string lets the Rust
+// decoder parse it into int64/decimal_arb columns.
+BigInt.prototype.toJSON = function () {
+  return this.toString();
+};
+
+// `eval(code)` compiles the user's script into a callable function. The
+// compiled function is cached per plugin instance (keyed by the raw code
+// string) so a script is only compiled once, not once per invoke() call.
+const compiledFnCache = new Map();
+function getCompiledFn(code) {
+  let fn = compiledFnCache.get(code);
+  if (!fn) {
+    fn = eval("(" + code + ")");
+    compiledFnCache.set(code, fn);
   }
-  return result;
+  return fn;
 }
 
 function invoke() {
   try {
     const code = Config.get("code");
-    // Compile the function once outside the loop for better performance
-    const fn = eval("(" + code + ")");
+    const fn = getCompiledFn(code);
 
-    // Read Arrow IPC bytes from host
     const inputBytes = Host.inputBytes();
-
-    // Ensure we have a Uint8Array (flechette expects Uint8Array, not ArrayBuffer)
+    // flechette expects a Uint8Array, not a raw ArrayBuffer.
     const inputUint8Array =
       inputBytes instanceof Uint8Array
         ? inputBytes
         : new Uint8Array(inputBytes);
 
-    // Decode Arrow IPC to table with proxy support for efficient iteration
-    // Proxy allows for 'zero-copy' iteration over the table
-    // but prevents things like Object.keys() from being called.
-    // In testing this is faster and uses less memory.
     let inputTable;
     try {
       inputTable = tableFromIPC(inputUint8Array, { useProxy: true });
@@ -60,150 +57,123 @@ function invoke() {
     }
 
     const numRows = inputTable.numRows;
-    const results = [];
+    const results = collectResults(fn, inputTable, numRows);
 
-    // Process each row using table iterator with .get()
-    for (let i = 0; i < numRows; i++) {
-      let inputObj;
-      try {
-        inputObj = inputTable.get(i);
-      } catch (error) {
-        throw new Error(
-          `Failed to get row ${i} from table: ${error.message}${
-            error.stack ? "\n" + error.stack : ""
-          }`
-        );
-      }
-      try {
-        const result = fn(inputObj);
+    // `results.map(...).join("\n")` builds the whole string in one pass;
+    // repeated `+=` concatenation would copy the growing string on every
+    // row. arrow_json doesn't need a trailing newline after the last row.
+    // Flechette exposes numeric lists as typed arrays; JSON needs regular arrays.
+    const out = fixLoneSurrogates(
+      results.map((row) => JSON.stringify(row, (_key, value) =>
+        ArrayBuffer.isView(value) && !(value instanceof DataView)
+          ? Array.from(value)
+          : value
+      )).join("\n")
+    );
 
-        // Allow null to filter out rows from the batch
-        if (result === null) {
-          continue;
-        }
-
-        // Support returning an array to expand one row into many rows
-        if (Array.isArray(result)) {
-          for (let j = 0; j < result.length; j++) {
-            const row = result[j];
-
-            // Allow null in array to filter out specific rows
-            if (row === null) {
-              continue;
-            }
-
-            if (typeof row !== "object") {
-              throw new Error(
-                `Script must return an object, null, or array of objects. Array element at index ${j} is ${typeof row}`
-              );
-            }
-
-            // Always preserve _gs_op from input if it exists, even if user function doesn't include it
-            if ("_gs_op" in inputObj) {
-              row._gs_op = inputObj._gs_op;
-            }
-
-            results.push(row);
-          }
-          continue;
-        }
-
-        if (typeof result !== "object") {
-          throw new Error(
-            `Script must return an object, null, or array of objects, got ${typeof result}`
-          );
-        }
-
-        // Always preserve _gs_op from input if it exists, even if user function doesn't include it
-        if ("_gs_op" in inputObj) {
-          result._gs_op = inputObj._gs_op;
-        }
-
-        results.push(result);
-      } catch (error) {
-        // Format the error with context and throw it
-        throw new Error(formatError(error, inputObj, i + 1));
-      }
-    }
-
-    // Convert results back to Arrow table
-    let outputTable;
-    try {
-      if (results.length === 0) {
-        // For empty results, create a minimal table with empty columns
-        // We'll create a table with a single dummy column that we can remove
-        outputTable = tableFromArrays({ _dummy: [] });
-      } else {
-        // Transform array of objects into columnar format (object of arrays)
-        // Collect all unique keys from all result objects
-        const allKeys = new Set();
-        for (const result of results) {
-          if (result && typeof result === "object") {
-            const keys = Object.keys(result);
-            for (const key of keys) {
-              allKeys.add(key);
-            }
-          }
-        }
-
-        // Build columnar structure: { columnName: [value1, value2, ...] }
-        const columns = {};
-        for (const key of allKeys) {
-          columns[key] = results.map((row) => {
-            if (row && typeof row === "object" && key in row) {
-              return row[key] ?? null;
-            }
-            return null;
-          });
-        }
-
-        try {
-          outputTable = tableFromArrays(columns);
-        } catch (error) {
-          console.error(`Error in tableFromArrays: ${error.message}`);
-          throw new Error(
-            `Failed to create Arrow table from arrays: ${error.message}${
-              error.stack ? "\n" + error.stack : ""
-            }`
-          );
-        }
-      }
-    } catch (error) {
-      throw new Error(
-        `Failed to create Arrow table from results: ${error.message}${
-          error.stack ? "\n" + error.stack : ""
-        }`
-      );
-    }
-
-    // Encode table to Arrow IPC bytes
-    // Try to encode in smaller chunks or with different options if it fails
-    let outputBytes;
-    try {
-      // Use file format (matches what Rust expects)
-      outputBytes = tableToIPC(outputTable, { format: "file" });
-
-      if (outputBytes === null) {
-        throw new Error("tableToIPC returned null even with explicit format");
-      }
-    } catch (error) {
-      throw new Error(
-        `Failed to encode Arrow IPC output: ${error.message}${
-          error.stack ? "\n" + error.stack : ""
-        }`
-      );
-    }
-
-    // Return Arrow IPC bytes directly - extism will convert Uint8Array to Vec<u8>
-    return Host.outputBytes(outputBytes.buffer);
+    return Host.outputString(out);
   } catch (error) {
-    // Catch any unexpected errors and provide context
     throw new Error(
       `script runtime error: ${error.message}${
         error.stack ? "\n" + error.stack : ""
       }`
     );
   }
+}
+
+// Runs the user function over every input row and returns the resulting
+// row-object array: returning null filters a row out, returning an array
+// expands one input row into many output rows. `_gs_op` is always copied
+// over from the input row when the input has it, even if the user's
+// function doesn't include it in its returned row; otherwise, when the
+// returned row doesn't set `_gs_op` (or sets it to null/undefined), it
+// defaults to "i" (insert).
+function collectResults(fn, inputTable, numRows) {
+  const results = [];
+
+  for (let i = 0; i < numRows; i++) {
+    let inputObj;
+    try {
+      inputObj = inputTable.get(i);
+    } catch (error) {
+      throw new Error(
+        `Failed to get row ${i} from table: ${error.message}${
+          error.stack ? "\n" + error.stack : ""
+        }`
+      );
+    }
+    try {
+      const result = fn(inputObj);
+
+      if (result === null) {
+        continue;
+      }
+
+      if (Array.isArray(result)) {
+        for (let j = 0; j < result.length; j++) {
+          const row = result[j];
+
+          if (row === null) {
+            continue;
+          }
+
+          if (typeof row !== "object") {
+            throw new Error(
+              `Script must return an object, null, or array of objects. Array element at index ${j} is ${typeof row}`
+            );
+          }
+
+          if ("_gs_op" in inputObj) {
+            row._gs_op = inputObj._gs_op;
+          } else if (row._gs_op === null || row._gs_op === undefined) {
+            row._gs_op = "i";
+          }
+
+          results.push(row);
+        }
+        continue;
+      }
+
+      if (typeof result !== "object") {
+        throw new Error(
+          `Script must return an object, null, or array of objects, got ${typeof result}`
+        );
+      }
+
+      if ("_gs_op" in inputObj) {
+        result._gs_op = inputObj._gs_op;
+      } else if (result._gs_op === null || result._gs_op === undefined) {
+        result._gs_op = "i";
+      }
+
+      results.push(result);
+    } catch (error) {
+      throw new Error(formatError(error, inputObj, i + 1));
+    }
+  }
+
+  return results;
+}
+
+// JSON.stringify writes an unpaired UTF-16 surrogate (half of a 4-byte
+// character truncated or otherwise produced without its partner) as a
+// lowercase `\udXXX`-style escape, and a valid surrogate pair as raw
+// characters. The Rust JSON decoder rejects a lone surrogate escape, so
+// replace each one with the U+FFFD replacement character escape -- the same
+// result `TextEncoder` gives when it encodes a lone surrogate. A user string
+// containing a literal backslash is written as `\\`, so this only matches an
+// escape preceded by an even number of backslashes (an odd count means the
+// backslash belongs to the user's text, not the start of a real escape).
+//
+// The regex scan below walks the whole output string, which is expensive in
+// QuickJS on a large batch. A lone surrogate is rare, so a plain substring
+// check skips the regex entirely in the common case where there's nothing
+// to fix.
+function fixLoneSurrogates(json) {
+  if (json.indexOf("\\ud") === -1) {
+    return json;
+  }
+  return json.replace(/(?<!\\)((?:\\\\)*)\\ud[89a-f][0-9a-f]{2}/g, "$1\\ufffd");
 }
 
 function truncateString(str, maxLength) {
@@ -220,7 +190,6 @@ function formatError(error, input, lineNumber) {
   const errorType = error.constructor.name;
   let commonIssues = [];
 
-  // Add type-specific guidance
   if (errorType === "TypeError") {
     commonIssues = [
       "Check if you're accessing properties that exist in the input",
@@ -251,13 +220,11 @@ function formatError(error, input, lineNumber) {
     formattedError += `Stack trace:\n${error.stack}\n\n`;
   }
 
-  // Format input data with truncation if too large
   let inputDataDisplay;
   try {
     const inputJson = JSON.stringify(input, null, 2);
     inputDataDisplay = truncateString(inputJson, MAX_INPUT_LENGTH);
   } catch (e) {
-    // If JSON stringify fails, show a simple representation
     inputDataDisplay = truncateString(String(input), MAX_INPUT_LENGTH);
   }
 
