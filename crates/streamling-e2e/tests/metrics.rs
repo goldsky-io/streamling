@@ -589,9 +589,10 @@ sinks:
             kafka.topic, replica
         )
     };
-    let opts = |timeout_secs| {
+    let opts = || {
+        // An upper bound only: the test drops both runs once it has observed them.
         PipelineOpts::new()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .timeout(std::time::Duration::from_secs(300))
             .env("STREAMLING__KAFKA_SOURCE__LAG_REPORT_INTERVAL_MS", "1000")
     };
 
@@ -603,22 +604,15 @@ sinks:
             "(timestamp(streamling_kafka_consumer_messages_lag{{instance=\"{instance}\"{selector}}}) > time() - 5)"
         )
     };
-
-    let (yaml_a, yaml_b) = (pipeline_yaml("a"), pipeline_yaml("b"));
-    let replica_a = ctx.run_pipeline_with_opts(&yaml_a, opts(50));
-    let replica_b = async {
-        // Join after replica a owns all four partitions.
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-        ctx.run_pipeline_with_opts(&yaml_b, opts(35)).await
+    let count = |query: String| async move {
+        prometheus
+            .query_count(&query)
+            .await
+            .expect("Failed to query lag metric")
     };
-    let check = async {
-        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
-        let count = |query: String| async move {
-            prometheus
-                .query_count(&query)
-                .await
-                .expect("Failed to query lag metric")
-        };
+    // (partitions reported by a, by b, partitions reported at all, max
+    // replicas reporting one partition)
+    let observe = || async {
         (
             count(format!("count({})", fresh(r#",replica="a""#))).await,
             count(format!("count({})", fresh(r#",replica="b""#))).await,
@@ -626,10 +620,40 @@ sinks:
             count(format!("max(count by (partition) ({}))", fresh(""))).await,
         )
     };
-    // Both replicas run until their timeouts, which is expected.
-    let (_, _, (a_partitions, b_partitions, partitions, reporters_per_partition)) =
-        tokio::join!(replica_a, replica_b, check);
+    // Polls `observe` until `done` holds; returns the last observation.
+    let wait_for = |done: fn(&Observation) -> bool| async move {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let observation = observe().await;
+            if done(&observation) || tokio::time::Instant::now() > deadline {
+                return observation;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    };
+    type Observation = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
 
+    let (yaml_a, yaml_b) = (pipeline_yaml("a"), pipeline_yaml("b"));
+    // Dropping a run future kills its process.
+    let replica_a = ctx.run_pipeline_with_opts(&yaml_a, opts());
+    tokio::pin!(replica_a);
+
+    let alone = tokio::select! {
+        exit = &mut replica_a => panic!("replica a exited early: {exit:?}"),
+        observation = wait_for(|o| o.0 == Some(4)) => observation,
+    };
+    assert_eq!(alone.0, Some(4), "replica a alone owns every partition");
+
+    let replica_b = ctx.run_pipeline_with_opts(&yaml_b, opts());
+    tokio::pin!(replica_b);
+    let rebalanced = tokio::select! {
+        exit = &mut replica_a => panic!("replica a exited early: {exit:?}"),
+        exit = &mut replica_b => panic!("replica b exited early: {exit:?}"),
+        // Wait for b to own partitions, then for the reports to settle.
+        observation = wait_for(|o| o.1.is_some_and(|b| b > 0) && o.0.zip(o.1).is_some_and(|(a, b)| a + b == 4)) => observation,
+    };
+
+    let (a_partitions, b_partitions, partitions, reporters_per_partition) = rebalanced;
     assert_eq!(partitions, Some(4), "every partition reports lag");
     assert_eq!(
         reporters_per_partition,

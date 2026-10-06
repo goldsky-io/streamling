@@ -1320,12 +1320,16 @@ impl KafkaSourceExec {
     }
 }
 
-/// Max lag over an instance's own partitions; `Some(0)` when it owns none
-/// (nothing to consume), `None` when any owned partition's lag is unknown.
+/// Max known lag over an instance's own partitions; `Some(0)` when it owns
+/// none (nothing to consume), `None` when no owned partition's lag is known.
 fn own_max_lag(lags: &BTreeMap<i32, i64>, own: &BTreeSet<i32>) -> Option<i64> {
+    if own.is_empty() {
+        return Some(0);
+    }
     own.iter()
-        .map(|partition| lags.get(partition).copied())
-        .try_fold(0, |max, lag| lag.map(|lag| max.max(lag)))
+        .filter_map(|partition| lags.get(partition))
+        .copied()
+        .max()
 }
 
 fn is_stalled_with_lag(
@@ -4315,7 +4319,7 @@ mod tests {
         assert_eq!(watchdog.max_observed_lag, Some(0));
         assert!(watchdog.lag_unavailable_since.is_none());
 
-        // Lag task stopped (or has not computed lag for an owned partition)
+        // Lag task stopped
         tx.send(None).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, None);
@@ -4364,8 +4368,9 @@ mod tests {
         assert_eq!(own_max_lag(&lags, &[0].into()), Some(5));
         // Owning nothing means nothing to consume, not unknown lag.
         assert_eq!(own_max_lag(&lags, &BTreeSet::new()), Some(0));
-        // Any owned partition without a lag makes the max unknown.
-        assert_eq!(own_max_lag(&lags, &[0, 2].into()), None);
+        // Partitions without a known lag are skipped; none known is unknown.
+        assert_eq!(own_max_lag(&lags, &[0, 2].into()), Some(5));
+        assert_eq!(own_max_lag(&lags, &[2].into()), None);
     }
 
     #[test]

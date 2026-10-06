@@ -65,6 +65,9 @@ pub async fn run_streamling(
     let (program, args) = construct_program_with_args(binary_path);
 
     let mut cmd = Command::new(&program);
+    // Callers bound unbounded pipelines with a timeout that drops this future;
+    // without this the process outlives the test and keeps consuming.
+    cmd.kill_on_drop(true);
 
     // Add cargo args if using cargo run
     for arg in &args {
