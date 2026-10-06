@@ -145,12 +145,7 @@ pub fn init_telemetry_provider(
 
         Ok(provider)
     } else {
-        let resource = metric_resource(
-            service_instance_id,
-            std::env::var("POD_NAME")
-                .ok()
-                .filter(|name| !name.is_empty()),
-        );
+        let resource = metric_resource(service_instance_id, std::env::var("POD_NAME").ok());
 
         // Build cumulative reader
         let reader = build_periodic_reader_exporter(
@@ -197,7 +192,8 @@ fn metric_resource(service_instance_id: &str, pod_name: Option<String>) -> Resou
             "service.instance.id",
             service_instance_id.to_string(),
         ));
-    if let Some(pod_name) = pod_name {
+    // An empty POD_NAME must not emit a blank k8s.pod.name attribute.
+    if let Some(pod_name) = pod_name.filter(|name| !name.is_empty()) {
         resource = resource.with_attribute(KeyValue::new("k8s.pod.name", pod_name));
     }
     resource.build()
@@ -438,6 +434,11 @@ mod tests {
         assert_eq!(
             second.get(&opentelemetry::Key::new("k8s.pod.name")),
             Some(opentelemetry::Value::from("pipeline-pod-b"))
+        );
+        assert_eq!(
+            metric_resource("pipeline", Some(String::new()))
+                .get(&opentelemetry::Key::new("k8s.pod.name")),
+            None
         );
     }
 
