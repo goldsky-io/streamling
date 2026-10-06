@@ -2,6 +2,7 @@ use crate::dynamic_table::DynamicTableRegistry;
 use crate::functions::StreamlingFunctions;
 use crate::operators::planner::StreamlingQueryPlanner;
 use crate::optimizer::StreamlingPhysicalOptimizerRules;
+use crate::table::apply::TABLE_APPLY_NODE_NAME;
 use crate::types::bigint_sql_preprocessor::preprocess_bigint_sql;
 use crate::{streamling_err, streamling_user_err};
 use datafusion::catalog::memory::MemorySchemaProvider;
@@ -308,6 +309,10 @@ impl SessionManager {
                         subquery_handling,
                     ),
                     "Plugin" => Self::validate_plan_and_extract_source_name(
+                        extension.node.inputs()[0],
+                        subquery_handling,
+                    ),
+                    TABLE_APPLY_NODE_NAME => Self::validate_plan_and_extract_source_name(
                         extension.node.inputs()[0],
                         subquery_handling,
                     ),

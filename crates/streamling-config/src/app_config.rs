@@ -141,18 +141,44 @@ impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
         D: Deserializer<'de>,
     {
         let s: String = String::deserialize(deserializer)?;
-        // Normalize to case-insensitive, remove non-alphanumeric to allow "in_memory", "In-Memory", etc.
-        let normalized = s
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-
-        match normalized.as_str() {
+        match normalize_backend_type(&s).as_str() {
             "inmemory" => Ok(DynamicTableBackendType::InMemory),
             "postgres" => Ok(DynamicTableBackendType::Postgres),
             _ => Err(DeError::custom(format!(
                 "invalid dynamic table backend_type '{}' (expected 'Postgres' or 'InMemory')",
+                s
+            ))),
+        }
+    }
+}
+
+/// Normalize to case-insensitive, remove non-alphanumeric to allow "in_memory", "In-Memory", etc.
+fn normalize_backend_type(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Storage backend of a `table` transform. Separate from
+/// [`DynamicTableBackendType`], which defaults to Postgres and would accept
+/// backends a table does not implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableBackendType {
+    InMemory,
+}
+
+impl<'de> SerdeDeserialize<'de> for TableBackendType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: String = String::deserialize(deserializer)?;
+        match normalize_backend_type(&s).as_str() {
+            "inmemory" => Ok(TableBackendType::InMemory),
+            _ => Err(DeError::custom(format!(
+                "invalid table backend_type '{}' (expected 'in_memory')",
                 s
             ))),
         }
@@ -2011,5 +2037,25 @@ coerce_to: bigint_truncated
         assert!(ColumnDirective::find(Some(&directives), "id").is_some());
         assert!(ColumnDirective::find(Some(&directives), "missing").is_none());
         assert!(ColumnDirective::find(None, "amount").is_none());
+    }
+
+    #[test]
+    fn table_backend_type_accepts_in_memory_spellings() {
+        for spelling in ["in_memory", "InMemory", "inmemory", "In-Memory"] {
+            let parsed: TableBackendType = serde_yaml::from_str(spelling).unwrap();
+            assert_eq!(parsed, TableBackendType::InMemory, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn table_backend_type_rejects_unknown_backends() {
+        let err = serde_yaml::from_str::<TableBackendType>("postgres")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid table backend_type 'postgres'"),
+            "{err}"
+        );
+        assert!(err.contains("expected 'in_memory'"), "{err}");
     }
 }

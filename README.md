@@ -26,6 +26,7 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 - [Reference](#reference)
 - [Topology](#topology)
 - [Dynamic Tables](#dynamic-tables)
+- [Tables](#tables)
 - [Side Outputs](#side-outputs)
 - [Checkpointing](#checkpointing)
 - [State Backends](#state-backends)
@@ -1130,6 +1131,57 @@ This input can be a source or another transform.
 - **Backend Choice**: Choose backends based on your latency and persistence requirements
 - **Indexing**: PostgreSQL backend automatically creates an index for optimal lookup performance
 
+## Tables
+
+A `table` transform keeps the latest row per primary key, built from a stateless SQL query. Other nodes read the table's **changelog** by name.
+
+```yaml
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory # required
+    primary_key: address # required; comma-separated for composite keys
+    deduplicate: true # optional, default true
+    sql: SELECT address, symbol, decimals FROM token_events WHERE chain = 'eth'
+
+sinks:
+  tokens_pg:
+    type: postgres
+    from: tokens # reads the table's changelog
+    table: tokens
+    schema: public
+    primary_key: address
+```
+
+| Field          | Notes                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------- |
+| `backend_type` | Required. `in_memory` is the only backend.                                                                    |
+| `primary_key`  | Required. Key columns must be in the SQL output. A null key value fails the pipeline.                         |
+| `deduplicate`  | Default `true`. Collapses each input batch to the last row per key before applying it.                        |
+| `sql`          | Required. Projections, filters, `UNNEST` and `UNION` over one source or transform. Joins and aggregations are rejected. |
+| `telemetry`    | Optional. Standard rules.                                                                                     |
+
+### Changelog
+
+Each input row is applied by primary key and produces one changelog row:
+
+| Input `_gs_op`     | Key in the table                             | Key not in the table                   |
+| ------------------ | -------------------------------------------- | -------------------------------------- |
+| `i`, `c`, `r`, `u` | updated, emits `u`                           | inserted, emits `i`                    |
+| `d`                | removed, emits `d` with the **stored** values | emits `d` with the **incoming** values |
+
+Matching is case-insensitive. Any other `_gs_op` value fails the pipeline. `deduplicate` changes which intermediate rows appear in the changelog, never the table's final state.
+
+Read the changelog with `FROM tokens` in a SQL transform or `from: tokens` on a sink, handler, script or plugin. Joins against a table are not supported yet, and a SQL transform that reads a table cannot set `parallelism`. A table with no readers is still maintained and still takes part in checkpointing.
+
+### Restarts (`in_memory`)
+
+The `in_memory` backend does not persist its contents. After a restart, the table starts empty and its source replays from the last committed offsets. As a result:
+
+- Keys written before the last checkpoint are missing until they are written again.
+- Replayed upserts of those keys are emitted as `i` instead of `u`. Sinks upsert both.
+- Deletes of those keys are forwarded with their incoming values.
+
 ## Side Outputs
 
 Side outputs allow emitting data to a "side" processor without modifying the main data flow. They're not part of the topology definition
@@ -2230,6 +2282,8 @@ The following table shows all supported components and the metrics they emit:
 | **Blackhole Sink**         |             | `output_rows`         | Counter     | Total number of rows discarded                       |
 |                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being discarded per time window |
 |                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)       |
+| **Table Transform**        |             | `table_live_rows`     | Gauge       | Rows currently stored in the table                   |
+|                            |             | `table_memory_bytes`  | Gauge       | Bytes held by the table's chunks and key index       |
 
 **Note**
 

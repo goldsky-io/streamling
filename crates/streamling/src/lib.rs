@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use streamling_config::AppConfig;
+use streamling_config::{AppConfig, TableBackendType};
 use streamling_connectors::table_providers::blackhole::BlackholeTableProvider;
 use streamling_connectors::table_providers::clickhouse::ClickHouseTableProvider;
 use streamling_connectors::table_providers::file::{FileSourceReadMode, FileSourceTableProvider};
@@ -32,6 +32,8 @@ use streamling_core::operators::checkpointable::CheckpointableNode;
 use streamling_core::operators::external_handlers::{ExternalHandlerConfig, ExternalHandlerNode};
 use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
+use streamling_core::table::InMemoryTable;
+use streamling_core::table::apply::{TABLE_APPLY_NODE_NAME, TableApplyNode};
 use streamling_core::topology::PipelineTopology;
 use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
@@ -1203,6 +1205,8 @@ impl Streamling {
         let mut checkpoint_sink_names: Vec<String> = Vec::new();
 
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
+        // (table name, plan) for each table's driver future.
+        let mut table_drivers: Vec<(String, LogicalPlan)> = Vec::new();
 
         let node_contexts = Self::build_node_contexts(&pipeline_topology);
         let metric_metadata_mapping = Self::build_pipeline_metric_metadata(
@@ -1227,7 +1231,10 @@ impl Streamling {
             &pipeline_topology,
         );
 
-        let mut sink_futures = Vec::new();
+        // Sinks and table drivers share the run loop's error, completion and
+        // shutdown handling.
+        type SinkFuture = Pin<Box<dyn Future<Output = datafusion::error::Result<()>>>>;
+        let mut sink_futures: Vec<SinkFuture> = Vec::new();
         let mut sources_to_sinks: SourceToSinkMapping = SourceToSinkMapping::new();
         let mut hybrid_providers: Vec<(
             Arc<HybridTableProvider>,
@@ -1751,6 +1758,92 @@ impl Streamling {
                         }
                     }
                 }
+                topology::Transform::table(table) => {
+                    let ctx = node_contexts
+                        .get(&reference_name)
+                        .expect("node context must exist");
+                    let sql = &table.sql;
+                    let (sql_plan, source_name) = session_manager
+                        .create_supported_logical_plan(sql.clone())
+                        .await
+                        .streamling_with_context(|| {
+                            format!(
+                                "{}: failed to parse SQL\n--- SQL ---\n{}\n-----------",
+                                ctx.format(),
+                                sql.trim()
+                            )
+                        })?;
+
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
+                        &Some(table.primary_key.clone()),
+                        source_name,
+                        reference_name.clone(),
+                        sql_plan.schema().inner(),
+                    )?;
+                    let primary_key = pk_columns(&pk_metadata_opt);
+                    if primary_key.is_empty() {
+                        streamling_user_bail!(
+                            "{}: primary_key must name at least one column",
+                            ctx.format()
+                        );
+                    }
+
+                    let metric_metadata_id = metric_key(&application_id, reference_name.as_str());
+                    let storage = match table.backend_type {
+                        TableBackendType::InMemory => Arc::new(InMemoryTable::try_new(
+                            &reference_name,
+                            sql_plan.schema().inner(),
+                            &primary_key,
+                            metric_metadata_id.clone(),
+                        )?),
+                    };
+
+                    let checkpointable_plan = LogicalPlan::Extension(Extension {
+                        node: Arc::new(CheckpointableNode::new(
+                            sql_plan,
+                            app_config.internal_buffer_size,
+                            reference_name.clone(),
+                        )),
+                    });
+                    let logical_plan = LogicalPlan::Extension(Extension {
+                        node: Arc::new(TableApplyNode::new(
+                            checkpointable_plan,
+                            storage,
+                            table.deduplicate,
+                        )),
+                    });
+
+                    let wrapping_node = Arc::new(WrappingNode::new_with_non_null_cols(
+                        logical_plan,
+                        metric_metadata_id,
+                        enable_scan_sharing,
+                        primary_key,
+                        transform_telemetry.clone(),
+                    ));
+
+                    self.register_operator_for_side_outputs(
+                        reference_name.as_str(),
+                        wrapping_node.clone(),
+                    );
+
+                    let logical_plan_with_telemetry = LogicalPlan::Extension(Extension {
+                        node: wrapping_node,
+                    });
+
+                    let view = ViewTable::new(logical_plan_with_telemetry.clone(), None);
+                    session_manager.register_table(reference_name.as_str(), Arc::new(view))?;
+
+                    // The table acks checkpoints as itself, through its driver.
+                    checkpoint_sink_names.push(reference_name.clone());
+                    table_drivers
+                        .push((reference_name.clone(), logical_plan_with_telemetry.clone()));
+
+                    if let Some(_existing_plan) =
+                        pipeline_plans.insert(reference_name.clone(), logical_plan_with_telemetry)
+                    {
+                        streamling_user_bail!("{}: duplicate node name", ctx.format());
+                    }
+                }
                 topology::Transform::sql(sql_transform) => {
                     let ctx = node_contexts
                         .get(&reference_name)
@@ -1785,6 +1878,20 @@ impl Streamling {
                     let pk_columns = pk_metadata_opt
                         .map(|pk| pk.columns.clone())
                         .unwrap_or_default();
+
+                    // A table read through its view is inlined into `sql_plan`, so
+                    // the exchange below would land under the table's apply and
+                    // reorder updates of one table key across streams.
+                    let reads_a_table = sql_plan.exists(|node| {
+                        Ok(matches!(node, LogicalPlan::Extension(extension)
+                            if extension.node.name() == TABLE_APPLY_NODE_NAME))
+                    })?;
+                    if sql_transform.parallelism.is_some() && reads_a_table {
+                        streamling_user_bail!(
+                            "{}: parallelism is not supported on a SQL transform that reads a table",
+                            ctx.format()
+                        );
+                    }
 
                     // An explicit `parallelism` widens the transform itself: the
                     // exchange goes under its SQL, so the filter/projection above
@@ -2993,11 +3100,26 @@ impl Streamling {
                             );
                         }
                     }
-                    result
+                    result.map(|_batches| ())
                 };
-                sink_futures.push(sink_future);
+                sink_futures.push(Box::pin(sink_future));
             } else {
                 dry_run_plans.push((future_name, sink_plan));
+            }
+        }
+
+        for (table_name, table_plan) in table_drivers {
+            if dry_run {
+                dry_run_plans.push((table_name, table_plan));
+            } else {
+                let metric_metadata_id = metric_key(&application_id, &table_name);
+                sink_futures.push(Box::pin(streamling_core::table::driver::run(
+                    session_manager.clone(),
+                    table_plan,
+                    table_name,
+                    metric_metadata_id,
+                    checkpoint_control.clone(),
+                )));
             }
         }
 
@@ -3637,17 +3759,20 @@ impl Streamling {
             node_consumers.insert(source_name.clone(), 0);
         }
 
-        // Initialize all transforms with 0 consumers
-        for transform_name in pipeline_topology.transforms.keys() {
-            node_consumers.insert(transform_name.clone(), 0);
+        // Initialize all transforms with 0 consumers, except a table: its
+        // driver always consumes it.
+        for (transform_name, transform) in &pipeline_topology.transforms {
+            let driver = usize::from(matches!(transform, topology::Transform::table(_)));
+            node_consumers.insert(transform_name.clone(), driver);
         }
 
         // Count consumers from transforms
         for transform in pipeline_topology.transforms.values() {
             match transform {
-                topology::Transform::sql(sql_transform) => {
+                topology::Transform::sql(topology::SqlTransform { sql, .. })
+                | topology::Transform::table(topology::TableTransform { sql, .. }) => {
                     // Extract table references from SQL
-                    if let Ok(table_names) = extract_table_references_from_sql(&sql_transform.sql) {
+                    if let Ok(table_names) = extract_table_references_from_sql(sql) {
                         for table_name in table_names {
                             if let Some(count) = node_consumers.get_mut(&table_name) {
                                 *count += 1;
@@ -3722,6 +3847,7 @@ impl Streamling {
         for (reference_name, transform) in &pipeline_topology.transforms {
             let operator_type = match transform {
                 topology::Transform::dynamic_table(_) => "dynamic_table",
+                topology::Transform::table(_) => "table",
                 topology::Transform::sql(_) => "sql",
                 topology::Transform::handler(_) => "handler",
                 topology::Transform::script(_) => "script",
@@ -3851,13 +3977,14 @@ impl Streamling {
                 .expect("node context must exist")
                 .clone();
             let (mut additional_tags, upstream_table_refs) = match transform {
-                topology::Transform::sql(sql_transform) => {
-                    let table_names = match extract_table_references_from_sql(&sql_transform.sql) {
+                topology::Transform::sql(topology::SqlTransform { sql, .. })
+                | topology::Transform::table(topology::TableTransform { sql, .. }) => {
+                    let table_names = match extract_table_references_from_sql(sql) {
                         Ok(names) => names,
                         Err(e) => {
                             warn!(
                                 "Cannot extract upstream references from sql query: {}. This may impact telemetry for this transform and children. Error: {}",
-                                sql_transform.sql, e
+                                sql, e
                             );
                             continue;
                         }
@@ -5557,6 +5684,151 @@ mod source_build_tests {
         assert!(
             message.contains("some_table"),
             "expected the blocking-pool source, first in name order, got: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use streamling_config::StateBackendConfig;
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    const TOKENS: &str = "  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n    sql: SELECT id, num FROM src\n";
+
+    fn csv_source() -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "streamling-table-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("src.csv");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "id,num").unwrap();
+        writeln!(file, "1,10").unwrap();
+        format!(
+            "  src:\n    type: file\n    path: {}\n    format: csv\n    mode:\n      type: bounded\n    primary_key: id\n",
+            path.display()
+        )
+    }
+
+    /// Plans `transforms_and_sinks` over a bounded CSV source `src` (`id`,
+    /// `num`) without running it.
+    async fn dry_run(transforms_and_sinks: &str) -> Result<()> {
+        let yaml = format!("sources:\n{}{transforms_and_sinks}", csv_source());
+        let topology = PipelineTopology::load_from_string(&yaml)?;
+        let mut app_config = AppConfig::load().expect("embedded config must load");
+        app_config.state_backend = StateBackendConfig::default();
+        // Scan-sharing handles live in a process-wide registry keyed by metric key.
+        app_config.application_id = format!("table_test_{}", SEQ.fetch_add(1, Ordering::SeqCst));
+        Streamling::new(app_config, topology).start_with(true).await
+    }
+
+    async fn dry_run_error(transforms_and_sinks: &str) -> String {
+        match dry_run(transforms_and_sinks).await {
+            Ok(()) => panic!("expected the pipeline to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn find_source_consumers_counts_the_table_driver() {
+        let topology = PipelineTopology::load_from_string(
+            "sources:\n  src: { type: kafka, topic: t, primary_key: id }\ntransforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n    sql: SELECT id FROM src\n  idle:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n    sql: SELECT id FROM src\n  reader:\n    type: sql\n    primary_key: id\n    sql: SELECT id FROM tokens\nsinks:\n  out:\n    type: print\n    from: tokens\n  reader_out:\n    type: print\n    from: reader\n",
+        )
+        .unwrap();
+
+        let consumers = Streamling::find_source_consumers(&topology);
+
+        assert_eq!(consumers["src"], 2, "each table consumes its feeding node");
+        assert_eq!(
+            consumers["idle"], 1,
+            "a reader-less table is consumed by its driver"
+        );
+        assert_eq!(consumers["tokens"], 3, "driver + SQL reader + sink");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plans_a_table_read_by_a_sql_transform_and_a_sink() {
+        dry_run(&format!(
+            "transforms:\n{TOKENS}  big:\n    type: sql\n    primary_key: id\n    sql: SELECT id FROM tokens WHERE num > 5\nsinks:\n  out:\n    type: print\n    from: tokens\n  big_out:\n    type: print\n    from: big\n"
+        ))
+        .await
+        .expect("a table with direct-scan readers must plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plans_a_table_without_readers() {
+        dry_run(&format!("transforms:\n{TOKENS}sinks: {{}}\n"))
+            .await
+            .expect("a reader-less table must plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_stateful_table_sql() {
+        for (sql, expected) in [
+            (
+                "SELECT id, count(*) AS n FROM src GROUP BY id",
+                "unsupported plan",
+            ),
+            (
+                "SELECT a.id FROM src a JOIN src b ON a.id = b.id",
+                "JOIN queries not supported",
+            ),
+        ] {
+            let err = dry_run_error(&format!(
+                "transforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n    sql: {sql}\nsinks: {{}}\n"
+            ))
+            .await;
+            assert!(err.contains(expected), "{sql}: {err}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_a_primary_key_missing_from_the_table_sql() {
+        let err = dry_run_error(
+            "transforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: address\n    sql: SELECT id, num FROM src\nsinks: {}\n",
+        )
+        .await;
+        assert!(err.contains("not found in schema"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_a_blank_primary_key() {
+        let err = dry_run_error(
+            "transforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: \"\"\n    sql: SELECT id, num FROM src\nsinks: {}\n",
+        )
+        .await;
+        assert!(
+            err.contains("primary_key must name at least one column"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_a_sql_transform_joining_a_table() {
+        let err = dry_run_error(&format!(
+            "transforms:\n{TOKENS}  joined:\n    type: sql\n    primary_key: id\n    sql: SELECT s.id FROM src s JOIN tokens t ON s.id = t.id\nsinks:\n  out:\n    type: print\n    from: joined\n"
+        ))
+        .await;
+        assert!(err.contains("JOIN queries not supported"), "{err}");
+    }
+
+    /// The exchange `parallelism` adds is placed at the scan of the reader's
+    /// root source, which for a table reader sits below the table's apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_parallelism_on_a_sql_transform_reading_a_table() {
+        let err = dry_run_error(&format!(
+            "transforms:\n{TOKENS}  wide:\n    type: sql\n    primary_key: id\n    parallelism: 2\n    sql: SELECT id FROM tokens\nsinks:\n  out:\n    type: print\n    from: wide\n"
+        ))
+        .await;
+        assert!(
+            err.contains("parallelism is not supported on a SQL transform that reads a table"),
+            "{err}"
         );
     }
 }
