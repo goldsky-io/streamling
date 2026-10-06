@@ -525,6 +525,124 @@ sinks:
     );
 }
 
+/// Two replicas of one pipeline share a consumer group over a 4-partition
+/// topic. After the second replica joins and the group rebalances, each
+/// partition's lag must be reported by exactly one replica — the one that owns
+/// it now — and the first replica must stop reporting the partitions it lost.
+#[tokio::test]
+async fn test_kafka_lag_reported_only_by_owning_replica_after_rebalance() {
+    let ctx = match setup_with_prometheus().await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("Skipping test - could not create context: {}", e);
+            return;
+        }
+    };
+
+    let prometheus = match &ctx.prometheus {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test - Prometheus not configured");
+            return;
+        }
+    };
+
+    let kafka = ctx
+        .create_kafka_topic_with_partitions("lag_rebalance", 4)
+        .await
+        .expect("Failed to create topic");
+    kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    let records: Vec<TestRecord> = (1..=40)
+        .map(|i| TestRecord {
+            id: i,
+            data: format!("data_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    kafka
+        .produce_avro_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline_yaml = |replica: &str| {
+        format!(
+            r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {}
+    primary_key: id
+    telemetry:
+      labels:
+        replica: {}
+
+transforms: {{}}
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: kafka_source
+"#,
+            kafka.topic, replica
+        )
+    };
+    let opts = |timeout_secs| {
+        PipelineOpts::new()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .env("STREAMLING__KAFKA_SOURCE__LAG_REPORT_INTERVAL_MS", "1000")
+    };
+
+    let instance = &ctx.test_id;
+    // Series that received a sample in the last 5s: Prometheus keeps
+    // returning a series that stopped being pushed for its 5m lookback.
+    let fresh = |selector: &str| {
+        format!(
+            "(timestamp(streamling_kafka_consumer_messages_lag{{instance=\"{instance}\"{selector}}}) > time() - 5)"
+        )
+    };
+
+    let (yaml_a, yaml_b) = (pipeline_yaml("a"), pipeline_yaml("b"));
+    let replica_a = ctx.run_pipeline_with_opts(&yaml_a, opts(50));
+    let replica_b = async {
+        // Join after replica a owns all four partitions.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        ctx.run_pipeline_with_opts(&yaml_b, opts(35)).await
+    };
+    let check = async {
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        let count = |query: String| async move {
+            prometheus
+                .query_count(&query)
+                .await
+                .expect("Failed to query lag metric")
+        };
+        (
+            count(format!("count({})", fresh(r#",replica="a""#))).await,
+            count(format!("count({})", fresh(r#",replica="b""#))).await,
+            count(format!("count(count by (partition) ({}))", fresh(""))).await,
+            count(format!("max(count by (partition) ({}))", fresh(""))).await,
+        )
+    };
+    // Both replicas run until their timeouts, which is expected.
+    let (_, _, (a_partitions, b_partitions, partitions, reporters_per_partition)) =
+        tokio::join!(replica_a, replica_b, check);
+
+    assert_eq!(partitions, Some(4), "every partition reports lag");
+    assert_eq!(
+        reporters_per_partition,
+        Some(1),
+        "each partition's lag is reported by one replica only"
+    );
+    assert_eq!(
+        (a_partitions, b_partitions),
+        (Some(2), Some(2)),
+        "each replica reports only the partitions it owns after the rebalance"
+    );
+}
+
 // =====================================================================
 // Event-time freshness metrics (Unit 5)
 // =====================================================================

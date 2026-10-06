@@ -9,6 +9,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
@@ -124,6 +125,79 @@ impl BoundHistogram {
     }
 }
 
+/// One gauge point: its attributes and value.
+type GaugePoint = (Vec<KeyValue>, u64);
+
+/// Points of one snapshot gauge, keyed by the owning [`SnapshotGauge`] handle.
+type SnapshotGaugePoints = Mutex<HashMap<u64, Vec<GaugePoint>>>;
+
+/// Registers the observable gauge `name` on `meter`. OTel keeps the callback
+/// for the meter provider's lifetime, so register each name once.
+fn register_snapshot_gauge(meter: &Meter, name: String) -> Arc<SnapshotGaugePoints> {
+    let points: Arc<SnapshotGaugePoints> = Arc::default();
+    let observed = points.clone();
+    meter
+        .u64_observable_gauge(name)
+        .with_callback(move |observer| {
+            let by_owner = observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (attrs, value) in by_owner.values().flatten() {
+                observer.observe(*value, attrs);
+            }
+        })
+        .build();
+    points
+}
+
+/// Gauge whose exported points are exactly the latest snapshot each handle
+/// published; dropping the handle stops its points from exporting.
+///
+/// A synchronous OTel gauge exports every attribute set it ever recorded for
+/// the life of the process, so a point for something no longer measured (a
+/// Kafka partition revoked by a rebalance) keeps exporting its last value.
+pub struct SnapshotGauge {
+    owner: u64,
+    attrs: Vec<KeyValue>,
+    points: Arc<SnapshotGaugePoints>,
+}
+
+impl SnapshotGauge {
+    fn new(owner: u64, attrs: Vec<KeyValue>, points: Arc<SnapshotGaugePoints>) -> Self {
+        Self {
+            owner,
+            attrs,
+            points,
+        }
+    }
+
+    /// Replace this handle's points with `points`, each given as its own tags
+    /// (added to the handle's per-source tags) and value.
+    pub fn replace(&self, points: impl IntoIterator<Item = (Vec<(&'static str, String)>, u64)>) {
+        let points = points
+            .into_iter()
+            .map(|(tags, value)| {
+                let mut attrs = self.attrs.clone();
+                attrs.extend(tags.into_iter().map(|(k, v)| KeyValue::new(k, v)));
+                (attrs, value)
+            })
+            .collect();
+        self.points
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.owner, points);
+    }
+}
+
+impl Drop for SnapshotGauge {
+    fn drop(&mut self) {
+        self.points
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.owner);
+    }
+}
+
 #[derive(Default)]
 pub struct MetricsRecorder {
     service_instance_id: String,
@@ -132,6 +206,10 @@ pub struct MetricsRecorder {
     count_registry: Mutex<HashMap<String, Counter<u64>>>,
     gauge_registry: Mutex<HashMap<String, Gauge<u64>>>,
     histogram_registry: Mutex<HashMap<String, Histogram<u64>>>,
+    /// One observable gauge per name, shared by every [`SnapshotGauge`]
+    /// handle resolved for it.
+    snapshot_gauge_registry: Mutex<HashMap<String, Arc<SnapshotGaugePoints>>>,
+    next_snapshot_gauge_owner: AtomicU64,
     /// Per-node running state for turning DataFusion's *cumulative* metrics into
     /// per-batch deltas. Keyed by `metadata_id`, then by metric name (a SQL
     /// transform's subtree exposes many cumulative metrics — `elapsed_compute`,
@@ -462,16 +540,46 @@ impl MetricsRecorder {
             .expect("histogram_registry mutex poisoned")
             .get(name)
             .cloned()?;
+        let attrs = self.resolve_attrs(metadata_id)?;
+        Some(BoundHistogram { histogram, attrs })
+    }
+
+    /// Resolve a [`SnapshotGauge`] handle for `name` carrying the per-source
+    /// tags of `metadata_id`. Use it for state whose measured set changes
+    /// over time, where a point that is no longer published must stop
+    /// exporting.
+    ///
+    /// Returns `None` when the metric is denied or the `metadata_id` is not
+    /// present in the per-source tag registry.
+    pub fn resolve_snapshot_gauge(&self, name: &str, metadata_id: &str) -> Option<SnapshotGauge> {
+        if is_metric_denied(name) {
+            return None;
+        }
+        let attrs = self.resolve_attrs(metadata_id)?;
+        let points = self
+            .snapshot_gauge_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(name.to_string())
+            .or_insert_with(|| register_snapshot_gauge(&get_meter(), add_service_prefix(name)))
+            .clone();
+        let owner = self
+            .next_snapshot_gauge_owner
+            .fetch_add(1, Ordering::Relaxed);
+        Some(SnapshotGauge::new(owner, attrs, points))
+    }
+
+    /// Per-source tags of `metadata_id` merged with the global tags, matching
+    /// the attribute set of the standard `record_metric_data` emission path:
+    /// per-source tags first, then any global tags that weren't already
+    /// provided.
+    fn resolve_attrs(&self, metadata_id: &str) -> Option<Vec<KeyValue>> {
         let metric_metadata_tags = self
             .metric_metadata_tags_registry
             .lock()
             .expect("metric_metadata_tags_registry mutex poisoned")
             .get(metadata_id)
             .cloned()?;
-        // Mirror the tag-merging logic in `record_metric_data` so the bound
-        // handle carries the same effective attribute set as the standard
-        // emission path: per-source tags first, then any global tags that
-        // weren't already provided.
         let svc_id = metric_metadata_tags
             .get("service_instance_id")
             .cloned()
@@ -488,7 +596,7 @@ impl MetricsRecorder {
                 attrs.push(tag);
             }
         }
-        Some(BoundHistogram { histogram, attrs })
+        Some(attrs)
     }
 
     /// This method dispatches count recorded as part of `TelemetryExec` wrapping of `ExecutionPlan`s
@@ -2353,6 +2461,91 @@ mod tests {
                 _ => None,
             });
             assert_eq!(gauge, Some(42), "gauge is forwarded unchanged, not deltaed");
+        }
+    }
+
+    mod snapshot_gauge_tests {
+        use super::*;
+        use opentelemetry::metrics::MeterProvider;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData as OtelMetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, InMemoryMetricExporterBuilder, PeriodicReader, SdkMeterProvider,
+        };
+
+        fn provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
+            let exporter = InMemoryMetricExporterBuilder::new().build();
+            let reader = PeriodicReader::builder(exporter.clone())
+                .with_interval(Duration::from_secs(3600))
+                .build();
+            (
+                SdkMeterProvider::builder().with_reader(reader).build(),
+                exporter,
+            )
+        }
+
+        /// Exports once and returns the `partition` attribute of every point.
+        fn exported_partitions(
+            provider: &SdkMeterProvider,
+            exporter: &InMemoryMetricExporter,
+        ) -> Vec<String> {
+            exporter.reset();
+            provider.force_flush().expect("flush");
+            let mut partitions = Vec::new();
+            for resource in exporter.get_finished_metrics().expect("metrics") {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if let AggregatedMetrics::U64(OtelMetricData::Gauge(gauge)) = metric.data()
+                        {
+                            for point in gauge.data_points() {
+                                partitions.extend(
+                                    point
+                                        .attributes()
+                                        .filter(|kv| kv.key.as_str() == "partition")
+                                        .map(|kv| kv.value.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            partitions.sort();
+            partitions
+        }
+
+        /// A partition revoked by a rebalance must stop exporting lag; a sync
+        /// OTel gauge keeps exporting every attribute set it ever recorded.
+        #[test]
+        fn point_absent_from_latest_snapshot_stops_exporting() {
+            let (provider, exporter) = provider();
+            let points = register_snapshot_gauge(&provider.meter("test"), "lag".to_string());
+            let gauge = SnapshotGauge::new(0, vec![KeyValue::new("id", "src")], points);
+
+            gauge.replace([
+                (vec![("partition", "1".to_string())], 10),
+                (vec![("partition", "2".to_string())], 20),
+            ]);
+            assert_eq!(exported_partitions(&provider, &exporter), ["1", "2"]);
+
+            gauge.replace([(vec![("partition", "2".to_string())], 5)]);
+            assert_eq!(exported_partitions(&provider, &exporter), ["2"]);
+
+            drop(gauge);
+            assert!(exported_partitions(&provider, &exporter).is_empty());
+        }
+
+        #[test]
+        fn handles_export_their_own_snapshots_independently() {
+            let (provider, exporter) = provider();
+            let points = register_snapshot_gauge(&provider.meter("test"), "lag".to_string());
+            let first = SnapshotGauge::new(0, vec![], points.clone());
+            let second = SnapshotGauge::new(1, vec![], points);
+
+            first.replace([(vec![("partition", "1".to_string())], 1)]);
+            second.replace([(vec![("partition", "2".to_string())], 2)]);
+            assert_eq!(exported_partitions(&provider, &exporter), ["1", "2"]);
+
+            drop(first);
+            assert_eq!(exported_partitions(&provider, &exporter), ["2"]);
         }
     }
 }
