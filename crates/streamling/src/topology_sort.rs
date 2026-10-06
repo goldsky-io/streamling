@@ -8,8 +8,8 @@ use tracing::debug;
 /// Get priority for transform types (lower number = higher priority)
 fn get_transform_priority(transform: &topology::Transform) -> u8 {
     match transform {
-        topology::Transform::dynamic_table(_) => 0, // Highest priority
-        topology::Transform::plugin(_) => 1,        // Plugin transforms register tables
+        topology::Transform::dynamic_table(_) | topology::Transform::table(_) => 0, // Highest priority
+        topology::Transform::plugin(_) => 1, // Plugin transforms register tables
         topology::Transform::sql(_) => 2,
         _ => 3, // Other transforms have equal lower priority
     }
@@ -33,9 +33,10 @@ pub fn sort_transforms(
     // Build dependency graph
     for (transform_name, transform) in transforms {
         let transform_dependencies: Vec<String> = match transform {
-            topology::Transform::sql(sql_transform) => {
+            topology::Transform::sql(topology::SqlTransform { sql, .. })
+            | topology::Transform::table(topology::TableTransform { sql, .. }) => {
                 // Extract table references from SQL to find dependencies on other transforms
-                extract_sql_dependencies(&sql_transform.sql, transforms, existing_plans)
+                extract_sql_dependencies(sql, transforms, existing_plans)
             }
             // Dynamic tables may depend on other transforms if they have an associated SQL query
             topology::Transform::dynamic_table(dt) => {
@@ -280,6 +281,37 @@ mod tests {
             parallelism: None,
             telemetry: None,
         })
+    }
+
+    fn create_table_transform(sql: &str) -> topology::Transform {
+        topology::Transform::table(topology::TableTransform {
+            backend_type: streamling_config::TableBackendType::InMemory,
+            primary_key: "id".to_string(),
+            deduplicate: true,
+            sql: sql.to_string(),
+            telemetry: None,
+        })
+    }
+
+    #[test]
+    fn tables_sort_first_and_before_their_readers() {
+        let mut transforms = HashMap::new();
+        transforms.insert(
+            "a_sql".to_string(),
+            create_sql_transform("SELECT id FROM src"),
+        );
+        transforms.insert(
+            "z_table".to_string(),
+            create_table_transform("SELECT id FROM src"),
+        );
+        transforms.insert(
+            "reader".to_string(),
+            create_sql_transform("SELECT id FROM z_table"),
+        );
+
+        let order = sort_transforms(&transforms, &HashMap::new());
+
+        assert_eq!(order, ["z_table", "a_sql", "reader"]);
     }
 
     fn create_handler_transform(from: &str, url: &str) -> topology::Transform {
