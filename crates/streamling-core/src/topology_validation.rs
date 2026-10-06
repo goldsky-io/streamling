@@ -69,12 +69,12 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
         // Skip dynamic_table transforms — they are consumed via dynamic_table_check()
         // UDF calls in SQL WHERE clauses, not via FROM clauses or `from:` fields.
         // They have dedicated validation in validate_dynamic_table_usage().
-        let is_dynamic_table = transform_val
+        // Skip table transforms too: their driver always consumes them.
+        let transform_type = transform_val
             .as_mapping()
             .and_then(|m| m.get("type"))
-            .and_then(|v| v.as_str())
-            == Some("dynamic_table");
-        if !is_dynamic_table {
+            .and_then(|v| v.as_str());
+        if !matches!(transform_type, Some("dynamic_table" | "table")) {
             node_consumers.insert(name.to_lowercase(), 0);
         }
     }
@@ -841,5 +841,24 @@ sinks:
             validate_job_mode(true, &topology).is_ok(),
             "job_mode with a plugin source should succeed"
         );
+    }
+
+    #[test]
+    fn table_without_readers_is_not_an_orphan() {
+        // Also proves the table counts as a consumer of `src`.
+        let config = r#"
+sources:
+  src:
+    type: kafka
+    topic: test
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    sql: "SELECT id FROM src"
+sinks: {}
+"#;
+        assert!(validate_no_orphan_nodes(config).is_ok());
     }
 }
