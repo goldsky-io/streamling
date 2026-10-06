@@ -157,6 +157,11 @@ pub struct HybridTableProvider {
     /// partition 0 drives every phase, and partitions 1.. only come alive once
     /// the unbounded phase starts (see `HybridSourceExec::execute`).
     unbounded_parallelism: usize,
+    /// Set by partition 0 once its unbounded stream is open, i.e. after the
+    /// offset seed succeeded and outside job mode. Follower partitions wait
+    /// on this, not on `current_phase`: the driver advances the phase index
+    /// before the seed runs and in job mode, where no unbounded phase follows.
+    unbounded_started: Arc<AtomicBool>,
     /// Flipped by partition 0 when the phase machine stops for good, so the
     /// follower partitions end their streams instead of waiting for an
     /// unbounded phase that will never start (job mode, shutdown, error).
@@ -232,6 +237,7 @@ impl HybridTableProvider {
             checkpoint_control: None,
             shutdown_rx: None,
             unbounded_parallelism: 1,
+            unbounded_started: Arc::new(AtomicBool::new(false)),
             terminated: Arc::new(AtomicBool::new(false)),
             scope: streamling_core::shutdown::ComponentScope::detached("hybrid-source"),
         };
@@ -266,12 +272,6 @@ impl HybridTableProvider {
     /// True once the phase machine has stopped for good.
     fn is_terminated(&self) -> bool {
         self.terminated.load(Ordering::SeqCst)
-    }
-
-    /// True once the bounded phases are done and the unbounded phase is the
-    /// current one — the point at which follower partitions start consuming.
-    async fn is_unbounded_phase(&self) -> bool {
-        self.state.read().await.current_phase >= self.config.bounded_sources.len()
     }
 
     /// Attach the run loop's shutdown scope so the hybrid's helper tasks are
@@ -1287,7 +1287,7 @@ impl ExecutionPlan for HybridSourceExec {
             // stop, joined, and the subscription is unsubscribed even
             // when downstream drops the receiver mid-stream.
             'outer: loop {
-                if !is_phase_driver && !provider.is_unbounded_phase().await {
+                if !is_phase_driver && !provider.unbounded_started.load(Ordering::SeqCst) {
                     if follower_wait_for_unbounded_phase(
                         &provider,
                         &pending_for_main,
@@ -1335,6 +1335,9 @@ impl ExecutionPlan for HybridSourceExec {
                         break 'outer;
                     }
                 };
+                if is_phase_driver && is_executing_unbounded {
+                    provider.unbounded_started.store(true, Ordering::SeqCst);
+                }
 
                 // Forward batches until the inner stream ends — or, during a
                 // BOUNDED phase, until the process-wide shutdown signal flips.
@@ -1633,7 +1636,7 @@ async fn follower_wait_for_unbounded_phase(
         reference_name, partition
     );
     loop {
-        if provider.is_unbounded_phase().await {
+        if provider.unbounded_started.load(Ordering::SeqCst) {
             return true;
         }
         // Deliver this tick's markers before checking termination too: the
@@ -3427,9 +3430,11 @@ mod tests {
                 continue; // synthetic marker-flush batches are empty
             }
             saw_data = true;
+            // Fields only: a marker broadcast by a concurrent test can land in
+            // the batch's checkpoint metadata.
             assert_eq!(
-                batch.schema(),
-                expected_schema,
+                batch.schema().fields(),
+                expected_schema.fields(),
                 "batches must match the declared projected schema"
             );
             let names = batch
@@ -3473,16 +3478,9 @@ mod tests {
             .await
             .expect("scan should succeed");
 
-        let context = Arc::new(TaskContext::default());
-        let streams: Vec<_> = (0..3)
-            .map(|p| plan.execute(p, context.clone()).expect("execute"))
-            .collect();
-
+        let outputs = run_partitions(&plan, 3).await;
         let expected_schema = Arc::new(create_test_schema().project(&projection).unwrap());
-        for (p, stream) in streams.into_iter().enumerate() {
-            let batches = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
-                .await
-                .unwrap_or_else(|_| panic!("partition {p} never ended"));
+        for (p, batches) in outputs.into_iter().enumerate() {
             let data: Vec<_> = batches
                 .into_iter()
                 .map(|b| b.unwrap_or_else(|e| panic!("partition {p} produced an error: {e}")))
@@ -3494,8 +3492,8 @@ mod tests {
                 "partition {p} must forward its unbounded batch"
             );
             assert_eq!(
-                data[0].schema(),
-                expected_schema,
+                data[0].schema().fields(),
+                expected_schema.fields(),
                 "partition {p} must emit the declared projected schema"
             );
         }
@@ -3552,53 +3550,6 @@ mod tests {
     // drives every phase, partitions 1.. are Kafka consumer instances that only
     // come alive at the handoff.
     // ========================================================================
-
-    /// An unbounded phase serving `partitions` output partitions — the shape of
-    /// a Kafka source with `parallelism: N`. Each partition's stream is empty
-    /// and terminates immediately.
-    #[derive(Debug)]
-    struct WideMockTableProvider {
-        schema: SchemaRef,
-        partitions: usize,
-    }
-
-    impl WideMockTableProvider {
-        fn new(partitions: usize) -> Self {
-            Self {
-                schema: create_test_schema(),
-                partitions,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl TableProvider for WideMockTableProvider {
-        fn schema(&self) -> SchemaRef {
-            self.schema.clone()
-        }
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-        async fn scan(
-            &self,
-            _state: &dyn datafusion::catalog::Session,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(FiniteMockExec {
-                schema: self.schema.clone(),
-                properties: Arc::new(PlanProperties::new(
-                    EquivalenceProperties::new(self.schema.clone()),
-                    Partitioning::UnknownPartitioning(self.partitions),
-                    datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-                    datafusion::physical_plan::execution_plan::Boundedness::Unbounded {
-                        requires_infinite_memory: false,
-                    },
-                )),
-            }))
-        }
-    }
 
     /// A bounded phase whose stream stays open until released, so a test can
     /// observe what the follower partitions do WHILE the replay is running.
@@ -3693,14 +3644,17 @@ mod tests {
         bounded_sources: Vec<Arc<dyn TableProvider>>,
         partitions: usize,
         job_mode: bool,
+        offset_provider: Option<Arc<dyn OffsetProvider>>,
         state_backend: Arc<dyn StateOperatorBackend<HybridSourceState>>,
     ) -> HybridTableProvider {
         HybridTableProvider::new(
             name.to_string(),
             HybridSourceConfig {
                 bounded_sources,
-                unbounded_source: Arc::new(WideMockTableProvider::new(partitions)),
-                offset_provider: None,
+                // Every partition emits one data row once it runs the
+                // unbounded phase, so a test sees which partitions entered it.
+                unbounded_source: Arc::new(ReorderedBatchMockProvider::wide(partitions)),
+                offset_provider,
                 job_mode,
             },
             create_test_schema(),
@@ -3709,6 +3663,40 @@ mod tests {
         )
         .unwrap()
         .with_unbounded_parallelism(partitions)
+    }
+
+    /// Executes every partition of `plan`, then drains each stream to its end.
+    async fn run_partitions(
+        plan: &Arc<dyn ExecutionPlan>,
+        partitions: usize,
+    ) -> Vec<Vec<DataFusionResult<RecordBatch>>> {
+        let context = Arc::new(TaskContext::default());
+        let streams: Vec<_> = (0..partitions)
+            .map(|p| {
+                plan.execute(p, context.clone())
+                    .unwrap_or_else(|e| panic!("execute({p}) should succeed: {e}"))
+            })
+            .collect();
+        let mut outputs = Vec::with_capacity(partitions);
+        for (p, stream) in streams.into_iter().enumerate() {
+            outputs.push(
+                tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+                    .await
+                    .unwrap_or_else(|_| panic!("partition {p} never ended")),
+            );
+        }
+        outputs
+    }
+
+    /// Data rows partition `p` emitted; panics on an error batch.
+    fn data_rows(p: usize, batches: &[DataFusionResult<RecordBatch>]) -> usize {
+        batches
+            .iter()
+            .map(|b| match b {
+                Ok(b) => b.num_rows(),
+                Err(e) => panic!("partition {p} produced an error: {e}"),
+            })
+            .sum()
     }
 
     /// The plan advertises the unbounded phase's width even while the bounded
@@ -3728,6 +3716,7 @@ mod tests {
             vec![Arc::new(FiniteMockTableProvider::new())],
             3,
             false,
+            None,
             state_backend,
         );
 
@@ -3743,21 +3732,8 @@ mod tests {
             "the hybrid plan must be as wide as its unbounded phase"
         );
 
-        let context = Arc::new(TaskContext::default());
-        let streams: Vec<_> = (0..3)
-            .map(|p| {
-                plan.execute(p, context.clone())
-                    .unwrap_or_else(|e| panic!("execute({p}) should succeed: {e}"))
-            })
-            .collect();
-
-        for (p, stream) in streams.into_iter().enumerate() {
-            let batches = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
-                .await
-                .unwrap_or_else(|_| panic!("partition {p} never ended"));
-            for batch in &batches {
-                assert!(batch.is_ok(), "partition {p} produced an error");
-            }
+        for (p, batches) in run_partitions(&plan, 3).await.iter().enumerate() {
+            data_rows(p, batches);
         }
 
         let state = hybrid_provider.state.read().await;
@@ -3784,6 +3760,7 @@ mod tests {
             })],
             2,
             false,
+            None,
             state_backend,
         );
 
@@ -3835,8 +3812,11 @@ mod tests {
         }
     }
 
-    /// In job mode the unbounded phase never runs, so a follower would park
-    /// forever without the termination signal partition 0 sets on its way out.
+    /// In job mode the unbounded phase never runs on ANY partition, and a
+    /// follower would park forever without the termination signal partition 0
+    /// sets on its way out. The driver advances `current_phase` past the
+    /// bounded phases before that signal, so a follower that reads the phase
+    /// index instead of waiting for the driver would start consuming here.
     #[tokio::test(flavor = "multi_thread")]
     async fn job_mode_terminates_every_partition_including_parked_followers() {
         let state_backend = create_state_backend("hybrid_parallelism_job_mode").await;
@@ -3848,6 +3828,7 @@ mod tests {
             ],
             3,
             true,
+            None,
             state_backend,
         );
 
@@ -3857,18 +3838,12 @@ mod tests {
             .await
             .expect("scan should succeed");
 
-        let context = Arc::new(TaskContext::default());
-        let streams: Vec<_> = (0..3)
-            .map(|p| plan.execute(p, context.clone()).expect("execute"))
-            .collect();
-
-        for (p, stream) in streams.into_iter().enumerate() {
-            let batches = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
-                .await
-                .unwrap_or_else(|_| panic!("partition {p} never ended in job mode"));
-            for batch in &batches {
-                assert!(batch.is_ok(), "partition {p} produced an error");
-            }
+        for (p, batches) in run_partitions(&plan, 3).await.iter().enumerate() {
+            assert_eq!(
+                data_rows(p, batches),
+                0,
+                "partition {p} must not run the unbounded phase in job mode"
+            );
         }
 
         let state = hybrid_provider.state.read().await;
@@ -3877,6 +3852,42 @@ mod tests {
             "both bounded phases run exactly once, then job mode stops"
         );
         assert!(state.completed_phases.iter().all(|&c| c));
+    }
+
+    /// A failed offset seed at the handoff must keep the followers out of the
+    /// unbounded phase. `current_phase` already points at it in memory, but
+    /// the seed never landed, so their consumers would fall back to
+    /// `start_at` and re-deliver rows the archive replay already wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_offset_seed_keeps_followers_out_of_the_unbounded_phase() {
+        let state_backend = create_state_backend("hybrid_parallelism_seed_failure").await;
+        let hybrid_provider = wide_hybrid(
+            "test_parallel_seed_failure",
+            vec![Arc::new(FiniteMockTableProvider::new())],
+            3,
+            false,
+            Some(Arc::new(FailingOffsetProvider)),
+            state_backend,
+        );
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let outputs = run_partitions(&plan, 3).await;
+        assert!(
+            outputs[0].iter().any(|b| b.is_err()),
+            "partition 0 must surface the seed failure"
+        );
+        for (p, batches) in outputs.iter().enumerate().skip(1) {
+            assert_eq!(
+                data_rows(p, batches),
+                0,
+                "partition {p} must not consume after a failed handoff"
+            );
+        }
     }
 
     use streamling_state::testing::{FailCondition, FailableStateBackend};

@@ -1639,6 +1639,319 @@ sinks:
 }
 
 // ============================================================================
+// Scenario 7: Unbounded phase with parallelism (N Kafka consumer instances)
+// ============================================================================
+
+/// `parallelism: N` on the unbounded source makes the whole hybrid plan N
+/// partitions wide. Partition 0 runs the ClickHouse replay and drives the phase
+/// machine; partitions 1..N-1 park, emitting checkpoint-marker heartbeats, until
+/// the handoff, then each runs as one Kafka consumer instance.
+///
+/// Setup on a 4-partition topic with `parallelism: 4`:
+/// - Kafka wave 1: one record per archive row, same ids, spread over every
+///   partition by key. The archive holds the same rows, so per partition it
+///   covers the Kafka prefix `[0, end_of_wave_1)`, and the offset table records
+///   that end.
+/// - Kafka wave 2: newer rows with fresh ids, again on every partition.
+///
+/// Pinned properties:
+/// 1. Offset seeding is honored by all N consumer instances: no wave-1 row is
+///    re-read (its `data` would overwrite the archive's) and no wave-2 row is
+///    skipped. The sink holds exactly archive ∪ wave 2.
+/// 2. Parked followers keep the sink's ack gate moving: an epoch finalizes
+///    while the bounded replay is still running.
+/// 3. After the handoff, every partition's committed offset reaches the end of
+///    the topic, which needs every consumer instance's markers to be acked.
+#[tokio::test]
+async fn test_hybrid_unbounded_parallelism_seeds_every_consumer_instance() {
+    use rdkafka::config::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    const PARTITIONS: i32 = 4;
+    const PARALLELISM: usize = 4;
+    // One row per ClickHouse page reads about 450 rows a second, so 3000 rows
+    // keep the replay running across several 1s checkpoint intervals.
+    const ARCHIVE_ROWS: i64 = 3000;
+    const LIVE_ROWS: i64 = 40;
+
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    let topic = ctx
+        .create_kafka_topic_with_partitions("wide_hybrid", PARTITIONS)
+        .await
+        .expect("Failed to create multi-partition topic");
+    topic
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let watermark_client: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &topic.broker)
+        .create()
+        .expect("Failed to create watermark client");
+    let end_offsets = || -> Vec<i64> {
+        (0..PARTITIONS)
+            .map(|p| {
+                watermark_client
+                    .fetch_watermarks(&topic.topic, p, Duration::from_secs(10))
+                    .expect("Failed to fetch watermarks")
+                    .1
+            })
+            .collect()
+    };
+
+    let row = |prefix: &str, data: &str, i: i64| TestRecord {
+        block: i,
+        id: format!("{prefix}_{i}"),
+        data: format!("{data}_{i}"),
+        timestamp: 1_700_000_000 + i,
+    };
+
+    // Wave 1: the Kafka prefix the archive already covers. Keyed by id so the
+    // records spread over every partition.
+    let wave_1: Vec<TestRecord> = (0..ARCHIVE_ROWS)
+        .map(|i| row("row", "replayed", i))
+        .collect();
+    topic
+        .produce_avro_records_keyed(&wave_1, |r| r.id.clone())
+        .await
+        .expect("Failed to produce wave 1");
+    let handoff_offsets = end_offsets();
+    assert!(
+        handoff_offsets.iter().all(|&o| o > 0),
+        "wave 1 must land on every partition so each consumer seeds past a prefix: {handoff_offsets:?}"
+    );
+
+    // Archive: the same rows as wave 1, with archive-side data.
+    clickhouse
+        .execute(
+            "CREATE TABLE wide_hybrid_archive (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+    let archive: Vec<TestRecord> = (0..ARCHIVE_ROWS)
+        .map(|i| row("row", "archive", i))
+        .collect();
+    let values: Vec<String> = archive
+        .iter()
+        .map(|r| {
+            format!(
+                "({}, '{}', '{}', {}, 0)",
+                r.block, r.id, r.data, r.timestamp
+            )
+        })
+        .collect();
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO wide_hybrid_archive VALUES {}",
+            values.join(", ")
+        ))
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    // The offset table records, per partition, where the archive's coverage of
+    // the topic ends: the next offset the unbounded phase must read.
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_wide (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+    let offset_rows: Vec<String> = handoff_offsets
+        .iter()
+        .enumerate()
+        .map(|(p, o)| format!("('{}', {p}, {o})", topic.topic))
+        .collect();
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO kafka_offsets_wide VALUES {}",
+            offset_rows.join(", ")
+        ))
+        .await
+        .expect("Failed to insert offsets");
+
+    // Wave 2: rows newer than the archive.
+    let wave_2: Vec<TestRecord> = (0..LIVE_ROWS).map(|i| row("live", "live", i)).collect();
+    topic
+        .produce_avro_records_keyed(&wave_2, |r| r.id.clone())
+        .await
+        .expect("Failed to produce wave 2");
+    let final_offsets = end_offsets();
+    assert!(
+        final_offsets
+            .iter()
+            .zip(&handoff_offsets)
+            .all(|(end, handoff)| end > handoff),
+        "wave 2 must land on every partition so each consumer instance has to read: \
+         handoff={handoff_offsets:?} end={final_offsets:?}"
+    );
+
+    let expected: BTreeSet<(String, String)> = archive
+        .iter()
+        .chain(&wave_2)
+        .map(|r| (r.id.clone(), r.data.clone()))
+        .collect();
+    let expected_committed: BTreeMap<String, i64> = final_offsets
+        .iter()
+        .enumerate()
+        .map(|(p, o)| (format!("hybrid_source:{}:{p}", topic.topic), *o))
+        .collect();
+
+    let state_table = format!("wide_hybrid_{}", ctx.test_id.replace('-', "_"));
+    let application_id = format!("wide_hybrid_{}", ctx.test_id);
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: wide_hybrid_archive
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {topic}
+      start_at: earliest
+      parallelism: {PARALLELISM}
+    offset_table:
+      topic_name: {topic}
+      table_name: kafka_offsets_wide
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: wide_hybrid_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 10
+    batch_flush_interval: 100ms
+"#,
+        topic = topic.topic,
+    );
+
+    let opts = PipelineOpts::new()
+        .env("STREAMLING__APPLICATION_ID", &application_id)
+        .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+            &ctx.postgres.host,
+        )
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+            ctx.postgres.port.to_string(),
+        )
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+        .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+        .env(
+            "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+            &state_table,
+        )
+        .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+        .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+        // One row per ClickHouse page stretches the replay (see ARCHIVE_ROWS),
+        // so epochs have to finalize while the followers are still parked.
+        .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1");
+
+    let sink_rows_query = "SELECT id, data FROM public.wide_hybrid_results";
+    let committed_query = format!(
+        "SELECT key, (data->>'offset')::bigint FROM streamling.\"{state_table}\" \
+         WHERE key LIKE 'hybrid_source:%'"
+    );
+    let sink_rows = || async {
+        ctx.postgres
+            .query::<(String, String)>(sink_rows_query)
+            .await
+            .unwrap_or_default()
+    };
+    let committed = || async {
+        ctx.postgres
+            .query::<(String, i64)>(&committed_query)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeMap<String, i64>>()
+    };
+
+    // Stop once every expected row is written and every partition's offset
+    // has been committed through the end of the topic. If either never
+    // happens, the deadline lets the assertions below report what did.
+    let caught_up = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        while tokio::time::Instant::now() < deadline {
+            if sink_rows().await.len() >= expected.len() && committed().await == expected_committed
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+
+    let (status, logs) = ctx
+        .run_pipeline_with_sigterm_when(&pipeline, opts, caught_up, Duration::from_secs(60))
+        .await
+        .expect("Pipeline execution failed");
+    assert!(status.success(), "Pipeline should exit cleanly on SIGTERM");
+
+    let rows = sink_rows().await;
+    let written: BTreeSet<(String, String)> = rows.iter().cloned().collect();
+    let missing: Vec<_> = expected.difference(&written).collect();
+    let unexpected: Vec<_> = written.difference(&expected).collect();
+    assert!(
+        missing.is_empty() && unexpected.is_empty() && rows.len() == expected.len(),
+        "sink must hold exactly the archive rows plus wave 2 ({} rows), got {}; \
+         missing={missing:?} unexpected={unexpected:?}",
+        expected.len(),
+        rows.len()
+    );
+
+    assert_eq!(
+        committed().await,
+        expected_committed,
+        "every partition's committed offset must reach the end of the topic"
+    );
+
+    // An epoch must finalize before the handoff: during the replay only
+    // partition 0 carries data, so the sink's ack gate can only release an
+    // epoch if every parked follower delivered its marker copy too.
+    let handoff = logs
+        .find("Advancing hybrid source 'hybrid_source' from phase 0 to 1")
+        .expect("the pipeline must hand off to the unbounded phase");
+    assert!(
+        logs[..handoff].contains("Epoch finalized: "),
+        "no checkpoint epoch finalized during the bounded replay; parked follower \
+         partitions did not keep the sink's ack gate moving"
+    );
+}
+
+// ============================================================================
 // Scenario: Hybrid source ClickHouse Nullable(UInt128) → u256 endianness
 // ============================================================================
 
