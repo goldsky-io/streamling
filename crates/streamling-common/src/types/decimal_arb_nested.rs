@@ -22,10 +22,10 @@ use crate::formats::decimal_arb_text::{
 use crate::streamling_err;
 use crate::types::decimal_arb::DecimalArbType;
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray,
-    make_array,
+    Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, MutableArrayData,
+    OffsetSizeTrait, StructArray, make_array,
 };
-use arrow::buffer::NullBuffer;
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use std::sync::Arc;
 
@@ -91,12 +91,13 @@ pub fn rewrite_decimal_arb_leaf_fields(
 }
 
 /// Rebuild `(field, array)` with every decimal_arb leaf below it replaced by
-/// what `leaf` returns for it; containers keep their offsets and validity. A
+/// what `leaf` returns for it; containers keep their logical values and validity. A
 /// struct's nulls are pushed down to its children first, so `leaf` sees a
 /// slot under a null struct as null rather than whatever placeholder bytes
 /// the producer left there; a child of a nullable struct that receives them
 /// is declared nullable. Fields without a decimal_arb leaf come back
-/// unchanged.
+/// unchanged. Children hidden by a null list or map are removed before conversion;
+/// fixed-size lists restore their hidden slots as nulls after conversion.
 pub fn rewrite_decimal_arb_leaves(
     field: &Field,
     array: &ArrayRef,
@@ -167,7 +168,7 @@ pub fn rewrite_decimal_arb_leaves(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| downcast_err("ListArray"))?;
-            let (offsets, values) = trim_list_child(la.offsets(), la.values());
+            let (offsets, values) = visible_list_child(la.offsets(), la.values(), la.nulls());
             let (f, values) = child(c, &values)?;
             let la = ListArray::try_new(Arc::clone(&f), offsets, values, la.nulls().cloned())?;
             (DataType::List(f), Arc::new(la))
@@ -177,7 +178,7 @@ pub fn rewrite_decimal_arb_leaves(
                 .as_any()
                 .downcast_ref::<LargeListArray>()
                 .ok_or_else(|| downcast_err("LargeListArray"))?;
-            let (offsets, values) = trim_list_child(la.offsets(), la.values());
+            let (offsets, values) = visible_list_child(la.offsets(), la.values(), la.nulls());
             let (f, values) = child(c, &values)?;
             let la = LargeListArray::try_new(Arc::clone(&f), offsets, values, la.nulls().cloned())?;
             (DataType::LargeList(f), Arc::new(la))
@@ -187,7 +188,39 @@ pub fn rewrite_decimal_arb_leaves(
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| downcast_err("FixedSizeListArray"))?;
-            let (f, values) = child(c, fa.values())?;
+            let (f, values) = if let Some(nulls) = fa.nulls().filter(|n| n.null_count() > 0) {
+                // Unlike a variable-size list, these child slots cannot be
+                // removed from the output. Convert only the visible slots,
+                // then restore null placeholders under the parent's mask.
+                // Arrow permits these masked nulls even for a non-nullable
+                // item field, so its declaration stays unchanged.
+                let width = fa.value_length() as usize;
+                let data = fa.values().to_data();
+                let mut visible = MutableArrayData::new(
+                    vec![&data],
+                    false,
+                    (fa.len() - nulls.null_count()) * width,
+                );
+                for (start, end) in nulls.valid_slices() {
+                    visible.extend(0, start * width, end * width);
+                }
+                let (f, values) = child(c, &make_array(visible.freeze()))?;
+                let data = values.to_data();
+                let mut restored = MutableArrayData::new(vec![&data], true, fa.values().len());
+                let mut row = 0;
+                let mut value = 0;
+                for (start, end) in nulls.valid_slices() {
+                    restored.extend_nulls((start - row) * width);
+                    let len = (end - start) * width;
+                    restored.extend(0, value, value + len);
+                    value += len;
+                    row = end;
+                }
+                restored.extend_nulls((fa.len() - row) * width);
+                (f, make_array(restored.freeze()))
+            } else {
+                child(c, fa.values())?
+            };
             // The length is given explicitly: `FixedSizeListArray::new` derives
             // it from the values, which for a zero-width list means zero rows.
             let fa = FixedSizeListArray::try_new_with_length(
@@ -205,7 +238,7 @@ pub fn rewrite_decimal_arb_leaves(
                 .downcast_ref::<MapArray>()
                 .ok_or_else(|| downcast_err("MapArray"))?;
             let entries: ArrayRef = Arc::new(ma.entries().clone());
-            let (offsets, entries) = trim_list_child(ma.offsets(), &entries);
+            let (offsets, entries) = visible_list_child(ma.offsets(), &entries, ma.nulls());
             let (f, entries) = child(entry_field, &entries)?;
             let entries = entries
                 .as_any()
@@ -224,6 +257,38 @@ pub fn rewrite_decimal_arb_leaves(
         other => return Err(unsupported_layout(path, other)),
     };
     Ok((field_with_type(field, data_type), rebuilt))
+}
+
+/// Keep only child spans belonging to visible list/map rows. Null rows may
+/// have nonempty spans containing arbitrary placeholders; unlike fixed-size
+/// lists, their offsets can be collapsed without changing logical values.
+/// Removing those spans also preserves non-nullable map entries and keys.
+fn visible_list_child<O: OffsetSizeTrait>(
+    offsets: &OffsetBuffer<O>,
+    child: &ArrayRef,
+    nulls: Option<&NullBuffer>,
+) -> (OffsetBuffer<O>, ArrayRef) {
+    let Some(nulls) = nulls.filter(|n| n.null_count() > 0) else {
+        return trim_list_child(offsets, child);
+    };
+    let visible_offsets =
+        OffsetBuffer::<O>::from_lengths(offsets.windows(2).enumerate().map(|(row, pair)| {
+            if nulls.is_valid(row) {
+                (pair[1] - pair[0]).as_usize()
+            } else {
+                0
+            }
+        }));
+    let visible_len = visible_offsets[visible_offsets.len() - 1].as_usize();
+    if visible_len == (offsets[offsets.len() - 1] - offsets[0]).as_usize() {
+        return trim_list_child(offsets, child);
+    }
+    let data = child.to_data();
+    let mut visible = MutableArrayData::new(vec![&data], false, visible_len);
+    for (start, end) in nulls.valid_slices() {
+        visible.extend(0, offsets[start].as_usize(), offsets[end].as_usize());
+    }
+    (visible_offsets, make_array(visible.freeze()))
 }
 
 /// The field a leaf-holding child of `parent` (a struct) is rewritten as.
@@ -412,6 +477,212 @@ mod tests {
     fn strings(array: &ArrayRef) -> Vec<Option<String>> {
         let s = array.as_any().downcast_ref::<StringArray>().unwrap();
         s.iter().map(|v| v.map(str::to_string)).collect()
+    }
+
+    /// Model a sink that rejects negative values, even though decimal_arb may
+    /// legally contain them in slots hidden by a container's null bitmap.
+    fn rewrite_nonnegative(field: &Field, array: &ArrayRef) -> (Field, ArrayRef, Vec<String>) {
+        let mut visited = Vec::new();
+        let (f, a) = rewrite_decimal_arb_leaves(field, array, field.name(), &mut |f, a, path| {
+            let lb = a.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            for bytes in lb.iter().flatten() {
+                let value =
+                    DecimalArbValue::from_canonical_bytes_at_scale(bytes, 0)?.to_canonical_string();
+                if value.starts_with('-') {
+                    return Err(streamling_err!("hidden negative value at {path}"));
+                }
+                visited.push(value);
+            }
+            to_text(f, a, path)
+        })
+        .unwrap();
+        let schema_only =
+            rewrite_decimal_arb_leaf_fields(field, field.name(), &mut to_text_field).unwrap();
+        assert_eq!(f, schema_only);
+        assert_eq!(f.data_type(), a.data_type());
+        a.to_data().validate_full().unwrap();
+        (f, a, visited)
+    }
+
+    #[test]
+    fn null_lists_and_maps_skip_hidden_leaf_values() {
+        let item = Arc::new(DecimalArbType::field("item", 78, 0, false).unwrap());
+        let list: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(&item),
+                OffsetBuffer::new(vec![0, 1, 3, 4, 4].into()),
+                leaf_array(&[Some("-1"), Some("7"), Some("8"), Some("-1")]),
+                Some(NullBuffer::from(vec![false, true, false, true])),
+            )
+            .unwrap(),
+        );
+        let large = cast(list.as_ref(), &DataType::LargeList(Arc::clone(&item))).unwrap();
+        for array in [Arc::clone(&list), large] {
+            let field = Field::new("l", array.data_type().clone(), true);
+            let (_, hidden, visited) = rewrite_nonnegative(&field, &array.slice(0, 1));
+            assert!(visited.is_empty());
+            assert!(hidden.is_null(0));
+            let (_, rewritten, visited) = rewrite_nonnegative(&field, &array);
+            assert_eq!(visited, ["7", "8"]);
+            assert_eq!(rewritten.len(), 4);
+            assert!(rewritten.is_null(0));
+            assert!(rewritten.is_null(2));
+            let rewritten = cast(
+                rewritten.as_ref(),
+                &DataType::List(Arc::new(to_text_field(&item, "l.item").unwrap())),
+            )
+            .unwrap();
+            let rewritten = rewritten.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(rewritten.value_offsets(), &[0, 0, 2, 2, 2]);
+            assert!(matches!(rewritten.data_type(), DataType::List(child) if !child.is_nullable()));
+            assert_eq!(
+                strings(rewritten.values()),
+                [Some("7".into()), Some("8".into())]
+            );
+        }
+
+        // Nulls inherited from a struct must reach a list's descendants too.
+        let nonnull_list: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(&item),
+                OffsetBuffer::new(vec![0, 1, 2].into()),
+                leaf_array(&[Some("-1"), Some("7")]),
+                None,
+            )
+            .unwrap(),
+        );
+        let child = Arc::new(Field::new("l", nonnull_list.data_type().clone(), false));
+        let structs: ArrayRef = Arc::new(
+            SA::try_new(
+                vec![child].into(),
+                vec![nonnull_list],
+                Some(NullBuffer::from(vec![false, true])),
+            )
+            .unwrap(),
+        );
+        let field = Field::new("s", structs.data_type().clone(), true);
+        let (_, _, visited) = rewrite_nonnegative(&field, &structs);
+        assert_eq!(visited, ["7"]);
+
+        let key = Arc::new(Field::new("key", DataType::Utf8, false));
+        let value = Arc::new(item.as_ref().clone().with_name("value"));
+        let entries = SA::try_new(
+            vec![key, value].into(),
+            vec![
+                Arc::new(StringArray::from(vec!["hidden", "kept"])),
+                leaf_array(&[Some("-1"), Some("7")]),
+            ],
+            None,
+        )
+        .unwrap();
+        let entry = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+        let map: ArrayRef = Arc::new(
+            MapArray::try_new(
+                entry,
+                OffsetBuffer::new(vec![0, 1, 2].into()),
+                entries,
+                Some(NullBuffer::from(vec![false, true])),
+                false,
+            )
+            .unwrap(),
+        );
+        let field = Field::new("m", map.data_type().clone(), true);
+        let (_, rewritten, visited) = rewrite_nonnegative(&field, &map);
+        assert_eq!(visited, ["7"]);
+        let rewritten = rewritten.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(rewritten.value_offsets(), &[0, 0, 1]);
+        assert_eq!(rewritten.keys().null_count(), 0);
+        assert!(!rewritten.entries().fields()[0].is_nullable());
+        assert!(!rewritten.entries().fields()[1].is_nullable());
+
+        // Restoring hidden fixed-size-list slots must also work for a map
+        // child, whose entries and keys can never be made nullable.
+        let unmasked_map = make_array(map.to_data().into_builder().nulls(None).build().unwrap());
+        let item = Arc::new(Field::new("item", unmasked_map.data_type().clone(), false));
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(
+                item,
+                1,
+                unmasked_map,
+                Some(NullBuffer::from(vec![false, true])),
+            )
+            .unwrap(),
+        );
+        let field = Field::new("f", fixed.data_type().clone(), true);
+        let (field, rewritten, visited) = rewrite_nonnegative(&field, &fixed);
+        assert_eq!(visited, ["7"]);
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!()
+        };
+        assert!(!item.is_nullable());
+        let fixed = rewritten
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert!(fixed.is_null(0));
+        let map = fixed.values().as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(map.is_null(0));
+        assert_eq!(map.keys().null_count(), 0);
+        assert!(!map.entries().fields()[0].is_nullable());
+    }
+
+    #[test]
+    fn null_fixed_size_lists_convert_only_visible_elements() {
+        let item = Arc::new(DecimalArbType::field("item", 78, 0, false).unwrap());
+        for valid in [vec![false, true, false], vec![false, false, false]] {
+            let array: ArrayRef = Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::clone(&item),
+                    2,
+                    leaf_array(&[
+                        Some("-1"),
+                        Some("-1"),
+                        Some("7"),
+                        Some("8"),
+                        Some("-1"),
+                        Some("-1"),
+                    ]),
+                    Some(NullBuffer::from(valid.clone())),
+                )
+                .unwrap(),
+            );
+            let field = Field::new("f", array.data_type().clone(), true);
+            let (field, rewritten, visited) = rewrite_nonnegative(&field, &array);
+            assert_eq!(visited, if valid[1] { vec!["7", "8"] } else { vec![] });
+            let DataType::FixedSizeList(child, _) = field.data_type() else {
+                panic!()
+            };
+            assert!(!child.is_nullable());
+            let rewritten = rewritten
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            assert_eq!(rewritten.len(), 3);
+            assert_eq!(rewritten.value_length(), 2);
+            for (row, valid) in valid.into_iter().enumerate() {
+                assert_eq!(rewritten.is_valid(row), valid);
+                if valid {
+                    assert_eq!(
+                        strings(&rewritten.value(row)),
+                        [Some("7".into()), Some("8".into())]
+                    );
+                }
+            }
+        }
+        let empty: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new_with_length(
+                item,
+                0,
+                leaf_array(&[]),
+                Some(NullBuffer::from(vec![false, true, false])),
+                3,
+            )
+            .unwrap(),
+        );
+        let field = Field::new("empty", empty.data_type().clone(), true);
+        let (_, empty, visited) = rewrite_nonnegative(&field, &empty);
+        assert_eq!(empty.len(), 3);
+        assert!(visited.is_empty());
     }
 
     /// Rewrites through both walks and checks they agree on the field.

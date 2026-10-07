@@ -7886,6 +7886,115 @@ mod nested_decimal_arb_tests {
     }
 
     #[test]
+    fn null_containers_do_not_range_check_hidden_u256_values() {
+        use arrow::array::FixedSizeListArray;
+
+        let item = Arc::new(
+            hinted("item", NativeIntKind::U256)
+                .as_ref()
+                .clone()
+                .with_nullable(false),
+        );
+        let nulls = NullBuffer::from(vec![false, true]);
+        let list = |nulls| -> ArrayRef {
+            Arc::new(
+                ListArray::try_new(
+                    Arc::clone(&item),
+                    OffsetBuffer::new(vec![0, 1, 2].into()),
+                    arb(&[Some("-1"), Some("7")], 78, 0),
+                    nulls,
+                )
+                .unwrap(),
+            )
+        };
+        let direct = list(Some(nulls.clone()));
+        let child = Arc::new(Field::new("values", direct.data_type().clone(), false));
+        let parent: ArrayRef = Arc::new(
+            StructArray::try_new(vec![child].into(), vec![list(None)], Some(nulls.clone()))
+                .unwrap(),
+        );
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::clone(&item),
+                1,
+                arb(&[Some("-1"), Some("7")], 78, 0),
+                Some(nulls.clone()),
+            )
+            .unwrap(),
+        );
+        let entries = StructArray::try_new(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(item.as_ref().clone().with_name("value")),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec!["hidden", "kept"])),
+                arb(&[Some("-1"), Some("7")], 78, 0),
+            ],
+            None,
+        )
+        .unwrap();
+        let map: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::new(vec![0, 1, 2].into()),
+                entries,
+                Some(nulls),
+                false,
+            )
+            .unwrap(),
+        );
+
+        for (name, input) in [
+            ("list", direct),
+            ("parent", parent),
+            ("fixed", fixed),
+            ("map", map),
+        ] {
+            let field = Field::new(name, input.data_type().clone(), true);
+            let (out_field, output) = nested_decimal_arb_column(&field, &input, None).unwrap();
+            assert_eq!(out_field, nested_decimal_arb_field(&field, None).unwrap());
+            output.to_data().validate_full().unwrap();
+            assert!(output.is_null(0), "{name}");
+            assert!(!output.is_null(1), "{name}");
+            let leaf = match name {
+                "list" => output
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .value(1),
+                "parent" => {
+                    let parent = output.as_any().downcast_ref::<StructArray>().unwrap();
+                    let list = parent
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .unwrap();
+                    assert!(list.is_null(0));
+                    list.value(1)
+                }
+                "fixed" => output
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .unwrap()
+                    .value(1),
+                "map" => {
+                    let map = output.as_any().downcast_ref::<MapArray>().unwrap();
+                    assert_eq!(map.keys().null_count(), 0);
+                    Arc::clone(map.values())
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                native_values(&leaf, NativeIntKind::U256),
+                vec![Some("7".into())],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn retired_wide_int_leaves_nested_in_a_column_are_converted_too() {
         use streamling_core::types::decimal_arb_legacy::LEGACY_U256_EXTENSION_NAME;
         // A plugin may still emit `streamling.u256` (32 big-endian bytes)
