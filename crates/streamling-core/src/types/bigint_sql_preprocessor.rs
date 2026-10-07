@@ -989,6 +989,27 @@ fn quote_inexact_literals_near_decimal_arb(stmt: &mut Statement, names: &Decimal
     });
 }
 
+/// Whether every `(` in `text` is closed and none is closed before it opens, ignoring parentheses
+/// inside single-quoted string literals (a doubled quote escapes itself and toggles twice).
+fn parentheses_balance(text: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     // First, normalize TRY_CAST DECIMAL via regex (AST may not have TryCast variant)
     lazy_static::lazy_static! {
@@ -1003,6 +1024,13 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     let sql = DECIMAL_TRY_RE
         .replace_all(sql, |caps: &regex::Captures| {
             let expr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            // The lazy `(.+?)` stops at the first `AS DECIMAL(..))` it can reach. When the argument
+            // holds a call of its own, that is the inner call's tail and what was captured is not an
+            // expression: its parentheses do not balance. Leave the match untouched; the AST pass
+            // below rewrites every TRY_CAST node on its own.
+            if !parentheses_balance(expr) {
+                return caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+            }
             // Parse precision as u32 — decimal_arb supports declared
             // precision well beyond u8::MAX. Scale parses as u32 too because
             // negative scale isn't representable for decimal_arb.
@@ -1333,6 +1361,37 @@ mod tests {
         assert_eq!(
             result,
             "SELECT to_decimal_arb_from_string('18446744073709551617', 77, 0, 'u256') FROM t"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_try_cast_around_an_expression_that_contains_try_cast() {
+        // The regex pass paired the outer call with the first `AS DECIMAL(..))` it reached,
+        // which closes the inner call, and the statement came out unparseable.
+        let sql = "SELECT TRY_CAST(CASE WHEN x > 1 THEN COALESCE(TRY_CAST(a AS DECIMAL(78)), 0) \
+                   ELSE 0 END AS DECIMAL(78)) AS v FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(
+            super::parse_single_statement(&result).is_some(),
+            "not valid SQL: {result}"
+        );
+        assert_eq!(
+            result.matches("try_to_decimal_arb_from_string(").count(),
+            2,
+            "{result}"
+        );
+        assert!(!result.to_uppercase().contains(" AS DECIMAL("), "{result}");
+    }
+
+    #[test]
+    fn test_preprocess_try_cast_keeps_parentheses_inside_literals_out_of_the_balance() {
+        let sql = "SELECT TRY_CAST(concat('(', a) AS DECIMAL(78, 0)) FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(super::parse_single_statement(&result).is_some(), "{result}");
+        assert_eq!(
+            result.matches("try_to_decimal_arb_from_string(").count(),
+            1,
+            "{result}"
         );
     }
 
