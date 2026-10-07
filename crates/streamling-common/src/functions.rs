@@ -15,7 +15,7 @@ use crate::functions::decimal_arb_ops::{
     DecimalArbDivFunc, DecimalArbEqFunc, DecimalArbExtremeFunc, DecimalArbGtFunc,
     DecimalArbGteFunc, DecimalArbLtFunc, DecimalArbLteFunc, DecimalArbModFunc, DecimalArbMulFunc,
     DecimalArbNegFunc, DecimalArbNeqFunc, DecimalArbRescaleFunc, DecimalArbRestampFunc,
-    DecimalArbSortKeyFunc, DecimalArbSubFunc, DecimalArbToDecimal128Func,
+    DecimalArbSortKeyFunc, DecimalArbSqlCastFunc, DecimalArbSubFunc, DecimalArbToDecimal128Func,
     DecimalArbToDecimal256Func, DecimalArbToStringFunc, LegacyWideIntToDecimalArbFunc,
     ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
     ToDecimalArbFromStringFunc, TryToDecimalArbFromStringFunc,
@@ -138,6 +138,11 @@ impl CommonFunctions {
             ScalarUDF::from(ToDecimalArbFromIntFunc::new()),
             // TRY_CAST(... AS DECIMAL(p > 76, s)) — NULL instead of an error
             ScalarUDF::from(TryToDecimalArbFromStringFunc::new()),
+            // Bare NUMERIC and DECIMAL(p > 76, s) casts, decided by whether the
+            // operand is decimal_arb (written by the SQL preprocessor)
+            ScalarUDF::from(DecimalArbSqlCastFunc::numeric()),
+            ScalarUDF::from(DecimalArbSqlCastFunc::wide_decimal()),
+            ScalarUDF::from(DecimalArbSqlCastFunc::try_wide_decimal()),
             // retired streamling.u256 / streamling.i256 plugin columns
             ScalarUDF::from(LegacyWideIntToDecimalArbFunc::new()),
             // Builtins whose argument coercion refuses decimal_arb mixed with
