@@ -123,16 +123,11 @@ impl Default for StateBackendConfig {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub enum DynamicTableBackendType {
     InMemory,
+    #[default]
     Postgres,
-}
-
-impl Default for DynamicTableBackendType {
-    fn default() -> Self {
-        Self::Postgres
-    }
 }
 
 impl<'de> SerdeDeserialize<'de> for DynamicTableBackendType {
