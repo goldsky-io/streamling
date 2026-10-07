@@ -806,6 +806,26 @@ impl KafkaSourceExec {
         )
     }
 
+    /// Synchronous broker offset commit. `rd_kafka_commit` with async=0
+    /// blocks the calling thread for a full broker round trip, coordinator
+    /// rediscovery and retry backoff included, so it runs under
+    /// `block_in_place`: during a drain every async worker is needed, and a
+    /// slow commit (observed multi-second in the field) must not pin one. The
+    /// flavor check keeps current_thread runtimes (unit tests) on the direct
+    /// call, where `block_in_place` would panic.
+    fn commit_sync(
+        consumer: &StreamConsumer,
+        offsets: &KafkaTopicPartitionList,
+    ) -> rdkafka::error::KafkaResult<()> {
+        if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(|| consumer.commit(offsets, CommitMode::Sync))
+        } else {
+            consumer.commit(offsets, CommitMode::Sync)
+        }
+    }
+
     /// Commit the consumer position recorded for `epoch` (offset commit +
     /// state-backend save), shared by the in-loop Finalizer dispatch and the
     /// terminal-checkpoint path on shutdown. No recorded position is the
@@ -879,22 +899,8 @@ impl KafkaSourceExec {
                 // Currently, every time a group rebalances it's possible to see the following error:
                 //     Consumer commit error: NoOffset (Local: No offset stored)
                 // This is OK because the next checkpoint epoch will commit the newly assigned partitions anyway
-                //
-                // rd_kafka_commit with async=0 blocks the calling thread for a
-                // full broker round trip — coordinator rediscovery and retry
-                // backoff included — so run it under block_in_place: during a
-                // drain every async worker is needed, and a slow commit
-                // (observed multi-second in the field) must not pin one. The
-                // flavor check keeps current_thread runtimes (unit tests) on
-                // the direct call, where block_in_place would panic.
                 let commit_started = std::time::Instant::now();
-                let commit_result = if tokio::runtime::Handle::current().runtime_flavor()
-                    == tokio::runtime::RuntimeFlavor::MultiThread
-                {
-                    tokio::task::block_in_place(|| consumer.commit(position, CommitMode::Sync))
-                } else {
-                    consumer.commit(position, CommitMode::Sync)
-                };
+                let commit_result = Self::commit_sync(consumer, position);
                 let commit_elapsed = commit_started.elapsed();
                 if commit_elapsed > Duration::from_secs(1) {
                     warn!(
@@ -1786,8 +1792,22 @@ impl ExecutionPlan for KafkaSourceExec {
                     }
                 }
 
-                // if the seek was successful, we assume the offsets from the state were committed
-                committed_offsets = Some(kafka_topic_partition_list_to_seek);
+                // Commit the seeked offsets to the broker too. A later
+                // rebalance can hand this instance a partition without a new
+                // seek, and that partition then resumes from the broker's
+                // group offset. The state backend can be ahead of the broker:
+                // a hybrid seed writes only the state backend, and a
+                // generated group id has no broker offsets at all. Without
+                // this commit, such a partition restarts at `start_at`.
+                match Self::commit_sync(&consumer, &kafka_topic_partition_list_to_seek) {
+                    Ok(()) => committed_offsets = Some(kafka_topic_partition_list_to_seek),
+                    // Soft, like the per-epoch commit: the first finalized
+                    // epoch commits these partitions again.
+                    Err(e) => warn!(
+                        "Kafka source '{}': committing the seeked offsets of topic '{}' failed: {}",
+                        reference_name, topic, e
+                    ),
+                }
             } else {
                 // No offsets found in the state backend, so we need to seek to the configured
                 // starting position (earliest/latest) for all assigned partitions
@@ -2479,6 +2499,13 @@ impl KafkaSourceTableProvider {
             }
             _ => requested,
         }
+    }
+
+    /// Consumer instances this source will run — the requested `parallelism`
+    /// after clamping to the topic's partition count. The hybrid source reads
+    /// it to size its own plan, which must serve exactly this many partitions.
+    pub fn parallelism(&self) -> usize {
+        self.parallelism
     }
 
     /// Get the payload schema (data columns only, without _gs_op or __kafka_* metadata)

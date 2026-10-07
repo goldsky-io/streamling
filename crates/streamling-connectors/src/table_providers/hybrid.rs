@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +14,9 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use streamling_config::AppConfig;
@@ -148,6 +151,21 @@ pub struct HybridTableProvider {
     /// current phase, emits the terminal checkpoint, and ends its stream
     /// instead of advancing to the next phase. `None` in tests.
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Output partitions this source's plan advertises — the unbounded (Kafka)
+    /// phase's consumer-instance count, clamped to the topic's partition count.
+    /// A plan's width is fixed for its lifetime, so it cannot follow the phase:
+    /// partition 0 drives every phase, and partitions 1.. only come alive once
+    /// the unbounded phase starts (see `HybridSourceExec::execute`).
+    unbounded_parallelism: usize,
+    /// Set by partition 0 once its unbounded stream is open, i.e. after the
+    /// offset seed succeeded and outside job mode. Follower partitions wait
+    /// on this, not on `current_phase`: the driver advances the phase index
+    /// before the seed runs and in job mode, where no unbounded phase follows.
+    unbounded_started: Arc<AtomicBool>,
+    /// Flipped by partition 0 when the phase machine stops for good, so the
+    /// follower partitions end their streams instead of waiting for an
+    /// unbounded phase that will never start (job mode, shutdown, error).
+    terminated: Arc<AtomicBool>,
     /// The run loop's shutdown scope: the hybrid driver, marker forwarder,
     /// and shutdown watcher spawn through it so the teardown drain ladder
     /// tracks them. `None` in tests (direct construction).
@@ -218,6 +236,9 @@ impl HybridTableProvider {
             session_manager,
             checkpoint_control: None,
             shutdown_rx: None,
+            unbounded_parallelism: 1,
+            unbounded_started: Arc::new(AtomicBool::new(false)),
+            terminated: Arc::new(AtomicBool::new(false)),
             scope: streamling_core::shutdown::ComponentScope::detached("hybrid-source"),
         };
 
@@ -239,6 +260,20 @@ impl HybridTableProvider {
         self
     }
 
+    /// Set the number of output partitions this source's plan advertises.
+    ///
+    /// MUST equal the partition count the unbounded phase's plan actually
+    /// serves: partition `k` of the hybrid executes partition `k` of that plan.
+    pub fn with_unbounded_parallelism(mut self, parallelism: usize) -> Self {
+        self.unbounded_parallelism = parallelism.max(1);
+        self
+    }
+
+    /// True once the phase machine has stopped for good.
+    fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::SeqCst)
+    }
+
     /// Attach the run loop's shutdown scope so the hybrid's helper tasks are
     /// tracked by the teardown drain ladder. Builder-style, applied before the
     /// provider is wrapped in an `Arc`.
@@ -246,7 +281,6 @@ impl HybridTableProvider {
         self.scope = scope;
         self
     }
-
     pub fn new_from_topology(
         reference_name: String,
         bounded_sources: Vec<HybridBoundedSource>,
@@ -277,63 +311,71 @@ impl HybridTableProvider {
         let application_id = app_config.application_id.clone();
 
         let unbounded_source_topic = unbounded_source.topic.clone();
-        let unbounded_table_provider: Arc<dyn TableProvider> =
-            match unbounded_source.source_type.as_str() {
-                "kafka" => {
-                    let kafka_table_provider = Arc::new(
-                        KafkaSourceTableProvider::new(
-                            reference_name.clone(),
-                            metric_key(&application_id, &reference_name),
-                            app_config.kafka_source.clone(),
-                            unbounded_source.topic,
-                            unbounded_source.start_at,
-                            unbounded_source.filter,
-                            app_config.record_batch_interval_ms,
-                            app_config.record_batch_size,
-                            app_config.internal_buffer_size,
-                            false,
-                            state_backend_factory.create(application_id.as_str()),
-                            session_manager.clone(),
-                            unbounded_source
-                                .validate_writer_schema_ordering
-                                .unwrap_or(true),
-                            unbounded_source.schema_id_overrides.unwrap_or_default(),
-                            unbounded_source.skip_schema_resolution.unwrap_or(false),
-                            unbounded_source
-                                .skip_schema_resolution_for_reader_schema_ids
-                                .unwrap_or_default(),
-                            // Hybrid sources are Avro-only; JSON is supported on the
-                            // standalone Kafka source.
-                            KafkaFormat::Avro,
-                            None,
-                            // The hybrid source orchestrates a bounded->unbounded
-                            // transition through one cursor, so its Kafka phase is
-                            // always a single consumer instance.
-                            1,
+        // The width of the whole hybrid plan. Declared on the unbounded phase
+        // because that is the only phase that can honor it; the Kafka provider
+        // clamps it to the topic's partition count, and the clamped value is
+        // what the plan must advertise.
+        let unbounded_parallelism = unbounded_source.parallelism.unwrap_or(1).max(1);
+        let (unbounded_table_provider, effective_unbounded_parallelism): (
+            Arc<dyn TableProvider>,
+            usize,
+        ) = match unbounded_source.source_type.as_str() {
+            "kafka" => {
+                let kafka_table_provider = Arc::new(
+                    KafkaSourceTableProvider::new(
+                        reference_name.clone(),
+                        metric_key(&application_id, &reference_name),
+                        app_config.kafka_source.clone(),
+                        unbounded_source.topic,
+                        unbounded_source.start_at,
+                        unbounded_source.filter,
+                        app_config.record_batch_interval_ms,
+                        app_config.record_batch_size,
+                        app_config.internal_buffer_size,
+                        false,
+                        state_backend_factory.create(application_id.as_str()),
+                        session_manager.clone(),
+                        unbounded_source
+                            .validate_writer_schema_ordering
+                            .unwrap_or(true),
+                        unbounded_source.schema_id_overrides.unwrap_or_default(),
+                        unbounded_source.skip_schema_resolution.unwrap_or(false),
+                        unbounded_source
+                            .skip_schema_resolution_for_reader_schema_ids
+                            .unwrap_or_default(),
+                        // Hybrid sources are Avro-only; JSON is supported on the
+                        // standalone Kafka source.
+                        KafkaFormat::Avro,
+                        None,
+                        unbounded_parallelism,
+                    )
+                    .streamling_with_context(|| {
+                        format!(
+                            "hybrid source '{}': failed to create Kafka source",
+                            reference_name
                         )
-                        .streamling_with_context(|| {
-                            format!(
-                                "hybrid source '{}': failed to create Kafka source",
-                                reference_name
-                            )
-                        })?
-                        .with_scope(scope.clone()),
-                    );
+                    })?
+                    .with_scope(scope.clone()),
+                );
+                let effective_parallelism = kafka_table_provider.parallelism();
+                (
                     Arc::new(WrappingSourceTableProvider::new(
                         kafka_table_provider,
                         metric_key_hybrid_src_unbounded(&application_id, reference_name.as_str()),
                         None,
                         telemetry,
-                    ))
-                }
-                _ => {
-                    return Err(streamling_core::streamling_user_err!(
-                        "unbounded source type '{}' is not supported for hybrid sources",
-                        unbounded_source.source_type
-                    )
-                    .into());
-                }
-            };
+                    )),
+                    effective_parallelism,
+                )
+            }
+            _ => {
+                return Err(streamling_core::streamling_user_err!(
+                    "unbounded source type '{}' is not supported for hybrid sources",
+                    unbounded_source.source_type
+                )
+                .into());
+            }
+        };
 
         let schema_adapter = ClickHouseSchemaAdapter {
             client: ClickHouseClient::new(app_config.clickhouse_source.connection.clone()),
@@ -431,6 +473,7 @@ impl HybridTableProvider {
             state_backend,
             session_manager,
         )?
+        .with_unbounded_parallelism(effective_unbounded_parallelism)
         .with_scope(scope);
         debug!("Created HybridTableProvider: {:?}", provider);
 
@@ -971,9 +1014,16 @@ impl HybridSourceExec {
             None => provider.schema.clone(),
         };
 
+        // The plan's width is the unbounded phase's, NOT the current phase's.
+        // A plan is partitioned once and keeps that width for its lifetime, so
+        // it cannot narrow to the single-stream ClickHouse replay and widen
+        // again at the handoff — the sink's ack gate is sized at execute time
+        // and never resized. Partition 0 therefore drives every phase and the
+        // followers idle (carrying checkpoint markers only) until the unbounded
+        // phase starts.
         let cached_properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
-            inner.properties().partitioning.clone(),
+            Partitioning::UnknownPartitioning(provider.unbounded_parallelism.max(1)),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -1224,12 +1274,35 @@ impl ExecutionPlan for HybridSourceExec {
         });
 
         scope.spawn(async move {
+            // Only partition 0 drives the phase machine. `current_phase` is one
+            // scalar behind one lock, and `advance_to_next_phase` seeds the
+            // Kafka offsets exactly once at the handoff — N advancers would
+            // step the phase N times and re-seed after the consumers had
+            // already moved past the seeded offsets. The followers are Kafka
+            // consumer instances of the unbounded phase and nothing else.
+            let is_phase_driver = partition == 0;
             // Every exit path from the loop falls through to the
             // post-loop teardown below — `break 'outer` is used uniformly
             // (instead of `return`) so the forwarder is signalled to
             // stop, joined, and the subscription is unsubscribed even
             // when downstream drops the receiver mid-stream.
             'outer: loop {
+                if !is_phase_driver && !provider.unbounded_started.load(Ordering::SeqCst) {
+                    if follower_wait_for_unbounded_phase(
+                        &provider,
+                        &pending_for_main,
+                        &schema_for_synth,
+                        &tx,
+                        &reference_name_for_spawn,
+                        partition,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    break 'outer;
+                }
+
                 // Capture the phase before streaming so we know what we were
                 // executing regardless of any concurrent state changes.
                 let executing_phase = provider.state.read().await.current_phase;
@@ -1262,6 +1335,9 @@ impl ExecutionPlan for HybridSourceExec {
                         break 'outer;
                     }
                 };
+                if is_phase_driver && is_executing_unbounded {
+                    provider.unbounded_started.store(true, Ordering::SeqCst);
+                }
 
                 // Forward batches until the inner stream ends — or, during a
                 // BOUNDED phase, until the process-wide shutdown signal flips.
@@ -1384,7 +1460,12 @@ impl ExecutionPlan for HybridSourceExec {
                     } else {
                         warn!("Unbounded source stream ended, exiting hybrid source");
                     }
-                    if let Some(control) = &checkpoint_control {
+                    // One terminal checkpoint per source, emitted by the phase
+                    // driver. A follower's own end-of-stream is not the
+                    // source's end: it just frees that partition's share of
+                    // the sink's ack gate, which is what lets the driver's
+                    // terminal epoch finalize.
+                    if is_phase_driver && let Some(control) = &checkpoint_control {
                         emit_terminal_checkpoint(
                             control,
                             &pending_for_main,
@@ -1466,6 +1547,16 @@ impl ExecutionPlan for HybridSourceExec {
                 }
             }
 
+            // The phase machine has stopped for good. Release any follower
+            // partition still parked waiting for an unbounded phase that will
+            // never start (job mode, shutdown during the replay, or a failure
+            // above), so its stream ends and the sink's ack gate stops
+            // expecting a marker copy from it. Set AFTER the terminal
+            // checkpoint above, which needs those copies to finalize.
+            if is_phase_driver {
+                provider.terminated.store(true, Ordering::SeqCst);
+            }
+
             // Final flush: if the loop exited with markers still buffered
             // (e.g. downstream dropped mid-batch, unbounded stream ended,
             // job_mode termination), they would otherwise be lost when the
@@ -1502,6 +1593,60 @@ impl ExecutionPlan for HybridSourceExec {
         });
 
         Ok(builder.build())
+    }
+}
+
+/// How often a parked follower partition delivers its checkpoint markers.
+/// Short relative to the checkpoint interval (seconds) so an epoch is never
+/// held for a meaningful fraction of it, and cheap: the flush is a no-op when
+/// nothing was buffered.
+const FOLLOWER_MARKER_HEARTBEAT: Duration = Duration::from_millis(100);
+
+/// Parks a follower partition (`partition > 0`) until partition 0 hands the
+/// source over to its unbounded phase.
+///
+/// Followers cannot run the bounded phases: a ClickHouse plan serves exactly
+/// one partition, and a second driver of the shared phase machine would step
+/// `current_phase` twice and re-seed the Kafka offsets. They are consumer
+/// instances of the unbounded phase and nothing else.
+///
+/// Parking is not silence. The sink's ack gate is sized to the plan's width
+/// and releases an epoch only once EVERY write stream delivered its copy of
+/// that epoch's marker (`MarkerAligner::observe`), with stream termination the
+/// only other way to discharge the obligation — so a partition that emits
+/// nothing for the length of a ClickHouse replay would stall checkpointing for
+/// the whole pipeline. Flushing the buffered markers onto a synthetic empty
+/// batch each tick is this partition's copy, the same heartbeat the Kafka
+/// consume loop gets for free by emitting a (possibly empty) batch every
+/// `record_batch_interval_ms`.
+///
+/// Returns `false` when the source terminated before the unbounded phase began
+/// (job mode, shutdown during the replay, or a failure in partition 0); the
+/// caller then ends this partition's stream.
+async fn follower_wait_for_unbounded_phase(
+    provider: &HybridTableProvider,
+    pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
+    schema_for_synth: &SchemaRef,
+    tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
+    reference_name: &str,
+    partition: usize,
+) -> bool {
+    debug!(
+        "Hybrid source '{}': partition {} parked until the unbounded phase starts",
+        reference_name, partition
+    );
+    loop {
+        if provider.unbounded_started.load(Ordering::SeqCst) {
+            return true;
+        }
+        // Deliver this tick's markers before checking termination too: the
+        // driver's terminal checkpoint is broadcast while it still waits for
+        // every write stream to ack it.
+        flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+        if provider.is_terminated() {
+            return false;
+        }
+        tokio::time::sleep(FOLLOWER_MARKER_HEARTBEAT).await;
     }
 }
 
@@ -3103,16 +3248,23 @@ mod tests {
     #[derive(Debug)]
     struct ReorderedBatchMockProvider {
         schema: SchemaRef,
+        partitions: usize,
     }
 
     impl ReorderedBatchMockProvider {
         /// Schema is create_test_schema() reversed: [name, id] vs [id, name].
         fn new() -> Self {
+            Self::wide(1)
+        }
+
+        /// Same, but every one of `partitions` output partitions emits the batch.
+        fn wide(partitions: usize) -> Self {
             Self {
                 schema: Arc::new(Schema::new(vec![
                     Field::new("name", DataType::Utf8, false),
                     Field::new("id", DataType::Int32, false),
                 ])),
+                partitions,
             }
         }
     }
@@ -3136,7 +3288,7 @@ mod tests {
                 schema: self.schema.clone(),
                 properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(self.schema.clone()),
-                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(self.partitions),
                     datafusion::physical_plan::execution_plan::EmissionType::Final,
                     datafusion::physical_plan::execution_plan::Boundedness::Bounded,
                 )),
@@ -3278,9 +3430,11 @@ mod tests {
                 continue; // synthetic marker-flush batches are empty
             }
             saw_data = true;
+            // Fields only: a marker broadcast by a concurrent test can land in
+            // the batch's checkpoint metadata.
             assert_eq!(
-                batch.schema(),
-                expected_schema,
+                batch.schema().fields(),
+                expected_schema.fields(),
                 "batches must match the declared projected schema"
             );
             let names = batch
@@ -3292,6 +3446,57 @@ mod tests {
             assert_eq!(names.value(1), "b");
         }
         assert!(saw_data, "the bounded phase's batch must be forwarded");
+    }
+
+    /// Follower partitions (1..N) forward the unbounded phase's batches through
+    /// the same projection alignment as partition 0. Without it, a projected
+    /// scan of a wide hybrid would emit full-width batches on every partition
+    /// but the first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_partition_aligns_unbounded_batches_to_the_projection() {
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(ReorderedBatchMockProvider::wide(3)),
+            offset_provider: None,
+            job_mode: false,
+        };
+        let state_backend = create_state_backend("hybrid_parallelism_projection").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_parallel_projection".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+        .with_unbounded_parallelism(3);
+
+        let session_state = SESSION_MANAGER.session_state();
+        let projection = vec![1usize]; // just "name"
+        let plan = hybrid_provider
+            .scan(&session_state, Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let outputs = run_partitions(&plan, 3).await;
+        let expected_schema = Arc::new(create_test_schema().project(&projection).unwrap());
+        for (p, batches) in outputs.into_iter().enumerate() {
+            let data: Vec<_> = batches
+                .into_iter()
+                .map(|b| b.unwrap_or_else(|e| panic!("partition {p} produced an error: {e}")))
+                .filter(|b| b.num_rows() > 0)
+                .collect();
+            assert_eq!(
+                data.len(),
+                1,
+                "partition {p} must forward its unbounded batch"
+            );
+            assert_eq!(
+                data[0].schema().fields(),
+                expected_schema.fields(),
+                "partition {p} must emit the declared projected schema"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3338,6 +3543,351 @@ mod tests {
             state.current_phase >= hybrid_provider.config.bounded_sources.len(),
             "Should have reached unbounded phase"
         );
+    }
+
+    // ========================================================================
+    // Unbounded-phase parallelism: the plan is N partitions wide, partition 0
+    // drives every phase, partitions 1.. are Kafka consumer instances that only
+    // come alive at the handoff.
+    // ========================================================================
+
+    /// A bounded phase whose stream stays open until released, so a test can
+    /// observe what the follower partitions do WHILE the replay is running.
+    #[derive(Debug)]
+    struct GatedMockTableProvider {
+        schema: SchemaRef,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl TableProvider for GatedMockTableProvider {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(GatedMockExec {
+                schema: self.schema.clone(),
+                release: self.release.clone(),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(self.schema.clone()),
+                    Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct GatedMockExec {
+        schema: SchemaRef,
+        release: Arc<tokio::sync::Notify>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for GatedMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "GatedMockExec")
+        }
+    }
+
+    impl ExecutionPlan for GatedMockExec {
+        fn name(&self) -> &str {
+            "GatedMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            let release = self.release.clone();
+            let stream = futures::stream::once(async move {
+                release.notified().await;
+                None::<DataFusionResult<RecordBatch>>
+            })
+            .filter_map(|item| async move { item });
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    stream,
+                ),
+            ))
+        }
+    }
+
+    fn wide_hybrid(
+        name: &str,
+        bounded_sources: Vec<Arc<dyn TableProvider>>,
+        partitions: usize,
+        job_mode: bool,
+        offset_provider: Option<Arc<dyn OffsetProvider>>,
+        state_backend: Arc<dyn StateOperatorBackend<HybridSourceState>>,
+    ) -> HybridTableProvider {
+        HybridTableProvider::new(
+            name.to_string(),
+            HybridSourceConfig {
+                bounded_sources,
+                // Every partition emits one data row once it runs the
+                // unbounded phase, so a test sees which partitions entered it.
+                unbounded_source: Arc::new(ReorderedBatchMockProvider::wide(partitions)),
+                offset_provider,
+                job_mode,
+            },
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+        .with_unbounded_parallelism(partitions)
+    }
+
+    /// Executes every partition of `plan`, then drains each stream to its end.
+    async fn run_partitions(
+        plan: &Arc<dyn ExecutionPlan>,
+        partitions: usize,
+    ) -> Vec<Vec<DataFusionResult<RecordBatch>>> {
+        let context = Arc::new(TaskContext::default());
+        let streams: Vec<_> = (0..partitions)
+            .map(|p| {
+                plan.execute(p, context.clone())
+                    .unwrap_or_else(|e| panic!("execute({p}) should succeed: {e}"))
+            })
+            .collect();
+        let mut outputs = Vec::with_capacity(partitions);
+        for (p, stream) in streams.into_iter().enumerate() {
+            outputs.push(
+                tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+                    .await
+                    .unwrap_or_else(|_| panic!("partition {p} never ended")),
+            );
+        }
+        outputs
+    }
+
+    /// Data rows partition `p` emitted; panics on an error batch.
+    fn data_rows(p: usize, batches: &[DataFusionResult<RecordBatch>]) -> usize {
+        batches
+            .iter()
+            .map(|b| match b {
+                Ok(b) => b.num_rows(),
+                Err(e) => panic!("partition {p} produced an error: {e}"),
+            })
+            .sum()
+    }
+
+    /// The plan advertises the unbounded phase's width even while the bounded
+    /// phase — which is single-stream — is the current one. A plan's partition
+    /// count is fixed for its lifetime, so it cannot be the current phase's.
+    ///
+    /// The load-bearing assertion is `current_phase == 1`: all three partitions
+    /// run the same state machine, and only partition 0 may advance it. Three
+    /// advancers would leave `current_phase == 3`, stepping past the unbounded
+    /// phase and re-running the offset seed after the consumers had already
+    /// started from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unbounded_parallelism_widens_the_plan_and_only_partition_zero_advances_phases() {
+        let state_backend = create_state_backend("hybrid_parallelism_single_advance").await;
+        let hybrid_provider = wide_hybrid(
+            "test_parallel_unbounded",
+            vec![Arc::new(FiniteMockTableProvider::new())],
+            3,
+            false,
+            None,
+            state_backend,
+        );
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        assert_eq!(
+            plan.properties().output_partitioning().partition_count(),
+            3,
+            "the hybrid plan must be as wide as its unbounded phase"
+        );
+
+        for (p, batches) in run_partitions(&plan, 3).await.iter().enumerate() {
+            data_rows(p, batches);
+        }
+
+        let state = hybrid_provider.state.read().await;
+        assert_eq!(
+            state.current_phase, 1,
+            "the phase machine must advance exactly once, by partition 0"
+        );
+    }
+
+    /// A follower partition parked through the bounded replay must still
+    /// deliver its copy of every checkpoint marker. The sink's ack gate is
+    /// sized to the plan's width and releases an epoch only when EVERY write
+    /// stream has delivered that epoch, so a silent partition would stall
+    /// checkpointing for the whole pipeline until the replay finished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parked_follower_partitions_still_deliver_checkpoint_markers() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let state_backend = create_state_backend("hybrid_parallelism_follower_markers").await;
+        let hybrid_provider = wide_hybrid(
+            "test_follower_markers",
+            vec![Arc::new(GatedMockTableProvider {
+                schema: create_test_schema(),
+                release: release.clone(),
+            })],
+            2,
+            false,
+            None,
+            state_backend,
+        );
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let context = Arc::new(TaskContext::default());
+        // Partition 0 is deliberately NOT executed: the bounded phase is still
+        // running, which is exactly the window this test is about.
+        let mut follower = plan.execute(1, context).expect("execute(1) should succeed");
+
+        let epoch = streamling_core::checkpoints::checkpoint_management::CheckpointEpoch(4242);
+        streamling_core::checkpoints::channels::send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Marker {
+                epoch: epoch.clone(),
+                created_at_ms: now_ms(),
+            },
+        )
+        .expect("broadcast should reach the parked follower");
+
+        let batch = tokio::time::timeout(Duration::from_secs(10), follower.next())
+            .await
+            .expect("a parked follower must emit the marker, not sit silent")
+            .expect("stream must not end before the marker")
+            .expect("marker batch must not be an error");
+        let carried = extract_checkpoint_messages(batch.schema().metadata());
+        assert!(
+            carried.iter().any(
+                |msg| matches!(msg, CheckpointMessage::Marker { epoch: e, .. } if *e == epoch)
+            ),
+            "the synthetic batch must carry the broadcast marker: {carried:?}"
+        );
+        assert_eq!(batch.num_rows(), 0, "the heartbeat carries no data");
+
+        // The phase machine stopping for good must release the parked
+        // partition — otherwise its stream never ends, and a stream that never
+        // ends never frees its share of the sink's ack gate.
+        hybrid_provider.terminated.store(true, Ordering::SeqCst);
+        release.notify_one();
+        let tail = tokio::time::timeout(Duration::from_secs(10), follower.collect::<Vec<_>>())
+            .await
+            .expect("a terminated source must release its parked partitions");
+        for batch in &tail {
+            assert!(batch.is_ok(), "follower produced an error");
+        }
+    }
+
+    /// In job mode the unbounded phase never runs on ANY partition, and a
+    /// follower would park forever without the termination signal partition 0
+    /// sets on its way out. The driver advances `current_phase` past the
+    /// bounded phases before that signal, so a follower that reads the phase
+    /// index instead of waiting for the driver would start consuming here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn job_mode_terminates_every_partition_including_parked_followers() {
+        let state_backend = create_state_backend("hybrid_parallelism_job_mode").await;
+        let hybrid_provider = wide_hybrid(
+            "test_parallel_job_mode",
+            vec![
+                Arc::new(FiniteMockTableProvider::new()),
+                Arc::new(FiniteMockTableProvider::new()),
+            ],
+            3,
+            true,
+            None,
+            state_backend,
+        );
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        for (p, batches) in run_partitions(&plan, 3).await.iter().enumerate() {
+            assert_eq!(
+                data_rows(p, batches),
+                0,
+                "partition {p} must not run the unbounded phase in job mode"
+            );
+        }
+
+        let state = hybrid_provider.state.read().await;
+        assert_eq!(
+            state.current_phase, 2,
+            "both bounded phases run exactly once, then job mode stops"
+        );
+        assert!(state.completed_phases.iter().all(|&c| c));
+    }
+
+    /// A failed offset seed at the handoff must keep the followers out of the
+    /// unbounded phase. `current_phase` already points at it in memory, but
+    /// the seed never landed, so their consumers would fall back to
+    /// `start_at` and re-deliver rows the archive replay already wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_offset_seed_keeps_followers_out_of_the_unbounded_phase() {
+        let state_backend = create_state_backend("hybrid_parallelism_seed_failure").await;
+        let hybrid_provider = wide_hybrid(
+            "test_parallel_seed_failure",
+            vec![Arc::new(FiniteMockTableProvider::new())],
+            3,
+            false,
+            Some(Arc::new(FailingOffsetProvider)),
+            state_backend,
+        );
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let outputs = run_partitions(&plan, 3).await;
+        assert!(
+            outputs[0].iter().any(|b| b.is_err()),
+            "partition 0 must surface the seed failure"
+        );
+        for (p, batches) in outputs.iter().enumerate().skip(1) {
+            assert_eq!(
+                data_rows(p, batches),
+                0,
+                "partition {p} must not consume after a failed handoff"
+            );
+        }
     }
 
     use streamling_state::testing::{FailCondition, FailableStateBackend};
