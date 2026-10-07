@@ -46,7 +46,7 @@ use datafusion::physical_plan::{
 use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
 use streamling_core::formats::avro::{
     FromArrowToAvroConverter, convert_avro_schema_to_arrow, post_process_avro_schema_for_writing,
-    to_avro,
+    try_to_avro,
 };
 use streamling_core::formats::json::{FromArrowToJsonConverter, JsonToArrowConverter};
 use streamling_core::formats::{FromArrowConverter, ToArrowConverter};
@@ -3291,7 +3291,7 @@ impl KafkaSink {
                 self.config.get_schema_registry_settings().ok_or_else(|| {
                     streamling_user_err!("schema_registry_url is required for Avro format")
                 })?;
-            let avro_schema = to_avro(&self.topic, &self.schema.fields);
+            let avro_schema = try_to_avro(&self.topic, &self.schema.fields)?;
             let avro_schema =
                 post_process_avro_schema_for_writing(avro_schema, self.primary_key.clone());
 
