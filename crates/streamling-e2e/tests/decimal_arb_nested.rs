@@ -5,9 +5,10 @@
 //! which. Nested input is built directly as an avro datum (the harness's
 //! flat producers can't express nested decimals).
 //!
-//! (Postgres has no nested-column type, so that boundary is not exercised
-//! here. ClickHouse stores nested leaves in `Array` / `Tuple` columns; the
-//! tests at the bottom cover it.)
+//! (Postgres writes nested columns as JSONB through the same JSON encoder; its
+//! projection is covered by the connector's unit tests. ClickHouse stores
+//! nested leaves in `Array` / `Tuple` columns; the tests at the bottom cover
+//! it.)
 
 use apache_avro::types::Value;
 use apache_avro::Decimal;
@@ -249,6 +250,127 @@ sinks:
         !blob.contains("00018ee90ff6c373e0ee4e3f0ad2"),
         "round-tripped nested decimal_arb must not render as hex; got: {blob}"
     );
+}
+
+// record { id: long, traces: array<null | record { amt: decimal(78,0) }>,
+//          transactions: array<null | record { amt: decimal(78,0) }> }
+const TWO_ARRAYS_OF_RECORDS_SCHEMA: &str = r#"{
+    "type": "record", "name": "R",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "traces", "type": {"type": "array", "items": ["null", {"type": "record", "name": "Trace", "fields": [
+            {"name": "amt", "type": {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}}
+        ]}]}},
+        {"name": "transactions", "type": {"type": "array", "items": ["null", {"type": "record", "name": "Tx", "fields": [
+            {"name": "amt", "type": {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}}
+        ]}]}}
+    ]
+}"#;
+
+const U256_MAX: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+const I256_MIN: &str =
+    "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+
+/// Two arrays of nullable records, each record holding a 256-bit decimal ->
+/// Kafka **Avro sink** -> re-read -> Print JSON. The sink's schema used to name
+/// every list-item record `item_item`, so a second list of records redefined
+/// that name and no record could be encoded; each list now gets its own record
+/// name, and every boundary value comes back exactly.
+#[tokio::test]
+async fn two_arrays_of_records_with_wide_decimals_kafka_avro_sink_round_trip() {
+    init_tracing();
+    let ctx = TestContext::new().await.unwrap();
+
+    let item = |amt: &str| {
+        Value::Union(
+            1,
+            Box::new(Value::Record(vec![("amt".to_string(), decimal_val(amt))])),
+        )
+    };
+    let rec = Value::Record(vec![
+        ("id".to_string(), Value::Long(1)),
+        (
+            "traces".to_string(),
+            Value::Array(vec![
+                item("1"),
+                Value::Union(0, Box::new(Value::Null)),
+                item("1000000000000000000"),
+            ]),
+        ),
+        (
+            "transactions".to_string(),
+            Value::Array(vec![item(U256_MAX), item(I256_MIN)]),
+        ),
+    ]);
+    ctx.kafka
+        .produce_avro_value(TWO_ARRAYS_OF_RECORDS_SCHEMA, rec)
+        .await
+        .unwrap();
+
+    let out_topic = ctx.create_kafka_topic("twolists").await.unwrap();
+    let p1 = format!(
+        r#"
+sources:
+  src:
+    type: kafka
+    topic: {input}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  ksink:
+    type: kafka
+    from: src
+    topic: {output}
+    topic_partitions: 1
+    data_format: avro
+"#,
+        input = ctx.kafka_topic,
+        output = out_topic.topic,
+    );
+    let s1 = ctx
+        .run_pipeline_with_opts(&p1, base_opts().record_limit(1))
+        .await
+        .unwrap();
+    assert!(
+        s1.success(),
+        "two arrays of records must encode to the Avro sink"
+    );
+
+    let p2 = format!(
+        r#"
+sources:
+  src2:
+    type: kafka
+    topic: {output}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  out:
+    type: print
+    from: src2
+"#,
+        output = out_topic.topic,
+    );
+    let captured = ctx
+        .run_pipeline_with_capture(&p2, base_opts().record_limit(1))
+        .await
+        .unwrap();
+    let traces = format!("{:?}", captured.column_values("traces"));
+    let transactions = format!("{:?}", captured.column_values("transactions"));
+    for (blob, values) in [
+        (&traces, &["1", "1000000000000000000"][..]),
+        (&transactions, &[U256_MAX, I256_MIN][..]),
+    ] {
+        for v in values {
+            assert!(
+                blob.contains(&format!("\"{v}\"")),
+                "{v} missing after the Avro sink round trip; got: {blob}"
+            );
+        }
+    }
 }
 
 // record { id: long, items: array<record { amt: decimal(100,18) }> }

@@ -1,20 +1,22 @@
 //! Copied from the Arroyo project, which is licensed under the Apache License 2.0.
 //! https://github.com/ArroyoSystems/arroyo/blob/master/crates/arroyo-formats/src/avro/ser.rs
 
+use crate::formats::decimal_arb_text::{plain_layout_field, to_plain_layout};
 use apache_avro::Schema;
 use apache_avro::types::{Record, Value};
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 use datafusion::arrow::array::cast::AsArray;
 use datafusion::arrow::array::types::{
-    Decimal128Type, Float16Type, Float32Type, Float64Type, Int8Type, Int32Type, Int64Type,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt32Type, UInt64Type,
+    Decimal32Type, Decimal64Type, Decimal128Type, Float16Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{Decimal256Type, i256};
 use num_bigint::{BigInt, Sign};
 use regex::Regex;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +47,42 @@ impl SerializeTarget for Vec<Value> {
     }
 }
 
+/// The record names already taken in the schema being built.
+///
+/// Avro needs every named type in a schema to have its own full name, and the
+/// names below are derived from field paths. A list's item record used to be
+/// named after the literal `item` prefix alone (`item_item`), so a second
+/// list of structs anywhere in the schema redefined that name, and encoding
+/// any record of it failed. The first record keeps the name it always had —
+/// a schema that never collided is unchanged, so a subject registered from it
+/// still matches — and a later one takes its path-qualified name instead.
+#[derive(Default)]
+struct RecordNames(HashSet<String>);
+
+impl RecordNames {
+    /// `preferred` if no record has it yet, else `qualified`, else
+    /// `qualified` with the first free numeric suffix.
+    fn claim(&mut self, preferred: &str, qualified: &str) -> String {
+        if self.0.insert(preferred.to_string()) {
+            return preferred.to_string();
+        }
+        if self.0.insert(qualified.to_string()) {
+            return qualified.to_string();
+        }
+        (2..)
+            .map(|n| format!("{qualified}_{n}"))
+            .find(|candidate| self.0.insert(candidate.clone()))
+            .expect("an unbounded range always yields a free name")
+    }
+}
+
+/// The name a field's nested record takes: `preferred` is the name it has
+/// always had, `qualified` one unique to its path, used on a collision.
+struct RecordPath<'a> {
+    preferred: &'a str,
+    qualified: &'a str,
+}
+
 /// Build the Avro record-schema JSON for a struct's `fields`, preserving nested
 /// `logicalType` attributes (decimal, date, timestamp, …).
 ///
@@ -53,23 +91,61 @@ impl SerializeTarget for Vec<Value> {
 /// struct schema through it silently demotes nested decimals to plain `bytes`
 /// (the F7 cause — the value encoder then emits `Decimal` against a `Bytes`
 /// schema and fails).
-fn record_schema_json(name: &str, fields: &Fields) -> serde_json::value::Value {
-    let avro_fields: Vec<_> = fields.iter().map(|f| field_to_avro(name, f)).collect();
-    json!({
+fn record_schema_json(
+    path: RecordPath<'_>,
+    fields: &Fields,
+    names: &mut RecordNames,
+) -> Result<serde_json::value::Value, String> {
+    let name = names.claim(path.preferred, path.qualified);
+    let avro_fields = fields
+        .iter()
+        .map(|f| field_to_avro(&name, &name, f, names))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(json!({
         "type": "record",
         "name": name,
         "fields": avro_fields,
-    })
+    }))
 }
 
-/// Computes an avro schema from an arrow schema
+/// Computes an avro schema from an arrow schema, or explains which column
+/// has no Avro encoding.
+pub fn try_to_avro(name: &str, fields: &Fields) -> crate::error::Result<Schema> {
+    let json = record_schema_json(
+        RecordPath {
+            preferred: name,
+            qualified: name,
+        },
+        fields,
+        &mut RecordNames::default(),
+    )
+    .map_err(|e| crate::streamling_user_err!("cannot encode as Avro: {}", e))?;
+    Schema::parse_str(&json.to_string())
+        .map_err(|e| crate::streamling_err!("invalid generated Avro schema: {}", e))
+}
+
+/// Computes an avro schema from an arrow schema. Panics on a column with no
+/// Avro encoding; [`try_to_avro`] reports it instead.
 pub fn to_avro(name: &str, fields: &Fields) -> Schema {
-    // TODO: make it a Result
-    Schema::parse_str(&record_schema_json(name, fields).to_string()).unwrap()
+    try_to_avro(name, fields).unwrap_or_else(|e| panic!("{e}"))
 }
 
-fn field_to_avro(name: &str, field: &Field) -> serde_json::value::Value {
-    let next_name = format!("{}_{}", name, &field.name());
+/// `prefix` / `qualified_prefix`: the names of the record (or list) the field
+/// sits in — the first as it has always been formed, the second unique to
+/// the field's path (see [`RecordNames`]).
+fn field_to_avro(
+    prefix: &str,
+    qualified_prefix: &str,
+    field: &Field,
+    names: &mut RecordNames,
+) -> Result<serde_json::value::Value, String> {
+    // A list view or a dictionary-/run-end-encoded column is written as its
+    // plain layout (see `serialize_column`), so it is declared as one.
+    if let Some(plain) = plain_layout_field(field) {
+        return field_to_avro(prefix, qualified_prefix, &plain, names);
+    }
+    let next_name = format!("{}_{}", prefix, &field.name());
+    let qualified_next_name = format!("{}_{}", qualified_prefix, &field.name());
     // decimal_arb fields are LargeBinary at the DataType level but
     // carry extension metadata that promotes them to Avro's `decimal`
     // logical type with the user-declared (precision, scale). Detect and
@@ -85,7 +161,14 @@ fn field_to_avro(name: &str, field: &Field) -> serde_json::value::Value {
             "precision": precision,
         })
     } else {
-        arrow_to_avro(&next_name, field.data_type())
+        arrow_to_avro(
+            RecordPath {
+                preferred: &next_name,
+                qualified: &qualified_next_name,
+            },
+            field,
+            names,
+        )?
     };
 
     if field.is_nullable() {
@@ -94,15 +177,26 @@ fn field_to_avro(name: &str, field: &Field) -> serde_json::value::Value {
         })
     }
 
-    json!({
+    Ok(json!({
         "name": sanitize_field(field.name()),
         "type": schema
-    })
+    }))
 }
 
-fn arrow_to_avro(name: &str, dt: &DataType) -> serde_json::value::Value {
-    let typ = match dt {
-        DataType::Null => unreachable!("null fields are not supported"),
+fn arrow_to_avro(
+    path: RecordPath<'_>,
+    field: &Field,
+    names: &mut RecordNames,
+) -> Result<serde_json::value::Value, String> {
+    let unsupported = |what: &str| {
+        Err(format!(
+            "column '{}' is {}, which has no Avro encoding",
+            field.name(),
+            what
+        ))
+    };
+    let typ = match field.data_type() {
+        DataType::Null => return unsupported("an untyped null"),
         DataType::Boolean => "boolean",
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16 => {
             "int"
@@ -119,67 +213,85 @@ fn arrow_to_avro(name: &str, dt: &DataType) -> serde_json::value::Value {
                 (TimeUnit::Millisecond | TimeUnit::Second, Some(_)) => "local-timestamp-millis",
             };
 
-            return json!({
+            return Ok(json!({
                 "type": "long",
                 "logicalType": logical
-            });
+            }));
         }
         DataType::Date32 | DataType::Date64 => {
-            return json!({
+            return Ok(json!({
                 "type": "int",
                 "logicalType": "date"
-            });
+            }));
         }
-        DataType::Time64(_) | DataType::Time32(_) => {
-            todo!("time is not supported")
-        }
-        DataType::Duration(_) => todo!("duration is not supported"),
-        DataType::Interval(_) => todo!("interval is not supported"),
+        DataType::Time64(_) | DataType::Time32(_) => return unsupported("a time"),
+        DataType::Duration(_) => return unsupported("a duration"),
+        DataType::Interval(_) => return unsupported("an interval"),
         DataType::Binary | DataType::FixedSizeBinary(_) | DataType::LargeBinary => "bytes",
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string",
         DataType::List(t) | DataType::FixedSizeList(t, _) | DataType::LargeList(t) => {
-            return json!({
+            // The item keeps the `item` prefix its record has always been
+            // named with; on a collision it takes the list's own path.
+            return Ok(json!({
                 "type": "array",
-                "items": field_to_avro("item", t),
-            });
+                "items": field_to_avro("item", path.qualified, t, names)?,
+            }));
+        }
+        DataType::Map(entries, _) => {
+            // Avro maps are keyed by strings.
+            let DataType::Struct(kv) = entries.data_type() else {
+                return unsupported("a map without key/value entries");
+            };
+            let (Some(key), Some(value)) = (kv.first(), kv.get(1)) else {
+                return unsupported("a map without key/value entries");
+            };
+            if !matches!(
+                key.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ) {
+                return unsupported("a map with non-string keys (Avro map keys are strings)");
+            }
+            return Ok(json!({
+                "type": "map",
+                "values": field_to_avro(path.qualified, path.qualified, value, names)?,
+            }));
         }
         DataType::Struct(fields) => {
             // Build the nested record JSON directly — NOT via canonical_form,
             // which strips nested logicalType (decimal/date/timestamp) and breaks
             // nested decimal encoding (F7).
-            return record_schema_json(name, fields);
+            return record_schema_json(path, fields, names);
         }
-        DataType::Union(_, _) => unimplemented!("unions are not supported"),
-        DataType::Dictionary(_, _) => unimplemented!("dictionaries are not supported"),
+        DataType::Union(_, _) => return unsupported("a union"),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
         | DataType::Decimal128(precision, scale) => {
-            return json!({
+            return Ok(json!({
                 "type": "bytes",
                 "logicalType": "decimal",
                 "scale": scale,
                 "precision": precision,
-            });
+            }));
         }
         DataType::Decimal256(precision, scale) => {
-            return json!({
+            return Ok(json!({
                 "type": "bytes",
                 "logicalType": "decimal",
                 "scale": scale,
                 "precision": precision,
-            });
+            }));
         }
-        DataType::Map(_, _) => unimplemented!("maps are not supported"),
-        DataType::RunEndEncoded(_, _) => unimplemented!("run end encoded is not supported"),
-        DataType::BinaryView => unimplemented!("binary view is not supported"),
-        // Utf8View handled above alongside Utf8/LargeUtf8
-        DataType::ListView(_) => unimplemented!("list view is not supported"),
-        DataType::LargeListView(_) => unimplemented!("large list view is not suported"),
+        DataType::BinaryView => return unsupported("a binary view"),
+        // `field_to_avro` unwraps these to their plain layout first.
+        DataType::Dictionary(_, _)
+        | DataType::RunEndEncoded(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => return unsupported("an encoded layout"),
     };
 
-    json!({
+    Ok(json!({
         "type": typ
-    })
+    }))
 }
 
 fn get_field_schema<'a>(schema: &'a Schema, name: &str, nullable: bool) -> &'a Schema {
@@ -263,6 +375,16 @@ fn serialize_column<T: SerializeTarget>(
     nullable: bool,
     field: Option<&Field>,
 ) {
+    // A list view or a dictionary-/run-end-encoded column is written as its
+    // plain layout, which is what `field_to_avro` declared for it.
+    if let Some(f) = field
+        && let Some((plain, plain_column)) = to_plain_layout(f, column)
+            .unwrap_or_else(|e| panic!("cannot unwrap column '{}': {e}", f.name()))
+    {
+        let nullable = plain.is_nullable();
+        return serialize_column(schema, values, name, &plain_column, nullable, Some(&plain));
+    }
+
     // decimal_arb columns store canonical bytes in a LargeBinary
     // array but must surface as Avro's `decimal` logical type. We
     // detect via the field's extension metadata before falling through
@@ -352,10 +474,12 @@ fn serialize_column<T: SerializeTarget>(
         DataType::Boolean => write_arrow_value!(ArrayRef::as_boolean, Value::Boolean, |v| v),
 
         DataType::Int8 => write_primitive!(Int8Type, i32, Value::Int),
+        DataType::Int16 => write_primitive!(Int16Type, i32, Value::Int),
         DataType::Int32 => write_primitive!(Int32Type, i32, Value::Int),
         DataType::Int64 => write_primitive!(Int64Type, i64, Value::Long),
 
         DataType::UInt8 => write_primitive!(UInt8Type, i32, Value::Int),
+        DataType::UInt16 => write_primitive!(UInt16Type, i32, Value::Int),
         DataType::UInt32 => write_primitive!(UInt32Type, i64, Value::Long),
         DataType::UInt64 => {
             write_arrow_value!(ArrayRef::as_primitive::<UInt64Type>, Value::Long, |v| v
@@ -365,6 +489,22 @@ fn serialize_column<T: SerializeTarget>(
         DataType::Float16 => write_primitive!(Float16Type, f32, Value::Float),
         DataType::Float32 => write_primitive!(Float32Type, f32, Value::Float),
         DataType::Float64 => write_primitive!(Float64Type, f64, Value::Double),
+
+        DataType::Decimal32(_, _) => {
+            write_arrow_value!(
+                ArrayRef::as_primitive::<Decimal32Type>,
+                Value::Decimal,
+                |v: i32| { v.to_be_bytes().into() }
+            );
+        }
+
+        DataType::Decimal64(_, _) => {
+            write_arrow_value!(
+                ArrayRef::as_primitive::<Decimal64Type>,
+                Value::Decimal,
+                |v: i64| { v.to_be_bytes().into() }
+            );
+        }
 
         DataType::Decimal128(_, _) => {
             write_arrow_value!(
@@ -433,7 +573,7 @@ fn serialize_column<T: SerializeTarget>(
             )
         }
 
-        DataType::List(item) => {
+        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
             let schema = get_field_schema(schema, name, nullable);
             let Schema::Array(item_schema) = schema else {
                 panic!(
@@ -441,30 +581,25 @@ fn serialize_column<T: SerializeTarget>(
                 );
             };
 
-            let item_values: Vec<Option<Vec<Value>>> = if let Some(nulls) = column.nulls() {
-                nulls
-                    .iter()
-                    .map(|null| null.then(std::vec::Vec::new))
-                    .collect()
-            } else {
-                (0..column.len()).map(|_| Some(vec![])).collect()
+            // Each row's items; a null row has none to write.
+            let rows: Vec<Option<ArrayRef>> = match column.data_type() {
+                DataType::List(_) => column.as_list::<i32>().iter().collect(),
+                DataType::LargeList(_) => column.as_list::<i64>().iter().collect(),
+                _ => column.as_fixed_size_list().iter().collect(),
             };
-
-            for ((i, mut v), column) in item_values
-                .into_iter()
-                .enumerate()
-                .zip(column.as_list::<i32>().iter())
-            {
-                if let Some(v) = &mut v {
+            for (i, row) in rows.into_iter().enumerate() {
+                let v = row.map(|items| {
+                    let mut v = Vec::with_capacity(items.len());
                     serialize_column(
                         &item_schema.items,
-                        v,
+                        &mut v,
                         "",
-                        &column.expect("unmasked null in list"),
+                        &items,
                         item.is_nullable(),
                         Some(item.as_ref()),
-                    )
-                }
+                    );
+                    v
+                });
 
                 if nullable {
                     values.add(
@@ -480,6 +615,60 @@ fn serialize_column<T: SerializeTarget>(
                         i,
                         name,
                         Value::Array(v.expect("null found in non-nullable list column")),
+                    );
+                }
+            }
+        }
+
+        DataType::Map(entries_field, _) => {
+            let schema = get_field_schema(schema, name, nullable);
+            let Schema::Map(map_schema) = schema else {
+                panic!(
+                    "invalid avro schema -- map field {name} should correspond to map schema but is {schema:?}"
+                );
+            };
+            let DataType::Struct(kv) = entries_field.data_type() else {
+                panic!("map field {name} has no key/value entries");
+            };
+            let value_field = &kv[1];
+
+            let map = column.as_map();
+            for i in 0..map.len() {
+                let v = map.is_valid(i).then(|| {
+                    let entries = map.value(i);
+                    // `arrow_to_avro` admits string keys only.
+                    let keys = datafusion::arrow::compute::cast(entries.column(0), &DataType::Utf8)
+                        .expect("string map keys cast to Utf8");
+                    let keys = keys.as_string::<i32>();
+                    let mut items = Vec::with_capacity(entries.len());
+                    serialize_column(
+                        &map_schema.types,
+                        &mut items,
+                        "",
+                        entries.column(1),
+                        value_field.is_nullable(),
+                        Some(value_field.as_ref()),
+                    );
+                    keys.iter()
+                        .map(|k| k.expect("map keys are never null").to_string())
+                        .zip(items)
+                        .collect::<HashMap<String, Value>>()
+                });
+
+                if nullable {
+                    values.add(
+                        i,
+                        name,
+                        Value::Union(
+                            v.is_some() as u32,
+                            Box::new(v.map(Value::Map).unwrap_or(Value::Null)),
+                        ),
+                    );
+                } else {
+                    values.add(
+                        i,
+                        name,
+                        Value::Map(v.expect("null found in non-nullable map column")),
                     );
                 }
             }
@@ -1366,7 +1555,8 @@ mod tests {
         // "bytes") would have lost numeric semantics on the consumer side.
         let field =
             crate::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false).unwrap();
-        let avro_field = field_to_avro("payload", &field);
+        let avro_field =
+            field_to_avro("payload", "payload", &field, &mut RecordNames::default()).unwrap();
         // The schema is: { "name": "amount", "type": { ... decimal logical ... } }
         let type_field = avro_field.get("type").unwrap();
         assert_eq!(type_field.get("type").unwrap(), "bytes");
@@ -1384,7 +1574,8 @@ mod tests {
         // key).
         let field =
             crate::types::decimal_arb::DecimalArbType::field("amount", 80, 30, true).unwrap();
-        let avro_field = field_to_avro("payload", &field);
+        let avro_field =
+            field_to_avro("payload", "payload", &field, &mut RecordNames::default()).unwrap();
         let nested_type = avro_field.get("type").unwrap();
         // {"type": ["null", { ... decimal ... }]}
         let outer = nested_type.get("type").unwrap();
@@ -1403,7 +1594,8 @@ mod tests {
         // {"type": "bytes"} (the avro schema for primitive types is itself
         // wrapped in an object by arrow_to_avro).
         let field = Field::new("blob", DataType::LargeBinary, false);
-        let avro_field = field_to_avro("payload", &field);
+        let avro_field =
+            field_to_avro("payload", "payload", &field, &mut RecordNames::default()).unwrap();
         let nested_type = avro_field.get("type").unwrap();
         // No logicalType key — stays as plain bytes.
         assert!(nested_type.get("logicalType").is_none());
@@ -1681,5 +1873,371 @@ mod tests {
         .map(|v| v.map(str::to_string))
         .collect();
         assert_eq!(seen, expected);
+    }
+
+    /// Every decimal (or null) below `v`, in document order; map entries in
+    /// key order.
+    fn collect_decimals(v: &Value, out: &mut Vec<Option<String>>) {
+        match v {
+            Value::Decimal(d) => {
+                let bytes = <Vec<u8>>::try_from(d).expect("decimal -> bytes");
+                out.push(Some(BigInt::from_signed_bytes_be(&bytes).to_string()));
+            }
+            Value::Null => out.push(None),
+            Value::Union(_, inner) => collect_decimals(inner, out),
+            Value::Array(items) => items.iter().for_each(|i| collect_decimals(i, out)),
+            Value::Record(fields) => fields.iter().for_each(|(_, f)| collect_decimals(f, out)),
+            Value::Map(entries) => {
+                let mut keys: Vec<_> = entries.keys().collect();
+                keys.sort();
+                keys.into_iter()
+                    .for_each(|k| collect_decimals(&entries[k], out));
+            }
+            _ => {}
+        }
+    }
+
+    /// Encode every row of `batch` with the generated schema, decode it back,
+    /// and collect the decimals it holds.
+    fn round_trip_decimals(batch: &RecordBatch) -> (apache_avro::Schema, Vec<Option<String>>) {
+        let avro_schema = try_to_avro("R", &batch.schema().fields).unwrap();
+        let mut seen = Vec::new();
+        for value in serialize(&avro_schema, batch) {
+            let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
+            let decoded =
+                apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
+            collect_decimals(&decoded, &mut seen);
+        }
+        (avro_schema, seen)
+    }
+
+    fn hinted_leaf(name: &str, kind: crate::types::decimal_arb::NativeIntKind) -> Arc<Field> {
+        use crate::types::decimal_arb::DecimalArbType;
+        Arc::new(
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field(name, 78, 0, true).unwrap(),
+                kind,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn arb_leaves(values: &[Option<&str>]) -> ArrayRef {
+        use crate::types::decimal_arb::DecimalArbArrayBuilder;
+        let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "v", 78, 0).unwrap();
+        for v in values {
+            match v {
+                Some(s) => b.append_str(s).unwrap(),
+                None => b.append_null(),
+            }
+        }
+        let (raw, _, _) = b.finish().into_inner();
+        Arc::new(raw)
+    }
+
+    /// `List<nullable Struct<value: leaf>>` with the given leaves, one list
+    /// per row (`offsets`), and a null struct where `struct_valid` says so.
+    fn list_of_structs(
+        leaf: Arc<Field>,
+        leaves: ArrayRef,
+        struct_valid: Vec<bool>,
+        offsets: Vec<i32>,
+    ) -> (Arc<Field>, ArrayRef) {
+        use datafusion::arrow::array::{ListArray, StructArray};
+        use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::clone(&leaf)].into()),
+            true,
+        ));
+        let structs = StructArray::try_new(
+            vec![leaf].into(),
+            vec![leaves],
+            Some(NullBuffer::from(struct_valid)),
+        )
+        .unwrap();
+        let list = ListArray::try_new(
+            Arc::clone(&item),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(structs),
+            None,
+        )
+        .unwrap();
+        (item, Arc::new(list))
+    }
+
+    /// Two `List<Struct<..>>` columns, plus a `List<Struct<..>>` nested in a
+    /// list item: every list-item record used to be named `item_item`, so
+    /// the schema defined that name more than once and no record encoded.
+    /// Each now gets its own name, and every 256-bit leaf decodes to its
+    /// exact value.
+    #[test]
+    fn several_lists_of_structs_get_distinct_record_names_and_round_trip() {
+        use crate::types::decimal_arb::NativeIntKind;
+        use crate::types::decimal_arb_nested::fixtures::{I256_MAX, I256_MIN, U256_MAX};
+        use datafusion::arrow::array::{ListArray, StructArray};
+        use datafusion::arrow::buffer::OffsetBuffer;
+
+        let (trace_item, traces) = list_of_structs(
+            hinted_leaf("value", NativeIntKind::U256),
+            arb_leaves(&[
+                Some("1"),
+                Some("1000000000000000000"),
+                Some("7"),
+                Some(U256_MAX),
+            ]),
+            vec![true, true, false, true],
+            vec![0, 2, 4],
+        );
+        let (tx_item, transactions) = list_of_structs(
+            hinted_leaf("value", NativeIntKind::I256),
+            arb_leaves(&[Some(I256_MIN), Some(I256_MAX)]),
+            vec![true, true],
+            vec![0, 1, 2],
+        );
+        // blocks: List<Struct<inner: List<Struct<value>>>>, one block per row.
+        let (inner_item, inner) = list_of_structs(
+            hinted_leaf("value", NativeIntKind::U256),
+            arb_leaves(&[Some("42"), None]),
+            vec![true, true],
+            vec![0, 1, 2],
+        );
+        let inner_field = Arc::new(Field::new("inner", DataType::List(inner_item), true));
+        let block = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::clone(&inner_field)].into()),
+            true,
+        ));
+        let blocks = ListArray::try_new(
+            Arc::clone(&block),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            Arc::new(StructArray::try_new(vec![inner_field].into(), vec![inner], None).unwrap()),
+            None,
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("traces", DataType::List(trace_item), false),
+            Field::new("transactions", DataType::List(tx_item), true),
+            Field::new("blocks", DataType::List(block), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![traces, transactions, Arc::new(blocks)],
+        )
+        .unwrap();
+
+        let (avro_schema, seen) = round_trip_decimals(&batch);
+        let json = serde_json::to_string(&avro_schema).unwrap();
+        // The first list keeps the name it always had; the others are named
+        // after their own path.
+        for name in [
+            "\"item_item\"",
+            "\"R_transactions_item\"",
+            "\"R_blocks_item\"",
+            "\"R_blocks_item_inner_item\"",
+        ] {
+            assert!(json.contains(name), "{name} missing from {json}");
+        }
+        let expected: Vec<Option<String>> = [
+            // row 0
+            Some("1"),
+            Some("1000000000000000000"),
+            Some(I256_MIN),
+            Some("42"),
+            // row 1: the null struct, then 2^256 - 1
+            None,
+            Some(U256_MAX),
+            Some(I256_MAX),
+            None,
+        ]
+        .iter()
+        .map(|v| v.map(str::to_string))
+        .collect();
+        assert_eq!(seen, expected);
+    }
+
+    /// A schema with a single list of structs is unchanged, so a subject
+    /// registered from it before still matches what the sink writes.
+    #[test]
+    fn single_list_of_structs_keeps_its_record_name() {
+        let a = Arc::new(Field::new("a", DataType::Int64, true));
+        let item = Arc::new(Field::new("item", DataType::Struct(vec![a].into()), true));
+        let fields: Fields = vec![Field::new("items", DataType::List(item), false)].into();
+        let json = serde_json::to_value(to_avro("R", &fields)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "record",
+                "name": "R",
+                "fields": [{
+                    "name": "items",
+                    "type": {"type": "array", "items": ["null", {
+                        "type": "record",
+                        "name": "item_item",
+                        "fields": [{"name": "a", "type": ["null", "long"]}],
+                    }]},
+                }],
+            })
+        );
+    }
+
+    /// Large / fixed-size lists, string-keyed maps, and run-end- or
+    /// dictionary-encoded columns all have an Avro encoding; each used to
+    /// panic, either building the schema or writing the first batch.
+    #[test]
+    fn other_container_layouts_encode_nested_leaves() {
+        use crate::types::decimal_arb::NativeIntKind;
+        use crate::types::decimal_arb_nested::fixtures::U256_MAX;
+        use datafusion::arrow::array::{
+            DictionaryArray, FixedSizeListArray, Int32Array, LargeListArray, MapArray, RunArray,
+            StringArray, StructArray, make_array,
+        };
+        use datafusion::arrow::buffer::OffsetBuffer;
+        use datafusion::arrow::datatypes::Int32Type;
+
+        let leaf = || hinted_leaf("item", NativeIntKind::U256);
+        let large = LargeListArray::try_new(
+            leaf(),
+            OffsetBuffer::new(vec![0_i64, 1, 2].into()),
+            arb_leaves(&[Some("1"), Some(U256_MAX)]),
+            None,
+        )
+        .unwrap();
+        let fixed =
+            FixedSizeListArray::try_new(leaf(), 1, arb_leaves(&[Some("2"), None]), None).unwrap();
+
+        let key = Arc::new(Field::new("key", DataType::Utf8, false));
+        let value = hinted_leaf("value", NativeIntKind::U256);
+        let entry = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![Arc::clone(&key), Arc::clone(&value)].into()),
+            false,
+        ));
+        let map = MapArray::try_new(
+            Arc::clone(&entry),
+            OffsetBuffer::new(vec![0, 2, 2].into()),
+            StructArray::try_new(
+                vec![key, value].into(),
+                vec![
+                    Arc::new(StringArray::from(vec!["b", "a"])),
+                    arb_leaves(&[Some("1000000000000000000"), Some("3")]),
+                ],
+                None,
+            )
+            .unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let ree = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![2]),
+            arb_leaves(&[Some("5")]).as_ref(),
+        )
+        .unwrap();
+        let DataType::RunEndEncoded(run_ends, _) = ree.data_type().clone() else {
+            unreachable!()
+        };
+        let ree_type =
+            DataType::RunEndEncoded(run_ends, hinted_leaf("values", NativeIntKind::U256));
+        let ree = make_array(
+            ree.to_data()
+                .into_builder()
+                .data_type(ree_type.clone())
+                .build()
+                .unwrap(),
+        );
+        let dict: DictionaryArray<Int32Type> = vec!["x", "y"].into_iter().collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("large", large.data_type().clone(), false),
+            Field::new("fixed", fixed.data_type().clone(), false),
+            Field::new("map", DataType::Map(entry, false), true),
+            Field::new("ree", ree_type, true),
+            Field::new("dict", dict.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(large),
+                Arc::new(fixed),
+                Arc::new(map),
+                ree,
+                Arc::new(dict),
+            ],
+        )
+        .unwrap();
+
+        let (avro_schema, seen) = round_trip_decimals(&batch);
+        let expected: Vec<Option<String>> = [
+            // row 0: large, fixed, map {a: 3, b: 10^18}, ree
+            Some("1"),
+            Some("2"),
+            Some("3"),
+            Some("1000000000000000000"),
+            Some("5"),
+            // row 1: large, fixed (null leaf), empty map, ree
+            Some(U256_MAX),
+            None,
+            Some("5"),
+        ]
+        .iter()
+        .map(|v| v.map(str::to_string))
+        .collect();
+        assert_eq!(seen, expected);
+        // The dictionary column is written as its string values.
+        let rows = serialize(&avro_schema, &batch);
+        let Value::Record(fields) = &rows[1] else {
+            panic!("{:?}", rows[1])
+        };
+        assert_eq!(fields[4], ("dict".to_string(), Value::String("y".into())));
+    }
+
+    /// A column the writer has no Avro encoding for is reported, naming the
+    /// column, instead of panicking while the schema is built.
+    #[test]
+    fn columns_without_an_avro_encoding_are_reported() {
+        use datafusion::arrow::datatypes::{UnionFields, UnionMode};
+        let entry = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int32, false),
+                    Field::new("value", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        for (field, what) in [
+            (
+                Field::new("m", DataType::Map(entry, false), true),
+                "non-string keys",
+            ),
+            (
+                Field::new(
+                    "u",
+                    DataType::Union(
+                        UnionFields::try_new(vec![0], vec![Field::new("a", DataType::Int32, true)])
+                            .unwrap(),
+                        UnionMode::Dense,
+                    ),
+                    true,
+                ),
+                "a union",
+            ),
+            (
+                Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
+                "a time",
+            ),
+        ] {
+            let name = field.name().clone();
+            let err = try_to_avro("R", &vec![field].into())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("'{name}'")), "{err}");
+            assert!(err.contains(what), "{err}");
+        }
     }
 }
