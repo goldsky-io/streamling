@@ -8102,6 +8102,166 @@ mod nested_decimal_arb_tests {
         );
     }
 
+    fn ddl_for(sink_schema: &Schema) -> String {
+        let config = ClickHouseConfig {
+            url: "http://localhost:8123".to_string(),
+            database: "test_db".to_string(),
+            user: "default".to_string(),
+            password: "".to_string(),
+            compression: ClickHouseCompression::None,
+            compression_level: GzipCompressionLevel::default(),
+            columns: None,
+        };
+        ClickHouseClient::new(config)
+            .build_create_table_query(
+                "t",
+                &Arc::new(ClickHouseClient::normalize_sink_schema(sink_schema, None)),
+                vec![],
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    /// A leaf declared non-nullable inside a nullable struct receives the
+    /// struct's nulls; its rewritten field — and so its ClickHouse column —
+    /// must be nullable, or the table declares `UInt256` for a slot the data
+    /// holds as NULL.
+    #[test]
+    fn non_nullable_leaf_under_a_nullable_struct_is_declared_nullable() {
+        let value = Arc::new(
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field("value", 78, 0, false).unwrap(),
+                NativeIntKind::U256,
+            )
+            .unwrap(),
+        );
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::clone(&value)].into()),
+            true,
+        ));
+        let structs = StructArray::try_new(
+            vec![value].into(),
+            vec![arb(&[Some("1"), Some("2")], 78, 0)],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let traces = ListArray::try_new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(structs),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "traces",
+            DataType::List(item),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(traces)]).unwrap();
+
+        let sink_schema = nested_decimal_arb_schema_for_clickhouse(&schema, None).unwrap();
+        let query = ddl_for(&sink_schema);
+        assert!(
+            query.contains("`traces` Array(Tuple(value Nullable(UInt256)))"),
+            "{query}"
+        );
+
+        let converted = nested_decimal_arb_batch_for_clickhouse(&batch, None).unwrap();
+        assert_eq!(converted.schema().field(0), sink_schema.field(0));
+        let DataType::List(item) = sink_schema.field(0).data_type() else {
+            panic!("{:?}", sink_schema.field(0))
+        };
+        let DataType::Struct(children) = item.data_type() else {
+            panic!("{item:?}")
+        };
+        let leaf = converted
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .clone();
+        assert_eq!(leaf.null_count(), 1);
+        assert_eq!(children[0].is_nullable(), leaf.null_count() > 0);
+        assert_eq!(
+            native_values(&leaf, NativeIntKind::U256),
+            vec![Some("1".to_string()), None]
+        );
+    }
+
+    /// A dictionary-encoded decimal_arb column with the extension metadata
+    /// on the dictionary field (the Arrow convention for an encoded
+    /// extension type) went undetected and shipped its canonical bytes as a
+    /// `String` column; it converts like the plain column, at the top level
+    /// and as a list's items.
+    #[test]
+    fn dictionary_encoded_decimal_arb_is_written_as_its_native_type() {
+        use arrow::compute::cast;
+        use streamling_core::types::decimal_arb_capability::{
+            ConnectorKind, validate_pipeline_decimal_arb,
+        };
+
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary));
+        let encoded = |name: &str| {
+            Field::new(name, dict_type.clone(), true)
+                .with_metadata(hinted(name, NativeIntKind::U256).metadata().clone())
+        };
+        let dict = cast(
+            arb(&[Some("1"), Some(U256_MAX), Some("1")], 78, 0).as_ref(),
+            &dict_type,
+        )
+        .unwrap();
+        let item = Arc::new(encoded("item"));
+        let list = ListArray::try_new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2, 3].into()),
+            Arc::clone(&dict),
+            None,
+        )
+        .unwrap();
+        let dict = dict.slice(0, 2);
+        let schema = Arc::new(Schema::new(vec![
+            encoded("x"),
+            Field::new("l", DataType::List(item), true),
+        ]));
+        assert!(schema.fields().iter().all(|f| has_nested_decimal_arb(f)));
+        validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![dict, Arc::new(list)]).unwrap();
+
+        let sink_schema = nested_decimal_arb_schema_for_clickhouse(&schema, None).unwrap();
+        let query = ddl_for(&sink_schema);
+        assert!(query.contains("`x` Nullable(UInt256)"), "{query}");
+        assert!(query.contains("`l` Array(Nullable(UInt256))"), "{query}");
+
+        let converted = nested_decimal_arb_batch_for_clickhouse(&batch, None).unwrap();
+        assert_eq!(converted.schema().as_ref(), &sink_schema);
+        assert_eq!(
+            native_values(converted.column(0), NativeIntKind::U256),
+            vec![Some("1".to_string()), Some(U256_MAX.to_string())]
+        );
+        let l = converted
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(
+            native_values(l.values(), NativeIntKind::U256),
+            vec![
+                Some("1".to_string()),
+                Some(U256_MAX.to_string()),
+                Some("1".to_string()),
+            ]
+        );
+    }
+
     /// A nested leaf ClickHouse cannot hold is rejected without pointing at
     /// `schema_override`, whose native-int pins match top-level columns only;
     /// a range error in a nested leaf counts flattened elements, not rows.

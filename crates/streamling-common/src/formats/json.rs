@@ -175,8 +175,13 @@ impl JsonToArrowConverter {
                     // arrow_json has no Dictionary decoder: decode the value type and cast
                     // back in `convert_batch_to_original_schema`.
                     // ponytail: top-level dictionaries only; a nested one still errors.
+                    // A dictionary-encoded decimal_arb leaf keeps its metadata
+                    // on the field, so the value type it decodes as is a
+                    // decimal_arb leaf and is read as text like any other.
                     if let DataType::Dictionary(_, value) = f.data_type() {
-                        return Ok(f.as_ref().clone().with_data_type(value.as_ref().clone()));
+                        return Ok(decimal_arb_leaves_as_text_field(
+                            &f.as_ref().clone().with_data_type(value.as_ref().clone()),
+                        ));
                     }
                     // Legacy leaves become their decimal_arb equivalent first, so the text
                     // rewrite reaches them too.
@@ -775,6 +780,60 @@ mod tests {
         let (unknown, scanned) = unknown_output_keys(&schema, bytes, 2);
         assert_eq!(unknown, BTreeSet::from(["extra".to_string()]));
         assert_eq!(scanned, 2);
+    }
+
+    /// A dictionary-encoded decimal_arb column carrying the extension
+    /// metadata on its own field (the Arrow convention) is written as its
+    /// decimal text and read back from it — not as hex of the raw bytes.
+    #[test]
+    fn dictionary_encoded_decimal_arb_round_trips_as_decimal_text() {
+        use datafusion::arrow::compute::cast;
+        let mut b = DecimalArbArrayBuilder::with_capacity(3, "amount", 30, 2).unwrap();
+        b.append_str("12.34").unwrap();
+        b.append_null();
+        b.append_str("12.34").unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary));
+        let dict = cast(&raw, &dict_type).unwrap();
+        let field = Field::new("amount", dict_type, true).with_metadata(
+            DecimalArbType::field("amount", 30, 2, true)
+                .unwrap()
+                .metadata()
+                .clone(),
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![dict]).unwrap();
+
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap();
+        let rows: Vec<String> = rows
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert!(rows[0].contains(r#""amount":"12.34""#), "{rows:?}");
+        assert!(rows[2].contains(r#""amount":"12.34""#), "{rows:?}");
+
+        let mut converter = JsonToArrowConverter::new(Arc::clone(&schema), false, None);
+        converter.buffer(r#"[{"amount":"12.34"},{"amount":null},{"amount":"-0.5"}]"#.to_string());
+        let read = converter.convert_to_batch().unwrap();
+        assert_eq!(read.schema(), schema);
+        let plain = cast(read.column(0), &DataType::LargeBinary).unwrap();
+        let plain = plain.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        let values: Vec<Option<String>> = (0..plain.len())
+            .map(|i| {
+                (!plain.is_null(i)).then(|| {
+                    DecimalArbValue::from_canonical_bytes_at_scale(plain.value(i), 2)
+                        .unwrap()
+                        .to_canonical_string()
+                })
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some("12.34".to_string()), None, Some("-0.50".to_string())]
+        );
     }
 
     #[test]

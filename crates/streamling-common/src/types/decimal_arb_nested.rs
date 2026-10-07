@@ -37,8 +37,8 @@ pub type LeafFieldRewrite<'a> = dyn FnMut(&Field, &str) -> Result<Field> + 'a;
 /// into the field and values that replace it.
 pub type LeafRewrite<'a> = dyn FnMut(&Field, &ArrayRef, &str) -> Result<(Field, ArrayRef)> + 'a;
 
-/// Does `field` hold a `decimal_arb` leaf *below* it (it is a container, not
-/// a decimal_arb column itself)?
+/// Does `field` hold a `decimal_arb` leaf *below* it (it is a container, or a
+/// dictionary- / run-end-encoded leaf, not a plain decimal_arb column itself)?
 pub fn contains_nested_decimal_arb(field: &Field) -> bool {
     !DecimalArbType::is_decimal_arb_field(field) && field_contains_decimal_arb(field)
 }
@@ -72,7 +72,13 @@ pub fn rewrite_decimal_arb_leaf_fields(
         DataType::Struct(children) => DataType::Struct(
             children
                 .iter()
-                .map(&mut child)
+                .map(|c| {
+                    if field_contains_decimal_arb(c) {
+                        child(&Arc::new(under_struct_nulls(c, field)))
+                    } else {
+                        Ok(Arc::clone(c))
+                    }
+                })
                 .collect::<Result<Fields>>()?,
         ),
         DataType::List(c) => DataType::List(child(c)?),
@@ -88,7 +94,8 @@ pub fn rewrite_decimal_arb_leaf_fields(
 /// what `leaf` returns for it; containers keep their offsets and validity. A
 /// struct's nulls are pushed down to its children first, so `leaf` sees a
 /// slot under a null struct as null rather than whatever placeholder bytes
-/// the producer left there. Fields without a decimal_arb leaf come back
+/// the producer left there; a child of a nullable struct that receives them
+/// is declared nullable. Fields without a decimal_arb leaf come back
 /// unchanged.
 pub fn rewrite_decimal_arb_leaves(
     field: &Field,
@@ -133,10 +140,13 @@ pub fn rewrite_decimal_arb_leaves(
                     // struct's nulls are pushed into it.
                     match to_plain_layout(c, column)? {
                         Some((plain, plain_column)) => child(
-                            &Arc::new(plain),
+                            &Arc::new(under_struct_nulls(&plain, field)),
                             &with_parent_nulls(&plain_column, sa.nulls())?,
                         )?,
-                        None => child(c, &with_parent_nulls(column, sa.nulls())?)?,
+                        None => child(
+                            &Arc::new(under_struct_nulls(c, field)),
+                            &with_parent_nulls(column, sa.nulls())?,
+                        )?,
                     }
                 } else {
                     (Arc::clone(c), Arc::clone(column))
@@ -210,6 +220,22 @@ pub fn rewrite_decimal_arb_leaves(
         other => return Err(unsupported_layout(path, other)),
     };
     Ok((field_with_type(field, data_type), rebuilt))
+}
+
+/// The field a leaf-holding child of `parent` (a struct) is rewritten as.
+///
+/// The array walk pushes the struct's nulls into such a child, so a child
+/// declared non-nullable under a nullable struct (legal Arrow: its slots
+/// under a null row are simply masked) comes out holding nulls. It is
+/// widened to nullable here, in both walks alike, so the rewritten field
+/// admits the nulls its values now carry — and a sink deriving its column
+/// types from the field (ClickHouse `Nullable(..)`) declares them.
+fn under_struct_nulls(child: &Field, parent: &Field) -> Field {
+    if parent.is_nullable() && !child.is_nullable() {
+        child.clone().with_nullable(true)
+    } else {
+        child.clone()
+    }
 }
 
 /// `array` with `parent`'s nulls OR-ed into its own validity.
@@ -730,6 +756,164 @@ mod tests {
         assert_eq!(seen, 1);
         let ma = a.as_any().downcast_ref::<MapArray>().unwrap();
         assert_eq!(strings(ma.values()), vec![Some("3".into())]);
+    }
+
+    /// The leaf of each struct in `item: Struct<value>` (one list row
+    /// holding them all), with the rewritten leaf's field.
+    fn struct_leaf(field: &Field, array: &ArrayRef) -> (FieldRef, ArrayRef) {
+        let (f, a) = rewrite(field, array);
+        let DataType::List(item) = f.data_type() else {
+            panic!("{f:?}")
+        };
+        let DataType::Struct(children) = item.data_type() else {
+            panic!("{item:?}")
+        };
+        let la = a.as_any().downcast_ref::<ListArray>().unwrap();
+        let leaf = la
+            .values()
+            .as_any()
+            .downcast_ref::<SA>()
+            .unwrap()
+            .column(0)
+            .clone();
+        (Arc::clone(&children[0]), leaf)
+    }
+
+    #[test]
+    fn non_nullable_leaf_under_a_nullable_struct_is_rewritten_as_nullable() {
+        // `value` is declared non-nullable inside a nullable struct — legal
+        // Arrow: its slot under a null struct is masked, not null. Pushing
+        // the struct's nulls down makes that slot null, so the rewritten
+        // leaf must be declared nullable for the field to admit its values.
+        let value = Arc::new(DecimalArbType::field("value", 78, 0, false).unwrap());
+        let list_of = |nullable_struct: bool, nulls: Option<NullBuffer>| {
+            let item = Arc::new(Field::new(
+                "item",
+                DataType::Struct(vec![Arc::clone(&value)].into()),
+                nullable_struct,
+            ));
+            let structs = SA::try_new(
+                vec![Arc::clone(&value)].into(),
+                vec![leaf_array(&[Some("1"), Some("7"), Some("3")])],
+                nulls,
+            )
+            .unwrap();
+            let list = ListArray::try_new(
+                Arc::clone(&item),
+                OffsetBuffer::new(vec![0, 3].into()),
+                Arc::new(structs),
+                None,
+            )
+            .unwrap();
+            (
+                Field::new("traces", DataType::List(item), false),
+                Arc::new(list) as ArrayRef,
+            )
+        };
+
+        let (field, array) = list_of(true, Some(NullBuffer::from(vec![true, false, true])));
+        let (leaf_field, leaf) = struct_leaf(&field, &array);
+        assert_eq!(
+            strings(&leaf),
+            vec![Some("1".into()), None, Some("3".into())]
+        );
+        assert!(leaf_field.is_nullable(), "{leaf_field:?}");
+        assert_eq!(leaf_field.is_nullable(), leaf.null_count() > 0);
+
+        // The declaration does not depend on the batch: a nullable struct
+        // with no null row in it widens the leaf all the same, so every
+        // batch (and the schema-only walk `rewrite` checks against) agrees.
+        let (field, array) = list_of(true, None);
+        let (leaf_field, leaf) = struct_leaf(&field, &array);
+        assert_eq!(leaf.null_count(), 0);
+        assert!(leaf_field.is_nullable(), "{leaf_field:?}");
+
+        // A non-nullable struct has no nulls to push down: the leaf keeps
+        // its declaration.
+        let (field, array) = list_of(false, None);
+        let (leaf_field, leaf) = struct_leaf(&field, &array);
+        assert_eq!(leaf.null_count(), 0);
+        assert!(!leaf_field.is_nullable(), "{leaf_field:?}");
+    }
+
+    /// `Dictionary<Int32, LargeBinary>` holding `[7, 7, null, 2^256 - 1]`,
+    /// with the decimal_arb metadata on the dictionary field itself — the
+    /// Arrow convention for a dictionary-encoded extension type.
+    fn dictionary_encoded_leaf(name: &str) -> (Field, ArrayRef) {
+        let plain = leaf_array(&[
+            Some("7"),
+            Some("7"),
+            None,
+            Some("115792089237316195423570985008687907853269984665640564039457584007913129639935"),
+        ]);
+        let dict = cast(
+            plain.as_ref(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary)),
+        )
+        .unwrap();
+        let field = Field::new(name, dict.data_type().clone(), true)
+            .with_metadata(leaf_field(name).metadata().clone());
+        (field, dict)
+    }
+
+    #[test]
+    fn dictionary_encoded_leaf_with_metadata_on_its_field_is_rewritten() {
+        let expected = vec![
+            Some("7".to_string()),
+            Some("7".to_string()),
+            None,
+            Some(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                    .to_string(),
+            ),
+        ];
+
+        // As a column of its own.
+        let (field, array) = dictionary_encoded_leaf("amt");
+        assert!(contains_nested_decimal_arb(&field));
+        let (f, a) = rewrite(&field, &array);
+        assert_eq!(f.data_type(), &DataType::Utf8);
+        assert_eq!(f.metadata().get("path").map(String::as_str), Some("amt"));
+        assert_eq!(strings(&a), expected);
+
+        // As a list's items.
+        let (item, values) = dictionary_encoded_leaf("item");
+        let item = Arc::new(item);
+        let list = ListArray::try_new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 4].into()),
+            values,
+            None,
+        )
+        .unwrap();
+        let field = Field::new("l", DataType::List(item), true);
+        assert!(contains_nested_decimal_arb(&field));
+        let (f, a) = rewrite(&field, &(Arc::new(list) as ArrayRef));
+        let DataType::List(item) = f.data_type() else {
+            panic!("{f:?}")
+        };
+        assert_eq!(
+            item.metadata().get("path").map(String::as_str),
+            Some("l.item")
+        );
+        let la = a.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(strings(la.values()), expected);
+
+        // As a struct child: unwrapped before the struct's nulls go in.
+        let (child, values) = dictionary_encoded_leaf("v");
+        let s = SA::try_new(
+            vec![Arc::new(child)].into(),
+            vec![values],
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        )
+        .unwrap();
+        let s_field = Field::new("s", s.data_type().clone(), true);
+        let (_, a) = rewrite(&s_field, &(Arc::new(s) as ArrayRef));
+        let leaf = a.as_any().downcast_ref::<SA>().unwrap().column(0).clone();
+        assert_eq!(
+            strings(&leaf),
+            vec![expected[0].clone(), None, None, expected[3].clone()]
+        );
     }
 
     #[test]

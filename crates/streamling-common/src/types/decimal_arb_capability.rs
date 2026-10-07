@@ -369,6 +369,12 @@ fn decimal_arb_view(
     if let Some((p, s)) = DecimalArbType::precision_scale_from_field(field) {
         return Some((p, s, DecimalArbType::native_int_kind_from_field(field)));
     }
+    // A dictionary- / run-end-encoded leaf carrying the metadata on its own
+    // field is checked as the plain leaf every sink unwraps it to.
+    if crate::formats::decimal_arb_text::is_encoded_decimal_arb_field(field) {
+        return crate::formats::decimal_arb_text::plain_layout_field(field)
+            .and_then(|plain| decimal_arb_view(&plain));
+    }
     crate::types::decimal_arb_legacy::legacy_wide_int_kind(field).map(|kind| {
         (
             crate::types::decimal_arb_legacy::LEGACY_WIDE_INT_PRECISION,
@@ -444,9 +450,10 @@ fn collect_nested_in_type(
         | DataType::Map(c, _) => visit(c, path, under_union, out),
         DataType::RunEndEncoded(_, values) => visit(values, path, under_union, out),
         DataType::Union(fields, _) => fields.iter().for_each(|(_, f)| visit(f, path, true, out)),
-        // A dictionary's value type is a bare `DataType`, so it cannot be a
-        // decimal_arb leaf itself (the extension metadata lives on a field);
-        // it can still be a container holding one.
+        // A dictionary's value type is a bare `DataType`: a dictionary-encoded
+        // leaf carries the extension metadata on the dictionary field itself
+        // (picked up by `decimal_arb_view`), and the value type can still be
+        // a container holding one.
         DataType::Dictionary(_, values) => collect_nested_in_type(values, path, under_union, out),
         _ => {}
     }
@@ -1075,6 +1082,38 @@ mod tests {
                 .unwrap_err();
         let msg = format!("{}", errs);
         assert!(msg.contains("u.amt") && msg.contains("union"), "{msg}");
+    }
+
+    #[test]
+    fn validator_sees_a_dictionary_encoded_leaf_with_metadata_on_its_field() {
+        use std::sync::Arc;
+        // The Arrow convention for a dictionary-encoded extension type puts
+        // the extension metadata on the dictionary field itself; the leaf is
+        // checked as the plain decimal_arb the sinks unwrap it to.
+        let encoded = |name: &str| {
+            Field::new(
+                name,
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary)),
+                true,
+            )
+            .with_metadata(
+                DecimalArbType::field(name, 100, 0, true)
+                    .unwrap()
+                    .metadata()
+                    .clone(),
+            )
+        };
+        let schema = Schema::new(vec![
+            encoded("top"),
+            Field::new("l", DataType::List(Arc::new(encoded("item"))), true),
+        ]);
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        let msg = format!("{}", errs);
+        assert_eq!(errs.len(), 2, "{msg}");
+        for path in ["top", "l.item"] {
+            assert!(msg.contains(path), "{path} missing from: {msg}");
+        }
     }
 
     /// `traces: List<Struct<id Int64, value: leaf>>`, the shape plugins emit

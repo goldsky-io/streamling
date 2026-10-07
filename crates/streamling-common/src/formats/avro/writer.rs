@@ -251,6 +251,17 @@ fn arrow_to_avro(
             ) {
                 return unsupported("a map with non-string keys (Avro map keys are strings)");
             }
+            // Arrow requires map keys to be non-null, and every producer here
+            // (DataFusion's map functions, the JSON / Avro / Parquet readers)
+            // declares the key field non-nullable. Arrow's `MapArray` does not
+            // itself check key nulls, so a nullable key field is the one way a
+            // null key could reach the row encoder, which has no Avro value
+            // for it; refuse it up front.
+            if key.is_nullable() {
+                return unsupported(
+                    "a map whose key field is nullable (Avro map keys are never null)",
+                );
+            }
             return Ok(json!({
                 "type": "map",
                 "values": field_to_avro(path.qualified, path.qualified, value, names)?,
@@ -650,7 +661,13 @@ fn serialize_column<T: SerializeTarget>(
                         Some(value_field.as_ref()),
                     );
                     keys.iter()
-                        .map(|k| k.expect("map keys are never null").to_string())
+                        .map(|k| {
+                            // `field_to_avro` admits a non-nullable key field
+                            // only, and `StructArray` validation rejects nulls
+                            // in one.
+                            k.expect("non-nullable map key field holds a null")
+                                .to_string()
+                        })
                         .zip(items)
                         .collect::<HashMap<String, Value>>()
                 });
@@ -2239,5 +2256,108 @@ mod tests {
             assert!(err.contains(&format!("'{name}'")), "{err}");
             assert!(err.contains(what), "{err}");
         }
+    }
+
+    /// Arrow's `MapArray` does not check its keys for nulls, so a map whose
+    /// key field is declared nullable can carry a null key. The row encoder
+    /// has no Avro value for one; the schema is refused before any row is
+    /// written instead of the sink panicking on the first such row.
+    #[test]
+    fn map_with_a_nullable_key_field_is_refused_before_any_row_is_written() {
+        use datafusion::arrow::array::{Int32Array, MapArray, StringArray, StructArray};
+        use datafusion::arrow::buffer::OffsetBuffer;
+
+        let entries_with = |key_nullable: bool| {
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, key_nullable),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            ))
+        };
+        let entries_array = |key_nullable: bool| {
+            let DataType::Struct(kv) = entries_with(key_nullable).data_type().clone() else {
+                unreachable!()
+            };
+            StructArray::try_new(
+                kv,
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"), None])),
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                ],
+                None,
+            )
+        };
+
+        // A nullable key field: Arrow builds the map, null key and all.
+        let entry = entries_with(true);
+        let map = MapArray::try_new(
+            Arc::clone(&entry),
+            OffsetBuffer::new(vec![0, 2].into()),
+            entries_array(true).unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(entry, false),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(map)]).unwrap();
+        let err = try_to_avro("R", &batch.schema().fields)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'m'"), "{err}");
+        assert!(err.contains("key field is nullable"), "{err}");
+
+        // A non-nullable key field — what every map producer declares —
+        // cannot hold the null key in the first place, and still encodes.
+        assert!(entries_array(false).is_err());
+        let entry = entries_with(false);
+        let DataType::Struct(kv) = entry.data_type().clone() else {
+            unreachable!()
+        };
+        let map = MapArray::try_new(
+            Arc::clone(&entry),
+            OffsetBuffer::new(vec![0, 1].into()),
+            StructArray::try_new(
+                kv,
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int32Array::from(vec![1])),
+                ],
+                None,
+            )
+            .unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(entry, false),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(map)]).unwrap();
+        let avro_schema = try_to_avro("R", &batch.schema().fields).unwrap();
+        let rows = serialize(&avro_schema, &batch);
+        let Value::Record(fields) = &rows[0] else {
+            panic!("{:?}", rows[0])
+        };
+        assert_eq!(
+            fields[0].1,
+            Value::Union(
+                1,
+                Box::new(Value::Map(
+                    [("a".to_string(), Value::Union(1, Box::new(Value::Int(1))))].into()
+                ))
+            )
+        );
     }
 }

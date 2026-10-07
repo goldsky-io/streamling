@@ -26,7 +26,26 @@ use std::sync::Arc;
 /// Map. Used to decide whether a batch needs the decimal_arb → Utf8 rewrite
 /// before text serialization.
 pub(crate) fn field_contains_decimal_arb(field: &Field) -> bool {
-    DecimalArbType::is_decimal_arb_field(field) || type_contains_decimal_arb(field.data_type())
+    DecimalArbType::is_decimal_arb_field(field)
+        || is_encoded_decimal_arb_field(field)
+        || type_contains_decimal_arb(field.data_type())
+}
+
+/// Is `field` a dictionary- or run-end-encoded `decimal_arb` leaf whose
+/// extension metadata sits on the encoded field itself?
+///
+/// That is the Arrow convention for a dictionary-encoded extension type: the
+/// field carries the extension name and the dictionary type, whose value type
+/// is the storage type. [`DecimalArbType::is_decimal_arb_field`] requires a
+/// `LargeBinary` type and so does not see such a leaf; unwrapped to its plain
+/// layout (see [`plain_layout_field`], which keeps the field's metadata) it
+/// is an ordinary decimal_arb leaf.
+pub(crate) fn is_encoded_decimal_arb_field(field: &Field) -> bool {
+    matches!(
+        field.data_type(),
+        DataType::Dictionary(..) | DataType::RunEndEncoded(..)
+    ) && DecimalArbType::is_decimal_arb_metadata(field.metadata())
+        && plain_layout(field.data_type()).as_ref() == Some(&DataType::LargeBinary)
 }
 
 /// Does a container type hold a `decimal_arb` field anywhere below it? (A
@@ -329,7 +348,7 @@ pub(crate) fn decimal_arb_leaves_to_text(
 /// `"12.34"` failed outright as invalid hex. Only top-level fields were
 /// rewritten before, so exactly the nested leaves fell into that path.
 pub(crate) fn decimal_arb_leaves_as_text_field(field: &Field) -> Field {
-    if DecimalArbType::is_decimal_arb_field(field) {
+    if DecimalArbType::is_decimal_arb_field(field) || is_encoded_decimal_arb_field(field) {
         return Field::new(field.name(), DataType::Utf8, field.is_nullable());
     }
     if !field_contains_decimal_arb(field) {
@@ -458,6 +477,15 @@ pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> 
         }
         let (raw, _, _) = builder.finish().into_inner();
         return Ok(Arc::new(raw) as ArrayRef);
+    }
+
+    // An encoded leaf is restored as its plain decimal_arb layout, then
+    // re-encoded the way the target declares it.
+    if is_encoded_decimal_arb_field(target)
+        && let Some(plain) = plain_layout_field(target)
+    {
+        let restored = decimal_arb_leaves_from_text(&plain, array)?;
+        return Ok(cast(restored.as_ref(), target.data_type())?);
     }
 
     if !field_contains_decimal_arb(target) {
