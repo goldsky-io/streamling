@@ -708,6 +708,42 @@ mod tests {
         assert_eq!(strings(&la.value(0)), vec![Some("500".into())]);
         assert_eq!(strings(&la.value(1)), vec![Some("501".into())]);
 
+        // A FixedSizeList's child is windowed by arrow when it is sliced
+        // (`FixedSizeListArray::slice` and `From<ArrayData>` both take
+        // `values.slice(offset * size, len * size)`), so the walk converts
+        // only the slice's own elements here too.
+        let fixed = cast(
+            array.as_ref(),
+            &DataType::FixedSizeList(leaf_field("item"), 1),
+        )
+        .unwrap();
+        let fixed_field = Field::new("l", fixed.data_type().clone(), true);
+        seen = 0;
+        let mut counting = |f: &Field, a: &ArrayRef, path: &str| {
+            seen += a.len();
+            to_text(f, a, path)
+        };
+        let (_, a) =
+            rewrite_decimal_arb_leaves(&fixed_field, &fixed.slice(700, 3), "l", &mut counting)
+                .unwrap();
+        assert_eq!(seen, 3, "only the slice's own elements are converted");
+        let fa = a.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fa.len(), 3);
+        assert_eq!(strings(&fa.value(2)), vec![Some("702".into())]);
+        // The same slice taken through `ArrayData`, as a sink receives it.
+        let (_, a) = rewrite_decimal_arb_leaves(
+            &fixed_field,
+            &make_array(fixed.to_data().slice(700, 3)),
+            "l",
+            &mut to_text,
+        )
+        .unwrap();
+        let fa = a.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(
+            strings(fa.values()),
+            vec![Some("700".into()), Some("701".into()), Some("702".into())]
+        );
+
         // Same for a LargeList and a Map.
         let large = cast(array.as_ref(), &DataType::LargeList(leaf_field("item"))).unwrap();
         let large_field = Field::new("l", large.data_type().clone(), true);

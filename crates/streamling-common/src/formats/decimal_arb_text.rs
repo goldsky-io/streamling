@@ -639,6 +639,24 @@ mod tests {
         );
         assert_eq!(f.data_type(), a.data_type());
 
+        // A sliced FixedSizeList's child is already windowed by arrow.
+        let fixed = cast(
+            list.as_ref(),
+            &DataType::FixedSizeList(
+                Arc::new(DecimalArbType::field("item", 78, 0, true).unwrap()),
+                1,
+            ),
+        )
+        .unwrap();
+        let field = Field::new("f", fixed.data_type().clone(), true);
+        let (_, a) = decimal_arb_leaves_to_text(&field, &fixed.slice(40, 2)).unwrap();
+        let fa = a.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fa.len(), 2);
+        assert_eq!(
+            texts(fa.values()),
+            vec![Some("40".into()), Some("41".into())]
+        );
+
         let key = Arc::new(Field::new("key", DataType::Utf8, false));
         let value = Arc::new(DecimalArbType::field("value", 78, 0, true).unwrap());
         let entry = Arc::new(Field::new(
