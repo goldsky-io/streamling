@@ -62,19 +62,25 @@ struct RecordNames(HashSet<String>);
 impl RecordNames {
     /// `preferred` if no record has it yet, else `qualified`, else
     /// `qualified` with the first free numeric suffix. Both are first made
-    /// valid Avro names (see [`record_name`]).
-    fn claim(&mut self, preferred: &str, qualified: &str) -> String {
+    /// valid Avro names (see [`record_name`]). Unqualified names inherit the
+    /// enclosing record's namespace, which is part of their identity but
+    /// need not be added to the emitted name.
+    fn claim(&mut self, preferred: &str, qualified: &str, namespace: Option<&str>) -> String {
+        let fullname = |name: &str| match namespace {
+            Some(namespace) if !name.contains('.') => format!("{namespace}.{name}"),
+            _ => name.to_string(),
+        };
         let preferred = record_name(preferred);
         let qualified = record_name(qualified);
-        if self.0.insert(preferred.clone()) {
+        if self.0.insert(fullname(&preferred)) {
             return preferred;
         }
-        if self.0.insert(qualified.clone()) {
+        if self.0.insert(fullname(&qualified)) {
             return qualified;
         }
         (2..)
             .map(|n| format!("{qualified}_{n}"))
-            .find(|candidate| self.0.insert(candidate.clone()))
+            .find(|candidate| self.0.insert(fullname(candidate)))
             .expect("an unbounded range always yields a free name")
     }
 }
@@ -84,6 +90,8 @@ impl RecordNames {
 struct RecordPath<'a> {
     preferred: &'a str,
     qualified: &'a str,
+    /// Inherited by an unqualified name; an explicit fullname overrides it.
+    namespace: Option<&'a str>,
 }
 
 /// Build the Avro record-schema JSON for a struct's `fields`, preserving nested
@@ -103,7 +111,11 @@ fn record_schema_json(
     fields: &Fields,
     names: &mut RecordNames,
 ) -> Result<serde_json::value::Value, String> {
-    let name = names.claim(path.preferred, path.qualified);
+    let name = names.claim(path.preferred, path.qualified, path.namespace);
+    let namespace = name
+        .rsplit_once('.')
+        .map(|(namespace, _)| namespace)
+        .or(path.namespace);
     let avro_fields = fields
         .iter()
         .map(|f| {
@@ -112,7 +124,7 @@ fn record_schema_json(
             } else {
                 format!("{column}.{}", f.name())
             };
-            field_to_avro(&name, &name, &child, f, names)
+            field_to_avro(&name, &name, namespace, &child, f, names)
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(json!({
@@ -129,6 +141,7 @@ pub fn try_to_avro(name: &str, fields: &Fields) -> crate::error::Result<Schema> 
         RecordPath {
             preferred: name,
             qualified: name,
+            namespace: None,
         },
         "",
         fields,
@@ -156,6 +169,7 @@ pub fn to_avro(name: &str, fields: &Fields) -> Schema {
 fn field_to_avro(
     prefix: &str,
     qualified_prefix: &str,
+    namespace: Option<&str>,
     column: &str,
     field: &Field,
     names: &mut RecordNames,
@@ -163,7 +177,7 @@ fn field_to_avro(
     // A list view or a dictionary-/run-end-encoded column is written as its
     // plain layout (see `serialize_column`), so it is declared as one.
     if let Some(plain) = plain_layout_field(field) {
-        return field_to_avro(prefix, qualified_prefix, column, &plain, names);
+        return field_to_avro(prefix, qualified_prefix, namespace, column, &plain, names);
     }
     let next_name = format!("{}_{}", prefix, &field.name());
     let qualified_next_name = format!("{}_{}", qualified_prefix, &field.name());
@@ -186,6 +200,7 @@ fn field_to_avro(
             RecordPath {
                 preferred: &next_name,
                 qualified: &qualified_next_name,
+                namespace,
             },
             column,
             field,
@@ -259,7 +274,7 @@ fn arrow_to_avro(
             // named with; on a collision it takes the list's own path.
             return Ok(json!({
                 "type": "array",
-                "items": field_to_avro("item", path.qualified, &format!("{column}[]"), t, names)?,
+                "items": field_to_avro("item", path.qualified, path.namespace, &format!("{column}[]"), t, names)?,
             }));
         }
         DataType::Map(entries, _) => {
@@ -292,6 +307,7 @@ fn arrow_to_avro(
                 "values": field_to_avro(
                     path.qualified,
                     path.qualified,
+                    path.namespace,
                     &format!("{column}{{}}"),
                     value,
                     names
@@ -1650,6 +1666,7 @@ mod tests {
         let avro_field = field_to_avro(
             "payload",
             "payload",
+            None,
             "amount",
             &field,
             &mut RecordNames::default(),
@@ -1675,6 +1692,7 @@ mod tests {
         let avro_field = field_to_avro(
             "payload",
             "payload",
+            None,
             "amount",
             &field,
             &mut RecordNames::default(),
@@ -1701,6 +1719,7 @@ mod tests {
         let avro_field = field_to_avro(
             "payload",
             "payload",
+            None,
             "blob",
             &field,
             &mut RecordNames::default(),
@@ -2190,6 +2209,110 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn record_names_preserve_distinct_inherited_namespaces() {
+        use apache_avro::schema_compatibility::SchemaCompatibility;
+
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Field::new("a", DataType::Int64, false)].into()),
+            false,
+        ));
+        let fields: Fields = ["a.x", "b.x"]
+            .into_iter()
+            .map(|name| {
+                Field::new(
+                    name,
+                    DataType::Struct(
+                        vec![Field::new("l", DataType::List(Arc::clone(&item)), false)].into(),
+                    ),
+                    false,
+                )
+            })
+            .collect();
+        // These two `item_item` definitions have different fullnames. This
+        // is the schema existing sinks registered before de-duplication.
+        let old = apache_avro::Schema::parse_str(
+            &json!({
+                "type": "record", "name": "R", "fields": [
+                    {"name": "a__x", "type": {
+                        "type": "record", "name": "R_a.x", "fields": [
+                            {"name": "l", "type": {"type": "array", "items": {
+                                "type": "record", "name": "item_item", "fields": [
+                                    {"name": "a", "type": "long"}
+                                ]
+                            }}}
+                        ]
+                    }},
+                    {"name": "b__x", "type": {
+                        "type": "record", "name": "R_b.x", "fields": [
+                            {"name": "l", "type": {"type": "array", "items": {
+                                "type": "record", "name": "item_item", "fields": [
+                                    {"name": "a", "type": "long"}
+                                ]
+                            }}}
+                        ]
+                    }}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let new = try_to_avro("R", &fields).unwrap();
+        SchemaCompatibility::can_read(&old, &new).expect("existing schemas stay compatible");
+        assert_eq!(
+            serde_json::to_value(new).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
+    }
+
+    #[test]
+    fn record_names_disambiguate_inherited_and_explicit_fullnames() {
+        use datafusion::arrow::array::{Int32Array, ListArray, StructArray};
+        use datafusion::arrow::buffer::OffsetBuffer;
+
+        let v = Arc::new(Field::new("v", DataType::Int32, false));
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::clone(&v)].into()),
+            false,
+        ));
+        let xs = ListArray::try_new(
+            item,
+            OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(
+                StructArray::try_new(
+                    vec![v].into(),
+                    vec![Arc::new(Int32Array::from(vec![1]))],
+                    None,
+                )
+                .unwrap(),
+            ),
+            None,
+        )
+        .unwrap();
+        let other = StructArray::try_new(
+            vec![Field::new("w", DataType::Int32, false)].into(),
+            vec![Arc::new(Int32Array::from(vec![2]))],
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("xs", xs.data_type().clone(), false),
+            Field::new("item", other.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(xs), Arc::new(other)]).unwrap();
+        // The list's unqualified `item_item` inherits namespace `a`, so it
+        // clashes with the second struct's explicit name `a.item_item`.
+        let avro_schema = try_to_avro("a.item", &batch.schema().fields).unwrap();
+        let value = serialize(&avro_schema, &batch).pop().unwrap();
+        let encoded = apache_avro::to_avro_datum(&avro_schema, value.clone())
+            .expect("record fullnames must be unique");
+        let decoded =
+            apache_avro::from_avro_datum(&avro_schema, &mut encoded.as_slice(), None).unwrap();
+        assert_eq!(decoded, value);
     }
 
     /// Large / fixed-size lists, string-keyed maps, and run-end- or

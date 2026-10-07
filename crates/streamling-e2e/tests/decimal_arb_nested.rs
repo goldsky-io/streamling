@@ -272,6 +272,140 @@ const U256_MAX: &str =
 const I256_MIN: &str =
     "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
 
+/// Dotted SQL aliases create distinct Avro namespaces. A list item can keep
+/// the same short record name in each namespace; treating the names as a
+/// global collision changes a previously compatible registered schema.
+#[tokio::test]
+async fn namespaced_lists_keep_their_avro_record_names() {
+    init_tracing();
+    let ctx = TestContext::new().await.unwrap();
+    ctx.kafka
+        .produce_avro_value(
+            ARRAY_STRUCT_SCHEMA,
+            Value::Record(vec![
+                ("id".into(), Value::Long(1)),
+                (
+                    "items".into(),
+                    Value::Array(vec![Value::Record(vec![("amt".into(), decimal_val(BIG))])]),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+    let output = ctx.create_kafka_topic("namespaces").await.unwrap();
+    let pipeline = format!(
+        r#"
+sources:
+  src:
+    type: kafka
+    topic: {input}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  namespaced:
+    type: sql
+    sql: >-
+      SELECT id, named_struct('l', items) AS "a.x",
+      named_struct('l', items) AS "b.x" FROM src
+    primary_key: id
+sinks:
+  out:
+    type: kafka
+    from: namespaced
+    topic: {output}
+    topic_partitions: 1
+    data_format: avro
+"#,
+        input = ctx.kafka_topic,
+        output = output.topic,
+    );
+    let run = ctx
+        .run_pipeline_raw(&pipeline, base_opts().record_limit(1))
+        .await
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "namespaced records must encode: {}\n{}",
+        run.stdout,
+        run.stderr,
+    );
+
+    let registered: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "{}/subjects/{}-value/versions/latest",
+            ctx.config.schema_registry_url, output.topic,
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let schema = apache_avro::Schema::parse_str(registered["schema"].as_str().unwrap()).unwrap();
+    fn non_null(schema: &apache_avro::Schema) -> &apache_avro::Schema {
+        match schema {
+            apache_avro::Schema::Union(union) => union
+                .variants()
+                .iter()
+                .find(|s| !matches!(s, apache_avro::Schema::Null))
+                .unwrap(),
+            other => other,
+        }
+    }
+    fn field<'a>(schema: &'a apache_avro::Schema, name: &str) -> &'a apache_avro::Schema {
+        let apache_avro::Schema::Record(record) = non_null(schema) else {
+            panic!("expected record, got {schema:?}");
+        };
+        &record.fields[*record.lookup.get(name).unwrap()].schema
+    }
+    let item_name = |column| {
+        let apache_avro::Schema::Array(array) = non_null(field(field(&schema, column), "l")) else {
+            panic!("expected list in {column}");
+        };
+        let apache_avro::Schema::Record(item) = non_null(&array.items) else {
+            panic!("expected record item in {column}");
+        };
+        item.name.clone()
+    };
+    let left = item_name("a__x");
+    let right = item_name("b__x");
+    assert_eq!(
+        left.name, right.name,
+        "distinct namespaces are not collisions"
+    );
+    assert_ne!(left.fullname(None), right.fullname(None));
+
+    let readback = format!(
+        r#"
+sources:
+  src:
+    type: kafka
+    topic: {output}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  out:
+    type: print
+    from: src
+"#,
+        output = output.topic,
+    );
+    let captured = ctx
+        .run_pipeline_with_capture(&readback, base_opts().record_limit(1))
+        .await
+        .unwrap();
+    for column in ["a__x", "b__x"] {
+        let values = format!("{:?}", captured.column_values(column));
+        assert!(
+            values.contains(BIG),
+            "decimal missing from {column}: {values}"
+        );
+    }
+}
+
 /// Two arrays of nullable records, each record holding a 256-bit decimal ->
 /// Kafka **Avro sink** -> re-read -> Print JSON. The sink's schema used to name
 /// every list-item record `item_item`, so a second list of records redefined
