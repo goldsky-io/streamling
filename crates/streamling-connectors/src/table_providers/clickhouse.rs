@@ -386,6 +386,32 @@ fn clickhouse_decimal_arb_conversion(
     field: &arrow::datatypes::Field,
     directives: Option<&[streamling_config::ColumnDirective]>,
 ) -> Result<Option<ClickHouseDecimalArbConversion>> {
+    clickhouse_decimal_arb_leaf_conversion(
+        field,
+        column_coerces_to_string(field.name(), directives),
+        field.name(),
+    )
+}
+
+/// Whether the sink's `columns:` directives set `coerce_to: string` on the
+/// top-level column `name`. A nested leaf follows its column's directive.
+fn column_coerces_to_string(
+    name: &str,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> bool {
+    streamling_config::ColumnDirective::find(directives, name)
+        .map(|d| d.coerces_to_string())
+        .unwrap_or(false)
+}
+
+/// [`clickhouse_decimal_arb_conversion`] for one decimal_arb leaf — a
+/// top-level column or a leaf nested inside one — under the directive of the
+/// column it belongs to. `path` names the leaf in errors.
+fn clickhouse_decimal_arb_leaf_conversion(
+    field: &arrow::datatypes::Field,
+    coerce_to_string: bool,
+    path: &str,
+) -> Result<Option<ClickHouseDecimalArbConversion>> {
     use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
     use streamling_core::types::decimal_arb_capability::{
         CapabilityResult, ConnectorKind, capability_for_decimal_arb, config_load_error,
@@ -395,9 +421,6 @@ fn clickhouse_decimal_arb_conversion(
         return Ok(None);
     };
     let native_int_kind = DecimalArbType::native_int_kind_from_field(field);
-    let coerce_to_string = streamling_config::ColumnDirective::find(directives, field.name())
-        .map(|d| d.coerces_to_string())
-        .unwrap_or(false);
 
     match capability_for_decimal_arb(
         ConnectorKind::ClickHouse,
@@ -422,7 +445,7 @@ fn clickhouse_decimal_arb_conversion(
         }
         CapabilityResult::OptInOnly(_) => Ok(Some(ClickHouseDecimalArbConversion::CanonicalString)),
         CapabilityResult::Reject(reason) => Err(DataFusionError::from(config_load_error(
-            field.name(),
+            path,
             ConnectorKind::ClickHouse,
             precision,
             scale,
@@ -495,6 +518,187 @@ fn build_decimal_arb_projection_for_clickhouse(
     } else {
         Ok(input)
     }
+}
+
+/// Does this top-level column hold a decimal_arb leaf below it — or a retired
+/// `streamling.u256` / `streamling.i256` leaf, which converts the same way
+/// once upgraded? Such a column goes through [`nested_decimal_arb_field`] /
+/// [`nested_decimal_arb_column`]; a decimal_arb column itself takes the
+/// top-level path.
+fn has_nested_decimal_arb(field: &arrow::datatypes::Field) -> bool {
+    use streamling_core::types::decimal_arb_legacy::{
+        field_contains_legacy_wide_int, legacy_wide_int_kind,
+    };
+    use streamling_core::types::decimal_arb_nested::contains_nested_decimal_arb;
+    contains_nested_decimal_arb(field)
+        || (legacy_wide_int_kind(field).is_none() && field_contains_legacy_wide_int(field))
+}
+
+/// The Arrow field a nested decimal_arb leaf is written as, for the
+/// conversion [`clickhouse_decimal_arb_leaf_conversion`] picked — the same
+/// shapes a top-level column gets: `FixedSizeBinary(32)` little-endian for
+/// `UInt256` / `Int256` (keeping the decimal_arb metadata so the DDL mapper
+/// can read the hint), `Decimal128` / `Decimal256` for `Decimal(p, s)`, and
+/// `Utf8` canonical text for `String`.
+fn clickhouse_nested_leaf_field(
+    leaf: &arrow::datatypes::Field,
+    conversion: ClickHouseDecimalArbConversion,
+) -> arrow::datatypes::Field {
+    use arrow::datatypes::{DataType, Field};
+    match conversion {
+        ClickHouseDecimalArbConversion::NativeIntBytes => Field::new(
+            leaf.name(),
+            DataType::FixedSizeBinary(32),
+            leaf.is_nullable(),
+        )
+        .with_metadata(leaf.metadata().clone()),
+        ClickHouseDecimalArbConversion::Decimal { precision, scale } => {
+            // precision ≤ 76 and scale ≤ precision, so both fit.
+            let (p, s) = (precision as u8, scale as i8);
+            let data_type = if precision <= 38 {
+                DataType::Decimal128(p, s)
+            } else {
+                DataType::Decimal256(p, s)
+            };
+            Field::new(leaf.name(), data_type, leaf.is_nullable())
+        }
+        ClickHouseDecimalArbConversion::CanonicalString => {
+            Field::new(leaf.name(), DataType::Utf8, leaf.is_nullable())
+        }
+    }
+}
+
+/// The field the ClickHouse sink writes for a column holding nested
+/// decimal_arb leaves (see [`has_nested_decimal_arb`]): every leaf rewritten
+/// per [`clickhouse_nested_leaf_field`] under the column's `coerce_to`
+/// directive, so the auto-created table declares `Array(Tuple(.. UInt256 ..))`
+/// and friends. A leaf ClickHouse cannot hold is an error naming its path.
+fn nested_decimal_arb_field(
+    field: &arrow::datatypes::Field,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> Result<arrow::datatypes::Field> {
+    use streamling_core::types::decimal_arb_legacy::upgrade_legacy_wide_int_field;
+    use streamling_core::types::decimal_arb_nested::rewrite_decimal_arb_leaf_fields;
+    let upgraded = upgrade_legacy_wide_int_field(field).map_err(DataFusionError::from)?;
+    let field = upgraded.as_ref().unwrap_or(field);
+    let coerce_to_string = column_coerces_to_string(field.name(), directives);
+    rewrite_decimal_arb_leaf_fields(field, field.name(), &mut |leaf, path| {
+        let conversion = clickhouse_decimal_arb_leaf_conversion(leaf, coerce_to_string, path)?
+            .ok_or_else(|| streamling_err!("'{path}' is not a decimal_arb leaf"))?;
+        Ok(clickhouse_nested_leaf_field(leaf, conversion))
+    })
+    .map_err(DataFusionError::from)
+}
+
+/// Array-level mirror of [`nested_decimal_arb_field`]: rebuild a column's
+/// containers with every nested decimal_arb leaf converted to its ClickHouse
+/// wire value. `UInt256` / `Int256` leaves get the same little-endian bytes
+/// and range checks as a top-level column — writing the canonical big-endian
+/// bytes there is what made `1` arrive as `2^248`.
+fn nested_decimal_arb_column(
+    field: &arrow::datatypes::Field,
+    array: &ArrayRef,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> Result<(arrow::datatypes::Field, ArrayRef)> {
+    use arrow::array::LargeBinaryArray;
+    use streamling_core::types::decimal_arb::DecimalArbArray;
+    use streamling_core::types::decimal_arb_legacy::upgrade_legacy_wide_ints;
+    use streamling_core::types::decimal_arb_nested::rewrite_decimal_arb_leaves;
+
+    let upgraded = upgrade_legacy_wide_ints(field, array).map_err(DataFusionError::from)?;
+    let (field, array) = match &upgraded {
+        Some((f, a)) => (f, a),
+        None => (field, array),
+    };
+    let coerce_to_string = column_coerces_to_string(field.name(), directives);
+    rewrite_decimal_arb_leaves(field, array, field.name(), &mut |leaf, values, path| {
+        let conversion = clickhouse_decimal_arb_leaf_conversion(leaf, coerce_to_string, path)?
+            .ok_or_else(|| streamling_err!("'{path}' is not a decimal_arb leaf"))?;
+        let out_field = clickhouse_nested_leaf_field(leaf, conversion);
+        let converted: ArrayRef = match conversion {
+            ClickHouseDecimalArbConversion::NativeIntBytes => {
+                // Named by its path so a range error points at the leaf.
+                let named = Arc::new(leaf.clone().with_name(path));
+                decimal_arb_to_clickhouse_native(values.as_ref(), &named)?
+            }
+            ClickHouseDecimalArbConversion::Decimal { .. }
+            | ClickHouseDecimalArbConversion::CanonicalString => {
+                let raw = values
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        streamling_err!(
+                            "expected LargeBinaryArray for decimal_arb leaf '{}', got {:?}",
+                            path,
+                            values.data_type(),
+                        )
+                    })?;
+                let arb = DecimalArbArray::try_from_array_and_field(raw.clone(), leaf)?;
+                match conversion {
+                    ClickHouseDecimalArbConversion::Decimal { precision, scale }
+                        if precision <= 38 =>
+                    {
+                        Arc::new(arb.to_decimal128(precision as u8, scale as i8, path)?)
+                    }
+                    ClickHouseDecimalArbConversion::Decimal { precision, scale } => {
+                        Arc::new(arb.to_decimal256(precision as u8, scale as i8, path)?)
+                    }
+                    _ => Arc::new(arb.to_string_array()?),
+                }
+            }
+        };
+        Ok((out_field, converted))
+    })
+    .map_err(DataFusionError::from)
+}
+
+/// [`nested_decimal_arb_field`] over every column of `schema` that needs it;
+/// other columns are untouched.
+fn nested_decimal_arb_schema_for_clickhouse(
+    schema: &Schema,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> Result<Schema> {
+    if !schema.fields().iter().any(|f| has_nested_decimal_arb(f)) {
+        return Ok(schema.clone());
+    }
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            Ok(if has_nested_decimal_arb(f) {
+                Arc::new(nested_decimal_arb_field(f, directives)?)
+            } else {
+                Arc::clone(f)
+            })
+        })
+        .collect::<Result<Vec<FieldRef>>>()?;
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// [`nested_decimal_arb_column`] over every column of `batch` that needs it;
+/// the batch is returned as-is when none does.
+fn nested_decimal_arb_batch_for_clickhouse(
+    batch: &RecordBatch,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    if !schema.fields().iter().any(|f| has_nested_decimal_arb(f)) {
+        return Ok(batch.clone());
+    }
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if has_nested_decimal_arb(field) {
+            let (f, a) = nested_decimal_arb_column(field, column, directives)?;
+            fields.push(Arc::new(f));
+            columns.push(a);
+        } else {
+            fields.push(Arc::clone(field));
+            columns.push(Arc::clone(column));
+        }
+    }
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 impl ClickHouseTableProvider {
@@ -1056,9 +1260,16 @@ impl TableProvider for ClickHouseTableProvider {
             self.client.creds.columns.as_deref(),
         )?;
 
-        let input_schema = projection_exec.schema();
+        // Columns holding nested decimal_arb leaves (`Array(Tuple(.. UInt256
+        // ..))` and the like) are converted per batch in `write_all`; the sink
+        // schema — and so the auto-created table — declares the converted
+        // types.
+        let input_schema = nested_decimal_arb_schema_for_clickhouse(
+            projection_exec.schema().as_ref(),
+            self.client.creds.columns.as_deref(),
+        )?;
         let schema = Arc::new(ClickHouseClient::normalize_sink_schema(
-            input_schema.as_ref(),
+            &input_schema,
             sink_params.schema_override.as_ref(),
         ));
 
@@ -1312,10 +1523,13 @@ impl DataSink for ClickHouseSinkExec {
 
             let start_at = Instant::now();
 
-            let normalized_batch = match ClickHouseClient::normalize_batch_for_clickhouse(
+            let normalized_batch = match nested_decimal_arb_batch_for_clickhouse(
                 &batch,
-                &normalized_schema,
-            ) {
+                client.creds.columns.as_deref(),
+            )
+            .and_then(|batch| {
+                ClickHouseClient::normalize_batch_for_clickhouse(&batch, &normalized_schema)
+            }) {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
@@ -3540,12 +3754,17 @@ impl ClickHouseClient {
                 "String".to_string()
             }
             arrow::datatypes::DataType::FixedSizeBinary(size) => {
-                // FSB(32)+U256/I256-metadata fields no longer exist now
-                // that sources route wide integers through decimal_arb.
-                // The decimal_arb hint-aware UInt256/Int256 emission
-                // lives in `clickhouse_column_type` (the directive-aware
-                // top-level entry point).
-                format!("FixedString({})", size)
+                // A decimal_arb leaf nested in an Array / Tuple / Map
+                // reaches here already converted to the little-endian
+                // FSB(32) wire shape, its metadata still carrying the
+                // native_int_kind hint (a top-level column takes the same
+                // decision in `clickhouse_column_type`).
+                use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
+                match DecimalArbType::native_int_kind_from_field_metadata(field.metadata()) {
+                    Some(NativeIntKind::U256) if *size == 32 => "UInt256".to_string(),
+                    Some(NativeIntKind::I256) if *size == 32 => "Int256".to_string(),
+                    _ => format!("FixedString({})", size),
+                }
             }
             arrow::datatypes::DataType::Date32 => "Date".to_string(),
             arrow::datatypes::DataType::Date64 => "DateTime".to_string(),
@@ -7211,5 +7430,564 @@ mod pr37_adversarial_connector_tests {
                 assert!(decoded.is_null(1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod nested_decimal_arb_tests {
+    //! decimal_arb leaves nested inside Array / Tuple / Map columns: the sink
+    //! schema, the auto-created table, and the values written.
+
+    use super::*;
+    use arrow::array::{
+        Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int64Array,
+        LargeBinaryArray, LargeListArray, ListArray, MapArray, StringArray, StructArray,
+    };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
+    use arrow::datatypes::{DataType, Field, Fields};
+    use streamling_core::types::decimal_arb::{
+        DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue, NativeIntKind,
+    };
+
+    const U256_MAX: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    const I256_MIN: &str =
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+
+    fn arb(values: &[Option<&str>], precision: u32, scale: u32) -> ArrayRef {
+        let mut b =
+            DecimalArbArrayBuilder::with_capacity(values.len(), "v", precision, scale).unwrap();
+        for v in values {
+            match v {
+                Some(s) => b.append_str(s).unwrap(),
+                None => b.append_null(),
+            }
+        }
+        let (raw, _, _) = b.finish().into_inner();
+        Arc::new(raw)
+    }
+
+    fn hinted(name: &str, kind: NativeIntKind) -> FieldRef {
+        Arc::new(
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field(name, 78, 0, true).unwrap(),
+                kind,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn wide_directive() -> Vec<streamling_config::ColumnDirective> {
+        vec![streamling_config::ColumnDirective {
+            name: "wide".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        }]
+    }
+
+    /// Four rows exercising every nested shape:
+    /// - `traces: List<Struct<id, value: u256>>` — the plugin call-trace
+    ///   shape — with a null list, a null struct whose leaf slot holds a
+    ///   negative placeholder (it must be masked, not range-checked), a null
+    ///   leaf, `1`, `10^18` and `2^256 - 1`;
+    /// - `signed: Struct<v: i256>` with `-1`, `-2^255`, `5`, `0`;
+    /// - `amounts: LargeList<decimal_arb(50, 5)>` (a Decimal256 leaf);
+    /// - `balances: Map<Utf8, decimal_arb(20, 2)>` (a Decimal128 value);
+    /// - `wide: List<decimal_arb(100, 18)>`, written as String under
+    ///   `coerce_to: string`.
+    fn nested_fixture() -> RecordBatch {
+        let id = Arc::new(Field::new("id", DataType::Int64, true));
+        let value = hinted("value", NativeIntKind::U256);
+        let trace_fields: Fields = vec![Arc::clone(&id), Arc::clone(&value)].into();
+        let trace = Arc::new(Field::new(
+            "item",
+            DataType::Struct(trace_fields.clone()),
+            true,
+        ));
+        let structs = StructArray::try_new(
+            trace_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                arb(
+                    &[
+                        Some("1"),
+                        Some("1000000000000000000"),
+                        Some("-1"),
+                        Some(U256_MAX),
+                        None,
+                    ],
+                    78,
+                    0,
+                ),
+            ],
+            Some(NullBuffer::from(vec![true, true, false, true, true])),
+        )
+        .unwrap();
+        let traces = ListArray::try_new(
+            Arc::clone(&trace),
+            OffsetBuffer::new(vec![0, 2, 2, 3, 5].into()),
+            Arc::new(structs),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        )
+        .unwrap();
+
+        let v = hinted("v", NativeIntKind::I256);
+        let signed_fields: Fields = vec![Arc::clone(&v)].into();
+        let signed = StructArray::try_new(
+            signed_fields.clone(),
+            vec![arb(
+                &[Some("-1"), Some(I256_MIN), Some("5"), Some("0")],
+                78,
+                0,
+            )],
+            None,
+        )
+        .unwrap();
+
+        let amount = Arc::new(DecimalArbType::field("item", 50, 5, true).unwrap());
+        let amounts = LargeListArray::try_new(
+            Arc::clone(&amount),
+            OffsetBuffer::new(vec![0_i64, 2, 2, 2, 3].into()),
+            arb(
+                &[
+                    Some("1.5"),
+                    Some("-2.25"),
+                    Some("123456789012345678901234567890.12345"),
+                ],
+                50,
+                5,
+            ),
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        )
+        .unwrap();
+
+        let key = Arc::new(Field::new("key", DataType::Utf8, false));
+        let balance = Arc::new(DecimalArbType::field("value", 20, 2, true).unwrap());
+        let entry_fields: Fields = vec![Arc::clone(&key), Arc::clone(&balance)].into();
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                arb(&[Some("1.23"), None, Some("-0.01")], 20, 2),
+            ],
+            None,
+        )
+        .unwrap();
+        let entry = Arc::new(Field::new("entries", DataType::Struct(entry_fields), false));
+        let balances = MapArray::try_new(
+            Arc::clone(&entry),
+            OffsetBuffer::new(vec![0, 1, 1, 3, 3].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let wide_leaf = Arc::new(DecimalArbType::field("item", 100, 18, true).unwrap());
+        let wide = ListArray::try_new(
+            Arc::clone(&wide_leaf),
+            OffsetBuffer::new(vec![0, 1, 1, 1, 1].into()),
+            arb(&[Some("1.000000000000000001")], 100, 18),
+            None,
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("traces", DataType::List(trace), true),
+            Field::new("signed", DataType::Struct(signed_fields), false),
+            Field::new("amounts", DataType::LargeList(amount), true),
+            Field::new("balances", DataType::Map(entry, false), true),
+            Field::new("wide", DataType::List(wide_leaf), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(traces),
+                Arc::new(signed),
+                Arc::new(amounts),
+                Arc::new(balances),
+                Arc::new(wide),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The batch as the sink puts it on the wire: nested leaves converted,
+    /// then the top-level normalizer, against the schema `insert_into` derives.
+    fn wire_batch(batch: &RecordBatch) -> (SchemaRef, RecordBatch) {
+        let directives = wide_directive();
+        let schema = Arc::new(ClickHouseClient::normalize_sink_schema(
+            &nested_decimal_arb_schema_for_clickhouse(batch.schema().as_ref(), Some(&directives))
+                .unwrap(),
+            None,
+        ));
+        let converted = nested_decimal_arb_batch_for_clickhouse(batch, Some(&directives)).unwrap();
+        let wire = ClickHouseClient::normalize_batch_for_clickhouse(&converted, &schema).unwrap();
+        (schema, wire)
+    }
+
+    /// Read ClickHouse's little-endian UInt256 / Int256 bytes back as decimal
+    /// text, the way ClickHouse itself interprets them.
+    fn native_values(leaf: &ArrayRef, kind: NativeIntKind) -> Vec<Option<String>> {
+        let field = hinted("v", kind);
+        let arb = clickhouse_native_to_decimal_arb(leaf.as_ref(), &field).unwrap();
+        let arb = arb.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        (0..arb.len())
+            .map(|i| {
+                (!arb.is_null(i)).then(|| {
+                    DecimalArbValue::from_canonical_bytes_at_scale(arb.value(i), 0)
+                        .unwrap()
+                        .to_canonical_string()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_leaves_map_to_native_clickhouse_column_types() {
+        let batch = nested_fixture();
+        let (schema, _) = wire_batch(&batch);
+        let config = ClickHouseConfig {
+            url: "http://localhost:8123".to_string(),
+            database: "test_db".to_string(),
+            user: "default".to_string(),
+            password: "".to_string(),
+            compression: ClickHouseCompression::None,
+            compression_level: GzipCompressionLevel::default(),
+            columns: Some(wide_directive()),
+        };
+        let query = ClickHouseClient::new(config)
+            .build_create_table_query("t", &schema, vec!["id".to_string()], false, None, None)
+            .unwrap();
+        for expected in [
+            "`traces` Array(Tuple(id Nullable(Int64), value Nullable(UInt256)))",
+            "`signed` Tuple(v Nullable(Int256))",
+            "`amounts` Array(Nullable(Decimal(50, 5)))",
+            "`balances` Map(String, Nullable(Decimal(20, 2)))",
+            "`wide` Array(Nullable(String))",
+        ] {
+            assert!(
+                query.contains(expected),
+                "{expected} missing from:\n{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_leaves_are_written_as_their_numeric_values() {
+        let batch = nested_fixture();
+        let (_, wire) = wire_batch(&batch);
+
+        // traces: List<Struct<id, value UInt256>>, little-endian.
+        let traces = wire.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(traces.is_null(1));
+        let structs = traces
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let values = structs.column(1);
+        assert_eq!(values.data_type(), &DataType::FixedSizeBinary(32));
+        let raw = values
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        // `1` is 0x01 followed by 31 zero bytes on ClickHouse's side; the
+        // canonical big-endian bytes written verbatim read back as 2^248.
+        let mut one = [0_u8; 32];
+        one[0] = 1;
+        assert_eq!(raw.value(0), one);
+        assert_eq!(
+            native_values(values, NativeIntKind::U256),
+            vec![
+                Some("1".to_string()),
+                Some("1000000000000000000".to_string()),
+                None, // under a null struct: masked, not range-checked
+                Some(U256_MAX.to_string()),
+                None,
+            ]
+        );
+
+        // signed: Struct<v Int256>, two's complement.
+        let signed = wire
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v = signed.column(0);
+        let raw = v.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+        assert_eq!(raw.value(0), [0xFF_u8; 32]);
+        assert_eq!(
+            native_values(v, NativeIntKind::I256),
+            vec![
+                Some("-1".to_string()),
+                Some(I256_MIN.to_string()),
+                Some("5".to_string()),
+                Some("0".to_string()),
+            ]
+        );
+
+        // amounts: Decimal(50, 5) travels as Decimal256.
+        let amounts = wire
+            .column(3)
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .unwrap();
+        let leaves = amounts
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal256Array>()
+            .unwrap();
+        assert_eq!(leaves.data_type(), &DataType::Decimal256(50, 5));
+        let texts: Vec<String> = (0..leaves.len())
+            .map(|i| leaves.value_as_string(i))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "1.50000",
+                "-2.25000",
+                "123456789012345678901234567890.12345"
+            ]
+        );
+
+        // balances: Map values as Decimal128(20, 2).
+        let balances = wire.column(4).as_any().downcast_ref::<MapArray>().unwrap();
+        let values = balances
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(values.value_as_string(0), "1.23");
+        assert!(values.is_null(1));
+        assert_eq!(values.value_as_string(2), "-0.01");
+
+        // wide: `coerce_to: string` on the column reaches its leaves.
+        let wide = wire.column(5).as_any().downcast_ref::<ListArray>().unwrap();
+        let text = wide
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(text.value(0), "1.000000000000000001");
+    }
+
+    #[test]
+    fn nested_leaf_clickhouse_cannot_hold_is_rejected_with_its_path() {
+        // Without the column's `coerce_to: string`, a 100-digit fractional
+        // leaf fits no ClickHouse numeric type.
+        let batch = nested_fixture();
+        let err = nested_decimal_arb_schema_for_clickhouse(batch.schema().as_ref(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wide.item"), "{err}");
+        assert!(err.contains("coerce_to: string"), "{err}");
+    }
+
+    #[test]
+    fn negative_value_in_a_nested_u256_leaf_fails_naming_the_leaf() {
+        let value = hinted("value", NativeIntKind::U256);
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::clone(&value)].into()),
+            true,
+        ));
+        let structs =
+            StructArray::try_new(vec![value].into(), vec![arb(&[Some("-3")], 78, 0)], None)
+                .unwrap();
+        let list = ListArray::try_new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(structs),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "traces",
+                DataType::List(item),
+                true,
+            )])),
+            vec![Arc::new(list)],
+        )
+        .unwrap();
+        let err = nested_decimal_arb_batch_for_clickhouse(&batch, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("traces.item.value"), "{err}");
+        assert!(err.contains("negative"), "{err}");
+    }
+
+    #[test]
+    fn retired_wide_int_leaves_nested_in_a_column_are_converted_too() {
+        use streamling_core::types::decimal_arb_legacy::LEGACY_U256_EXTENSION_NAME;
+        // A plugin may still emit `streamling.u256` (32 big-endian bytes)
+        // inside a struct.
+        let legacy = Arc::new(
+            Field::new("value", DataType::FixedSizeBinary(32), true).with_metadata(
+                [(
+                    arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.to_string(),
+                    LEGACY_U256_EXTENSION_NAME.to_string(),
+                )]
+                .into(),
+            ),
+        );
+        let mut be_one = [0_u8; 32];
+        be_one[31] = 1;
+        let structs = StructArray::try_new(
+            vec![Arc::clone(&legacy)].into(),
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::once(be_one)).unwrap(),
+            )],
+            None,
+        )
+        .unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![legacy].into()),
+            false,
+        )]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(structs)]).unwrap();
+        let converted = nested_decimal_arb_batch_for_clickhouse(&batch, None).unwrap();
+        assert_eq!(
+            converted.schema().field(0),
+            nested_decimal_arb_schema_for_clickhouse(&schema, None)
+                .unwrap()
+                .field(0)
+        );
+        let leaf = converted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .clone();
+        assert_eq!(
+            native_values(&leaf, NativeIntKind::U256),
+            vec![Some("1".to_string())]
+        );
+    }
+
+    /// Writes [`nested_fixture`] through the real sink — `insert_into`, the
+    /// auto-created table, `INSERT ... FORMAT Arrow` — into a live ClickHouse
+    /// and reads every value back as ClickHouse renders it, which is what
+    /// proves the byte order. Needs a ClickHouse HTTP endpoint without auth:
+    /// `E2E_CLICKHOUSE_URL` (default `http://127.0.0.1:30123`, the local e2e
+    /// environment from `just env-setup`).
+    #[tokio::test]
+    #[ignore = "needs a local ClickHouse; run with --ignored"]
+    async fn nested_decimal_arb_round_trips_through_a_live_clickhouse() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::prelude::SessionContext;
+
+        let url = std::env::var("E2E_CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:30123".to_string());
+        let table = format!(
+            "nested_decimal_arb_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let config = ClickHouseConfig {
+            url: url.clone(),
+            database: "default".to_string(),
+            user: "default".to_string(),
+            password: "".to_string(),
+            compression: ClickHouseCompression::None,
+            compression_level: GzipCompressionLevel::default(),
+            columns: Some(wide_directive()),
+        };
+
+        // The sink needs `_gs_op` to split inserts from deletes.
+        let fixture = nested_fixture();
+        let mut fields: Vec<FieldRef> = fixture.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(COLUMN_NAME_OP, DataType::Utf8, false)));
+        let mut columns = fixture.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(vec!["i"; 4])));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+
+        let sink = ClickHouseTableProvider::new_sink(
+            "nested_decimal_arb".into(),
+            &table,
+            config.clone(),
+            None,
+            "id".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "nested_decimal_arb".into(),
+            None,
+        )
+        .unwrap();
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+        let ctx = SessionContext::new();
+        let plan = sink
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .unwrap();
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+
+        let client = ClickHouseClient::new(config);
+        let query = |sql: String| {
+            let client = client.clone();
+            async move {
+                let response = client
+                    .send_query(reqwest::Method::POST, &sql)
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = response.text().await.unwrap();
+                assert!(status.is_success(), "{sql}: {body}");
+                body
+            }
+        };
+        let types = query(format!(
+            "SELECT name, type FROM system.columns WHERE database = 'default' AND table = '{table}' \
+             ORDER BY position FORMAT TSV"
+        ))
+        .await;
+        let rows = query(format!(
+            "SELECT id, \
+                    arrayMap(t -> toString(t.value), traces), \
+                    toString(signed.v), \
+                    arrayMap(x -> toString(x), amounts), \
+                    mapApply((k, v) -> (k, toString(v)), balances), \
+                    wide \
+             FROM {table} FINAL ORDER BY id FORMAT TSV"
+        ))
+        .await;
+        query(format!("DROP TABLE IF EXISTS {table}")).await;
+        for expected in [
+            "traces\tArray(Tuple(id Nullable(Int64), value Nullable(UInt256)))",
+            "signed\tTuple(v Nullable(Int256))",
+            "amounts\tArray(Nullable(Decimal(50, 5)))",
+            "balances\tMap(String, Nullable(Decimal(20, 2)))",
+            "wide\tArray(Nullable(String))",
+        ] {
+            assert!(
+                types.lines().any(|l| l == expected),
+                "{expected} not in:\n{types}"
+            );
+        }
+        let expected = [
+            "1\t['1','1000000000000000000']\t-1\t['1.5','-2.25']\t{'a':'1.23'}\t['1.000000000000000001']"
+                .to_string(),
+            format!("2\t[]\t{I256_MIN}\t[]\t{{}}\t[]"),
+            // The masked leaf under the null struct is a NULL element.
+            "3\t[NULL]\t5\t[]\t{'b':NULL,'c':'-0.01'}\t[]".to_string(),
+            format!(
+                "4\t['{U256_MAX}',NULL]\t0\t['123456789012345678901234567890.12345']\t{{}}\t[]"
+            ),
+        ];
+        assert_eq!(rows.lines().collect::<Vec<_>>(), expected, "{rows}");
     }
 }

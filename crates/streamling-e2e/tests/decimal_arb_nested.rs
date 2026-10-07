@@ -5,15 +5,15 @@
 //! which. Nested input is built directly as an avro datum (the harness's
 //! flat producers can't express nested decimals).
 //!
-//! (Postgres has no nested-column type, and nested decimal_arb is rejected at
-//! config load for ClickHouse/Hybrid, so those boundaries are not exercised
-//! here.)
+//! (Postgres has no nested-column type, so that boundary is not exercised
+//! here. ClickHouse stores nested leaves in `Array` / `Tuple` columns; the
+//! tests at the bottom cover it.)
 
 use apache_avro::types::Value;
 use apache_avro::Decimal;
 use num_bigint::BigInt;
 use std::str::FromStr;
-use streamling_e2e::{init_tracing, PipelineOpts, TestContext};
+use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
 
 fn base_opts() -> PipelineOpts {
     PipelineOpts::new()
@@ -248,5 +248,161 @@ sinks:
     assert!(
         !blob.contains("00018ee90ff6c373e0ee4e3f0ad2"),
         "round-tripped nested decimal_arb must not render as hex; got: {blob}"
+    );
+}
+
+// record { id: long, items: array<record { amt: decimal(100,18) }> }
+const ARRAY_STRUCT_WIDE_FRACTION_SCHEMA: &str = r#"{
+    "type": "record", "name": "R",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "items", "type": {"type": "array", "items": {"type": "record", "name": "X", "fields": [
+            {"name": "amt", "type": {"type": "bytes", "logicalType": "decimal", "precision": 100, "scale": 18}}
+        ]}}}
+    ]
+}"#;
+
+fn clickhouse_opts(ctx: &TestContext) -> PipelineOpts {
+    let clickhouse = ctx
+        .clickhouse
+        .as_ref()
+        .expect("ClickHouse should be enabled");
+    base_opts()
+        .record_limit(1)
+        .env(
+            "STREAMLING__CLICKHOUSE_SINK__URL",
+            &ctx.config.clickhouse_url,
+        )
+        .env(
+            "STREAMLING__CLICKHOUSE_SINK__DATABASE",
+            &clickhouse.database,
+        )
+        .env("STREAMLING__CLICKHOUSE_SINK__USER", "default")
+        .env("STREAMLING__CLICKHOUSE_SINK__PASSWORD", "")
+}
+
+fn array_to_clickhouse_yaml(ctx: &TestContext) -> String {
+    format!(
+        r#"
+sources:
+  src:
+    type: kafka
+    topic: {input}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  out:
+    type: clickhouse
+    from: src
+    table: nested_items
+    primary_key: id
+"#,
+        input = ctx.kafka_topic,
+    )
+}
+
+/// array<record<decimal(100, 18)>> -> ClickHouse with `coerce_to: string` on
+/// the column. Nested decimal_arb used to be rejected at config load for
+/// ClickHouse; the directive on the top-level column now reaches every leaf,
+/// the table is created as `Array(Tuple(amt String))`, and each element
+/// stores its canonical decimal text.
+#[tokio::test]
+async fn array_of_wide_decimal_arb_to_clickhouse_with_coerce_to_string() {
+    init_tracing();
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .unwrap();
+
+    let rec = Value::Record(vec![
+        ("id".to_string(), Value::Long(1)),
+        (
+            "items".to_string(),
+            Value::Array(vec![
+                // 1.000000000000000001
+                Value::Record(vec![(
+                    "amt".to_string(),
+                    decimal_val("1000000000000000001"),
+                )]),
+                // -123456789012345678901234567890.5
+                Value::Record(vec![(
+                    "amt".to_string(),
+                    decimal_val("-123456789012345678901234567890500000000000000000"),
+                )]),
+            ]),
+        ),
+    ]);
+    ctx.kafka
+        .produce_avro_value(ARRAY_STRUCT_WIDE_FRACTION_SCHEMA, rec)
+        .await
+        .unwrap();
+
+    let output = ctx
+        .run_pipeline_raw(
+            &array_to_clickhouse_yaml(&ctx),
+            clickhouse_opts(&ctx).env(
+                "STREAMLING__CLICKHOUSE_SINK__COLUMNS",
+                r#"[{"name":"items","coerce_to":"string"}]"#,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "nested decimal_arb with coerce_to: string must load into ClickHouse.\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr,
+    );
+
+    let clickhouse = ctx.clickhouse.as_ref().unwrap();
+    let columns = clickhouse.get_column_types("nested_items").await.unwrap();
+    let items = columns
+        .iter()
+        .find(|(name, _)| name == "items")
+        .expect("items column");
+    assert!(
+        items.1.starts_with("Array(Tuple(")
+            && items.1.contains("amt")
+            && items.1.contains("String"),
+        "items must be an Array(Tuple(amt String)), got {}",
+        items.1,
+    );
+    let values: String = clickhouse
+        .query_one("SELECT toString(arrayMap(t -> t.1, items)) FROM nested_items")
+        .await
+        .unwrap();
+    assert_eq!(
+        values,
+        "['1.000000000000000001','-123456789012345678901234567890.500000000000000000']"
+    );
+}
+
+/// The same shape without the directive: a 100-digit fractional leaf fits no
+/// ClickHouse numeric type, so the pipeline is still rejected at config load,
+/// with an error naming the nested leaf and the opt-in.
+#[tokio::test]
+async fn array_of_wide_decimal_arb_to_clickhouse_without_directive_is_rejected() {
+    init_tracing();
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .unwrap();
+    ctx.kafka
+        .register_schema(ARRAY_STRUCT_WIDE_FRACTION_SCHEMA)
+        .await
+        .unwrap();
+
+    let output = ctx
+        .run_pipeline_raw(&array_to_clickhouse_yaml(&ctx), clickhouse_opts(&ctx))
+        .await
+        .unwrap();
+    assert!(!output.status.success(), "pipeline must be rejected");
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    assert!(
+        combined.contains("items.") && combined.contains(".amt"),
+        "error names the nested leaf: {combined}"
+    );
+    assert!(
+        combined.contains("coerce_to: string"),
+        "error points at the opt-in: {combined}"
     );
 }

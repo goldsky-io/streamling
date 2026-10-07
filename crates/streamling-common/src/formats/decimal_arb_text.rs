@@ -50,7 +50,7 @@ fn type_contains_decimal_arb(data_type: &DataType) -> bool {
 /// become lists and dictionary / run-end encodings unwrap to their value type.
 /// Everything the text bridge walks is expressed in these layouts; the
 /// encoded variants are `cast` to them first.
-fn plain_layout(data_type: &DataType) -> Option<DataType> {
+pub(crate) fn plain_layout(data_type: &DataType) -> Option<DataType> {
     match data_type {
         DataType::ListView(c) => Some(DataType::List(Arc::clone(c))),
         DataType::LargeListView(c) => Some(DataType::LargeList(Arc::clone(c))),

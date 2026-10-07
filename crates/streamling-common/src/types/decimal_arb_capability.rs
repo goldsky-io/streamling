@@ -304,8 +304,14 @@ impl fmt::Display for DecimalArbConfigErrors {
 }
 
 /// Connectors whose decimal_arb conversion covers only top-level columns.
+///
+/// ClickHouse is not one of them: its sink rebuilds `Array` / `Tuple` / `Map`
+/// columns with every nested leaf in the same native type a top-level column
+/// gets (`UInt256` / `Int256`, `Decimal(p, s)`, or `String` under the column's
+/// `coerce_to: string`). The ClickHouse-backed hybrid connector reads
+/// top-level columns only.
 fn converts_only_top_level(kind: ConnectorKind) -> bool {
-    matches!(kind, ConnectorKind::ClickHouse | ConnectorKind::Hybrid)
+    matches!(kind, ConnectorKind::Hybrid)
 }
 
 /// `(precision, scale, native_int_kind)` of a decimal_arb field — or of a
@@ -412,12 +418,12 @@ fn collect_nested_in_type(
 ///
 /// Leaves nested inside a Struct / List / Map (or any other container layout)
 /// get the same decision as a top-level column would, under the column's
-/// directive: the connectors that serialise whole containers (JSON, Avro, …)
-/// carry the leaf exactly when they would carry the column. ClickHouse /
-/// Hybrid convert top-level columns only, so a nested leaf is rejected
-/// outright there rather than written as raw bytes, and a leaf anywhere inside
-/// a `Union` is rejected for every connector because nothing serialises
-/// decimal_arb through one.
+/// directive: every connector that writes whole containers (JSON, Avro,
+/// ClickHouse `Array` / `Tuple` / `Map`, …) carries the leaf exactly when it
+/// would carry the column. Hybrid converts top-level columns only, so a nested
+/// leaf is rejected outright there rather than written as raw bytes, and a
+/// leaf anywhere inside a `Union` is rejected for every connector because
+/// nothing serialises decimal_arb through one.
 pub fn validate_pipeline_decimal_arb(
     schema: &Schema,
     kind: ConnectorKind,
@@ -1019,6 +1025,101 @@ mod tests {
             validate_pipeline_decimal_arb(&Schema::new(vec![union]), ConnectorKind::KafkaJson, &[])
                 .unwrap_err();
         let msg = format!("{}", errs);
+        assert!(msg.contains("u.amt") && msg.contains("union"), "{msg}");
+    }
+
+    /// `traces: List<Struct<id Int64, value: leaf>>`, the shape plugins emit
+    /// for per-transaction call traces.
+    fn traces_schema(leaf: Field) -> Schema {
+        use std::sync::Arc;
+        let item = Field::new(
+            "item",
+            DataType::Struct(vec![Field::new("id", DataType::Int64, true), leaf].into()),
+            true,
+        );
+        Schema::new(vec![Field::new(
+            "traces",
+            DataType::List(Arc::new(item)),
+            true,
+        )])
+    }
+
+    #[test]
+    fn clickhouse_carries_nested_leaves_it_can_store_natively() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // ClickHouse holds UInt256 / Int256 / Decimal(p ≤ 76, s) inside
+        // Array / Tuple / Map, and the sink converts nested leaves, so these
+        // no longer need to be rejected.
+        for leaf in [
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field("value", 78, 0, true).unwrap(),
+                NativeIntKind::U256,
+            )
+            .unwrap(),
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field("value", 78, 0, true).unwrap(),
+                NativeIntKind::I256,
+            )
+            .unwrap(),
+            DecimalArbType::field("value", 50, 5, true).unwrap(),
+        ] {
+            let schema = traces_schema(leaf);
+            assert!(
+                validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).is_ok(),
+                "{schema:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_nested_wide_leaf_needs_the_columns_coerce_to_string() {
+        let schema = traces_schema(DecimalArbType::field("value", 100, 18, true).unwrap());
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        let msg = format!("{errs}");
+        assert_eq!(errs.len(), 1, "{msg}");
+        assert!(msg.contains("traces.item.value"), "{msg}");
+        assert!(msg.contains("coerce_to: string"), "{msg}");
+
+        // The directive sits on the top-level column and covers every leaf in it.
+        let directives = [ColumnDirectiveView {
+            name: "traces",
+            coerce_to_string: true,
+        }];
+        assert!(
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &directives).is_ok()
+        );
+    }
+
+    #[test]
+    fn hybrid_still_rejects_nested_leaves() {
+        let schema = traces_schema(DecimalArbType::field("value", 50, 5, true).unwrap());
+        let errs = validate_pipeline_decimal_arb(&schema, ConnectorKind::Hybrid, &[]).unwrap_err();
+        let msg = format!("{errs}");
+        assert!(msg.contains("traces.item.value"), "{msg}");
+        assert!(msg.contains("only top-level columns"), "{msg}");
+    }
+
+    #[test]
+    fn clickhouse_still_rejects_a_leaf_under_a_union() {
+        use arrow_schema::{UnionFields, UnionMode};
+        use std::sync::Arc;
+        let leaf = Arc::new(DecimalArbType::field("amt", 50, 0, true).unwrap());
+        let union = Field::new(
+            "u",
+            DataType::Union(
+                UnionFields::try_new(vec![0], vec![leaf]).unwrap(),
+                UnionMode::Dense,
+            ),
+            true,
+        );
+        let errs = validate_pipeline_decimal_arb(
+            &Schema::new(vec![union]),
+            ConnectorKind::ClickHouse,
+            &[],
+        )
+        .unwrap_err();
+        let msg = format!("{errs}");
         assert!(msg.contains("u.amt") && msg.contains("union"), "{msg}");
     }
 
