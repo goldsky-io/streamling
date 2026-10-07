@@ -275,9 +275,11 @@ pub fn capability_for_nested_decimal_arb(
             match capability_for_decimal_arb(kind, precision, scale, false, native_int_kind) {
                 CapabilityResult::Reject(_) => CapabilityResult::Reject(format!(
                     "ClickHouse Decimal precision is capped at {} digits; declared precision {} \
-                     exceeds the cap. Add `coerce_to: string` under the top-level column that \
-                     holds this field in the sink YAML to write its decimal leaves as Strings, or \
-                     reduce declared precision to ≤{} if the source data fits.",
+                     exceeds the cap. Set `coerce_to: string` on the top-level column that holds \
+                     this field in the ClickHouse sink's `columns` setting \
+                     (`STREAMLING__CLICKHOUSE_SINK__COLUMNS` in the environment) to write its \
+                     decimal leaves as Strings, or reduce declared precision to ≤{} if the source \
+                     data fits.",
                     MAX_CLICKHOUSE_DECIMAL_PRECISION, precision, MAX_CLICKHOUSE_DECIMAL_PRECISION,
                 )),
                 other => other,
@@ -410,6 +412,12 @@ fn collect_nested_decimal_arb(
     under_union: bool,
     out: &mut Vec<DecimalArbLeaf>,
 ) {
+    // An encoded leaf carrying the metadata on its own field is the leaf
+    // (`decimal_arb_view` reports it), not a layout holding one: descending
+    // into its values would check the same leaf twice.
+    if crate::formats::decimal_arb_text::is_encoded_decimal_arb_field(field) {
+        return;
+    }
     collect_nested_in_type(field.data_type(), path, under_union, out);
 }
 
@@ -1025,6 +1033,41 @@ mod tests {
                 CapabilityResult::OptInOnly(CoercionDirective::String),
                 "precision {precision}"
             );
+        }
+    }
+
+    /// A dictionary- or run-end-encoded leaf carrying its metadata on the
+    /// encoded field is one leaf, checked once under the column's own name.
+    #[test]
+    fn an_encoded_leaf_is_checked_once() {
+        use std::sync::Arc;
+        let wide = DecimalArbType::field("x", 100, 2, true).unwrap();
+        let dict = Field::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary)),
+            true,
+        )
+        .with_metadata(wide.metadata().clone());
+        let ree = Field::new(
+            "x",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::LargeBinary, true)),
+            ),
+            true,
+        )
+        .with_metadata(wide.metadata().clone());
+        for field in [dict, ree] {
+            let errs = validate_pipeline_decimal_arb(
+                &Schema::new(vec![field]),
+                ConnectorKind::ClickHouse,
+                &[],
+            )
+            .unwrap_err();
+            let msg = format!("{errs}");
+            assert_eq!(errs.len(), 1, "{msg}");
+            assert!(msg.contains("column `x`"), "{msg}");
+            assert!(!msg.contains("x.values"), "{msg}");
         }
     }
 

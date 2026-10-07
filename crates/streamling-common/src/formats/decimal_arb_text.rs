@@ -98,15 +98,14 @@ pub(crate) fn plain_layout_field(field: &Field) -> Option<Field> {
     match field.data_type() {
         DataType::RunEndEncoded(_, values) => {
             let values = plain_layout_field(values).unwrap_or_else(|| values.as_ref().clone());
+            // The run-end array carries no validity of its own; its nulls are
+            // the values field's, which the unwrapped field has to admit.
+            let nullable = field.is_nullable() || values.is_nullable();
             Some(if DecimalArbType::is_decimal_arb_field(&values) {
-                Field::new(
-                    field.name(),
-                    values.data_type().clone(),
-                    field.is_nullable() || values.is_nullable(),
-                )
-                .with_metadata(values.metadata().clone())
+                Field::new(field.name(), values.data_type().clone(), nullable)
+                    .with_metadata(values.metadata().clone())
             } else {
-                field_with_type(field, values.data_type().clone())
+                field_with_type(field, values.data_type().clone()).with_nullable(nullable)
             })
         }
         other => plain_layout(other).map(|plain| field_with_type(field, plain)),
@@ -580,5 +579,117 @@ pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> 
             other,
             target.name(),
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::decimal_arb::DecimalArbArrayBuilder;
+    use datafusion::arrow::array::{Int32Array, RunArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::datatypes::Int32Type;
+
+    fn leaves(values: &[&str]) -> ArrayRef {
+        let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "v", 78, 0).unwrap();
+        for v in values {
+            b.append_str(v).unwrap();
+        }
+        let (raw, _, _) = b.finish().into_inner();
+        Arc::new(raw)
+    }
+
+    fn texts(array: &ArrayRef) -> Vec<Option<String>> {
+        array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(str::to_string))
+            .collect()
+    }
+
+    /// A sliced list or map shares its whole child with the array it was cut
+    /// from; the text bridge converts only the window the slice owns.
+    #[test]
+    fn sliced_lists_and_maps_convert_only_their_own_elements() {
+        let item = Arc::new(DecimalArbType::field("item", 78, 0, true).unwrap());
+        let all: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+        let list: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(&item),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, 100)),
+                leaves(&all.iter().map(String::as_str).collect::<Vec<_>>()),
+                None,
+            )
+            .unwrap(),
+        );
+        let field = Field::new("l", DataType::List(item), true);
+        let (f, a) = decimal_arb_leaves_to_text(&field, &list.slice(40, 2)).unwrap();
+        let la = a.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(
+            la.values().len(),
+            2,
+            "only the slice's elements are rewritten"
+        );
+        assert_eq!(la.value_offsets(), &[0, 1, 2]);
+        assert_eq!(
+            texts(la.values()),
+            vec![Some("40".into()), Some("41".into())]
+        );
+        assert_eq!(f.data_type(), a.data_type());
+
+        let key = Arc::new(Field::new("key", DataType::Utf8, false));
+        let value = Arc::new(DecimalArbType::field("value", 78, 0, true).unwrap());
+        let entry = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![Arc::clone(&key), Arc::clone(&value)].into()),
+            false,
+        ));
+        let entries = StructArray::try_new(
+            vec![key, value].into(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                leaves(&["1", "2", "3"]),
+            ],
+            None,
+        )
+        .unwrap();
+        let map: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::clone(&entry),
+                OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+                entries,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let field = Field::new("m", DataType::Map(entry, false), true);
+        let (_, a) = decimal_arb_leaves_to_text(&field, &map.slice(2, 1)).unwrap();
+        let ma = a.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(ma.entries().len(), 1);
+        assert_eq!(texts(ma.values()), vec![Some("3".into())]);
+    }
+
+    /// A run-end-encoded column's nulls live in its values field, so the
+    /// unwrapped field is nullable whenever the values are, whatever the
+    /// outer field declared.
+    #[test]
+    fn run_end_encoded_unwrap_admits_the_values_nulls() {
+        let ree = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![1, 2]),
+            &Int32Array::from(vec![Some(1), None]),
+        )
+        .unwrap();
+        let field = Field::new("r", ree.data_type().clone(), false);
+        let plain = plain_layout_field(&field).unwrap();
+        assert_eq!(plain.data_type(), &DataType::Int32);
+        assert!(plain.is_nullable());
+        assert_eq!(plain.name(), "r");
+        let (_, array) = to_plain_layout(&field, &(Arc::new(ree) as ArrayRef))
+            .unwrap()
+            .unwrap();
+        assert_eq!(array.null_count(), 1);
     }
 }

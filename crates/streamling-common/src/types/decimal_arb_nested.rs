@@ -133,7 +133,7 @@ pub fn rewrite_decimal_arb_leaves(
                 .ok_or_else(|| downcast_err("StructArray"))?;
             let mut fields = Vec::with_capacity(children.len());
             let mut columns = Vec::with_capacity(children.len());
-            for (c, column) in children.iter().zip(sa.columns()) {
+            for ((c, own), column) in children.iter().zip(sa.fields()).zip(sa.columns()) {
                 let (f, a) = if field_contains_decimal_arb(c) {
                     // An encoded child (dictionary / run-end) cannot take a
                     // null buffer of its own, so it is unwrapped before the
@@ -149,7 +149,11 @@ pub fn rewrite_decimal_arb_leaves(
                         )?,
                     }
                 } else {
-                    (Arc::clone(c), Arc::clone(column))
+                    // Kept as the array declares it: a batch is accepted with
+                    // nested field names and metadata that differ from its
+                    // schema's, and `StructArray::try_new` compares the two
+                    // exactly.
+                    (Arc::clone(own), Arc::clone(column))
                 };
                 fields.push(f);
                 columns.push(a);

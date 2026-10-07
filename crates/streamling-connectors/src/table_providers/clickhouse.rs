@@ -8396,8 +8396,7 @@ mod nested_decimal_arb_tests {
                     .unwrap();
                 let status = response.status();
                 let body = response.text().await.unwrap();
-                assert!(status.is_success(), "{sql}: {body}");
-                body
+                (sql, status, body)
             }
         };
         let types = query(format!(
@@ -8406,7 +8405,13 @@ mod nested_decimal_arb_tests {
         ))
         .await;
         let rows = query(format!("{} FORMAT TSV", select.replace("{table}", &table))).await;
+        // The table goes before the reads are judged, so a failing read does
+        // not leave it behind in the shared database.
         query(format!("DROP TABLE IF EXISTS {table}")).await;
+        let [types, rows] = [types, rows].map(|(sql, status, body)| {
+            assert!(status.is_success(), "{sql}: {body}");
+            body
+        });
         (types, rows)
     }
 
