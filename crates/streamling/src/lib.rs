@@ -2231,6 +2231,17 @@ impl Streamling {
                         &source_schema,
                     )?;
 
+                    // The JSON payload carries every decimal_arb leaf, nested
+                    // ones included, as decimal text; only a leaf under a
+                    // union has no encoding, and that is a startup error
+                    // rather than a failed request per batch.
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::SqsJson,
+                        None,
+                        &reference_name,
+                    )?;
+
                     let batch_flush_interval =
                         parse_batch_flush_interval(&webhook.batch_flush_interval, &reference_name)?;
                     let http_sink_provider = Arc::new(HttpTableProvider::new(

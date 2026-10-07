@@ -233,6 +233,100 @@ fn unsupported_layout(path: &str, layout: &DataType) -> crate::error::Streamling
     )
 }
 
+/// Shared fixture for the per-format nested decimal_arb tests: the plugin
+/// call-trace shape with 256-bit integer leaves at their boundaries.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, NativeIntKind};
+    use arrow::array::{ArrayRef, Int64Array, ListArray, RecordBatch, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field, Fields, Schema};
+    use std::sync::Arc;
+
+    pub(crate) const U256_MAX: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    pub(crate) const I256_MIN: &str =
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+    pub(crate) const I256_MAX: &str =
+        "57896044618658097711785492504343953926634992332820282019728792003956564819967";
+
+    fn hinted(name: &str, kind: NativeIntKind) -> Arc<Field> {
+        Arc::new(
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field(name, 78, 0, true).unwrap(),
+                kind,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn leaves(values: &[Option<&str>]) -> ArrayRef {
+        let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "v", 78, 0).unwrap();
+        for v in values {
+            match v {
+                Some(s) => b.append_str(s).unwrap(),
+                None => b.append_null(),
+            }
+        }
+        let (raw, _, _) = b.finish().into_inner();
+        Arc::new(raw)
+    }
+
+    /// Two rows:
+    /// - `traces: List<Struct<value: decimal_arb(78, 0) u256>>` —
+    ///   `[{1}, {10^18}]` and `[{2^256 - 1}, {null}]`;
+    /// - `signed: List<decimal_arb(78, 0) i256>` — `[-1, 0]` and
+    ///   `[-2^255, 2^255 - 1]`.
+    pub(crate) fn wide_int_traces_batch() -> RecordBatch {
+        let value = hinted("value", NativeIntKind::U256);
+        let trace_fields: Fields = vec![value].into();
+        let trace = Arc::new(Field::new(
+            "item",
+            DataType::Struct(trace_fields.clone()),
+            true,
+        ));
+        let structs = StructArray::try_new(
+            trace_fields,
+            vec![leaves(&[
+                Some("1"),
+                Some("1000000000000000000"),
+                Some(U256_MAX),
+                None,
+            ])],
+            None,
+        )
+        .unwrap();
+        let traces = ListArray::try_new(
+            Arc::clone(&trace),
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::new(structs),
+            None,
+        )
+        .unwrap();
+        let signed_leaf = hinted("item", NativeIntKind::I256);
+        let signed = ListArray::try_new(
+            Arc::clone(&signed_leaf),
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            leaves(&[Some("-1"), Some("0"), Some(I256_MIN), Some(I256_MAX)]),
+            None,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("traces", DataType::List(trace), false),
+                Field::new("signed", DataType::List(signed_leaf), false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(traces),
+                Arc::new(signed),
+            ],
+        )
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

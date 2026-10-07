@@ -833,6 +833,33 @@ mod tests {
         assert!(row1.contains(r#""amount":null"#));
     }
 
+    /// 256-bit integer leaves nested in `List<Struct<..>>` / `List<..>` (the
+    /// plugin call-trace shape) serialize as their exact decimal values — the
+    /// encoding the Kafka JSON, webhook and print sinks share.
+    #[test]
+    fn nested_wide_int_leaves_serialize_as_their_values() {
+        use crate::types::decimal_arb_nested::fixtures::{
+            I256_MAX, I256_MIN, U256_MAX, wide_int_traces_batch,
+        };
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&wide_int_traces_batch())
+            .unwrap();
+        let rows: Vec<String> = rows
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                r#"{"id":1,"traces":[{"value":"1"},{"value":"1000000000000000000"}],"signed":["-1","0"]}"#
+                    .to_string(),
+                format!(
+                    r#"{{"id":2,"traces":[{{"value":"{U256_MAX}"}},{{"value":null}}],"signed":["{I256_MIN}","{I256_MAX}"]}}"#
+                ),
+            ]
+        );
+    }
+
     // ------- nested decimal_arb JSON serialization (F6) -------
 
     /// A `decimal_arb` nested inside a struct must serialize as its decimal

@@ -1633,4 +1633,53 @@ mod tests {
             ]
         );
     }
+
+    /// 256-bit integer leaves nested in `List<Struct<..>>` / `List<..>` (the
+    /// plugin call-trace shape) are encoded as Avro decimals carrying their
+    /// exact values, and the datum validates against the generated schema.
+    #[test]
+    fn nested_wide_int_leaves_encode_as_their_values() {
+        use crate::types::decimal_arb_nested::fixtures::{
+            I256_MAX, I256_MIN, U256_MAX, wide_int_traces_batch,
+        };
+
+        /// Every decimal (or null leaf) below `v`, in document order.
+        fn decimals(v: &Value, out: &mut Vec<Option<String>>) {
+            match v {
+                Value::Decimal(d) => {
+                    let bytes = <Vec<u8>>::try_from(d).expect("decimal -> bytes");
+                    out.push(Some(BigInt::from_signed_bytes_be(&bytes).to_string()));
+                }
+                Value::Null => out.push(None),
+                Value::Union(_, inner) => decimals(inner, out),
+                Value::Array(items) => items.iter().for_each(|i| decimals(i, out)),
+                Value::Record(fields) => fields.iter().for_each(|(_, f)| decimals(f, out)),
+                _ => {}
+            }
+        }
+
+        let batch = wide_int_traces_batch();
+        let avro_schema = to_avro("R", &batch.schema().fields);
+        let mut seen = Vec::new();
+        for value in serialize(&avro_schema, &batch) {
+            let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
+            let decoded =
+                apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
+            decimals(&decoded, &mut seen);
+        }
+        let expected: Vec<Option<String>> = [
+            Some("1"),
+            Some("1000000000000000000"),
+            Some("-1"),
+            Some("0"),
+            Some(U256_MAX),
+            None,
+            Some(I256_MIN),
+            Some(I256_MAX),
+        ]
+        .iter()
+        .map(|v| v.map(str::to_string))
+        .collect();
+        assert_eq!(seen, expected);
+    }
 }
