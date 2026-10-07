@@ -174,7 +174,9 @@ impl JsonToArrowConverter {
                 .map(|f| {
                     // arrow_json has no Dictionary decoder: decode the value type and cast
                     // back in `convert_batch_to_original_schema`.
-                    // ponytail: top-level dictionaries only; a nested one still errors.
+                    // ponytail: other nested dictionaries still error; a nested
+                    // dictionary-encoded decimal_arb leaf is read as text by the
+                    // leaf rewrite like any other.
                     // A dictionary-encoded decimal_arb leaf keeps its metadata
                     // on the field, so the value type it decodes as is a
                     // decimal_arb leaf and is read as text like any other.
