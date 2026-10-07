@@ -243,6 +243,51 @@ pub fn capability_for_decimal_arb(
     }
 }
 
+/// [`capability_for_decimal_arb`] for a decimal_arb leaf nested inside a
+/// column (Struct / List / Map / …) rather than a top-level column.
+/// `coerce_to_string` is the directive on the top-level column the leaf
+/// belongs to; a directive cannot name a nested leaf.
+///
+/// Where it differs from the top-level decision:
+///
+/// - **ClickHouse**: the column's `coerce_to: string` turns *every* leaf under
+///   it into a `String`, narrow ones included — the directive is the one
+///   switch a nested leaf has. (A top-level column keeps its native
+///   `Decimal(p, s)` at precision ≤ 76 whatever the directive says, which
+///   existing tables rely on.) A wide unhinted leaf is rejected with a hint
+///   that does not point at `schema_override`, whose native-int pins match
+///   top-level columns only.
+/// - **Postgres**: a container column is written as JSONB text, where a
+///   nested leaf is a decimal string of any precision, so `NUMERIC`'s
+///   precision cap does not apply to it.
+pub fn capability_for_nested_decimal_arb(
+    kind: ConnectorKind,
+    precision: u32,
+    scale: u32,
+    coerce_to_string: bool,
+    native_int_kind: Option<crate::types::decimal_arb::NativeIntKind>,
+) -> CapabilityResult {
+    match kind {
+        ConnectorKind::ClickHouse | ConnectorKind::Hybrid => {
+            if coerce_to_string {
+                return CapabilityResult::OptInOnly(CoercionDirective::String);
+            }
+            match capability_for_decimal_arb(kind, precision, scale, false, native_int_kind) {
+                CapabilityResult::Reject(_) => CapabilityResult::Reject(format!(
+                    "ClickHouse Decimal precision is capped at {} digits; declared precision {} \
+                     exceeds the cap. Add `coerce_to: string` under the top-level column that \
+                     holds this field in the sink YAML to write its decimal leaves as Strings, or \
+                     reduce declared precision to ≤{} if the source data fits.",
+                    MAX_CLICKHOUSE_DECIMAL_PRECISION, precision, MAX_CLICKHOUSE_DECIMAL_PRECISION,
+                )),
+                other => other,
+            }
+        }
+        ConnectorKind::Postgres => CapabilityResult::Native,
+        _ => capability_for_decimal_arb(kind, precision, scale, coerce_to_string, native_int_kind),
+    }
+}
+
 /// Build the user-facing config-load error string for a given Reject result.
 /// Centralizes the error format so every connector emits a consistent shape:
 /// column, connector, declared (p, s), reason, hint.
@@ -417,10 +462,11 @@ fn collect_nested_in_type(
 /// Non-decimal_arb fields are ignored.
 ///
 /// Leaves nested inside a Struct / List / Map (or any other container layout)
-/// get the same decision as a top-level column would, under the column's
+/// are decided by [`capability_for_nested_decimal_arb`] under the column's
 /// directive: every connector that writes whole containers (JSON, Avro,
-/// ClickHouse `Array` / `Tuple` / `Map`, …) carries the leaf exactly when it
-/// would carry the column. Hybrid converts top-level columns only, so a nested
+/// ClickHouse `Array` / `Tuple` / `Map`, Postgres JSONB, …) carries the leaf
+/// when it would carry the column, and Postgres carries it at any precision
+/// as JSON text. Hybrid converts top-level columns only, so a nested
 /// leaf is rejected outright there rather than written as raw bytes, and a
 /// leaf anywhere inside a `Union` is rejected for every connector because
 /// nothing serialises decimal_arb through one.
@@ -481,9 +527,12 @@ pub fn validate_pipeline_decimal_arb(
                 ));
                 continue;
             }
-            if let CapabilityResult::Reject(reason) =
+            let capability = if i >= top_level {
+                capability_for_nested_decimal_arb(kind, precision, scale, coerce_to_string, hint)
+            } else {
                 capability_for_decimal_arb(kind, precision, scale, coerce_to_string, hint)
-            {
+            };
+            if let CapabilityResult::Reject(reason) = capability {
                 errors.push(config_load_error(&path, kind, precision, scale, &reason));
             }
         }
@@ -1089,6 +1138,62 @@ mod tests {
         assert!(
             validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &directives).is_ok()
         );
+    }
+
+    #[test]
+    fn clickhouse_nested_reject_does_not_suggest_a_top_level_only_remedy() {
+        // `schema_override` native-int pins match top-level columns only, so
+        // the hint for a nested leaf must not point there.
+        let schema = traces_schema(DecimalArbType::field("value", 100, 0, true).unwrap());
+        let msg = format!(
+            "{}",
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err()
+        );
+        assert!(msg.contains("traces.item.value"), "{msg}");
+        assert!(msg.contains("coerce_to: string"), "{msg}");
+        assert!(!msg.contains("schema_override"), "{msg}");
+
+        // The same column at the top level keeps the schema_override hint.
+        let top = Schema::new(vec![DecimalArbType::field("value", 100, 0, true).unwrap()]);
+        let msg = format!(
+            "{}",
+            validate_pipeline_decimal_arb(&top, ConnectorKind::ClickHouse, &[]).unwrap_err()
+        );
+        assert!(msg.contains("schema_override"), "{msg}");
+    }
+
+    #[test]
+    fn clickhouse_nested_coerce_to_string_covers_every_leaf() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // A nested leaf under a `coerce_to: string` column is a String
+        // whatever its precision or hint; a top-level narrow column under the
+        // same directive keeps its native Decimal.
+        for hint in [None, Some(NativeIntKind::U256)] {
+            assert_eq!(
+                capability_for_nested_decimal_arb(ConnectorKind::ClickHouse, 50, 0, true, hint),
+                CapabilityResult::OptInOnly(CoercionDirective::String)
+            );
+        }
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::ClickHouse, 50, 5, true, None),
+            CapabilityResult::Native
+        );
+        // Without the directive a nested leaf gets the top-level decision.
+        assert_eq!(
+            capability_for_nested_decimal_arb(ConnectorKind::ClickHouse, 50, 5, false, None),
+            CapabilityResult::Native
+        );
+    }
+
+    #[test]
+    fn postgres_nested_leaves_are_json_text_at_any_precision() {
+        // Postgres writes container columns as JSONB, where a leaf is a
+        // decimal string; NUMERIC's precision cap applies to top-level
+        // columns only, and no directive exists to opt a nested leaf out.
+        let schema = traces_schema(DecimalArbType::field("value", 1200, 0, true).unwrap());
+        assert!(validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_ok());
+        let top = Schema::new(vec![DecimalArbType::field("value", 1200, 0, true).unwrap()]);
+        assert!(validate_pipeline_decimal_arb(&top, ConnectorKind::Postgres, &[]).is_err());
     }
 
     #[test]

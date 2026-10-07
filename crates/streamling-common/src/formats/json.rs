@@ -860,6 +860,67 @@ mod tests {
         );
     }
 
+    /// A run-end-encoded decimal_arb column keeps its metadata on the values
+    /// field; unwrapping it used to drop that metadata, and the leaf printed
+    /// as the hex of its canonical bytes. A sliced batch prints its own rows.
+    #[test]
+    fn run_end_encoded_and_sliced_nested_leaves_serialize_as_their_values() {
+        use crate::types::decimal_arb_nested::fixtures::{U256_MAX, wide_int_traces_batch};
+        use datafusion::arrow::datatypes::Int32Type;
+
+        let values = Arc::new(DecimalArbType::field("values", 78, 0, true).unwrap());
+        let mut b = DecimalArbArrayBuilder::with_capacity(2, "v", 78, 0).unwrap();
+        b.append_str("1").unwrap();
+        b.append_str(U256_MAX).unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let ree = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![1, 2]), &raw).unwrap();
+        let DataType::RunEndEncoded(run_ends, _) = ree.data_type().clone() else {
+            unreachable!()
+        };
+        let ree_type = DataType::RunEndEncoded(run_ends, values);
+        let ree = make_array(
+            ree.to_data()
+                .into_builder()
+                .data_type(ree_type.clone())
+                .build()
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ree", ree_type, true)])),
+            vec![ree],
+        )
+        .unwrap();
+        let rows: Vec<String> = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                r#"{"ree":"1"}"#.to_string(),
+                format!(r#"{{"ree":"{U256_MAX}"}}"#)
+            ]
+        );
+
+        let sliced = wide_int_traces_batch().slice(1, 1);
+        let rows: Vec<String> = FromArrowToJsonConverter::new()
+            .convert_from_batch(&sliced)
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].starts_with(&format!(
+                r#"{{"id":2,"traces":[{{"value":"{U256_MAX}"}},{{"value":null}}]"#
+            )),
+            "{}",
+            rows[0]
+        );
+    }
+
     // ------- nested decimal_arb JSON serialization (F6) -------
 
     /// A `decimal_arb` nested inside a struct must serialize as its decimal

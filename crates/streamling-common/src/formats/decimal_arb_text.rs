@@ -13,8 +13,9 @@ use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalA
 use arrow_schema::{DataType, Field, Fields};
 use datafusion::arrow::array::{
     Array, ArrayRef, FixedSizeListArray, LargeBinaryArray, LargeListArray, ListArray, MapArray,
-    StringArray, StructArray,
+    OffsetSizeTrait, StringArray, StructArray,
 };
+use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::cast;
 use datafusion::common::{DataFusionError, Result};
 use std::str::FromStr;
@@ -62,6 +63,76 @@ pub(crate) fn plain_layout(data_type: &DataType) -> Option<DataType> {
         }
         _ => None,
     }
+}
+
+/// [`plain_layout`] at the field level: `field` rebuilt with its plain layout,
+/// or `None` when it already is one.
+///
+/// A run-end encoding is the one layout whose values sit in a field of their
+/// own, so a decimal_arb leaf held directly by it carries its extension
+/// metadata on that values field. Rebuilding the outer field with only the
+/// unwrapped type dropped that metadata: the leaf was no longer recognised as
+/// decimal_arb, and its canonical bytes went out as an opaque binary/string
+/// value. The unwrapped field takes the values field's metadata instead (and
+/// the outer field's name, which is the one the batch carries).
+pub(crate) fn plain_layout_field(field: &Field) -> Option<Field> {
+    match field.data_type() {
+        DataType::RunEndEncoded(_, values) => {
+            let values = plain_layout_field(values).unwrap_or_else(|| values.as_ref().clone());
+            Some(if DecimalArbType::is_decimal_arb_field(&values) {
+                Field::new(
+                    field.name(),
+                    values.data_type().clone(),
+                    field.is_nullable() || values.is_nullable(),
+                )
+                .with_metadata(values.metadata().clone())
+            } else {
+                field_with_type(field, values.data_type().clone())
+            })
+        }
+        other => plain_layout(other).map(|plain| field_with_type(field, plain)),
+    }
+}
+
+/// `(field, array)` cast to its plain layout (see [`plain_layout_field`]), or
+/// `None` when it already is one.
+pub(crate) fn to_plain_layout(
+    field: &Field,
+    array: &ArrayRef,
+) -> std::result::Result<Option<(Field, ArrayRef)>, arrow_schema::ArrowError> {
+    let Some(plain) = plain_layout_field(field) else {
+        return Ok(None);
+    };
+    let plain_array = cast(array.as_ref(), plain.data_type())?;
+    Ok(Some((plain, plain_array)))
+}
+
+/// The part of a list's (or map's) child that its offsets reference, with
+/// the offsets rebased to start at zero.
+///
+/// Slicing a `ListArray` / `LargeListArray` / `MapArray` slices only its
+/// offsets; the child keeps every element of the original array. A walk that
+/// rewrites the child as a whole therefore converts — and range-checks —
+/// elements that belong to rows outside the slice, once per slice. Sinks
+/// routinely receive such zero-copy slices (repartitioning hands each output
+/// partition a slice of one gathered batch), so the walks trim the child to
+/// the window first.
+pub(crate) fn trim_list_child<O: OffsetSizeTrait>(
+    offsets: &OffsetBuffer<O>,
+    child: &ArrayRef,
+) -> (OffsetBuffer<O>, ArrayRef) {
+    // An offset buffer always holds at least one entry.
+    let first = offsets[0];
+    let last = offsets[offsets.len() - 1];
+    let (start, end) = (first.as_usize(), last.as_usize());
+    if start == 0 && end == child.len() {
+        return (offsets.clone(), Arc::clone(child));
+    }
+    let rebased: Vec<O> = offsets.iter().map(|o| *o - first).collect();
+    (
+        OffsetBuffer::new(rebased.into()),
+        child.slice(start, end - start),
+    )
 }
 
 /// Rebuild `orig` with a new `DataType`, preserving its name, nullability, and
@@ -125,10 +196,10 @@ pub(crate) fn decimal_arb_leaves_to_text(
     // A list view or a dictionary-/run-end-encoded container: the arrow-json
     // writer rendered the leaves inside these as hex because the walk below
     // never reached them. Cast to the plain layout and walk that instead.
-    if let Some(plain) = plain_layout(field.data_type()) {
-        let plain_array = cast(array.as_ref(), &plain)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        return decimal_arb_leaves_to_text(&field_with_type(field, plain), &plain_array);
+    if let Some((plain, plain_array)) =
+        to_plain_layout(field, array).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+    {
+        return decimal_arb_leaves_to_text(&plain, &plain_array);
     }
 
     let downcast_err = |what: &str| {
@@ -165,9 +236,10 @@ pub(crate) fn decimal_arb_leaves_to_text(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| downcast_err("ListArray"))?;
-            let (nf, nv) = decimal_arb_leaves_to_text(child, la.values())?;
+            let (offsets, values) = trim_list_child(la.offsets(), la.values());
+            let (nf, nv) = decimal_arb_leaves_to_text(child, &values)?;
             let nf = Arc::new(nf);
-            let new_arr = ListArray::new(nf.clone(), la.offsets().clone(), nv, la.nulls().cloned());
+            let new_arr = ListArray::new(nf.clone(), offsets, nv, la.nulls().cloned());
             Ok((
                 field_with_type(field, DataType::List(nf)),
                 Arc::new(new_arr) as ArrayRef,
@@ -178,10 +250,10 @@ pub(crate) fn decimal_arb_leaves_to_text(
                 .as_any()
                 .downcast_ref::<LargeListArray>()
                 .ok_or_else(|| downcast_err("LargeListArray"))?;
-            let (nf, nv) = decimal_arb_leaves_to_text(child, la.values())?;
+            let (offsets, values) = trim_list_child(la.offsets(), la.values());
+            let (nf, nv) = decimal_arb_leaves_to_text(child, &values)?;
             let nf = Arc::new(nf);
-            let new_arr =
-                LargeListArray::new(nf.clone(), la.offsets().clone(), nv, la.nulls().cloned());
+            let new_arr = LargeListArray::new(nf.clone(), offsets, nv, la.nulls().cloned());
             Ok((
                 field_with_type(field, DataType::LargeList(nf)),
                 Arc::new(new_arr) as ArrayRef,
@@ -215,6 +287,7 @@ pub(crate) fn decimal_arb_leaves_to_text(
                 .downcast_ref::<MapArray>()
                 .ok_or_else(|| downcast_err("MapArray"))?;
             let entries: ArrayRef = Arc::new(ma.entries().clone());
+            let (offsets, entries) = trim_list_child(ma.offsets(), &entries);
             let (nef, nea) = decimal_arb_leaves_to_text(entry_field, &entries)?;
             let nef = Arc::new(nef);
             let new_entries = nea
@@ -224,7 +297,7 @@ pub(crate) fn decimal_arb_leaves_to_text(
                 .clone();
             let new_arr = MapArray::new(
                 nef.clone(),
-                ma.offsets().clone(),
+                offsets,
                 new_entries,
                 ma.nulls().cloned(),
                 *sorted,
