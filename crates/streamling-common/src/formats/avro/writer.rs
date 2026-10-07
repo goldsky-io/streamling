@@ -183,17 +183,19 @@ fn arrow_to_avro(name: &str, dt: &DataType) -> serde_json::value::Value {
 }
 
 fn get_field_schema<'a>(schema: &'a Schema, name: &str, nullable: bool) -> &'a Schema {
-    let Schema::Record(record_schema) = schema else {
-        panic!("invalid avro schema -- struct field {name} should correspond to record schema");
+    // For lists the name is empty, but the schema argument is already the item
+    // schema — a `["null", item]` union when the item is nullable, which is
+    // unwrapped below like a nullable record field. Returning the union as-is
+    // panicked on every list of nullable structs (or lists), whatever they held.
+    let schema = if name.is_empty() {
+        schema
+    } else {
+        let Schema::Record(record_schema) = schema else {
+            panic!("invalid avro schema -- struct field {name} should correspond to record schema");
+        };
+        let record_field_number = record_schema.lookup.get(name).unwrap();
+        &record_schema.fields[*record_field_number].schema
     };
-
-    // For lists the name is empty, but the schema argument is already the item schema
-    if name.is_empty() {
-        return schema;
-    }
-
-    let record_field_number = record_schema.lookup.get(name).unwrap();
-    let schema = &record_schema.fields[*record_field_number].schema;
 
     if nullable {
         let Schema::Union(__union_schema) = schema else {
@@ -1562,5 +1564,73 @@ mod tests {
             .unwrap()
             .to_canonical_bytes_at_scale(0);
         assert_eq!(canonical, expected);
+    }
+
+    /// A list whose items are nullable structs: the item schema is a
+    /// `["null", record]` union, and a null item stays null.
+    #[test]
+    fn list_of_nullable_structs_round_trips() {
+        use datafusion::arrow::array::{Int64Array, ListArray, StructArray};
+        use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let a = Arc::new(Field::new("a", DataType::Int64, true));
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::clone(&a)].into()),
+            true,
+        ));
+        let structs = StructArray::try_new(
+            vec![a].into(),
+            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))],
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let list = ListArray::try_new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2, 3].into()),
+            Arc::new(structs),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "items",
+            DataType::List(item),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list)]).unwrap();
+
+        let avro_schema = to_avro("R", &schema.fields);
+        let decoded: Vec<Value> = serialize(&avro_schema, &batch)
+            .into_iter()
+            .map(|value| {
+                let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
+                apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap()
+            })
+            .collect();
+        let item = |a: Option<i64>| {
+            Value::Union(
+                1,
+                Box::new(Value::Record(vec![(
+                    "a".to_string(),
+                    match a {
+                        Some(a) => Value::Union(1, Box::new(Value::Long(a))),
+                        None => Value::Union(0, Box::new(Value::Null)),
+                    },
+                )])),
+            )
+        };
+        assert_eq!(
+            decoded,
+            vec![
+                Value::Record(vec![(
+                    "items".to_string(),
+                    Value::Array(vec![item(Some(1)), Value::Union(0, Box::new(Value::Null))]),
+                )]),
+                Value::Record(vec![(
+                    "items".to_string(),
+                    Value::Array(vec![item(Some(3))]),
+                )]),
+            ]
+        );
     }
 }
