@@ -22,7 +22,7 @@ use streamling_common::functions::decimal_arb_aggregates::{
 };
 use streamling_common::functions::decimal_arb_coercion::DecimalArbExprPlanner;
 use streamling_common::functions::decimal_arb_ops::{
-    DecimalArbCastFunc, DecimalArbStripMetaFunc, DecimalArbWithMetaFunc,
+    DecimalArbStripMetaFunc, DecimalArbWithMetaFunc,
 };
 use streamling_common::functions::decimal_arb_predicate_optimizer::DecimalArbExprRewrite;
 use streamling_common::functions::decimal_arb_scale_unify::DecimalArbScaleUnifyRule;
@@ -270,8 +270,8 @@ impl SessionManager {
     /// decimal_arb different from what was declared, put the same `decimal_arb_with_meta` relabel
     /// on top of the declared plan. It passes the bytes through untouched, so it only changes the
     /// declared field. Likewise, a column declared with decimal_arb metadata it does not produce
-    /// (a cast of decimal_arb to `BIGINT`, `DOUBLE` or `DECIMAL(p, s)`) gets the metadata dropped
-    /// with `decimal_arb_strip_meta`. A plan that needs no relabelling is returned as is.
+    /// (a cast of decimal_arb to `BIGINT`, `DOUBLE`, `DECIMAL(p, s)` or `TEXT`) gets the metadata
+    /// dropped with `decimal_arb_strip_meta`. A plan that needs no relabelling is returned as is.
     fn declare_resolved_decimal_arb_fields(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         // A plan that cannot be resolved fails later with its usual context, not from here.
         let Ok(resolved) = self.ctx.state().optimize(&plan) else {
@@ -293,12 +293,13 @@ impl SessionManager {
                 let Some((precision, scale)) =
                     DecimalArbType::precision_scale_from_field(resolved_field)
                 else {
-                    // A numeric cast of decimal_arb is declared with its operand's decimal_arb
-                    // metadata (DataFusion copies a cast operand's metadata, and a UNION keeps
-                    // its first input's); the lowered cast produces none. Drop it from the
-                    // declared field, or a reader of the metadata alone would take an `Int64`
-                    // for a decimal_arb.
-                    if DecimalArbCastFunc::supports(declared_field.data_type())
+                    // A cast of decimal_arb to a number or to text is declared with its
+                    // operand's decimal_arb metadata (DataFusion copies a cast operand's
+                    // metadata, and a UNION keeps the keys its non-empty inputs agree on); the
+                    // lowered cast produces none. Drop it from the declared field, or a reader
+                    // of the metadata alone would take an `Int64` or a `Utf8` for a
+                    // decimal_arb. Only the `LargeBinary` storage can carry the metadata.
+                    if declared_field.data_type() != &arrow::datatypes::DataType::LargeBinary
                         && DecimalArbType::without_decimal_arb_metadata(declared_field.metadata())
                             .is_some()
                     {

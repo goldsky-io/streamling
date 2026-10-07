@@ -247,6 +247,7 @@ async fn declared_cast_fields_match_the_executed_fields() {
     ] {
         let (declared, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         let executed = batches[0].schema();
+        assert_eq!(declared.fields().len(), executed.fields().len(), "{sql}");
         for (d, e) in declared.fields().iter().zip(executed.fields()) {
             assert_eq!(d.data_type(), e.data_type(), "{sql}: {}", d.name());
             assert_eq!(d.metadata(), e.metadata(), "{sql}: {}", d.name());
@@ -488,7 +489,12 @@ async fn bare_numeric_over_decimal_arb_stays_decimal_arb() {
         "SELECT id, ROUND(CAST(ts AS NUMERIC), 2) AS v FROM t",
         "SELECT id, CAST(ts AS NUMERIC) * CAST(id AS DOUBLE) AS v FROM t",
     ] {
-        assert!(run(sql).await.is_err(), "{sql}");
+        // Refused for being decimal_arb, not for any other planning reason.
+        let err = run(sql).await.expect_err(sql);
+        assert!(
+            err.contains("decimal_arb") || err.contains("LargeBinary"),
+            "{sql}: {err}"
+        );
     }
     let sql =
         "SELECT id, CAST(ts AS NUMERIC(38, 10)) * CAST(id AS DOUBLE) AS v FROM t WHERE id = 1";
@@ -573,8 +579,73 @@ async fn cast_of_a_derived_case_or_unnest_column_is_not_supported_yet() {
         "SELECT id, CAST(unnest(make_array(gas, ts)) AS NUMERIC) AS v FROM t",
     ] {
         let err = run(sql).await.expect_err(sql);
-        assert!(err.contains("LargeBinary"), "{sql}: {err}");
+        assert!(
+            err.contains("Unsupported CAST from LargeBinary to Int64")
+                || err.contains("Unsupported CAST from LargeBinary to Decimal128(38, 10)"),
+            "{sql}: {err}"
+        );
     }
+}
+
+/// A text cast of a decimal_arb expression, which the SQL preprocessor
+/// leaves to the analyzer, is declared without the operand's metadata.
+#[tokio::test]
+async fn text_cast_of_an_expression_is_declared_without_decimal_arb_metadata() {
+    let sql = "SELECT id, CAST(amount + amount AS TEXT) AS s FROM t WHERE id = 1";
+    let (declared, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let s = declared.field_with_name("s").unwrap();
+    assert!(
+        DecimalArbType::without_decimal_arb_metadata(s.metadata()).is_none(),
+        "{s:?}"
+    );
+    assert_eq!(
+        texts(&batches, "s"),
+        some(&["246913578024691357802469135780.246913578024691356"])
+    );
+}
+
+/// `DECIMAL(77..78, 0)` carries a `u256` hint from the type alone; an
+/// operand hinted `i256` keeps its signedness, so a negative value is not
+/// labelled unsigned (a ClickHouse sink would refuse it in a `UInt256`).
+#[tokio::test]
+async fn wide_integer_decimal_keeps_a_signed_operands_hint() {
+    for (sql, hint) in [
+        (
+            "SELECT id, CAST(signed AS DECIMAL(78, 0)) AS v FROM t",
+            NativeIntKind::I256,
+        ),
+        (
+            "SELECT id, TRY_CAST(signed AS DECIMAL(77, 0)) AS v FROM t",
+            NativeIntKind::I256,
+        ),
+        (
+            "SELECT id, CAST(gas AS DECIMAL(78, 0)) AS v FROM t",
+            NativeIntKind::U256,
+        ),
+        (
+            "SELECT id, CAST(amount AS DECIMAL(78, 0)) AS v FROM t",
+            NativeIntKind::U256,
+        ),
+    ] {
+        let (declared, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let field = declared.field_with_name("v").unwrap();
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(field),
+            Some(hint),
+            "{sql}"
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(
+                batches[0].schema().field_with_name("v").unwrap()
+            ),
+            Some(hint),
+            "{sql}: executed field"
+        );
+    }
+    assert_eq!(
+        column_of("SELECT id, CAST(signed AS DECIMAL(78, 0)) AS v FROM t", "v").await,
+        some(&["-5", I256_MIN, "0", "-9223372036854775808"])
+    );
 }
 
 #[tokio::test]

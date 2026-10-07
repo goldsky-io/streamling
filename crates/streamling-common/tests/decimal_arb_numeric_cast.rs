@@ -822,6 +822,22 @@ fn sql_cast_invoked_directly_takes_the_same_branch() {
         7
     );
 
+    // Raw bytes without decimal_arb metadata, bare NUMERIC: declared as
+    // themselves, and returned as themselves.
+    let bytes: FieldRef = Arc::new(Field::new("v", DataType::LargeBinary, true));
+    let raw = arb_array(&[Some("7"), None], 78, 0);
+    let (field, out) = call(
+        &DecimalArbSqlCastFunc::numeric(),
+        vec![
+            ColumnarValue::Array(raw.clone()),
+            ColumnarValue::Scalar(ScalarValue::Decimal128(None, 38, 10)),
+        ],
+        vec![bytes.clone(), decimal128.clone()],
+    )
+    .unwrap();
+    assert_eq!(field, bytes);
+    assert_eq!(out.into_array(2).unwrap().as_ref(), raw.as_ref());
+
     // decimal_arb, bare NUMERIC: the value itself.
     let values = arb_array(&[Some("1.000000000000000001"), None], 100, 18);
     let (field, out) = call(

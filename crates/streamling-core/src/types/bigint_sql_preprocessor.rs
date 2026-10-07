@@ -235,28 +235,24 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         )
     })?;
 
-    let decimal_columns = |schema: &arrow_schema::Schema| -> HashSet<String> {
-        schema
-            .fields()
-            .iter()
-            .filter(|f| crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(f))
-            .map(|f| f.name().to_string())
-            .collect()
-    };
     let mut decimal_arb_cols: HashSet<String> = HashSet::new();
+    let mut all_columns: HashSet<String> = HashSet::new();
+    let mut struct_leaves: HashSet<String> = HashSet::new();
     let mut by_qualifier: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut record_table = |table: &str, columns: HashSet<String>| {
-        decimal_arb_cols.extend(columns.iter().cloned());
+    let mut record_table = |table: &str, columns: TableColumns| {
+        decimal_arb_cols.extend(columns.decimal_arb.iter().cloned());
+        all_columns.extend(columns.all);
+        struct_leaves.extend(columns.struct_leaves);
         // Keyed by the full name and by the last segment, so `schema.t.c`,
         // `t.c` and an alias (added below) all resolve.
-        by_qualifier.insert(table.to_string(), columns.clone());
+        by_qualifier.insert(table.to_string(), columns.decimal_arb.clone());
         if let Some(last) = table.rsplit('.').next() {
-            by_qualifier.insert(last.to_string(), columns);
+            by_qualifier.insert(last.to_string(), columns.decimal_arb);
         }
     };
     record_table(
         &tables[0],
-        decimal_columns(table_provider.schema().as_ref()),
+        TableColumns::of(table_provider.schema().as_ref()),
     );
     // Joined tables contribute their decimal_arb columns too; one that
     // cannot be resolved here is left for DataFusion to report.
@@ -269,7 +265,7 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         let Ok(Some(provider)) = schema.table(table_name).await else {
             continue;
         };
-        record_table(table, decimal_columns(provider.schema().as_ref()));
+        record_table(table, TableColumns::of(provider.schema().as_ref()));
     }
     // Every alias a table is given resolves to that table's columns.
     let mut aliases = TableAliases {
@@ -279,6 +275,8 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
     let scope = DecimalArbNames {
         names: decimal_arb_cols,
         by_qualifier,
+        columns: all_columns,
+        struct_leaves,
         rebound: HashSet::new(),
     };
 
@@ -721,32 +719,98 @@ struct DecimalArbNames {
     /// qualified reference is resolved against its own table: `p.amt` next
     /// to a decimal_arb `q.amt` is not decimal_arb.
     by_qualifier: HashMap<String, HashSet<String>>,
-    /// Names some projection (a CTE, a derived table, a select item) binds to
-    /// an expression that is not decimal_arb. `names` is one set for the
-    /// whole statement, so such a name can still be in it from a table.
+    /// Every top-level column of every referenced table, whatever its type:
+    /// `s.amount` with `s` among them is a struct field access, decided by
+    /// [`Self::struct_leaves`], not a column qualified by a table or CTE.
+    columns: HashSet<String>,
+    /// Dotted paths (`s.amount`, `s.inner.v`) of the decimal_arb fields
+    /// reachable through the referenced tables' struct columns.
+    struct_leaves: HashSet<String>,
+    /// Names some projection (a CTE or a derived table) binds to an
+    /// expression that is not decimal_arb. `names` is one set for the whole
+    /// statement, so such a name can still be in it from a table.
     rebound: HashSet<String>,
+}
+
+/// What the preprocessor reads from a referenced table's schema.
+struct TableColumns {
+    /// The top-level decimal_arb columns.
+    decimal_arb: HashSet<String>,
+    /// Every top-level column.
+    all: HashSet<String>,
+    /// Dotted paths of the decimal_arb fields under struct columns.
+    struct_leaves: HashSet<String>,
+}
+
+impl TableColumns {
+    fn of(schema: &arrow_schema::Schema) -> Self {
+        use crate::types::decimal_arb::DecimalArbType;
+        fn leaves(field: &arrow_schema::Field, path: &str, out: &mut HashSet<String>) {
+            let arrow_schema::DataType::Struct(children) = field.data_type() else {
+                return;
+            };
+            for child in children.iter() {
+                let child_path = format!("{path}.{}", child.name());
+                if DecimalArbType::is_decimal_arb_field(child) {
+                    out.insert(child_path.clone());
+                }
+                leaves(child, &child_path, out);
+            }
+        }
+        let mut struct_leaves = HashSet::new();
+        for field in schema.fields() {
+            leaves(field, field.name(), &mut struct_leaves);
+        }
+        Self {
+            decimal_arb: schema
+                .fields()
+                .iter()
+                .filter(|f| DecimalArbType::is_decimal_arb_field(f))
+                .map(|f| f.name().to_string())
+                .collect(),
+            all: schema
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect(),
+            struct_leaves,
+        }
+    }
 }
 
 impl DecimalArbNames {
     fn collect(stmt: &Statement, mut names: Self) -> Self {
-        // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
-        // FROM a)`), so collect until nothing new appears.
-        loop {
-            let before = names.names.len();
-            let mut collector = AliasCollector { names: &mut names };
-            let _ = stmt.visit(&mut collector);
-            if names.names.len() == before {
+        // `names` and `rebound` depend on each other: an alias bound to
+        // `decimal_arb_cast_numeric(x, …)` is decimal_arb only while `x` is
+        // not rebound, and which names are rebound is decided by which are
+        // decimal_arb. Alternate the two until neither changes, restarting
+        // the aliases from the tables' columns each round so one recorded
+        // under an incomplete `rebound` does not stick.
+        let base = names.names.clone();
+        for _ in 0..8 {
+            names.names = base.clone();
+            // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
+            // FROM a)`), so collect until nothing new appears.
+            loop {
+                let before = names.names.len();
+                let mut collector = AliasCollector { names: &mut names };
+                let _ = stmt.visit(&mut collector);
+                if names.names.len() == before {
+                    break;
+                }
+            }
+            // Once `names` is complete, so a chained alias is not mistaken
+            // for a non-decimal one on an early pass.
+            let mut rebound = HashSet::new();
+            let _ = stmt.visit(&mut ReboundCollector {
+                names: &names,
+                rebound: &mut rebound,
+            });
+            if rebound == names.rebound {
                 break;
             }
+            names.rebound = rebound;
         }
-        // Once `names` is complete, so a chained alias is not mistaken for a
-        // non-decimal one on an early pass.
-        let mut rebound = HashSet::new();
-        let _ = stmt.visit(&mut ReboundCollector {
-            names: &names,
-            rebound: &mut rebound,
-        });
-        names.rebound = rebound;
         names
     }
 
@@ -795,16 +859,31 @@ impl DecimalArbNames {
 
     /// A (possibly qualified) column reference. A qualifier that names a
     /// referenced table or one of its aliases decides by that table's own
-    /// columns; any other qualifier (a CTE, a derived table) and a bare name
-    /// fall back to the name set.
+    /// columns; a leading segment that names one of the tables' columns
+    /// makes the rest a struct field path, decided by the struct's own
+    /// fields (`s.amount` is not the table's `amount`); any other qualifier
+    /// (a CTE, a derived table) and a bare name fall back to the name set.
     fn column_is_decimal(&self, parts: &[datafusion::logical_expr::sqlparser::ast::Ident]) -> bool {
         let Some(column) = parts.last() else {
             return false;
         };
-        if parts.len() >= 2
-            && let Some(columns) = self.by_qualifier.get(&parts[parts.len() - 2].value)
-        {
-            return columns.contains(&column.value);
+        if parts.len() >= 2 {
+            if let Some(columns) = self.by_qualifier.get(&parts[parts.len() - 2].value) {
+                return columns.contains(&column.value);
+            }
+            // `s.a.b`, or `t.s.a.b` under a table qualifier.
+            let struct_start = (0..parts.len() - 1).find(|&i| {
+                self.columns.contains(&parts[i].value)
+                    && (i == 0 || self.by_qualifier.contains_key(&parts[i - 1].value))
+            });
+            if let Some(start) = struct_start {
+                let path = parts[start..]
+                    .iter()
+                    .map(|p| p.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                return self.struct_leaves.contains(&path);
+            }
         }
         self.names.contains(&column.value)
     }
@@ -968,8 +1047,11 @@ impl Visitor for AliasCollector<'_> {
     }
 }
 
-/// Collects [`DecimalArbNames::rebound`] from every projection: CTE bodies,
-/// derived tables and plain selects.
+/// Collects [`DecimalArbNames::rebound`] from the projections other query
+/// blocks read: CTE bodies and derived tables. A select's own aliases are
+/// not visible to its own expressions (`SELECT CAST(amount AS DOUBLE) AS
+/// amount, CAST(amount AS NUMERIC) * 1.5 …` casts the table's column), so a
+/// plain select rebinds nothing.
 struct ReboundCollector<'a> {
     names: &'a DecimalArbNames,
     rebound: &'a mut HashSet<String>,
@@ -1001,11 +1083,6 @@ impl Visitor for ReboundCollector<'_> {
             self.rebound
                 .extend(self.names.rebound_names(select, Some(alias)));
         }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
-        self.rebound.extend(self.names.rebound_names(select, None));
         ControlFlow::Continue(())
     }
 }
@@ -1977,6 +2054,68 @@ mod tests {
                  FROM (SELECT CAST(amount AS DOUBLE) AS amount FROM t) s",
                 false,
             ),
+            // A select's own alias is not what its expressions refer to.
+            (
+                "SELECT CAST(amount AS DOUBLE) AS amount, CAST(amount AS NUMERIC) * 1.5 AS v \
+                 FROM t",
+                true,
+            ),
+            // An alias of a cast over a rebound name is not decimal_arb, even
+            // though the rebinding is only known once the aliases are.
+            (
+                "WITH c AS (SELECT CAST(amount AS TEXT) AS amount FROM t), \
+                 d AS (SELECT CAST(amount AS NUMERIC) AS v FROM c) \
+                 SELECT v * 1.5 AS w FROM d",
+                false,
+            ),
+        ] {
+            let rewritten = super::preprocess_bigint_sql(&ctx, sql).await.unwrap();
+            assert_eq!(
+                rewritten.contains("'1.5'"),
+                quoted,
+                "{sql}\n -> {rewritten}"
+            );
+        }
+    }
+
+    /// `s.amount` is the struct column `s`'s field, not the table's
+    /// decimal_arb `amount`: it is decided by the struct's own fields,
+    /// whether cast to a bare `NUMERIC` or used as is.
+    #[tokio::test]
+    async fn struct_fields_are_decided_by_the_struct_not_by_a_column_of_the_same_name() {
+        let ctx = setup_session_context();
+        let amount =
+            crate::types::decimal_arb::DecimalArbType::field("amount", 78, 0, false).unwrap();
+        let wide = crate::types::decimal_arb::DecimalArbType::field("wide", 100, 2, true).unwrap();
+        let s = Field::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    Field::new("amount", DataType::Float64, true),
+                    wide,
+                    Field::new(
+                        "inner",
+                        DataType::Struct(vec![Field::new("amount", DataType::Int64, true)].into()),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![amount, s]));
+        let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        for (sql, quoted) in [
+            ("SELECT CAST(s.amount AS NUMERIC) * 1.5 AS v FROM t", false),
+            ("SELECT s.amount * 1.5 AS v FROM t", false),
+            ("SELECT t.s.inner.amount * 1.5 AS v FROM t", false),
+            ("SELECT CAST(s.wide AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT s.wide * 1.5 AS v FROM t", true),
+            ("SELECT CAST(amount AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT CAST(\"amount\" AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT CAST(t.amount AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT t.amount * 1.5 AS v FROM t", true),
         ] {
             let rewritten = super::preprocess_bigint_sql(&ctx, sql).await.unwrap();
             assert_eq!(

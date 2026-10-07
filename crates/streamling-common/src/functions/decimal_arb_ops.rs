@@ -3375,6 +3375,12 @@ impl ScalarUDFImpl for DecimalArbSqlCastFunc {
             streamling_user_bail!("{} requires (value, fallback)", self.name());
         };
         if !DecimalArbType::is_decimal_arb_field(value_field) {
+            // Declared as itself by `return_field_from_args`.
+            if self.cast == DecimalArbSqlCast::Numeric
+                && value_field.data_type() == &DataType::LargeBinary
+            {
+                return Ok(value.clone());
+            }
             return Ok(fallback.clone());
         }
         match self.cast {

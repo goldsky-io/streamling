@@ -374,6 +374,18 @@ impl DecimalArbExprRewrite {
                 sf.func.name()
             )));
         };
+        // The fallback's hint is `u256` for every `DECIMAL(77..=78, 0)`, the
+        // only shape it can read from the type; a signed operand keeps its
+        // `i256`, so a negative value is not labelled unsigned.
+        let mut target = target.as_ref().clone();
+        if DecimalArbType::native_int_kind_from_field(&target).is_some()
+            && Self::field_of(&value, schema)
+                .and_then(|f| DecimalArbType::native_int_kind_from_field(&f))
+                == Some(NativeIntKind::I256)
+        {
+            target = DecimalArbType::with_native_int_kind(target, NativeIntKind::I256)
+                .map_err(DataFusionError::from)?;
+        }
         // The target (p, s) and hint travel as a typed NULL literal's metadata.
         let template = Expr::Literal(
             ScalarValue::LargeBinary(None),
