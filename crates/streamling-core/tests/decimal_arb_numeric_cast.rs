@@ -6,6 +6,10 @@
 //! `CAST(v AS BIGINT)` failed with "Unsupported CAST from LargeBinary to
 //! Int64" — in a projection and in a `WHERE` clause alike — and the only way
 //! out was a round trip through text (`TRY_CAST(CAST(v AS TEXT) AS BIGINT)`).
+//! A bare `CAST(v AS NUMERIC)` planned as `Decimal128(38, 10)`; over
+//! decimal_arb it now keeps the value as it is, and `DECIMAL(p > 76, s)`
+//! rounds it like `DECIMAL(p <= 76, s)` — both decided by the operand's
+//! type, not its name.
 use arrow::array::{Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray};
 use arrow::util::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema};
@@ -293,6 +297,286 @@ async fn text_round_trip_workaround_still_works() {
     assert_eq!(direct, vec![Some("21000".into()), None, None, None]);
 }
 
+const AMOUNTS: [Option<&str>; 4] = [
+    Some(WIDE_AMOUNT),
+    Some("-0.500000000000000000"),
+    None,
+    Some("1.000000000000000001"),
+];
+
+fn owned(values: &[Option<&str>]) -> Vec<Option<String>> {
+    values.iter().map(|v| v.map(str::to_string)).collect()
+}
+
+#[tokio::test]
+async fn bare_numeric_keeps_the_exact_decimal_arb_value() {
+    let (declared, batches) = run(
+        "SELECT id, CAST(amount AS NUMERIC) AS amount, TRY_CAST(amount AS DECIMAL) AS a2, \
+         amount::numeric AS a3, CAST(AMOUNT AS NUMERIC) AS a4, TRY_CAST(Amount AS NUMERIC) AS a5, \
+         CAST(gas AS NUMERIC) AS gas FROM t",
+    )
+    .await
+    .unwrap();
+    // Every spelling of the column, and of the cast, is the same value.
+    for name in ["amount", "a2", "a3", "a4", "a5"] {
+        let field = declared.field_with_name(name).unwrap();
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(field),
+            Some((100, 18)),
+            "{name}: {field:?}"
+        );
+        assert_eq!(texts(&batches, name), owned(&AMOUNTS), "{name}");
+    }
+    // The value is unchanged, so is a u256 hint (a ClickHouse sink keeps UInt256).
+    let gas = declared.field_with_name("gas").unwrap();
+    assert_eq!(
+        DecimalArbType::native_int_kind_from_field(gas),
+        Some(NativeIntKind::U256)
+    );
+    assert_eq!(texts(&batches, "gas")[1].as_deref(), Some(U256_MAX));
+
+    // Unaliased, the column is named as any cast of it is (the name cannot
+    // depend on the operand's type), declared and executed alike.
+    let (declared, batches) = run("SELECT id, CAST(amount AS NUMERIC) FROM t")
+        .await
+        .unwrap();
+    let (other_cast, _) = run("SELECT id, CAST(amount AS BIGINT) FROM t WHERE id = 3")
+        .await
+        .unwrap();
+    let name = other_cast.field(1).name();
+    assert!(DecimalArbType::is_decimal_arb_field(
+        declared.field_with_name(name).unwrap()
+    ));
+    assert_eq!(batches[0].schema().field(1).name(), name);
+}
+
+#[tokio::test]
+async fn bare_numeric_over_other_types_is_unchanged() {
+    let (declared, batches) =
+        run("SELECT id, CAST(id AS NUMERIC) AS n, CAST(CAST(ts AS BIGINT) AS NUMERIC) AS m FROM t")
+            .await
+            .unwrap();
+    for name in ["n", "m"] {
+        assert_eq!(
+            declared.field_with_name(name).unwrap().data_type(),
+            &DataType::Decimal128(38, 10)
+        );
+    }
+    assert_eq!(texts(&batches, "n")[0].as_deref(), Some("1.0000000000"));
+}
+
+/// The cast is decided by the type the operand has where it is used, not by
+/// its name: a CTE or derived table that rebinds a decimal_arb column's name
+/// to another type gets DataFusion's `Decimal128(38, 10)`, as a column of any
+/// other name does.
+#[tokio::test]
+async fn bare_numeric_over_a_rebound_name_is_a_decimal128_cast() {
+    let decimal = DataType::Decimal128(38, 10);
+    for (sql, expected) in [
+        (
+            "WITH c AS (SELECT id, CAST(ts AS VARCHAR) AS ts FROM t) \
+             SELECT id, CAST(ts AS NUMERIC) AS v FROM c WHERE id = 1",
+            "1700000000.0000000000",
+        ),
+        (
+            "WITH c AS (SELECT id, CAST(ts AS BIGINT) AS ts FROM t) \
+             SELECT id, CAST(ts AS NUMERIC) AS v FROM c WHERE id = 1",
+            "1700000000.0000000000",
+        ),
+        (
+            "SELECT id, CAST(s.ts AS NUMERIC) AS v \
+             FROM (SELECT id, CAST(ts AS BIGINT) AS ts FROM t) s WHERE id = 1",
+            "1700000000.0000000000",
+        ),
+        (
+            "WITH c AS (SELECT id, CAST(amount AS DOUBLE) AS amount FROM t) \
+             SELECT id, CAST(amount AS NUMERIC) AS v FROM c WHERE id = 2",
+            "-0.5000000000",
+        ),
+    ] {
+        let (declared, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(
+            declared.field_with_name("v").unwrap().data_type(),
+            &decimal,
+            "{sql}"
+        );
+        assert_eq!(texts(&batches, "v"), some(&[expected]), "{sql}");
+    }
+
+    // In arithmetic, decimal arithmetic: not integer division, and a
+    // fractional literal next to it is not quoted to text.
+    let sql = "WITH c AS (SELECT id, id AS amount FROM t) \
+               SELECT id, CAST(amount AS NUMERIC) / 4 AS q, CAST(amount AS NUMERIC) * 1.5 AS m \
+               FROM c WHERE id = 1";
+    let (_, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let q: f64 = texts(&batches, "q")[0].as_deref().unwrap().parse().unwrap();
+    let m: f64 = texts(&batches, "m")[0].as_deref().unwrap().parse().unwrap();
+    assert_eq!((q, m), (0.25, 1.5));
+    let sql = "WITH c AS (SELECT id, CAST(ts AS VARCHAR) AS ts FROM t) \
+               SELECT id, CAST(ts AS NUMERIC) * 2 AS v FROM c WHERE id = 1";
+    let v: f64 = column_of(sql, "v").await[0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(v, 3_400_000_000.0);
+
+    // The same TRY_CAST as one written over the text inline.
+    let rebound = column_of(
+        "WITH x AS (SELECT id, CAST(amount AS TEXT) AS amount FROM t) \
+         SELECT id, TRY_CAST(amount AS NUMERIC) AS amount FROM x",
+        "amount",
+    )
+    .await;
+    let inline = column_of(
+        "SELECT id, TRY_CAST(CAST(amount AS TEXT) AS NUMERIC) AS amount FROM t",
+        "amount",
+    )
+    .await;
+    assert_eq!(rebound, inline);
+    assert_eq!(
+        rebound,
+        vec![
+            None,
+            Some("-0.5000000000".into()),
+            None,
+            Some("1.0000000000".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn bare_numeric_reaches_through_expressions_and_aliases() {
+    let cases = [
+        "SELECT id, CAST(NULLIF(amount, 0) AS NUMERIC) AS v FROM t",
+        "SELECT id, CAST((amount) AS NUMERIC) AS v FROM t",
+        "WITH c AS (SELECT id, amount AS amt FROM t) SELECT id, CAST(amt AS NUMERIC) AS v FROM c",
+        "SELECT id, CAST(s.a AS NUMERIC) AS v FROM (SELECT id, amount AS a FROM t) s",
+        // A struct field and a list element: no name to recognise.
+        "SELECT id, CAST(named_struct('x', amount)['x'] AS NUMERIC) AS v FROM t",
+        "SELECT id, CAST(make_array(amount, amount)[1] AS NUMERIC) AS v FROM t",
+        "SELECT id, CAST(CASE WHEN id > 0 THEN amount END AS NUMERIC) AS v FROM t",
+    ];
+    for sql in cases {
+        let (declared, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(
+            DecimalArbType::is_decimal_arb_field(declared.field_with_name("v").unwrap()),
+            "{sql}: {declared:?}"
+        );
+        assert_eq!(texts(&batches, "v"), owned(&AMOUNTS), "{sql}");
+    }
+    // A function that yields decimal_arb.
+    let sql = "SELECT id, CAST(to_decimal_arb_from_int(id, 20, 0) AS NUMERIC) AS v FROM t";
+    let (declared, batches) = run(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert_eq!(
+        DecimalArbType::precision_scale_from_field(declared.field_with_name("v").unwrap()),
+        Some((20, 0))
+    );
+    assert_eq!(texts(&batches, "v"), some(&["1", "2", "3", "4"]));
+    // The operand keeps its grouping.
+    let v = column_of("SELECT id, CAST(gas - 1 AS NUMERIC) * 2 AS v FROM t", "v").await;
+    assert_eq!(v[0].as_deref(), Some("41998"));
+    let v = column_of("SELECT id, CAST(amount AS NUMERIC) * 1.5 AS v FROM t", "v").await;
+    assert_eq!(v[1].as_deref(), Some("-0.7500000000000000000"));
+}
+
+/// A bare `NUMERIC` over decimal_arb is still decimal_arb, so what refuses
+/// decimal_arb refuses it too; an explicit precision is a native decimal.
+#[tokio::test]
+async fn bare_numeric_over_decimal_arb_stays_decimal_arb() {
+    for sql in [
+        "SELECT id, ROUND(CAST(ts AS NUMERIC), 2) AS v FROM t",
+        "SELECT id, CAST(ts AS NUMERIC) * CAST(id AS DOUBLE) AS v FROM t",
+    ] {
+        assert!(run(sql).await.is_err(), "{sql}");
+    }
+    let sql =
+        "SELECT id, CAST(ts AS NUMERIC(38, 10)) * CAST(id AS DOUBLE) AS v FROM t WHERE id = 1";
+    assert_eq!(column_of(sql, "v").await, some(&["1700000000.0"]));
+}
+
+/// `DECIMAL(p > 76, s)` over decimal_arb rounds like `DECIMAL(p <= 76, s)`:
+/// a dropped digit rounds half away from zero, then the precision is checked.
+#[tokio::test]
+async fn wide_decimal_targets_round_like_narrow_ones() {
+    let (declared, batches) = run(
+        "SELECT id, CAST(amount AS DECIMAL(76, 0)) AS n0, CAST(amount AS DECIMAL(77, 0)) AS w0, \
+         TRY_CAST(amount AS DECIMAL(76, 2)) AS n2, TRY_CAST(amount AS DECIMAL(80, 2)) AS w2, \
+         TRY_CAST(TRY_CAST(amount AS DECIMAL(80, 0)) AS BIGINT) AS b, \
+         CAST(amount AS DECIMAL(78, 0)) AS u, CAST(id AS DECIMAL(80, 0)) AS i FROM t",
+    )
+    .await
+    .unwrap();
+    let rounded = vec![
+        Some("123456789012345678901234567890".into()),
+        Some("-1".into()),
+        None,
+        Some("1".into()),
+    ];
+    assert_eq!(texts(&batches, "n0"), rounded);
+    assert_eq!(texts(&batches, "w0"), rounded);
+    let rounded = vec![
+        Some("123456789012345678901234567890.12".into()),
+        Some("-0.50".into()),
+        None,
+        Some("1.00".into()),
+    ];
+    assert_eq!(texts(&batches, "n2"), rounded);
+    assert_eq!(texts(&batches, "w2"), rounded);
+    assert_eq!(
+        texts(&batches, "b"),
+        vec![None, Some("-1".into()), None, Some("1".into())]
+    );
+    let w2 = declared.field_with_name("w2").unwrap();
+    assert_eq!(
+        DecimalArbType::precision_scale_from_field(w2),
+        Some((80, 2))
+    );
+    // `DECIMAL(77..=78, 0)` keeps the u256 hint.
+    let u = declared.field_with_name("u").unwrap();
+    assert_eq!(
+        DecimalArbType::native_int_kind_from_field(u),
+        Some(NativeIntKind::U256)
+    );
+    // Any other operand goes through its text, as before.
+    assert_eq!(texts(&batches, "i"), some(&["1", "2", "3", "4"]));
+
+    // Past the precision: CAST errors naming the value, TRY_CAST is NULL.
+    let err = run("SELECT id, CAST(amount AS DECIMAL(80, 60)) AS v FROM t")
+        .await
+        .expect_err("30 integer digits do not fit DECIMAL(80, 60)");
+    assert!(
+        err.contains(WIDE_AMOUNT) && err.contains("out of range"),
+        "{err}"
+    );
+    let v = column_of(
+        "SELECT id, TRY_CAST(amount AS DECIMAL(80, 60)) AS v FROM t",
+        "v",
+    )
+    .await;
+    assert_eq!(v[0], None);
+    assert!(v[1].as_deref().unwrap().starts_with("-0.5000"));
+}
+
+/// Known limitation, not specific to casts: a `CASE` over decimal_arb only
+/// gets its metadata back in the analyzer, and an `unnest` of decimal_arb
+/// elements not at all, so read through a CTE or derived table (or unnested)
+/// the column is raw `LargeBinary` and does not cast. Comparisons and
+/// arithmetic fail on it the same way. A `CASE` written inline casts (see
+/// `casts_nested_in_case_coalesce_and_subqueries`).
+#[tokio::test]
+async fn cast_of_a_derived_case_or_unnest_column_is_not_supported_yet() {
+    for sql in [
+        "SELECT id FROM (SELECT id, CASE WHEN id > 1 THEN ts ELSE gas END AS x FROM t) s \
+         WHERE CAST(x AS BIGINT) > 100000",
+        "SELECT id, CAST(unnest(make_array(gas, ts)) AS BIGINT) AS v FROM t",
+        "SELECT id, CAST(unnest(make_array(gas, ts)) AS NUMERIC) AS v FROM t",
+    ] {
+        let err = run(sql).await.expect_err(sql);
+        assert!(err.contains("LargeBinary"), "{sql}: {err}");
+    }
+}
+
 #[tokio::test]
 async fn decimal_targets_rescale_and_check_precision() {
     let (declared, batches) = run("SELECT id, CAST(amount AS DECIMAL(38, 2)) AS d128, \
@@ -478,7 +762,7 @@ async fn next_transform_sees_the_cast_type() {
     let declared = p
         .transform(
             "up",
-            "SELECT id, CAST(ts AS BIGINT) AS ts, amount, \
+            "SELECT id, CAST(ts AS BIGINT) AS ts, CAST(amount AS NUMERIC) AS amount, \
              TRY_CAST(gas AS DECIMAL(20, 0)) AS gas, CAST(signed AS DOUBLE) AS signed FROM t",
         )
         .await;
@@ -520,4 +804,25 @@ async fn next_transform_sees_the_cast_type() {
             Some("-0.500000000000000000".into())
         ]
     );
+}
+
+/// The preprocessor writes the operand twice (as the value and inside the
+/// cast kept as fallback); an `unnest` operand still expands once.
+#[tokio::test]
+async fn casts_of_an_unnest_expand_it_once() {
+    for (sql, expected) in [
+        (
+            "SELECT id, CAST(unnest(make_array(id, id + 1)) AS NUMERIC) AS v FROM t WHERE id = 1",
+            ["1.0000000000", "2.0000000000"],
+        ),
+        (
+            "SELECT id, CAST(unnest(make_array(id, id + 1)) AS DECIMAL(80, 0)) AS v \
+             FROM t WHERE id = 1",
+            ["1", "2"],
+        ),
+    ] {
+        let mut v = column_of(sql, "v").await;
+        v.sort();
+        assert_eq!(v, some(&expected), "{sql}");
+    }
 }

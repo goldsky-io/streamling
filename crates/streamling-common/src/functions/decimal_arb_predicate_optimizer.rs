@@ -59,6 +59,11 @@
 //! Int64" (likewise to a float or a `DECIMAL(p ≤ 76, s)`). `CAST` / `TRY_CAST`
 //! to those types become `decimal_arb_cast` / `decimal_arb_try_cast`, which
 //! follow arrow-cast's `Decimal256` rules and return exactly the cast type.
+//! A precision-less `NUMERIC` and a `DECIMAL(p > 76, s)` reach here as the
+//! preprocessor's `decimal_arb_[try_]cast_*` calls (`DecimalArbSqlCastFunc`),
+//! which are resolved by the operand's type: over decimal_arb, the value
+//! itself or a rounding `decimal_arb_[try_]cast`; otherwise the cast written
+//! before.
 //!
 //! **Unary minus / `abs()`** are numeric-only in DataFusion and route to
 //! `decimal_arb_neg` / `decimal_arb_abs`.
@@ -74,14 +79,15 @@ use crate::functions::decimal_arb_ops::{
     DecimalArbAbsFunc, DecimalArbArrayExtremeFunc, DecimalArbArraySortFunc, DecimalArbCastFunc,
     DecimalArbEqFunc, DecimalArbExtremeFunc, DecimalArbGtFunc, DecimalArbGteFunc, DecimalArbLtFunc,
     DecimalArbLteFunc, DecimalArbNegFunc, DecimalArbNeqFunc, DecimalArbRescaleFunc,
-    DecimalArbRestampFunc, DecimalArbSortKeyFunc, DecimalArbToStringFunc, DecimalArbWithMetaFunc,
-    ToDecimalArbFromDecimal128Func, ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc,
-    ToDecimalArbFromStringFunc,
+    DecimalArbRestampFunc, DecimalArbSortKeyFunc, DecimalArbSqlCast, DecimalArbSqlCastFunc,
+    DecimalArbToStringFunc, DecimalArbWithMetaFunc, ToDecimalArbFromDecimal128Func,
+    ToDecimalArbFromDecimal256Func, ToDecimalArbFromIntFunc, ToDecimalArbFromStringFunc,
 };
 use crate::functions::decimal_arb_ops::{agreed_native_int_kind, common_precision_scale};
 use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, NativeIntKind};
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::metadata::FieldMetadata;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, DataFusionError, Result as DFResult, ScalarValue};
 use datafusion::logical_expr::expr::{
@@ -324,6 +330,56 @@ impl DecimalArbExprRewrite {
     fn numeric_cast(&self, udf: &Arc<ScalarUDF>, expr: Expr, target: &DataType) -> DFResult<Expr> {
         let template = Expr::Literal(ScalarValue::try_new_null(target)?, None);
         Ok(Self::call(udf, vec![expr, template]))
+    }
+
+    /// Resolve a `DecimalArbSqlCastFunc` call `(value, fallback)` by the type
+    /// of `value`: not decimal_arb, `fallback`; decimal_arb, `value` itself
+    /// for a bare `NUMERIC`, or `value` rounded to `fallback`'s decimal_arb
+    /// `(p, s)` (and hint) for `DECIMAL(p > 76, s)`.
+    fn resolve_sql_cast(
+        &self,
+        sf: ScalarFunction,
+        schema: &DFSchema,
+    ) -> DFResult<Transformed<Expr>> {
+        let Some(kind) = sf
+            .func
+            .inner()
+            .downcast_ref::<DecimalArbSqlCastFunc>()
+            .map(DecimalArbSqlCastFunc::kind)
+        else {
+            return Ok(Transformed::no(Expr::ScalarFunction(sf)));
+        };
+        let [value, fallback]: [Expr; 2] = match sf.args.try_into() {
+            Ok(args) => args,
+            Err(args) => {
+                return Ok(Transformed::no(Expr::ScalarFunction(ScalarFunction {
+                    func: sf.func,
+                    args,
+                })));
+            }
+        };
+        if !self.is_decimal_arb(&value, schema) {
+            return Ok(Transformed::yes(fallback));
+        }
+        let udf = match kind {
+            DecimalArbSqlCast::Numeric => return Ok(Transformed::yes(value)),
+            DecimalArbSqlCast::WideDecimal => &self.cast,
+            DecimalArbSqlCast::TryWideDecimal => &self.try_cast,
+        };
+        let Some(target) =
+            Self::field_of(&fallback, schema).filter(|f| DecimalArbType::is_decimal_arb_field(f))
+        else {
+            return Err(DataFusionError::Plan(format!(
+                "{}: the fallback of a DECIMAL(p > 76, s) cast must be decimal_arb",
+                sf.func.name()
+            )));
+        };
+        // The target (p, s) and hint travel as a typed NULL literal's metadata.
+        let template = Expr::Literal(
+            ScalarValue::LargeBinary(None),
+            Some(FieldMetadata::from(target.metadata())),
+        );
+        Ok(Transformed::yes(Self::call(udf, vec![value, template])))
     }
 
     fn cmp(&self, udf: &Arc<ScalarUDF>, left: Expr, right: Expr) -> Expr {
@@ -1488,6 +1544,18 @@ impl DecimalArbExprRewrite {
                     expr: Box::new(self.to_text(*inner)),
                     field,
                 })))
+            }
+            // A bare `NUMERIC` / `DECIMAL(p > 76, s)` cast the preprocessor
+            // could not decide: the operand's type picks the branch.
+            Expr::ScalarFunction(sf)
+                if sf.args.len() == 2
+                    && sf
+                        .func
+                        .inner()
+                        .downcast_ref::<DecimalArbSqlCastFunc>()
+                        .is_some() =>
+            {
+                self.resolve_sql_cast(sf, schema)
             }
             // `CAST(x AS BIGINT | DOUBLE | DECIMAL(p, s))`: Arrow has no cast
             // from the storage type. The UDF returns exactly the cast type.

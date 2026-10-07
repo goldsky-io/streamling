@@ -2934,6 +2934,10 @@ impl ScalarUDFImpl for DecimalArbToDecimal256Func {
 /// - `Float32` / `Float64`: the nearest representable value (arrow divides
 ///   two floats and can be off by an ulp); beyond the type's range,
 ///   ±infinity rather than an error, as arrow does.
+/// - decimal_arb (a `template` carrying decimal_arb `(p, s)` metadata, for
+///   `DECIMAL(p > 76, s)`; see [`DecimalArbSqlCastFunc`]): the same rule as
+///   `Decimal128` / `Decimal256` — rescaled to `s` half away from zero, then
+///   checked against `p` — and the template's `native_int_kind`.
 ///
 /// A value that does not fit the target fails `decimal_arb_cast` with an
 /// error naming the value and the type; `decimal_arb_try_cast` yields NULL.
@@ -3130,12 +3134,22 @@ impl ScalarUDFImpl for DecimalArbCastFunc {
     }
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
         require_decimal_arb_field(args.arg_fields[0].as_ref(), self.name())?;
-        let target = args.arg_fields[1].data_type();
+        let template = args.arg_fields[1].as_ref();
+        // As for CAST, NULL only where the input is; TRY_CAST may add some.
+        let nullable = self.safe || args.arg_fields[0].is_nullable();
+        if DecimalArbType::is_decimal_arb_field(template) {
+            // `DECIMAL(p > 76, s)`: the template's decimal_arb metadata, hint included.
+            return Ok(Arc::new(
+                template
+                    .clone()
+                    .with_name(self.name())
+                    .with_nullable(nullable),
+            ));
+        }
+        let target = template.data_type();
         if !Self::supports(target) {
             streamling_user_bail!("{}: decimal_arb cannot be cast to {}", self.name(), target);
         }
-        // As for CAST, NULL only where the input is; TRY_CAST may add some.
-        let nullable = self.safe || args.arg_fields[0].is_nullable();
         Ok(Arc::new(arrow_schema::Field::new(
             self.name(),
             target.clone(),
@@ -3146,14 +3160,234 @@ impl ScalarUDFImpl for DecimalArbCastFunc {
         if args.args.len() != 2 {
             streamling_user_bail!("{} requires (value, template)", self.name());
         }
-        let (_, scale) = require_decimal_arb_field(args.arg_fields[0].as_ref(), self.name())?;
-        let values = downcast_decimal_arb_array(&args.args[0], self.name(), "input")?;
-        let out = cast_decimal_arb(&values, scale, args.return_field.data_type(), self.safe)?;
-        match &args.args[0] {
-            ColumnarValue::Array(_) => Ok(ColumnarValue::Array(out)),
-            ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(
-                datafusion::scalar::ScalarValue::try_from_array(&out, 0)?,
-            )),
+        cast_decimal_arb_columnar(
+            &args.args[0],
+            args.arg_fields[0].as_ref(),
+            args.return_field.as_ref(),
+            self.safe,
+            self.name(),
+        )
+    }
+}
+
+/// `value` (a decimal_arb `input` field) cast to the type of `target`: a
+/// numeric type ([`cast_decimal_arb`]) or a decimal_arb `(p, s)`
+/// ([`rescale_decimal_arb_rounded`]). A scalar in, a scalar out.
+fn cast_decimal_arb_columnar(
+    value: &ColumnarValue,
+    input: &arrow_schema::Field,
+    target: &arrow_schema::Field,
+    safe: bool,
+    fn_name: &str,
+) -> Result<ColumnarValue> {
+    let (_, scale) = require_decimal_arb_field(input, fn_name)?;
+    let values = downcast_decimal_arb_array(value, fn_name, "input")?;
+    let out = match DecimalArbType::precision_scale_from_field(target) {
+        Some((precision, target_scale)) => rescale_decimal_arb_rounded(
+            &values,
+            scale,
+            precision,
+            target_scale,
+            safe,
+            target.name(),
+        )?,
+        None => cast_decimal_arb(&values, scale, target.data_type(), safe)?,
+    };
+    match value {
+        ColumnarValue::Array(_) => Ok(ColumnarValue::Array(out)),
+        ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(
+            datafusion::scalar::ScalarValue::try_from_array(&out, 0)?,
+        )),
+    }
+}
+
+/// `values` (decimal_arb at `scale`) as decimal_arb `(precision,
+/// target_scale)`: rescaled half away from zero, then checked against
+/// `precision` — the rule of a `Decimal128` / `Decimal256` target, so a value
+/// casts the same way on either side of precision 76.
+fn rescale_decimal_arb_rounded(
+    values: &LargeBinaryArray,
+    scale: u32,
+    precision: u32,
+    target_scale: u32,
+    safe: bool,
+    column: &str,
+) -> Result<ArrayRef> {
+    let mut builder =
+        DecimalArbArrayBuilder::with_capacity(values.len(), column, precision, target_scale)?;
+    for i in 0..values.len() {
+        let Some(value) = decode_value(values, i, scale)? else {
+            builder.append_null();
+            continue;
+        };
+        let rounded = DecimalArbValue::from_bigdecimal(
+            value
+                .as_bigdecimal()
+                .with_scale_round(i64::from(target_scale), RoundingMode::HalfUp),
+        );
+        if rounded.check_fits(precision, target_scale, column).is_ok() {
+            builder.append_value(&rounded)?;
+        } else if safe {
+            builder.append_null();
+        } else {
+            return Err(streamling_user_err!(
+                "cannot cast decimal_arb value {} to DECIMAL({}, {}): out of range",
+                value,
+                precision,
+                target_scale
+            )
+            .into());
+        }
+    }
+    Ok(Arc::new(builder.finish().into_inner().0))
+}
+
+// ---------- SQL casts decided by the operand's type: decimal_arb_cast_numeric / _wide_decimal ----------
+
+/// Which SQL cast a [`DecimalArbSqlCastFunc`] call stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecimalArbSqlCast {
+    /// `CAST` / `TRY_CAST` / `::` to `NUMERIC` or `DECIMAL` with no precision.
+    Numeric,
+    /// `CAST(x AS DECIMAL(p > 76, s))`.
+    WideDecimal,
+    /// `TRY_CAST(x AS DECIMAL(p > 76, s))`.
+    TryWideDecimal,
+}
+
+/// A SQL cast whose meaning depends on whether `value` is decimal_arb, decided in the analyzer.
+///
+/// The SQL preprocessor cannot see types, so it writes such a cast as
+/// `decimal_arb_cast_numeric(value, fallback)`,
+/// `decimal_arb_cast_wide_decimal(value, fallback)` or
+/// `decimal_arb_try_cast_wide_decimal(value, fallback)`, with `fallback` the
+/// expression it wrote for the cast before, and the type of `value` decides:
+///
+/// - `value` not decimal_arb: `fallback`, unchanged — `CAST(value AS NUMERIC)`
+///   (DataFusion's `Decimal128(38, 10)`), or the text round trip
+///   `[try_]to_decimal_arb_from_string(CAST(value AS VARCHAR), p, s)`.
+/// - `value` decimal_arb, precision-less `NUMERIC`: `value` itself. In SQL
+///   (Postgres's, for one) a bare `NUMERIC` has unconstrained precision, which
+///   decimal_arb already has, where `Decimal128(38, 10)` would round to 10
+///   fractional digits and fail past 28 integer digits. The result is still
+///   decimal_arb: `ROUND` or float arithmetic on it needs an explicit
+///   precision (`NUMERIC(38, 10)`), as for the column itself.
+/// - `value` decimal_arb, `DECIMAL(p > 76, s)`: `value` rescaled to `s` half
+///   away from zero and checked against `p`, as `DECIMAL(p <= 76, s)` does,
+///   with `fallback`'s precision, scale and `native_int_kind` (`u256` for
+///   `(77..=78, 0)`). The text round trip rejected any value with more
+///   significant fractional digits than `s`.
+///
+/// The analyzer rewrite replaces each call with the branch it takes, so only
+/// that branch is evaluated; the output column is named as `fallback` would
+/// be. Invoked as is, the function takes the same branch.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DecimalArbSqlCastFunc {
+    signature: Signature,
+    cast: DecimalArbSqlCast,
+}
+
+impl DecimalArbSqlCastFunc {
+    fn new(cast: DecimalArbSqlCast) -> Self {
+        Self {
+            signature: Signature::user_defined(Volatility::Immutable),
+            cast,
+        }
+    }
+
+    pub fn numeric() -> Self {
+        Self::new(DecimalArbSqlCast::Numeric)
+    }
+
+    pub fn wide_decimal() -> Self {
+        Self::new(DecimalArbSqlCast::WideDecimal)
+    }
+
+    pub fn try_wide_decimal() -> Self {
+        Self::new(DecimalArbSqlCast::TryWideDecimal)
+    }
+
+    /// The SQL cast this function stands for.
+    pub fn kind(&self) -> DecimalArbSqlCast {
+        self.cast
+    }
+}
+
+impl ScalarUDFImpl for DecimalArbSqlCastFunc {
+    fn name(&self) -> &str {
+        match self.cast {
+            DecimalArbSqlCast::Numeric => "decimal_arb_cast_numeric",
+            DecimalArbSqlCast::WideDecimal => "decimal_arb_cast_wide_decimal",
+            DecimalArbSqlCast::TryWideDecimal => "decimal_arb_try_cast_wide_decimal",
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        if arg_types.len() != 2 {
+            streamling_user_bail!(
+                "{} expects (value, fallback), got {} arguments",
+                self.name(),
+                arg_types.len()
+            );
+        }
+        Ok(arg_types.to_vec())
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[1].clone())
+    }
+    /// Named like `fallback`, the cast the call stands for.
+    fn schema_name(&self, args: &[datafusion::logical_expr::Expr]) -> Result<String> {
+        match args {
+            [_, fallback] => Ok(fallback.schema_name().to_string()),
+            _ => streamling_user_bail!("{} requires (value, fallback)", self.name()),
+        }
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let [value, fallback] = args.arg_fields else {
+            streamling_user_bail!("{} requires (value, fallback)", self.name());
+        };
+        if !DecimalArbType::is_decimal_arb_field(value) {
+            // A `CASE` over decimal_arb is a bare `LargeBinary` until the
+            // analyzer restores its metadata; no cast takes raw bytes to a
+            // number, so declare it as itself and let the declared-schema
+            // relabel stamp its `(p, s)`, as for the `CASE` on its own.
+            if self.cast == DecimalArbSqlCast::Numeric
+                && value.data_type() == &DataType::LargeBinary
+            {
+                return Ok(value.clone());
+            }
+            return Ok(fallback.clone());
+        }
+        match self.cast {
+            DecimalArbSqlCast::Numeric => Ok(value.clone()),
+            DecimalArbSqlCast::WideDecimal | DecimalArbSqlCast::TryWideDecimal => {
+                require_decimal_arb_field(fallback, self.name())?;
+                let nullable =
+                    self.cast == DecimalArbSqlCast::TryWideDecimal || value.is_nullable();
+                Ok(Arc::new(fallback.as_ref().clone().with_nullable(nullable)))
+            }
+        }
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let ([value, fallback], [value_field, _]) = (&args.args[..], &args.arg_fields[..]) else {
+            streamling_user_bail!("{} requires (value, fallback)", self.name());
+        };
+        if !DecimalArbType::is_decimal_arb_field(value_field) {
+            return Ok(fallback.clone());
+        }
+        match self.cast {
+            DecimalArbSqlCast::Numeric => Ok(value.clone()),
+            DecimalArbSqlCast::WideDecimal | DecimalArbSqlCast::TryWideDecimal => {
+                cast_decimal_arb_columnar(
+                    value,
+                    value_field,
+                    args.return_field.as_ref(),
+                    self.cast == DecimalArbSqlCast::TryWideDecimal,
+                    self.name(),
+                )
+            }
         }
     }
 }

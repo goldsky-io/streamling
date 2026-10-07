@@ -88,6 +88,9 @@ Registered by `CommonFunctions::functions()` in `crates/streamling-common/src/fu
 | [`decimal_arb_to_decimal256`](#udf-decimal-arb-to-decimal256) | `decimal_arb_to_decimal256(value, precision, scale)` | `decimal_arb, Int64 literal, Int64 literal` | `Decimal256(precision, scale)` |
 | [`to_decimal_arb_from_int`](#udf-to-decimal-arb-from-int) | `to_decimal_arb_from_int(value, precision, scale)` | `(Int8, Int64, Int64) or (Int16, Int64, Int64) or (Int32, Int64, Int64) or (Int64, Int64, Int64) or (UInt8, Int64, Int64) or (UInt16, Int64, Int64) or (UInt32, Int64, Int64) or (UInt64, Int64, Int64)` | `decimal_arb` |
 | [`try_to_decimal_arb_from_string`](#udf-try-to-decimal-arb-from-string) | `try_to_decimal_arb_from_string(text, precision, scale[, native_int_kind])` | `(Utf8, Int64, Int64) or (Utf8, Int64, Int64, Utf8)` | `decimal_arb or NULL` |
+| [`decimal_arb_cast_numeric`](#udf-decimal-arb-cast-numeric) | `decimal_arb_cast_numeric(value, fallback)` | `any value, then the planner's cast of it` | `decimal_arb, or the type of fallback` |
+| [`decimal_arb_cast_wide_decimal`](#udf-decimal-arb-cast-wide-decimal) | `decimal_arb_cast_wide_decimal(value, fallback)` | `any value, then the planner's decimal_arb cast of it` | `decimal_arb` |
+| [`decimal_arb_try_cast_wide_decimal`](#udf-decimal-arb-try-cast-wide-decimal) | `decimal_arb_try_cast_wide_decimal(value, fallback)` | `any value, then the planner's decimal_arb cast of it` | `decimal_arb or NULL` |
 | [`legacy_wide_int_to_decimal_arb`](#udf-legacy-wide-int-to-decimal-arb) | `legacy_wide_int_to_decimal_arb(value)` | `FixedSizeBinary(32) with streamling.u256 / streamling.i256 metadata` | `decimal_arb(78, 0)` |
 
 <a id="udf-now"></a>
@@ -873,6 +876,54 @@ SELECT try_to_decimal_arb_from_string('bad', 100, 2); -- NULL
 ```
 
 Source: [`decimal_arb_ops.rs`](../crates/streamling-common/src/functions/decimal_arb_ops.rs) (`TryToDecimalArbFromStringFunc`).
+
+<a id="udf-decimal-arb-cast-numeric"></a>
+
+### `decimal_arb_cast_numeric`
+
+**Signature:** `decimal_arb_cast_numeric(value, fallback)` → `decimal_arb, or the type of fallback`. **DataFusion signature:** `user-defined`.
+
+**Rust doc summary:** A SQL cast whose meaning depends on whether `value` is decimal_arb, decided in the analyzer.
+
+Planner-generated for `CAST` / `TRY_CAST` / `::` to `NUMERIC` or `DECIMAL` without a precision; `fallback` is the cast as written. A decimal_arb value is returned unchanged (a bare NUMERIC has unconstrained precision); it stays decimal_arb, so `ROUND` or float arithmetic on it needs an explicit precision. Any other value takes `fallback`, DataFusion's `Decimal128(38, 10)` cast. The column is named as `fallback` would be.
+
+```sql
+SELECT CAST(amount AS NUMERIC) FROM events; -- decimal_arb_cast_numeric(amount, CAST(amount AS NUMERIC))
+```
+
+Source: [`decimal_arb_ops.rs`](../crates/streamling-common/src/functions/decimal_arb_ops.rs) (`DecimalArbSqlCastFunc`).
+
+<a id="udf-decimal-arb-cast-wide-decimal"></a>
+
+### `decimal_arb_cast_wide_decimal`
+
+**Signature:** `decimal_arb_cast_wide_decimal(value, fallback)` → `decimal_arb`. **DataFusion signature:** `user-defined`.
+
+**Rust doc summary:** A SQL cast whose meaning depends on whether `value` is decimal_arb, decided in the analyzer.
+
+Planner-generated for `CAST(value AS DECIMAL(p, s))` with p > 76; `fallback` is `to_decimal_arb_from_string(CAST(value AS VARCHAR), p, s[, 'u256'])`. A decimal_arb value is rescaled to s, a dropped digit rounding half away from zero, and must then fit p (an error otherwise), as for `DECIMAL(p <= 76, s)`; the result takes fallback's precision, scale and native_int_kind. Any other value takes `fallback`.
+
+```sql
+SELECT CAST(amount AS DECIMAL(80, 2)) FROM events;
+```
+
+Source: [`decimal_arb_ops.rs`](../crates/streamling-common/src/functions/decimal_arb_ops.rs) (`DecimalArbSqlCastFunc`).
+
+<a id="udf-decimal-arb-try-cast-wide-decimal"></a>
+
+### `decimal_arb_try_cast_wide_decimal`
+
+**Signature:** `decimal_arb_try_cast_wide_decimal(value, fallback)` → `decimal_arb or NULL`. **DataFusion signature:** `user-defined`.
+
+**Rust doc summary:** A SQL cast whose meaning depends on whether `value` is decimal_arb, decided in the analyzer.
+
+Like decimal_arb_cast_wide_decimal, for `TRY_CAST`: `fallback` is `try_to_decimal_arb_from_string(...)`, and a decimal_arb value that does not fit p after rounding becomes NULL.
+
+```sql
+SELECT TRY_CAST(amount AS DECIMAL(80, 2)) FROM events;
+```
+
+Source: [`decimal_arb_ops.rs`](../crates/streamling-common/src/functions/decimal_arb_ops.rs) (`DecimalArbSqlCastFunc`).
 
 <a id="udf-legacy-wide-int-to-decimal-arb"></a>
 

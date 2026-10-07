@@ -5,6 +5,8 @@
 //! the integral part truncated toward zero, decimals round a dropped digit
 //! half away from zero, floats take the nearest value (±infinity past the
 //! range). An out-of-range value fails `CAST` and is NULL under `TRY_CAST`.
+//! A decimal_arb target (`DECIMAL(p > 76, s)`) rounds like a decimal one, and
+//! `DecimalArbSqlCastFunc` picks a bare `NUMERIC` / wide `DECIMAL` cast by type.
 use arrow::array::*;
 use arrow::util::display::array_value_to_string;
 use arrow_schema::{DataType, Field, FieldRef};
@@ -14,8 +16,8 @@ use datafusion::{
 };
 use std::sync::Arc;
 use streamling_common::{
-    functions::decimal_arb_ops::DecimalArbCastFunc,
-    types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, NativeIntKind},
+    functions::decimal_arb_ops::{DecimalArbCastFunc, DecimalArbSqlCastFunc},
+    types::decimal_arb::{DecimalArbArray, DecimalArbArrayBuilder, DecimalArbType, NativeIntKind},
 };
 
 const I64_MAX: &str = "9223372036854775807";
@@ -589,4 +591,279 @@ fn arrow_wraps(value: &str, target: &DataType) -> bool {
     );
     let integral = value.split('.').next().unwrap().trim_start_matches('-');
     signed && integral.parse::<num_bigint::BigInt>().unwrap() > num_bigint::BigInt::from(u64::MAX)
+}
+
+// ---------- decimal_arb targets: DECIMAL(p > 76, s) ----------
+
+/// Plan and invoke `udf` on `args`; the planned return field and the output.
+fn call(
+    udf: &dyn ScalarUDFImpl,
+    args: Vec<ColumnarValue>,
+    arg_fields: Vec<FieldRef>,
+) -> datafusion::error::Result<(FieldRef, ColumnarValue)> {
+    let return_field = udf.return_field_from_args(ReturnFieldArgs {
+        arg_fields: &arg_fields,
+        scalar_arguments: &vec![None; arg_fields.len()],
+    })?;
+    let number_rows = match &args[0] {
+        ColumnarValue::Array(a) => a.len(),
+        ColumnarValue::Scalar(_) => 1,
+    };
+    let out = udf.invoke_with_args(ScalarFunctionArgs {
+        args,
+        arg_fields,
+        number_rows,
+        return_field: return_field.clone(),
+        config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+    })?;
+    Ok((return_field, out))
+}
+
+/// A decimal_arb output, rendered as decimal text.
+fn decimal_texts(field: &Field, out: ColumnarValue) -> Vec<Option<String>> {
+    let array = out.into_array(1).unwrap();
+    let lba = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+    let arb = DecimalArbArray::try_from_array_and_field(lba.clone(), field).unwrap();
+    (0..arb.len())
+        .map(|i| arb.value(i).unwrap().map(|v| v.to_canonical_string()))
+        .collect()
+}
+
+fn hinted(field: FieldRef, kind: NativeIntKind) -> FieldRef {
+    Arc::new(DecimalArbType::with_native_int_kind(field.as_ref().clone(), kind).unwrap())
+}
+
+/// `decimal_arb_[try_]cast(values at (p, s), NULL template of decimal_arb(tp, ts))`.
+fn cast_to_arb(
+    safe: bool,
+    values: &[Option<&str>],
+    (p, s): (u32, u32),
+    template: FieldRef,
+) -> datafusion::error::Result<(FieldRef, Vec<Option<String>>)> {
+    let (field, out) = call(
+        &func(safe),
+        vec![
+            ColumnarValue::Array(arb_array(values, p, s)),
+            ColumnarValue::Scalar(ScalarValue::LargeBinary(None)),
+        ],
+        vec![arb_field(p, s, true), template],
+    )?;
+    let texts = decimal_texts(&field, out);
+    Ok((field, texts))
+}
+
+#[test]
+fn decimal_arb_target_rounds_half_away_from_zero_then_checks_precision() {
+    let values = [
+        Some("1.25"),
+        Some("-1.25"),
+        Some("1.24"),
+        Some("99.95"),
+        Some("-0.5"),
+        None,
+    ];
+    let (field, out) = cast_to_arb(false, &values, (100, 18), arb_field(77, 1, true)).unwrap();
+    assert_eq!(
+        DecimalArbType::precision_scale_from_field(&field),
+        Some((77, 1))
+    );
+    assert_eq!(
+        out,
+        vec![
+            Some("1.3".into()),
+            Some("-1.3".into()),
+            Some("1.2".into()),
+            Some("100.0".into()),
+            Some("-0.5".into()),
+            None
+        ]
+    );
+    // 99.95 rounds to 100.0, three integer digits: past DECIMAL(3, 1).
+    let err = cast_to_arb(false, &values, (100, 18), arb_field(3, 1, true)).unwrap_err();
+    assert!(
+        err.to_string().contains("99.95") && err.to_string().contains("DECIMAL(3, 1)"),
+        "{err}"
+    );
+    let (_, out) = cast_to_arb(true, &values, (100, 18), arb_field(3, 1, true)).unwrap();
+    assert_eq!(
+        out,
+        vec![
+            Some("1.3".into()),
+            Some("-1.3".into()),
+            Some("1.2".into()),
+            None,
+            Some("-0.5".into()),
+            None
+        ]
+    );
+}
+
+#[test]
+fn decimal_arb_target_keeps_the_template_hint_and_a_scalar_stays_scalar() {
+    let template = hinted(arb_field(78, 0, true), NativeIntKind::U256);
+    let (field, out) = cast_to_arb(
+        false,
+        &[Some("2.5"), Some("-2.5")],
+        (10, 1),
+        template.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        DecimalArbType::native_int_kind_from_field(&field),
+        Some(NativeIntKind::U256)
+    );
+    assert_eq!(out, some(&["3", "-3"]));
+
+    let scalar = ScalarValue::try_from_array(&arb_array(&[Some("7.5")], 10, 1), 0).unwrap();
+    let (field, out) = call(
+        &func(false),
+        vec![
+            ColumnarValue::Scalar(scalar),
+            ColumnarValue::Scalar(ScalarValue::LargeBinary(None)),
+        ],
+        vec![arb_field(10, 1, false), template],
+    )
+    .unwrap();
+    assert!(matches!(out, ColumnarValue::Scalar(_)));
+    assert!(!field.is_nullable(), "CAST of a non-null input");
+    assert_eq!(decimal_texts(&field, out), some(&["8"]));
+}
+
+// ---------- DecimalArbSqlCastFunc: decided by the operand's type ----------
+
+fn int_field(nullable: bool) -> FieldRef {
+    Arc::new(Field::new("v", DataType::Int64, nullable))
+}
+
+#[test]
+fn sql_cast_declares_by_the_operand_type() {
+    let declared = |udf: DecimalArbSqlCastFunc, value: FieldRef, fallback: FieldRef| {
+        udf.return_field_from_args(ReturnFieldArgs {
+            arg_fields: &[value, fallback],
+            scalar_arguments: &[None, None],
+        })
+        .unwrap()
+    };
+    let decimal128 = Arc::new(Field::new("f", DataType::Decimal128(38, 10), true));
+    let arb = arb_field(100, 18, false);
+    // Bare NUMERIC: decimal_arb is itself, anything else is the cast.
+    let field = declared(
+        DecimalArbSqlCastFunc::numeric(),
+        arb.clone(),
+        decimal128.clone(),
+    );
+    assert_eq!(field, arb);
+    let field = declared(
+        DecimalArbSqlCastFunc::numeric(),
+        int_field(true),
+        decimal128.clone(),
+    );
+    assert_eq!(field, decimal128);
+    // Raw bytes (a CASE before its metadata is restored) are declared as themselves.
+    let bytes: FieldRef = Arc::new(Field::new("v", DataType::LargeBinary, true));
+    let field = declared(
+        DecimalArbSqlCastFunc::numeric(),
+        bytes.clone(),
+        decimal128.clone(),
+    );
+    assert_eq!(field, bytes);
+
+    // DECIMAL(p > 76, s): the fallback's decimal_arb (p, s) and hint either way.
+    let target = hinted(arb_field(78, 0, true), NativeIntKind::U256);
+    let field = declared(
+        DecimalArbSqlCastFunc::wide_decimal(),
+        arb.clone(),
+        target.clone(),
+    );
+    assert_eq!(
+        DecimalArbType::precision_scale_from_field(&field),
+        Some((78, 0))
+    );
+    assert_eq!(
+        DecimalArbType::native_int_kind_from_field(&field),
+        Some(NativeIntKind::U256)
+    );
+    assert!(!field.is_nullable(), "CAST of a non-null decimal_arb");
+    let field = declared(
+        DecimalArbSqlCastFunc::try_wide_decimal(),
+        arb,
+        target.clone(),
+    );
+    assert!(field.is_nullable(), "TRY_CAST");
+    let field = declared(
+        DecimalArbSqlCastFunc::wide_decimal(),
+        int_field(false),
+        target.clone(),
+    );
+    assert_eq!(field, target);
+}
+
+#[test]
+fn sql_cast_invoked_directly_takes_the_same_branch() {
+    let fallback = ColumnarValue::Array(Arc::new(Decimal128Array::from(vec![Some(7)])));
+    let decimal128 = Arc::new(Field::new("f", DataType::Decimal128(38, 10), true));
+    // Not decimal_arb: the fallback's values.
+    let (_, out) = call(
+        &DecimalArbSqlCastFunc::numeric(),
+        vec![
+            ColumnarValue::Array(Arc::new(Int64Array::from(vec![Some(1)]))),
+            fallback,
+        ],
+        vec![int_field(true), decimal128.clone()],
+    )
+    .unwrap();
+    let out = out.into_array(1).unwrap();
+    assert_eq!(out.data_type(), &DataType::Decimal128(38, 10));
+    assert_eq!(
+        out.as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+
+    // decimal_arb, bare NUMERIC: the value itself.
+    let values = arb_array(&[Some("1.000000000000000001"), None], 100, 18);
+    let (field, out) = call(
+        &DecimalArbSqlCastFunc::numeric(),
+        vec![
+            ColumnarValue::Array(values.clone()),
+            ColumnarValue::Scalar(ScalarValue::Decimal128(None, 38, 10)),
+        ],
+        vec![arb_field(100, 18, true), decimal128],
+    )
+    .unwrap();
+    assert_eq!(
+        decimal_texts(&field, out),
+        vec![Some("1.000000000000000001".into()), None]
+    );
+
+    // decimal_arb, DECIMAL(80, 2): rounded, and NULL past the precision under TRY_CAST.
+    let values = arb_array(&[Some("1.005"), Some("-1.005"), Some("123456.7")], 100, 18);
+    for (udf, expected) in [
+        (
+            DecimalArbSqlCastFunc::try_wide_decimal(),
+            vec![Some("1.01".to_string()), Some("-1.01".to_string()), None],
+        ),
+        (
+            DecimalArbSqlCastFunc::wide_decimal(),
+            vec![
+                Some("1.01".to_string()),
+                Some("-1.01".to_string()),
+                Some("123456.70".to_string()),
+            ],
+        ),
+    ] {
+        let precision = if expected[2].is_none() { 7 } else { 80 };
+        let (field, out) = call(
+            &udf,
+            vec![
+                ColumnarValue::Array(values.clone()),
+                ColumnarValue::Scalar(ScalarValue::LargeBinary(None)),
+            ],
+            vec![arb_field(100, 18, true), arb_field(precision, 2, true)],
+        )
+        .unwrap();
+        assert_eq!(decimal_texts(&field, out), expected, "{}", udf.name());
+    }
 }
