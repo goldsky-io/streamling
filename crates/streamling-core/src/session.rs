@@ -6,14 +6,14 @@ use crate::types::bigint_sql_preprocessor::preprocess_bigint_sql;
 use crate::{streamling_err, streamling_user_err};
 use datafusion::catalog::memory::MemorySchemaProvider;
 use datafusion::catalog::{SchemaProvider, Session, TableProvider};
-use datafusion::common::{config::ConfigExtension, extensions_options};
+use datafusion::common::{Column, config::ConfigExtension, extensions_options};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateDefaults;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{FunctionRegistry, SessionState, SessionStateBuilder};
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::planner::ExprPlanner;
-use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, col};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
@@ -21,9 +21,11 @@ use streamling_common::functions::decimal_arb_aggregates::{
     DecimalArbArrayAggUdaf, DecimalArbAvgUdaf, DecimalArbExtremeUdaf, DecimalArbSumUdaf,
 };
 use streamling_common::functions::decimal_arb_coercion::DecimalArbExprPlanner;
+use streamling_common::functions::decimal_arb_ops::DecimalArbWithMetaFunc;
 use streamling_common::functions::decimal_arb_predicate_optimizer::DecimalArbExprRewrite;
 use streamling_common::functions::decimal_arb_scale_unify::DecimalArbScaleUnifyRule;
 use streamling_common::functions::decimal_arb_sort_optimizer::DecimalArbSortRewriteRule;
+use streamling_common::types::decimal_arb::DecimalArbType;
 use streamling_flink_compat::{register_json_functions, register_string_aliases};
 
 pub static DEFAULT_CATALOG_NAME: &str = "default";
@@ -247,8 +249,78 @@ impl SessionManager {
         // Ensure _gs_op transparently propagates through SQL projections
         let logical_plan = Self::append_gs_op_to_projection_if_missing(logical_plan);
 
+        let logical_plan = self.declare_resolved_decimal_arb_fields(logical_plan)?;
+
         Self::validate_plan_and_extract_source_name(&logical_plan, SubqueryHandling::Recurse)
             .map(|name| (logical_plan, name))
+    }
+
+    /// Make the schema a transform is declared with match the schema it produces.
+    ///
+    /// DataFusion derives the output field of a `CASE` over decimal_arb as a bare `LargeBinary`.
+    /// The analyzer restores the decimal metadata with `decimal_arb_with_meta`, but the plan
+    /// returned here is the unanalyzed one: a pipeline registers each SQL transform as a view over
+    /// it, and the extension nodes around it capture its schema. Everything planned downstream
+    /// then reads the column as raw bytes: `CAST(v AS VARCHAR)` decodes the encoding as UTF-8,
+    /// `v + 1` does not plan, and a sink treats the column as binary.
+    ///
+    /// Resolve the plan the way execution will. For every output column that comes out as a
+    /// decimal_arb different from what was declared, put the same `decimal_arb_with_meta` relabel
+    /// on top of the declared plan. It passes the bytes through untouched, so it only changes the
+    /// declared field. A plan that needs no relabelling is returned as is.
+    fn declare_resolved_decimal_arb_fields(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        // A plan that cannot be resolved fails later with its usual context, not from here.
+        let Ok(resolved) = self.ctx.state().optimize(&plan) else {
+            return Ok(plan);
+        };
+        let declared = plan.schema();
+        if declared.fields().len() != resolved.schema().fields().len() {
+            return Ok(plan);
+        }
+
+        let with_meta = Arc::new(ScalarUDF::from(DecimalArbWithMetaFunc::new()));
+        let mut relabelled = false;
+        let exprs: Vec<Expr> = declared
+            .iter()
+            .zip(resolved.schema().fields())
+            .map(|((qualifier, declared_field), resolved_field)| {
+                let column = Expr::Column(Column::new(qualifier.cloned(), declared_field.name()));
+                let Some((precision, scale)) =
+                    DecimalArbType::precision_scale_from_field(resolved_field)
+                else {
+                    return column;
+                };
+                let hint = DecimalArbType::native_int_kind_from_field(resolved_field)
+                    .filter(|_| scale == 0);
+                if DecimalArbType::precision_scale_from_field(declared_field)
+                    == Some((precision, scale))
+                    && DecimalArbType::native_int_kind_from_field(declared_field) == hint
+                {
+                    return column;
+                }
+                relabelled = true;
+                let mut args = vec![column, lit(i64::from(precision)), lit(i64::from(scale))];
+                if let Some(kind) = hint {
+                    args.push(lit(kind.as_str()));
+                }
+                with_meta
+                    .call(args)
+                    .alias_qualified(qualifier.cloned(), declared_field.name())
+            })
+            .collect();
+
+        if !relabelled {
+            return Ok(plan);
+        }
+        // Keep the plan as it was if the relabelling projection cannot be built (for instance
+        // duplicate output names): the declared schema is then as wrong as before, not worse.
+        match LogicalPlanBuilder::from(plan.clone())
+            .project(exprs)
+            .and_then(|builder| builder.build())
+        {
+            Ok(relabelled) => Ok(relabelled),
+            Err(_) => Ok(plan),
+        }
     }
 
     /// Same as create_supported_logical_plan, but without validation. It doesn't return the source name.
