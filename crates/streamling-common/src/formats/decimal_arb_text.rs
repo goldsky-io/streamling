@@ -45,7 +45,8 @@ pub(crate) fn is_encoded_decimal_arb_field(field: &Field) -> bool {
         field.data_type(),
         DataType::Dictionary(..) | DataType::RunEndEncoded(..)
     ) && DecimalArbType::is_decimal_arb_metadata(field.metadata())
-        && plain_layout(field.data_type()).as_ref() == Some(&DataType::LargeBinary)
+        && plain_layout_field(field)
+            .is_some_and(|plain| DecimalArbType::is_decimal_arb_field(&plain))
 }
 
 /// Does a container type hold a `decimal_arb` field anywhere below it? (A
@@ -96,6 +97,14 @@ pub(crate) fn plain_layout(data_type: &DataType) -> Option<DataType> {
 /// the outer field's name, which is the one the batch carries).
 pub(crate) fn plain_layout_field(field: &Field) -> Option<Field> {
     match field.data_type() {
+        DataType::Dictionary(_, values) => {
+            // Keep unwrapping at the field level: a dictionary's values may
+            // themselves be run-end encoded, with extension metadata and
+            // nullability on their own values field. Unwrapping only the
+            // DataType loses both before the run-end branch can see them.
+            let values = field_with_type(field, values.as_ref().clone());
+            Some(plain_layout_field(&values).unwrap_or(values))
+        }
         DataType::RunEndEncoded(_, values) => {
             let values = plain_layout_field(values).unwrap_or_else(|| values.as_ref().clone());
             // The run-end array carries no validity of its own; its nulls are
@@ -709,5 +718,116 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(array.null_count(), 1);
+    }
+
+    #[test]
+    fn mixed_dictionary_and_run_end_fields_preserve_decimal_metadata() {
+        use crate::types::decimal_arb::NativeIntKind;
+
+        let leaf = DecimalArbType::with_native_int_kind(
+            DecimalArbType::field("values", 78, 0, true).unwrap(),
+            NativeIntKind::U256,
+        )
+        .unwrap();
+        for wrappers in ["dr", "ddr", "rdr", "drd", "drdrd"] {
+            let mut field = leaf.clone();
+            for wrapper in wrappers.chars().rev() {
+                field = match wrapper {
+                    // Dictionary values have no Field of their own, so the
+                    // extension metadata belongs to the dictionary field.
+                    'd' => field_with_type(
+                        &field,
+                        DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(field.data_type().clone()),
+                        ),
+                    ),
+                    'r' => Field::new(
+                        "encoded",
+                        DataType::RunEndEncoded(
+                            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                            Arc::new(field),
+                        ),
+                        false,
+                    ),
+                    _ => unreachable!(),
+                };
+            }
+            field = field.with_name("amount");
+            assert!(field_contains_decimal_arb(&field), "{wrappers}");
+            let plain = plain_layout_field(&field).unwrap();
+            assert_eq!(plain.name(), "amount", "{wrappers}");
+            assert_eq!(plain.data_type(), &DataType::LargeBinary, "{wrappers}");
+            assert_eq!(plain.metadata(), leaf.metadata(), "{wrappers}");
+            assert!(plain.is_nullable(), "{wrappers}");
+        }
+    }
+
+    #[test]
+    fn dictionary_over_run_end_decimal_keeps_text_and_avro_values() {
+        use crate::formats::avro::{serialize, try_to_avro};
+        use apache_avro::{Decimal, from_avro_datum, to_avro_datum, types::Value};
+        use datafusion::arrow::array::{DictionaryArray, RecordBatch, make_array};
+        use datafusion::arrow::datatypes::Schema;
+
+        let mut builder = DecimalArbArrayBuilder::with_capacity(3, "values", 78, 0).unwrap();
+        builder.append_str("1").unwrap();
+        builder.append_null();
+        builder.append_str("1000000000000000000").unwrap();
+        let (values, _, _) = builder.finish().into_inner();
+        let run =
+            RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 3, 5]), &values).unwrap();
+        let DataType::RunEndEncoded(run_ends, _) = run.data_type() else {
+            unreachable!()
+        };
+        let run_type = DataType::RunEndEncoded(
+            Arc::clone(run_ends),
+            Arc::new(DecimalArbType::field("values", 78, 0, true).unwrap()),
+        );
+        let run = make_array(
+            run.to_data()
+                .into_builder()
+                .data_type(run_type)
+                .build()
+                .unwrap(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![4, 0, 2, 1]), run).unwrap(),
+        );
+        // The outer dictionary has no metadata and no physical nulls. The
+        // decimal extension and logical null both belong to its REE values.
+        let field = Field::new("amount", dictionary.data_type().clone(), false);
+        let (text_field, text) = decimal_arb_leaves_to_text(&field, &dictionary).unwrap();
+        assert_eq!(text_field.data_type(), &DataType::Utf8);
+        assert!(text_field.is_nullable());
+        assert_eq!(
+            texts(&text),
+            vec![
+                Some("1000000000000000000".into()),
+                Some("1".into()),
+                None,
+                Some("1".into())
+            ],
+        );
+
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![dictionary]).unwrap();
+        let schema = try_to_avro("EncodedAmounts", batch.schema().fields()).unwrap();
+        let rows = serialize(&schema, &batch);
+        for (row, expected) in
+            rows.into_iter()
+                .zip([Some(1_000_000_000_000_000_000_i64), Some(1), None, Some(1)])
+        {
+            let encoded = to_avro_datum(&schema, row).unwrap();
+            let decoded = from_avro_datum(&schema, &mut encoded.as_slice(), None).unwrap();
+            let expected = match expected {
+                Some(value) => Value::Union(
+                    1,
+                    Box::new(Value::Decimal(Decimal::from(value.to_be_bytes().to_vec()))),
+                ),
+                None => Value::Union(0, Box::new(Value::Null)),
+            };
+            assert_eq!(decoded, Value::Record(vec![("amount".into(), expected)]));
+        }
     }
 }
