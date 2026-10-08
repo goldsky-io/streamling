@@ -59,7 +59,6 @@ use streamling_state::StateBackendErrorKind;
 use streamling_state::StateKey;
 use streamling_state::StateOperatorBackend;
 
-use crate::util::lag::LagResult;
 use apache_avro::types::Value::Union;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::sink::DataSink;
@@ -68,7 +67,10 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::consumer::{
+    BaseConsumer, CommitMode, Consumer, ConsumerContext, DefaultConsumerContext, Rebalance,
+    StreamConsumer,
+};
 use rdkafka::message::{BorrowedHeaders, BorrowedMessage, Header, Headers, OwnedHeaders, ToBytes};
 use rdkafka::producer::{BaseRecord, Producer, ThreadedProducer};
 use rdkafka::util::Timeout;
@@ -84,7 +86,7 @@ use schema_registry_converter::schema_registry_common::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -93,7 +95,7 @@ use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
-use streamling_core::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
+use streamling_core::telemetry::recorder::{MetricsRecorder, SnapshotGauge, get_metrics_recorder};
 use streamling_core::topology::Telemetry;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
@@ -176,12 +178,12 @@ static QUEUE_FULL_SHUTDOWN_RETRY_WINDOW: StdDuration = StdDuration::from_secs(10
 /// finish, but those threads may also be waiting for cleanup coordination.
 ///
 /// This wrapper moves the drop operation to a blocking thread to prevent deadlock.
-struct SafeKafkaConsumer {
-    consumer: Option<Arc<StreamConsumer>>,
+struct SafeKafkaConsumer<C: ConsumerContext + 'static = DefaultConsumerContext> {
+    consumer: Option<Arc<StreamConsumer<C>>>,
 }
 
-impl SafeKafkaConsumer {
-    fn new(consumer: StreamConsumer) -> Self {
+impl<C: ConsumerContext + 'static> SafeKafkaConsumer<C> {
+    fn new(consumer: StreamConsumer<C>) -> Self {
         tracing::debug!("SafeKafkaConsumer: created");
         Self {
             consumer: Some(Arc::new(consumer)),
@@ -199,14 +201,14 @@ impl SafeKafkaConsumer {
     }
 }
 
-impl std::ops::Deref for SafeKafkaConsumer {
-    type Target = Arc<StreamConsumer>;
+impl<C: ConsumerContext + 'static> std::ops::Deref for SafeKafkaConsumer<C> {
+    type Target = Arc<StreamConsumer<C>>;
     fn deref(&self) -> &Self::Target {
         self.consumer.as_ref().expect("consumer already taken")
     }
 }
 
-impl Drop for SafeKafkaConsumer {
+impl<C: ConsumerContext + 'static> Drop for SafeKafkaConsumer<C> {
     fn drop(&mut self) {
         if let Some(consumer) = self.consumer.take() {
             // Run rd_kafka_destroy on a detached OS thread, NOT spawn_blocking:
@@ -228,6 +230,75 @@ impl Drop for SafeKafkaConsumer {
         }
     }
 }
+
+/// Live Kafka partition assignment of every consumer instance of one source
+/// in this process, kept current by [`AssignmentTrackingContext`]. Per-pod
+/// telemetry must cover exactly the partitions this pod owns now: a startup
+/// snapshot goes stale on the first rebalance, and with several pods in one
+/// group each pod would keep reporting partitions another pod now owns.
+#[derive(Clone, Default)]
+struct PartitionAssignments(Arc<std::sync::Mutex<BTreeMap<usize, BTreeSet<i32>>>>);
+
+impl PartitionAssignments {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<usize, BTreeSet<i32>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, instance: usize, partitions: BTreeSet<i32>) {
+        self.lock().insert(instance, partitions);
+    }
+
+    /// Partitions owned by any instance of the source in this process.
+    fn owned(&self) -> BTreeSet<i32> {
+        self.lock().values().flatten().copied().collect()
+    }
+
+    /// Max known lag over the partitions one instance owns; see [`own_max_lag`].
+    fn own_max_lag(&self, instance: usize, lags: &BTreeMap<i32, i64>) -> Option<i64> {
+        self.lock()
+            .get(&instance)
+            .map_or(Some(0), |own| own_max_lag(lags, own))
+    }
+}
+
+/// Consumer context that records the instance's partition assignment after
+/// every rebalance.
+struct AssignmentTrackingContext {
+    instance: usize,
+    topic: String,
+    assignments: PartitionAssignments,
+}
+
+impl ClientContext for AssignmentTrackingContext {}
+
+impl ConsumerContext for AssignmentTrackingContext {
+    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, _rebalance: &Rebalance<'_>) {
+        // The default `rebalance` has already (un)assigned synchronously, so
+        // `assignment()` reflects this rebalance for eager and cooperative alike.
+        match base_consumer.assignment() {
+            Ok(assignment) => self.assignments.set(
+                self.instance,
+                assignment
+                    .elements_for_topic(&self.topic)
+                    .iter()
+                    .map(|element| element.partition())
+                    .collect(),
+            ),
+            Err(e) => warn!(
+                "Failed to read the partition assignment of topic '{}' after a rebalance: {}",
+                self.topic, e
+            ),
+        }
+    }
+}
+
+/// Latest lag per owned partition, published by the source's lag task.
+/// `None` until the first lag computation.
+type PartitionLags = Option<Arc<BTreeMap<i32, i64>>>;
+
+const KAFKA_CONSUMER_LAG_METRIC: &str = "kafka_consumer_messages_lag";
 
 /// Wrapper that keeps rdkafka *producer* teardown off tokio worker threads.
 ///
@@ -289,8 +360,12 @@ pub struct TopicPartition {
 
 impl TopicPartition {
     fn state_key(&self, reference_name: String) -> String {
-        format!("{}:{}:{}", reference_name, self.topic, self.partition)
+        partition_state_key(&reference_name, &self.topic, self.partition)
     }
+}
+
+fn partition_state_key(reference_name: &str, topic: &str, partition: i32) -> String {
+    format!("{}:{}:{}", reference_name, topic, partition)
 }
 
 pub struct TopicPartitionList {
@@ -693,6 +768,8 @@ struct KafkaSourceExec {
     /// instance would then read the whole topic instead of a disjoint slice.
     group_id: String,
     lag_group_id: String,
+    assignments: PartitionAssignments,
+    partition_lags: Arc<watch::Sender<PartitionLags>>,
 }
 
 impl Debug for KafkaSourceExec {
@@ -785,6 +862,8 @@ impl KafkaSourceExec {
             parallelism,
             group_id,
             lag_group_id,
+            assignments: PartitionAssignments::default(),
+            partition_lags: Arc::new(watch::channel(None).0),
         }
     }
 
@@ -821,8 +900,8 @@ impl KafkaSourceExec {
     /// must not tear down the stream; but the terminal caller MUST NOT log
     /// its "drained tail committed" line on it — the offsets were not
     /// committed and the tail replays.
-    async fn commit_offsets_for_finalized_epoch(
-        consumer: &StreamConsumer,
+    async fn commit_offsets_for_finalized_epoch<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
         state_backend: &Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
         reference_name: &str,
         consumer_offsets: &mut BTreeMap<CheckpointEpoch, KafkaTopicPartitionList>,
@@ -882,19 +961,12 @@ impl KafkaSourceExec {
                 //
                 // rd_kafka_commit with async=0 blocks the calling thread for a
                 // full broker round trip — coordinator rediscovery and retry
-                // backoff included — so run it under block_in_place: during a
-                // drain every async worker is needed, and a slow commit
-                // (observed multi-second in the field) must not pin one. The
-                // flavor check keeps current_thread runtimes (unit tests) on
-                // the direct call, where block_in_place would panic.
+                // backoff included: during a drain every async worker is
+                // needed, and a slow commit (observed multi-second in the
+                // field) must not pin one.
                 let commit_started = std::time::Instant::now();
-                let commit_result = if tokio::runtime::Handle::current().runtime_flavor()
-                    == tokio::runtime::RuntimeFlavor::MultiThread
-                {
-                    tokio::task::block_in_place(|| consumer.commit(position, CommitMode::Sync))
-                } else {
-                    consumer.commit(position, CommitMode::Sync)
-                };
+                let commit_result =
+                    block_in_place_if_multi_thread(|| consumer.commit(position, CommitMode::Sync));
                 let commit_elapsed = commit_started.elapsed();
                 if commit_elapsed > Duration::from_secs(1) {
                     warn!(
@@ -1059,13 +1131,14 @@ impl KafkaSourceExec {
         }
     }
 
-    fn create_consumer(
+    fn create_consumer<C: ConsumerContext + 'static>(
         config: &KafkaConfig,
         starting_offsets: &Option<String>,
         reference_name: &str,
         group_id: &str,
         is_lag_consumer: bool,
-    ) -> StreamConsumer {
+        context: C,
+    ) -> StreamConsumer<C> {
         let mut builder = KafkaCommon::build_client(config);
 
         debug!(
@@ -1090,7 +1163,9 @@ impl KafkaSourceExec {
                 builder.set(key, value);
             });
 
-        builder.create().expect("Failed to create client")
+        builder
+            .create_with_context(context)
+            .expect("Failed to create client")
     }
 
     fn extract_op_from_headers(headers: Option<&BorrowedHeaders>) -> Option<&str> {
@@ -1108,8 +1183,8 @@ impl KafkaSourceExec {
         })
     }
 
-    async fn wait_for_assignment(
-        consumer: &StreamConsumer,
+    async fn wait_for_assignment<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
     ) -> streamling_core::error::Result<KafkaTopicPartitionList> {
         let timeout = Duration::from_secs(CONSUMER_ASSIGNMENT_TIMEOUT_SEC);
         let tpl = tokio::time::timeout(timeout, async {
@@ -1138,8 +1213,8 @@ impl KafkaSourceExec {
     ///
     /// If no message arrives within the fetch timeout, we keep retrying
     /// so idle topics do not fail source startup.
-    async fn wait_for_initial_assignment_or_message(
-        consumer: &StreamConsumer,
+    async fn wait_for_initial_assignment_or_message<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
         topic: &str,
     ) -> streamling_core::error::Result<()> {
         let shutdown = streamling_core::shutdown::subscribe();
@@ -1153,8 +1228,8 @@ impl KafkaSourceExec {
     /// A SIGTERM during startup used to be unobservable here: this wait looped
     /// forever (broker unreachable, stuck rebalance, idle topic) and the
     /// consume loop's shutdown handling hadn't been reached yet.
-    async fn wait_for_initial_assignment_or_message_cancellable(
-        consumer: &StreamConsumer,
+    async fn wait_for_initial_assignment_or_message_cancellable<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
         topic: &str,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> streamling_core::error::Result<()> {
@@ -1242,6 +1317,31 @@ impl KafkaSourceExec {
     }
 }
 
+/// Runs a blocking librdkafka call under `block_in_place` so a slow broker
+/// round trip does not pin an async worker. A current_thread runtime (unit
+/// tests) calls it directly, where `block_in_place` would panic.
+fn block_in_place_if_multi_thread<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+/// Max known lag over an instance's own partitions; `Some(0)` when it owns
+/// none (nothing to consume), `None` when no owned partition's lag is known.
+fn own_max_lag(lags: &BTreeMap<i32, i64>, own: &BTreeSet<i32>) -> Option<i64> {
+    if own.is_empty() {
+        return Some(0);
+    }
+    own.iter()
+        .filter_map(|partition| lags.get(partition))
+        .copied()
+        .max()
+}
+
 fn is_stalled_with_lag(
     has_received_data: bool,
     elapsed_since_last_input: Duration,
@@ -1272,11 +1372,18 @@ struct KafkaSourceWatchdogState {
     stall_timeout: Duration,
     stall_check_count: u64,
     last_stall_log_at: Option<Instant>,
-    lag_rx: watch::Receiver<Option<i64>>,
+    lag_rx: watch::Receiver<PartitionLags>,
+    assignments: PartitionAssignments,
+    instance: usize,
 }
 
 impl KafkaSourceWatchdogState {
-    fn new(stall_timeout: Duration, lag_rx: watch::Receiver<Option<i64>>) -> Self {
+    fn new(
+        stall_timeout: Duration,
+        lag_rx: watch::Receiver<PartitionLags>,
+        assignments: PartitionAssignments,
+        instance: usize,
+    ) -> Self {
         Self {
             has_received_data: false,
             last_input_row_at: Instant::now(),
@@ -1286,6 +1393,8 @@ impl KafkaSourceWatchdogState {
             stall_check_count: 0,
             last_stall_log_at: None,
             lag_rx,
+            assignments,
+            instance,
         }
     }
 
@@ -1301,7 +1410,11 @@ impl KafkaSourceWatchdogState {
             return;
         }
 
-        self.max_observed_lag = *self.lag_rx.borrow();
+        self.max_observed_lag = self
+            .lag_rx
+            .borrow()
+            .as_deref()
+            .and_then(|lags| self.assignments.own_max_lag(self.instance, lags));
 
         if self.max_observed_lag.is_some() {
             self.lag_unavailable_since = None;
@@ -1367,15 +1480,18 @@ impl KafkaSourceWatchdogState {
     }
 }
 
+/// Reports the lag of the partitions the source's local instances own at each
+/// tick, both as the `kafka_consumer_messages_lag` gauge and to the stall
+/// watchdogs through `partition_lags`.
 async fn calculate_lag_task(
     reference_name: String,
-    metric_metadata_id: String,
-    kafka_topic_partition_list: KafkaTopicPartitionList,
+    topic: String,
+    assignments: PartitionAssignments,
     consumer: SafeKafkaConsumer,
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
-    metrics_recorder: Arc<MetricsRecorder>,
+    lag_gauge: Option<SnapshotGauge>,
     lag_report_interval_ms: Option<u64>,
-    max_lag_tx: watch::Sender<Option<i64>>,
+    partition_lags: Arc<watch::Sender<PartitionLags>>,
     mut shutdown_rx: watch::Receiver<bool>,
     cancel: Option<streamling_core::shutdown::CancellationToken>,
 ) {
@@ -1428,92 +1544,86 @@ async fn calculate_lag_task(
             },
             _ = interval.tick() => {
                 trace!("Calculating lag for reference_name: {}", reference_name);
-                let mut lag_results = Vec::new();
-        let topic_partition_list = TopicPartitionList::from(kafka_topic_partition_list.clone());
-
-        let mut max_lag: Option<i64> = None;
-
-        for topic_partition in topic_partition_list.topic_partitions {
-            // Add yield point for better cancellation responsiveness
-            tokio::task::yield_now().await;
-
-            trace!(
-                "Calculating lag for reference_name: {}, topic: {}, partition: {}",
-                reference_name, topic_partition.topic, topic_partition.partition
-            );
-            let (_, high_watermark) = match consumer.fetch_watermarks(
-                &topic_partition.topic,
-                topic_partition.partition,
-                Duration::from_secs(5),
-            ) {
-                Ok(watermarks) => watermarks,
-                Err(e) => {
-                    error!(
-                        "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
-                        topic_partition.topic, topic_partition.partition, e
-                    );
-                    continue;
+                let lags = Arc::new(
+                    owned_partition_lags(
+                        &reference_name,
+                        &topic,
+                        &assignments.owned(),
+                        &consumer,
+                        &state_backend,
+                    )
+                    .await,
+                );
+                if let Some(lag_gauge) = &lag_gauge {
+                    lag_gauge.replace(lags.iter().map(|(partition, lag)| {
+                        (vec![("partition", partition.to_string())], *lag as u64)
+                    }));
                 }
-            };
-
-            let state_key = StateKey::from(topic_partition.state_key(reference_name.to_string()));
-            let tail_at = match state_backend.get(state_key).await {
-                Ok(Some(offset_state)) => offset_state.offset,
-                Ok(None) => {
-                    trace!(
-                        "No offset found in state backend for topic: {}, partition {}; fallback to 0",
-                        topic_partition.topic, topic_partition.partition
-                    );
-                    0
-                }
-                Err(_) => {
-                    error!(
-                        "Failed to fetch offsets from state backend for topic: {}, partition {}, lag metric will not be reported",
-                        topic_partition.topic, topic_partition.partition,
-                    );
-                    continue;
-                }
-            };
-
-            let partition_lag = (high_watermark - tail_at).max(0);
-            max_lag = Some(max_lag.unwrap_or(0).max(partition_lag));
-
-            lag_results.push(LagResult {
-                metric_metadata_id: metric_metadata_id.to_string(),
-                unit: "messages".to_string(),
-                head_at_provider: "kafka_consumer".to_string(),
-                head_at: high_watermark as u64,
-                tail_at: tail_at as u64,
-                tags: vec![(
-                    String::from("partition"),
-                    topic_partition.partition.to_string(),
-                )],
-            });
-        }
-
-        let _ = max_lag_tx.send(max_lag);
-
-        lag_results.iter().for_each(|lag_result| {
-            let tags = lag_result
-                .tags
-                .iter()
-                .map(|tuple| (tuple.0.as_str(), tuple.1.as_str()))
-                .collect();
-            let metric_name = &format!("{}_{}_lag", lag_result.head_at_provider, lag_result.unit);
-            debug!("Recording lag result with metric_name: {}", metric_name);
-            metrics_recorder.record_gauge_w_tags(
-                metric_name,
-                lag_result.head_at - lag_result.tail_at,
-                tags,
-                lag_result.metric_metadata_id.as_str(),
-            );
-        });
-
+                partition_lags.send_replace(Some(lags));
             }
         }
     }
 
+    partition_lags.send_replace(None);
     info!("Lag task shutting down for {}", reference_name);
+}
+
+/// Lag (high watermark minus the committed offset in the state backend) of
+/// each `owned` partition. A partition whose lag cannot be read this tick is
+/// left out, so the gauge and the stall watchdog see it as unknown rather
+/// than as a stale value.
+async fn owned_partition_lags(
+    reference_name: &str,
+    topic: &str,
+    owned: &BTreeSet<i32>,
+    consumer: &SafeKafkaConsumer,
+    state_backend: &Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
+) -> BTreeMap<i32, i64> {
+    let mut lags = BTreeMap::new();
+    for &partition in owned {
+        // Add yield point for better cancellation responsiveness
+        tokio::task::yield_now().await;
+
+        trace!(
+            "Calculating lag for reference_name: {}, topic: {}, partition: {}",
+            reference_name, topic, partition
+        );
+        // A blocking broker round trip (up to the 5s timeout) per partition.
+        let high_watermark = match block_in_place_if_multi_thread(|| {
+            consumer.fetch_watermarks(topic, partition, Duration::from_secs(5))
+        }) {
+            Ok((_, high_watermark)) => high_watermark,
+            Err(e) => {
+                error!(
+                    "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
+                    topic, partition, e
+                );
+                continue;
+            }
+        };
+
+        let state_key = StateKey::from(partition_state_key(reference_name, topic, partition));
+        let tail_at = match state_backend.get(state_key).await {
+            Ok(Some(offset_state)) => offset_state.offset,
+            Ok(None) => {
+                trace!(
+                    "No offset found in state backend for topic: {}, partition {}; fallback to 0",
+                    topic, partition
+                );
+                0
+            }
+            Err(_) => {
+                error!(
+                    "Failed to fetch offsets from state backend for topic: {}, partition {}; lag metric will not be reported",
+                    topic, partition,
+                );
+                continue;
+            }
+        };
+
+        lags.insert(partition, (high_watermark - tail_at).max(0));
+    }
+    lags
 }
 
 impl DisplayAs for KafkaSourceExec {
@@ -1573,6 +1683,11 @@ impl ExecutionPlan for KafkaSourceExec {
             &self.reference_name,
             &self.group_id,
             false,
+            AssignmentTrackingContext {
+                instance: partition,
+                topic: self.topic.clone(),
+                assignments: self.assignments.clone(),
+            },
         ));
         consumer
             .subscribe(&[&*self.topic])
@@ -1680,8 +1795,8 @@ impl ExecutionPlan for KafkaSourceExec {
         let metric_metadata_id = self.metric_metadata_id.clone();
         let kafka_lag_reporter_interval = self.kafka_config.lag_report_interval_ms;
         let metrics_recorder = get_metrics_recorder().clone();
-        // Lag is a per-source metric, and every instance would report the same
-        // topic-wide numbers, so only instance 0 runs the reporter.
+        // One lag reporter per source in this process: instance 0 runs it for
+        // the partitions every local instance currently owns.
         //
         // Wrap the lag consumer so its rd_kafka_destroy is deferred to a
         // blocking thread on drop, instead of running inline on a tokio worker
@@ -1693,13 +1808,48 @@ impl ExecutionPlan for KafkaSourceExec {
                 &self.reference_name,
                 &self.lag_group_id,
                 true,
+                DefaultConsumerContext,
             ))
         });
         let topic = self.topic.clone();
+        let assignments = self.assignments.clone();
+        let partition_lags = self.partition_lags.clone();
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
-            let (max_lag_tx, max_lag_rx) = watch::channel(None);
-            let mut watchdog = KafkaSourceWatchdogState::new(stall_watchdog_timeout, max_lag_rx);
+            // Only the instance that was handed the lag consumer reports lag
+            // (one per source, not one per parallel instance); it spawns
+            // through the scope so the drain ladder tracks it. Spawn before
+            // this instance's own assignment: it may own no partition (more
+            // consumers in the group than partitions) while its siblings do.
+            if let Some(lag_consumer) = lag_consumer {
+                let lag_gauge = metrics_recorder
+                    .resolve_snapshot_gauge(KAFKA_CONSUMER_LAG_METRIC, &metric_metadata_id);
+                if lag_gauge.is_none() {
+                    warn!(
+                        "Kafka source '{}': metric '{}' is denied or metadata_id '{}' is not registered; lag will not be exported",
+                        reference_name, KAFKA_CONSUMER_LAG_METRIC, metric_metadata_id
+                    );
+                }
+                let lag_task = calculate_lag_task(
+                    reference_name.clone(),
+                    topic.clone(),
+                    assignments.clone(),
+                    lag_consumer,
+                    state_backend.clone(),
+                    lag_gauge,
+                    kafka_lag_reporter_interval,
+                    partition_lags.clone(),
+                    shutdown_rx.clone(),
+                    Some(scope.token().clone()),
+                );
+                scope.spawn(lag_task);
+            }
+            let mut watchdog = KafkaSourceWatchdogState::new(
+                stall_watchdog_timeout,
+                partition_lags.subscribe(),
+                assignments.clone(),
+                partition,
+            );
             // first, wait for the consumer to be assigned partitions and then check the offsets
             // in the state backend
 
@@ -1730,24 +1880,6 @@ impl ExecutionPlan for KafkaSourceExec {
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
-            // Only the instance that was handed the lag consumer reports lag
-            // (one per source, not one per parallel instance); it spawns
-            // through the scope so the drain ladder tracks it.
-            if let Some(lag_consumer) = lag_consumer {
-                let lag_task = calculate_lag_task(
-                    reference_name.clone(),
-                    metric_metadata_id.clone(),
-                    kafka_topic_partition_list.clone(),
-                    lag_consumer,
-                    state_backend.clone(),
-                    metrics_recorder.clone(),
-                    kafka_lag_reporter_interval,
-                    max_lag_tx,
-                    shutdown_rx.clone(),
-                    Some(scope.token().clone()),
-                );
-                scope.spawn(lag_task);
-            }
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
@@ -4161,10 +4293,21 @@ mod tests {
         ));
     }
 
+    fn lags(points: &[(i32, i64)]) -> PartitionLags {
+        Some(Arc::new(points.iter().copied().collect()))
+    }
+
+    fn assigned(instance: usize, partitions: &[i32]) -> PartitionAssignments {
+        let assignments = PartitionAssignments::default();
+        assignments.set(instance, partitions.iter().copied().collect());
+        assignments
+    }
+
     #[test]
     fn test_watchdog_reads_lag_from_channel() {
         let (tx, rx) = watch::channel(None);
-        let mut watchdog = KafkaSourceWatchdogState::new(Duration::from_secs(60), rx);
+        let mut watchdog =
+            KafkaSourceWatchdogState::new(Duration::from_secs(60), rx, assigned(0, &[0, 1]), 0);
 
         watchdog.on_record();
 
@@ -4174,18 +4317,18 @@ mod tests {
         assert!(watchdog.lag_unavailable_since.is_some());
 
         // Lag task publishes positive lag
-        tx.send(Some(500)).unwrap();
+        tx.send(lags(&[(0, 500), (1, 20)])).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, Some(500));
         assert!(watchdog.lag_unavailable_since.is_none());
 
         // Lag task publishes caught-up
-        tx.send(Some(0)).unwrap();
+        tx.send(lags(&[(0, 0), (1, 0)])).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, Some(0));
         assert!(watchdog.lag_unavailable_since.is_none());
 
-        // Lag task publishes None (watermarks temporarily unavailable)
+        // Lag task stopped
         tx.send(None).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, None);
@@ -4195,13 +4338,64 @@ mod tests {
     #[test]
     fn test_watchdog_skips_refresh_before_data() {
         let (tx, rx) = watch::channel(None);
-        let mut watchdog = KafkaSourceWatchdogState::new(Duration::from_secs(60), rx);
+        let mut watchdog =
+            KafkaSourceWatchdogState::new(Duration::from_secs(60), rx, assigned(0, &[0]), 0);
 
-        tx.send(Some(100)).unwrap();
+        tx.send(lags(&[(0, 100)])).unwrap();
         watchdog.refresh_lag();
 
         // Should not read from channel before first record
         assert_eq!(watchdog.max_observed_lag, None);
+    }
+
+    /// Every local instance's watchdog sees the lag of its own partitions,
+    /// not of partitions another instance (or pod) consumes.
+    #[test]
+    fn test_watchdog_uses_only_own_partitions() {
+        let assignments = assigned(0, &[0]);
+        assignments.set(1, [1].into());
+        let (tx, rx) = watch::channel(lags(&[(0, 900), (1, 7)]));
+        let mut watchdog =
+            KafkaSourceWatchdogState::new(Duration::from_secs(60), rx, assignments.clone(), 1);
+        watchdog.on_record();
+
+        watchdog.refresh_lag();
+        assert_eq!(watchdog.max_observed_lag, Some(7));
+
+        // A rebalance moves partition 0 to instance 1.
+        assignments.set(0, BTreeSet::new());
+        assignments.set(1, [0, 1].into());
+        tx.send(lags(&[(0, 900), (1, 7)])).unwrap();
+        watchdog.refresh_lag();
+        assert_eq!(watchdog.max_observed_lag, Some(900));
+    }
+
+    #[test]
+    fn test_own_max_lag() {
+        let lags: BTreeMap<i32, i64> = [(0, 5), (1, 9)].into();
+        assert_eq!(own_max_lag(&lags, &[0, 1].into()), Some(9));
+        assert_eq!(own_max_lag(&lags, &[0].into()), Some(5));
+        // Owning nothing means nothing to consume, not unknown lag.
+        assert_eq!(own_max_lag(&lags, &BTreeSet::new()), Some(0));
+        // Partitions without a known lag are skipped; none known is unknown.
+        assert_eq!(own_max_lag(&lags, &[0, 2].into()), Some(5));
+        assert_eq!(own_max_lag(&lags, &[2].into()), None);
+    }
+
+    #[test]
+    fn test_partition_assignments_track_each_instance() {
+        let assignments = PartitionAssignments::default();
+        assignments.set(0, [0, 1].into());
+        assignments.set(1, [2].into());
+        assert_eq!(assignments.owned(), [0, 1, 2].into());
+        let lags = [(0, 5), (1, 9), (2, 3)].into();
+        assert_eq!(assignments.own_max_lag(1, &lags), Some(3));
+        // An instance with no recorded assignment owns nothing.
+        assert_eq!(assignments.own_max_lag(7, &lags), Some(0));
+
+        // A rebalance replaces an instance's assignment, it never accumulates.
+        assignments.set(0, [1].into());
+        assert_eq!(assignments.owned(), [1, 2].into());
     }
 
     mod filter_validation {

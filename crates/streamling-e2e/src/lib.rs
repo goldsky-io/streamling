@@ -497,7 +497,12 @@ impl TestContext {
         pipeline_yaml: &str,
         opts: PipelineOpts,
     ) -> Result<ExitStatus> {
-        let pipeline_path = self.temp_dir.path().join("pipeline.yaml");
+        // One file per run so concurrent runs (several replicas of a pipeline)
+        // never read each other's YAML.
+        let pipeline_path = self
+            .temp_dir
+            .path()
+            .join(format!("pipeline-{}.yaml", uuid::Uuid::new_v4()));
         std::fs::write(&pipeline_path, pipeline_yaml)?;
 
         let mut env_vars = self.build_env_vars();
