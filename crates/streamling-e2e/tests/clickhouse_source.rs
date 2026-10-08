@@ -992,3 +992,110 @@ sinks:
         "tied live+delete rows must both be dropped (delete wins the tie)"
     );
 }
+
+// ============================================================================
+// Scenario: non-prefix projection through a standalone ClickHouse source
+// ============================================================================
+
+/// A transform that selects a strict, REORDERED, non-prefix subset of a
+/// standalone ClickHouse source's columns. DataFusion pushes the projection
+/// into `ClickHouseTableProvider::scan`; the exec must declare and emit exactly
+/// that schema — declaring the full schema fails planning with "Input field
+/// name X does not match with the projection expression Y", and emitting
+/// full-width batches under a projected schema would swap columns.
+#[tokio::test]
+async fn test_clickhouse_source_non_prefix_projection() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE projection_test (
+                block_number UInt64,
+                id String,
+                payload String,
+                extra String,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    clickhouse
+        .execute(
+            "INSERT INTO projection_test VALUES
+                (1, 'a', 'payload_a', 'extra_a', 0),
+                (2, 'b', 'payload_b', 'extra_b', 0),
+                (3, 'c', 'payload_c', 'extra_c', 0)",
+        )
+        .await
+        .expect("Failed to insert source data");
+
+    // `payload` (index 2) then `id` (index 1): not a prefix, not in table order.
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: projection_test
+    columns: "block_number,id,payload,extra"
+    primary_key: id
+
+transforms:
+  narrow:
+    type: sql
+    primary_key: id
+    sql: "SELECT payload, id FROM ch_source"
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: narrow
+    table: projection_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            PipelineOpts::new()
+                .record_limit(3)
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    let rows: Vec<(String, String)> = ctx
+        .postgres
+        .query("SELECT id, payload FROM public.projection_results ORDER BY id")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), "payload_a".to_string()),
+            ("b".to_string(), "payload_b".to_string()),
+            ("c".to_string(), "payload_c".to_string()),
+        ],
+        "projected columns must carry the right values under the right ids"
+    );
+
+    let cols = ctx
+        .postgres
+        .get_column_names("projection_results")
+        .await
+        .expect("failed to read column names");
+    for pruned in ["block_number", "extra"] {
+        assert!(
+            !cols.iter().any(|c| c == pruned),
+            "column '{pruned}' should have been pruned by the projection (got columns: {cols:?})"
+        );
+    }
+}
