@@ -219,12 +219,13 @@ impl TestContext {
             None
         };
 
-        // Create Prometheus resource if URL is configured and needed
+        // Create Prometheus resource if needed
         let prometheus = if options.with_prometheus {
-            config
+            let prometheus_url = config
                 .prometheus_url
                 .as_ref()
-                .map(|url| PrometheusResource::new(url))
+                .ok_or_else(|| E2eError::EnvVarNotSet("E2E_PROMETHEUS_URL".to_string()))?;
+            Some(PrometheusResource::new(prometheus_url))
         } else {
             None
         };
