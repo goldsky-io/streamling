@@ -19,9 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.90.0
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
         with:
-          toolchain: 1.90.0
+          toolchain: 1.91.1
           components: clippy, rustfmt
       - name: Install sccache
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
@@ -35,10 +35,10 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-plugin_examples-${{ runner.os }}-1.90.0-${{ github.ref_name }}-${{ github.sha }}
+          key: sccache-plugin_examples-${{ runner.os }}-1.91.1-${{ github.ref_name }}-${{ github.sha }}
           restore-keys: |
-            sccache-plugin_examples-${{ runner.os }}-1.90.0-${{ github.ref_name }}-
-            sccache-plugin_examples-${{ runner.os }}-1.90.0-main-
+            sccache-plugin_examples-${{ runner.os }}-1.91.1-${{ github.ref_name }}-
+            sccache-plugin_examples-${{ runner.os }}-1.91.1-main-
 
       - name: Setup rust cache (plugin_examples/basic)
         uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
