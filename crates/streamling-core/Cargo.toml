@@ -93,4 +93,5 @@ paste.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 rand.workspace = true
 serial_test.workspace = true
+tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
