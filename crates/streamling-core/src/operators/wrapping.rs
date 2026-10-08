@@ -10,6 +10,7 @@ use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
 use crate::telemetry::MillisAccumulator;
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
+use crate::telemetry::task_wait::{TaskWaitMeter, TaskWaitMillis};
 use crate::telemetry::types::RowCountMeasurementType;
 use crate::topology::Telemetry;
 use crate::utils::dedup::deduplicate_record_batch;
@@ -755,11 +756,15 @@ impl ExecutionPlan for WrappingExec {
             metric_metadata_id
         );
 
+        // An inner operator that runs its loop in a spawned task claims this
+        // meter, so its own work is not mistaken for `starved` (see
+        // `TaskWaitMeter`).
+        let (inner_context, task_wait) = TaskWaitMeter::install(&context);
         let mut data = execute_input_stream(
             Arc::clone(&self.inner),
             Arc::clone(&self.schema()),
             partition,
-            Arc::clone(&context),
+            inner_context,
         )?;
 
         // Read the input's metrics AFTER `execute_input_stream` has run: a
@@ -835,13 +840,20 @@ impl ExecutionPlan for WrappingExec {
                 let batch_elapsed = batch_start.elapsed();
                 // `starved`: time waiting on upstream for input. Node-local (not
                 // an edge), so downstream_id="" to match the blocked label set.
-                // Only a delivered batch (`Some(Ok)`) counts; a `None` poll is EOF
-                // and a `Some(Err)` is an upstream failure — attribute nothing for
-                // either.
-                starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
-                // After a successful drain only a <1ms remainder remains; EOF/error polls
-                // add zero, so they cannot emit a carried whole millisecond.
-                let starved_ms = starved.take_whole_millis();
+                // A task-decoupled inner operator measures it at its own input
+                // await, and its remaining task time is `task_busy_ms`. Otherwise
+                // it is this poll: only a delivered batch (`Some(Ok)`) counts; a
+                // `None` poll is EOF and a `Some(Err)` is an upstream failure —
+                // attribute nothing for either.
+                let task_wait_claimed = task_wait.is_claimed();
+                let TaskWaitMillis { starved: starved_ms, busy: task_busy_ms } = if task_wait_claimed {
+                    task_wait.take_whole_millis()
+                } else {
+                    starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
+                    // After a successful drain only a <1ms remainder remains; EOF/error polls
+                    // add zero, so they cannot emit a carried whole millisecond.
+                    TaskWaitMillis { starved: starved.take_whole_millis(), busy: 0 }
+                };
                 if starved_ms > 0 {
                     metrics_recorder.record_count_w_tags(
                         "node_wait",
@@ -872,12 +884,18 @@ impl ExecutionPlan for WrappingExec {
                         // below `starved` and `busy = elapsed_compute - starved`
                         // drift negative at high throughput — the exact failure
                         // the `MillisAccumulator` exists to prevent.
-                        if starved_ms > 0 {
+                        //
+                        // A task-decoupled operator has no DataFusion compute
+                        // signal, so its measured task work is folded too, keeping
+                        // `busy = elapsed_compute - starved` exact.
+                        let folded_ms = starved_ms
+                            + if record_wall_clock_compute { task_busy_ms } else { 0 };
+                        if folded_ms > 0 {
                             metrics_recorder.record_elapsed_compute(
-                                Duration::from_millis(starved_ms),
+                                Duration::from_millis(folded_ms),
                                 &metric_metadata_id,
                             );
-                        } else if record_wall_clock_compute {
+                        } else if record_wall_clock_compute && !task_wait_claimed {
                             // No whole starved millisecond this batch: keep #85's
                             // wall-clock path for non-SQL / passthrough SQL so
                             // sub-ms compute isn't dropped entirely.
@@ -897,6 +915,16 @@ impl ExecutionPlan for WrappingExec {
 
                         // Record checkpoint marker arrival time for transforms
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
+                        // A zero-row batch that carries checkpoint messages is
+                        // control traffic; only an empty *data* batch counts.
+                        if batch.num_rows() == 0 && checkpoint_messages.is_empty() {
+                            metrics_recorder.record_count_w_tags(
+                                "node_empty_batches",
+                                1,
+                                vec![],
+                                &metric_metadata_id,
+                            );
+                        }
                         for message in &checkpoint_messages {
                             if let CheckpointMessage::Marker { created_at_ms, .. } = message {
                                 let arrival_latency_ms = now_ms().saturating_sub(*created_at_ms);
@@ -1040,7 +1068,26 @@ impl DataSink for WrappingDataSink {
         let primary_key = self.primary_key.clone();
 
         let measured_stream = async_stream::stream! {
-            while let Some(batch_result) = data.next().await {
+            // `starved`: the sink waiting on upstream, measured like
+            // `WrappingExec`'s. No fold into `elapsed_compute`: a sink's is
+            // connector-recorded service time.
+            let mut starved = MillisAccumulator::default();
+            loop {
+                let poll_start = Instant::now();
+                let batch_result = data.next().await;
+                starved.add(starved_span_for_poll(&batch_result, poll_start.elapsed()));
+                let starved_ms = starved.take_whole_millis();
+                if starved_ms > 0 {
+                    metrics_recorder.record_count_w_tags(
+                        "node_wait",
+                        starved_ms,
+                        vec![("state", "starved"), ("downstream_id", "")],
+                        &metric_metadata_id,
+                    );
+                }
+                let Some(batch_result) = batch_result else {
+                    break;
+                };
                 match batch_result {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
@@ -2172,6 +2219,59 @@ mod tests {
         );
     }
 
+    /// `node_empty_batches` counts zero-row data batches, so a node that runs
+    /// but moves no rows is visible. A zero-row batch that carries checkpoint
+    /// messages is control traffic, not an empty data batch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn wrapping_exec_counts_empty_data_batches_but_not_marker_batches() {
+        use crate::checkpoints::checkpoint_management::{CheckpointEpoch, CheckpointMessage};
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "empty_batches_unit_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let empty = RecordBatch::new_empty(schema.clone());
+        let marker_only = crate::operators::marker_only_batch(
+            &schema,
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(1),
+                created_at_ms: 0,
+            }],
+        );
+        // `MemorySourceConfig`, not `MemTable`: the marker batch's schema
+        // carries metadata, which `MemTable` rejects as a mismatch.
+        let source_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![empty.clone(), test_batch(), marker_only, empty]],
+            schema,
+            None,
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut batches = 0;
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+            batches += 1;
+        }
+        assert_eq!(batches, 4, "every batch must flow through");
+        assert_eq!(
+            test_support::counter_total("node_empty_batches", node_id),
+            2,
+            "two empty data batches; the marker-only batch is not counted"
+        );
+    }
+
     /// Regression: the input-wait span dual-emitted into `elapsed_compute` and
     /// `node_wait{state="starved"}` must use identical quantization, otherwise
     /// the advertised `busy = elapsed_compute - starved` accounting drifts.
@@ -2466,6 +2566,50 @@ mod tests {
 
         let ids = ids_written.lock().unwrap();
         ids.clone()
+    }
+
+    /// A sink waiting on its upstream is starved just like any other node:
+    /// `WrappingDataSink` must emit `node_wait{state="starved"}` for the wait
+    /// in front of each delivered batch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn wrapping_data_sink_emits_starved_when_input_is_slow() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_unit_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let slow_input = futures::stream::iter([test_batch(), test_batch(), test_batch()]).then(
+            |batch| async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(batch)
+            },
+        );
+        let sink = WrappingDataSink::new(
+            Arc::new(RecordingSink {
+                schema: schema.clone(),
+                ids_written: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        let rows = sink
+            .write_all(
+                Box::pin(RecordBatchStreamAdapter::new(schema, slow_input)),
+                &Arc::new(TaskContext::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, test_batch().num_rows() as u64 * 3);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(
+            starved >= 10,
+            "expected sink starved >= 10ms for a 3×10ms slow input, got {starved}ms"
+        );
     }
 
     #[tokio::test]
