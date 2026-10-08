@@ -14,6 +14,7 @@ use crate::formats::FromArrowConverter;
 use crate::formats::ipc::FromArrowToIpcConverter;
 use crate::formats::json::JsonToArrowConverter;
 use crate::operators::wasm_runner::transpiler::TsToJSTranspiler;
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
 use arrow_schema::{DataType, Field, Schema};
@@ -34,7 +35,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use extism::{Manifest, Plugin, Wasm};
-use futures::StreamExt;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -356,6 +356,7 @@ impl ExecutionPlan for WasmRunnerExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let task_wait = TaskWaitMeter::claim(&context);
         let mut data = execute_input_stream(
             Arc::clone(&self.input),
             Arc::clone(&self.input.schema()),
@@ -386,7 +387,7 @@ impl ExecutionPlan for WasmRunnerExec {
             })??;
             let plugin = Arc::new(std::sync::Mutex::new(plugin));
 
-            while let Some(batch) = data.next().await {
+            while let Some(batch) = task_wait.next(&mut data).await {
                 let batch = batch?;
                 let plugin = Arc::clone(&plugin);
                 let batch_output_schema = Arc::clone(&output_schema);
@@ -409,12 +410,12 @@ impl ExecutionPlan for WasmRunnerExec {
 
                 match result {
                     Ok(batch) => {
-                        if tx.send(Ok(batch)).await.is_err() {
+                        if task_wait.send(tx.send(Ok(batch))).await.is_err() {
                             break;
                         }
                     }
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        let _ = task_wait.send(tx.send(Err(error))).await;
                         break;
                     }
                 }
