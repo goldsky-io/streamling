@@ -863,6 +863,32 @@ impl ExecutionPlan for WrappingExec {
                     );
                 }
 
+                // Deprecated back-compat dual-emit: input-wait is also folded
+                // into `elapsed_compute` so existing dashboards are unchanged.
+                // Pure compute is `elapsed_compute - node_wait{state="starved"}`;
+                // remove once consumers migrate to the `starved` state.
+                //
+                // Fold the SAME remainder-carrying whole-ms value drained for
+                // `starved` (not the raw `batch_elapsed`) so both series quantize
+                // the span identically. Flooring each batch here instead would
+                // drop the sub-ms remainder that `starved` carries, making the
+                // folded input-wait fall below `starved` and `busy =
+                // elapsed_compute - starved` drift negative at high throughput —
+                // the exact failure the `MillisAccumulator` exists to prevent.
+                //
+                // A task-decoupled operator has no DataFusion compute signal, so
+                // its measured task work is folded too. Folded on every poll, not
+                // only on a delivered batch, so work drained on the terminal
+                // EOF/error poll is not lost.
+                let folded_ms =
+                    starved_ms + if record_wall_clock_compute { task_busy_ms } else { 0 };
+                if folded_ms > 0 {
+                    metrics_recorder.record_elapsed_compute(
+                        Duration::from_millis(folded_ms),
+                        &metric_metadata_id,
+                    );
+                }
+
                 let batch_result = match batch_result {
                     Some(r) => r,
                     None => break,
@@ -870,32 +896,7 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        // Deprecated back-compat dual-emit: input-wait is also
-                        // folded into `elapsed_compute` so existing dashboards are
-                        // unchanged. Pure compute is `elapsed_compute -
-                        // node_wait{state="starved"}`; remove once consumers
-                        // migrate to the `starved` state.
-                        //
-                        // Fold the SAME remainder-carrying whole-ms value drained
-                        // for `starved` (not the raw `batch_elapsed`) so both
-                        // series quantize the span identically. Flooring each
-                        // batch here instead would drop the sub-ms remainder that
-                        // `starved` carries, making the folded input-wait fall
-                        // below `starved` and `busy = elapsed_compute - starved`
-                        // drift negative at high throughput — the exact failure
-                        // the `MillisAccumulator` exists to prevent.
-                        //
-                        // A task-decoupled operator has no DataFusion compute
-                        // signal, so its measured task work is folded too, keeping
-                        // `busy = elapsed_compute - starved` exact.
-                        let folded_ms = starved_ms
-                            + if record_wall_clock_compute { task_busy_ms } else { 0 };
-                        if folded_ms > 0 {
-                            metrics_recorder.record_elapsed_compute(
-                                Duration::from_millis(folded_ms),
-                                &metric_metadata_id,
-                            );
-                        } else if record_wall_clock_compute && !task_wait_claimed {
+                        if folded_ms == 0 && record_wall_clock_compute && !task_wait_claimed {
                             // No whole starved millisecond this batch: keep #85's
                             // wall-clock path for non-SQL / passthrough SQL so
                             // sub-ms compute isn't dropped entirely.
@@ -2153,6 +2154,101 @@ mod tests {
             };
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
         }
+    }
+
+    /// A test-only task-decoupled operator: claims the wrapper's
+    /// `TaskWaitMeter`, takes one input batch, works for `work`, then fails.
+    #[derive(Debug)]
+    struct WorkThenFailExec {
+        inner: Arc<dyn ExecutionPlan>,
+        work: Duration,
+    }
+
+    impl DisplayAs for WorkThenFailExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "WorkThenFailExec")
+        }
+    }
+
+    impl ExecutionPlan for WorkThenFailExec {
+        fn name(&self) -> &str {
+            "WorkThenFailExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(WorkThenFailExec {
+                inner: children.swap_remove(0),
+                work: self.work,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let mut input = self.inner.execute(partition, context)?;
+            let work = self.work;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                let _ = task_wait.next(&mut input).await;
+                tokio::time::sleep(work).await;
+                yield Err(DataFusionError::Execution("work failed".to_string()));
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    /// Task work that ends in an error is still the node's work: the wrapper
+    /// must fold the busy time it drains on the terminal poll into
+    /// `elapsed_compute`, not only on polls that deliver a batch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn task_work_before_a_terminal_error_is_reported_as_busy() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "work_then_fail_busy";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(WrappingExec::new(
+            Arc::new(WorkThenFailExec {
+                inner: source_exec,
+                work: Duration::from_millis(30),
+            }),
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        assert!(stream.next().await.expect("one item").is_err());
+        assert!(stream.next().await.is_none());
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        let busy = elapsed_compute.saturating_sub(starved);
+        assert!(
+            busy >= 20,
+            "30ms of task work before the error must be busy: \
+             busy={busy}ms starved={starved}ms elapsed_compute={elapsed_compute}ms"
+        );
     }
 
     /// `WrappingExec::execute` must emit `node_wait{state="starved"}` when its
