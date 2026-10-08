@@ -35,6 +35,14 @@ Covers the bounded-then-unbounded phase progression, the three independent kinds
 
 - `hybrid-source-state.allium` — formal spec
 
+### Node flow metrics
+
+Reference for the per-node flow metrics (`node_idle_wait`,
+`node_backpressure_wait`, `node_empty_batch`, `node_inflight_buffered`, …):
+what each one means, where it is emitted, and how to read the in-flight gauge.
+
+- `node-flow-metrics.md` — metric reference
+
 ## How to keep this up to date
 
 When behavior changes:

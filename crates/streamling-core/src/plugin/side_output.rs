@@ -114,7 +114,7 @@ pub fn register_plugin_side_outputs(
             // teardown; the PostPlugin stage drains it after that.
             scope.spawn(process_plugin_metrics(
                 metrics_channel.receiver,
-                host_metrics_recorder,
+                Some(host_metrics_recorder),
                 metric_metadata_id,
                 scope.stage_token().clone(),
             ));

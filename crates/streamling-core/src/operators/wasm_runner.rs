@@ -14,6 +14,8 @@ use crate::formats::FromArrowConverter;
 use crate::formats::ipc::FromArrowToIpcConverter;
 use crate::formats::json::JsonToArrowConverter;
 use crate::operators::wasm_runner::transpiler::TsToJSTranspiler;
+use crate::telemetry::node_flow::{record_backpressure_wait, send_batch_with_metrics};
+use crate::telemetry::recorder::try_get_metrics_recorder;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
 use arrow_schema::{DataType, Field, Schema};
@@ -40,6 +42,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{self, debug, error};
 
 const WASM_FUNCTION_INVOKE: &str = "invoke";
@@ -56,6 +59,9 @@ pub struct WasmRunnerNode {
     internal_buffer_size: u32,
     schema_map: Option<BTreeMap<String, String>>,
     schema: Option<Arc<DFSchema>>,
+    /// Attribution key for this node's metrics. Excluded from the node's
+    /// identity impls below, so adding telemetry never changes planning.
+    metric_metadata_id: String,
 }
 
 impl WasmRunnerNode {
@@ -118,7 +124,17 @@ impl WasmRunnerNode {
             internal_buffer_size,
             schema_map,
             schema,
+            metric_metadata_id: String::new(),
         })
+    }
+
+    pub fn with_metric_metadata_id(mut self, metric_metadata_id: String) -> Self {
+        self.metric_metadata_id = metric_metadata_id;
+        self
+    }
+
+    pub fn metric_metadata_id(&self) -> &str {
+        &self.metric_metadata_id
     }
 
     pub fn get_output_schema(&self) -> Result<SchemaRef> {
@@ -194,6 +210,7 @@ impl UserDefinedLogicalNodeCore for WasmRunnerNode {
             internal_buffer_size: self.internal_buffer_size,
             schema_map: self.schema_map.clone(),
             schema: self.schema.clone(),
+            metric_metadata_id: self.metric_metadata_id.clone(),
         })
     }
 
@@ -229,6 +246,7 @@ impl ExtensionPlanner for WasmRunnerExtensionPlanner {
                     wasm_runner_node.runtime_wasm_file_path.clone(),
                     wasm_runner_node.internal_buffer_size,
                     output_schema,
+                    wasm_runner_node.metric_metadata_id.clone(),
                 ));
                 Some(wasm_exec)
             } else {
@@ -248,6 +266,7 @@ struct WasmRunnerExec {
     schema: SchemaRef,
     /// Pre-transpiled code (cached for efficiency)
     transpiled_code: String,
+    metric_metadata_id: String,
 }
 
 impl WasmRunnerExec {
@@ -258,6 +277,7 @@ impl WasmRunnerExec {
         runtime_wasm_file_path: Option<String>,
         internal_buffer_size: u32,
         schema: SchemaRef,
+        metric_metadata_id: String,
     ) -> Self {
         let transpiler = TsToJSTranspiler::new();
         let cache = Self::compute_properties(&input, schema.clone());
@@ -284,6 +304,7 @@ impl WasmRunnerExec {
             cache: Arc::new(cache),
             schema,
             transpiled_code,
+            metric_metadata_id,
         }
     }
 
@@ -348,6 +369,7 @@ impl ExecutionPlan for WasmRunnerExec {
             self.runtime_wasm_file_path.clone(),
             self.internal_buffer_size,
             self.schema.clone(),
+            self.metric_metadata_id.clone(),
         )))
     }
 
@@ -366,6 +388,8 @@ impl ExecutionPlan for WasmRunnerExec {
         let output_schema = self.schema.clone();
         let runtime_wasm_file_path = self.runtime_wasm_file_path.clone();
         let transpiled_code = self.transpiled_code.clone();
+        let metrics_recorder = try_get_metrics_recorder();
+        let metric_metadata_id = self.metric_metadata_id.clone();
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             self.schema(),
@@ -385,6 +409,7 @@ impl ExecutionPlan for WasmRunnerExec {
                 ))
             })??;
             let plugin = Arc::new(std::sync::Mutex::new(plugin));
+            let tags = [("execution_kind", "native")];
 
             while let Some(batch) = data.next().await {
                 let batch = batch?;
@@ -409,12 +434,29 @@ impl ExecutionPlan for WasmRunnerExec {
 
                 match result {
                     Ok(batch) => {
-                        if tx.send(Ok(batch)).await.is_err() {
+                        let num_rows = batch.num_rows() as u64;
+                        if !send_batch_with_metrics(
+                            &tx,
+                            Ok(batch),
+                            num_rows,
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &tags,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
                     Err(error) => {
+                        let send_start = Instant::now();
                         let _ = tx.send(Err(error)).await;
+                        record_backpressure_wait(
+                            metrics_recorder.as_deref(),
+                            &metric_metadata_id,
+                            &tags,
+                            send_start,
+                        );
                         break;
                     }
                 }

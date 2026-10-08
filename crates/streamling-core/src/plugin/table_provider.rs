@@ -186,7 +186,7 @@ impl ExecutionPlan for PluginSourceExec {
             // AFTER the dispatcher flush it serves.
             forwarder_scope.spawn(process_plugin_metrics(
                 metrics_receiver,
-                metrics_recorder,
+                Some(metrics_recorder),
                 metric_metadata_id,
                 forwarder_scope.stage_token().clone(),
             ));
@@ -608,7 +608,7 @@ impl DataSink for PluginSink {
             // teardown; drained after the dispatcher flush it serves.
             self.scope.spawn(process_plugin_metrics(
                 self.plugin_channels.metrics.receiver.clone(),
-                metrics_recorder.clone(),
+                Some(metrics_recorder.clone()),
                 self.metric_metadata_id.clone(),
                 self.scope.stage_token().clone(),
             ));
