@@ -106,14 +106,27 @@ impl TaskWaitMeter {
         now
     }
 
-    fn end_wait(&self, started: Instant, starved: bool) {
+    fn end_wait(&self, started: Instant, end: WaitEnd) {
         let now = Instant::now();
         let mut timeline = self.timeline.lock();
-        if starved {
-            timeline.starved.add(now - started);
+        match end {
+            WaitEnd::Delivered => timeline.starved.add(now - started),
+            WaitEnd::Sent => {}
+            // The input is exhausted: the task has no more work to time.
+            WaitEnd::Exhausted => return,
         }
         timeline.busy_since = Some(now);
     }
+}
+
+/// How a bracketed await ended.
+enum WaitEnd {
+    /// An input item arrived: the wait was `starved`.
+    Delivered,
+    /// An output send completed: the wait was the edge's `blocked`.
+    Sent,
+    /// The input ended: the wait was teardown, and no work follows.
+    Exhausted,
 }
 
 /// The operator's view of its (possibly absent) [`TaskWaitMeter`]. Without a
@@ -130,7 +143,12 @@ impl TaskWaitHandle {
         };
         let started = meter.begin_wait();
         let item = input.next().await;
-        meter.end_wait(started, item.is_some());
+        let end = if item.is_some() {
+            WaitEnd::Delivered
+        } else {
+            WaitEnd::Exhausted
+        };
+        meter.end_wait(started, end);
         item
     }
 
@@ -141,7 +159,7 @@ impl TaskWaitHandle {
         };
         let started = meter.begin_wait();
         let output = send.await;
-        meter.end_wait(started, false);
+        meter.end_wait(started, WaitEnd::Sent);
         output
     }
 }
@@ -198,6 +216,20 @@ mod tests {
         assert!(
             (30..60).contains(&drained.busy),
             "busy = work only, not the send wait: {drained:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_of_input_stops_the_busy_clock() {
+        let (meter, handle) = claimed_meter();
+        let mut input = futures::stream::empty::<()>();
+        assert_eq!(handle.next(&mut input).await, None);
+        meter.take_whole_millis();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            meter.take_whole_millis().busy,
+            0,
+            "a task past end of input is not working"
         );
     }
 
