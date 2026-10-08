@@ -24,6 +24,7 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 - [Common patterns](#common-patterns)
 - [Development setup](#development-setup)
 - [Reference](#reference)
+- [Engine SQL functions](docs/sql-udfs.md)
 - [Topology](#topology)
 - [Dynamic Tables](#dynamic-tables)
 - [Side Outputs](#side-outputs)
@@ -294,6 +295,10 @@ Recommended environment variables when running locally:
 ## Reference
 
 The sections below are the full connector and runtime reference. New here? Start with [Quick start](#quick-start).
+
+For functions available to SQL transforms, see the [engine SQL function reference](docs/sql-udfs.md): Streamling's
+own functions, the Flink-compatible string and JSON functions, and `dynamic_table_check`.
+Plugin-provided SQL functions depend on which plugins the deployment loads.
 
 ## Topology
 
@@ -2206,6 +2211,8 @@ open_telemetry_metrics:
 ```
 
 By default, service name is set to `streamling` and `service.instance.id` is set to `application_id`.
+
+For Kubernetes deployments, the agent injects `POD_NAME` from `metadata.name`. Streamling adds it to the OTLP resource as `k8s.pod.name` for both cumulative and delta metrics, while `service.instance.id` remains the application ID. Compute `rate` or `increase` per pod before summing across replicas; do not aggregate cumulative counters before computing their rate.
 
 Environment variables can also be used:
 

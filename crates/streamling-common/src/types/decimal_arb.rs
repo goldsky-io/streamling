@@ -153,6 +153,25 @@ impl DecimalArbType {
         NativeIntKind::parse(raw)
     }
 
+    /// `metadata` without the decimal_arb keys (extension name and payload,
+    /// `native_int_kind`), or `None` when it has none of them.
+    pub fn without_decimal_arb_metadata(
+        metadata: &HashMap<String, String>,
+    ) -> Option<HashMap<String, String>> {
+        let decimal_arb_key = |key: &str| {
+            key == Self::NATIVE_INT_KIND_KEY
+                || (Self::is_decimal_arb_metadata(metadata)
+                    && (key == Self::EXTENSION_NAME_KEY || key == Self::EXTENSION_METADATA_KEY))
+        };
+        metadata.keys().any(|k| decimal_arb_key(k)).then(|| {
+            metadata
+                .iter()
+                .filter(|(k, _)| !decimal_arb_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+    }
+
     /// Read the `native_int_kind` origin hint from a raw metadata map.
     /// Used by code paths that need to inspect the hint *after* a field's
     /// `DataType` has been transformed away from `LargeBinary` (e.g. the
@@ -1033,7 +1052,7 @@ fn bigint_to_i128(value: &BigInt) -> Option<i128> {
 }
 
 /// Convert a `BigInt` to `arrow::buffer::i256`, returning `None` on overflow.
-fn bigint_to_arrow_i256(value: &BigInt) -> Option<ArrowI256> {
+pub(crate) fn bigint_to_arrow_i256(value: &BigInt) -> Option<ArrowI256> {
     let bytes = value.to_signed_bytes_be();
     if bytes.len() > 32 {
         return None;

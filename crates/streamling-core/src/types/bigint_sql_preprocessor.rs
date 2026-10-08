@@ -235,28 +235,24 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         )
     })?;
 
-    let decimal_columns = |schema: &arrow_schema::Schema| -> HashSet<String> {
-        schema
-            .fields()
-            .iter()
-            .filter(|f| crate::types::decimal_arb::DecimalArbType::is_decimal_arb_field(f))
-            .map(|f| f.name().to_string())
-            .collect()
-    };
     let mut decimal_arb_cols: HashSet<String> = HashSet::new();
+    let mut all_columns: HashSet<String> = HashSet::new();
+    let mut struct_leaves: HashSet<String> = HashSet::new();
     let mut by_qualifier: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut record_table = |table: &str, columns: HashSet<String>| {
-        decimal_arb_cols.extend(columns.iter().cloned());
+    let mut record_table = |table: &str, columns: TableColumns| {
+        decimal_arb_cols.extend(columns.decimal_arb.iter().cloned());
+        all_columns.extend(columns.all);
+        struct_leaves.extend(columns.struct_leaves);
         // Keyed by the full name and by the last segment, so `schema.t.c`,
         // `t.c` and an alias (added below) all resolve.
-        by_qualifier.insert(table.to_string(), columns.clone());
+        by_qualifier.insert(table.to_string(), columns.decimal_arb.clone());
         if let Some(last) = table.rsplit('.').next() {
-            by_qualifier.insert(last.to_string(), columns);
+            by_qualifier.insert(last.to_string(), columns.decimal_arb);
         }
     };
     record_table(
         &tables[0],
-        decimal_columns(table_provider.schema().as_ref()),
+        TableColumns::of(table_provider.schema().as_ref()),
     );
     // Joined tables contribute their decimal_arb columns too; one that
     // cannot be resolved here is left for DataFusion to report.
@@ -269,7 +265,7 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
         let Ok(Some(provider)) = schema.table(table_name).await else {
             continue;
         };
-        record_table(table, decimal_columns(provider.schema().as_ref()));
+        record_table(table, TableColumns::of(provider.schema().as_ref()));
     }
     // Every alias a table is given resolves to that table's columns.
     let mut aliases = TableAliases {
@@ -279,6 +275,9 @@ pub async fn preprocess_bigint_binary_ops_with_schema(
     let scope = DecimalArbNames {
         names: decimal_arb_cols,
         by_qualifier,
+        columns: all_columns,
+        struct_leaves,
+        rebound: HashSet::new(),
     };
 
     // Walk the SQL AST and apply the decimal_arb CAST-to-string rewrite.
@@ -638,7 +637,16 @@ const DECIMAL_ARB_CONSTRUCTORS: &[&str] = &[
     "decimal_arb_least",
     "decimal_arb_array_min",
     "decimal_arb_array_max",
+    WIDE_DECIMAL_CAST,
+    TRY_WIDE_DECIMAL_CAST,
 ];
+
+/// The preprocessor's calls for casts it cannot decide without types (see
+/// `DecimalArbSqlCastFunc`): `(value, fallback)`, `fallback` being the cast
+/// as written before.
+const UNBOUNDED_NUMERIC_CAST: &str = "decimal_arb_cast_numeric";
+const WIDE_DECIMAL_CAST: &str = "decimal_arb_cast_wide_decimal";
+const TRY_WIDE_DECIMAL_CAST: &str = "decimal_arb_try_cast_wide_decimal";
 
 /// Functions whose result is decimal_arb when a decimal_arb argument goes in.
 const DECIMAL_ARB_PRESERVING: &[&str] = &[
@@ -711,35 +719,171 @@ struct DecimalArbNames {
     /// qualified reference is resolved against its own table: `p.amt` next
     /// to a decimal_arb `q.amt` is not decimal_arb.
     by_qualifier: HashMap<String, HashSet<String>>,
+    /// Every top-level column of every referenced table, whatever its type:
+    /// `s.amount` with `s` among them is a struct field access, decided by
+    /// [`Self::struct_leaves`], not a column qualified by a table or CTE.
+    columns: HashSet<String>,
+    /// Dotted paths (`s.amount`, `s.inner.v`) of the decimal_arb fields
+    /// reachable through the referenced tables' struct columns.
+    struct_leaves: HashSet<String>,
+    /// Names some projection (a CTE or a derived table) binds to an
+    /// expression that is not decimal_arb. `names` is one set for the whole
+    /// statement, so such a name can still be in it from a table.
+    rebound: HashSet<String>,
+}
+
+/// What the preprocessor reads from a referenced table's schema.
+struct TableColumns {
+    /// The top-level decimal_arb columns.
+    decimal_arb: HashSet<String>,
+    /// Every top-level column.
+    all: HashSet<String>,
+    /// Dotted paths of the decimal_arb fields under struct columns.
+    struct_leaves: HashSet<String>,
+}
+
+impl TableColumns {
+    fn of(schema: &arrow_schema::Schema) -> Self {
+        use crate::types::decimal_arb::DecimalArbType;
+        fn leaves(field: &arrow_schema::Field, path: &str, out: &mut HashSet<String>) {
+            let arrow_schema::DataType::Struct(children) = field.data_type() else {
+                return;
+            };
+            for child in children.iter() {
+                let child_path = format!("{path}.{}", child.name());
+                if DecimalArbType::is_decimal_arb_field(child) {
+                    out.insert(child_path.clone());
+                }
+                leaves(child, &child_path, out);
+            }
+        }
+        let mut struct_leaves = HashSet::new();
+        for field in schema.fields() {
+            leaves(field, field.name(), &mut struct_leaves);
+        }
+        Self {
+            decimal_arb: schema
+                .fields()
+                .iter()
+                .filter(|f| DecimalArbType::is_decimal_arb_field(f))
+                .map(|f| f.name().to_string())
+                .collect(),
+            all: schema
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect(),
+            struct_leaves,
+        }
+    }
 }
 
 impl DecimalArbNames {
     fn collect(stmt: &Statement, mut names: Self) -> Self {
-        // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
-        // FROM a)`), so collect until nothing new appears.
-        loop {
-            let before = names.names.len();
-            let mut collector = AliasCollector { names: &mut names };
-            let _ = stmt.visit(&mut collector);
-            if names.names.len() == before {
+        // `names` and `rebound` depend on each other: an alias bound to
+        // `decimal_arb_cast_numeric(x, …)` is decimal_arb only while `x` is
+        // not rebound, and which names are rebound is decided by which are
+        // decimal_arb. Alternate the two until neither changes, restarting
+        // the aliases from the tables' columns each round so one recorded
+        // under an incomplete `rebound` does not stick.
+        let base = names.names.clone();
+        for _ in 0..8 {
+            names.names = base.clone();
+            // Aliases chain (`WITH a AS (SELECT v AS x …), b AS (SELECT x AS y
+            // FROM a)`), so collect until nothing new appears.
+            loop {
+                let before = names.names.len();
+                let mut collector = AliasCollector { names: &mut names };
+                let _ = stmt.visit(&mut collector);
+                if names.names.len() == before {
+                    break;
+                }
+            }
+            // Once `names` is complete, so a chained alias is not mistaken
+            // for a non-decimal one on an early pass.
+            let mut rebound = HashSet::new();
+            let _ = stmt.visit(&mut ReboundCollector {
+                names: &names,
+                rebound: &mut rebound,
+            });
+            if rebound == names.rebound {
                 break;
             }
+            names.rebound = rebound;
         }
         names
     }
 
+    /// A column reference to a name some projection rebinds to a
+    /// non-decimal_arb value (unqualified, or qualified by a CTE or derived
+    /// table rather than a referenced table).
+    fn is_rebound(&self, expr: &SqlExpr) -> bool {
+        match expr {
+            SqlExpr::Identifier(ident) => self.rebound.contains(&ident.value),
+            SqlExpr::CompoundIdentifier(parts) => match &parts[..] {
+                [.., qualifier, column] => {
+                    !self.by_qualifier.contains_key(&qualifier.value)
+                        && self.rebound.contains(&column.value)
+                }
+                [column] => self.rebound.contains(&column.value),
+                [] => false,
+            },
+            SqlExpr::Nested(inner) => self.is_rebound(inner),
+            _ => false,
+        }
+    }
+
+    /// Output names of `select` bound to a non-decimal_arb expression.
+    fn rebound_names(&self, select: &Select, positional: Option<&TableAlias>) -> Vec<String> {
+        let mut out = vec![];
+        for (i, item) in select.projection.iter().enumerate() {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr) => expr,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if !self.is_decimal(expr) {
+                        out.push(alias.value.clone());
+                    }
+                    expr
+                }
+                _ => continue,
+            };
+            if let Some(alias) = positional
+                && let Some(column) = alias.columns.get(i)
+                && !self.is_decimal(expr)
+            {
+                out.push(column.name.value.clone());
+            }
+        }
+        out
+    }
+
     /// A (possibly qualified) column reference. A qualifier that names a
     /// referenced table or one of its aliases decides by that table's own
-    /// columns; any other qualifier (a CTE, a derived table) and a bare name
-    /// fall back to the name set.
+    /// columns; a leading segment that names one of the tables' columns
+    /// makes the rest a struct field path, decided by the struct's own
+    /// fields (`s.amount` is not the table's `amount`); any other qualifier
+    /// (a CTE, a derived table) and a bare name fall back to the name set.
     fn column_is_decimal(&self, parts: &[datafusion::logical_expr::sqlparser::ast::Ident]) -> bool {
         let Some(column) = parts.last() else {
             return false;
         };
-        if parts.len() >= 2
-            && let Some(columns) = self.by_qualifier.get(&parts[parts.len() - 2].value)
-        {
-            return columns.contains(&column.value);
+        if parts.len() >= 2 {
+            if let Some(columns) = self.by_qualifier.get(&parts[parts.len() - 2].value) {
+                return columns.contains(&column.value);
+            }
+            // `s.a.b`, or `t.s.a.b` under a table qualifier.
+            let struct_start = (0..parts.len() - 1).find(|&i| {
+                self.columns.contains(&parts[i].value)
+                    && (i == 0 || self.by_qualifier.contains_key(&parts[i - 1].value))
+            });
+            if let Some(start) = struct_start {
+                let path = parts[start..]
+                    .iter()
+                    .map(|p| p.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                return self.struct_leaves.contains(&path);
+            }
         }
         self.names.contains(&column.value)
     }
@@ -768,6 +912,13 @@ impl DecimalArbNames {
             }
             SqlExpr::Function(func) => match function_name(func) {
                 Some(name) if DECIMAL_ARB_CONSTRUCTORS.contains(&name.as_str()) => true,
+                // A bare `CAST(x AS NUMERIC)` is `x` when `x` is decimal_arb. A
+                // name some projection rebinds to another type may not be:
+                // leave its literals to the planner, as before the cast was
+                // decided by type.
+                Some(name) if name == UNBOUNDED_NUMERIC_CAST => function_args(func)
+                    .first()
+                    .is_some_and(|x| self.is_decimal(x) && !self.is_rebound(x)),
                 Some(name) if DECIMAL_ARB_PRESERVING.contains(&name.as_str()) => {
                     function_args(func).into_iter().any(|a| self.is_decimal(a))
                 }
@@ -801,6 +952,18 @@ impl DecimalArbNames {
             }
         }
     }
+}
+
+/// `DECIMAL` / `NUMERIC` (or another spelling) written without a precision.
+fn is_unbounded_decimal_type(data_type: &SqlDataType) -> bool {
+    matches!(
+        data_type,
+        SqlDataType::Decimal(ExactNumberInfo::None)
+            | SqlDataType::Numeric(ExactNumberInfo::None)
+            | SqlDataType::Dec(ExactNumberInfo::None)
+            | SqlDataType::BigNumeric(ExactNumberInfo::None)
+            | SqlDataType::BigDecimal(ExactNumberInfo::None)
+    )
 }
 
 /// `CAST(… AS DECIMAL(p[, s]))` beyond DataFusion's native precision routes
@@ -880,6 +1043,46 @@ impl Visitor for AliasCollector<'_> {
 
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
         self.names.record_select(select, None);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Collects [`DecimalArbNames::rebound`] from the projections other query
+/// blocks read: CTE bodies and derived tables. A select's own aliases are
+/// not visible to its own expressions (`SELECT CAST(amount AS DOUBLE) AS
+/// amount, CAST(amount AS NUMERIC) * 1.5 …` casts the table's column), so a
+/// plain select rebinds nothing.
+struct ReboundCollector<'a> {
+    names: &'a DecimalArbNames,
+    rebound: &'a mut HashSet<String>,
+}
+
+impl Visitor for ReboundCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                if let Some(select) = leftmost_select(&cte.query.body) {
+                    self.rebound
+                        .extend(self.names.rebound_names(select, Some(&cte.alias)));
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } = table_factor
+            && let Some(select) = leftmost_select(&subquery.body)
+        {
+            self.rebound
+                .extend(self.names.rebound_names(select, Some(alias)));
+        }
         ControlFlow::Continue(())
     }
 }
@@ -989,6 +1192,27 @@ fn quote_inexact_literals_near_decimal_arb(stmt: &mut Statement, names: &Decimal
     });
 }
 
+/// Whether every `(` in `text` is closed and none is closed before it opens, ignoring parentheses
+/// inside single-quoted string literals (a doubled quote escapes itself and toggles twice).
+fn parentheses_balance(text: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     // First, normalize TRY_CAST DECIMAL via regex (AST may not have TryCast variant)
     lazy_static::lazy_static! {
@@ -1003,6 +1227,13 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
     let sql = DECIMAL_TRY_RE
         .replace_all(sql, |caps: &regex::Captures| {
             let expr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            // The lazy `(.+?)` stops at the first `AS DECIMAL(..))` it can reach. When the argument
+            // holds a call of its own, that is the inner call's tail and what was captured is not an
+            // expression: its parentheses do not balance. Leave the match untouched; the AST pass
+            // below rewrites every TRY_CAST node on its own.
+            if !parentheses_balance(expr) {
+                return caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+            }
             // Parse precision as u32 — decimal_arb supports declared
             // precision well beyond u8::MAX. Scale parses as u32 too because
             // negative scale isn't representable for decimal_arb.
@@ -1022,14 +1253,20 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
                 // not fit the declared type instead of failing the query.
                 // A bare numeric literal is quoted rather than cast to
                 // VARCHAR: planned as Float64 it would lose digits first.
-                let text = if NUMERIC_LITERAL_RE.is_match(expr.trim()) {
-                    format!("'{}'", expr.trim())
-                } else {
-                    format!("TRY_CAST({expr} AS VARCHAR)")
-                };
+                if NUMERIC_LITERAL_RE.is_match(expr.trim()) {
+                    return format!(
+                        "try_to_decimal_arb_from_string('{}', {}, {}{})",
+                        expr.trim(),
+                        precision,
+                        scale,
+                        native_int_hint_arg(precision, scale)
+                    );
+                }
+                // Any other operand may be decimal_arb, which rounds to the
+                // declared scale instead of going through text.
                 format!(
-                    "try_to_decimal_arb_from_string({}, {}, {}{})",
-                    text,
+                    "{TRY_WIDE_DECIMAL_CAST}({expr}, \
+                     try_to_decimal_arb_from_string(TRY_CAST({expr} AS VARCHAR), {}, {}{}))",
                     precision,
                     scale,
                     native_int_hint_arg(precision, scale)
@@ -1090,7 +1327,8 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         // has no SQL type of its own: DataFusion plans it as Float64 before the
         // cast ever runs, so `CAST(... AS VARCHAR)` saw an approximation and the
         // exact digits were gone. Quoting the token keeps them.
-        let inner_sql = match number_literal_text(inner) {
+        let literal = number_literal_text(inner);
+        let inner_sql = match &literal {
             Some(text) => format!("'{text}'"),
             None => format!("CAST({inner} AS VARCHAR)"),
         };
@@ -1099,10 +1337,20 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
             .zip(i32::try_from(scale).ok())
             .map(|(p, s)| native_int_hint_arg(p, s))
             .unwrap_or_default();
-        let call_sql = format!(
-            "SELECT {}({}, {}, {}{})",
-            function, inner_sql, precision, scale, hint
-        );
+        let text_cast = format!("{function}({inner_sql}, {precision}, {scale}{hint})");
+        // Any operand but a literal may be decimal_arb, which rounds to the
+        // declared scale instead of going through text.
+        let call_sql = match literal {
+            Some(_) => format!("SELECT {text_cast}"),
+            None => {
+                let marker = if non_throwing {
+                    TRY_WIDE_DECIMAL_CAST
+                } else {
+                    WIDE_DECIMAL_CAST
+                };
+                format!("SELECT {marker}({inner}, {text_cast})")
+            }
+        };
         let mut stmts = Parser::parse_sql(&dialect, call_sql.as_str()).ok()?;
         if stmts.len() != 1 {
             return None;
@@ -1182,8 +1430,40 @@ pub fn preprocess_bigint_decimal_casts(sql: &str) -> String {
         rewrite_expr(expr);
         ControlFlow::<()>::Continue(())
     });
+    mark_unbounded_numeric_casts(&mut stmt);
 
     stmt.to_string()
+}
+
+/// Write every `CAST` / `TRY_CAST` / `::` to `NUMERIC` or `DECIMAL` without a
+/// precision as `decimal_arb_cast_numeric(x, <the cast>)`.
+///
+/// DataFusion reads a bare `NUMERIC` as `Decimal128(38, 10)`, which rounds a
+/// decimal_arb value to 10 fractional digits and fails past 28 integer
+/// digits, where SQL means a numeric of unconstrained precision — which
+/// decimal_arb already is. Whether `x` is decimal_arb is a question of types
+/// (a CTE can rebind a column's name, a struct field or a UDF can yield one),
+/// so the analyzer answers it: `x` itself if it is decimal_arb, the cast as
+/// written otherwise. See `DecimalArbSqlCastFunc`.
+fn mark_unbounded_numeric_casts(stmt: &mut Statement) {
+    // Post-order: the cast kept inside the call is not visited again.
+    let _ = visit_expressions_mut(stmt, |expr: &mut SqlExpr| {
+        if let SqlExpr::Cast {
+            expr: inner,
+            data_type,
+            format: None,
+            ..
+        } = &*expr
+            && is_unbounded_decimal_type(data_type)
+            && let Some(Statement::Query(query)) =
+                parse_single_statement(&format!("SELECT {UNBOUNDED_NUMERIC_CAST}({inner}, {expr})"))
+            && let SetExpr::Select(select) = *query.body
+            && let Some(SelectItem::UnnamedExpr(call)) = select.projection.into_iter().next()
+        {
+            *expr = call;
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 /// Combined preprocessor: first applies DECIMAL cast rewrite, then bigint binary-op rewrite.
@@ -1207,17 +1487,17 @@ mod tests {
         // printed-type sniff for `decimal(` left them to fail planning.
         assert_eq!(
             preprocess_bigint_decimal_casts("SELECT CAST(balance AS NUMERIC(78, 0)) FROM accounts"),
-            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+            "SELECT decimal_arb_cast_wide_decimal(balance, to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256')) FROM accounts"
         );
         assert_eq!(
             preprocess_bigint_decimal_casts("SELECT CAST(balance AS DEC(100, 2)) FROM accounts"),
-            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 100, 2) FROM accounts"
+            "SELECT decimal_arb_cast_wide_decimal(balance, to_decimal_arb_from_string(CAST(balance AS VARCHAR), 100, 2)) FROM accounts"
         );
         assert_eq!(
             preprocess_bigint_decimal_casts(
                 "SELECT TRY_CAST(balance AS NUMERIC(78)) FROM accounts"
             ),
-            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+            "SELECT decimal_arb_try_cast_wide_decimal(balance, try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0, 'u256')) FROM accounts"
         );
         // Narrow spellings stay native.
         assert_eq!(
@@ -1253,7 +1533,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+            "SELECT decimal_arb_cast_wide_decimal(balance, to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256')) FROM accounts"
         );
     }
 
@@ -1264,7 +1544,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(value AS VARCHAR), 77, 0, 'u256') FROM data"
+            "SELECT decimal_arb_cast_wide_decimal(value, to_decimal_arb_from_string(CAST(value AS VARCHAR), 77, 0, 'u256')) FROM data"
         );
     }
 
@@ -1276,7 +1556,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(large_num AS VARCHAR), 100, 0) FROM data"
+            "SELECT decimal_arb_cast_wide_decimal(large_num, to_decimal_arb_from_string(CAST(large_num AS VARCHAR), 100, 0)) FROM data"
         );
     }
 
@@ -1314,7 +1594,7 @@ mod tests {
         // TRY_CAST is non-throwing, so it takes the `try_` constructor.
         assert_eq!(
             result,
-            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+            "SELECT decimal_arb_try_cast_wide_decimal(balance, try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 78, 0, 'u256')) FROM accounts"
         );
     }
 
@@ -1337,13 +1617,47 @@ mod tests {
     }
 
     #[test]
+    fn test_preprocess_try_cast_around_an_expression_that_contains_try_cast() {
+        // The regex pass paired the outer call with the first `AS DECIMAL(..))` it reached,
+        // which closes the inner call, and the statement came out unparseable.
+        let sql = "SELECT TRY_CAST(CASE WHEN x > 1 THEN COALESCE(TRY_CAST(a AS DECIMAL(78)), 0) \
+                   ELSE 0 END AS DECIMAL(78)) AS v FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(
+            super::parse_single_statement(&result).is_some(),
+            "not valid SQL: {result}"
+        );
+        // Each wide cast keeps its text round trip as the fallback of the
+        // call that decides by type, and the outer one prints the inner call
+        // twice (as its value and inside its fallback): three in all.
+        assert_eq!(
+            result.matches("try_to_decimal_arb_from_string(").count(),
+            3,
+            "{result}"
+        );
+        assert!(!result.to_uppercase().contains(" AS DECIMAL("), "{result}");
+    }
+
+    #[test]
+    fn test_preprocess_try_cast_keeps_parentheses_inside_literals_out_of_the_balance() {
+        let sql = "SELECT TRY_CAST(concat('(', a) AS DECIMAL(78, 0)) FROM t";
+        let result = preprocess_bigint_decimal_casts(sql);
+        assert!(super::parse_single_statement(&result).is_some(), "{result}");
+        assert_eq!(
+            result.matches("try_to_decimal_arb_from_string(").count(),
+            1,
+            "{result}"
+        );
+    }
+
+    #[test]
     fn test_preprocess_try_cast_100() {
         // TRY_CAST routes through the same lossless path.
         let sql = "SELECT TRY_CAST(balance AS DECIMAL(100, 0)) FROM accounts";
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 100, 0) FROM accounts"
+            "SELECT decimal_arb_try_cast_wide_decimal(balance, try_to_decimal_arb_from_string(TRY_CAST(balance AS VARCHAR), 100, 0)) FROM accounts"
         );
     }
 
@@ -1363,7 +1677,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(price AS VARCHAR), 78, 2) FROM products"
+            "SELECT decimal_arb_cast_wide_decimal(price, to_decimal_arb_from_string(CAST(price AS VARCHAR), 78, 2)) FROM products"
         );
     }
 
@@ -1375,8 +1689,8 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(a AS VARCHAR), 78, 0, 'u256'), \
-             to_decimal_arb_from_string(CAST(b AS VARCHAR), 100, 0) FROM t"
+            "SELECT decimal_arb_cast_wide_decimal(a, to_decimal_arb_from_string(CAST(a AS VARCHAR), 78, 0, 'u256')), \
+             decimal_arb_cast_wide_decimal(b, to_decimal_arb_from_string(CAST(b AS VARCHAR), 100, 0)) FROM t"
         );
     }
 
@@ -1386,7 +1700,7 @@ mod tests {
         let result = preprocess_bigint_decimal_casts(sql);
         assert_eq!(
             result,
-            "SELECT to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256') FROM accounts"
+            "SELECT decimal_arb_cast_wide_decimal(balance, to_decimal_arb_from_string(CAST(balance AS VARCHAR), 78, 0, 'u256')) FROM accounts"
         );
     }
 
@@ -1679,6 +1993,137 @@ mod tests {
             "wide-int text-cast fix must NOT leave the raw cast: {}",
             rewritten
         );
+    }
+
+    /// Every precision-less `NUMERIC` / `DECIMAL` cast is handed to the
+    /// analyzer with the cast as written, whatever its operand: only types
+    /// tell whether the operand is decimal_arb. One with a precision is left
+    /// to the planner.
+    #[test]
+    fn unbounded_numeric_casts_are_decided_by_type() {
+        for (sql, expected) in [
+            (
+                "SELECT CAST(amount AS NUMERIC) AS amount FROM t",
+                "SELECT decimal_arb_cast_numeric(amount, CAST(amount AS NUMERIC)) AS amount FROM t",
+            ),
+            (
+                "SELECT TRY_CAST(AMOUNT AS DECIMAL), amount::numeric FROM t",
+                "SELECT decimal_arb_cast_numeric(AMOUNT, TRY_CAST(AMOUNT AS DECIMAL)), \
+                 decimal_arb_cast_numeric(amount, amount::NUMERIC) FROM t",
+            ),
+            (
+                "SELECT CAST(amount + fee AS NUMERIC) * 2 AS v FROM t",
+                "SELECT decimal_arb_cast_numeric(amount + fee, CAST(amount + fee AS NUMERIC)) * 2 AS v \
+                 FROM t",
+            ),
+            (
+                "SELECT CAST(s['amount'] AS NUMERIC) FROM t",
+                "SELECT decimal_arb_cast_numeric(s['amount'], CAST(s['amount'] AS NUMERIC)) FROM t",
+            ),
+            // A precision is a request for that type.
+            (
+                "SELECT CAST(amount AS NUMERIC(20, 2)) FROM t",
+                "SELECT CAST(amount AS NUMERIC(20,2)) FROM t",
+            ),
+        ] {
+            assert_eq!(preprocess_bigint_decimal_casts(sql), expected, "{sql}");
+        }
+    }
+
+    /// A fractional literal next to `CAST(x AS NUMERIC)` is quoted like one
+    /// next to `x` (decimal_arb arithmetic refuses a Float64), except where a
+    /// projection rebinds the name to another type: there the cast is the
+    /// planner's `Decimal128(38, 10)`, which takes the literal as is.
+    #[tokio::test]
+    async fn literals_next_to_an_unbounded_numeric_cast() {
+        let ctx = setup_session_context();
+        register_decimal_arb_table(&ctx, "t", vec![("amount", None)]);
+        for (sql, quoted) in [
+            ("SELECT CAST(amount AS NUMERIC) * 1.5 AS v FROM t", true),
+            (
+                "WITH c AS (SELECT amount AS a FROM t) SELECT CAST(a AS NUMERIC) * 1.5 AS v FROM c",
+                true,
+            ),
+            (
+                "WITH c AS (SELECT CAST(amount AS TEXT) AS amount FROM t) \
+                 SELECT CAST(amount AS NUMERIC) * 1.5 AS v FROM c",
+                false,
+            ),
+            (
+                "SELECT CAST(s.amount AS NUMERIC) * 1.5 AS v \
+                 FROM (SELECT CAST(amount AS DOUBLE) AS amount FROM t) s",
+                false,
+            ),
+            // A select's own alias is not what its expressions refer to.
+            (
+                "SELECT CAST(amount AS DOUBLE) AS amount, CAST(amount AS NUMERIC) * 1.5 AS v \
+                 FROM t",
+                true,
+            ),
+            // An alias of a cast over a rebound name is not decimal_arb, even
+            // though the rebinding is only known once the aliases are.
+            (
+                "WITH c AS (SELECT CAST(amount AS TEXT) AS amount FROM t), \
+                 d AS (SELECT CAST(amount AS NUMERIC) AS v FROM c) \
+                 SELECT v * 1.5 AS w FROM d",
+                false,
+            ),
+        ] {
+            let rewritten = super::preprocess_bigint_sql(&ctx, sql).await.unwrap();
+            assert_eq!(
+                rewritten.contains("'1.5'"),
+                quoted,
+                "{sql}\n -> {rewritten}"
+            );
+        }
+    }
+
+    /// `s.amount` is the struct column `s`'s field, not the table's
+    /// decimal_arb `amount`: it is decided by the struct's own fields,
+    /// whether cast to a bare `NUMERIC` or used as is.
+    #[tokio::test]
+    async fn struct_fields_are_decided_by_the_struct_not_by_a_column_of_the_same_name() {
+        let ctx = setup_session_context();
+        let amount =
+            crate::types::decimal_arb::DecimalArbType::field("amount", 78, 0, false).unwrap();
+        let wide = crate::types::decimal_arb::DecimalArbType::field("wide", 100, 2, true).unwrap();
+        let s = Field::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    Field::new("amount", DataType::Float64, true),
+                    wide,
+                    Field::new(
+                        "inner",
+                        DataType::Struct(vec![Field::new("amount", DataType::Int64, true)].into()),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![amount, s]));
+        let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        for (sql, quoted) in [
+            ("SELECT CAST(s.amount AS NUMERIC) * 1.5 AS v FROM t", false),
+            ("SELECT s.amount * 1.5 AS v FROM t", false),
+            ("SELECT t.s.inner.amount * 1.5 AS v FROM t", false),
+            ("SELECT CAST(s.wide AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT s.wide * 1.5 AS v FROM t", true),
+            ("SELECT CAST(amount AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT CAST(\"amount\" AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT CAST(t.amount AS NUMERIC) * 1.5 AS v FROM t", true),
+            ("SELECT t.amount * 1.5 AS v FROM t", true),
+        ] {
+            let rewritten = super::preprocess_bigint_sql(&ctx, sql).await.unwrap();
+            assert_eq!(
+                rewritten.contains("'1.5'"),
+                quoted,
+                "{sql}\n -> {rewritten}"
+            );
+        }
     }
 
     /// Non-decimal_arb columns are not rewritten — verifies the
