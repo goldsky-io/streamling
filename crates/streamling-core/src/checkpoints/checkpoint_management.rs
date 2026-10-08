@@ -151,7 +151,12 @@ struct MarkerState {
 /// delivery is preserved.
 #[derive(Debug)]
 pub struct MarkerAligner {
-    live_inputs: usize,
+    inputs: usize,
+    /// The last epoch each finished input delivered (`None`: it delivered
+    /// none). Every input delivers markers in epoch order, so a finished input
+    /// delivered every epoch up to its watermark and will never deliver a
+    /// later one.
+    finished: Vec<Option<CheckpointEpoch>>,
     /// Released epochs stay recorded so a late copy from a slower input is
     /// absorbed rather than releasing the same epoch a second time. Entries are
     /// pruned when the epoch is finalized.
@@ -163,7 +168,8 @@ pub struct MarkerAligner {
 impl MarkerAligner {
     pub fn new(inputs: usize) -> Self {
         Self {
-            live_inputs: inputs,
+            inputs,
+            finished: Vec::new(),
             epochs: BTreeMap::new(),
             seen_finalizers: HashSet::new(),
             seen_source_completions: HashSet::new(),
@@ -180,13 +186,13 @@ impl MarkerAligner {
                     ref epoch,
                     created_at_ms,
                 } => {
-                    let live = self.live_inputs;
+                    let required = required_copies(self.inputs, &self.finished, epoch);
                     let state = self.epochs.entry(epoch.clone()).or_default();
                     if state.released {
                         continue;
                     }
                     state.copies += 1;
-                    if state.copies >= live.max(1) {
+                    if state.copies >= required {
                         state.released = true;
                         released.push(CheckpointMessage::Marker {
                             epoch: epoch.clone(),
@@ -214,14 +220,23 @@ impl MarkerAligner {
         released
     }
 
-    /// Record that one input stream has ended. Its share of every pending epoch
-    /// counts as delivered, so epochs it would never contribute to are released.
-    pub fn input_done(&mut self) -> Vec<CheckpointMessage> {
-        self.live_inputs = self.live_inputs.saturating_sub(1);
-        let live = self.live_inputs.max(1);
+    /// Record that one input stream has ended after delivering every epoch up
+    /// to `last_delivered`. Pending epochs after its watermark no longer wait
+    /// for it; the ones up to it already counted its copy. Once every input
+    /// has ended no copy can arrive any more, so every pending epoch is
+    /// released.
+    pub fn input_done(
+        &mut self,
+        last_delivered: Option<CheckpointEpoch>,
+    ) -> Vec<CheckpointMessage> {
+        self.finished.push(last_delivered);
+        let all_finished = self.finished.len() >= self.inputs;
         let mut released = Vec::new();
         for (epoch, state) in self.epochs.iter_mut() {
-            if !state.released && (state.copies >= live || self.live_inputs == 0) {
+            if !state.released
+                && (all_finished
+                    || state.copies >= required_copies(self.inputs, &self.finished, epoch))
+            {
                 state.released = true;
                 released.push(CheckpointMessage::Marker {
                     epoch: epoch.clone(),
@@ -231,6 +246,20 @@ impl MarkerAligner {
         }
         released
     }
+}
+
+/// Copies of `epoch` a [`MarkerAligner`] needs: one per input, except the
+/// inputs that finished before it.
+fn required_copies(
+    inputs: usize,
+    finished: &[Option<CheckpointEpoch>],
+    epoch: &CheckpointEpoch,
+) -> usize {
+    let finished_before = finished
+        .iter()
+        .filter(|last| last.as_ref().is_none_or(|last| last < epoch))
+        .count();
+    inputs.saturating_sub(finished_before).max(1)
 }
 
 /// Tracks, per sink, how many concurrent write streams must flush an epoch
@@ -266,14 +295,21 @@ pub fn report_marker_at_sink(sink_id: &str, epoch: CheckpointEpoch) -> bool {
         .is_empty()
 }
 
-/// Report that one write stream of `sink_id` has finished, returning any epochs
-/// that become ackable because the stream will never report them itself.
-pub fn sink_stream_done(sink_id: &str) -> Vec<CheckpointEpoch> {
+/// Report that one write stream of `sink_id` has finished after flushing every
+/// epoch up to `last_flushed`, returning any epochs that become ackable because
+/// the stream will never report them itself.
+///
+/// Report only a stream whose write succeeded: a failed stream must stay
+/// required, so that no epoch it did not flush is ever acked.
+pub fn sink_stream_done(
+    sink_id: &str,
+    last_flushed: Option<CheckpointEpoch>,
+) -> Vec<CheckpointEpoch> {
     let mut gates = SINK_ACK_GATES.lock();
     let Some(gate) = gates.get_mut(sink_id) else {
         return Vec::new();
     };
-    gate.input_done()
+    gate.input_done(last_flushed)
         .into_iter()
         .filter_map(|m| match m {
             CheckpointMessage::Marker { epoch, .. } => Some(epoch),
@@ -1239,6 +1275,17 @@ pub fn extract_checkpoint_messages(
     }
 }
 
+/// The latest epoch among the markers in `messages`.
+pub fn last_marker_epoch(messages: &[CheckpointMessage]) -> Option<CheckpointEpoch> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            CheckpointMessage::Marker { epoch, .. } => Some(epoch.clone()),
+            _ => None,
+        })
+        .max()
+}
+
 /// Remove checkpoint messages metadata from a record batch, preserving all other metadata and data.
 ///
 /// This is used by the batch accumulator to strip checkpoint markers from remainder slices
@@ -1303,20 +1350,45 @@ mod tests {
     }
 
     #[test]
-    fn aligner_treats_an_ended_input_as_having_delivered() {
+    fn aligner_releases_an_epoch_an_ended_input_never_delivered() {
         let mut aligner = MarkerAligner::new(2);
         assert!(aligner.observe(vec![marker(7)]).is_empty());
         assert_eq!(
-            epochs_of(&aligner.input_done()),
+            epochs_of(&aligner.input_done(Some(CheckpointEpoch(6)))),
             vec![7],
-            "an input that ends can no longer withhold an epoch"
+            "an input that ended before epoch 7 can no longer withhold it"
+        );
+    }
+
+    /// Counting alone, the ended input's own copy would stand in for the
+    /// other input's once the ended one stopped being required.
+    #[test]
+    fn aligner_waits_for_the_others_when_an_input_ends_after_delivering_an_epoch() {
+        let mut aligner = MarkerAligner::new(2);
+        assert!(aligner.observe(vec![marker(5)]).is_empty());
+        assert!(
+            aligner.input_done(Some(CheckpointEpoch(5))).is_empty(),
+            "the other input has not delivered epoch 5"
+        );
+        assert_eq!(epochs_of(&aligner.observe(vec![marker(5)])), vec![5]);
+    }
+
+    #[test]
+    fn aligner_releases_every_pending_epoch_once_all_inputs_ended() {
+        let mut aligner = MarkerAligner::new(2);
+        aligner.observe(vec![marker(5)]);
+        aligner.input_done(Some(CheckpointEpoch(5)));
+        assert_eq!(
+            epochs_of(&aligner.input_done(Some(CheckpointEpoch(5)))),
+            vec![5],
+            "no copy can arrive any more"
         );
     }
 
     #[test]
     fn aligner_releases_later_epochs_at_the_reduced_input_count() {
         let mut aligner = MarkerAligner::new(2);
-        aligner.input_done();
+        aligner.input_done(None);
         assert_eq!(
             epochs_of(&aligner.observe(vec![marker(3)])),
             vec![3],
@@ -1361,10 +1433,38 @@ mod tests {
         register_sink_streams(sink, 2);
         assert!(!report_marker_at_sink(sink, CheckpointEpoch(4)));
         assert_eq!(
-            sink_stream_done(sink),
+            sink_stream_done(sink, Some(CheckpointEpoch(3))),
             vec![CheckpointEpoch(4)],
-            "a finished stream cannot report the epoch, so it is released"
+            "a stream that finished before epoch 4 cannot flush it, so it is released"
         );
+    }
+
+    /// One stream flushed the epoch and then ended; the other has not
+    /// flushed it yet.
+    #[test]
+    fn a_finished_stream_does_not_flush_an_epoch_for_the_others() {
+        let sink = "gate_test_sink_finished_after_flushing";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink(sink, CheckpointEpoch(2)));
+
+        assert!(
+            sink_stream_done(sink, Some(CheckpointEpoch(2))).is_empty(),
+            "the other stream has not flushed the epoch"
+        );
+        assert!(
+            report_marker_at_sink(sink, CheckpointEpoch(2)),
+            "the ack is released once the other stream flushed it"
+        );
+    }
+
+    #[test]
+    fn a_released_epoch_is_not_acked_twice() {
+        let sink = "gate_test_sink_released_once";
+        register_sink_streams(sink, 2);
+        assert!(!report_marker_at_sink(sink, CheckpointEpoch(3)));
+
+        assert_eq!(sink_stream_done(sink, None), vec![CheckpointEpoch(3)]);
+        assert!(!report_marker_at_sink(sink, CheckpointEpoch(3)));
     }
 
     #[test]
