@@ -2,6 +2,7 @@ pub mod accumulator;
 pub mod event_time_reader;
 pub mod provider;
 pub mod recorder;
+pub mod task_wait;
 pub mod types;
 
 pub use accumulator::MillisAccumulator;

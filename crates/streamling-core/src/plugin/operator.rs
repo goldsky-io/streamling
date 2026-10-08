@@ -6,6 +6,7 @@ use crate::checkpoints::checkpoint_management::{
 };
 use crate::plugin::telemetry::process_plugin_metrics;
 use crate::telemetry::recorder::get_metrics_recorder;
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::utils::batch::enrich_batch_with_metadata;
 use abi_stable::nonexhaustive_enum::NonExhaustive;
 use arrow_schema::SchemaRef;
@@ -25,7 +26,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_input_stream,
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -314,6 +314,7 @@ impl ExecutionPlan for PluginExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let task_wait = TaskWaitMeter::claim(&context);
         let data = execute_input_stream(
             Arc::clone(&self.input),
             Arc::clone(&self.input.schema()),
@@ -357,7 +358,7 @@ impl ExecutionPlan for PluginExec {
 
             let mut stream = data;
 
-            'outer: while let Some(batch) = stream.next().await {
+            'outer: while let Some(batch) = task_wait.next(&mut stream).await {
                 match batch {
                     Ok(batch) => {
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
@@ -434,7 +435,10 @@ impl ExecutionPlan for PluginExec {
                                         checkpoint_buffer.clear();
                                     }
 
-                                    tx.send(Ok(processed_batch)).await.unwrap(); // handle send error
+                                    // A dropped receiver means the consumer is gone; stop.
+                                    if task_wait.send(tx.send(Ok(processed_batch))).await.is_err() {
+                                        break 'outer;
+                                    }
                                     break;
                                 }
                                 Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
@@ -471,7 +475,7 @@ impl ExecutionPlan for PluginExec {
                     }
                     Err(e) => {
                         debug!("PluginExec [{}]: Error from input stream, transform will terminate: {}", metric_metadata_id, e);
-                        let _ = tx.send(Err(e)).await;
+                        let _ = task_wait.send(tx.send(Err(e))).await;
                         break;
                     }
                 }

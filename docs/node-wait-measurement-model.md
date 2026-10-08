@@ -20,6 +20,32 @@ For a normal single-consumer node, `WrappingExec` records:
 - `state="starved"`: time spent awaiting the next input batch from upstream.
   End-of-stream is not counted as starvation.
 
+### Task-decoupled operators
+
+An operator that runs its loop in a spawned task (HTTP handler, WASM, plugin)
+hides that loop behind an output channel. The wrapper's input poll then waits
+on the operator's own work, not on upstream, so it cannot measure `starved`.
+
+Such an operator claims the `TaskWaitMeter` its wrapper installs in the
+`TaskContext` and brackets its awaits:
+
+- input await → `starved`;
+- output send await → neither (the edge's `blocked`, owned by the wrapper);
+- everything else in the task → busy, folded into `elapsed_compute`.
+
+The wrapper then reports the meter instead of its own poll. A new
+task-decoupled operator must claim the meter, or its work reads as `starved`.
+
+A SQL transform's forwarder task cannot use the meter: its input await drives
+the SQL subtree inline, so compute runs inside the await. Its busy signal is
+the DataFusion compute in `elapsed_compute`.
+
+### Sinks
+
+`WrappingDataSink` records `state="starved"` for the time the sink waits on
+its input stream. A sink that prefetches moves that wait like any consumer
+(see below).
+
 The blocked series is attributed to the edge:
 
 ```text
@@ -141,7 +167,9 @@ A correctly named edge can still have a misleading magnitude.
 
 Plugins do not need to emit `node_wait` themselves:
 
-- Plugin sources and transforms are observed by host `WrappingExec` nodes.
+- Plugin sources and transforms are observed by host `WrappingExec` nodes. The
+  host plugin transform operator claims the `TaskWaitMeter`, so time the plugin
+  spends on a batch is busy, not `starved`.
 - A plugin sink's feeding edge is observed by its upstream `WrappingExec`.
 - Plugin input/output channels are bounded, so channel saturation propagates
   backpressure to the host boundary.

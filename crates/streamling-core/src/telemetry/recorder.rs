@@ -1187,6 +1187,15 @@ fn build_metrics_recorder(
             .with_unit("ms")
             .build(),
     );
+    count_registry.insert(
+        String::from("node_empty_batches"),
+        meter
+            .u64_counter(add_service_prefix("node_empty_batches"))
+            .with_description(
+                "Zero-row data batches a node emitted; batches that only carry checkpoint messages are not counted",
+            )
+            .build(),
+    );
     let mut metric_metadata_tags_registry = HashMap::new();
     // caching tags for each metric metadata so that we don't have to compute them everytime metric is recorded
     for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
@@ -1668,6 +1677,36 @@ pub(crate) mod test_support {
                         }
                     }
                     if id_ok && state_ok && ds_ok {
+                        total += dp.value();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Sum every data point of the `streamling_<name>` counter for node `id`.
+    pub(crate) fn counter_total(name: &str, id: &str) -> u64 {
+        let mut rm = ResourceMetrics::default();
+        harness()
+            .reader
+            .collect(&mut rm)
+            .expect("collect metrics from manual reader");
+        let metric_name = format!("streamling_{name}");
+        let mut total = 0u64;
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != metric_name {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    continue;
+                };
+                for dp in sum.data_points() {
+                    if dp
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == "id" && &*kv.value.as_str() == id)
+                    {
                         total += dp.value();
                     }
                 }
