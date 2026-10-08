@@ -2267,7 +2267,7 @@ Query: `streamling_output_rows_total{dataset="app.events",tier="critical"}`.
 
 - Up to 20 labels per node.
 - Keys match Prometheus label-name grammar (`^[a-zA-Z_][a-zA-Z0-9_]*$`) and cannot start with `__`.
-- Keys cannot shadow built-in tags (`id`, `topology_node_type`, `operator_type`, `service_instance_id`) or the per-type identity tag for the node's kind (`topic` on Kafka, `table` on ClickHouse/Postgres, `url` on webhooks, `type` on plugins, `language` on script transforms; hybrid sources reserve both `table` and `topic`).
+- Keys cannot shadow built-in tags (`id`, `topology_node_type`, `operator_type`, `service_instance_id`) or the per-type identity tag for the node's kind (`topic` and `partition` on Kafka sources, `topic` on Kafka sinks, `table` on ClickHouse/Postgres, `url` on webhooks, `type` on plugins, `language` on script transforms; hybrid sources reserve `table`, `topic` and `partition`).
 - Values up to 256 bytes; control characters (newline, null, etc.) are rejected to protect Prometheus text-format output. Tab is allowed.
 
 **Precedence with plugin-declared labels:** plugins can return their own identity labels via `PluginResult::labels`. When a plugin-declared key collides with a YAML-declared key on the same node, the plugin value wins and a WARN log names the colliding key and both values (plugins are authoritative about their own identity, but the WARN surfaces misconfigurations rather than hiding them).
