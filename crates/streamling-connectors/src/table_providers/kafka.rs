@@ -257,8 +257,9 @@ impl PartitionAssignments {
 
     /// Max known lag over the partitions one instance owns; see [`own_max_lag`].
     fn own_max_lag(&self, instance: usize, lags: &BTreeMap<i32, i64>) -> Option<i64> {
-        static NONE_OWNED: BTreeSet<i32> = BTreeSet::new();
-        own_max_lag(lags, self.lock().get(&instance).unwrap_or(&NONE_OWNED))
+        self.lock()
+            .get(&instance)
+            .map_or(Some(0), |own| own_max_lag(lags, own))
     }
 }
 
@@ -960,19 +961,12 @@ impl KafkaSourceExec {
                 //
                 // rd_kafka_commit with async=0 blocks the calling thread for a
                 // full broker round trip — coordinator rediscovery and retry
-                // backoff included — so run it under block_in_place: during a
-                // drain every async worker is needed, and a slow commit
-                // (observed multi-second in the field) must not pin one. The
-                // flavor check keeps current_thread runtimes (unit tests) on
-                // the direct call, where block_in_place would panic.
+                // backoff included: during a drain every async worker is
+                // needed, and a slow commit (observed multi-second in the
+                // field) must not pin one.
                 let commit_started = std::time::Instant::now();
-                let commit_result = if tokio::runtime::Handle::current().runtime_flavor()
-                    == tokio::runtime::RuntimeFlavor::MultiThread
-                {
-                    tokio::task::block_in_place(|| consumer.commit(position, CommitMode::Sync))
-                } else {
-                    consumer.commit(position, CommitMode::Sync)
-                };
+                let commit_result =
+                    block_in_place_if_multi_thread(|| consumer.commit(position, CommitMode::Sync));
                 let commit_elapsed = commit_started.elapsed();
                 if commit_elapsed > Duration::from_secs(1) {
                     warn!(
@@ -1323,6 +1317,19 @@ impl KafkaSourceExec {
     }
 }
 
+/// Runs a blocking librdkafka call under `block_in_place` so a slow broker
+/// round trip does not pin an async worker. A current_thread runtime (unit
+/// tests) calls it directly, where `block_in_place` would panic.
+fn block_in_place_if_multi_thread<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Max known lag over an instance's own partitions; `Some(0)` when it owns
 /// none (nothing to consume), `None` when no owned partition's lag is known.
 fn own_max_lag(lags: &BTreeMap<i32, i64>, own: &BTreeSet<i32>) -> Option<i64> {
@@ -1581,11 +1588,10 @@ async fn owned_partition_lags(
             "Calculating lag for reference_name: {}, topic: {}, partition: {}",
             reference_name, topic, partition
         );
-        let high_watermark = match consumer.fetch_watermarks(
-            topic,
-            partition,
-            Duration::from_secs(5),
-        ) {
+        // A blocking broker round trip (up to the 5s timeout) per partition.
+        let high_watermark = match block_in_place_if_multi_thread(|| {
+            consumer.fetch_watermarks(topic, partition, Duration::from_secs(5))
+        }) {
             Ok((_, high_watermark)) => high_watermark,
             Err(e) => {
                 error!(
