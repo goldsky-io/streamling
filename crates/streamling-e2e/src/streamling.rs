@@ -55,37 +55,40 @@ fn construct_program_with_args(binary_path: Option<&Path>) -> (String, Vec<Strin
     }
 }
 
-/// SIGKILLs a child's whole process group when dropped while armed. The
-/// child must be spawned with `process_group(0)` (pgid == its pid). Under
+/// SIGKILLs a child and its own children when dropped while armed. Under
 /// `cargo run` the streamling binary is cargo's child, so killing only the
-/// direct child (`kill_on_drop`) leaves it running.
-struct ProcessGroupKillGuard {
-    pgid: Option<u32>,
+/// direct child (`kill_on_drop`) leaves it running. The child stays in the
+/// caller's process group, where nextest's Ctrl-C and timeout signals reach
+/// it.
+struct ChildTreeKillGuard {
+    pid: Option<u32>,
 }
 
-impl ProcessGroupKillGuard {
+impl ChildTreeKillGuard {
     fn new(child: &tokio::process::Child) -> Self {
-        Self { pgid: child.id() }
+        Self { pid: child.id() }
     }
 
-    /// The child exited on its own: never signal its (possibly reused) pgid.
+    /// The child exited on its own: never signal its (possibly reused) pid.
     fn disarm(&mut self) {
-        self.pgid = None;
+        self.pid = None;
     }
 }
 
-impl Drop for ProcessGroupKillGuard {
+impl Drop for ChildTreeKillGuard {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid {
-            signal_process_group(pgid, "-KILL");
+        if let Some(pid) = self.pid {
+            let pid = pid.to_string();
+            // Children first: once the parent dies they reparent and `-P`
+            // no longer finds them.
+            let _ = std::process::Command::new("pkill")
+                .args(["-KILL", "-P", &pid])
+                .status();
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .status();
         }
     }
-}
-
-fn signal_process_group(pgid: u32, signal: &str) {
-    let _ = std::process::Command::new("kill")
-        .args([signal, "--", &format!("-{}", pgid)])
-        .status();
 }
 
 /// Run the streamling binary with the given pipeline file
@@ -99,9 +102,8 @@ pub async fn run_streamling(
 
     let mut cmd = Command::new(&program);
     // Callers bound unbounded pipelines with a timeout that drops this future;
-    // the guard below then kills the group, so the process does not outlive
-    // the test and keep consuming.
-    cmd.process_group(0);
+    // the guard below then kills the process tree, so streamling does not
+    // outlive the test and keep consuming.
 
     // Add cargo args if using cargo run
     for arg in &args {
@@ -142,7 +144,7 @@ pub async fn run_streamling(
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let mut guard = ProcessGroupKillGuard::new(&child);
+        let mut guard = ChildTreeKillGuard::new(&child);
 
         // Spawn tasks to stream stdout/stderr
         let stdout_handle = child.stdout.take().map(|stdout| {
@@ -186,7 +188,7 @@ pub async fn run_streamling(
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         let child = cmd.spawn()?;
-        let mut guard = ProcessGroupKillGuard::new(&child);
+        let mut guard = ChildTreeKillGuard::new(&child);
         let output = child.wait_with_output().await?;
         guard.disarm();
 
@@ -319,7 +321,11 @@ pub async fn run_streamling_with_sigterm_when(
         })
     });
 
-    let send_group_signal = |sig: &str| signal_process_group(pid, sig);
+    let send_group_signal = |sig: &str| {
+        let _ = std::process::Command::new("kill")
+            .args([sig, "--", &format!("-{}", pid)])
+            .status();
+    };
 
     signal_when.await;
     info!("Sending SIGTERM to streamling process group {}", pid);
@@ -552,6 +558,46 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    fn pgid_of(pid: &str) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", pid])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// nextest delivers Ctrl-C and its timeout signals to the test's process
+    /// group; a run in a group of its own never gets them and is orphaned.
+    #[tokio::test]
+    async fn run_stays_in_the_callers_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("wrapper.pid");
+        let wrapper = dir.path().join("wrapper.sh");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\necho $$ > {}\nsleep 1\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pipeline = dir.path().join("pipeline.yaml");
+        let wrapper_pgid = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .filter(|pid| pid.ends_with('\n'))
+                {
+                    return pgid_of(pid.trim());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (exit, wrapper_pgid) =
+            tokio::join!(run_streamling(&pipeline, Some(&wrapper), &[]), wrapper_pgid);
+        exit.unwrap();
+        assert_eq!(wrapper_pgid, pgid_of(&std::process::id().to_string()));
     }
 
     /// `cargo run` is a wrapper: the streamling binary is a grandchild of the
