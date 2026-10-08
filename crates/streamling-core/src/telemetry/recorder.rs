@@ -172,12 +172,14 @@ impl SnapshotGauge {
     }
 
     /// Replace this handle's points with `points`, each given as its own tags
-    /// (added to the handle's per-source tags) and value.
+    /// (added to the handle's per-source tags, replacing any with the same
+    /// key) and value.
     pub fn replace(&self, points: impl IntoIterator<Item = (Vec<(&'static str, String)>, u64)>) {
         let points = points
             .into_iter()
             .map(|(tags, value)| {
                 let mut attrs = self.attrs.clone();
+                attrs.retain(|attr| !tags.iter().any(|(k, _)| attr.key.as_str() == *k));
                 attrs.extend(tags.into_iter().map(|(k, v)| KeyValue::new(k, v)));
                 (attrs, value)
             })
@@ -2531,6 +2533,18 @@ mod tests {
 
             drop(gauge);
             assert!(exported_partitions(&provider, &exporter).is_empty());
+        }
+
+        /// A per-source label that shares a point tag's key (a user label
+        /// named `partition`) must not shadow the measured value.
+        #[test]
+        fn point_tag_overrides_per_source_tag_with_same_key() {
+            let (provider, exporter) = provider();
+            let points = register_snapshot_gauge(&provider.meter("test"), "lag".to_string());
+            let gauge = SnapshotGauge::new(0, vec![KeyValue::new("partition", "user")], points);
+
+            gauge.replace([(vec![("partition", "3".to_string())], 1)]);
+            assert_eq!(exported_partitions(&provider, &exporter), ["3"]);
         }
 
         #[test]
