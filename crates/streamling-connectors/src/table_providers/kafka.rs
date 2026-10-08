@@ -274,6 +274,8 @@ impl ClientContext for AssignmentTrackingContext {}
 
 impl ConsumerContext for AssignmentTrackingContext {
     fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, _rebalance: &Rebalance<'_>) {
+        // The default `rebalance` has already (un)assigned synchronously, so
+        // `assignment()` reflects this rebalance for eager and cooperative alike.
         match base_consumer.assignment() {
             Ok(assignment) => self.assignments.set(
                 self.instance,
