@@ -1797,6 +1797,7 @@ impl Streamling {
                             metric_metadata_id.clone(),
                         )?),
                     };
+                    session_manager.tables().register(Arc::clone(&storage));
 
                     let checkpointable_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(CheckpointableNode::new(
@@ -5759,6 +5760,15 @@ mod table_tests {
         ))
         .await
         .expect("a table with direct-scan readers must plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plans_a_lookup_reader_before_its_table_in_name_order() {
+        dry_run(
+            "transforms:\n  m_prep:\n    type: sql\n    primary_key: id\n    sql: SELECT id, num FROM src\n  z_rates:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n    sql: SELECT id, num FROM m_prep\n  a_reader:\n    type: sql\n    primary_key: id\n    sql: SELECT id, lookup_eq('z_rates', 'id', id, 'num') AS rate FROM src\nsinks:\n  out:\n    type: print\n    from: a_reader\n",
+        )
+        .await
+        .expect("a lookup reader must plan after its table");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

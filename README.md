@@ -1172,7 +1172,29 @@ Each input row is applied by primary key and produces one changelog row:
 
 Matching is case-insensitive. Any other `_gs_op` value fails the pipeline. `deduplicate` changes which intermediate rows appear in the changelog, never the table's final state.
 
-Read the changelog with `FROM tokens` in a SQL transform or `from: tokens` on a sink, handler, script or plugin. Joins against a table are not supported yet, and a SQL transform that reads a table cannot set `parallelism`. A table with no readers is still maintained and still takes part in checkpointing.
+Read the changelog with `FROM tokens` in a SQL transform or `from: tokens` on a sink, handler, script or plugin. Joins against a table are not supported yet; use [`lookup_eq`](#lookups) for primary-key lookups. A SQL transform that reads a table's changelog cannot set `parallelism`. A table with no readers is still maintained and still takes part in checkpointing.
+
+### Lookups
+
+`lookup_eq(table, key, value, column)` returns `column` of the row in `table` whose primary key `key` equals `value`, or `NULL` if no row matches.
+
+```yaml
+transforms:
+  rates_mapping:
+    type: table
+    backend_type: in_memory
+    primary_key: address
+    sql: SELECT address, amount FROM rates
+  enriched:
+    type: sql
+    primary_key: id
+    sql: SELECT *, lookup_eq('rates_mapping', 'address', address, 'amount') AS calc_amount FROM transactions
+```
+
+- `table`, `key` and `column` are string literals. `key` must be the table's primary key, and the primary key must be a single column. Invalid calls fail at startup.
+- `value` is cast to the key's type. A `NULL` value, or one that cannot be cast, returns `NULL`.
+- A lookup reads the table as it is when the row is processed. The table's input and the reader's input are not synchronized, so a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup.
+- After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
 
 ### Restarts (`in_memory`)
 
