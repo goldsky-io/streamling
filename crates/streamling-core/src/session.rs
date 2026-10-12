@@ -2,6 +2,7 @@ use crate::dynamic_table::DynamicTableRegistry;
 use crate::functions::StreamlingFunctions;
 use crate::operators::planner::StreamlingQueryPlanner;
 use crate::optimizer::StreamlingPhysicalOptimizerRules;
+use crate::table::TableRegistry;
 use crate::table::apply::TABLE_APPLY_NODE_NAME;
 use crate::types::bigint_sql_preprocessor::preprocess_bigint_sql;
 use crate::{streamling_err, streamling_user_err};
@@ -48,6 +49,7 @@ fn decimal_arb_expr_planners() -> Vec<Arc<dyn ExprPlanner>> {
 #[derive(Clone)]
 pub struct SessionManager {
     ctx: SessionContext,
+    tables: TableRegistry,
 }
 
 #[derive(Clone, Copy)]
@@ -195,7 +197,8 @@ impl SessionManager {
         register_json_functions(&ctx)?;
         register_string_aliases(&ctx)?;
 
-        for udf in StreamlingFunctions::functions(dynamic_table_registry) {
+        let tables = TableRegistry::default();
+        for udf in StreamlingFunctions::functions(dynamic_table_registry, tables.clone()) {
             // This can override a built-in function with the same name
             ctx.register_udf(udf);
         }
@@ -219,7 +222,7 @@ impl SessionManager {
 
         crate::plugin::udf::register_plugin_udfs(&ctx);
 
-        Ok(SessionManager { ctx })
+        Ok(SessionManager { ctx, tables })
     }
 
     /// Registers a table with the given name and provider in the default catalog and the default OR custom schema.
@@ -548,6 +551,11 @@ impl SessionManager {
 
     pub fn session_context(&self) -> SessionContext {
         self.ctx.clone()
+    }
+
+    /// The `table` transforms `lookup_eq` can read.
+    pub fn tables(&self) -> &TableRegistry {
+        &self.tables
     }
 
     /// Registers a schema with the given name in the default catalog (or returns it if it already exists).
