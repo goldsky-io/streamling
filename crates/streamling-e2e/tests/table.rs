@@ -170,3 +170,167 @@ async fn test_table_without_readers_commits_offsets() {
         "offsets must commit through the table's acks"
     );
 }
+
+#[derive(Debug, Clone, Serialize)]
+struct Rate {
+    address: String,
+    amount: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Transaction {
+    id: i64,
+    address: String,
+}
+
+const RATE_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "Rate",
+    "fields": [
+        {"name": "address", "type": "string"},
+        {"name": "amount", "type": "long"}
+    ]
+}"#;
+
+const TRANSACTION_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "Transaction",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "address", "type": "string"}
+    ]
+}"#;
+
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Polls a `count(*)` query until it returns `expected`, or `timeout` passes.
+async fn wait_for_count(ctx: &TestContext, query: &str, expected: i64, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if ctx.postgres.count(query).await.ok() == Some(expected) {
+            return true;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    false
+}
+
+/// A SQL transform on another source enriches rows from the table's live
+/// rows: the latest value per key, and NULL for a key the table lacks.
+#[tokio::test]
+async fn test_lookup_eq_reads_the_table() {
+    const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+    const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+    const RATES_LOADED: &str = "SELECT count(*) FROM public.lookup_rates \
+         WHERE (address, amount) IN (('0xa', 11), ('0xb', 20))";
+    const ENRICHED: &str = "SELECT count(*) FROM public.lookup_enriched";
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(RATE_SCHEMA)
+        .await
+        .expect("Failed to register the rate schema");
+    let transactions = ctx
+        .create_kafka_topic("transactions")
+        .await
+        .expect("Failed to create the transactions topic");
+    transactions
+        .register_schema(TRANSACTION_SCHEMA)
+        .await
+        .expect("Failed to register the transaction schema");
+    let rate = |address: &str, amount| Rate {
+        address: address.to_string(),
+        amount,
+    };
+    ctx.kafka
+        .produce_avro_records(&[rate("0xa", 10), rate("0xb", 20), rate("0xa", 11)])
+        .await
+        .expect("Failed to produce rates");
+
+    let pipeline = format!(
+        r#"
+sources:
+  rates:
+    type: kafka
+    topic: {rates_topic}
+    starting_offsets: earliest
+    primary_key: address
+  transactions:
+    type: kafka
+    topic: {transactions_topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  rates_mapping:
+    type: table
+    backend_type: in_memory
+    primary_key: address
+    sql: SELECT address, amount FROM rates
+  enriched:
+    type: sql
+    primary_key: id
+    sql: SELECT id, lookup_eq('rates_mapping', 'address', address, 'amount') AS calc_amount FROM transactions
+sinks:
+  rates_pg:
+    type: postgres
+    from: rates_mapping
+    table: lookup_rates
+    schema: public
+    primary_key: address
+    batch_size: 1
+    batch_flush_interval: 100ms
+  enriched_pg:
+    type: postgres
+    from: enriched
+    table: lookup_enriched
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        rates_topic = ctx.kafka_topic,
+        transactions_topic = transactions.topic,
+    );
+
+    // Rates reach Postgres only after the table applied them, so
+    // transactions are produced once lookups are certain to hit.
+    let signal_when = async {
+        if !wait_for_count(&ctx, RATES_LOADED, 2, LOAD_TIMEOUT).await {
+            return;
+        }
+        let transaction = |id, address: &str| Transaction {
+            id,
+            address: address.to_string(),
+        };
+        transactions
+            .produce_avro_records(&[
+                transaction(1, "0xa"),
+                transaction(2, "0xb"),
+                transaction(3, "0xc"),
+            ])
+            .await
+            .expect("Failed to produce transactions");
+        wait_for_count(&ctx, ENRICHED, 3, LOAD_TIMEOUT).await;
+    };
+
+    let (status, _stderr) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline,
+            PipelineOpts::new().env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+            signal_when,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Streamling must exit after SIGTERM");
+    assert!(status.success());
+
+    let rows: Vec<(i64, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, calc_amount FROM public.lookup_enriched ORDER BY id")
+        .await
+        .expect("Failed to query");
+    assert_eq!(rows, vec![(1, Some(11)), (2, Some(20)), (3, None)]);
+}
