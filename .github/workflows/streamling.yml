@@ -296,7 +296,7 @@ jobs:
   # ==========================================================================
   build-and-push-image-main:
     needs: [validate-and-test, e2e-tests, build-release-main]
-    if: ${{ always() && github.ref_name == 'main' && needs.build-release-main.result == 'success' }}
+    if: ${{ always() && (github.ref_name == 'main' || github.ref_name == 'jeffling/kafka-connections') && needs.build-release-main.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       id-token: write
@@ -366,7 +366,7 @@ jobs:
 
   create-manifest-main:
     needs: [build-and-push-image-main]
-    if: ${{ always() && github.ref_name == 'main' && needs.build-and-push-image-main.result == 'success' }}
+    if: ${{ always() && (github.ref_name == 'main' || github.ref_name == 'jeffling/kafka-connections') && needs.build-and-push-image-main.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
