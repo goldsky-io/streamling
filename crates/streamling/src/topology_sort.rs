@@ -2,6 +2,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Word};
 use std::collections::{HashMap, VecDeque};
+use streamling_core::functions::lookup::LOOKUP_EQ_NAME;
 use streamling_core::topology;
 use tracing::debug;
 
@@ -134,6 +135,9 @@ struct SqlTokens {
     /// Lowercased multi-part dotted identifiers like `schema.table` or
     /// `receipt.value.logs`, reconstructed from consecutive Word.Word runs.
     dotted_sequences: Vec<String>,
+    /// Lowercased table names from `lookup_eq('<table>', ...)` calls. A string
+    /// literal is not a word, so these are collected separately.
+    lookup_tables: Vec<String>,
 }
 
 /// Tokenize SQL and collect both standalone words and dotted sequences.
@@ -154,9 +158,25 @@ fn extract_sql_tokens(sql: &str) -> SqlTokens {
             return SqlTokens {
                 standalone_words: Vec::new(),
                 dotted_sequences: Vec::new(),
+                lookup_tables: Vec::new(),
             };
         }
     };
+    let significant: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    let lookup_tables = significant
+        .windows(3)
+        .filter_map(|window| match window {
+            [
+                Token::Word(Word { value, .. }),
+                Token::LParen,
+                Token::SingleQuotedString(table),
+            ] if value.eq_ignore_ascii_case(LOOKUP_EQ_NAME) => Some(table.to_lowercase()),
+            _ => None,
+        })
+        .collect();
 
     let mut standalone_words = Vec::new();
     let mut dotted_sequences = Vec::new();
@@ -231,6 +251,7 @@ fn extract_sql_tokens(sql: &str) -> SqlTokens {
     SqlTokens {
         standalone_words,
         dotted_sequences,
+        lookup_tables,
     }
 }
 
@@ -252,11 +273,14 @@ fn extract_sql_dependencies(
 
     for transform_name in transforms.keys() {
         let transform_lower = transform_name.to_lowercase();
-        if transform_lower.contains('.') {
-            if tokens.dotted_sequences.contains(&transform_lower) {
-                dependencies.push(transform_name.clone());
-            }
-        } else if tokens.standalone_words.contains(&transform_lower) {
+        let referenced = if tokens.lookup_tables.contains(&transform_lower) {
+            true
+        } else if transform_lower.contains('.') {
+            tokens.dotted_sequences.contains(&transform_lower)
+        } else {
+            tokens.standalone_words.contains(&transform_lower)
+        };
+        if referenced {
             dependencies.push(transform_name.clone());
         }
     }
@@ -312,6 +336,31 @@ mod tests {
         let order = sort_transforms(&transforms, &HashMap::new());
 
         assert_eq!(order, ["z_table", "a_sql", "reader"]);
+    }
+
+    /// `enriched` sorts before `prep` by name, and `rates` only becomes ready
+    /// after `prep`, so only the lookup dependency puts `enriched` last.
+    #[test]
+    fn lookup_readers_sort_after_their_table() {
+        let mut transforms = HashMap::new();
+        transforms.insert(
+            "prep".to_string(),
+            create_sql_transform("SELECT address, amount FROM rates_src"),
+        );
+        transforms.insert(
+            "rates".to_string(),
+            create_table_transform("SELECT address, amount FROM prep"),
+        );
+        transforms.insert(
+            "enriched".to_string(),
+            create_sql_transform(
+                "SELECT id, LOOKUP_EQ( 'Rates', 'address', address, 'amount') AS amount FROM transactions",
+            ),
+        );
+
+        let order = sort_transforms(&transforms, &HashMap::new());
+
+        assert_eq!(order, ["prep", "rates", "enriched"]);
     }
 
     fn create_handler_transform(from: &str, url: &str) -> topology::Transform {
