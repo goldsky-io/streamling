@@ -1140,7 +1140,7 @@ This input can be a source or another transform.
 
 ## Tables
 
-A `table` transform keeps the latest row per primary key, built from a stateless SQL query. Other nodes read the table's **changelog** by name.
+A `table` transform keeps the latest row per primary key, built from a stateless SQL query. Other nodes read the table's SQL output by name, and [`lookup_eq`](#lookups) reads its rows.
 
 ```yaml
 transforms:
@@ -1148,13 +1148,13 @@ transforms:
     type: table
     backend_type: in_memory # required
     primary_key: address # required; comma-separated for composite keys
-    deduplicate: true # optional, default true
+    max_dead_ratio: 0.25 # optional, default 0.25
     sql: SELECT address, symbol, decimals FROM token_events WHERE chain = 'eth'
 
 sinks:
   tokens_pg:
     type: postgres
-    from: tokens # reads the table's changelog
+    from: tokens # reads the table's SQL output
     table: tokens
     schema: public
     primary_key: address
@@ -1164,22 +1164,19 @@ sinks:
 | -------------- | ------------------------------------------------------------------------------------------------------------- |
 | `backend_type` | Required. `in_memory` is the only backend.                                                                    |
 | `primary_key`  | Required. Key columns must be in the SQL output. A null key value fails the pipeline.                         |
-| `deduplicate`  | Default `true`. Collapses each input batch to the last row per key before applying it.                        |
-| `sql`          | Required. Projections, filters, `UNNEST` and `UNION` over one source or transform. Joins and aggregations are rejected. |
+| `max_dead_ratio` | Default `0.25`. Storage stays within about (1 + `max_dead_ratio`) × the live rows. Each batch cleans up to (1 + 1/`max_dead_ratio`) stored rows per written row, at least 1024. Lower values use less memory and more CPU. |
+| `sql`          | Required. Projections and filters over one source or transform. Anything else, including `UNNEST`, `UNION`, joins and aggregations, is rejected. |
 | `telemetry`    | Optional. Standard rules.                                                                                     |
 
-### Changelog
+The table is applied inside the node its SQL reads, before that node hands the batch to anyone else. On a source with a `filter`, the table gets only the rows the filter keeps.
 
-Each input row is applied by primary key and produces one changelog row:
+Each partition of that node applies its own batches. Keep all versions of a key in one partition (for Kafka, key the topic by the table's primary key); otherwise the table keeps whichever version is applied last.
 
-| Input `_gs_op`     | Key in the table                             | Key not in the table                   |
-| ------------------ | -------------------------------------------- | -------------------------------------- |
-| `i`, `c`, `r`, `u` | updated, emits `u`                           | inserted, emits `i`                    |
-| `d`                | removed, emits `d` with the **stored** values | emits `d` with the **incoming** values |
+### Applying and reading
 
-Matching is case-insensitive. Any other `_gs_op` value fails the pipeline. `deduplicate` changes which intermediate rows appear in the changelog, never the table's final state.
+Each row of the SQL output is applied by primary key, in order. A row whose `_gs_op` is `i`, `c`, `r` or `u` replaces the key's row, or inserts it. A `d` removes the key's row, if there is one. Matching is case-insensitive. Any other `_gs_op` value fails the pipeline.
 
-Read the changelog with `FROM tokens` in a SQL transform or `from: tokens` on a sink, handler, script or plugin. Joins against a table are not supported yet; use [`lookup_eq`](#lookups) for primary-key lookups. A SQL transform that reads a table's changelog cannot set `parallelism`. A table with no readers is still maintained and still takes part in checkpointing.
+`FROM tokens` in a SQL transform, or `from: tokens` on a sink, handler, script or plugin, reads the table's SQL output unchanged, `_gs_op` included: the same rows a SQL transform with the table's query would emit. Joins against a table are not supported yet; use [`lookup_eq`](#lookups) for primary-key lookups. A table with no readers is still maintained and still takes part in checkpointing.
 
 ### Lookups
 
@@ -1200,16 +1197,13 @@ transforms:
 
 - `table`, `key` and `column` are string literals. `key` must be the table's primary key, and the primary key must be a single column. Invalid calls fail at startup.
 - `value` is cast to the key's type. A `NULL` value, or one that cannot be cast, returns `NULL`.
-- A lookup reads the table as it is when the row is processed. The table's input and the reader's input are not synchronized, so a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup.
+- A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), sees every row that input's partition has produced up to and including the batch being processed, rows later in the same batch included. This is a lower bound: the lookup may also see rows from later batches, because the shared input can run ahead of its readers. Rows from the input's other partitions appear as those partitions produce them.
+- Lookups from other inputs are not synchronized with the table: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
 - After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
 
 ### Restarts (`in_memory`)
 
-The `in_memory` backend does not persist its contents. After a restart, the table starts empty and its source replays from the last committed offsets. As a result:
-
-- Keys written before the last checkpoint are missing until they are written again.
-- Replayed upserts of those keys are emitted as `i` instead of `u`. Sinks upsert both.
-- Deletes of those keys are forwarded with their incoming values.
+The `in_memory` backend does not persist its contents. After a restart, the table starts empty and its source replays from the last committed offsets, so keys written before the last checkpoint are missing until they are written again.
 
 ## Side Outputs
 
@@ -1217,7 +1211,7 @@ Side outputs allow emitting data to a "side" processor without modifying the mai
 (not visible in the LogicalPlan). The implementation can slightly differ between operators, but the general idea is that side outputs are executed
 right before the data is emitted (by receiving a `RecordBatch`).
 
-Currently, the only use case for side outputs is populating dynamic tables (when a SQL query is defined).
+Side outputs populate dynamic tables (when a SQL query is defined) and tables. On a source with a `filter`, side outputs see every row the source reads, except a table's, which sees only the rows the filter keeps.
 
 ## Checkpointing
 

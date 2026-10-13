@@ -33,7 +33,7 @@ use streamling_core::operators::external_handlers::{ExternalHandlerConfig, Exter
 use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
 use streamling_core::table::InMemoryTable;
-use streamling_core::table::apply::{TABLE_APPLY_NODE_NAME, TableApplyNode};
+use streamling_core::table::side_output::TableSideOutput;
 use streamling_core::topology::PipelineTopology;
 use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
@@ -46,9 +46,7 @@ pub use streamling_core::topology;
 // Re-export modules that tests need access to
 pub use streamling_connectors::table_providers;
 use streamling_core::dynamic_table::{DynamicTableBackendFactory, validate_dynamic_table_usage};
-use streamling_core::dynamic_table::{
-    DynamicTableRegistry, DynamicTableSideOutput, extract_expressions_from_sql_query,
-};
+use streamling_core::dynamic_table::{DynamicTableRegistry, DynamicTableSideOutput};
 pub use streamling_core::operators;
 use streamling_core::operators::pg_aggregation::PostgresAggregator;
 use streamling_core::operators::rebatch::{RebatchConfig, RebatchNode};
@@ -1224,6 +1222,9 @@ impl Streamling {
         // Shared-scan broadcast drivers spawn through this scope; they end
         // when their source stream ends, which shutdown forces.
         scan_sharing_registry.set_scope(shutdown_controller.scope("shared-scans"));
+        // Table drivers poll each partition in a task of this scope; the
+        // tasks end when their streams end, which shutdown forces.
+        let table_scope = shutdown_controller.scope("tables");
 
         // Whether a graceful shutdown drains and terminally checkpoints the
         // in-flight tail, or exits fast and lets it replay. Derived from the
@@ -1766,7 +1767,11 @@ impl Streamling {
                             SubqueryHandling::Return,
                         )?;
 
-                        let (projection, filter) = extract_expressions_from_sql_query(&plan)?;
+                        let (projection, filter) =
+                            SessionManager::extract_expressions_from_sql_query(&plan)
+                                .streamling_with_context(|| {
+                                    format!("{}: unsupported dynamic table SQL", ctx.format())
+                                })?;
 
                         let schema = pipeline_plans.get(&source_name).unwrap().schema();
                         // Recreating the same schema with field_qualifiers of the source_name
@@ -1833,22 +1838,45 @@ impl Streamling {
                             sql_plan.schema().inner(),
                             &primary_key,
                             metric_metadata_id.clone(),
+                            table.max_dead_ratio,
                         )?),
                     };
                     session_manager.tables().register(Arc::clone(&storage));
 
-                    let checkpointable_plan = LogicalPlan::Extension(Extension {
+                    // The table is applied by a side output of the node its SQL
+                    // reads, so every node downstream of that node reads the
+                    // table with its current batch already applied. A node on
+                    // a sibling branch, even one reading the same source, isn't
+                    // synchronized with the table.
+                    let upstream = SessionManager::validate_plan_and_extract_source_name(
+                        &sql_plan,
+                        SubqueryHandling::Return,
+                    )?;
+                    let side_output = TableSideOutput::try_new(
+                        storage,
+                        &sql_plan,
+                        upstream.clone(),
+                        session_manager.session_state(),
+                    )
+                    .streamling_with_context(|| {
+                        format!("{}: unsupported table SQL", ctx.format())
+                    })?;
+                    let Some(upstream_operator) = self.get_side_output_operator(&upstream) else {
+                        streamling_user_bail!(
+                            "{}: '{}' cannot feed a table",
+                            ctx.format(),
+                            upstream
+                        );
+                    };
+                    upstream_operator.add_side_output(Arc::new(side_output));
+
+                    // The side output already applied every row, so the table's
+                    // node is the table SQL, like a SQL transform.
+                    let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(CheckpointableNode::new(
                             sql_plan,
                             app_config.internal_buffer_size,
                             reference_name.clone(),
-                        )),
-                    });
-                    let logical_plan = LogicalPlan::Extension(Extension {
-                        node: Arc::new(TableApplyNode::new(
-                            checkpointable_plan,
-                            storage,
-                            table.deduplicate,
                         )),
                     });
 
@@ -1917,20 +1945,6 @@ impl Streamling {
                     let pk_columns = pk_metadata_opt
                         .map(|pk| pk.columns.clone())
                         .unwrap_or_default();
-
-                    // A table read through its view is inlined into `sql_plan`, so
-                    // the exchange below would land under the table's apply and
-                    // reorder updates of one table key across streams.
-                    let reads_a_table = sql_plan.exists(|node| {
-                        Ok(matches!(node, LogicalPlan::Extension(extension)
-                            if extension.node.name() == TABLE_APPLY_NODE_NAME))
-                    })?;
-                    if sql_transform.parallelism.is_some() && reads_a_table {
-                        streamling_user_bail!(
-                            "{}: parallelism is not supported on a SQL transform that reads a table",
-                            ctx.format()
-                        );
-                    }
 
                     // An explicit `parallelism` widens the transform itself: the
                     // exchange goes under its SQL, so the filter/projection above
@@ -3267,6 +3281,7 @@ impl Streamling {
                     table_name,
                     metric_metadata_id,
                     checkpoint_control.clone(),
+                    Arc::clone(&table_scope),
                 )));
             }
         }
@@ -5996,6 +6011,23 @@ mod table_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_table_sql_beyond_projection_and_filter() {
+        for sql in [
+            "SELECT id, num FROM src UNION ALL SELECT id, num FROM src",
+            "SELECT unnest(make_array(id, num)) AS id, _gs_op FROM src",
+        ] {
+            let err = dry_run_error(&format!(
+                "transforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n    sql: {sql}\nsinks: {{}}\n"
+            ))
+            .await;
+            assert!(
+                err.contains("only Projection and Filter SQL queries are supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejects_a_primary_key_missing_from_the_table_sql() {
         let err = dry_run_error(
             "transforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: address\n    sql: SELECT id, num FROM src\nsinks: {}\n",
@@ -6026,16 +6058,14 @@ mod table_tests {
     }
 
     /// The exchange `parallelism` adds is placed at the scan of the reader's
-    /// root source, which for a table reader sits below the table's apply.
+    /// root source, above the source's side outputs, so the table is applied
+    /// before the exchange.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rejects_parallelism_on_a_sql_transform_reading_a_table() {
-        let err = dry_run_error(&format!(
+    async fn plans_parallelism_on_a_sql_transform_reading_a_table() {
+        dry_run(&format!(
             "transforms:\n{TOKENS}  wide:\n    type: sql\n    primary_key: id\n    parallelism: 2\n    sql: SELECT id FROM tokens\nsinks:\n  out:\n    type: print\n    from: wide\n"
         ))
-        .await;
-        assert!(
-            err.contains("parallelism is not supported on a SQL transform that reads a table"),
-            "{err}"
-        );
+        .await
+        .expect("a table reader with parallelism must plan");
     }
 }
