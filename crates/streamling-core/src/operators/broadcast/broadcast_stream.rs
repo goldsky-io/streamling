@@ -189,20 +189,12 @@ impl BroadcastStream {
                     let send_futures: Vec<_> = consumers
                         .iter()
                         .map(|slot| {
-                            let downstream_id = slot.downstream_id.clone();
-                            let tx = slot.tx.clone();
-                            let batch_result = &batch_result;
-                            let shutdown = &shutdown;
-                            async move {
-                                let result = Self::try_send_batch_with_retry_forever(
-                                    &tx,
-                                    batch_result,
-                                    shutdown,
-                                    SHUTDOWN_STALLED_CONSUMER_WINDOW,
-                                )
-                                .await;
-                                (downstream_id, result)
-                            }
+                            Self::try_send_batch_with_retry_forever(
+                                &slot.tx,
+                                &batch_result,
+                                &shutdown,
+                                SHUTDOWN_STALLED_CONSUMER_WINDOW,
+                            )
                         })
                         .collect();
 
@@ -221,7 +213,7 @@ impl BroadcastStream {
                     // never deregistered, so its missing ack keeps the
                     // epoch from finalizing and the gap replays on restart.
                     let mut failed: Vec<ConsumerSlot> = Vec::new();
-                    for (slot, (downstream_id, result)) in consumers.iter().zip(results) {
+                    for (slot, result) in consumers.iter().zip(results) {
                         match result {
                             Ok(blocked) => {
                                 // Not attributed: no producer id (tests only) or
@@ -229,11 +221,11 @@ impl BroadcastStream {
                                 let Some(metadata_id) = upstream_metadata_id.as_deref() else {
                                     continue;
                                 };
-                                if downstream_id.is_empty() {
+                                if slot.downstream_id.is_empty() {
                                     continue;
                                 }
                                 let acc = blocked_accumulators
-                                    .entry(downstream_id.clone())
+                                    .entry(Arc::clone(&slot.downstream_id))
                                     .or_default();
                                 acc.add(blocked);
                                 let blocked_ms = acc.take_whole_millis();
@@ -243,7 +235,7 @@ impl BroadcastStream {
                                         blocked_ms,
                                         vec![
                                             ("state", "blocked"),
-                                            ("downstream_id", downstream_id.as_ref()),
+                                            ("downstream_id", slot.downstream_id.as_ref()),
                                         ],
                                         metadata_id,
                                     );
