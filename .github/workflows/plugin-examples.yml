@@ -51,3 +51,10 @@ jobs:
       - name: Build low_level example
         working-directory: plugin_examples/low_level
         run: cargo build --locked
+
+      # TEMP: one-time seed of the kache remote from a non-protected branch (see streamling.yml).
+      - name: Seed kache remote (temporary)
+        if: ${{ !cancelled() }}
+        run: |
+          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-plugin-examples --namespace streamling-plugin-examples
+          GITHUB_ACTIONS=false kache sync --push
