@@ -2302,3 +2302,5 @@ If metrics are not appearing:
 4. **Test Connectivity**: Verify network connectivity to the metrics endpoint
 
 The telemetry system will log warnings if initialization fails, but the application will continue running without metrics export.
+
+Review gateway smoke fixture.
