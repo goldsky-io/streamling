@@ -1,30 +1,31 @@
 //! The `table` transform: the latest row per primary key, maintained from a
-//! changelog stream.
+//! changelog stream. The table is applied by its upstream's side output.
 
-pub mod apply;
 pub mod driver;
+pub mod side_output;
 
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt};
 use crate::telemetry::recorder::get_metrics_recorder;
-use crate::utils::dedup::deduplicate_record_batch;
 use crate::{streamling_user_bail, streamling_user_err};
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray, new_null_array};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, new_null_array};
 use arrow::compute::{cast, interleave, interleave_record_batch};
 use arrow::datatypes::{FieldRef, Fields, Schema, SchemaRef};
 use arrow::row::{RowConverter, SortField};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-const OP_INSERT: &str = "i";
-const OP_UPDATE: &str = "u";
 const OP_DELETE: &str = "d";
 const UPSERT_OPS: [&str; 4] = ["i", "c", "r", "u"];
 
 const LIVE_ROWS_GAUGE: &str = "table_live_rows";
 const MEMORY_BYTES_GAUGE: &str = "table_memory_bytes";
+
+/// Floor of a cleaning step's budget, so tiny batches still merge old chunks
+/// into chunks of a useful size.
+const MIN_CLEANING_ROWS: usize = 1024;
 
 #[derive(Clone, Copy)]
 enum RowOp {
@@ -32,16 +33,26 @@ enum RowOp {
     Delete,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct RowLocation {
     chunk: usize,
     row: usize,
 }
 
+struct Chunk {
+    batch: RecordBatch,
+    /// Rows of `batch` the index points to.
+    live_rows: usize,
+}
+
 #[derive(Default)]
 struct TableState {
-    /// Rows superseded by a later write stay in their chunk until compaction.
-    chunks: Vec<RecordBatch>,
+    /// Oldest first. A chunk's id is its position plus `first_chunk_id`, so
+    /// ids stay valid while the cleaner drops chunks from the front.
+    chunks: VecDeque<Chunk>,
+    first_chunk_id: usize,
+    /// The front chunk's next row to clean.
+    cleaning_cursor: usize,
     /// Primary key, encoded by the table's `RowConverter`, to its live row.
     index: HashMap<Box<[u8]>, RowLocation>,
     total_rows: usize,
@@ -49,7 +60,76 @@ struct TableState {
     key_bytes: usize,
 }
 
+impl TableState {
+    fn chunk(&self, id: usize) -> &Chunk {
+        &self.chunks[id - self.first_chunk_id]
+    }
+
+    fn chunk_mut(&mut self, id: usize) -> &mut Chunk {
+        &mut self.chunks[id - self.first_chunk_id]
+    }
+
+    fn next_chunk_id(&self) -> usize {
+        self.first_chunk_id + self.chunks.len()
+    }
+
+    fn push_chunk(&mut self, batch: RecordBatch, live_rows: usize) {
+        self.total_rows += batch.num_rows();
+        self.chunk_bytes += batch.get_array_memory_size();
+        self.chunks.push_back(Chunk { batch, live_rows });
+    }
+
+    fn pop_front_chunk(&mut self) {
+        if let Some(chunk) = self.chunks.pop_front() {
+            self.total_rows -= chunk.batch.num_rows();
+            self.chunk_bytes -= chunk.batch.get_array_memory_size();
+            self.first_chunk_id += 1;
+            self.cleaning_cursor = 0;
+        }
+    }
+
+    /// The row at `location` is no longer the live row of its key.
+    fn release(&mut self, location: RowLocation) {
+        self.chunk_mut(location.chunk).live_rows -= 1;
+    }
+}
+
 /// The `in_memory` backend of a `table` transform.
+///
+/// Storage is append-only, because Arrow arrays can't be edited in place:
+///
+/// - A chunk is one applied batch, stored without `_gs_op`.
+/// - The index maps each primary key to its live row, the key's latest
+///   version. Every other stored row (an older version, a deleted key's row,
+///   a delete row) is dead.
+/// - Each chunk counts its live rows, so a fully dead chunk is dropped
+///   without being read. Chunk ids keep growing, so dropping chunks from the
+///   front leaves the other ids valid.
+///
+/// [`Self::apply`] stores the batch as a new chunk, then goes through its
+/// rows in order. An upsert points the index at its row, and the key's
+/// previous row becomes dead. A delete removes the key from the index, and
+/// its row becomes dead. So the last row of a key in a batch wins. A lookup
+/// reads the row the index points to.
+///
+/// Every apply then cleans a little. While dead rows exceed `max_dead_ratio`
+/// of the live ones, the live rows of the oldest chunks, which are mostly
+/// dead, are copied into one new chunk, the index is pointed at the copies
+/// and the old chunks are dropped. A step visits a budget of rows
+/// proportional to the rows just written (`clean` explains the factor), so
+/// the work is spread over writes, and a step that runs out mid-chunk
+/// resumes there next time. Storage stays at about `1 + max_dead_ratio`
+/// times the live rows.
+///
+/// For example, with a `max_dead_ratio` of 0.25:
+///
+/// | Step              | Chunks                         | Index          | Stored / live / dead |
+/// |-------------------|--------------------------------|----------------|----------------------|
+/// | apply `A1 B2 C3`  | `c0:[A1 B2 C3]`                | A→c0 B→c0 C→c0 | 3 / 3 / 0            |
+/// | apply `A10 -B`    | `c0:[A1 B2 C3]` `c1:[A10 -B]`  | A→c1 C→c0      | 5 / 2 / 3            |
+/// | clean             | `c2:[C3 A10]`                  | A→c2 C→c2      | 2 / 2 / 0            |
+///
+/// Nothing is persisted, so the table starts empty after a restart.
 pub struct InMemoryTable {
     name: String,
     metric_metadata_id: String,
@@ -59,22 +139,35 @@ pub struct InMemoryTable {
     /// Input columns stored in `schema`, in order.
     value_indices: Vec<usize>,
     key_indices: Vec<usize>,
+    /// Primary key columns' positions in `schema`.
+    stored_key_indices: Vec<usize>,
     /// The primary key columns, in order.
     key_fields: Fields,
     primary_key: String,
     converter: RowConverter,
+    /// Cleaning runs while dead rows exceed this fraction of the live rows.
+    max_dead_ratio: f64,
     state: RwLock<TableState>,
 }
 
 impl InMemoryTable {
     /// `input_schema` is the table's SQL output schema. It must contain
-    /// `_gs_op` and every `primary_key` column.
+    /// `_gs_op` and every `primary_key` column. `max_dead_ratio` must be a
+    /// positive number.
     pub fn try_new(
         name: &str,
         input_schema: &SchemaRef,
         primary_key: &[String],
         metric_metadata_id: String,
+        max_dead_ratio: f64,
     ) -> Result<Self> {
+        if !(max_dead_ratio.is_finite() && max_dead_ratio > 0.0) {
+            streamling_user_bail!(
+                "table '{}': max_dead_ratio must be a positive number, got {}",
+                name,
+                max_dead_ratio
+            );
+        }
         let op_index = input_schema.index_of(COLUMN_NAME_OP).map_err(|_| {
             streamling_user_err!(
                 "table '{}': the SQL output must contain the '{}' column",
@@ -82,6 +175,13 @@ impl InMemoryTable {
                 COLUMN_NAME_OP
             )
         })?;
+        if primary_key.iter().any(|column| column == COLUMN_NAME_OP) {
+            streamling_user_bail!(
+                "table '{}': the primary key cannot be '{}'",
+                name,
+                COLUMN_NAME_OP
+            );
+        }
         let key_indices = primary_key
             .iter()
             .map(|column| {
@@ -116,6 +216,10 @@ impl InMemoryTable {
                 .map(|&index| Arc::clone(&input_schema.fields()[index]))
                 .collect::<Vec<_>>(),
         ));
+        let stored_key_indices = key_indices
+            .iter()
+            .map(|&index| index - usize::from(index > op_index))
+            .collect();
         Ok(Self {
             name: name.to_string(),
             metric_metadata_id,
@@ -123,27 +227,23 @@ impl InMemoryTable {
             op_index,
             value_indices,
             key_indices,
+            stored_key_indices,
             key_fields,
             primary_key: primary_key.join(","),
             converter,
+            max_dead_ratio,
             state: RwLock::new(TableState::default()),
         })
     }
 
-    /// Applies `batch` (the table's SQL output) by primary key and returns the
-    /// table's changelog: one row per applied row, in `batch`'s schema so the
-    /// batch's checkpoint markers carry over.
-    pub fn apply(&self, batch: &RecordBatch, deduplicate: bool) -> Result<RecordBatch> {
-        let input = if deduplicate {
-            deduplicate_record_batch(batch, &self.primary_key)?
-        } else {
-            batch.clone()
-        };
-        let ops = self.parse_ops(input.column(self.op_index))?;
+    /// Applies `batch` (the table's SQL output) in row order: an upsert
+    /// replaces its key's row, and a delete removes it.
+    pub fn apply(&self, batch: &RecordBatch) -> Result<()> {
+        let ops = self.parse_ops(batch.column(self.op_index))?;
         let key_columns: Vec<ArrayRef> = self
             .key_indices
             .iter()
-            .map(|&index| Arc::clone(input.column(index)))
+            .map(|&index| Arc::clone(batch.column(index)))
             .collect();
         if let Some(position) = key_columns
             .iter()
@@ -152,7 +252,7 @@ impl InMemoryTable {
             streamling_user_bail!(
                 "table '{}': primary key column '{}' contains a null value",
                 self.name,
-                input.schema().field(self.key_indices[position]).name()
+                batch.schema().field(self.key_indices[position]).name()
             );
         }
         let keys = self
@@ -163,7 +263,7 @@ impl InMemoryTable {
             Arc::clone(&self.schema),
             self.value_indices
                 .iter()
-                .map(|&index| Arc::clone(input.column(index)))
+                .map(|&index| Arc::clone(batch.column(index)))
                 .collect(),
         )
         .streamling_with_context(|| {
@@ -173,15 +273,15 @@ impl InMemoryTable {
             )
         })?;
 
+        let written_rows = values.num_rows();
         let mut guard = self.state.write();
         let state = &mut *guard;
-        let new_chunk = state.chunks.len();
-        let mut changelog_ops = Vec::with_capacity(ops.len());
-        // `interleave` indices for each changelog row's values. Source 0 is
-        // `values`; deletes of stored keys add the chunks they read from.
-        let mut gather = Vec::with_capacity(ops.len());
-        let mut stored_sources: HashMap<usize, usize> = HashMap::new();
-        let mut reads_stored_rows = false;
+        let new_chunk = state.next_chunk_id();
+        // Stored before the loop, so a row the batch replaces in itself is
+        // released like any other.
+        if written_rows > 0 {
+            state.push_chunk(values, 0);
+        }
         for (row, op) in ops.into_iter().enumerate() {
             let key = keys.row(row);
             match op {
@@ -190,62 +290,34 @@ impl InMemoryTable {
                         chunk: new_chunk,
                         row,
                     };
-                    if let Some(existing) = state.index.get_mut(key.as_ref()) {
-                        *existing = location;
-                        changelog_ops.push(OP_UPDATE);
-                    } else {
-                        state.key_bytes += key.as_ref().len();
-                        state.index.insert(key.as_ref().into(), location);
-                        changelog_ops.push(OP_INSERT);
+                    let replaced = match state.index.get_mut(key.as_ref()) {
+                        Some(existing) => Some(std::mem::replace(existing, location)),
+                        None => {
+                            state.key_bytes += key.as_ref().len();
+                            state.index.insert(key.as_ref().into(), location);
+                            None
+                        }
+                    };
+                    if let Some(replaced) = replaced {
+                        state.release(replaced);
                     }
-                    gather.push((0, row));
+                    state.chunk_mut(new_chunk).live_rows += 1;
                 }
                 RowOp::Delete => {
-                    changelog_ops.push(OP_DELETE);
-                    let Some(stored) = state.index.remove(key.as_ref()) else {
-                        gather.push((0, row));
-                        continue;
-                    };
-                    state.key_bytes -= key.as_ref().len();
-                    reads_stored_rows = true;
-                    if stored.chunk == new_chunk {
-                        gather.push((0, stored.row));
-                    } else {
-                        let next_source = stored_sources.len() + 1;
-                        let source = *stored_sources.entry(stored.chunk).or_insert(next_source);
-                        gather.push((source, stored.row));
+                    if let Some(stored) = state.index.remove(key.as_ref()) {
+                        state.key_bytes -= key.as_ref().len();
+                        state.release(stored);
                     }
                 }
             }
         }
 
-        let changelog_values = if !reads_stored_rows {
-            values.clone()
-        } else {
-            let mut sources = vec![&values; stored_sources.len() + 1];
-            for (&chunk, &source) in &stored_sources {
-                sources[source] = &state.chunks[chunk];
-            }
-            interleave_record_batch(&sources, &gather)
-                .streamling_context("failed to read stored rows")?
-        };
-
-        if values.num_rows() > 0 {
-            state.total_rows += values.num_rows();
-            state.chunk_bytes += values.get_array_memory_size();
-            state.chunks.push(values);
-        }
-        compact_if_needed(state)?;
+        self.clean(state, written_rows)?;
         let live_rows = state.index.len();
         let memory_bytes = state.chunk_bytes + state.key_bytes;
         drop(guard);
         self.record_gauges(live_rows, memory_bytes);
-
-        let mut columns = changelog_values.columns().to_vec();
-        columns.insert(self.op_index, Arc::new(StringArray::from(changelog_ops)));
-        RecordBatch::try_new(batch.schema(), columns).streamling_with_context(|| {
-            format!("table '{}': failed to build the changelog", self.name)
-        })
+        Ok(())
     }
 
     /// The primary key's field, if `key` names the table's single-column
@@ -301,7 +373,13 @@ impl InMemoryTable {
                 continue;
             };
             let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
-                sources.push(state.chunks[location.chunk].column(column_index).as_ref());
+                sources.push(
+                    state
+                        .chunk(location.chunk)
+                        .batch
+                        .column(column_index)
+                        .as_ref(),
+                );
                 sources.len() - 1
             });
             gather_indices.push((source, location.row));
@@ -356,6 +434,99 @@ impl InMemoryTable {
             .collect()
     }
 
+    /// While dead rows exceed `max_dead_ratio` of the live ones, moves the
+    /// live rows of the oldest chunks into one new chunk, visiting at most a
+    /// budget of rows. A chunk without live rows is dropped unvisited.
+    ///
+    /// Visiting k = 1 + 1/max_dead_ratio rows per written row reclaims dead
+    /// rows as fast as writes create them once they make up 1/k of storage,
+    /// which is max_dead_ratio of the live rows; the oldest chunks, cleaned
+    /// first, hold at least their share of dead rows.
+    ///
+    /// A chunk keeps its input's buffers alive. If upstream hands over slices
+    /// of larger buffers, memory exceeds what the row counts suggest. The
+    /// upgrade path is to trigger on `get_array_memory_size` instead.
+    ///
+    /// An error leaves the index pointing at dropped chunks. It fails the
+    /// pipeline through the side output, and an in_memory table starts empty
+    /// after a restart.
+    fn clean(&self, state: &mut TableState, written_rows: usize) -> Result<()> {
+        let rows_per_write = 1.0 + 1.0 / self.max_dead_ratio;
+        let budget =
+            ((written_rows as f64 * rows_per_write).ceil() as usize).max(MIN_CLEANING_ROWS);
+        let target = state.next_chunk_id();
+        // Moved rows as `(position in sources, row)`, in their order in `target`.
+        let mut sources: Vec<RecordBatch> = Vec::new();
+        let mut moved: Vec<(usize, usize)> = Vec::new();
+        let mut visited = 0;
+        // `moved` rows count toward storage: `target` will hold them.
+        while visited < budget
+            && self.too_many_dead_rows(state.total_rows + moved.len(), state.index.len())
+        {
+            let Some(front) = state.chunks.front() else {
+                break;
+            };
+            if front.live_rows == 0 {
+                state.pop_front_chunk();
+                continue;
+            }
+            let front_id = state.first_chunk_id;
+            let batch = front.batch.clone();
+            let start = state.cleaning_cursor;
+            let end = batch.num_rows().min(start.saturating_add(budget - visited));
+            let key_columns: Vec<ArrayRef> = self
+                .stored_key_indices
+                .iter()
+                .map(|&index| batch.column(index).slice(start, end - start))
+                .collect();
+            let keys = self
+                .converter
+                .convert_columns(&key_columns)
+                .streamling_context("failed to encode the stored keys")?;
+            let source = sources.len();
+            let mut moved_from_front = 0;
+            for (offset, key) in keys.iter().enumerate() {
+                let row = start + offset;
+                // A row is live if the index still points to it.
+                if let Some(location) = state.index.get_mut(key.as_ref())
+                    && *location
+                        == (RowLocation {
+                            chunk: front_id,
+                            row,
+                        })
+                {
+                    *location = RowLocation {
+                        chunk: target,
+                        row: moved.len(),
+                    };
+                    moved.push((source, row));
+                    moved_from_front += 1;
+                }
+            }
+            visited += end - start;
+            let finished = end == batch.num_rows();
+            sources.push(batch);
+            state.chunk_mut(front_id).live_rows -= moved_from_front;
+            // The rest of a chunk without live rows is dead.
+            if finished || state.chunk(front_id).live_rows == 0 {
+                state.pop_front_chunk();
+            } else {
+                state.cleaning_cursor = end;
+            }
+        }
+        if !moved.is_empty() {
+            let sources: Vec<&RecordBatch> = sources.iter().collect();
+            let batch = interleave_record_batch(&sources, &moved)
+                .streamling_context("failed to move the live rows")?;
+            state.push_chunk(batch, moved.len());
+        }
+        Ok(())
+    }
+
+    fn too_many_dead_rows(&self, total_rows: usize, live_rows: usize) -> bool {
+        total_rows.saturating_sub(live_rows) as f64 > self.max_dead_ratio * live_rows as f64
+    }
+
     fn record_gauges(&self, live_rows: usize, memory_bytes: usize) {
         let recorder = get_metrics_recorder();
         recorder.record_gauge(LIVE_ROWS_GAUGE, live_rows as u64, &self.metric_metadata_id);
@@ -387,55 +558,16 @@ impl fmt::Debug for TableRegistry {
     }
 }
 
-/// Rewrites the live rows into one chunk once dead rows outnumber them, which
-/// keeps storage under twice the live rows at amortized O(1) per write.
-///
-/// A chunk keeps its input's buffers alive. If upstream hands over slices of
-/// larger buffers, memory exceeds what the row counts suggest. The upgrade
-/// path is to trigger on `get_array_memory_size` instead.
-fn compact_if_needed(state: &mut TableState) -> Result<()> {
-    let live_rows = state.index.len();
-    if state.total_rows - live_rows <= live_rows {
-        return Ok(());
-    }
-    let mut locations: Vec<&mut RowLocation> = state.index.values_mut().collect();
-    let gather: Vec<(usize, usize)> = locations
-        .iter()
-        .map(|location| (location.chunk, location.row))
-        .collect();
-    let compacted = if gather.is_empty() {
-        None
-    } else {
-        let chunks: Vec<&RecordBatch> = state.chunks.iter().collect();
-        Some(
-            interleave_record_batch(&chunks, &gather)
-                .streamling_context("failed to compact the table")?,
-        )
-    };
-    for (row, location) in locations.iter_mut().enumerate() {
-        **location = RowLocation { chunk: 0, row };
-    }
-    state.chunks = compacted.into_iter().collect();
-    state.total_rows = live_rows;
-    state.chunk_bytes = state
-        .chunks
-        .iter()
-        .map(RecordBatch::get_array_memory_size)
-        .sum();
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::RowKind;
-    use arrow::array::{Int32Array, Int64Array, LargeBinaryArray, StringViewArray};
+    use arrow::array::{Int32Array, Int64Array, LargeBinaryArray, StringArray, StringViewArray};
     use arrow::datatypes::{DataType, Field, Int64Type};
-    use std::str::FromStr;
     use streamling_common::types::decimal_arb::DecimalArbType;
 
     const TABLE: &str = "tokens";
     const METRIC_KEY: &str = "app::tokens";
+    const MAX_DEAD_RATIO: f64 = 0.25;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -463,28 +595,9 @@ mod tests {
             &schema(),
             &["id".to_string()],
             METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
         )
         .unwrap()
-    }
-
-    fn row(id: i64, name: &str, op: &str) -> (i64, String, String) {
-        (id, name.to_string(), op.to_string())
-    }
-
-    /// Changelog rows as `(id, name, _gs_op)`.
-    fn rows(changelog: &RecordBatch) -> Vec<(i64, String, String)> {
-        let ids = changelog
-            .column_by_name("id")
-            .unwrap()
-            .as_primitive::<Int64Type>();
-        let names = changelog.column_by_name("name").unwrap().as_string::<i32>();
-        let ops = changelog
-            .column_by_name(COLUMN_NAME_OP)
-            .unwrap()
-            .as_string::<i32>();
-        (0..changelog.num_rows())
-            .map(|i| row(ids.value(i), names.value(i), ops.value(i)))
-            .collect()
     }
 
     /// Live contents as `(id, name)`, sorted by id.
@@ -493,12 +606,12 @@ mod tests {
         let gather: Vec<(usize, usize)> = state
             .index
             .values()
-            .map(|location| (location.chunk, location.row))
+            .map(|location| (location.chunk - state.first_chunk_id, location.row))
             .collect();
         if gather.is_empty() {
             return Vec::new();
         }
-        let chunks: Vec<&RecordBatch> = state.chunks.iter().collect();
+        let chunks: Vec<&RecordBatch> = state.chunks.iter().map(|chunk| &chunk.batch).collect();
         let live = interleave_record_batch(&chunks, &gather).unwrap();
         let ids = live
             .column_by_name("id")
@@ -512,101 +625,71 @@ mod tests {
         contents
     }
 
-    #[test]
-    fn upserts_and_deletes_map_to_changelog_ops() {
-        let table = table();
-        let inserted = table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "c"), (3, "c", "r")]), true)
-            .unwrap();
+    /// Every chunk's live-row count matches the index.
+    fn assert_live_rows_match_the_index(table: &InMemoryTable) {
+        let state = table.state.read();
         assert_eq!(
-            rows(&inserted),
-            vec![row(1, "a", "i"), row(2, "b", "i"), row(3, "c", "i")]
+            state
+                .chunks
+                .iter()
+                .map(|chunk| chunk.live_rows)
+                .sum::<usize>(),
+            state.index.len()
         );
-        let updated = table
-            .apply(
-                &batch(&[(1, "a2", "u"), (2, "b2", "C"), (3, "c2", "i")]),
-                true,
-            )
-            .unwrap();
-        assert_eq!(
-            rows(&updated),
-            vec![row(1, "a2", "u"), row(2, "b2", "u"), row(3, "c2", "u")]
-        );
-        // A delete of a stored key carries the stored values, not the incoming ones.
-        let deleted = table
-            .apply(&batch(&[(1, "ignored", "d"), (2, "ignored", "D")]), true)
-            .unwrap();
-        assert_eq!(rows(&deleted), vec![row(1, "a2", "d"), row(2, "b2", "d")]);
-        assert_eq!(contents(&table), vec![(3, "c2".to_string())]);
     }
 
     #[test]
-    fn emitted_ops_parse_as_row_kinds() {
-        // The Kafka and print sinks parse `_gs_op` with `RowKind::from_str`,
-        // which rejects Debezium's `c` and `r`.
+    fn upserts_replace_and_deletes_remove_by_primary_key() {
         let table = table();
-        let mut ops = Vec::new();
-        for input in [
-            batch(&[(1, "a", "c")]),
-            batch(&[(1, "b", "r")]),
-            batch(&[(1, "b", "d")]),
-        ] {
-            ops.extend(
-                rows(&table.apply(&input, true).unwrap())
-                    .into_iter()
-                    .map(|(_, _, op)| op),
-            );
-        }
-        assert_eq!(ops, ["i", "u", "d"]);
-        for op in &ops {
-            RowKind::from_str(op).unwrap();
-        }
-    }
-
-    #[test]
-    fn delete_of_an_unknown_key_is_forwarded_with_incoming_values() {
-        let table = table();
-        let changelog = table.apply(&batch(&[(9, "incoming", "d")]), true).unwrap();
-        assert_eq!(rows(&changelog), vec![row(9, "incoming", "d")]);
-        assert!(contents(&table).is_empty());
-    }
-
-    #[test]
-    fn delete_after_insert_in_the_same_batch_carries_the_inserted_values() {
-        let table = table();
-        let changelog = table
-            .apply(&batch(&[(1, "inserted", "i"), (1, "incoming", "d")]), false)
+        table
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "c"), (3, "c", "r")]))
             .unwrap();
         assert_eq!(
-            rows(&changelog),
-            vec![row(1, "inserted", "i"), row(1, "inserted", "d")]
-        );
-        assert!(contents(&table).is_empty());
-    }
-
-    #[test]
-    fn deduplicate_changes_the_changelog_but_not_the_final_state() {
-        let input = batch(&[(1, "a", "i"), (1, "b", "u"), (2, "c", "i"), (2, "c", "d")]);
-
-        let deduplicated = table();
-        assert_eq!(
-            rows(&deduplicated.apply(&input, true).unwrap()),
-            vec![row(1, "b", "i"), row(2, "c", "d")]
-        );
-
-        let raw = table();
-        assert_eq!(
-            rows(&raw.apply(&input, false).unwrap()),
+            contents(&table),
             vec![
-                row(1, "a", "i"),
-                row(1, "b", "u"),
-                row(2, "c", "i"),
-                row(2, "c", "d")
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string())
             ]
         );
+        table
+            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "C"), (3, "c2", "i")]))
+            .unwrap();
+        assert_eq!(
+            contents(&table),
+            vec![
+                (1, "a2".to_string()),
+                (2, "b2".to_string()),
+                (3, "c2".to_string())
+            ]
+        );
+        table
+            .apply(&batch(&[(1, "ignored", "d"), (2, "ignored", "D")]))
+            .unwrap();
+        assert_eq!(contents(&table), vec![(3, "c2".to_string())]);
+        assert_live_rows_match_the_index(&table);
+    }
 
-        assert_eq!(contents(&raw), vec![(1, "b".to_string())]);
-        assert_eq!(contents(&deduplicated), contents(&raw));
+    #[test]
+    fn delete_of_an_unknown_key_changes_nothing() {
+        let table = table();
+        table.apply(&batch(&[(9, "incoming", "d")])).unwrap();
+        assert!(contents(&table).is_empty());
+    }
+
+    #[test]
+    fn later_rows_of_a_batch_win() {
+        let table = table();
+        table
+            .apply(&batch(&[
+                (1, "a", "i"),
+                (1, "b", "u"),
+                (2, "c", "i"),
+                (2, "c", "d"),
+            ]))
+            .unwrap();
+        assert_eq!(contents(&table), vec![(1, "b".to_string())]);
+        assert_live_rows_match_the_index(&table);
     }
 
     #[test]
@@ -621,6 +704,7 @@ mod tests {
             &schema,
             &["chain".to_string(), "address".to_string()],
             METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
         )
         .unwrap();
         let input = |rows: &[(&str, &str, &str)]| {
@@ -634,38 +718,34 @@ mod tests {
             )
             .unwrap()
         };
-        let ops = |changelog: RecordBatch| -> Vec<String> {
-            changelog
-                .column_by_name(COLUMN_NAME_OP)
-                .unwrap()
-                .as_string::<i32>()
-                .iter()
-                .map(|op| op.unwrap().to_string())
-                .collect()
-        };
 
-        let first = table
-            .apply(&input(&[("eth", "0x1", "i"), ("sol", "0x1", "i")]), true)
+        table
+            .apply(&input(&[("eth", "0x1", "i"), ("sol", "0x1", "i")]))
             .unwrap();
-        assert_eq!(ops(first), ["i", "i"]);
-        let second = table
-            .apply(&input(&[("eth", "0x1", "u"), ("eth", "0x2", "i")]), true)
+        assert_eq!(table.state.read().index.len(), 2);
+        table
+            .apply(&input(&[("eth", "0x1", "u"), ("eth", "0x2", "i")]))
             .unwrap();
-        assert_eq!(ops(second), ["u", "i"]);
         assert_eq!(table.state.read().index.len(), 3);
+        assert_live_rows_match_the_index(&table);
     }
 
     #[test]
-    fn field_metadata_survives_into_storage_and_changelog() {
+    fn field_metadata_survives_into_storage() {
         let amount = DecimalArbType::field("amount", 78, 0, true).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             amount.clone(),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
         ]));
-        let table =
-            InMemoryTable::try_new(TABLE, &schema, &["id".to_string()], METRIC_KEY.to_string())
-                .unwrap();
+        let table = InMemoryTable::try_new(
+            TABLE,
+            &schema,
+            &["id".to_string()],
+            METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
+        )
+        .unwrap();
         let input = |op: &str| {
             RecordBatch::try_new(
                 Arc::clone(&schema),
@@ -677,46 +757,44 @@ mod tests {
             )
             .unwrap()
         };
-        table.apply(&input("i"), true).unwrap();
-        // The delete's values are gathered from storage.
-        let changelog = table.apply(&input("d"), true).unwrap();
+        table.apply(&input("i")).unwrap();
         assert_eq!(
-            changelog
-                .schema()
-                .field_with_name("amount")
-                .unwrap()
-                .metadata(),
+            table.schema.field_with_name("amount").unwrap().metadata(),
             amount.metadata()
         );
         assert_eq!(
-            table.schema.field_with_name("amount").unwrap().metadata(),
+            table.lookup_field("amount").unwrap().metadata(),
             amount.metadata()
         );
     }
 
     #[test]
-    fn compaction_keeps_contents_and_remaps_the_index() {
+    fn cleaning_keeps_contents_and_remaps_the_index() {
         let table = table();
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), true)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]))
+            .unwrap();
+        // Each batch leaves 2 dead rows, more than a quarter of the 3 live ones,
+        // so every chunk holding a dead row is cleaned.
+        table
+            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]))
             .unwrap();
         table
-            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]), true)
-            .unwrap();
-        assert_eq!(
-            table.state.read().chunks.len(),
-            2,
-            "2 dead rows do not outnumber 3 live ones"
-        );
-        table
-            .apply(&batch(&[(1, "a3", "u"), (3, "c3", "u")]), true)
+            .apply(&batch(&[(1, "a3", "u"), (3, "c3", "u")]))
             .unwrap();
 
         {
             let state = table.state.read();
-            assert_eq!(state.chunks.len(), 1, "4 dead rows outnumber 3 live ones");
+            assert_eq!(state.first_chunk_id, 3);
             assert_eq!(state.total_rows, 3);
-            assert_eq!(state.chunk_bytes, state.chunks[0].get_array_memory_size());
+            assert_eq!(
+                state.chunk_bytes,
+                state
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.batch.get_array_memory_size())
+                    .sum::<usize>()
+            );
             assert_eq!(
                 state.key_bytes,
                 state.index.keys().map(|key| key.len()).sum::<usize>()
@@ -730,9 +808,13 @@ mod tests {
                 (3, "c3".to_string())
             ]
         );
-        // The delete reads the stored row through the remapped index.
-        let deleted = table.apply(&batch(&[(2, "x", "d")]), true).unwrap();
-        assert_eq!(rows(&deleted), vec![row(2, "b2", "d")]);
+        // Key 2 was moved by the cleaner; the delete releases it at its new place.
+        table.apply(&batch(&[(2, "x", "d")])).unwrap();
+        assert_eq!(
+            contents(&table),
+            vec![(1, "a3".to_string()), (3, "c3".to_string())]
+        );
+        assert_live_rows_match_the_index(&table);
     }
 
     #[test]
@@ -746,7 +828,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, true).unwrap_err().to_string();
+        let err = table().apply(&input).unwrap_err().to_string();
         assert!(
             err.contains("primary key column 'id' contains a null value"),
             "{err}"
@@ -765,7 +847,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let err = table().apply(&input, true).unwrap_err().to_string();
+            let err = table().apply(&input).unwrap_err().to_string();
             assert!(err.contains("unrecognized '_gs_op' value"), "{err}");
         }
 
@@ -783,7 +865,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, true).unwrap_err().to_string();
+        let err = table().apply(&input).unwrap_err().to_string();
         assert!(err.contains("column '_gs_op' must be Utf8"), "{err}");
     }
 
@@ -803,7 +885,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, true).unwrap_err().to_string();
+        let err = table().apply(&input).unwrap_err().to_string();
         assert!(err.contains("does not match the table schema"), "{err}");
     }
 
@@ -823,10 +905,10 @@ mod tests {
         let table = table();
         assert_eq!(lookup_names(&table, &[Some(1)]), [None], "empty table");
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), true)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]))
             .unwrap();
         table
-            .apply(&batch(&[(1, "a2", "u"), (2, "x", "d")]), true)
+            .apply(&batch(&[(1, "a2", "u"), (2, "x", "d")]))
             .unwrap();
         assert_eq!(
             lookup_names(&table, &[Some(1), Some(2), Some(3), Some(9), None, Some(1)]),
@@ -842,20 +924,16 @@ mod tests {
     }
 
     #[test]
-    fn lookup_follows_compaction() {
+    fn lookup_follows_cleaning() {
         let table = table();
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i")]), true)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "i")]))
             .unwrap();
-        table.apply(&batch(&[(1, "a2", "u")]), true).unwrap();
+        table.apply(&batch(&[(1, "a2", "u")])).unwrap();
         table
-            .apply(&batch(&[(1, "a3", "u"), (2, "b2", "u")]), true)
+            .apply(&batch(&[(1, "a3", "u"), (2, "b2", "u")]))
             .unwrap();
-        assert_eq!(
-            table.state.read().chunks.len(),
-            1,
-            "3 dead rows outnumber 2 live ones"
-        );
+        assert_eq!(table.state.read().first_chunk_id, 3);
         assert_eq!(
             lookup_names(&table, &[Some(2), Some(1)]),
             [Some("b2".to_string()), Some("a3".to_string())]
@@ -863,9 +941,112 @@ mod tests {
     }
 
     #[test]
+    fn cleaning_keeps_dead_rows_within_the_ratio() {
+        const KEYS: i64 = 4096;
+        const BATCH: i64 = 512;
+        const UPDATE_BATCHES: i64 = 64;
+        // Coprime with KEYS, so updates sweep the keys in a scattered order.
+        const STRIDE: i64 = 2053;
+        let table = table();
+        for start in (0..KEYS).step_by(BATCH as usize) {
+            let inserts: Vec<(i64, &str, &str)> =
+                (start..start + BATCH).map(|id| (id, "a", "i")).collect();
+            table.apply(&batch(&inserts)).unwrap();
+        }
+        for round in 0..UPDATE_BATCHES {
+            let updates: Vec<(i64, &str, &str)> = (0..BATCH)
+                .map(|i| (((round * BATCH + i) * STRIDE) % KEYS, "b", "u"))
+                .collect();
+            table.apply(&batch(&updates)).unwrap();
+            let state = table.state.read();
+            let live = state.index.len();
+            let dead = state.total_rows - live;
+            assert!(
+                dead as f64 <= MAX_DEAD_RATIO * live as f64 + BATCH as f64,
+                "round {round}: {dead} dead rows for {live} live ones"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_key_updates_drop_dead_chunks() {
+        const UPDATES: usize = 1000;
+        let table = table();
+        for _ in 0..UPDATES {
+            table.apply(&batch(&[(1, "a", "u")])).unwrap();
+            let state = table.state.read();
+            assert_eq!((state.chunks.len(), state.total_rows), (1, 1));
+        }
+    }
+
+    #[test]
+    fn cleaning_resumes_mid_chunk() {
+        const KEYS: i64 = 3000;
+        const UPDATE_BATCH: i64 = 100;
+        // 800 dead rows exceed a quarter of the 3000 live ones only after the
+        // last batch, whose cleaning budget is MIN_CLEANING_ROWS.
+        const UPDATE_BATCHES: i64 = 8;
+        let table = table();
+        let names: Vec<String> = (0..KEYS).map(|id| format!("v{id}")).collect();
+        let inserts: Vec<(i64, &str, &str)> = (0..KEYS)
+            .map(|id| (id, names[id as usize].as_str(), "i"))
+            .collect();
+        table.apply(&batch(&inserts)).unwrap();
+        for start in (0..UPDATE_BATCH * UPDATE_BATCHES).step_by(UPDATE_BATCH as usize) {
+            let updates: Vec<(i64, &str, &str)> = (start..start + UPDATE_BATCH)
+                .map(|id| (id, "u", "u"))
+                .collect();
+            table.apply(&batch(&updates)).unwrap();
+        }
+
+        {
+            let state = table.state.read();
+            assert_eq!(
+                state.first_chunk_id, 0,
+                "the insert chunk is partly cleaned"
+            );
+            assert_eq!(state.cleaning_cursor, MIN_CLEANING_ROWS);
+        }
+        // 900 was moved, 2900 is past the cursor, 5 was updated.
+        assert_eq!(
+            lookup_names(&table, &[Some(900), Some(2900), Some(5)]),
+            [
+                Some("v900".to_string()),
+                Some("v2900".to_string()),
+                Some("u".to_string())
+            ]
+        );
+        table
+            .apply(&batch(&[(900, "x", "d"), (2900, "x", "d")]))
+            .unwrap();
+        assert_eq!(lookup_names(&table, &[Some(900), Some(2900)]), [None, None]);
+        assert_live_rows_match_the_index(&table);
+    }
+
+    #[test]
+    fn rejects_a_max_dead_ratio_that_is_not_a_positive_number() {
+        for ratio in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+            let err = InMemoryTable::try_new(
+                TABLE,
+                &schema(),
+                &["id".to_string()],
+                METRIC_KEY.to_string(),
+                ratio,
+            )
+            .err()
+            .expect("the ratio must be rejected")
+            .to_string();
+            assert!(
+                err.contains("max_dead_ratio must be a positive number"),
+                "{ratio}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn lookup_casts_keys_to_the_primary_key_type() {
         let table = table();
-        table.apply(&batch(&[(7, "seven", "i")]), true).unwrap();
+        table.apply(&batch(&[(7, "seven", "i")])).unwrap();
         let narrower: ArrayRef = Arc::new(Int32Array::from(vec![7]));
         let text: ArrayRef = Arc::new(StringViewArray::from(vec!["7"]));
         for keys in [narrower, text] {
@@ -905,6 +1086,7 @@ mod tests {
             &schema(),
             &["id".to_string(), "name".to_string()],
             METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
         )
         .unwrap();
         let err = composite.lookup_key_field("id").unwrap_err().to_string();
@@ -917,11 +1099,31 @@ mod tests {
     #[test]
     fn sql_output_without_op_column_is_rejected() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let err =
-            InMemoryTable::try_new(TABLE, &schema, &["id".to_string()], METRIC_KEY.to_string())
-                .err()
-                .expect("a schema without _gs_op must be rejected")
-                .to_string();
+        let err = InMemoryTable::try_new(
+            TABLE,
+            &schema,
+            &["id".to_string()],
+            METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
+        )
+        .err()
+        .expect("a schema without _gs_op must be rejected")
+        .to_string();
         assert!(err.contains("must contain the '_gs_op' column"), "{err}");
+    }
+
+    #[test]
+    fn primary_key_naming_the_op_column_is_rejected() {
+        let err = InMemoryTable::try_new(
+            TABLE,
+            &schema(),
+            &[COLUMN_NAME_OP.to_string()],
+            METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
+        )
+        .err()
+        .expect("a primary key on _gs_op must be rejected")
+        .to_string();
+        assert!(err.contains("primary key cannot be '_gs_op'"), "{err}");
     }
 }

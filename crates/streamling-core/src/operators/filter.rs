@@ -80,7 +80,7 @@ pub struct StreamingFilterExec {
     original_filter: FilterExec,
     /// True when this filter belongs to an upstream source node and was
     /// re-applied above the source's `WrappingExec` (see
-    /// `wrap_with_side_outputs_before_filter`). Marks a topology boundary for
+    /// `wrap_with_side_outputs`). Marks a topology boundary for
     /// downstream metric aggregation so this operator's compute is not
     /// attributed to the consuming transform.
     source_owned: bool,
@@ -118,7 +118,7 @@ impl StreamingFilterExec {
     /// NOTE: always resets `source_owned` to `false`. A rebuild path that
     /// routes a source-owned filter through here silently drops the topology
     /// boundary mark — callers must re-apply it via [`Self::with_source_owned`]
-    /// (see `wrap_with_side_outputs_before_filter`).
+    /// (see `wrap_with_side_outputs`).
     pub fn from_original(original_filter: FilterExec) -> Result<Self> {
         Ok(Self {
             predicate: original_filter.predicate().clone(),
@@ -136,7 +136,7 @@ impl StreamingFilterExec {
     /// above the source's `WrappingExec`); see the `source_owned` field.
     ///
     /// Crate-internal: the mark is only set by
-    /// `wrap_with_side_outputs_before_filter` (and tests that model that path).
+    /// `wrap_with_side_outputs` (and tests that model that path).
     pub(crate) fn is_source_owned(&self) -> bool {
         self.source_owned
     }
@@ -144,7 +144,7 @@ impl StreamingFilterExec {
     /// Consume `self`, returning it marked as owned by an upstream source
     /// node (see the `source_owned` field).
     ///
-    /// Crate-internal: only `wrap_with_side_outputs_before_filter` should set
+    /// Crate-internal: only `wrap_with_side_outputs` should set
     /// this mark (tests may model that path).
     pub(crate) fn with_source_owned(mut self) -> Self {
         self.source_owned = true;
