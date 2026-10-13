@@ -85,6 +85,9 @@ jobs:
           shared-key: "streamling"
           cache-targets: true
           cache-on-failure: true
+      # TEMP: drop the rust-cache target dir so every crate compiles through kache and lands in the seed.
+      - name: Cold target dir (temporary)
+        run: rm -rf target
       - name: Run linters
         run: |
           cargo fmt --check
@@ -105,8 +108,8 @@ jobs:
       - name: Seed kache remote (temporary)
         if: ${{ !cancelled() }}
         run: |
-          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-check-test --namespace streamling-check-test
-          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push
+          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-check-test --namespace streamling-check-test || echo "::warning::save-manifest failed"
+          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push --allow-partial
 
   # ==========================================================================
   # Build release binary, share via artifact.
@@ -137,7 +140,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/release/streamling
-          key: main-bin-v4-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          key: main-bin-v5-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
 
       # Everything below only runs on cache miss
       - name: Configure Rust toolchain
@@ -165,6 +168,9 @@ jobs:
           shared-key: "v0-release-main-${{ matrix.os }}-${{ matrix.arch }}"
           cache-targets: true
           cache-on-failure: true
+      - name: Cold target dir (temporary)
+        if: steps.main-cache.outputs.cache-hit != 'true'
+        run: rm -rf target
       - name: Build release binary
         if: steps.main-cache.outputs.cache-hit != 'true'
         run: cargo build --release --locked
@@ -178,8 +184,8 @@ jobs:
       - name: Seed kache remote (temporary)
         if: ${{ !cancelled() && steps.main-cache.outputs.cache-hit != 'true' }}
         run: |
-          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-release-main-${{ matrix.arch }} --namespace streamling-release-main-${{ matrix.arch }}
-          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push
+          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-release-main-${{ matrix.arch }} --namespace streamling-release-main-${{ matrix.arch }} || echo "::warning::save-manifest failed"
+          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push --allow-partial
 
       - name: Upload release binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -269,6 +275,8 @@ jobs:
       - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: nextest
+      - name: Cold target dir (temporary)
+        run: rm -rf target/debug
       - name: Build e2e tests
         run: cargo test -p streamling-e2e --no-run
         env:
@@ -277,8 +285,8 @@ jobs:
       - name: Seed kache remote (temporary)
         if: ${{ !cancelled() }}
         run: |
-          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-e2e --namespace streamling-e2e
-          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push
+          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-e2e --namespace streamling-e2e || echo "::warning::save-manifest failed"
+          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push --allow-partial
       - name: Run e2e tests
         run: |
           set -euo pipefail
