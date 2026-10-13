@@ -3,8 +3,8 @@
 //! A sink that stores containers in a native layout (ClickHouse `Array` /
 //! `Tuple` / `Map`) cannot hand a nested decimal_arb leaf over as its
 //! canonical `LargeBinary` bytes: each leaf has to become the concrete type
-//! the destination declares for it. These walks rebuild the containers around
-//! the leaves and leave the per-leaf decision to the caller. They cover the
+//! the destination declares for it. This walk rebuilds the containers around
+//! the leaves and leaves the per-leaf decision to the caller. It covers the
 //! same layouts as the text bridge in [`crate::formats::decimal_arb_text`]:
 //! list views and dictionary / run-end encodings are cast to their plain
 //! layout first, and a leaf under a union is refused. A sliced list or map
@@ -16,8 +16,7 @@
 
 use crate::error::Result;
 use crate::formats::decimal_arb_text::{
-    field_contains_decimal_arb, field_with_type, plain_layout_field, to_plain_layout,
-    trim_list_child,
+    field_contains_decimal_arb, field_with_type, to_plain_layout, trim_list_child,
 };
 use crate::streamling_err;
 use crate::types::decimal_arb::DecimalArbType;
@@ -29,10 +28,6 @@ use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use std::sync::Arc;
 
-/// Rewrites one decimal_arb leaf, given its field and dotted path, into the
-/// field that replaces it.
-pub type LeafFieldRewrite<'a> = dyn FnMut(&Field, &str) -> Result<Field> + 'a;
-
 /// Rewrites one decimal_arb leaf, given its field, values and dotted path,
 /// into the field and values that replace it.
 pub type LeafRewrite<'a> = dyn FnMut(&Field, &ArrayRef, &str) -> Result<(Field, ArrayRef)> + 'a;
@@ -43,53 +38,6 @@ pub fn contains_nested_decimal_arb(field: &Field) -> bool {
     !DecimalArbType::is_decimal_arb_field(field) && field_contains_decimal_arb(field)
 }
 
-/// Schema-only mirror of [`rewrite_decimal_arb_leaves`]: the field `field`
-/// becomes once `leaf` has rewritten every decimal_arb leaf in it. Fields
-/// without a decimal_arb leaf come back unchanged.
-pub fn rewrite_decimal_arb_leaf_fields(
-    field: &Field,
-    path: &str,
-    leaf: &mut LeafFieldRewrite<'_>,
-) -> Result<Field> {
-    if DecimalArbType::is_decimal_arb_field(field) {
-        return leaf(field, path);
-    }
-    if !field_contains_decimal_arb(field) {
-        return Ok(field.clone());
-    }
-    if let Some(plain) = plain_layout_field(field) {
-        return rewrite_decimal_arb_leaf_fields(&plain, path, leaf);
-    }
-    let mut child = |c: &FieldRef| -> Result<FieldRef> {
-        let child_path = format!("{}.{}", path, c.name());
-        Ok(Arc::new(rewrite_decimal_arb_leaf_fields(
-            c,
-            &child_path,
-            leaf,
-        )?))
-    };
-    let data_type = match field.data_type() {
-        DataType::Struct(children) => DataType::Struct(
-            children
-                .iter()
-                .map(|c| {
-                    if field_contains_decimal_arb(c) {
-                        child(&Arc::new(under_struct_nulls(c, field)))
-                    } else {
-                        Ok(Arc::clone(c))
-                    }
-                })
-                .collect::<Result<Fields>>()?,
-        ),
-        DataType::List(c) => DataType::List(child(c)?),
-        DataType::LargeList(c) => DataType::LargeList(child(c)?),
-        DataType::FixedSizeList(c, n) => DataType::FixedSizeList(child(c)?, *n),
-        DataType::Map(c, sorted) => DataType::Map(child(c)?, *sorted),
-        other => return Err(unsupported_layout(path, other)),
-    };
-    Ok(field_with_type(field, data_type))
-}
-
 /// Rebuild `(field, array)` with every decimal_arb leaf below it replaced by
 /// what `leaf` returns for it; containers keep their logical values and validity. A
 /// struct's nulls are pushed down to its children first, so `leaf` sees a
@@ -98,6 +46,7 @@ pub fn rewrite_decimal_arb_leaf_fields(
 /// is declared nullable. Fields without a decimal_arb leaf come back
 /// unchanged. Children hidden by a null list or map are removed before conversion;
 /// fixed-size lists restore their hidden slots as nulls after conversion.
+/// Decoded map keys must be non-null and keep a non-nullable declaration.
 pub fn rewrite_decimal_arb_leaves(
     field: &Field,
     array: &ArrayRef,
@@ -189,9 +138,7 @@ pub fn rewrite_decimal_arb_leaves(
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| downcast_err("FixedSizeListArray"))?;
             let (f, values) = if let Some(nulls) = fa.nulls().filter(|n| n.null_count() > 0) {
-                // Unlike a variable-size list, these child slots cannot be
-                // removed from the output. Convert only the visible slots,
-                // then restore null placeholders under the parent's mask.
+                // Fixed-size lists must restore the hidden slots as nulls.
                 // Arrow permits these masked nulls even for a non-nullable
                 // item field, so its declaration stays unchanged.
                 let width = fa.value_length() as usize;
@@ -239,12 +186,41 @@ pub fn rewrite_decimal_arb_leaves(
                 .ok_or_else(|| downcast_err("MapArray"))?;
             let entries: ArrayRef = Arc::new(ma.entries().clone());
             let (offsets, entries) = visible_list_child(ma.offsets(), &entries, ma.nulls());
+            let original_entries = entries
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| downcast_err("StructArray (map entries)"))?;
+            if original_entries.column(0).logical_null_count() > 0 {
+                return Err(streamling_err!(
+                    "null map key at '{}.{}.{}'",
+                    path,
+                    entry_field.name(),
+                    original_entries.fields()[0].name(),
+                ));
+            }
             let (f, entries) = child(entry_field, &entries)?;
             let entries = entries
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| downcast_err("StructArray (map entries)"))?
-                .clone();
+                .ok_or_else(|| downcast_err("StructArray (map entries)"))?;
+            // Dictionary decoding normally widens nullability, but map keys
+            // cannot be nullable, including in the empty schema walk.
+            let (f, entries) = if entries.fields()[0].is_nullable() {
+                let mut fields = entries.fields().to_vec();
+                fields[0] = Arc::new(fields[0].as_ref().clone().with_nullable(false));
+                let fields = Fields::from(fields);
+                let entries = StructArray::try_new(
+                    fields.clone(),
+                    entries.columns().to_vec(),
+                    entries.nulls().cloned(),
+                )?;
+                (
+                    Arc::new(field_with_type(&f, DataType::Struct(fields))),
+                    entries,
+                )
+            } else {
+                (f, entries.clone())
+            };
             let ma = MapArray::try_new(
                 Arc::clone(&f),
                 offsets,
@@ -283,6 +259,7 @@ fn visible_list_child<O: OffsetSizeTrait>(
     if visible_len == (offsets[offsets.len() - 1] - offsets[0]).as_usize() {
         return trim_list_child(offsets, child);
     }
+    // Unlike selection kernels, ArrayData packing retains encoded child fields.
     let data = child.to_data();
     let mut visible = MutableArrayData::new(vec![&data], false, visible_len);
     for (start, end) in nulls.valid_slices() {
@@ -296,7 +273,7 @@ fn visible_list_child<O: OffsetSizeTrait>(
 /// The array walk pushes the struct's nulls into such a child, so a child
 /// declared non-nullable under a nullable struct (legal Arrow: its slots
 /// under a null row are simply masked) comes out holding nulls. It is
-/// widened to nullable here, in both walks alike, so the rewritten field
+/// widened to nullable here, so the rewritten field
 /// admits the nulls its values now carry — and a sink deriving its column
 /// types from the field (ClickHouse `Nullable(..)`) declares them.
 fn under_struct_nulls(child: &Field, parent: &Field) -> Field {
@@ -355,7 +332,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    fn leaves(values: &[Option<&str>]) -> ArrayRef {
+    pub(crate) fn leaves(values: &[Option<&str>]) -> ArrayRef {
         let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "v", 78, 0).unwrap();
         for v in values {
             match v {
@@ -424,9 +401,10 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{U256_MAX, leaves as leaf_array};
     use super::*;
-    use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbValue};
-    use arrow::array::{Int32Array, LargeBinaryArray, StringArray, StructArray as SA};
+    use crate::formats::decimal_arb_text::decimal_arb_to_strings;
+    use arrow::array::{AsArray, Int32Array, StringArray, StructArray as SA, new_empty_array};
     use arrow::buffer::OffsetBuffer;
     use arrow::compute::cast;
 
@@ -434,74 +412,273 @@ mod tests {
         Arc::new(DecimalArbType::field(name, 78, 0, true).unwrap())
     }
 
-    fn leaf_array(values: &[Option<&str>]) -> ArrayRef {
-        let mut b = DecimalArbArrayBuilder::with_capacity(values.len(), "v", 78, 0).unwrap();
-        for v in values {
-            match v {
-                Some(s) => b.append_str(s).unwrap(),
-                None => b.append_null(),
-            }
-        }
-        let (raw, _, _) = b.finish().into_inner();
-        Arc::new(raw)
-    }
-
-    /// The test leaf rewrite: decimal_arb → canonical text, tagging the
-    /// field with the path it was reached by.
-    fn to_text(field: &Field, array: &ArrayRef, path: &str) -> Result<(Field, ArrayRef)> {
-        let lb = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-        let (_, scale) = DecimalArbType::precision_scale_from_field(field).unwrap();
-        let text: StringArray = (0..lb.len())
-            .map(|i| {
-                (!lb.is_null(i)).then(|| {
-                    DecimalArbValue::from_canonical_bytes_at_scale(lb.value(i), scale)
-                        .unwrap()
-                        .to_canonical_string()
-                })
-            })
-            .collect();
-        Ok((
-            Field::new(field.name(), DataType::Utf8, field.is_nullable())
-                .with_metadata([("path".to_string(), path.to_string())].into()),
-            Arc::new(text),
-        ))
-    }
-
-    fn to_text_field(field: &Field, path: &str) -> Result<Field> {
-        Ok(
-            Field::new(field.name(), DataType::Utf8, field.is_nullable())
-                .with_metadata([("path".to_string(), path.to_string())].into()),
-        )
-    }
-
     fn strings(array: &ArrayRef) -> Vec<Option<String>> {
         let s = array.as_any().downcast_ref::<StringArray>().unwrap();
         s.iter().map(|v| v.map(str::to_string)).collect()
     }
 
-    /// Model a sink that rejects negative values, even though decimal_arb may
-    /// legally contain them in slots hidden by a container's null bitmap.
-    fn rewrite_nonnegative(field: &Field, array: &ArrayRef) -> (Field, ArrayRef, Vec<String>) {
+    /// Rewrites every leaf to canonical text, tagging its field with the path
+    /// it was reached by, and returns the non-null values the leaf rewrite
+    /// was handed: values hidden by a container's null bitmap must not be.
+    fn rewrite(field: &Field, array: &ArrayRef) -> (Field, ArrayRef, Vec<String>) {
         let mut visited = Vec::new();
         let (f, a) = rewrite_decimal_arb_leaves(field, array, field.name(), &mut |f, a, path| {
-            let lb = a.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            for bytes in lb.iter().flatten() {
-                let value =
-                    DecimalArbValue::from_canonical_bytes_at_scale(bytes, 0)?.to_canonical_string();
-                if value.starts_with('-') {
-                    return Err(streamling_err!("hidden negative value at {path}"));
-                }
-                visited.push(value);
-            }
-            to_text(f, a, path)
+            let text = decimal_arb_to_strings(f, a).unwrap();
+            visited.extend(text.iter().flatten().map(str::to_string));
+            Ok((
+                Field::new(f.name(), DataType::Utf8, f.is_nullable())
+                    .with_metadata([("path".to_string(), path.to_string())].into()),
+                Arc::new(text),
+            ))
         })
         .unwrap();
-        let schema_only =
-            rewrite_decimal_arb_leaf_fields(field, field.name(), &mut to_text_field).unwrap();
-        assert_eq!(f, schema_only);
         assert_eq!(f.data_type(), a.data_type());
         a.to_data().validate_full().unwrap();
         (f, a, visited)
+    }
+
+    fn run_sibling_struct(custom_fields: bool) -> ArrayRef {
+        use arrow::array::RunArray;
+        use arrow::datatypes::Int32Type;
+        let runs = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![1, 2, 3]),
+            &Int32Array::from(vec![11, 22, 33]),
+        )
+        .unwrap();
+        let sibling = if custom_fields {
+            let named = |name, nullable| {
+                Arc::new(
+                    Field::new(name, DataType::Int32, nullable)
+                        .with_metadata([("producer".into(), "custom".into())].into()),
+                )
+            };
+            make_array(
+                runs.to_data()
+                    .into_builder()
+                    .data_type(DataType::RunEndEncoded(
+                        named("ends", false),
+                        named("payload", false),
+                    ))
+                    .build()
+                    .unwrap(),
+            )
+        } else {
+            Arc::new(runs) as ArrayRef
+        };
+        Arc::new(
+            SA::try_new(
+                vec![
+                    leaf_field("amount"),
+                    Arc::new(Field::new("sibling", sibling.data_type().clone(), true)),
+                ]
+                .into(),
+                vec![leaf_array(&[Some("1"), Some("7"), Some(U256_MAX)]), sibling],
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn masked_containers_preserve_run_end_sibling_fields_and_values() {
+        let values = run_sibling_struct(true);
+        let original = values.as_struct().fields()[1].clone();
+        let item = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let nulls = Some(NullBuffer::from(vec![true, false, true]));
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(item.clone(), 1, values.clone(), nulls.clone()).unwrap(),
+        );
+        let list: ArrayRef = Arc::new(
+            ListArray::try_new(
+                item.clone(),
+                OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+                values.clone(),
+                nulls.clone(),
+            )
+            .unwrap(),
+        );
+        let large: ArrayRef = Arc::new(
+            LargeListArray::try_new(
+                item,
+                OffsetBuffer::new(vec![0_i64, 1, 2, 3].into()),
+                values.clone(),
+                nulls.clone(),
+            )
+            .unwrap(),
+        );
+        let entries = SA::try_new(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", values.data_type().clone(), true)),
+            ]
+            .into(),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"])), values],
+            None,
+        )
+        .unwrap();
+        let map: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+                entries,
+                nulls,
+                false,
+            )
+            .unwrap(),
+        );
+        for array in [fixed, list, large, map] {
+            for input in [array.clone(), array.slice(1, 2)] {
+                let field = Field::new("container", input.data_type().clone(), true);
+                let (_, output, visited) = rewrite(&field, &input);
+                assert_eq!(visited.last().unwrap(), U256_MAX);
+                for row in 0..output.len() {
+                    if output.is_null(row) {
+                        continue;
+                    }
+                    let structs = match output.data_type() {
+                        DataType::FixedSizeList(_, _) => output.as_fixed_size_list().value(row),
+                        DataType::List(_) => output.as_list::<i32>().value(row),
+                        DataType::LargeList(_) => output.as_list::<i64>().value(row),
+                        DataType::Map(_, _) => {
+                            let entries = output.as_map().value(row);
+                            entries.column(1).clone()
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(structs.as_struct().fields()[1], original);
+                    let sibling =
+                        cast(structs.as_struct().column(1).as_ref(), &DataType::Int32).unwrap();
+                    let expected = if input.len() == 3 && row == 0 { 11 } else { 33 };
+                    assert_eq!(
+                        sibling
+                            .as_primitive::<arrow::datatypes::Int32Type>()
+                            .value(0),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_null_fixed_lists_restore_run_end_siblings_without_indices() {
+        for custom in [false, true] {
+            let values = run_sibling_struct(custom);
+            let sibling = values.as_struct().fields()[1].clone();
+            let array: ArrayRef = Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::new(Field::new("item", values.data_type().clone(), true)),
+                    1,
+                    values,
+                    Some(NullBuffer::from(vec![false, false, false])),
+                )
+                .unwrap(),
+            );
+            let field = Field::new("f", array.data_type().clone(), true);
+            let (_, output, visited) = rewrite(&field, &array);
+            assert!(visited.is_empty());
+            assert_eq!(output.logical_null_count(), 3);
+            let values = output.as_fixed_size_list().values();
+            assert_eq!(values.logical_null_count(), 3);
+            assert_eq!(values.as_struct().fields()[1], sibling);
+        }
+    }
+
+    fn dictionary_key_map(null_value: bool) -> ArrayRef {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+        let keys: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                leaf_array(&[Some(U256_MAX), if null_value { None } else { Some("7") }]),
+            )
+            .unwrap(),
+        );
+        let key = Field::new("key", keys.data_type().clone(), false)
+            .with_metadata(leaf_field("key").metadata().clone());
+        let entries = SA::try_new(
+            vec![
+                Arc::new(key.clone().with_nullable(true)),
+                Arc::new(Field::new("value", DataType::Utf8, false)),
+            ]
+            .into(),
+            vec![keys, Arc::new(StringArray::from(vec!["max", "seven"]))],
+            None,
+        )
+        .unwrap();
+        // ArrayData validates physical dictionary validity; MapArray also
+        // accepts these non-null indices even when a decoded value is null.
+        let entries = make_array(
+            entries
+                .to_data()
+                .into_builder()
+                .data_type(DataType::Struct(
+                    vec![
+                        Arc::new(key),
+                        Arc::new(Field::new("value", DataType::Utf8, false)),
+                    ]
+                    .into(),
+                ))
+                .build()
+                .unwrap(),
+        )
+        .as_struct()
+        .clone();
+        Arc::new(
+            MapArray::try_new(
+                Arc::new(
+                    Field::new("entries", entries.data_type().clone(), false)
+                        .with_metadata([("owner".into(), "producer".into())].into()),
+                ),
+                OffsetBuffer::new(vec![0, 2].into()),
+                entries,
+                None,
+                true,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn dictionary_decimal_map_keys_remain_non_nullable() {
+        let array = dictionary_key_map(false);
+        let field = Field::new("m", array.data_type().clone(), false);
+        for input in [array.clone(), new_empty_array(array.data_type())] {
+            let (rewritten, output, _) = rewrite(&field, &input);
+            let DataType::Map(entries, sorted) = rewritten.data_type() else {
+                panic!()
+            };
+            assert!(*sorted);
+            assert_eq!(entries.name(), "entries");
+            assert_eq!(entries.metadata().get("owner").unwrap(), "producer");
+            let DataType::Struct(fields) = entries.data_type() else {
+                panic!()
+            };
+            assert!(!fields[0].is_nullable());
+            assert_eq!(fields[0].name(), "key");
+            assert_eq!(fields[0].metadata().get("path").unwrap(), "m.entries.key");
+            if !input.is_empty() {
+                assert_eq!(
+                    strings(output.as_map().keys()),
+                    [Some(U256_MAX.into()), Some("7".into())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_decimal_map_keys_reject_decoded_nulls() {
+        let array = dictionary_key_map(true);
+        let field = Field::new("m", array.data_type().clone(), false);
+        let error = rewrite_decimal_arb_leaves(&field, &array, "m", &mut |f, a, _| {
+            Ok((
+                field_with_type(f, DataType::Utf8),
+                Arc::new(decimal_arb_to_strings(f, a)?),
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("m.entries.key"), "{error}");
+        assert!(error.to_string().contains("null"), "{error}");
     }
 
     #[test]
@@ -519,19 +696,30 @@ mod tests {
         let large = cast(list.as_ref(), &DataType::LargeList(Arc::clone(&item))).unwrap();
         for array in [Arc::clone(&list), large] {
             let field = Field::new("l", array.data_type().clone(), true);
-            let (_, hidden, visited) = rewrite_nonnegative(&field, &array.slice(0, 1));
+            let (_, hidden, visited) = rewrite(&field, &array.slice(0, 1));
             assert!(visited.is_empty());
             assert!(hidden.is_null(0));
-            let (_, rewritten, visited) = rewrite_nonnegative(&field, &array);
+            let (sliced_field, sliced, visited) = rewrite(&field, &array.slice(1, 2));
+            assert_eq!(visited, ["7", "8"]);
+            assert!(sliced.is_null(1));
+            let (DataType::List(item) | DataType::LargeList(item)) = sliced_field.data_type()
+            else {
+                panic!("{sliced_field:?}")
+            };
+            let sliced = cast(sliced.as_ref(), &DataType::List(Arc::clone(item))).unwrap();
+            assert_eq!(sliced.as_list::<i32>().value_offsets(), &[0, 2, 2]);
+            let (rewritten_field, rewritten, visited) = rewrite(&field, &array);
             assert_eq!(visited, ["7", "8"]);
             assert_eq!(rewritten.len(), 4);
             assert!(rewritten.is_null(0));
             assert!(rewritten.is_null(2));
-            let rewritten = cast(
-                rewritten.as_ref(),
-                &DataType::List(Arc::new(to_text_field(&item, "l.item").unwrap())),
-            )
-            .unwrap();
+            let (DataType::List(text_item) | DataType::LargeList(text_item)) =
+                rewritten_field.data_type()
+            else {
+                panic!("{rewritten_field:?}")
+            };
+            let rewritten =
+                cast(rewritten.as_ref(), &DataType::List(Arc::clone(text_item))).unwrap();
             let rewritten = rewritten.as_any().downcast_ref::<ListArray>().unwrap();
             assert_eq!(rewritten.value_offsets(), &[0, 0, 2, 2, 2]);
             assert!(matches!(rewritten.data_type(), DataType::List(child) if !child.is_nullable()));
@@ -561,7 +749,7 @@ mod tests {
             .unwrap(),
         );
         let field = Field::new("s", structs.data_type().clone(), true);
-        let (_, _, visited) = rewrite_nonnegative(&field, &structs);
+        let (_, _, visited) = rewrite(&field, &structs);
         assert_eq!(visited, ["7"]);
 
         let key = Arc::new(Field::new("key", DataType::Utf8, false));
@@ -587,7 +775,7 @@ mod tests {
             .unwrap(),
         );
         let field = Field::new("m", map.data_type().clone(), true);
-        let (_, rewritten, visited) = rewrite_nonnegative(&field, &map);
+        let (_, rewritten, visited) = rewrite(&field, &map);
         assert_eq!(visited, ["7"]);
         let rewritten = rewritten.as_any().downcast_ref::<MapArray>().unwrap();
         assert_eq!(rewritten.value_offsets(), &[0, 0, 1]);
@@ -609,7 +797,7 @@ mod tests {
             .unwrap(),
         );
         let field = Field::new("f", fixed.data_type().clone(), true);
-        let (field, rewritten, visited) = rewrite_nonnegative(&field, &fixed);
+        let (field, rewritten, visited) = rewrite(&field, &fixed);
         assert_eq!(visited, ["7"]);
         let DataType::FixedSizeList(item, _) = field.data_type() else {
             panic!()
@@ -647,7 +835,7 @@ mod tests {
                 .unwrap(),
             );
             let field = Field::new("f", array.data_type().clone(), true);
-            let (field, rewritten, visited) = rewrite_nonnegative(&field, &array);
+            let (field, rewritten, visited) = rewrite(&field, &array);
             assert_eq!(visited, if valid[1] { vec!["7", "8"] } else { vec![] });
             let DataType::FixedSizeList(child, _) = field.data_type() else {
                 panic!()
@@ -680,19 +868,9 @@ mod tests {
             .unwrap(),
         );
         let field = Field::new("empty", empty.data_type().clone(), true);
-        let (_, empty, visited) = rewrite_nonnegative(&field, &empty);
+        let (_, empty, visited) = rewrite(&field, &empty);
         assert_eq!(empty.len(), 3);
         assert!(visited.is_empty());
-    }
-
-    /// Rewrites through both walks and checks they agree on the field.
-    fn rewrite(field: &Field, array: &ArrayRef) -> (Field, ArrayRef) {
-        let (f, a) = rewrite_decimal_arb_leaves(field, array, field.name(), &mut to_text).unwrap();
-        let schema_only =
-            rewrite_decimal_arb_leaf_fields(field, field.name(), &mut to_text_field).unwrap();
-        assert_eq!(f, schema_only, "schema and array walks disagree");
-        assert_eq!(f.data_type(), a.data_type());
-        (f, a)
     }
 
     #[test]
@@ -715,7 +893,7 @@ mod tests {
                     Some("1000000000000000000"),
                     Some("7"),
                     None,
-                    Some("115792089237316195423570985008687907853269984665640564039457584007913129639935"),
+                    Some(U256_MAX),
                 ]),
             ],
             Some(NullBuffer::from(vec![true, true, false, true, true])),
@@ -732,7 +910,7 @@ mod tests {
         let field = Field::new("traces", DataType::List(item), true);
         let array: ArrayRef = Arc::new(list);
 
-        let (f, a) = rewrite(&field, &array);
+        let (f, a, _) = rewrite(&field, &array);
         let DataType::List(item) = f.data_type() else {
             panic!("{f:?}")
         };
@@ -760,13 +938,13 @@ mod tests {
                 Some("1000000000000000000".into()),
                 None, // masked by the null struct
                 None,
-                Some("115792089237316195423570985008687907853269984665640564039457584007913129639935".into()),
+                Some(U256_MAX.into()),
             ]
         );
 
         // A sliced column keeps its window.
         let sliced = array.slice(2, 2);
-        let (_, a) = rewrite(&field, &sliced);
+        let (_, a, _) = rewrite(&field, &sliced);
         let la = a.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(la.len(), 2);
         assert_eq!(la.value_length(0), 0);
@@ -777,10 +955,7 @@ mod tests {
             .unwrap()
             .column(1)
             .clone();
-        assert_eq!(
-            strings(&leaves)[2].as_deref(),
-            Some("115792089237316195423570985008687907853269984665640564039457584007913129639935")
-        );
+        assert_eq!(strings(&leaves)[2].as_deref(), Some(U256_MAX));
     }
 
     #[test]
@@ -794,7 +969,7 @@ mod tests {
         )
         .unwrap();
         let field = Field::new("l", DataType::LargeList(Arc::clone(&value)), false);
-        let (_, a) = rewrite(&field, &(Arc::new(large) as ArrayRef));
+        let (_, a, _) = rewrite(&field, &(Arc::new(large) as ArrayRef));
         let la = a.as_any().downcast_ref::<LargeListArray>().unwrap();
         assert_eq!(
             strings(la.values()),
@@ -809,7 +984,7 @@ mod tests {
         )
         .unwrap();
         let field = Field::new("f", DataType::FixedSizeList(Arc::clone(&value), 2), false);
-        let (_, a) = rewrite(&field, &(Arc::new(fixed) as ArrayRef));
+        let (_, a, _) = rewrite(&field, &(Arc::new(fixed) as ArrayRef));
         let fa = a.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(
             strings(&fa.value(1)),
@@ -841,7 +1016,7 @@ mod tests {
         )
         .unwrap();
         let field = Field::new("m", DataType::Map(entry_field, false), true);
-        let (f, a) = rewrite(&field, &(Arc::new(map) as ArrayRef));
+        let (f, a, _) = rewrite(&field, &(Arc::new(map) as ArrayRef));
         let DataType::Map(entries, _) = f.data_type() else {
             panic!("{f:?}")
         };
@@ -873,7 +1048,7 @@ mod tests {
         );
         let view = cast(list.as_ref(), &DataType::ListView(Arc::clone(&value))).unwrap();
         let field = Field::new("v", DataType::ListView(value), true);
-        let (f, a) = rewrite(&field, &view);
+        let (f, a, _) = rewrite(&field, &view);
         assert!(matches!(f.data_type(), DataType::List(_)), "{f:?}");
         let la = a.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(strings(la.values()), vec![Some("42".into())]);
@@ -912,7 +1087,7 @@ mod tests {
         // outer field's (empty) metadata, so the leaf was never converted and
         // its canonical bytes went out as-is.
         let (field, array) = run_end_encoded_leaf();
-        let (f, a) = rewrite(&field, &array);
+        let (f, a, _) = rewrite(&field, &array);
         assert_eq!(f.data_type(), &DataType::Utf8);
         assert_eq!(f.name(), "ree");
         assert_eq!(f.metadata().get("path").map(String::as_str), Some("ree"));
@@ -935,7 +1110,7 @@ mod tests {
         )
         .unwrap();
         let s_field = Field::new("s", s.data_type().clone(), true);
-        let (_, a) = rewrite(&s_field, &(Arc::new(s) as ArrayRef));
+        let (_, a, _) = rewrite(&s_field, &(Arc::new(s) as ArrayRef));
         let leaf = a.as_any().downcast_ref::<SA>().unwrap().column(0).clone();
         assert_eq!(
             strings(&leaf),
@@ -965,14 +1140,13 @@ mod tests {
         let field = Field::new("l", DataType::List(item), true);
         let array: ArrayRef = Arc::new(list);
 
-        let mut seen = 0;
-        let mut counting = |f: &Field, a: &ArrayRef, path: &str| {
-            seen += a.len();
-            to_text(f, a, path)
-        };
         let sliced = array.slice(500, 2);
-        let (_, a) = rewrite_decimal_arb_leaves(&field, &sliced, "l", &mut counting).unwrap();
-        assert_eq!(seen, 2, "only the slice's own elements are converted");
+        let (_, a, visited) = rewrite(&field, &sliced);
+        assert_eq!(
+            visited,
+            ["500", "501"],
+            "only the slice's own elements are converted"
+        );
         let la = a.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(la.len(), 2);
         assert_eq!(la.value_offsets(), &[0, 1, 2]);
@@ -989,26 +1163,17 @@ mod tests {
         )
         .unwrap();
         let fixed_field = Field::new("l", fixed.data_type().clone(), true);
-        seen = 0;
-        let mut counting = |f: &Field, a: &ArrayRef, path: &str| {
-            seen += a.len();
-            to_text(f, a, path)
-        };
-        let (_, a) =
-            rewrite_decimal_arb_leaves(&fixed_field, &fixed.slice(700, 3), "l", &mut counting)
-                .unwrap();
-        assert_eq!(seen, 3, "only the slice's own elements are converted");
+        let (_, a, visited) = rewrite(&fixed_field, &fixed.slice(700, 3));
+        assert_eq!(
+            visited.len(),
+            3,
+            "only the slice's own elements are converted"
+        );
         let fa = a.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(fa.len(), 3);
         assert_eq!(strings(&fa.value(2)), vec![Some("702".into())]);
         // The same slice taken through `ArrayData`, as a sink receives it.
-        let (_, a) = rewrite_decimal_arb_leaves(
-            &fixed_field,
-            &make_array(fixed.to_data().slice(700, 3)),
-            "l",
-            &mut to_text,
-        )
-        .unwrap();
+        let (_, a, _) = rewrite(&fixed_field, &make_array(fixed.to_data().slice(700, 3)));
         let fa = a.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(
             strings(fa.values()),
@@ -1018,15 +1183,8 @@ mod tests {
         // Same for a LargeList and a Map.
         let large = cast(array.as_ref(), &DataType::LargeList(leaf_field("item"))).unwrap();
         let large_field = Field::new("l", large.data_type().clone(), true);
-        seen = 0;
-        let mut counting = |f: &Field, a: &ArrayRef, path: &str| {
-            seen += a.len();
-            to_text(f, a, path)
-        };
-        let (_, a) =
-            rewrite_decimal_arb_leaves(&large_field, &large.slice(10, 3), "l", &mut counting)
-                .unwrap();
-        assert_eq!(seen, 3);
+        let (_, a, visited) = rewrite(&large_field, &large.slice(10, 3));
+        assert_eq!(visited.len(), 3);
         let la = a.as_any().downcast_ref::<LargeListArray>().unwrap();
         assert_eq!(strings(&la.value(2)), vec![Some("12".into())]);
 
@@ -1057,14 +1215,8 @@ mod tests {
             .unwrap(),
         );
         let map_field = Field::new("m", DataType::Map(entry_field, false), true);
-        seen = 0;
-        let mut counting = |f: &Field, a: &ArrayRef, path: &str| {
-            seen += a.len();
-            to_text(f, a, path)
-        };
-        let (_, a) =
-            rewrite_decimal_arb_leaves(&map_field, &map.slice(1, 1), "m", &mut counting).unwrap();
-        assert_eq!(seen, 1);
+        let (_, a, visited) = rewrite(&map_field, &map.slice(1, 1));
+        assert_eq!(visited.len(), 1);
         let ma = a.as_any().downcast_ref::<MapArray>().unwrap();
         assert_eq!(strings(ma.values()), vec![Some("3".into())]);
     }
@@ -1072,7 +1224,7 @@ mod tests {
     /// The leaf of each struct in `item: Struct<value>` (one list row
     /// holding them all), with the rewritten leaf's field.
     fn struct_leaf(field: &Field, array: &ArrayRef) -> (FieldRef, ArrayRef) {
-        let (f, a) = rewrite(field, array);
+        let (f, a, _) = rewrite(field, array);
         let DataType::List(item) = f.data_type() else {
             panic!("{f:?}")
         };
@@ -1133,7 +1285,7 @@ mod tests {
 
         // The declaration does not depend on the batch: a nullable struct
         // with no null row in it widens the leaf all the same, so every
-        // batch (and the schema-only walk `rewrite` checks against) agrees.
+        // batch agrees.
         let (field, array) = list_of(true, None);
         let (leaf_field, leaf) = struct_leaf(&field, &array);
         assert_eq!(leaf.null_count(), 0);
@@ -1151,12 +1303,7 @@ mod tests {
     /// with the decimal_arb metadata on the dictionary field itself — the
     /// Arrow convention for a dictionary-encoded extension type.
     fn dictionary_encoded_leaf(name: &str) -> (Field, ArrayRef) {
-        let plain = leaf_array(&[
-            Some("7"),
-            Some("7"),
-            None,
-            Some("115792089237316195423570985008687907853269984665640564039457584007913129639935"),
-        ]);
+        let plain = leaf_array(&[Some("7"), Some("7"), None, Some(U256_MAX)]);
         let dict = cast(
             plain.as_ref(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary)),
@@ -1173,16 +1320,13 @@ mod tests {
             Some("7".to_string()),
             Some("7".to_string()),
             None,
-            Some(
-                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
-                    .to_string(),
-            ),
+            Some(U256_MAX.to_string()),
         ];
 
         // As a column of its own.
         let (field, array) = dictionary_encoded_leaf("amt");
         assert!(contains_nested_decimal_arb(&field));
-        let (f, a) = rewrite(&field, &array);
+        let (f, a, _) = rewrite(&field, &array);
         assert_eq!(f.data_type(), &DataType::Utf8);
         assert_eq!(f.metadata().get("path").map(String::as_str), Some("amt"));
         assert_eq!(strings(&a), expected);
@@ -1199,7 +1343,7 @@ mod tests {
         .unwrap();
         let field = Field::new("l", DataType::List(item), true);
         assert!(contains_nested_decimal_arb(&field));
-        let (f, a) = rewrite(&field, &(Arc::new(list) as ArrayRef));
+        let (f, a, _) = rewrite(&field, &(Arc::new(list) as ArrayRef));
         let DataType::List(item) = f.data_type() else {
             panic!("{f:?}")
         };
@@ -1219,7 +1363,7 @@ mod tests {
         )
         .unwrap();
         let s_field = Field::new("s", s.data_type().clone(), true);
-        let (_, a) = rewrite(&s_field, &(Arc::new(s) as ArrayRef));
+        let (_, a, _) = rewrite(&s_field, &(Arc::new(s) as ArrayRef));
         let leaf = a.as_any().downcast_ref::<SA>().unwrap().column(0).clone();
         assert_eq!(
             strings(&leaf),
@@ -1239,7 +1383,7 @@ mod tests {
             &DecimalArbType::field("top", 10, 0, true).unwrap()
         ));
         assert_eq!(
-            rewrite_decimal_arb_leaf_fields(&plain, "p", &mut to_text_field).unwrap(),
+            rewrite(&plain, &new_empty_array(plain.data_type())).0,
             plain
         );
 
@@ -1252,7 +1396,9 @@ mod tests {
             true,
         );
         assert!(contains_nested_decimal_arb(&union));
-        let err = rewrite_decimal_arb_leaf_fields(&union, "u", &mut to_text_field).unwrap_err();
+        let empty = new_empty_array(union.data_type());
+        let err = rewrite_decimal_arb_leaves(&union, &empty, "u", &mut |_, _, _| unreachable!())
+            .unwrap_err();
         assert!(err.to_string().contains("'u'"), "{err}");
     }
 }

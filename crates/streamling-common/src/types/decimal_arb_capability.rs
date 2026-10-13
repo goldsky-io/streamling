@@ -269,7 +269,7 @@ pub fn capability_for_nested_decimal_arb(
     native_int_kind: Option<crate::types::decimal_arb::NativeIntKind>,
 ) -> CapabilityResult {
     match kind {
-        ConnectorKind::ClickHouse | ConnectorKind::Hybrid => {
+        ConnectorKind::ClickHouse => {
             if coerce_to_string {
                 return CapabilityResult::OptInOnly(CoercionDirective::String);
             }
@@ -349,17 +349,6 @@ impl fmt::Display for DecimalArbConfigErrors {
         }
         Ok(())
     }
-}
-
-/// Connectors whose decimal_arb conversion covers only top-level columns.
-///
-/// ClickHouse is not one of them: its sink rebuilds `Array` / `Tuple` / `Map`
-/// columns with every nested leaf in the same native type a top-level column
-/// gets (`UInt256` / `Int256`, `Decimal(p, s)`, or `String` under the column's
-/// `coerce_to: string`). The ClickHouse-backed hybrid connector reads
-/// top-level columns only.
-fn converts_only_top_level(kind: ConnectorKind) -> bool {
-    matches!(kind, ConnectorKind::Hybrid)
 }
 
 /// `(precision, scale, native_int_kind)` of a decimal_arb field — or of a
@@ -532,7 +521,7 @@ pub fn validate_pipeline_decimal_arb(
                 ));
                 continue;
             }
-            if i >= top_level && converts_only_top_level(kind) {
+            if i >= top_level && kind == ConnectorKind::Hybrid {
                 errors.push(config_load_error(
                     &path,
                     kind,
@@ -1238,28 +1227,6 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_nested_reject_does_not_suggest_a_top_level_only_remedy() {
-        // `schema_override` native-int pins match top-level columns only, so
-        // the hint for a nested leaf must not point there.
-        let schema = traces_schema(DecimalArbType::field("value", 100, 0, true).unwrap());
-        let msg = format!(
-            "{}",
-            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err()
-        );
-        assert!(msg.contains("traces.item.value"), "{msg}");
-        assert!(msg.contains("coerce_to: string"), "{msg}");
-        assert!(!msg.contains("schema_override"), "{msg}");
-
-        // The same column at the top level keeps the schema_override hint.
-        let top = Schema::new(vec![DecimalArbType::field("value", 100, 0, true).unwrap()]);
-        let msg = format!(
-            "{}",
-            validate_pipeline_decimal_arb(&top, ConnectorKind::ClickHouse, &[]).unwrap_err()
-        );
-        assert!(msg.contains("schema_override"), "{msg}");
-    }
-
-    #[test]
     fn clickhouse_nested_coerce_to_string_covers_every_leaf() {
         use crate::types::decimal_arb::NativeIntKind;
         // A nested leaf under a `coerce_to: string` column is a String
@@ -1343,29 +1310,6 @@ mod tests {
         let msg = format!("{errs}");
         assert!(msg.contains("traces.item.value"), "{msg}");
         assert!(msg.contains("only top-level columns"), "{msg}");
-    }
-
-    #[test]
-    fn clickhouse_still_rejects_a_leaf_under_a_union() {
-        use arrow_schema::{UnionFields, UnionMode};
-        use std::sync::Arc;
-        let leaf = Arc::new(DecimalArbType::field("amt", 50, 0, true).unwrap());
-        let union = Field::new(
-            "u",
-            DataType::Union(
-                UnionFields::try_new(vec![0], vec![leaf]).unwrap(),
-                UnionMode::Dense,
-            ),
-            true,
-        );
-        let errs = validate_pipeline_decimal_arb(
-            &Schema::new(vec![union]),
-            ConnectorKind::ClickHouse,
-            &[],
-        )
-        .unwrap_err();
-        let msg = format!("{errs}");
-        assert!(msg.contains("u.amt") && msg.contains("union"), "{msg}");
     }
 
     #[test]

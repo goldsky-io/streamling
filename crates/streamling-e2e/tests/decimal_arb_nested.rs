@@ -416,7 +416,7 @@ const ARRAY_STRUCT_WIDE_FRACTION_SCHEMA: &str = r#"{
     ]
 }"#;
 
-fn array_to_clickhouse_yaml(ctx: &TestContext) -> String {
+fn array_to_clickhouse_yaml(ctx: &TestContext, transforms: &str, from: &str) -> String {
     format!(
         r#"
 sources:
@@ -425,11 +425,11 @@ sources:
     topic: {input}
     starting_offsets: earliest
     primary_key: id
-transforms: {{}}
+transforms: {transforms}
 sinks:
   out:
     type: clickhouse
-    from: src
+    from: {from}
     table: nested_items
     primary_key: id
 "#,
@@ -437,17 +437,29 @@ sinks:
     )
 }
 
-/// array<record<decimal(100, 18)>> -> ClickHouse with `coerce_to: string` on
-/// the column. Nested decimal_arb used to be rejected at config load for
-/// ClickHouse; the directive on the top-level column now reaches every leaf,
-/// the table is created as `Array(Tuple(amt String))`, and each element
-/// stores its canonical decimal text.
+/// Coerced and native nested leaves round-trip through the real Arrow insert.
+/// The native leaves cover UInt256 and Int256 boundaries and byte order.
 #[tokio::test]
 async fn array_of_wide_decimal_arb_to_clickhouse_with_coerce_to_string() {
     init_tracing();
     let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
         .await
         .unwrap();
+
+    let schema = r#"{
+        "type": "record", "name": "R",
+        "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "items", "type": {"type": "array", "items": {"type": "record", "name": "X", "fields": [
+                {"name": "amt", "type": {"type": "bytes", "logicalType": "decimal", "precision": 100, "scale": 18}}
+            ]}}},
+            {"name": "unsigned_one", "type": {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}},
+            {"name": "unsigned_max", "type": {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}},
+            {"name": "signed_min", "type": {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}},
+            {"name": "signed_max", "type": {"type": "bytes", "logicalType": "decimal", "precision": 78, "scale": 0}}
+        ]
+    }"#;
+    let i256_max = "57896044618658097711785492504343953926634992332820282019728792003956564819967";
 
     let rec = Value::Record(vec![
         ("id".to_string(), Value::Long(1)),
@@ -466,15 +478,29 @@ async fn array_of_wide_decimal_arb_to_clickhouse_with_coerce_to_string() {
                 )]),
             ]),
         ),
+        ("unsigned_one".to_string(), decimal_val("1")),
+        ("unsigned_max".to_string(), decimal_val(U256_MAX)),
+        ("signed_min".to_string(), decimal_val(I256_MIN)),
+        ("signed_max".to_string(), decimal_val(i256_max)),
     ]);
-    ctx.kafka
-        .produce_avro_value(ARRAY_STRUCT_WIDE_FRACTION_SCHEMA, rec)
-        .await
-        .unwrap();
+    ctx.kafka.produce_avro_value(schema, rec).await.unwrap();
+    let transforms = r#"
+  nested:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT id, items, make_array(named_struct(
+        'unsigned_one', unsigned_one,
+        'unsigned_max', unsigned_max,
+        'signed_min', to_decimal_arb_from_string(decimal_arb_to_string(signed_min), 78, 0, 'i256'),
+        'signed_max', to_decimal_arb_from_string(decimal_arb_to_string(signed_max), 78, 0, 'i256')
+      )) AS native FROM src
+"#;
+    let yaml = array_to_clickhouse_yaml(&ctx, transforms, "nested");
 
     let output = ctx
         .run_pipeline_raw(
-            &array_to_clickhouse_yaml(&ctx),
+            &yaml,
             base_opts().record_limit(1).env(
                 "STREAMLING__CLICKHOUSE_SINK__COLUMNS",
                 r#"[{"name":"items","coerce_to":"string"}]"#,
@@ -504,6 +530,28 @@ async fn array_of_wide_decimal_arb_to_clickhouse_with_coerce_to_string() {
         values,
         "['1.000000000000000001','-123456789012345678901234567890.500000000000000000']"
     );
+    let native = columns
+        .iter()
+        .find(|(name, _)| name == "native")
+        .expect("native column");
+    assert_eq!(
+        native.1,
+        "Array(Tuple(unsigned_one Nullable(UInt256), unsigned_max Nullable(UInt256), signed_min Nullable(Int256), signed_max Nullable(Int256)))"
+    );
+    for (name, expected) in [
+        ("unsigned_one", "1"),
+        ("unsigned_max", U256_MAX),
+        ("signed_min", I256_MIN),
+        ("signed_max", i256_max),
+    ] {
+        let value: String = clickhouse
+            .query_one(&format!(
+                "SELECT toString(arrayMap(t -> tupleElement(t, '{name}'), native)) FROM nested_items"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(value, format!("[{expected}]"), "{name}");
+    }
 }
 
 /// The same shape without the directive: a 100-digit fractional leaf fits no
@@ -533,7 +581,10 @@ async fn array_of_wide_decimal_arb_to_clickhouse_without_directive_is_rejected()
         .unwrap();
 
     let output = ctx
-        .run_pipeline_raw(&array_to_clickhouse_yaml(&ctx), base_opts().record_limit(1))
+        .run_pipeline_raw(
+            &array_to_clickhouse_yaml(&ctx, "{}", "src"),
+            base_opts().record_limit(1),
+        )
         .await
         .unwrap();
     assert!(!output.status.success(), "pipeline must be rejected");

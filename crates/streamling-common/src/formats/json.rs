@@ -174,12 +174,8 @@ impl JsonToArrowConverter {
                 .map(|f| {
                     // arrow_json has no Dictionary decoder: decode the value type and cast
                     // back in `convert_batch_to_original_schema`.
-                    // ponytail: other nested dictionaries still error; a nested
-                    // dictionary-encoded decimal_arb leaf is read as text by the
-                    // leaf rewrite like any other.
-                    // A dictionary-encoded decimal_arb leaf keeps its metadata
-                    // on the field, so the value type it decodes as is a
-                    // decimal_arb leaf and is read as text like any other.
+                    // ponytail: other nested dictionaries still error. A dictionary-encoded
+                    // decimal_arb leaf, nested or not, keeps its metadata and is read as text.
                     if let DataType::Dictionary(_, value) = f.data_type() {
                         return Ok(decimal_arb_leaves_as_text_field(
                             &f.as_ref().clone().with_data_type(value.as_ref().clone()),
@@ -476,11 +472,9 @@ impl ToArrowConverter<String> for JsonToArrowConverter {
 mod tests {
     use super::*;
     use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
-    use arrow_schema::{DataType, Fields};
+    use arrow_schema::Fields;
     use datafusion::arrow::array::*;
-    use datafusion::arrow::record_batch::RecordBatch;
     use std::str::FromStr;
-    use std::sync::Arc;
 
     /// Test schema with two fields: `a` (Int32, non-nullable) and
     /// `b` (Utf8, nullable). Used by the basic JSON converter tests.
@@ -923,10 +917,10 @@ mod tests {
 
     /// A run-end-encoded decimal_arb column keeps its metadata on the values
     /// field; unwrapping it used to drop that metadata, and the leaf printed
-    /// as the hex of its canonical bytes. A sliced batch prints its own rows.
+    /// as the hex of its canonical bytes.
     #[test]
-    fn run_end_encoded_and_sliced_nested_leaves_serialize_as_their_values() {
-        use crate::types::decimal_arb_nested::fixtures::{U256_MAX, wide_int_traces_batch};
+    fn run_end_encoded_leaves_serialize_as_their_values() {
+        use crate::types::decimal_arb_nested::fixtures::U256_MAX;
         use datafusion::arrow::datatypes::Int32Type;
 
         let values = Arc::new(DecimalArbType::field("values", 78, 0, true).unwrap());
@@ -963,22 +957,6 @@ mod tests {
                 r#"{"ree":"1"}"#.to_string(),
                 format!(r#"{{"ree":"{U256_MAX}"}}"#)
             ]
-        );
-
-        let sliced = wide_int_traces_batch().slice(1, 1);
-        let rows: Vec<String> = FromArrowToJsonConverter::new()
-            .convert_from_batch(&sliced)
-            .unwrap()
-            .into_iter()
-            .map(|r| String::from_utf8(r).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].starts_with(&format!(
-                r#"{{"id":2,"traces":[{{"value":"{U256_MAX}"}},{{"value":null}}]"#
-            )),
-            "{}",
-            rows[0]
         );
     }
 

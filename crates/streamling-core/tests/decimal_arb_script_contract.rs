@@ -8,7 +8,7 @@ use datafusion::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 use streamling_common::{
-    formats::avro::{serialize, to_avro},
+    formats::avro::{serialize, try_to_avro},
     types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType},
 };
 use streamling_core::operators::{planner::StreamlingQueryPlanner, wasm_runner::WasmRunnerNode};
@@ -74,8 +74,11 @@ fn assert_avro_decimal_value(output: &RecordBatch, text: &str) {
     let mut expected_columns = output.columns().to_vec();
     expected_columns[output.schema().index_of("amount").unwrap()] = Arc::new(raw);
     let expected = RecordBatch::try_new(output.schema(), expected_columns).unwrap();
-    let schema = to_avro("Test", output.schema().fields());
-    assert_eq!(serialize(&schema, output), serialize(&schema, &expected));
+    let schema = try_to_avro("Test", output.schema().fields()).unwrap();
+    assert_eq!(
+        serialize(&schema, output).unwrap(),
+        serialize(&schema, &expected).unwrap()
+    );
 }
 #[tokio::test]
 async fn wasm_string_100_roundtrips_to_avro() {

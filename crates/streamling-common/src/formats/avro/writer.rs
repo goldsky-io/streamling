@@ -17,7 +17,7 @@ use num_bigint::{BigInt, Sign};
 use regex::Regex;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 trait SerializeTarget {
@@ -47,15 +47,8 @@ impl SerializeTarget for Vec<Value> {
     }
 }
 
-/// The record names already taken in the schema being built.
-///
-/// Avro needs every named type in a schema to have its own full name, and the
-/// names below are derived from field paths. A list's item record used to be
-/// named after the literal `item` prefix alone (`item_item`), so a second
-/// list of structs anywhere in the schema redefined that name, and encoding
-/// any record of it failed. The first record keeps the name it always had —
-/// a schema that never collided is unchanged, so a subject registered from it
-/// still matches — and a later one takes its path-qualified name instead.
+/// The record names already taken in the schema being built: Avro needs
+/// every named type in a schema to have its own full name.
 #[derive(Default)]
 struct RecordNames(HashSet<String>);
 
@@ -85,15 +78,6 @@ impl RecordNames {
     }
 }
 
-/// The name a field's nested record takes: `preferred` is the name it has
-/// always had, `qualified` one unique to its path, used on a collision.
-struct RecordPath<'a> {
-    preferred: &'a str,
-    qualified: &'a str,
-    /// Inherited by an unqualified name; an explicit fullname overrides it.
-    namespace: Option<&'a str>,
-}
-
 /// Build the Avro record-schema JSON for a struct's `fields`, preserving nested
 /// `logicalType` attributes (decimal, date, timestamp, …).
 ///
@@ -103,19 +87,23 @@ struct RecordPath<'a> {
 /// (the F7 cause — the value encoder then emits `Decimal` against a `Bytes`
 /// schema and fails).
 ///
-/// `column` is the path of the struct this record stands for, in the form
-/// error messages use (see [`field_to_avro`]); empty for the root record.
+/// The record is named `preferred`, or `qualified` on a collision (see
+/// [`RecordNames::claim`]). `column` is the path of the struct this record
+/// stands for, in the form error messages use (see [`field_to_avro`]); empty
+/// for the root record.
 fn record_schema_json(
-    path: RecordPath<'_>,
+    preferred: &str,
+    qualified: &str,
+    namespace: Option<&str>,
     column: &str,
     fields: &Fields,
     names: &mut RecordNames,
 ) -> Result<serde_json::value::Value, String> {
-    let name = names.claim(path.preferred, path.qualified, path.namespace);
+    let name = names.claim(preferred, qualified, namespace);
     let namespace = name
         .rsplit_once('.')
         .map(|(namespace, _)| namespace)
-        .or(path.namespace);
+        .or(namespace);
     let avro_fields = fields
         .iter()
         .map(|f| {
@@ -137,30 +125,15 @@ fn record_schema_json(
 /// Computes an avro schema from an arrow schema, or explains which column
 /// has no Avro encoding.
 pub fn try_to_avro(name: &str, fields: &Fields) -> crate::error::Result<Schema> {
-    let json = record_schema_json(
-        RecordPath {
-            preferred: name,
-            qualified: name,
-            namespace: None,
-        },
-        "",
-        fields,
-        &mut RecordNames::default(),
-    )
-    .map_err(|e| crate::streamling_user_err!("cannot encode as Avro: {}", e))?;
+    let json = record_schema_json(name, name, None, "", fields, &mut RecordNames::default())
+        .map_err(|e| crate::streamling_user_err!("cannot encode as Avro: {}", e))?;
     Schema::parse_str(&json.to_string())
         .map_err(|e| crate::streamling_err!("invalid generated Avro schema: {}", e))
 }
 
-/// Computes an avro schema from an arrow schema. Panics on a column with no
-/// Avro encoding; [`try_to_avro`] reports it instead.
-pub fn to_avro(name: &str, fields: &Fields) -> Schema {
-    try_to_avro(name, fields).unwrap_or_else(|e| panic!("{e}"))
-}
-
 /// `prefix` / `qualified_prefix`: the names of the record (or list) the field
-/// sits in — the first as it has always been formed, the second unique to
-/// the field's path (see [`RecordNames`]).
+/// sits in — the first as it is preferred, the second unique to the field's
+/// path (see [`RecordNames`]).
 ///
 /// `column` names the field in errors, from the top-level column down: a
 /// struct child as `col.child`, a list's items as `col[]`, a map's values as
@@ -197,11 +170,9 @@ fn field_to_avro(
         })
     } else {
         arrow_to_avro(
-            RecordPath {
-                preferred: &next_name,
-                qualified: &qualified_next_name,
-                namespace,
-            },
+            &next_name,
+            &qualified_next_name,
+            namespace,
             column,
             field,
             names,
@@ -221,7 +192,9 @@ fn field_to_avro(
 }
 
 fn arrow_to_avro(
-    path: RecordPath<'_>,
+    preferred: &str,
+    qualified: &str,
+    namespace: Option<&str>,
     column: &str,
     field: &Field,
     names: &mut RecordNames,
@@ -242,12 +215,8 @@ fn arrow_to_avro(
         DataType::Float16 | DataType::Float32 => "float",
         DataType::Float64 => "double",
         DataType::Timestamp(t, _) => {
-            // Every timestamp is written as an offset from the epoch
-            // (`Value::TimestampMicros` / `TimestampMillis` in
-            // `serialize_column`), which is Avro's `timestamp-*`: an instant.
-            // A column with a time zone used to be declared
-            // `local-timestamp-*`, a wall-clock time apache-avro refuses to
-            // pair with an instant value, so no record holding one encoded.
+            // Every timestamp is written as an offset from the epoch, which
+            // is Avro's `timestamp-*` (an instant), time zone or not.
             let logical = match t {
                 TimeUnit::Microsecond | TimeUnit::Nanosecond => "timestamp-micros",
                 TimeUnit::Millisecond | TimeUnit::Second => "timestamp-millis",
@@ -270,11 +239,11 @@ fn arrow_to_avro(
         DataType::Binary | DataType::FixedSizeBinary(_) | DataType::LargeBinary => "bytes",
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string",
         DataType::List(t) | DataType::FixedSizeList(t, _) | DataType::LargeList(t) => {
-            // The item keeps the `item` prefix its record has always been
-            // named with; on a collision it takes the list's own path.
+            // The item record prefers the `item` prefix; on a collision it
+            // takes the list's own path.
             return Ok(json!({
                 "type": "array",
-                "items": field_to_avro("item", path.qualified, path.namespace, &format!("{column}[]"), t, names)?,
+                "items": field_to_avro("item", qualified, namespace, &format!("{column}[]"), t, names)?,
             }));
         }
         DataType::Map(entries, _) => {
@@ -305,9 +274,9 @@ fn arrow_to_avro(
             return Ok(json!({
                 "type": "map",
                 "values": field_to_avro(
-                    path.qualified,
-                    path.qualified,
-                    path.namespace,
+                    qualified,
+                    qualified,
+                    namespace,
                     &format!("{column}{{}}"),
                     value,
                     names
@@ -318,20 +287,13 @@ fn arrow_to_avro(
             // Build the nested record JSON directly — NOT via canonical_form,
             // which strips nested logicalType (decimal/date/timestamp) and breaks
             // nested decimal encoding (F7).
-            return record_schema_json(path, column, fields, names);
+            return record_schema_json(preferred, qualified, namespace, column, fields, names);
         }
         DataType::Union(_, _) => return unsupported("a union"),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
-        | DataType::Decimal128(precision, scale) => {
-            return Ok(json!({
-                "type": "bytes",
-                "logicalType": "decimal",
-                "scale": scale,
-                "precision": precision,
-            }));
-        }
-        DataType::Decimal256(precision, scale) => {
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => {
             return Ok(json!({
                 "type": "bytes",
                 "logicalType": "decimal",
@@ -355,8 +317,7 @@ fn arrow_to_avro(
 fn get_field_schema<'a>(schema: &'a Schema, name: &str, nullable: bool) -> &'a Schema {
     // For lists the name is empty, but the schema argument is already the item
     // schema — a `["null", item]` union when the item is nullable, which is
-    // unwrapped below like a nullable record field. Returning the union as-is
-    // panicked on every list of nullable structs (or lists), whatever they held.
+    // unwrapped below like a nullable record field.
     let schema = if name.is_empty() {
         schema
     } else {
@@ -392,10 +353,8 @@ pub fn to_micros(time: SystemTime) -> u64 {
 }
 
 fn sanitize_field(s: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_.]").unwrap());
-
-    re.replace_all(s, "_").replace('.', "__")
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^a-zA-Z0-9_.]").unwrap());
+    RE.replace_all(s, "_").replace('.', "__")
 }
 
 /// `s` as a valid Avro full name: dot-separated segments, each starting with
@@ -410,13 +369,11 @@ fn sanitize_field(s: &str) -> String {
 /// starts with a digit gets a leading `_`. Dots are kept: a dotted topic
 /// names a namespace.
 fn record_name(s: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[^A-Za-z0-9_]").unwrap());
     s.split('.')
         .map(|segment| {
-            let segment = re.replace_all(segment, "_");
+            let segment = segment.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_");
             match segment.as_bytes().first() {
-                Some(b) if b.is_ascii_alphabetic() || *b == b'_' => segment.into_owned(),
+                Some(b) if b.is_ascii_alphabetic() || *b == b'_' => segment,
                 _ => format!("_{segment}"),
             }
         })
@@ -456,26 +413,23 @@ fn serialize_column<T: SerializeTarget>(
     values: &mut T,
     name: &str,
     column: &ArrayRef,
-    nullable: bool,
-    field: Option<&Field>,
-) {
+    field: &Field,
+    column_path: &str,
+) -> crate::error::Result<()> {
     // A list view or a dictionary-/run-end-encoded column is written as its
     // plain layout, which is what `field_to_avro` declared for it.
-    if let Some(f) = field
-        && let Some((plain, plain_column)) = to_plain_layout(f, column)
-            .unwrap_or_else(|e| panic!("cannot unwrap column '{}': {e}", f.name()))
+    if let Some((plain, plain_column)) = to_plain_layout(field, column)
+        .map_err(|e| crate::streamling_err!("cannot unwrap column '{column_path}': {e}"))?
     {
-        let nullable = plain.is_nullable();
-        return serialize_column(schema, values, name, &plain_column, nullable, Some(&plain));
+        return serialize_column(schema, values, name, &plain_column, &plain, column_path);
     }
+    let nullable = field.is_nullable();
 
     // decimal_arb columns store canonical bytes in a LargeBinary
     // array but must surface as Avro's `decimal` logical type. We
     // detect via the field's extension metadata before falling through
     // to the generic LargeBinary → Bytes mapping below.
-    if let Some(f) = field
-        && crate::types::decimal_arb::DecimalArbType::precision_scale_from_field(f).is_some()
-    {
+    if crate::types::decimal_arb::DecimalArbType::precision_scale_from_field(field).is_some() {
         let array = column.as_binary::<i64>();
         for (i, v) in array.iter().enumerate() {
             if !values.is_some(i) {
@@ -502,7 +456,7 @@ fn serialize_column<T: SerializeTarget>(
                 );
             }
         }
-        return;
+        return Ok(());
     }
 
     macro_rules! write_arrow_value {
@@ -671,6 +625,7 @@ fn serialize_column<T: SerializeTarget>(
                 DataType::LargeList(_) => Box::new(column.as_list::<i64>().iter()),
                 _ => Box::new(column.as_fixed_size_list().iter()),
             };
+            let item_path = format!("{column_path}[]");
             for (i, row) in rows.enumerate() {
                 // A slot under a null record holds nothing to write — and may
                 // hold a null the record's validity masks, even in a
@@ -678,18 +633,13 @@ fn serialize_column<T: SerializeTarget>(
                 if !values.is_some(i) {
                     continue;
                 }
-                let v = row.map(|items| {
+                let v = if let Some(items) = row {
                     let mut v = Vec::with_capacity(items.len());
-                    serialize_column(
-                        &item_schema.items,
-                        &mut v,
-                        "",
-                        &items,
-                        item.is_nullable(),
-                        Some(item.as_ref()),
-                    );
-                    v
-                });
+                    serialize_column(&item_schema.items, &mut v, "", &items, item, &item_path)?;
+                    Some(v)
+                } else {
+                    None
+                };
 
                 if nullable {
                     values.add(
@@ -723,15 +673,20 @@ fn serialize_column<T: SerializeTarget>(
             let value_field = &kv[1];
 
             let map = column.as_map();
+            let value_path = format!("{column_path}{{}}");
             for i in 0..map.len() {
                 if !values.is_some(i) {
                     continue;
                 }
-                let v = map.is_valid(i).then(|| {
+                let v = if map.is_valid(i) {
                     let entries = map.value(i);
                     // `arrow_to_avro` admits string keys only.
                     let keys = datafusion::arrow::compute::cast(entries.column(0), &DataType::Utf8)
-                        .expect("string map keys cast to Utf8");
+                        .map_err(|e| {
+                            crate::streamling_err!(
+                                "cannot cast map keys for column '{column_path}': {e}"
+                            )
+                        })?;
                     let keys = keys.as_string::<i32>();
                     let mut items = Vec::with_capacity(entries.len());
                     serialize_column(
@@ -739,20 +694,24 @@ fn serialize_column<T: SerializeTarget>(
                         &mut items,
                         "",
                         entries.column(1),
-                        value_field.is_nullable(),
-                        Some(value_field.as_ref()),
-                    );
-                    keys.iter()
-                        .map(|k| {
-                            // `field_to_avro` admits a non-nullable key field
-                            // only, and `StructArray` validation rejects nulls
-                            // in one.
-                            k.expect("non-nullable map key field holds a null")
-                                .to_string()
-                        })
-                        .zip(items)
-                        .collect::<HashMap<String, Value>>()
-                });
+                        value_field,
+                        &value_path,
+                    )?;
+                    let mut v = HashMap::with_capacity(entries.len());
+                    for (key, item) in keys.iter().zip(items) {
+                        // `field_to_avro` admits a non-nullable key field
+                        // only, and `StructArray` validation rejects nulls
+                        // in one.
+                        v.insert(
+                            key.expect("non-nullable map key field holds a null")
+                                .to_string(),
+                            item,
+                        );
+                    }
+                    Some(v)
+                } else {
+                    None
+                };
 
                 if nullable {
                     values.add(
@@ -778,100 +737,71 @@ fn serialize_column<T: SerializeTarget>(
             // No record is built for a slot under a null parent record (or a
             // null struct), so the children skip it: a non-nullable child may
             // hold a null there that the parent's validity masks.
-            if nullable {
-                let mut struct_values: Vec<_> = if let Some(nulls) = column.nulls() {
-                    nulls
-                        .iter()
-                        .enumerate()
-                        .map(|(i, null)| {
-                            (null && values.is_some(i)).then(|| Record::new(schema).unwrap())
-                        })
-                        .collect()
+            let mut struct_values = Vec::with_capacity(column.len());
+            for i in 0..column.len() {
+                let record = if (!nullable || column.is_valid(i)) && values.is_some(i) {
+                    Some(Record::new(schema).ok_or_else(|| {
+                        crate::streamling_err!(
+                            "invalid Avro record schema for column '{column_path}'"
+                        )
+                    })?)
                 } else {
-                    (0..column.len())
-                        .map(|i| values.is_some(i).then(|| Record::new(schema).unwrap()))
-                        .collect()
+                    None
                 };
-
-                for (field, column) in fields.iter().zip(column.as_struct().columns()) {
-                    let name = sanitize_field(field.name());
-
-                    serialize_column(
-                        schema,
-                        &mut struct_values,
-                        &name,
-                        column,
-                        field.is_nullable(),
-                        Some(field.as_ref()),
-                    );
-                }
-
-                for (i, struct_v) in struct_values.into_iter().enumerate() {
+                struct_values.push(record);
+            }
+            for (field, column) in fields.iter().zip(column.as_struct().columns()) {
+                let name = sanitize_field(field.name());
+                serialize_column(
+                    schema,
+                    &mut struct_values,
+                    &name,
+                    column,
+                    field,
+                    &format!("{column_path}.{}", field.name()),
+                )?;
+            }
+            for (i, struct_v) in struct_values.into_iter().enumerate() {
+                if nullable {
                     values.add(
                         i,
                         name,
                         Value::Union(
                             struct_v.is_some() as u32,
-                            Box::new(if let Some(struct_v) = struct_v {
-                                struct_v.into()
-                            } else {
-                                Value::Null
-                            }),
+                            Box::new(struct_v.map_or(Value::Null, Into::into)),
                         ),
                     );
-                }
-            } else {
-                let mut struct_values = (0..column.len())
-                    .map(|i| values.is_some(i).then(|| Record::new(schema).unwrap()))
-                    .collect::<Vec<_>>();
-
-                for (field, column) in fields.iter().zip(column.as_struct().columns()) {
-                    let name = sanitize_field(field.name());
-
-                    serialize_column(
-                        schema,
-                        &mut struct_values,
-                        &name,
-                        column,
-                        field.is_nullable(),
-                        Some(field.as_ref()),
-                    );
-                }
-
-                for (i, struct_v) in struct_values.into_iter().enumerate() {
+                } else if let Some(struct_v) = struct_v {
                     // `None` only under a null parent record, where `add` is a no-op.
-                    if let Some(struct_v) = struct_v {
-                        values.add(i, name, Into::<Value>::into(struct_v));
-                    }
+                    values.add(i, name, struct_v.into());
                 }
             }
         }
 
         _ => unimplemented!("unsupported data type: {}", column.data_type()),
     };
+    Ok(())
 }
 
-pub fn serialize(schema: &Schema, batch: &RecordBatch) -> Vec<Value> {
-    let mut values = (0..batch.num_rows())
-        .map(|_| Some(Record::new(schema).unwrap()))
-        .collect::<Vec<_>>();
+/// Serialize a batch as Avro records, returning conversion errors with the
+/// offending column path when an encoded layout or map key cannot be cast.
+pub fn serialize(schema: &Schema, batch: &RecordBatch) -> crate::error::Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(batch.num_rows());
+    for _ in 0..batch.num_rows() {
+        values.push(Some(Record::new(schema).ok_or_else(|| {
+            crate::streamling_err!("invalid Avro record schema")
+        })?));
+    }
 
     for i in 0..batch.num_columns() {
         let column = batch.column(i);
         let field = &batch.schema().fields[i];
 
         let name = sanitize_field(field.name());
-        serialize_column(
-            schema,
-            &mut values,
-            &name,
-            column,
-            field.is_nullable(),
-            Some(field.as_ref()),
-        );
+        serialize_column(schema, &mut values, &name, column, field, field.name())?;
     }
 
-    values.into_iter().flatten().map(|r| r.into()).collect()
+    Ok(values.into_iter().flatten().map(|r| r.into()).collect())
 }
 
 #[cfg(test)]
@@ -883,6 +813,54 @@ mod tests {
         Int64Builder, ListBuilder, StringBuilder, StructBuilder,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn serialize_reports_nested_dictionary_union_cast_error() {
+        use arrow_schema::UnionFields;
+        use datafusion::arrow::array::{
+            DictionaryArray, Int8Array, Int32Array, StructArray, UnionArray,
+        };
+
+        // This is a valid dictionary, but Arrow rejects casting to a Union
+        // before dispatching to its dictionary-unpacking kernel.
+        let union = UnionArray::try_new(
+            UnionFields::from_fields(vec![Field::new("number", DataType::Int32, false)]),
+            vec![0_i8].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![7]))],
+        )
+        .unwrap();
+        let dictionary = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![0]), Arc::new(union))
+                .unwrap(),
+        ) as ArrayRef;
+        let choice = Arc::new(Field::new("choice", dictionary.data_type().clone(), false));
+        let payload = StructArray::try_new(vec![choice].into(), vec![dictionary], None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            payload.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payload)]).unwrap();
+        // Schema generation deliberately refuses Arrow unions; a manual Avro
+        // schema lets this test exercise the public serialization error boundary.
+        let avro_schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"Root","fields":[
+                {"name":"payload","type":{"type":"record","name":"Payload","fields":[
+                    {"name":"choice","type":["null","int"]}
+                ]}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let error = serialize(&avro_schema, &batch).unwrap_err().to_string();
+        assert!(
+            error.contains("cannot unwrap column 'payload.choice'"),
+            "{error}"
+        );
+        assert!(error.contains("Casting from Dictionary"), "{error}");
+        assert!(error.contains("not supported"), "{error}");
+    }
 
     /// Zero's canonical payload is a lone sign byte; on the Avro wire it must
     /// be the one-byte `0x00`, never an empty payload (Java's
@@ -936,7 +914,7 @@ mod tests {
             Field::new("inner", DataType::Struct(inner.into()), false),
         ]);
 
-        let avro = to_avro("R", &arrow_schema.fields);
+        let avro = try_to_avro("R", &arrow_schema.fields).unwrap();
         let json = serde_json::to_string(&avro).unwrap();
 
         // Both nested decimals must surface their decimal logicalType, not bytes.
@@ -1066,7 +1044,7 @@ mod tests {
         numbers.append_null();
         numbers.append_value([Some(4), Some(5)]);
 
-        let avro_schema = to_avro("User", &arrow_schema.fields);
+        let avro_schema = try_to_avro("User", &arrow_schema.fields).unwrap();
 
         let batch = RecordBatch::try_new(
             arrow_schema,
@@ -1086,7 +1064,7 @@ mod tests {
         )
         .unwrap();
 
-        let result: Vec<apache_avro::types::Value> = serialize(&avro_schema, &batch);
+        let result: Vec<apache_avro::types::Value> = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1214,8 +1192,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(builder.finish())]).unwrap();
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1243,8 +1221,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(builder.finish())]).unwrap();
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         // Seconds are converted to millis for Avro's timestamp-millis logical type
         assert_eq!(
@@ -1276,8 +1254,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(builder.finish())]).unwrap();
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1320,8 +1298,8 @@ mod tests {
         )
         .unwrap();
 
-        let avro_schema = to_avro("StellarLedger", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("StellarLedger", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1429,12 +1407,12 @@ mod tests {
         let outer_array: ArrayRef = Arc::new(outer_list_builder.finish());
         let arrow_schema = Arc::new(Schema::new(root_fields));
 
-        let avro_schema = to_avro("Outer", &arrow_schema.fields);
+        let avro_schema = try_to_avro("Outer", &arrow_schema.fields).unwrap();
         println!("Avro schema: {}", avro_schema.canonical_form());
 
         let batch = RecordBatch::try_new(arrow_schema, vec![outer_array]).unwrap();
 
-        let result: Vec<apache_avro::types::Value> = serialize(&avro_schema, &batch);
+        let result: Vec<apache_avro::types::Value> = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1506,8 +1484,8 @@ mod tests {
         let array = FixedSizeBinaryArray::try_from_iter(vec![row0, row1].into_iter()).unwrap();
 
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
-        let avro_schema = to_avro("U256Record", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("U256Record", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1536,8 +1514,8 @@ mod tests {
         .unwrap();
 
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
-        let avro_schema = to_avro("MaybeHash", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("MaybeHash", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1570,8 +1548,8 @@ mod tests {
             LargeBinaryArray::from(vec![Some(b"hello".as_ref()), None, Some(b"world".as_ref())]);
 
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
-        let avro_schema = to_avro("Payload", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Payload", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1608,8 +1586,8 @@ mod tests {
         let array = LargeStringArray::from(vec!["0xdeadbeef", ""]);
 
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
-        let avro_schema = to_avro("LogData", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("LogData", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1634,8 +1612,8 @@ mod tests {
         let array = LargeStringArray::from(vec![Some("0x00"), None, Some("0xffff")]);
 
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
-        let avro_schema = to_avro("TxInput", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("TxInput", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         assert_eq!(
             result,
@@ -1657,23 +1635,12 @@ mod tests {
 
     #[test]
     fn decimal_arb_field_emits_avro_decimal_logical_type() {
-        // A `decimal_arb(100, 18)` field on the Arrow side must surface as
-        // an Avro `bytes` logical-type `decimal` with the declared
-        // precision and scale. The previous behavior (LargeBinary → plain
-        // "bytes") would have lost numeric semantics on the consumer side.
+        // decimal_arb(100, 18) emits a decimal logical type with its declared scale.
         let field =
             crate::types::decimal_arb::DecimalArbType::field("amount", 100, 18, false).unwrap();
-        let avro_field = field_to_avro(
-            "payload",
-            "payload",
-            None,
-            "amount",
-            &field,
-            &mut RecordNames::default(),
-        )
-        .unwrap();
-        // The schema is: { "name": "amount", "type": { ... decimal logical ... } }
-        let type_field = avro_field.get("type").unwrap();
+        let schema = try_to_avro("payload", &vec![field].into()).unwrap();
+        let json = serde_json::to_value(schema).unwrap();
+        let type_field = &json["fields"][0]["type"];
         assert_eq!(type_field.get("type").unwrap(), "bytes");
         assert_eq!(type_field.get("logicalType").unwrap(), "decimal");
         assert_eq!(type_field.get("precision").unwrap(), 100);
@@ -1682,26 +1649,14 @@ mod tests {
 
     #[test]
     fn decimal_arb_nullable_field_wraps_in_union() {
-        // Nullable Avro fields wrap the schema in a union with "null".
-        // The decimal logical type → outer union gets the inner schema
-        // under the second variant (whose 'type' contains the bytes/
-        // logicalType/precision/scale shape directly, NOT under a "type"
-        // key).
+        // Nullable Avro fields wrap the decimal schema in a union with "null".
         let field =
             crate::types::decimal_arb::DecimalArbType::field("amount", 80, 30, true).unwrap();
-        let avro_field = field_to_avro(
-            "payload",
-            "payload",
-            None,
-            "amount",
-            &field,
-            &mut RecordNames::default(),
-        )
-        .unwrap();
-        let nested_type = avro_field.get("type").unwrap();
-        // {"type": ["null", { ... decimal ... }]}
-        let outer = nested_type.get("type").unwrap();
-        let arr = outer.as_array().expect("nullable type is union array");
+        let schema = try_to_avro("payload", &vec![field].into()).unwrap();
+        let json = serde_json::to_value(schema).unwrap();
+        let arr = json["fields"][0]["type"]
+            .as_array()
+            .expect("nullable type is union array");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0], "null");
         assert_eq!(arr[1].get("logicalType").unwrap(), "decimal");
@@ -1711,24 +1666,11 @@ mod tests {
 
     #[test]
     fn plain_large_binary_field_still_maps_to_bytes() {
-        // Regression guard: LargeBinary without decimal_arb metadata stays
-        // as plain Avro `bytes` (no logical type promotion). The shape is
-        // {"type": "bytes"} (the avro schema for primitive types is itself
-        // wrapped in an object by arrow_to_avro).
+        // LargeBinary without decimal_arb metadata stays plain Avro bytes.
         let field = Field::new("blob", DataType::LargeBinary, false);
-        let avro_field = field_to_avro(
-            "payload",
-            "payload",
-            None,
-            "blob",
-            &field,
-            &mut RecordNames::default(),
-        )
-        .unwrap();
-        let nested_type = avro_field.get("type").unwrap();
-        // No logicalType key — stays as plain bytes.
-        assert!(nested_type.get("logicalType").is_none());
-        assert_eq!(nested_type.get("type").unwrap(), "bytes");
+        let schema = try_to_avro("payload", &vec![field].into()).unwrap();
+        let json = serde_json::to_value(schema).unwrap();
+        assert_eq!(json["fields"][0]["type"], "bytes");
     }
 
     // ------- decimal_arb Avro value serialization -------
@@ -1785,8 +1727,8 @@ mod tests {
         // precision/scale chosen to exercise the > Decimal256 (76) regime.
         let (arrow_schema, batch) = build_decimal_arb_batch(80, 4, false, &[Some("123.4500")]);
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         let Value::Record(fields) = &result[0] else {
             panic!("expected Record, got {:?}", result[0]);
@@ -1808,8 +1750,8 @@ mod tests {
     fn decimal_arb_round_trips_negative_value() {
         let (arrow_schema, batch) = build_decimal_arb_batch(80, 6, false, &[Some("-0.000123")]);
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         let Value::Record(fields) = &result[0] else {
             panic!("expected Record");
@@ -1830,8 +1772,8 @@ mod tests {
         let (arrow_schema, batch) =
             build_decimal_arb_batch(80, 4, true, &[Some("1.0000"), None, Some("-2.5000")]);
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         // Row 0: positive
         let Value::Record(fields0) = &result[0] else {
@@ -1874,8 +1816,8 @@ mod tests {
         let big = "1".to_string() + &"0".repeat(99); // 1e99 (100-digit integer)
         let (arrow_schema, batch) = build_decimal_arb_batch(120, 0, false, &[Some(&big)]);
 
-        let avro_schema = to_avro("Test", &arrow_schema.fields);
-        let result = serialize(&avro_schema, &batch);
+        let avro_schema = try_to_avro("Test", &arrow_schema.fields).unwrap();
+        let result = serialize(&avro_schema, &batch).unwrap();
 
         let Value::Record(fields) = &result[0] else {
             panic!("expected Record");
@@ -1887,74 +1829,6 @@ mod tests {
         assert_eq!(canonical, expected);
     }
 
-    /// A list whose items are nullable structs: the item schema is a
-    /// `["null", record]` union, and a null item stays null.
-    #[test]
-    fn list_of_nullable_structs_round_trips() {
-        use datafusion::arrow::array::{Int64Array, ListArray, StructArray};
-        use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
-
-        let a = Arc::new(Field::new("a", DataType::Int64, true));
-        let item = Arc::new(Field::new(
-            "item",
-            DataType::Struct(vec![Arc::clone(&a)].into()),
-            true,
-        ));
-        let structs = StructArray::try_new(
-            vec![a].into(),
-            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))],
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-        .unwrap();
-        let list = ListArray::try_new(
-            Arc::clone(&item),
-            OffsetBuffer::new(vec![0, 2, 3].into()),
-            Arc::new(structs),
-            None,
-        )
-        .unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "items",
-            DataType::List(item),
-            false,
-        )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list)]).unwrap();
-
-        let avro_schema = to_avro("R", &schema.fields);
-        let decoded: Vec<Value> = serialize(&avro_schema, &batch)
-            .into_iter()
-            .map(|value| {
-                let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
-                apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap()
-            })
-            .collect();
-        let item = |a: Option<i64>| {
-            Value::Union(
-                1,
-                Box::new(Value::Record(vec![(
-                    "a".to_string(),
-                    match a {
-                        Some(a) => Value::Union(1, Box::new(Value::Long(a))),
-                        None => Value::Union(0, Box::new(Value::Null)),
-                    },
-                )])),
-            )
-        };
-        assert_eq!(
-            decoded,
-            vec![
-                Value::Record(vec![(
-                    "items".to_string(),
-                    Value::Array(vec![item(Some(1)), Value::Union(0, Box::new(Value::Null))]),
-                )]),
-                Value::Record(vec![(
-                    "items".to_string(),
-                    Value::Array(vec![item(Some(3))]),
-                )]),
-            ]
-        );
-    }
-
     /// 256-bit integer leaves nested in `List<Struct<..>>` / `List<..>` (the
     /// plugin call-trace shape) are encoded as Avro decimals carrying their
     /// exact values, and the datum validates against the generated schema.
@@ -1964,30 +1838,7 @@ mod tests {
             I256_MAX, I256_MIN, U256_MAX, wide_int_traces_batch,
         };
 
-        /// Every decimal (or null leaf) below `v`, in document order.
-        fn decimals(v: &Value, out: &mut Vec<Option<String>>) {
-            match v {
-                Value::Decimal(d) => {
-                    let bytes = <Vec<u8>>::try_from(d).expect("decimal -> bytes");
-                    out.push(Some(BigInt::from_signed_bytes_be(&bytes).to_string()));
-                }
-                Value::Null => out.push(None),
-                Value::Union(_, inner) => decimals(inner, out),
-                Value::Array(items) => items.iter().for_each(|i| decimals(i, out)),
-                Value::Record(fields) => fields.iter().for_each(|(_, f)| decimals(f, out)),
-                _ => {}
-            }
-        }
-
-        let batch = wide_int_traces_batch();
-        let avro_schema = to_avro("R", &batch.schema().fields);
-        let mut seen = Vec::new();
-        for value in serialize(&avro_schema, &batch) {
-            let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
-            let decoded =
-                apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
-            decimals(&decoded, &mut seen);
-        }
+        let (_, seen) = round_trip_decimals(&wide_int_traces_batch());
         let expected: Vec<Option<String>> = [
             Some("1"),
             Some("1000000000000000000"),
@@ -2031,7 +1882,7 @@ mod tests {
     fn round_trip_decimals(batch: &RecordBatch) -> (apache_avro::Schema, Vec<Option<String>>) {
         let avro_schema = try_to_avro("R", &batch.schema().fields).unwrap();
         let mut seen = Vec::new();
-        for value in serialize(&avro_schema, batch) {
+        for value in serialize(&avro_schema, batch).unwrap() {
             let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
             let decoded =
                 apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
@@ -2095,11 +1946,7 @@ mod tests {
         (item, Arc::new(list))
     }
 
-    /// Two `List<Struct<..>>` columns, plus a `List<Struct<..>>` nested in a
-    /// list item: every list-item record used to be named `item_item`, so
-    /// the schema defined that name more than once and no record encoded.
-    /// Each now gets its own name, and every 256-bit leaf decodes to its
-    /// exact value.
+    /// Nested lists of structs get distinct record names and preserve exact leaves.
     #[test]
     fn several_lists_of_structs_get_distinct_record_names_and_round_trip() {
         use crate::types::decimal_arb::NativeIntKind;
@@ -2193,7 +2040,7 @@ mod tests {
         let a = Arc::new(Field::new("a", DataType::Int64, true));
         let item = Arc::new(Field::new("item", DataType::Struct(vec![a].into()), true));
         let fields: Fields = vec![Field::new("items", DataType::List(item), false)].into();
-        let json = serde_json::to_value(to_avro("R", &fields)).unwrap();
+        let json = serde_json::to_value(try_to_avro("R", &fields).unwrap()).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
@@ -2307,7 +2154,7 @@ mod tests {
         // The list's unqualified `item_item` inherits namespace `a`, so it
         // clashes with the second struct's explicit name `a.item_item`.
         let avro_schema = try_to_avro("a.item", &batch.schema().fields).unwrap();
-        let value = serialize(&avro_schema, &batch).pop().unwrap();
+        let value = serialize(&avro_schema, &batch).unwrap().pop().unwrap();
         let encoded = apache_avro::to_avro_datum(&avro_schema, value.clone())
             .expect("record fullnames must be unique");
         let decoded =
@@ -2421,7 +2268,7 @@ mod tests {
         assert_eq!(seen, expected);
         // The dictionary column is written as its string values, nullable
         // since a dictionary's values may hold nulls its keys do not show.
-        let rows = serialize(&avro_schema, &batch);
+        let rows = serialize(&avro_schema, &batch).unwrap();
         let Value::Record(fields) = &rows[1] else {
             panic!("{:?}", rows[1])
         };
@@ -2434,12 +2281,12 @@ mod tests {
         );
     }
 
-    /// A column the writer has no Avro encoding for is reported, naming the
-    /// column, instead of panicking while the schema is built.
+    /// Unsupported columns are reported by their user-facing path, including
+    /// nested list, map and struct leaves.
     #[test]
     fn columns_without_an_avro_encoding_are_reported() {
         use datafusion::arrow::datatypes::{UnionFields, UnionMode};
-        let entry = Arc::new(Field::new(
+        let bad_entry = Arc::new(Field::new(
             "entries",
             DataType::Struct(
                 vec![
@@ -2450,10 +2297,49 @@ mod tests {
             ),
             false,
         ));
-        for (field, what) in [
+        let durations = Field::new(
+            "durations",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Duration(TimeUnit::Millisecond),
+                true,
+            ))),
+            true,
+        );
+        let entry = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Time64(TimeUnit::Microsecond), true),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let by_id = Field::new("by_id", DataType::Map(entry, false), true);
+        let s = Field::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new(
+                        "inner",
+                        DataType::Struct(
+                            vec![Field::new("when", DataType::Time32(TimeUnit::Second), true)]
+                                .into(),
+                        ),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        for (field, path) in [
             (
-                Field::new("m", DataType::Map(entry, false), true),
-                "non-string keys",
+                Field::new("m", DataType::Map(bad_entry, false), true),
+                "'m'",
             ),
             (
                 Field::new(
@@ -2465,19 +2351,21 @@ mod tests {
                     ),
                     true,
                 ),
-                "a union",
+                "'u'",
             ),
             (
                 Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
-                "a time",
+                "'t'",
             ),
+            (durations, "'durations[]'"),
+            (by_id, "'by_id{}'"),
+            (s, "'s.inner.when'"),
         ] {
-            let name = field.name().clone();
             let err = try_to_avro("R", &vec![field].into())
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains(&format!("'{name}'")), "{err}");
-            assert!(err.contains(what), "{err}");
+            assert!(err.contains(path), "{err}");
+            assert!(!err.contains("'item'") && !err.contains("'value'"), "{err}");
         }
     }
 
@@ -2490,23 +2378,16 @@ mod tests {
         use datafusion::arrow::array::{Int32Array, MapArray, StringArray, StructArray};
         use datafusion::arrow::buffer::OffsetBuffer;
 
-        let entries_with = |key_nullable: bool| {
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Field::new("key", DataType::Utf8, key_nullable),
-                        Field::new("value", DataType::Int32, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            ))
-        };
-        let entries_array = |key_nullable: bool| {
-            let DataType::Struct(kv) = entries_with(key_nullable).data_type().clone() else {
-                unreachable!()
-            };
+        let kv: Fields = vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("value", DataType::Int32, true),
+        ]
+        .into();
+        let entry = Arc::new(Field::new("entries", DataType::Struct(kv.clone()), false));
+        // Arrow builds the map with a nullable key field, null key and all.
+        let map = MapArray::try_new(
+            Arc::clone(&entry),
+            OffsetBuffer::new(vec![0, 2].into()),
             StructArray::try_new(
                 kv,
                 vec![
@@ -2515,14 +2396,7 @@ mod tests {
                 ],
                 None,
             )
-        };
-
-        // A nullable key field: Arrow builds the map, null key and all.
-        let entry = entries_with(true);
-        let map = MapArray::try_new(
-            Arc::clone(&entry),
-            OffsetBuffer::new(vec![0, 2].into()),
-            entries_array(true).unwrap(),
+            .unwrap(),
             None,
             false,
         )
@@ -2538,51 +2412,8 @@ mod tests {
             .to_string();
         assert!(err.contains("'m'"), "{err}");
         assert!(err.contains("key field is nullable"), "{err}");
-
-        // A non-nullable key field — what every map producer declares —
-        // cannot hold the null key in the first place, and still encodes.
-        assert!(entries_array(false).is_err());
-        let entry = entries_with(false);
-        let DataType::Struct(kv) = entry.data_type().clone() else {
-            unreachable!()
-        };
-        let map = MapArray::try_new(
-            Arc::clone(&entry),
-            OffsetBuffer::new(vec![0, 1].into()),
-            StructArray::try_new(
-                kv,
-                vec![
-                    Arc::new(StringArray::from(vec!["a"])),
-                    Arc::new(Int32Array::from(vec![1])),
-                ],
-                None,
-            )
-            .unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "m",
-            DataType::Map(entry, false),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(map)]).unwrap();
-        let avro_schema = try_to_avro("R", &batch.schema().fields).unwrap();
-        let rows = serialize(&avro_schema, &batch);
-        let Value::Record(fields) = &rows[0] else {
-            panic!("{:?}", rows[0])
-        };
-        assert_eq!(
-            fields[0].1,
-            Value::Union(
-                1,
-                Box::new(Value::Map(
-                    [("a".to_string(), Value::Union(1, Box::new(Value::Int(1))))].into()
-                ))
-            )
-        );
     }
+
     /// Record names come from the topic and from Arrow field names, which
     /// Avro's name grammar does not constrain; apache-avro panicked while
     /// parsing a schema whose record name broke it. Such names are made
@@ -2623,7 +2454,7 @@ mod tests {
         assert!(json.contains("evm_blocks"), "{json}");
         assert!(json.contains("v2_my_struct"), "{json}");
         assert!(!json.contains("my-struct"), "{json}");
-        for value in serialize(&avro_schema, &batch) {
+        for value in serialize(&avro_schema, &batch).unwrap() {
             let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
             let decoded =
                 apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
@@ -2643,68 +2474,7 @@ mod tests {
         }
     }
 
-    /// A type with no Avro encoding nested in a list, a map or a struct is
-    /// reported by the path of the user's column, not by the Arrow field
-    /// (`item`, `value`) that holds it.
-    #[test]
-    fn errors_for_nested_unencodable_types_name_the_column_path() {
-        let durations = Field::new(
-            "durations",
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Duration(TimeUnit::Millisecond),
-                true,
-            ))),
-            true,
-        );
-        let entry = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Time64(TimeUnit::Microsecond), true),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let by_id = Field::new("by_id", DataType::Map(entry, false), true);
-        let s = Field::new(
-            "s",
-            DataType::Struct(
-                vec![
-                    Field::new("id", DataType::Int64, false),
-                    Field::new(
-                        "inner",
-                        DataType::Struct(
-                            vec![Field::new("when", DataType::Time32(TimeUnit::Second), true)]
-                                .into(),
-                        ),
-                        true,
-                    ),
-                ]
-                .into(),
-            ),
-            true,
-        );
-        for (field, path, what) in [
-            (durations, "'durations[]'", "a duration"),
-            (by_id, "'by_id{}'", "a time"),
-            (s, "'s.inner.when'", "a time"),
-        ] {
-            let err = try_to_avro("R", &vec![field].into())
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(path), "{err}");
-            assert!(err.contains(what), "{err}");
-            assert!(!err.contains("'item'") && !err.contains("'value'"), "{err}");
-        }
-    }
-
-    /// A timestamp column with a time zone is an instant, written as an
-    /// epoch offset like every other timestamp; it is declared as Avro's
-    /// `timestamp-*`. Declared `local-timestamp-*`, as before, apache-avro
-    /// refused the value and no record holding one could be encoded.
+    /// Time-zone-aware timestamps are epoch offsets declared as Avro `timestamp-*`.
     #[test]
     fn timezone_aware_timestamps_encode_as_avro_instants() {
         use datafusion::arrow::array::{TimestampMicrosecondArray, TimestampMillisecondArray};
@@ -2747,7 +2517,7 @@ mod tests {
             "{json}"
         );
         assert!(!json.contains("local-timestamp"), "{json}");
-        for value in serialize(&avro_schema, &batch) {
+        for value in serialize(&avro_schema, &batch).unwrap() {
             let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
             let decoded =
                 apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
@@ -2790,7 +2560,7 @@ mod tests {
         let avro_schema = try_to_avro("R", &schema.fields).unwrap();
         let json = serde_json::to_string(&avro_schema).unwrap();
         assert!(json.contains(r#"["null","int"]"#), "{json}");
-        let rows = serialize(&avro_schema, &batch);
+        let rows = serialize(&avro_schema, &batch).unwrap();
         let r = |i: usize| match &rows[i] {
             Value::Record(fields) => fields[0].1.clone(),
             other => panic!("{other:?}"),
@@ -2838,7 +2608,7 @@ mod tests {
         )
         .unwrap();
         let avro_schema = try_to_avro("R", &schema.fields).unwrap();
-        for value in serialize(&avro_schema, &batch) {
+        for value in serialize(&avro_schema, &batch).unwrap() {
             let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
             let decoded =
                 apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
@@ -2932,7 +2702,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s)]).unwrap();
 
         let avro_schema = try_to_avro("R", &schema.fields).unwrap();
-        let rows = serialize(&avro_schema, &batch);
+        let rows = serialize(&avro_schema, &batch).unwrap();
         assert_eq!(
             rows[0],
             Value::Record(vec![(

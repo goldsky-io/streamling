@@ -41,12 +41,16 @@ pub(crate) fn field_contains_decimal_arb(field: &Field) -> bool {
 /// layout (see [`plain_layout_field`], which keeps the field's metadata) it
 /// is an ordinary decimal_arb leaf.
 pub(crate) fn is_encoded_decimal_arb_field(field: &Field) -> bool {
-    matches!(
-        field.data_type(),
-        DataType::Dictionary(..) | DataType::RunEndEncoded(..)
-    ) && DecimalArbType::is_decimal_arb_metadata(field.metadata())
-        && plain_layout_field(field)
-            .is_some_and(|plain| DecimalArbType::is_decimal_arb_field(&plain))
+    encoded_decimal_arb_plain_field(field).is_some()
+}
+
+/// The plain decimal_arb leaf an encoded one (see
+/// [`is_encoded_decimal_arb_field`]) unwraps to.
+fn encoded_decimal_arb_plain_field(field: &Field) -> Option<Field> {
+    if !DecimalArbType::is_decimal_arb_metadata(field.metadata()) {
+        return None;
+    }
+    plain_layout_field(field).filter(DecimalArbType::is_decimal_arb_field)
 }
 
 /// Does a container type hold a `decimal_arb` field anywhere below it? (A
@@ -67,26 +71,11 @@ fn type_contains_decimal_arb(data_type: &DataType) -> bool {
     }
 }
 
-/// The plain (offset-based, un-encoded) layout `data_type` maps to: list views
-/// become lists and dictionary / run-end encodings unwrap to their value type.
-/// Everything the text bridge walks is expressed in these layouts; the
-/// encoded variants are `cast` to them first.
-pub(crate) fn plain_layout(data_type: &DataType) -> Option<DataType> {
-    match data_type {
-        DataType::ListView(c) => Some(DataType::List(Arc::clone(c))),
-        DataType::LargeListView(c) => Some(DataType::LargeList(Arc::clone(c))),
-        DataType::Dictionary(_, values) => {
-            Some(plain_layout(values).unwrap_or_else(|| values.as_ref().clone()))
-        }
-        DataType::RunEndEncoded(_, values) => {
-            Some(plain_layout(values.data_type()).unwrap_or_else(|| values.data_type().clone()))
-        }
-        _ => None,
-    }
-}
-
-/// [`plain_layout`] at the field level: `field` rebuilt with its plain layout,
-/// or `None` when it already is one.
+/// `field` rebuilt with its plain (offset-based, un-encoded) layout — list
+/// views become lists, dictionary / run-end encodings unwrap to their value
+/// type — or `None` when it already is one. Everything the text bridge walks
+/// is expressed in these layouts; the encoded variants are `cast` to them
+/// first.
 ///
 /// A run-end encoding is the one layout whose values sit in a field of their
 /// own, so a decimal_arb leaf held directly by it carries its extension
@@ -121,7 +110,11 @@ pub(crate) fn plain_layout_field(field: &Field) -> Option<Field> {
                 field_with_type(field, values.data_type().clone()).with_nullable(nullable)
             })
         }
-        other => plain_layout(other).map(|plain| field_with_type(field, plain)),
+        DataType::ListView(c) => Some(field_with_type(field, DataType::List(Arc::clone(c)))),
+        DataType::LargeListView(c) => {
+            Some(field_with_type(field, DataType::LargeList(Arc::clone(c))))
+        }
+        _ => None,
     }
 }
 
@@ -153,15 +146,12 @@ pub(crate) fn trim_list_child<O: OffsetSizeTrait>(
     child: &ArrayRef,
 ) -> (OffsetBuffer<O>, ArrayRef) {
     // An offset buffer always holds at least one entry.
-    let first = offsets[0];
-    let last = offsets[offsets.len() - 1];
-    let (start, end) = (first.as_usize(), last.as_usize());
+    let (start, end) = (offsets[0].as_usize(), offsets[offsets.len() - 1].as_usize());
     if start == 0 && end == child.len() {
         return (offsets.clone(), Arc::clone(child));
     }
-    let rebased: Vec<O> = offsets.iter().map(|o| *o - first).collect();
     (
-        OffsetBuffer::new(rebased.into()),
+        OffsetBuffer::from_lengths(offsets.lengths()),
         child.slice(start, end - start),
     )
 }
@@ -227,9 +217,7 @@ pub(crate) fn decimal_arb_leaves_to_text(
     // A list view or a dictionary-/run-end-encoded container: the arrow-json
     // writer rendered the leaves inside these as hex because the walk below
     // never reached them. Cast to the plain layout and walk that instead.
-    if let Some((plain, plain_array)) =
-        to_plain_layout(field, array).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-    {
+    if let Some((plain, plain_array)) = to_plain_layout(field, array)? {
         return decimal_arb_leaves_to_text(&plain, &plain_array);
     }
 
@@ -305,8 +293,7 @@ pub(crate) fn decimal_arb_leaves_to_text(
                 nv,
                 fa.nulls().cloned(),
                 fa.len(),
-            )
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            )?;
             Ok((
                 field_with_type(field, DataType::FixedSizeList(nf, *n)),
                 Arc::new(new_arr) as ArrayRef,
@@ -493,9 +480,7 @@ pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> 
 
     // An encoded leaf is restored as its plain decimal_arb layout, then
     // re-encoded the way the target declares it.
-    if is_encoded_decimal_arb_field(target)
-        && let Some(plain) = plain_layout_field(target)
-    {
+    if let Some(plain) = encoded_decimal_arb_plain_field(target) {
         let restored = decimal_arb_leaves_from_text(&plain, array)?;
         return Ok(cast(restored.as_ref(), target.data_type())?);
     }
@@ -552,16 +537,13 @@ pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> 
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| downcast_err("FixedSizeListArray"))?;
             let values = decimal_arb_leaves_from_text(child, fa.values())?;
-            Ok(Arc::new(
-                FixedSizeListArray::try_new_with_length(
-                    child.clone(),
-                    *n,
-                    values,
-                    fa.nulls().cloned(),
-                    fa.len(),
-                )
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-            ) as ArrayRef)
+            Ok(Arc::new(FixedSizeListArray::try_new_with_length(
+                child.clone(),
+                *n,
+                values,
+                fa.nulls().cloned(),
+                fa.len(),
+            )?) as ArrayRef)
         }
         DataType::Map(entry_field, sorted) => {
             let ma = array
@@ -598,9 +580,7 @@ pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::decimal_arb::DecimalArbArrayBuilder;
     use datafusion::arrow::array::{Int32Array, RunArray};
-    use datafusion::arrow::buffer::OffsetBuffer;
     use datafusion::arrow::datatypes::Int32Type;
 
     fn leaves(values: &[&str]) -> ArrayRef {
@@ -817,7 +797,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![dictionary]).unwrap();
         let schema = try_to_avro("EncodedAmounts", batch.schema().fields()).unwrap();
-        let rows = serialize(&schema, &batch);
+        let rows = serialize(&schema, &batch).unwrap();
         for (row, expected) in
             rows.into_iter()
                 .zip([Some(1_000_000_000_000_000_000_i64), Some(1), None, Some(1)])
