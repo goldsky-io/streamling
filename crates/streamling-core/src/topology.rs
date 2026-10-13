@@ -538,18 +538,18 @@ pub struct DynamicTableTransform {
 }
 
 /// A primary-keyed table maintained from a stateless SQL query. Other nodes
-/// read its changelog by name.
+/// read its SQL output by name.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct TableTransform {
     pub backend_type: TableBackendType,
     /// Comma-separated for composite keys.
     pub primary_key: String,
-    /// Collapse each input batch to its last row per key before applying it.
-    /// Only the changelog changes; the table's final state is the same.
-    #[serde(default = "default_deduplicate")]
-    pub deduplicate: bool,
-    /// Projection, filter, unnest or union over one source or transform.
+    /// Storage stays within about (1 + max_dead_ratio) × the live rows. Lower
+    /// values use less memory and spend more time cleaning.
+    #[serde(default = "default_max_dead_ratio")]
+    pub max_dead_ratio: f64,
+    /// Projection and filter over one source or transform.
     pub sql: String,
     pub telemetry: Option<Telemetry>,
 }
@@ -766,8 +766,11 @@ fn default_on_conflict() -> String {
     "update".to_string()
 }
 
-fn default_deduplicate() -> bool {
-    true
+/// Default for [`TableTransform::max_dead_ratio`].
+pub const DEFAULT_MAX_DEAD_RATIO: f64 = 0.25;
+
+fn default_max_dead_ratio() -> f64 {
+    DEFAULT_MAX_DEAD_RATIO
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -3369,7 +3372,7 @@ sinks: {}
     }
 
     #[test]
-    fn table_transform_parses_with_default_deduplicate() {
+    fn table_transform_parses_with_defaults() {
         let yaml = r#"
 sources:
   src: { type: kafka, topic: t, primary_key: id }
@@ -3387,8 +3390,29 @@ sinks: {}
         };
         assert_eq!(table.backend_type, TableBackendType::InMemory);
         assert_eq!(table.primary_key, "chain, address");
-        assert!(table.deduplicate);
+        assert_eq!(table.max_dead_ratio, DEFAULT_MAX_DEAD_RATIO);
         assert_eq!(topology.transforms["tokens"].parallelism(), None);
+    }
+
+    #[test]
+    fn table_transform_parses_max_dead_ratio() {
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    max_dead_ratio: 0.1
+    sql: SELECT id FROM src
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        let Transform::table(table) = &topology.transforms["tokens"] else {
+            panic!("expected a table transform");
+        };
+        assert_eq!(table.max_dead_ratio, 0.1);
     }
 
     #[test]
