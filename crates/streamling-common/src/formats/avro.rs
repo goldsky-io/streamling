@@ -6,7 +6,7 @@ use crate::formats::FromArrowConverter;
 pub use crate::formats::avro::schema::convert_avro_schema_to_arrow;
 pub use crate::formats::avro::schema::post_process_avro_schema_for_reading;
 pub use crate::formats::avro::schema::post_process_avro_schema_for_writing;
-pub use crate::formats::avro::writer::{serialize, to_avro};
+pub use crate::formats::avro::writer::{serialize, to_avro, try_to_avro};
 use apache_avro::types::Value;
 use arrow_schema::SchemaRef;
 use datafusion::arrow::array::RecordBatch;
@@ -33,7 +33,8 @@ impl FromArrowConverter<Value> for FromArrowToAvroConverter {
             return Ok(vec![]);
         }
 
-        let avro_schema = to_avro(&self.topic, &self.schema.fields);
+        let avro_schema = try_to_avro(&self.topic, &self.schema.fields)
+            .map_err(datafusion::error::DataFusionError::from)?;
         let payloads = serialize(&avro_schema, batch);
         Ok(payloads)
     }

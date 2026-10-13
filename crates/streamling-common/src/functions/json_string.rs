@@ -196,4 +196,34 @@ mod tests {
         assert_eq!(s.value(0), "{\"a\":1,\"b\":\"foo\"}");
         assert_eq!(s.value(1), "{\"a\":2,\"b\":\"bar\"}");
     }
+
+    /// The Postgres sink writes a nested column as JSONB through this
+    /// function; 256-bit integer leaves inside it keep their exact values.
+    #[test]
+    fn test_gs_json_string_nested_wide_int_leaves() {
+        use crate::types::decimal_arb_nested::fixtures::{U256_MAX, wide_int_traces_batch};
+        let batch = wide_int_traces_batch();
+        let traces = batch.column_by_name("traces").unwrap().clone();
+        let field = batch.schema().field_with_name("traces").unwrap().clone();
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(traces)],
+            arg_fields: vec![Arc::new(field)],
+            number_rows: 2,
+            return_field: Arc::new(Field::new("gs_json_string", DataType::Utf8, true)),
+            config_options: ::std::sync::Arc::new(::datafusion::config::ConfigOptions::default()),
+        };
+        let ColumnarValue::Array(out) = JsonStringFunc::new().invoke_with_args(args).unwrap()
+        else {
+            panic!("expected an array");
+        };
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            out.value(0),
+            r#"[{"value":"1"},{"value":"1000000000000000000"}]"#
+        );
+        assert_eq!(
+            out.value(1),
+            format!(r#"[{{"value":"{U256_MAX}"}},{{"value":null}}]"#)
+        );
+    }
 }
