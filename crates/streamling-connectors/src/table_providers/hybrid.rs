@@ -1016,12 +1016,17 @@ fn project_onto_source(
     if same_shape {
         return Some(projection.clone());
     }
-    Some(
-        projection
-            .iter()
-            .filter_map(|&i| source.index_of(hybrid.field(i).name()).ok())
-            .collect(),
-    )
+    let mapped: Vec<usize> = projection
+        .iter()
+        .filter_map(|&i| source.index_of(hybrid.field(i).name()).ok())
+        .collect();
+    // A projection that selects only columns the source lacks would map to a
+    // zero-column projection, which inner sources may reject; scanning
+    // unprojected lets `align_batch_to_schema` do the reshape and null-fill.
+    if mapped.is_empty() {
+        return None;
+    }
+    Some(mapped)
 }
 
 /// Align a batch to `target` by selecting the target's columns by NAME.
@@ -2428,6 +2433,50 @@ mod tests {
     }
 
     #[test]
+    fn project_onto_source_maps_by_name_and_drops_absent_columns() {
+        let hybrid = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("after_evm_transfers", DataType::Utf8, true),
+        ]));
+        // Same shape but different order than the hybrid schema.
+        let source = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // No projection: scan unprojected.
+        assert_eq!(project_onto_source(None, &hybrid, &source), None);
+
+        // Same shape (Kafka phase): projection passes through unchanged.
+        let same_shape = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("after_evm_transfers", DataType::Utf8, true),
+        ]));
+        assert_eq!(
+            project_onto_source(Some(&vec![2, 0]), &hybrid, &same_shape),
+            Some(vec![2, 0])
+        );
+
+        // Reordered source: indices re-expressed by name.
+        assert_eq!(
+            project_onto_source(Some(&vec![2, 0]), &hybrid, &source),
+            Some(vec![1])
+        );
+
+        // Absent hybrid column is dropped from the projection.
+        assert_eq!(
+            project_onto_source(Some(&vec![1, 2]), &hybrid, &source),
+            Some(vec![0])
+        );
+
+        // A projection selecting only absent columns maps to nothing: the
+        // inner scan runs unprojected and align_batch_to_schema fills nulls.
+        assert_eq!(project_onto_source(Some(&vec![2]), &hybrid, &source), None);
+    }
+
+    #[test]
     fn select_columns_rejects_absent_non_nullable_column() {
         let table_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let target_schema = Arc::new(Schema::new(vec![
@@ -3549,7 +3598,14 @@ mod tests {
             Field::new("after_evm_transfers", transfers_type.clone(), true),
         ]));
 
-        for (label, projection) in [("full", None), ("projected", Some(vec![2usize, 1]))] {
+        // "missing_only" selects just the Kafka-only column: the mapped
+        // source projection is empty, so the inner scan runs unprojected and
+        // the null-fill path supplies the column alone.
+        for (label, projection) in [
+            ("full", None),
+            ("projected", Some(vec![2usize, 1])),
+            ("missing_only", Some(vec![2usize])),
+        ] {
             let config = HybridSourceConfig {
                 bounded_sources: vec![Arc::new(ReorderedBatchMockProvider::new())],
                 unbounded_source: Arc::new(FiniteMockTableProvider {
@@ -3606,13 +3662,10 @@ mod tests {
                 let transfers = batch.column_by_name("after_evm_transfers").unwrap();
                 assert_eq!(transfers.data_type(), &transfers_type, "[{label}]");
                 assert_eq!(transfers.null_count(), 2, "[{label}] filled with nulls");
-                let names = batch
-                    .column_by_name("name")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                assert_eq!((names.value(0), names.value(1)), ("a", "b"), "[{label}]");
+                if let Some(names_col) = batch.column_by_name("name") {
+                    let names = names_col.as_any().downcast_ref::<StringArray>().unwrap();
+                    assert_eq!((names.value(0), names.value(1)), ("a", "b"), "[{label}]");
+                }
             }
             assert!(
                 saw_data,
