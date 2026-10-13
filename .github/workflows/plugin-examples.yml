@@ -44,10 +44,6 @@ jobs:
           cache-targets: true
           cache-on-failure: true
 
-      # TEMP: drop the rust-cache target dirs so every crate compiles through kache and lands in the seed.
-      - name: Cold target dirs (temporary)
-        run: rm -rf plugin_examples/basic/target plugin_examples/low_level/target
-
       - name: Build basic example
         working-directory: plugin_examples/basic
         run: cargo build --locked
@@ -55,10 +51,3 @@ jobs:
       - name: Build low_level example
         working-directory: plugin_examples/low_level
         run: cargo build --locked
-
-      # TEMP: one-time seed of the kache remote from a non-protected branch (see streamling.yml).
-      - name: Seed kache remote (temporary)
-        if: ${{ !cancelled() }}
-        run: |
-          GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-plugin-examples --namespace streamling-plugin-examples || echo "::warning::save-manifest failed"
-          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push --allow-partial
