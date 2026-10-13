@@ -311,7 +311,7 @@ mod tests {
         topology::Transform::table(topology::TableTransform {
             backend_type: streamling_config::TableBackendType::InMemory,
             primary_key: "id".to_string(),
-            deduplicate: true,
+            max_dead_ratio: topology::DEFAULT_MAX_DEAD_RATIO,
             sql: sql.to_string(),
             telemetry: None,
         })

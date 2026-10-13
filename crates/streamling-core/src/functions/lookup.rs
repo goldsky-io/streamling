@@ -174,6 +174,7 @@ mod tests {
             &schema,
             &["address".to_string()],
             "app::rates".to_string(),
+            crate::topology::DEFAULT_MAX_DEAD_RATIO,
         )
         .unwrap();
         rates
@@ -187,7 +188,6 @@ mod tests {
                     ],
                 )
                 .unwrap(),
-                true,
             )
             .unwrap();
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
@@ -283,6 +283,7 @@ mod tests {
                 &ids_schema,
                 &["id".to_string()],
                 "app::ids".to_string(),
+                crate::topology::DEFAULT_MAX_DEAD_RATIO,
             )
             .unwrap(),
         ));
@@ -329,6 +330,7 @@ mod tests {
                 &rates_schema(amount.clone()),
                 &["address".to_string()],
                 "app::decimals".to_string(),
+                crate::topology::DEFAULT_MAX_DEAD_RATIO,
             )
             .unwrap(),
         ));

@@ -6,7 +6,7 @@ use crate::operators::inspect::LiveDataInspect;
 use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, SharedSourceRegistry};
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
-use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
+use crate::side_output::{SideOutputPlacement, SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::types::RowCountMeasurementType;
@@ -16,8 +16,8 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
-use datafusion::common::not_impl_err;
 use datafusion::common::{DFSchemaRef, DataFusionError, Result};
+use datafusion::common::{internal_err, not_impl_err};
 use datafusion::datasource::sink::DataSink;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -45,7 +45,7 @@ use tracing::{debug, trace, warn};
 
 /// Per-source event-time instrumentation state, propagated through every
 /// `WrappingExec` reconstruction (`with_new_children`,
-/// `wrap_with_side_outputs_before_filter`) so optimizer rewrites cannot
+/// `wrap_with_side_outputs`) so optimizer rewrites cannot
 /// silently drop the freshness signal.
 ///
 /// Cloning is shallow: the watermark `Arc<Mutex<_>>` is shared across all
@@ -223,18 +223,33 @@ impl WrappingSourceTableProvider {
             .unwrap_or_default()
     }
 
-    /// When the inner plan is a `StreamingFilterExec`, place the `WrappingExec` (with side
-    /// outputs like `BlockReporter`) around the unfiltered source, then re-apply the filter
-    /// on top. This ensures side outputs observe **all** rows before filtering, giving
-    /// accurate lag calculations even when a source-level filter is configured. Same
-    /// rationale applies to event-time instrumentation: the `WrappingExec` sits below
-    /// the source filter so freshness metrics see the pre-filter row stream.
-    fn wrap_with_side_outputs_before_filter(
+    /// When the inner plan is a `StreamingFilterExec`, place the `WrappingExec` around the
+    /// unfiltered source, then re-apply the filter on top. Side outputs placed before the
+    /// filter (like `BlockReporter`) run right above the `WrappingExec`, so they observe
+    /// **all** rows before filtering, giving accurate lag calculations even when a
+    /// source-level filter is configured. Same rationale applies to event-time
+    /// instrumentation: the `WrappingExec` sits below the source filter so freshness
+    /// metrics see the pre-filter row stream. Side outputs placed after the filter run
+    /// right above it, below any projection, so they see the rows every consumer sees.
+    fn wrap_with_side_outputs(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
     ) -> Arc<dyn ExecutionPlan> {
+        let (after_filter, before_filter): (Vec<_>, Vec<_>) =
+            side_outputs.into_iter().partition(|side_output| {
+                side_output.placement() == SideOutputPlacement::AfterSourceFilter
+            });
+        let wrap = |exec: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(WrappingExec::new(
+                exec,
+                reference_name.to_string(),
+                Vec::new(),
+                event_time_instrumentation.clone(),
+            ))
+        };
+
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -246,14 +261,11 @@ impl WrappingSourceTableProvider {
                 .input()
                 .downcast_ref::<StreamingFilterExec>()
         {
-            let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-                source_exec,
-                reference_name.to_string(),
-                side_outputs.clone(),
-                Vec::new(),
-                event_time_instrumentation.clone(),
-            ));
+            let wrapped_source = with_side_outputs(
+                wrap(filter_exec.input().clone()),
+                reference_name,
+                before_filter.clone(),
+            );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
             // consumer's plan subtree, and must act as a topology boundary so
@@ -261,8 +273,9 @@ impl WrappingSourceTableProvider {
             let rebuilt = Arc::new(filter_exec.clone().with_source_owned())
                 .with_new_children(vec![wrapped_source])
                 .and_then(|new_filter| {
-                    Arc::new(projection_exec.clone().with_source_owned())
-                        .with_new_children(vec![new_filter])
+                    Arc::new(projection_exec.clone().with_source_owned()).with_new_children(vec![
+                        with_side_outputs(new_filter, reference_name, after_filter.clone()),
+                    ])
                 });
             match rebuilt {
                 Ok(plan) => return plan,
@@ -278,45 +291,32 @@ impl WrappingSourceTableProvider {
         }
 
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
-            let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-                source_exec,
-                reference_name.to_string(),
-                side_outputs.clone(),
-                Vec::new(),
-                event_time_instrumentation.clone(),
-            ));
+            let wrapped_source = with_side_outputs(
+                wrap(filter_exec.input().clone()),
+                reference_name,
+                before_filter.clone(),
+            );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
             // `WrappingExec` and must bound downstream metric aggregation.
             match Arc::new(filter_exec.clone().with_source_owned())
                 .with_new_children(vec![wrapped_source])
             {
-                Ok(plan) => plan,
+                Ok(plan) => return with_side_outputs(plan, reference_name, after_filter),
                 Err(e) => {
                     warn!(
                         "Failed to rebuild filter around WrappingExec for '{}': {}. \
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(WrappingExec::new(
-                        inner_exec,
-                        reference_name.to_string(),
-                        side_outputs,
-                        Vec::new(),
-                        event_time_instrumentation,
-                    ))
                 }
             }
-        } else {
-            Arc::new(WrappingExec::new(
-                inner_exec,
-                reference_name.to_string(),
-                side_outputs,
-                Vec::new(),
-                event_time_instrumentation,
-            ))
         }
+
+        // No filter, or one that couldn't be rebuilt: every side output sees
+        // the rows `inner_exec` yields.
+        let side_outputs = before_filter.into_iter().chain(after_filter).collect();
+        with_side_outputs(wrap(inner_exec), reference_name, side_outputs)
     }
 }
 
@@ -400,7 +400,7 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
-            let wrapped_exec = Self::wrap_with_side_outputs_before_filter(
+            let wrapped_exec = Self::wrap_with_side_outputs(
                 inner_exec,
                 &reference_name,
                 side_outputs,
@@ -447,7 +447,7 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
-            Ok(Self::wrap_with_side_outputs_before_filter(
+            Ok(Self::wrap_with_side_outputs(
                 inner_exec,
                 &self.reference_name,
                 side_outputs,
@@ -471,12 +471,11 @@ impl TableProvider for WrappingSourceTableProvider {
 }
 
 /// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
-/// attributes and dynamic tables
+/// attributes. Side outputs run in a `SideOutputExec` above it.
 #[derive(Debug)]
 pub struct WrappingExec {
     inner: Arc<dyn ExecutionPlan>,
     reference_name: String,
-    side_outputs: Vec<Arc<dyn SourceSideOutput>>,
     forced_non_null_columns: Vec<String>,
     adjusted_schema: SchemaRef,
     /// Per-source event-time instrumentation. `None` when the source has no
@@ -496,7 +495,6 @@ impl WrappingExec {
     pub fn new(
         inner: Arc<dyn ExecutionPlan>,
         reference_name: String,
-        side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         forced_non_null_columns: Vec<String>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
     ) -> WrappingExec {
@@ -529,7 +527,6 @@ impl WrappingExec {
         Self {
             inner,
             reference_name,
-            side_outputs,
             forced_non_null_columns,
             adjusted_schema,
             event_time_instrumentation,
@@ -590,7 +587,6 @@ impl ExecutionPlan for WrappingExec {
         Ok(Arc::new(WrappingExec::new(
             new_inner,
             self.reference_name.clone(),
-            self.side_outputs.clone(),
             self.forced_non_null_columns.clone(),
             self.event_time_instrumentation.clone(),
         )))
@@ -642,7 +638,6 @@ impl ExecutionPlan for WrappingExec {
             metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
         );
 
-        let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
 
         let schema = self.schema();
@@ -702,18 +697,6 @@ impl ExecutionPlan for WrappingExec {
                             );
                         }
 
-                        // Process side outputs
-                        for side_output in &side_outputs {
-                            if let Err(e) = side_output.process(&batch).await {
-                                debug!("WrappingExec [{}]: Side output error, stream will terminate: {}", metric_metadata_id, e);
-                                yield Err(DataFusionError::from(crate::streamling_err!(
-                                    "side output error for '{}': {e}",
-                                    metric_metadata_id
-                                )));
-                                return;
-                            }
-                        }
-
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
                         yield Ok(batch);
@@ -750,6 +733,145 @@ impl Drop for WrappingExec {
             "Running drop for WrappingExec with inner_plan_node_name: {}",
             inner_plan_node_name
         );
+    }
+}
+
+/// `input` itself when there are no side outputs, so plans without any are unchanged.
+fn with_side_outputs(
+    input: Arc<dyn ExecutionPlan>,
+    reference_name: &str,
+    side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+) -> Arc<dyn ExecutionPlan> {
+    if side_outputs.is_empty() {
+        input
+    } else {
+        Arc::new(SideOutputExec::new(
+            input,
+            reference_name.to_string(),
+            side_outputs,
+        ))
+    }
+}
+
+/// Runs side outputs on each batch of `input` before yielding it, so every
+/// consumer receives a batch only after the side outputs processed it.
+#[derive(Debug)]
+pub struct SideOutputExec {
+    input: Arc<dyn ExecutionPlan>,
+    /// The node whose output the side outputs observe.
+    reference_name: String,
+    side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+}
+
+impl SideOutputExec {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        reference_name: String,
+        side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+    ) -> Self {
+        Self {
+            input,
+            reference_name,
+            side_outputs,
+        }
+    }
+}
+
+// Like `WrappingExec`, the optimizer hooks that return a rewritten subtree
+// (`try_swapping_with_projection`, `with_fetch`, `repartitioned`) keep their
+// no-op defaults, so no rewrite can drop the side outputs.
+impl ExecutionPlan for SideOutputExec {
+    fn name(&self) -> &str {
+        "SideOutputExec"
+    }
+
+    /// The input's, which differs from `properties().schema()` under a
+    /// `WrappingExec` with forced non-null columns.
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return internal_err!(
+                "SideOutputExec expects exactly one child, got {}",
+                children.len()
+            );
+        }
+        Ok(Arc::new(SideOutputExec::new(
+            children.swap_remove(0),
+            self.reference_name.clone(),
+            self.side_outputs.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let mut input = self.input.execute(partition, context)?;
+        let reference_name = self.reference_name.clone();
+        let side_outputs = self.side_outputs.clone();
+        let processed = async_stream::stream! {
+            while let Some(batch) = input.next().await {
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                };
+                for side_output in &side_outputs {
+                    if let Err(e) = side_output.process(&batch).await {
+                        debug!("SideOutputExec [{}]: Side output error, stream will terminate: {}", reference_name, e);
+                        yield Err(DataFusionError::from(crate::streamling_err!(
+                            "side output error for '{}': {e}",
+                            reference_name
+                        )));
+                        return;
+                    }
+                }
+                yield Ok(batch);
+            }
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            processed,
+        )))
+    }
+}
+
+impl DisplayAs for SideOutputExec {
+    fn fmt_as(&self, _format: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SideOutputExec: {}", self.reference_name)
     }
 }
 
@@ -1057,13 +1179,16 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                     }
                 }
 
-                let exec = Arc::new(WrappingExec::new(
-                    input_physical,
-                    reference_name.clone(),
+                let exec = with_side_outputs(
+                    Arc::new(WrappingExec::new(
+                        input_physical,
+                        reference_name.clone(),
+                        wrapping_node.forced_non_null_columns.clone(),
+                        EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
+                    )),
+                    &reference_name,
                     side_outputs,
-                    wrapping_node.forced_non_null_columns.clone(),
-                    EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
-                ));
+                );
 
                 // Check if we should store this in the scan sharing registry for future reuse
                 if wrapping_node.enable_scan_sharing {
@@ -1211,7 +1336,21 @@ mod tests {
 
     #[derive(Debug)]
     struct CountingSideOutput {
-        rows_seen: Arc<AtomicUsize>,
+        rows_seen: AtomicUsize,
+        placement: SideOutputPlacement,
+    }
+
+    impl CountingSideOutput {
+        fn new(placement: SideOutputPlacement) -> Arc<Self> {
+            Arc::new(Self {
+                rows_seen: AtomicUsize::new(0),
+                placement,
+            })
+        }
+
+        fn rows_seen(&self) -> usize {
+            self.rows_seen.load(Ordering::Relaxed)
+        }
     }
 
     #[async_trait]
@@ -1221,6 +1360,26 @@ mod tests {
                 .fetch_add(batch.num_rows(), Ordering::Relaxed);
             Ok(())
         }
+
+        fn placement(&self) -> SideOutputPlacement {
+            self.placement
+        }
+    }
+
+    /// One counting side output per placement.
+    fn side_outputs_on_both_sides() -> Vec<Arc<dyn SourceSideOutput>> {
+        vec![
+            CountingSideOutput::new(SideOutputPlacement::BeforeSourceFilter),
+            CountingSideOutput::new(SideOutputPlacement::AfterSourceFilter),
+        ]
+    }
+
+    fn assert_side_output_exec(plan: &Arc<dyn ExecutionPlan>, position: &str) {
+        assert!(
+            plan.downcast_ref::<SideOutputExec>().is_some(),
+            "Expected {position} to be SideOutputExec, got: {}",
+            plan.name()
+        );
     }
 
     fn test_schema() -> SchemaRef {
@@ -1273,21 +1432,19 @@ mod tests {
             Arc::new(StreamingProjectionExec::from_original(projection).unwrap())
                 as Arc<dyn ExecutionPlan>;
 
-        let rows_seen = Arc::new(AtomicUsize::new(0));
-        let side_output = Arc::new(CountingSideOutput {
-            rows_seen: rows_seen.clone(),
-        });
-
-        let result = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+        let result = WrappingSourceTableProvider::wrap_with_side_outputs(
             streaming_projection,
             "test_source",
-            vec![side_output],
+            side_outputs_on_both_sides(),
             None,
         );
 
-        // Order must be projection -> filter -> wrapper -> source, so side
-        // outputs / event-time observe every pre-filter row (R7). Both
-        // rebuilt nodes must keep the source-owned topology-boundary mark.
+        // Order must be projection -> side outputs after the filter -> filter
+        // -> side outputs before the filter -> wrapper -> source, so side
+        // outputs placed before the filter / event-time observe every
+        // pre-filter row (R7), and the others see every column of the rows
+        // the filter keeps. Both rebuilt nodes must keep the source-owned
+        // topology-boundary mark.
         let rebuilt_proj = result
             .downcast_ref::<StreamingProjectionExec>()
             .unwrap_or_else(|| {
@@ -1302,29 +1459,33 @@ mod tests {
         );
         let proj_children = result.children();
         assert_eq!(proj_children.len(), 1);
-        let rebuilt_filter = proj_children[0]
+        assert_side_output_exec(proj_children[0], "projection's child");
+        let after_children = proj_children[0].children();
+        let rebuilt_filter = after_children[0]
             .downcast_ref::<StreamingFilterExec>()
             .unwrap_or_else(|| {
                 panic!(
-                    "Expected projection's child to be StreamingFilterExec, got: {}",
-                    proj_children[0].name()
+                    "Expected side outputs' child to be StreamingFilterExec, got: {}",
+                    after_children[0].name()
                 )
             });
         assert!(
             rebuilt_filter.is_source_owned(),
             "rebuilt source filter must stay a topology boundary after with_new_children"
         );
-        let filter_children = proj_children[0].children();
+        let filter_children = after_children[0].children();
         assert_eq!(filter_children.len(), 1);
+        assert_side_output_exec(filter_children[0], "filter's child");
+        let before_children = filter_children[0].children();
         assert!(
-            filter_children[0].downcast_ref::<WrappingExec>().is_some(),
-            "Expected filter's child to be WrappingExec, got: {}",
-            filter_children[0].name()
+            before_children[0].downcast_ref::<WrappingExec>().is_some(),
+            "Expected side outputs' child to be WrappingExec, got: {}",
+            before_children[0].name()
         );
     }
 
     #[test]
-    fn test_wrap_with_side_outputs_before_filter_reorders_plan() {
+    fn test_wrap_with_side_outputs_reorders_plan() {
         let schema = test_schema();
         let mem_table = MemTable::try_new(schema.clone(), vec![vec![test_batch()]]).unwrap();
         let ctx = SessionContext::new();
@@ -1339,25 +1500,24 @@ mod tests {
         let streaming_filter =
             Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
 
-        let rows_seen = Arc::new(AtomicUsize::new(0));
-        let side_output = Arc::new(CountingSideOutput {
-            rows_seen: rows_seen.clone(),
-        });
-
-        let result = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+        let result = WrappingSourceTableProvider::wrap_with_side_outputs(
             streaming_filter,
             "test_source",
-            vec![side_output],
+            side_outputs_on_both_sides(),
             None,
         );
 
-        // The top-level plan should be a StreamingFilterExec (filter is on top)
-        let rebuilt_filter = result
+        // Side outputs placed after the filter are on top
+        assert_side_output_exec(&result, "top-level plan");
+
+        // Then the filter
+        let after_children = result.children();
+        let rebuilt_filter = after_children[0]
             .downcast_ref::<StreamingFilterExec>()
             .unwrap_or_else(|| {
                 panic!(
-                    "Expected top-level plan to be StreamingFilterExec, got: {}",
-                    result.name()
+                    "Expected side outputs' child to be StreamingFilterExec, got: {}",
+                    after_children[0].name()
                 )
             });
         assert!(
@@ -1365,13 +1525,16 @@ mod tests {
             "wrap reconstruction must keep the source-owned topology boundary"
         );
 
-        // Its child should be WrappingExec (side outputs run before the filter)
-        let filter_children = result.children();
+        // Its child should be the side outputs placed before the filter, over
+        // the WrappingExec
+        let filter_children = after_children[0].children();
         assert_eq!(filter_children.len(), 1);
+        assert_side_output_exec(filter_children[0], "filter's child");
+        let before_children = filter_children[0].children();
         assert!(
-            filter_children[0].downcast_ref::<WrappingExec>().is_some(),
-            "Expected filter's child to be WrappingExec, got: {}",
-            filter_children[0].name()
+            before_children[0].downcast_ref::<WrappingExec>().is_some(),
+            "Expected side outputs' child to be WrappingExec, got: {}",
+            before_children[0].name()
         );
     }
 
@@ -1385,28 +1548,32 @@ mod tests {
         let source_exec =
             futures::executor::block_on(mem_table.scan(&state, None, &[], None)).unwrap();
 
-        let rows_seen = Arc::new(AtomicUsize::new(0));
-        let side_output = Arc::new(CountingSideOutput {
-            rows_seen: rows_seen.clone(),
-        });
-
-        let result = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+        let result = WrappingSourceTableProvider::wrap_with_side_outputs(
             source_exec,
             "test_source",
-            vec![side_output],
+            side_outputs_on_both_sides(),
             None,
         );
 
-        // Without a filter, the top-level plan should be WrappingExec directly
+        // Without a filter, every side output runs directly above WrappingExec
+        let side_output_exec = result.downcast_ref::<SideOutputExec>().unwrap_or_else(|| {
+            panic!(
+                "Expected top-level plan to be SideOutputExec, got: {}",
+                result.name()
+            )
+        });
+        assert_eq!(side_output_exec.side_outputs.len(), 2);
         assert!(
-            result.downcast_ref::<WrappingExec>().is_some(),
-            "Expected top-level plan to be WrappingExec, got: {}",
-            result.name()
+            result.children()[0]
+                .downcast_ref::<WrappingExec>()
+                .is_some(),
+            "Expected side outputs' child to be WrappingExec, got: {}",
+            result.children()[0].name()
         );
     }
 
     #[tokio::test]
-    async fn test_side_output_sees_all_rows_before_filter() {
+    async fn test_side_outputs_see_the_rows_on_their_side_of_the_filter() {
         let schema = test_schema();
         let mem_table = MemTable::try_new(schema.clone(), vec![vec![test_batch()]]).unwrap();
         let ctx = SessionContext::new();
@@ -1420,15 +1587,13 @@ mod tests {
         let streaming_filter =
             Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
 
-        let rows_seen = Arc::new(AtomicUsize::new(0));
-        let side_output = Arc::new(CountingSideOutput {
-            rows_seen: rows_seen.clone(),
-        });
+        let before = CountingSideOutput::new(SideOutputPlacement::BeforeSourceFilter);
+        let after = CountingSideOutput::new(SideOutputPlacement::AfterSourceFilter);
 
-        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs(
             streaming_filter,
             "test_source",
-            vec![side_output],
+            vec![before.clone(), after.clone()],
             None,
         );
 
@@ -1445,9 +1610,14 @@ mod tests {
 
         // Side output should have seen all 5 rows (before filter)
         assert_eq!(
-            rows_seen.load(Ordering::Relaxed),
+            before.rows_seen(),
             5,
             "Side output should see all 5 rows before filtering"
+        );
+        assert_eq!(
+            after.rows_seen(),
+            3,
+            "Side output placed after the filter should see the 3 rows it keeps"
         );
     }
 
@@ -1578,7 +1748,6 @@ mod tests {
             source_exec.clone(),
             "test_source".to_string(),
             Vec::new(),
-            Vec::new(),
             Some(inst),
         ));
 
@@ -1621,7 +1790,7 @@ mod tests {
         .unwrap();
         let watermark_arc = inst.watermark_state.clone();
 
-        let result = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+        let result = WrappingSourceTableProvider::wrap_with_side_outputs(
             streaming_filter,
             "test_source",
             Vec::new(),

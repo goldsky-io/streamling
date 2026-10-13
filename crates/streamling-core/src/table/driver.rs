@@ -3,45 +3,54 @@
 
 use crate::checkpoints::checkpoint_management::{
     CheckpointControl, extract_checkpoint_messages, now_ms, process_checkpoint_acks,
+    register_sink_streams, send_checkpoint_ack, sink_stream_done,
 };
 use crate::session::SessionManager;
+use crate::shutdown::ComponentScope;
 use crate::telemetry::recorder::get_metrics_recorder;
+use datafusion::common::internal_datafusion_err;
 use datafusion::error::Result;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::{displayable, execute_stream};
+use datafusion::physical_plan::{ExecutionPlanProperties, displayable};
 use futures::StreamExt;
+use futures::future::try_join_all;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info};
 
-/// Plans and polls the table's `plan`, acking its markers as `table_name`.
-/// This mirrors a sink future but streams instead of collecting, because the
-/// output is unbounded and discarded.
+/// Plans the table's `plan` and polls each of its partitions in a task of
+/// `scope`, acking its markers as `table_name`. This mirrors a sink future
+/// but streams instead of collecting, because the output is unbounded and
+/// discarded.
 pub async fn run(
     session_manager: SessionManager,
     plan: LogicalPlan,
     table_name: String,
     metric_metadata_id: String,
     checkpoint_control: CheckpointControl,
+    scope: Arc<ComponentScope>,
 ) -> Result<()> {
     let df = session_manager.new_df(plan);
     let task_ctx = Arc::new(df.task_ctx());
-    let stream = df.create_physical_plan().await.and_then(|physical_plan| {
+    let streams = df.create_physical_plan().await.and_then(|physical_plan| {
         info!(
             "Table [{}] physical plan:\n{}",
             table_name,
             displayable(physical_plan.as_ref()).indent(true)
         );
-        execute_stream(physical_plan, task_ctx)
+        (0..physical_plan.output_partitioning().partition_count())
+            .map(|partition| physical_plan.execute(partition, Arc::clone(&task_ctx)))
+            .collect::<Result<Vec<_>>>()
     });
-    match stream {
-        Ok(stream) => {
+    match streams {
+        Ok(streams) => {
             drive(
-                stream,
+                streams,
                 &table_name,
                 &metric_metadata_id,
                 &checkpoint_control,
+                &scope,
             )
             .await
         }
@@ -52,27 +61,37 @@ pub async fn run(
     }
 }
 
+/// Polls each stream in its own task, so an upstream that runs inline in the
+/// table's plan runs its partitions in parallel. As with a sink's partitions,
+/// the streams share an ack gate: an epoch is acked once every stream
+/// delivered its marker or ended.
 async fn drive(
-    mut stream: SendableRecordBatchStream,
+    streams: Vec<SendableRecordBatchStream>,
     table_name: &str,
     metric_metadata_id: &str,
     checkpoint_control: &CheckpointControl,
+    scope: &ComponentScope,
 ) -> Result<()> {
-    let metrics_recorder = get_metrics_recorder();
-    let result = loop {
-        match stream.next().await {
-            Some(Ok(batch)) => process_checkpoint_acks(
-                extract_checkpoint_messages(batch.schema().metadata()),
-                now_ms(),
-                Instant::now(),
-                &metrics_recorder,
-                metric_metadata_id,
-                table_name,
-            ),
-            Some(Err(err)) => break Err(err),
-            None => break Ok(()),
-        }
-    };
+    register_sink_streams(table_name, streams.len());
+    let tasks: Vec<_> = streams
+        .into_iter()
+        .map(|stream| {
+            scope.spawn(drive_partition(
+                stream,
+                table_name.to_string(),
+                metric_metadata_id.to_string(),
+            ))
+        })
+        .collect();
+    // After the first failure the other tasks run until shutdown ends their
+    // streams. The failed stream never reports to the gate, so no later epoch
+    // is acked.
+    let result = try_join_all(tasks.into_iter().map(|task| async move {
+        task.await
+            .map_err(|err| internal_datafusion_err!("table partition task failed: {err}"))?
+    }))
+    .await
+    .map(|_| ());
     match &result {
         // The table will never ack again, so the coordinator stops waiting on it.
         Ok(()) => checkpoint_control.sink_completed(table_name),
@@ -86,6 +105,31 @@ async fn drive(
     result
 }
 
+async fn drive_partition(
+    mut stream: SendableRecordBatchStream,
+    table_name: String,
+    metric_metadata_id: String,
+) -> Result<()> {
+    let metrics_recorder = get_metrics_recorder();
+    while let Some(batch) = stream.next().await {
+        process_checkpoint_acks(
+            extract_checkpoint_messages(batch?.schema().metadata()),
+            now_ms(),
+            Instant::now(),
+            &metrics_recorder,
+            &metric_metadata_id,
+            &table_name,
+        );
+    }
+    // An ended stream never delivers another marker, so the gate counts its
+    // share of every pending epoch as delivered. A failed stream returns
+    // above, so the epochs it touched aren't acked.
+    for epoch in sink_stream_done(&table_name) {
+        send_checkpoint_ack(epoch, &table_name);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,8 +138,11 @@ mod tests {
         CHECKPOINT_COORDINATOR_CHANNEL, CheckpointCoordinator, CheckpointEpoch, CheckpointMessage,
         enrich_batch_metadata_with_checkpoints,
     };
+    use crate::dynamic_table::DynamicTableRegistry;
+    use crate::shutdown::ComponentScope;
     use arrow::array::RecordBatch;
     use arrow::datatypes::Schema;
+    use datafusion::datasource::MemTable;
     use datafusion::error::DataFusionError;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use serial_test::serial;
@@ -123,6 +170,15 @@ mod tests {
         ))
     }
 
+    fn acked(messages: impl Iterator<Item = CheckpointMessage>, table: &str) -> Vec<u64> {
+        messages
+            .filter_map(|message| match message {
+                CheckpointMessage::Ack { epoch, sink_id } if sink_id == table => Some(epoch.0),
+                _ => None,
+            })
+            .collect()
+    }
+
     // `#[serial]`: acks and the coordinator use process-wide checkpoint channels.
     #[tokio::test]
     #[serial]
@@ -131,23 +187,17 @@ mod tests {
         let (acks, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
 
         drive(
-            stream(vec![Ok(marker_batch(1)), Ok(marker_batch(2))]),
+            vec![stream(vec![Ok(marker_batch(1)), Ok(marker_batch(2))])],
             TABLE,
             "app::driver_acks_table",
             &CheckpointCoordinator::new().control(),
+            &ComponentScope::detached("test"),
         )
         .await
         .unwrap();
         unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, subscriber_id);
 
-        let acked: Vec<u64> = acks
-            .try_iter()
-            .filter_map(|message| match message {
-                CheckpointMessage::Ack { epoch, sink_id } if sink_id == TABLE => Some(epoch.0),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(acked, [1, 2]);
+        assert_eq!(acked(acks.try_iter(), TABLE), [1, 2]);
     }
 
     #[tokio::test]
@@ -159,9 +209,15 @@ mod tests {
         let control = coordinator.control();
         control.begin_terminal_checkpoint();
 
-        drive(stream(vec![]), TABLE, "app::driver_done_table", &control)
-            .await
-            .unwrap();
+        drive(
+            vec![stream(vec![])],
+            TABLE,
+            "app::driver_done_table",
+            &control,
+            &ComponentScope::detached("test"),
+        )
+        .await
+        .unwrap();
 
         assert!(
             control.is_terminal_finalized(),
@@ -180,10 +236,13 @@ mod tests {
         control.begin_terminal_checkpoint();
 
         let result = drive(
-            stream(vec![Err(DataFusionError::Execution("boom".to_string()))]),
+            vec![stream(vec![Err(DataFusionError::Execution(
+                "boom".to_string(),
+            ))])],
             TABLE,
             "app::driver_failed_table",
             &control,
+            &ComponentScope::detached("test"),
         )
         .await;
 
@@ -193,5 +252,54 @@ mod tests {
             "a failed table must keep the epochs it touched from finalizing"
         );
         coordinator.stop().await;
+    }
+
+    /// Each partition carries its own copy of every marker.
+    #[tokio::test]
+    #[serial]
+    async fn acks_an_epoch_once_across_partitions() {
+        const TABLE: &str = "driver_partitions_table";
+        let batch = marker_batch(1);
+        let source =
+            MemTable::try_new(batch.schema(), vec![vec![batch.clone()], vec![batch]]).unwrap();
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 2).unwrap();
+        let ctx = session_manager.session_context();
+        ctx.register_table("src", Arc::new(source)).unwrap();
+        let plan = ctx.table("src").await.unwrap().into_unoptimized_plan();
+        let (acks, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+
+        run(
+            session_manager,
+            plan,
+            TABLE.to_string(),
+            "app::driver_partitions_table".to_string(),
+            CheckpointCoordinator::new().control(),
+            ComponentScope::detached("test"),
+        )
+        .await
+        .unwrap();
+        unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, subscriber_id);
+
+        assert_eq!(acked(acks.try_iter(), TABLE), [1]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_ended_partition_releases_the_epochs_it_never_reached() {
+        const TABLE: &str = "driver_ended_partition_table";
+        let (acks, subscriber_id) = subscribe_with_id(CHECKPOINT_COORDINATOR_CHANNEL);
+
+        drive(
+            vec![stream(vec![Ok(marker_batch(1))]), stream(vec![])],
+            TABLE,
+            "app::driver_ended_partition_table",
+            &CheckpointCoordinator::new().control(),
+            &ComponentScope::detached("test"),
+        )
+        .await
+        .unwrap();
+        unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, subscriber_id);
+
+        assert_eq!(acked(acks.try_iter(), TABLE), [1]);
     }
 }

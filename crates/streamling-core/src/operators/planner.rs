@@ -2,7 +2,6 @@ use crate::operators::{
     broadcast, checkpointable, external_handlers, rebatch, repartition, wasm_runner, wrapping,
 };
 use crate::plugin;
-use crate::table;
 use async_trait::async_trait;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::QueryPlanner;
@@ -42,7 +41,6 @@ impl QueryPlanner for StreamlingQueryPlanner {
             Arc::new(wrapping::WrappingExtensionPlanner {}),
             Arc::new(wasm_runner::WasmRunnerExtensionPlanner {}),
             Arc::new(plugin::operator::PluginExtensionPlanner {}),
-            Arc::new(table::apply::TableApplyExtensionPlanner {}),
         ]);
         // Delegate most work of physical planning to the default physical planner
         physical_planner

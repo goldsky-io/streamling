@@ -3,7 +3,6 @@ use crate::functions::StreamlingFunctions;
 use crate::operators::planner::StreamlingQueryPlanner;
 use crate::optimizer::StreamlingPhysicalOptimizerRules;
 use crate::table::TableRegistry;
-use crate::table::apply::TABLE_APPLY_NODE_NAME;
 use crate::types::bigint_sql_preprocessor::preprocess_bigint_sql;
 use crate::{streamling_err, streamling_user_err};
 use datafusion::catalog::memory::MemorySchemaProvider;
@@ -407,14 +406,46 @@ impl SessionManager {
                         extension.node.inputs()[0],
                         subquery_handling,
                     ),
-                    TABLE_APPLY_NODE_NAME => Self::validate_plan_and_extract_source_name(
-                        extension.node.inputs()[0],
-                        subquery_handling,
-                    ),
                     _ => Err(streamling_user_err!("unsupported extension: {}", name).into()),
                 }
             }
             _ => Err(streamling_user_err!("unsupported plan: {}", plan.display()).into()),
+        }
+    }
+
+    /// Extract expressions from a SQL query. Only Projection and Filter are supported.
+    /// Returns a tuple of (projection expressions, optional filter expression)
+    pub fn extract_expressions_from_sql_query(
+        plan: &LogicalPlan,
+    ) -> Result<(Vec<Expr>, Option<Expr>)> {
+        match plan {
+            LogicalPlan::Projection(projection) => {
+                let exprs = projection.expr.clone();
+                // Unwrap common wrapper nodes to find an optional Filter or base scan
+                let mut current = projection.input.as_ref();
+                let filter_expr: Option<Expr> = loop {
+                    match current {
+                        LogicalPlan::Filter(filter) => break Some(filter.predicate.clone()),
+                        LogicalPlan::TableScan(_) => break None,
+                        LogicalPlan::SubqueryAlias(alias) => {
+                            current = alias.input.as_ref();
+                        }
+                        // Treat Extension as a valid base (e.g., custom table provider)
+                        LogicalPlan::Extension(_) => break None,
+                        _ => return Err(unsupported_query().into()),
+                    }
+                };
+                Ok((exprs, filter_expr))
+            }
+            LogicalPlan::Filter(filter) => {
+                let filter_expr = filter.predicate.clone();
+                Ok((vec![], Some(filter_expr)))
+            }
+            // Allow top-level wrappers by delegating to their inputs
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::extract_expressions_from_sql_query(alias.input.as_ref())
+            }
+            _ => Err(unsupported_query().into()),
         }
     }
 
@@ -596,6 +627,10 @@ impl SessionManager {
             None => (DEFAULT_SCHEMA_NAME, full_table_name),
         }
     }
+}
+
+fn unsupported_query() -> crate::error::StreamlingError {
+    streamling_user_err!("only Projection and Filter SQL queries are supported")
 }
 
 // TODO: more test coverage
@@ -915,5 +950,141 @@ mod tests {
                 "wrong result for `{sql}`"
             );
         }
+    }
+
+    async fn plan_over_test_table(sql: &str) -> LogicalPlan {
+        let session_manager = SessionManager::new(1000, 10, DynamicTableRegistry::new(), 1)
+            .expect("test session manager initialisation failed");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        session_manager
+            .register_table(
+                "test_table",
+                Arc::new(datafusion::datasource::empty::EmptyTable::new(schema)),
+            )
+            .unwrap();
+        session_manager
+            .create_logical_plan(String::from(sql))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_simple_select() {
+        let plan = plan_over_test_table("SELECT * FROM test_table").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(result.is_ok(), "Should successfully parse simple SELECT *");
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        // For SELECT *, we expect wildcard expressions for each column
+        assert!(
+            !projection_exprs.is_empty(),
+            "Should have projection expressions for SELECT *"
+        );
+        assert!(filter_expr.is_none(), "Should have no filter expression");
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_projection() {
+        let plan = plan_over_test_table("SELECT id, name FROM test_table").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(result.is_ok(), "Should successfully parse projection query");
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        assert_eq!(
+            projection_exprs.len(),
+            2,
+            "Should have 2 projection expressions"
+        );
+        assert!(filter_expr.is_none(), "Should have no filter expression");
+
+        // Verify the expressions are column references
+        match &projection_exprs[0] {
+            Expr::Column(_) => (),
+            _ => panic!("First expression should be a column reference"),
+        }
+        match &projection_exprs[1] {
+            Expr::Column(_) => (),
+            _ => panic!("Second expression should be a column reference"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_filter_only() {
+        let plan = plan_over_test_table("SELECT * FROM test_table WHERE id > 10").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(
+            result.is_ok(),
+            "Should successfully parse query with WHERE clause"
+        );
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        assert!(
+            !projection_exprs.is_empty(),
+            "Should have projection expressions"
+        );
+        assert!(filter_expr.is_some(), "Should have filter expression");
+
+        // Verify the filter expression is a binary expression
+        let filter = filter_expr.unwrap();
+        match filter {
+            Expr::BinaryExpr(_) => (),
+            _ => panic!("Filter expression should be a binary expression"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_projection_and_filter() {
+        let plan = plan_over_test_table("SELECT id, name FROM test_table WHERE id > 10").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(
+            result.is_ok(),
+            "Should successfully parse projection with WHERE clause"
+        );
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        assert_eq!(
+            projection_exprs.len(),
+            2,
+            "Should have 2 projection expressions"
+        );
+        assert!(filter_expr.is_some(), "Should have filter expression");
+
+        // Verify the projection expressions are column references
+        match &projection_exprs[0] {
+            Expr::Column(_) => (),
+            _ => panic!("First expression should be a column reference"),
+        }
+        match &projection_exprs[1] {
+            Expr::Column(_) => (),
+            _ => panic!("Second expression should be a column reference"),
+        }
+
+        // Verify the filter expression is a binary expression
+        let filter = filter_expr.unwrap();
+        match filter {
+            Expr::BinaryExpr(_) => (),
+            _ => panic!("Filter expression should be a binary expression"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_unsupported_query() {
+        // Test an unsupported query type (GROUP BY)
+        let plan = plan_over_test_table("SELECT COUNT(*) FROM test_table GROUP BY id").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(result.is_err(), "Should fail for unsupported query types");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("only Projection and Filter SQL queries are supported"),
+            "Error should mention unsupported query type, got: {error_msg}"
+        );
     }
 }
