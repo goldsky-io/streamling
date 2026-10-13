@@ -102,7 +102,11 @@ pub(crate) fn plain_layout_field(field: &Field) -> Option<Field> {
             // themselves be run-end encoded, with extension metadata and
             // nullability on their own values field. Unwrapping only the
             // DataType loses both before the run-end branch can see them.
-            let values = field_with_type(field, values.as_ref().clone());
+            //
+            // Always nullable: Arrow counts only key nulls toward a
+            // dictionary's validity, so a non-nullable dictionary can still
+            // point at a null value, which the cast surfaces as a null.
+            let values = field_with_type(field, values.as_ref().clone()).with_nullable(true);
             Some(plain_layout_field(&values).unwrap_or(values))
         }
         DataType::RunEndEncoded(_, values) => {

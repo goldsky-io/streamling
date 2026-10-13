@@ -24,6 +24,47 @@ fn base_opts() -> PipelineOpts {
         .env("STREAMLING__PLUGIN__SIDE_OUTPUT_IDS", "")
 }
 
+/// Pipeline YAML: kafka `topic` -> Print (JSON).
+fn print_from(topic: &str) -> String {
+    format!(
+        r#"
+sources:
+  src:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  out:
+    type: print
+    from: src
+"#
+    )
+}
+
+/// Pipeline YAML: kafka(avro) `input` -> Kafka Avro sink on `output`.
+fn avro_sink(input: &str, output: &str) -> String {
+    format!(
+        r#"
+sources:
+  src:
+    type: kafka
+    topic: {input}
+    starting_offsets: earliest
+    primary_key: id
+transforms: {{}}
+sinks:
+  ksink:
+    type: kafka
+    from: src
+    topic: {output}
+    topic_partitions: 1
+    data_format: avro
+"#
+    )
+}
+
 // record { id: long, inner: record { amt: decimal(100,0) } }
 const NESTED_STRUCT_SCHEMA: &str = r#"{
     "type": "record", "name": "R",
@@ -73,24 +114,8 @@ async fn nested_struct_decimal_arb_to_print_json() {
         .await
         .unwrap();
 
-    let yaml = format!(
-        r#"
-sources:
-  src:
-    type: kafka
-    topic: {input}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  out:
-    type: print
-    from: src
-"#,
-        input = ctx.kafka_topic,
-    );
     let captured = ctx
-        .run_pipeline_with_capture(&yaml, base_opts().record_limit(1))
+        .run_pipeline_with_capture(&print_from(&ctx.kafka_topic), base_opts().record_limit(1))
         .await
         .unwrap();
 
@@ -130,24 +155,8 @@ async fn array_of_decimal_arb_to_print_json() {
         .await
         .unwrap();
 
-    let yaml = format!(
-        r#"
-sources:
-  src:
-    type: kafka
-    topic: {input}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  out:
-    type: print
-    from: src
-"#,
-        input = ctx.kafka_topic,
-    );
     let captured = ctx
-        .run_pipeline_with_capture(&yaml, base_opts().record_limit(1))
+        .run_pipeline_with_capture(&print_from(&ctx.kafka_topic), base_opts().record_limit(1))
         .await
         .unwrap();
 
@@ -190,28 +199,11 @@ async fn nested_struct_decimal_arb_kafka_avro_sink_round_trip() {
     let out_topic = ctx.create_kafka_topic("nestout").await.unwrap();
 
     // Pipeline 1: kafka(avro) source -> kafka(avro) sink. Must succeed now.
-    let p1 = format!(
-        r#"
-sources:
-  src:
-    type: kafka
-    topic: {input}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  ksink:
-    type: kafka
-    from: src
-    topic: {output}
-    topic_partitions: 1
-    data_format: avro
-"#,
-        input = ctx.kafka_topic,
-        output = out_topic.topic,
-    );
     let s1 = ctx
-        .run_pipeline_with_opts(&p1, base_opts().record_limit(1))
+        .run_pipeline_with_opts(
+            &avro_sink(&ctx.kafka_topic, &out_topic.topic),
+            base_opts().record_limit(1),
+        )
         .await
         .unwrap();
     assert!(
@@ -221,24 +213,8 @@ sinks:
 
     // Pipeline 2: read the avro-sink output back -> Print (JSON). The nested
     // decimal must render its value (decode C1 + JSON render F6), not hex.
-    let p2 = format!(
-        r#"
-sources:
-  src2:
-    type: kafka
-    topic: {output}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  out:
-    type: print
-    from: src2
-"#,
-        output = out_topic.topic,
-    );
     let captured = ctx
-        .run_pipeline_with_capture(&p2, base_opts().record_limit(1))
+        .run_pipeline_with_capture(&print_from(&out_topic.topic), base_opts().record_limit(1))
         .await
         .unwrap();
     let blob = format!("{:?}", captured.column_values("inner"));
@@ -330,71 +306,31 @@ sinks:
         run.stderr,
     );
 
-    let registered: serde_json::Value = reqwest::Client::new()
-        .get(format!(
-            "{}/subjects/{}-value/versions/latest",
-            ctx.config.schema_registry_url, output.topic,
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let registered: serde_json::Value = reqwest::get(format!(
+        "{}/subjects/{}-value/versions/latest",
+        ctx.config.schema_registry_url, output.topic,
+    ))
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    // Parsed and re-serialized so registry formatting cannot matter (records
+    // serialize their short name, namespace apart). Each list's item record
+    // keeps its short `item_*` name in its column's namespace; were the
+    // namespace lost, the two would collide and the writer rename one.
     let schema = apache_avro::Schema::parse_str(registered["schema"].as_str().unwrap()).unwrap();
-    fn non_null(schema: &apache_avro::Schema) -> &apache_avro::Schema {
-        match schema {
-            apache_avro::Schema::Union(union) => union
-                .variants()
-                .iter()
-                .find(|s| !matches!(s, apache_avro::Schema::Null))
-                .unwrap(),
-            other => other,
-        }
-    }
-    fn field<'a>(schema: &'a apache_avro::Schema, name: &str) -> &'a apache_avro::Schema {
-        let apache_avro::Schema::Record(record) = non_null(schema) else {
-            panic!("expected record, got {schema:?}");
-        };
-        &record.fields[*record.lookup.get(name).unwrap()].schema
-    }
-    let item_name = |column| {
-        let apache_avro::Schema::Array(array) = non_null(field(field(&schema, column), "l")) else {
-            panic!("expected list in {column}");
-        };
-        let apache_avro::Schema::Record(item) = non_null(&array.items) else {
-            panic!("expected record item in {column}");
-        };
-        item.name.clone()
-    };
-    let left = item_name("a__x");
-    let right = item_name("b__x");
+    let schema = serde_json::to_string(&schema).unwrap();
     assert_eq!(
-        left.name, right.name,
-        "distinct namespaces are not collisions"
+        schema.matches(r#""name":"item_"#).count(),
+        2,
+        "both list items keep their short record name: {schema}"
     );
-    assert_ne!(left.fullname(None), right.fullname(None));
 
-    let readback = format!(
-        r#"
-sources:
-  src:
-    type: kafka
-    topic: {output}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  out:
-    type: print
-    from: src
-"#,
-        output = output.topic,
-    );
     let captured = ctx
-        .run_pipeline_with_capture(&readback, base_opts().record_limit(1))
+        .run_pipeline_with_capture(&print_from(&output.topic), base_opts().record_limit(1))
         .await
         .unwrap();
     for column in ["a__x", "b__x"] {
@@ -443,28 +379,11 @@ async fn two_arrays_of_records_with_wide_decimals_kafka_avro_sink_round_trip() {
         .unwrap();
 
     let out_topic = ctx.create_kafka_topic("twolists").await.unwrap();
-    let p1 = format!(
-        r#"
-sources:
-  src:
-    type: kafka
-    topic: {input}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  ksink:
-    type: kafka
-    from: src
-    topic: {output}
-    topic_partitions: 1
-    data_format: avro
-"#,
-        input = ctx.kafka_topic,
-        output = out_topic.topic,
-    );
     let s1 = ctx
-        .run_pipeline_with_opts(&p1, base_opts().record_limit(1))
+        .run_pipeline_with_opts(
+            &avro_sink(&ctx.kafka_topic, &out_topic.topic),
+            base_opts().record_limit(1),
+        )
         .await
         .unwrap();
     assert!(
@@ -472,39 +391,18 @@ sinks:
         "two arrays of records must encode to the Avro sink"
     );
 
-    let p2 = format!(
-        r#"
-sources:
-  src2:
-    type: kafka
-    topic: {output}
-    starting_offsets: earliest
-    primary_key: id
-transforms: {{}}
-sinks:
-  out:
-    type: print
-    from: src2
-"#,
-        output = out_topic.topic,
-    );
     let captured = ctx
-        .run_pipeline_with_capture(&p2, base_opts().record_limit(1))
+        .run_pipeline_with_capture(&print_from(&out_topic.topic), base_opts().record_limit(1))
         .await
         .unwrap();
-    let traces = format!("{:?}", captured.column_values("traces"));
-    let transactions = format!("{:?}", captured.column_values("transactions"));
-    for (blob, values) in [
-        (&traces, &["1", "1000000000000000000"][..]),
-        (&transactions, &[U256_MAX, I256_MIN][..]),
-    ] {
-        for v in values {
-            assert!(
-                blob.contains(&format!("\"{v}\"")),
-                "{v} missing after the Avro sink round trip; got: {blob}"
-            );
-        }
-    }
+    assert_eq!(
+        captured.column_values("traces"),
+        [&serde_json::json!([{"amt": "1"}, null, {"amt": "1000000000000000000"}])]
+    );
+    assert_eq!(
+        captured.column_values("transactions"),
+        [&serde_json::json!([{"amt": U256_MAX}, {"amt": I256_MIN}])]
+    );
 }
 
 // record { id: long, items: array<record { amt: decimal(100,18) }> }
@@ -517,25 +415,6 @@ const ARRAY_STRUCT_WIDE_FRACTION_SCHEMA: &str = r#"{
         ]}}}
     ]
 }"#;
-
-fn clickhouse_opts(ctx: &TestContext) -> PipelineOpts {
-    let clickhouse = ctx
-        .clickhouse
-        .as_ref()
-        .expect("ClickHouse should be enabled");
-    base_opts()
-        .record_limit(1)
-        .env(
-            "STREAMLING__CLICKHOUSE_SINK__URL",
-            &ctx.config.clickhouse_url,
-        )
-        .env(
-            "STREAMLING__CLICKHOUSE_SINK__DATABASE",
-            &clickhouse.database,
-        )
-        .env("STREAMLING__CLICKHOUSE_SINK__USER", "default")
-        .env("STREAMLING__CLICKHOUSE_SINK__PASSWORD", "")
-}
 
 fn array_to_clickhouse_yaml(ctx: &TestContext) -> String {
     format!(
@@ -596,7 +475,7 @@ async fn array_of_wide_decimal_arb_to_clickhouse_with_coerce_to_string() {
     let output = ctx
         .run_pipeline_raw(
             &array_to_clickhouse_yaml(&ctx),
-            clickhouse_opts(&ctx).env(
+            base_opts().record_limit(1).env(
                 "STREAMLING__CLICKHOUSE_SINK__COLUMNS",
                 r#"[{"name":"items","coerce_to":"string"}]"#,
             ),
@@ -616,13 +495,7 @@ async fn array_of_wide_decimal_arb_to_clickhouse_with_coerce_to_string() {
         .iter()
         .find(|(name, _)| name == "items")
         .expect("items column");
-    assert!(
-        items.1.starts_with("Array(Tuple(")
-            && items.1.contains("amt")
-            && items.1.contains("String"),
-        "items must be an Array(Tuple(amt String)), got {}",
-        items.1,
-    );
+    assert_eq!(items.1, "Array(Tuple(amt String))");
     let values: String = clickhouse
         .query_one("SELECT toString(arrayMap(t -> t.1, items)) FROM nested_items")
         .await
@@ -642,13 +515,25 @@ async fn array_of_wide_decimal_arb_to_clickhouse_without_directive_is_rejected()
     let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
         .await
         .unwrap();
+    // A record to read, so a regression that accepts the config finishes
+    // fast and fails the assertion below instead of timing out.
+    let rec = Value::Record(vec![
+        ("id".to_string(), Value::Long(1)),
+        (
+            "items".to_string(),
+            Value::Array(vec![Value::Record(vec![(
+                "amt".to_string(),
+                decimal_val("1"),
+            )])]),
+        ),
+    ]);
     ctx.kafka
-        .register_schema(ARRAY_STRUCT_WIDE_FRACTION_SCHEMA)
+        .produce_avro_value(ARRAY_STRUCT_WIDE_FRACTION_SCHEMA, rec)
         .await
         .unwrap();
 
     let output = ctx
-        .run_pipeline_raw(&array_to_clickhouse_yaml(&ctx), clickhouse_opts(&ctx))
+        .run_pipeline_raw(&array_to_clickhouse_yaml(&ctx), base_opts().record_limit(1))
         .await
         .unwrap();
     assert!(!output.status.success(), "pipeline must be rejected");

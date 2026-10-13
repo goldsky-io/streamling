@@ -257,9 +257,10 @@ pub fn capability_for_decimal_arb(
 ///   existing tables rely on.) A wide unhinted leaf is rejected with a hint
 ///   that does not point at `schema_override`, whose native-int pins match
 ///   top-level columns only.
-/// - **Postgres**: a container column is written as JSONB text, where a
-///   nested leaf is a decimal string of any precision, so `NUMERIC`'s
-///   precision cap does not apply to it.
+/// - **Postgres**: a top-level Struct / List / LargeList / FixedSizeList / Map
+///   column is written as JSONB text, where a nested leaf is a decimal string
+///   of any precision, so `NUMERIC`'s precision cap does not apply to it. The
+///   validator applies that cap to leaves under any other top-level layout.
 pub fn capability_for_nested_decimal_arb(
     kind: ConnectorKind,
     precision: u32,
@@ -481,7 +482,8 @@ fn collect_nested_in_type(
 /// directive: every connector that writes whole containers (JSON, Avro,
 /// ClickHouse `Array` / `Tuple` / `Map`, Postgres JSONB, …) carries the leaf
 /// when it would carry the column, and Postgres carries it at any precision
-/// as JSON text. Hybrid converts top-level columns only, so a nested
+/// as JSON text under a column it writes as JSONB. Hybrid converts top-level
+/// columns only, so a nested
 /// leaf is rejected outright there rather than written as raw bytes, and a
 /// leaf anywhere inside a `Union` is rejected for every connector because
 /// nothing serialises decimal_arb through one.
@@ -542,7 +544,20 @@ pub fn validate_pipeline_decimal_arb(
                 ));
                 continue;
             }
-            let capability = if i >= top_level {
+            // Postgres JSON-encodes only these top-level layouts
+            // (`postgres/projection.rs`); a leaf under any other reaches
+            // NUMERIC, whose cap then applies.
+            let nested = i >= top_level
+                && (!matches!(kind, ConnectorKind::Postgres)
+                    || matches!(
+                        field.data_type(),
+                        arrow_schema::DataType::Struct(_)
+                            | arrow_schema::DataType::List(_)
+                            | arrow_schema::DataType::LargeList(_)
+                            | arrow_schema::DataType::FixedSizeList(_, _)
+                            | arrow_schema::DataType::Map(_, _)
+                    ));
+            let capability = if nested {
                 capability_for_nested_decimal_arb(kind, precision, scale, coerce_to_string, hint)
             } else {
                 capability_for_decimal_arb(kind, precision, scale, coerce_to_string, hint)
@@ -1276,6 +1291,49 @@ mod tests {
         assert!(validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_ok());
         let top = Schema::new(vec![DecimalArbType::field("value", 1200, 0, true).unwrap()]);
         assert!(validate_pipeline_decimal_arb(&top, ConnectorKind::Postgres, &[]).is_err());
+    }
+
+    #[test]
+    fn postgres_caps_nested_leaves_outside_the_jsonb_layouts() {
+        use std::sync::Arc;
+        // Postgres JSON-encodes only top-level Struct / List / LargeList /
+        // FixedSizeList / Map columns; a leaf under any other layout reaches
+        // NUMERIC, so its cap applies at config load, not on every batch.
+        let leaf = || Arc::new(DecimalArbType::field("amt", 1200, 0, true).unwrap());
+        let list = || DataType::List(leaf());
+        let rejected = [
+            Field::new("c", DataType::ListView(leaf()), true),
+            Field::new("c", DataType::LargeListView(leaf()), true),
+            Field::new(
+                "c",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(list())),
+                true,
+            ),
+            Field::new(
+                "c",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    leaf(),
+                ),
+                true,
+            ),
+        ];
+        for field in rejected {
+            let dt = field.data_type().clone();
+            let schema = Schema::new(vec![field]);
+            assert!(
+                validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_err(),
+                "{dt} accepted"
+            );
+        }
+        let accepted = [
+            Field::new("c", list(), true),
+            Field::new("c", DataType::Struct(vec![leaf()].into()), true),
+        ];
+        for field in accepted {
+            let schema = Schema::new(vec![field]);
+            assert!(validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_ok());
+        }
     }
 
     #[test]

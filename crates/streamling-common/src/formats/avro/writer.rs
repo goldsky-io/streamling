@@ -2419,12 +2419,19 @@ mod tests {
         .map(|v| v.map(str::to_string))
         .collect();
         assert_eq!(seen, expected);
-        // The dictionary column is written as its string values.
+        // The dictionary column is written as its string values, nullable
+        // since a dictionary's values may hold nulls its keys do not show.
         let rows = serialize(&avro_schema, &batch);
         let Value::Record(fields) = &rows[1] else {
             panic!("{:?}", rows[1])
         };
-        assert_eq!(fields[4], ("dict".to_string(), Value::String("y".into())));
+        assert_eq!(
+            fields[4],
+            (
+                "dict".to_string(),
+                Value::Union(1, Box::new(Value::String("y".into())))
+            )
+        );
     }
 
     /// A column the writer has no Avro encoding for is reported, naming the
@@ -2793,6 +2800,53 @@ mod tests {
         assert_eq!(r(2), Value::Union(0, Box::new(Value::Null)));
         for value in rows {
             apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
+        }
+    }
+
+    /// Arrow counts only key nulls toward a dictionary's validity, so a
+    /// non-nullable dictionary column may still point at a null value. It is
+    /// declared and written nullable, so that value reads back as Avro null.
+    #[test]
+    fn dictionary_column_with_null_values_encodes_as_nullable() {
+        use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType};
+        use datafusion::arrow::array::{DictionaryArray, Int32Array, StringArray};
+        use datafusion::arrow::datatypes::Int32Type;
+
+        let strings = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0]),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        )
+        .unwrap();
+        let mut builder = DecimalArbArrayBuilder::with_capacity(1, "d", 78, 0).unwrap();
+        builder.append_null();
+        let (raw, _, _) = builder.finish().into_inner();
+        let decimals =
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), Arc::new(raw))
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", strings.data_type().clone(), false),
+            Field::new("d", decimals.data_type().clone(), false).with_metadata(
+                DecimalArbType::field("d", 78, 0, false)
+                    .unwrap()
+                    .metadata()
+                    .clone(),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(strings), Arc::new(decimals)],
+        )
+        .unwrap();
+        let avro_schema = try_to_avro("R", &schema.fields).unwrap();
+        for value in serialize(&avro_schema, &batch) {
+            let datum = apache_avro::to_avro_datum(&avro_schema, value).expect("valid datum");
+            let decoded =
+                apache_avro::from_avro_datum(&avro_schema, &mut datum.as_slice(), None).unwrap();
+            let null = Value::Union(0, Box::new(Value::Null));
+            assert_eq!(
+                decoded,
+                Value::Record(vec![("s".into(), null.clone()), ("d".into(), null)])
+            );
         }
     }
 
