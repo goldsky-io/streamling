@@ -57,4 +57,4 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           GITHUB_ACTIONS=false kache save-manifest --manifest-key streamling-plugin-examples --namespace streamling-plugin-examples
-          GITHUB_ACTIONS=false kache sync --push
+          cd "$RUNNER_TEMP" && GITHUB_ACTIONS=false kache sync --push
