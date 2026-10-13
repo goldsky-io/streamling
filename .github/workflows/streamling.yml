@@ -293,10 +293,14 @@ jobs:
   # ==========================================================================
   # Image push jobs: download pre-built binary and package into Docker image.
   # No Rust compilation needed — just checkout (for Dockerfile) + Docker push.
+  # main publishes on every push. Other branches publish only from a manual
+  # workflow_dispatch run, and wait for a reviewer of the `branch-image`
+  # environment to approve before pushing.
   # ==========================================================================
   build-and-push-image-main:
     needs: [validate-and-test, e2e-tests, build-release-main]
-    if: ${{ always() && github.ref_name == 'main' && needs.build-release-main.result == 'success' }}
+    if: ${{ always() && (github.ref_name == 'main' || github.event_name == 'workflow_dispatch') && needs.build-release-main.result == 'success' }}
+    environment: ${{ github.ref_name != 'main' && 'branch-image' || '' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       id-token: write
@@ -366,7 +370,7 @@ jobs:
 
   create-manifest-main:
     needs: [build-and-push-image-main]
-    if: ${{ always() && github.ref_name == 'main' && needs.build-and-push-image-main.result == 'success' }}
+    if: ${{ always() && needs.build-and-push-image-main.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
