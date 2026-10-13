@@ -539,6 +539,62 @@ fn starved_span_for_poll<T, E>(poll_result: &Option<Result<T, E>>, waited: Durat
     }
 }
 
+/// Counts zero-row data batches for `node_empty_batches`. A selective filter
+/// emits one empty batch per input batch, so one recorder call per batch would
+/// cost a tag-map clone and global locks at the input rate. This emits at most
+/// once per millisecond, the same cap as `node_wait`, and flushes the rest on
+/// drop, so no count is lost when the stream ends or is cancelled.
+struct EmptyBatchCounter {
+    recorder: Arc<MetricsRecorder>,
+    metric_metadata_id: String,
+    pending: u64,
+    flushed_at: Instant,
+}
+
+impl EmptyBatchCounter {
+    const FLUSH_INTERVAL: Duration = Duration::from_millis(1);
+
+    fn new(recorder: Arc<MetricsRecorder>, metric_metadata_id: String) -> Self {
+        Self {
+            recorder,
+            metric_metadata_id,
+            pending: 0,
+            flushed_at: Instant::now(),
+        }
+    }
+
+    /// Called for every delivered batch, so a remainder left by a burst is
+    /// flushed by the next batch at least 1ms later, empty or not.
+    fn observe(&mut self, is_empty_data_batch: bool) {
+        self.pending += u64::from(is_empty_data_batch);
+        if self.pending == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if now - self.flushed_at >= Self::FLUSH_INTERVAL {
+            self.flush();
+            self.flushed_at = now;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending > 0 {
+            self.recorder.record_count_w_tags(
+                "node_empty_batches",
+                std::mem::take(&mut self.pending),
+                vec![],
+                &self.metric_metadata_id,
+            );
+        }
+    }
+}
+
+impl Drop for EmptyBatchCounter {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 /// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
 /// attributes and dynamic tables
 #[derive(Debug, Clone)]
@@ -806,6 +862,8 @@ impl ExecutionPlan for WrappingExec {
             let mut blocked = MillisAccumulator::default();
             let mut starved = MillisAccumulator::default();
             let mut last_yield: Option<Instant> = None;
+            let mut empty_batches =
+                EmptyBatchCounter::new(Arc::clone(&metrics_recorder), metric_metadata_id.clone());
             loop {
                 // Resume point: the span since the previous `yield` is the
                 // downstream-induced suspension (blocked). The first iteration
@@ -918,14 +976,7 @@ impl ExecutionPlan for WrappingExec {
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
                         // A zero-row batch that carries checkpoint messages is
                         // control traffic; only an empty *data* batch counts.
-                        if batch.num_rows() == 0 && checkpoint_messages.is_empty() {
-                            metrics_recorder.record_count_w_tags(
-                                "node_empty_batches",
-                                1,
-                                vec![],
-                                &metric_metadata_id,
-                            );
-                        }
+                        empty_batches.observe(batch.num_rows() == 0 && checkpoint_messages.is_empty());
                         for message in &checkpoint_messages {
                             if let CheckpointMessage::Marker { created_at_ms, .. } = message {
                                 let arrival_latency_ms = now_ms().saturating_sub(*created_at_ms);
@@ -2365,6 +2416,53 @@ mod tests {
             test_support::counter_total("node_empty_batches", node_id),
             2,
             "two empty data batches; the marker-only batch is not counted"
+        );
+    }
+
+    /// A burst of empty batches is emitted at most once per millisecond, so
+    /// most of the burst is held back. Cancelling the stream mid-run must still
+    /// flush the held-back count instead of dropping it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn empty_batch_burst_is_fully_counted_when_the_stream_is_cancelled() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "empty_batches_burst_cancel";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mut batches = vec![RecordBatch::new_empty(schema.clone()); 200];
+        batches.push(test_batch());
+        let source_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[batches],
+            schema,
+            None,
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        for _ in 0..200 {
+            stream
+                .next()
+                .await
+                .expect("batch")
+                .expect("batch must be Ok");
+        }
+        // The data batch is never polled: the stream is cancelled mid-run.
+        drop(stream);
+
+        assert_eq!(
+            test_support::counter_total("node_empty_batches", node_id),
+            200
         );
     }
 

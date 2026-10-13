@@ -352,7 +352,10 @@ impl MetricsRecorder {
             .get(metadata_id)
             .cloned();
         if metric_metadata_tags.is_none() {
-            warn!(
+            // Per-batch callers (`node_wait`, `node_empty_batches`) hit this for
+            // every emission, so log at debug like the silent skip in
+            // `record_execution_plan_metrics` instead of flooding WARN.
+            debug!(
                 "record_count_w_tags: metadata_id '{}' not found in registry, skipping metric '{}'",
                 metadata_id, name
             );
