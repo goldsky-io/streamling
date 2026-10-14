@@ -37,8 +37,6 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2204
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_CACHE_SIZE: "10G"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
@@ -46,21 +44,19 @@ jobs:
         with:
           toolchain: 1.91.1
           components: clippy, rustfmt
-      - name: Install sccache
-        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
+      # kache setup mirrors streamling.yml (see the comment there).
+      - name: Setup kache
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache
-      - name: Set SCCACHE_DIR env
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-${{ runner.os }}-1.91.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-release-${{ runner.os }}-1.91.1-
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: streamling-check-test
+          cache-c-cpp: "true"
+          pr-comment: "false"
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
@@ -80,7 +76,6 @@ jobs:
           RUST_LOG: info
           CARGO_INCREMENTAL: 0
           CARGO_PROFILE_TEST_DEBUG: 0
-          RUSTC_WRAPPER: sccache
         timeout-minutes: 15
 
   # Resolve the release version/tag from the `streamling` crate and refuse to
@@ -156,25 +151,19 @@ jobs:
         uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
         with:
           toolchain: 1.91.1
-      - name: Install sccache
+      - name: Setup kache
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          tool: sccache
-      - name: Set SCCACHE_DIR env
-        if: steps.bin-cache.outputs.cache-hit != 'true'
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> $GITHUB_ENV
-      - name: Prepare sccache dir
-        if: steps.bin-cache.outputs.cache-hit != 'true'
-        run: mkdir -p "$SCCACHE_DIR"
-      - name: Cache sccache
-        if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.91.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-release-opt-${{ matrix.os }}-${{ matrix.arch }}-1.91.1-
+          version: v0.28.1
+          s3-bucket: github-action-kache
+          s3-endpoint: https://t3.storage.dev
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_TIGRIS_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_TIGRIS_SECRET_ACCESS_KEY }}
+          manifest-key: streamling-release-opt-${{ matrix.arch }}
+          cache-c-cpp: "true"
+          pr-comment: "false"
       - name: Setup rust cache
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
@@ -187,13 +176,11 @@ jobs:
         run: cargo build --profile release-optimized --locked
         env:
           CARGO_INCREMENTAL: 0
-          RUSTC_WRAPPER: sccache
-          SCCACHE_CACHE_SIZE: "10G"
           LIBZ_SYS_STATIC: 1
           PKG_CONFIG_ALL_STATIC: 1
-      - name: Show sccache stats
+      - name: Show kache stats
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        run: sccache --show-stats || true
+        run: kache stats || true
       - name: Upload release binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
