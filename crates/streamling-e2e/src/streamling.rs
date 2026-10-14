@@ -55,6 +55,42 @@ fn construct_program_with_args(binary_path: Option<&Path>) -> (String, Vec<Strin
     }
 }
 
+/// SIGKILLs a child and its own children when dropped while armed. Under
+/// `cargo run` the streamling binary is cargo's child, so killing only the
+/// direct child (`kill_on_drop`) leaves it running. The child stays in the
+/// caller's process group, where nextest's Ctrl-C and timeout signals reach
+/// it.
+struct ChildTreeKillGuard {
+    pid: Option<u32>,
+}
+
+impl ChildTreeKillGuard {
+    fn new(child: &tokio::process::Child) -> Self {
+        Self { pid: child.id() }
+    }
+
+    /// The child exited on its own: never signal its (possibly reused) pid.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ChildTreeKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            let pid = pid.to_string();
+            // Children first: once the parent dies they reparent and `-P`
+            // no longer finds them.
+            let _ = std::process::Command::new("pkill")
+                .args(["-KILL", "-P", &pid])
+                .status();
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .status();
+        }
+    }
+}
+
 /// Run the streamling binary with the given pipeline file
 pub async fn run_streamling(
     pipeline_path: &Path,
@@ -65,6 +101,9 @@ pub async fn run_streamling(
     let (program, args) = construct_program_with_args(binary_path);
 
     let mut cmd = Command::new(&program);
+    // Callers bound unbounded pipelines with a timeout that drops this future;
+    // the guard below then kills the process tree, so streamling does not
+    // outlive the test and keep consuming.
 
     // Add cargo args if using cargo run
     for arg in &args {
@@ -105,6 +144,7 @@ pub async fn run_streamling(
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
+        let mut guard = ChildTreeKillGuard::new(&child);
 
         // Spawn tasks to stream stdout/stderr
         let stdout_handle = child.stdout.take().map(|stdout| {
@@ -131,6 +171,7 @@ pub async fn run_streamling(
 
         // Wait for process to finish
         let exit_status = child.wait().await?;
+        guard.disarm();
 
         // Wait for output streams to finish
         if let Some(handle) = stdout_handle {
@@ -143,7 +184,13 @@ pub async fn run_streamling(
         exit_status
     } else {
         // Capture output (original behavior)
-        let output = cmd.output().await?;
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let child = cmd.spawn()?;
+        let mut guard = ChildTreeKillGuard::new(&child);
+        let output = child.wait_with_output().await?;
+        guard.disarm();
 
         // Log captured output
         if !output.stdout.is_empty() {
@@ -497,4 +544,107 @@ pub async fn run_streamling_raw(
         stdout,
         stderr,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn is_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn pgid_of(pid: &str) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", pid])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// nextest delivers Ctrl-C and its timeout signals to the test's process
+    /// group; a run in a group of its own never gets them and is orphaned.
+    #[tokio::test]
+    async fn run_stays_in_the_callers_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("wrapper.pid");
+        let wrapper = dir.path().join("wrapper.sh");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\necho $$ > {}\nsleep 1\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pipeline = dir.path().join("pipeline.yaml");
+        let wrapper_pgid = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .filter(|pid| pid.ends_with('\n'))
+                {
+                    return pgid_of(pid.trim());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (exit, wrapper_pgid) =
+            tokio::join!(run_streamling(&pipeline, Some(&wrapper), &[]), wrapper_pgid);
+        exit.unwrap();
+        assert_eq!(wrapper_pgid, pgid_of(&std::process::id().to_string()));
+    }
+
+    /// `cargo run` is a wrapper: the streamling binary is a grandchild of the
+    /// test. Dropping a run (a test's timeout) must kill it, not only cargo.
+    #[tokio::test]
+    async fn dropping_a_run_kills_the_wrapped_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let wrapper = dir.path().join("wrapper.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > {}\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pipeline = dir.path().join("pipeline.yaml");
+        let run = run_streamling(&pipeline, Some(&wrapper), &[]);
+        // Resolves once the grandchild runs; `select!` then drops the run.
+        let pid = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .filter(|pid| pid.ends_with('\n') && is_alive(pid.trim()))
+                {
+                    return pid.trim().to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let pid = tokio::select! {
+            exit = run => panic!("wrapper exited early: {exit:?}"),
+            pid = pid => pid,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while is_alive(&pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let survived = is_alive(&pid);
+        if survived {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .status();
+        }
+        assert!(!survived, "grandchild {pid} outlived the dropped run");
+    }
 }

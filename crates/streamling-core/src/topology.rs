@@ -992,11 +992,13 @@ pub(crate) const MAX_LABEL_VALUE_LEN: usize = 256;
 /// would find zero series with no diagnostic. Hybrid reserves both
 /// `table` and `topic` because its bounded phase emits `table` and its
 /// unbounded phase emits `topic`, and parent labels propagate to both.
+/// Kafka consumption (including hybrid's unbounded phase) also reserves
+/// `partition`, which tags each point of the consumer lag gauge.
 fn source_per_type_reserved_keys(source: &Source) -> &'static [&'static str] {
     match source {
-        Source::kafka(_) => &["topic"],
+        Source::kafka(_) => &["topic", "partition"],
         Source::clickhouse(_) => &["table"],
-        Source::hybrid(_) => &["table", "topic"],
+        Source::hybrid(_) => &["table", "topic", "partition"],
         Source::file(_) => &["path"],
         Source::plugin(_) => &["type"],
     }
@@ -2917,6 +2919,51 @@ sources:
     telemetry:
       labels:
         table: override
+transforms: {}
+sinks: {}
+"#;
+        let err = PipelineTopology::load_from_string(yaml).expect_err("should reject");
+        assert!(err.to_string().contains("reserved for this source kind"));
+    }
+
+    #[test]
+    fn test_labels_partition_rejected_on_kafka_source() {
+        // The Kafka lag gauge tags each point with the real `partition`.
+        let yaml = r#"
+sources:
+  s1:
+    type: kafka
+    topic: real_topic
+    telemetry:
+      labels:
+        partition: override
+transforms: {}
+sinks: {}
+"#;
+        let err = PipelineTopology::load_from_string(yaml).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved for this source kind"),
+            "message: {msg}"
+        );
+        assert!(msg.contains("'partition'"), "message: {msg}");
+    }
+
+    #[test]
+    fn test_labels_partition_rejected_on_hybrid_source() {
+        let yaml = r#"
+sources:
+  s1:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: blocks_historic
+    unbounded_source:
+      source_type: kafka
+      topic: blocks_live
+    telemetry:
+      labels:
+        partition: override
 transforms: {}
 sinks: {}
 "#;
