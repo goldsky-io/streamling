@@ -3031,13 +3031,19 @@ impl Streamling {
         // signal (sources drain front-to-back) and arms the watchdog. This
         // replaces the per-component signal handlers (notably the plugin
         // watcher that used to kill plugins first, inverting the drain order).
+        // `interrupted_by_signal` records that the drain was signal-initiated:
+        // the shared shutdown flag can't tell, since a bounded plugin source
+        // also flips it when its range completes naturally.
+        let interrupted_by_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if !dry_run {
+            let interrupted_by_signal = interrupted_by_signal.clone();
             // The trigger task itself: it initiates the drain, so it cannot be
             // tracked by it. Exits right after flipping the signal.
             #[allow(clippy::disallowed_methods)]
             tokio::spawn(async move {
                 Self::wait_for_shutdown_signal().await;
                 info!("Shutdown signal received; draining pipeline front-to-back");
+                interrupted_by_signal.store(true, std::sync::atomic::Ordering::SeqCst);
                 streamling_core::shutdown::request_shutdown();
                 Self::arm_shutdown_watchdog(Self::shutdown_budget());
             });
@@ -3147,6 +3153,10 @@ impl Streamling {
                 Some(e) => Err(e),
             }
         };
+        // Snapshot once the sinks have drained: a signal landing during
+        // teardown, after every source already finished its range, must not
+        // turn a completed job into a failure.
+        let interrupted_by_signal = interrupted_by_signal.load(std::sync::atomic::Ordering::SeqCst);
 
         // Teardown. Everything below is bounded by a single deadline shared
         // with the watchdog: arming is idempotent and returns the deadline of
@@ -3339,6 +3349,26 @@ impl Streamling {
         // the teardown drain above), without masking an earlier app error.
         if let Some(e) = teardown_plugin_error {
             return Err(e);
+        }
+        Self::job_completion_result(self.app_config.job_mode, interrupted_by_signal)
+    }
+
+    /// The run's outcome once the drain itself succeeded.
+    ///
+    /// In job mode the exit code is the only completion signal the k8s Job
+    /// controller sees: exit 0 marks the Job `Complete` and nothing resumes
+    /// it. A drain started by SIGTERM/SIGINT (pod eviction, node drain) ends
+    /// the sources at a batch boundary, part-way through the range, so it
+    /// must fail the run; the terminal checkpoint already recorded where the
+    /// replacement pod resumes. Streaming mode is never "done", so a signal
+    /// there is an ordinary clean shutdown.
+    fn job_completion_result(job_mode: bool, interrupted_by_signal: bool) -> Result<()> {
+        if job_mode && interrupted_by_signal {
+            return Err(streamling_err!(
+                "Job-mode pipeline was interrupted by a shutdown signal before its bounded \
+                 range finished; a rerun with the same application id resumes from the \
+                 last checkpoint"
+            ));
         }
         Ok(())
     }
@@ -3994,10 +4024,23 @@ impl Streamling {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, script_input_placement};
+    use super::{Placement, Streamling, script_input_placement};
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Regression: a job-mode run drained by SIGTERM (pod eviction) exited 0,
+    /// so the k8s Job went `Complete` on a partial range and was never resumed.
+    #[test]
+    fn job_mode_signal_interrupted_run_fails() {
+        assert!(Streamling::job_completion_result(true, true).is_err());
+    }
+
+    #[test]
+    fn job_mode_natural_completion_and_streaming_signal_succeed() {
+        assert!(Streamling::job_completion_result(true, false).is_ok());
+        assert!(Streamling::job_completion_result(false, true).is_ok());
     }
 
     /// Regression: a script whose key includes a column it PRODUCES must not be

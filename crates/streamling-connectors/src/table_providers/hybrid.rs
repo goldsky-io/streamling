@@ -1203,9 +1203,8 @@ impl ExecutionPlan for HybridSourceExec {
         // loop below falls through to the terminal-checkpoint path. Without
         // this the loop would block indefinitely in `stream.next()` on a live
         // topic and never observe the signal. Bounded-phase (ClickHouse)
-        // streams have no equivalent stop hook — the forwarding loop below
-        // selects on the shutdown watch instead, and the ClickHouse scan also
-        // checks the signal between pages.
+        // streams need no stop hook: the scan checks the signal between pages
+        // and ends its own stream.
         let shutdown_watcher_handle = shutdown_rx.clone().map(|mut sd| {
             let provider_for_shutdown = provider.clone();
             let ref_name = reference_name_for_spawn.clone();
@@ -1263,51 +1262,16 @@ impl ExecutionPlan for HybridSourceExec {
                     }
                 };
 
-                // Forward batches until the inner stream ends — or, during a
-                // BOUNDED phase, until the process-wide shutdown signal flips.
-                // The select on the shutdown watch is what makes bounded
-                // (ClickHouse) phases shutdown-aware: the watcher task above
-                // only stops the Kafka unbounded source, and the post-loop
-                // check below only runs after the stream ends, so without
-                // this arm a SIGTERM during a long bounded scan would sit in
-                // `stream.next()` until the scan finished and the watchdog
-                // force-exited instead of draining. Ending a bounded stream
-                // early is safe: nothing past the last emitted batch is
-                // checkpoint-covered, so a restart resumes from the last
-                // finalized cursor. The unbounded (Kafka) phase is exempt on
-                // purpose — its source observes the signal itself and drains
-                // the in-flight batch before ending its stream, which this
-                // loop must keep consuming.
-                let mut shutdown_for_stream = shutdown_rx.clone();
-                let mut shutdown_watch_dead = false;
-                loop {
-                    let next = match (&mut shutdown_for_stream, shutdown_watch_dead) {
-                        (Some(sd), false) if !is_executing_unbounded => {
-                            if *sd.borrow() {
-                                info!(
-                                    "Hybrid source '{}': shutdown requested; ending bounded stream early",
-                                    reference_name_for_spawn,
-                                );
-                                break;
-                            }
-                            tokio::select! {
-                                biased;
-                                changed = sd.changed() => {
-                                    // On a real change the next iteration sees
-                                    // borrow()==true and breaks; a closed
-                                    // sender means no shutdown signal exists,
-                                    // so stop watching rather than spin.
-                                    shutdown_watch_dead = changed.is_err();
-                                    continue;
-                                }
-                                n = stream.next() => n,
-                            }
-                        }
-                        _ => stream.next().await,
-                    };
-                    let Some(batch_result) = next else {
-                        break;
-                    };
+                // Forward batches until the inner stream ends. On shutdown the
+                // inner source ends it itself: the ClickHouse scan stops at the
+                // next page boundary, and the Kafka unbounded phase is stopped
+                // by the watcher above and drains its in-flight batch. This
+                // loop must keep consuming until then rather than break on the
+                // signal: the bounded source's cursor already covers every
+                // batch it has produced, so a batch dropped here is never
+                // delivered, yet the terminal checkpoint persists a cursor past
+                // it and the restart skips those rows.
+                while let Some(batch_result) = stream.next().await {
                     match batch_result {
                         Ok(batch) => {
                             let schema_clone = schema_for_main.clone();
@@ -3291,6 +3255,178 @@ mod tests {
             assert_eq!(names.value(1), "b");
         }
         assert!(saw_data, "the bounded phase's batch must be forwarded");
+    }
+
+    /// A bounded phase shaped like the ClickHouse scan under shutdown: it
+    /// emits one batch, and only once shutdown is requested does it finish its
+    /// in-flight page (ids 2 and 3) and end its stream.
+    #[derive(Debug)]
+    struct ShutdownGatedMockProvider {
+        schema: SchemaRef,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl TableProvider for ShutdownGatedMockProvider {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ShutdownGatedMockExec {
+                schema: self.schema.clone(),
+                shutdown: self.shutdown.clone(),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(self.schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ShutdownGatedMockExec {
+        schema: SchemaRef,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ShutdownGatedMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ShutdownGatedMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ShutdownGatedMockExec {
+        fn name(&self) -> &str {
+            "ShutdownGatedMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            use datafusion::arrow::array::{Int32Array, StringArray};
+            let schema = self.schema.clone();
+            let batch = move |id: i32| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![id])),
+                        Arc::new(StringArray::from(vec![format!("row_{id}")])),
+                    ],
+                )
+                .map_err(DataFusionError::from)
+            };
+            let mut shutdown = self.shutdown.clone();
+            let first = futures::stream::iter(vec![batch(1)]);
+            let rest = futures::stream::once(async move {
+                let _ = shutdown.wait_for(|requested| *requested).await;
+                futures::stream::iter(vec![batch(2), batch(3)])
+            })
+            .flatten();
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    first.chain(rest),
+                ),
+            ))
+        }
+    }
+
+    /// Regression: on shutdown during a bounded phase the hybrid stopped
+    /// reading its inner stream at once, dropping batches the bounded source
+    /// had already produced. The ClickHouse source's cursor had advanced past
+    /// them, so the terminal checkpoint persisted a position beyond what any
+    /// sink received and the restarted job skipped those rows. Every batch
+    /// the bounded source emits must be forwarded, and the phase must stay
+    /// incomplete so a restart resumes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_shutdown_during_bounded_phase_forwards_in_flight_batches() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(ShutdownGatedMockProvider {
+                schema: create_test_schema(),
+                shutdown: shutdown_rx.clone(),
+            })],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend = create_state_backend("test_shutdown_bounded_forwards").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_shutdown_bounded_forwards".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+        .with_shutdown(shutdown_rx);
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("stream batch should not be an error");
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .expect("id column must be Int32");
+            ids.extend(col.iter().flatten());
+            if ids == [1] {
+                shutdown_tx.send(true).expect("shutdown receiver alive");
+            }
+        }
+
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "batches produced after shutdown were dropped"
+        );
+        let state = hybrid_provider.state.read().await;
+        assert_eq!(
+            state.current_phase, 0,
+            "shutdown must not advance the phase"
+        );
+        assert_eq!(
+            state.completed_phases,
+            vec![false],
+            "an interrupted bounded phase must not be marked complete"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
