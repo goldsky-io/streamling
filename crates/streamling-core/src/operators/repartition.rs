@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::checkpoints::checkpoint_management::{
-    MarkerAligner, extract_checkpoint_messages, strip_checkpoint_messages,
+    MarkerAligner, extract_checkpoint_messages, last_marker_epoch, strip_checkpoint_messages,
 };
 use crate::operators::coalesce::StreamingCoalesceExec;
 use crate::operators::{marker_only_batch, schema_with_messages};
@@ -478,6 +478,7 @@ impl ExecutionPlan for StreamingRepartitionExec {
             let aligner = Arc::clone(&aligner);
             let output_schema = Arc::clone(&output_schema);
             builder.spawn(async move {
+                let mut last_delivered = None;
                 while let Some(batch) = receiver.recv().await {
                     let batch = match batch {
                         Ok(batch) => batch,
@@ -501,6 +502,7 @@ impl ExecutionPlan for StreamingRepartitionExec {
                     {
                         return Ok(());
                     }
+                    last_delivered = last_delivered.max(last_marker_epoch(&messages));
                     let released = aligner.lock().observe(messages);
                     if !released.is_empty()
                         && tx
@@ -512,7 +514,7 @@ impl ExecutionPlan for StreamingRepartitionExec {
                     }
                 }
                 // The sender was dropped: this input reader is finished.
-                let released = aligner.lock().input_done();
+                let released = aligner.lock().input_done(last_delivered);
                 if !released.is_empty() {
                     let _ = tx
                         .send(Ok(marker_only_batch(&output_schema, &released)))

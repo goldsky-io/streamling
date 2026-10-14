@@ -8,7 +8,9 @@
 //! buffered batches.
 
 use serde::Serialize;
-use streamling_e2e::{init_tracing, PipelineOpts, TestContext, TestContextOptions};
+use streamling_e2e::{
+    build_basic_example_plugin, init_tracing, PipelineOpts, TestContext, TestContextOptions,
+};
 
 /// Test record for Kafka messages — id is String to match the ClickHouse
 /// schema for hybrid source unification.
@@ -533,36 +535,6 @@ sinks:
 // ============================================================================
 // Job mode: plugin sink terminal ack must finalize the terminal epoch
 // ============================================================================
-
-/// Build the in-repo example plugin (`plugin_examples/basic`, registers the
-/// `print_sink` sink plugin) as a cdylib and return the shared-library path.
-/// It lives in its own cargo workspace, so this is a separate (cached) build.
-async fn build_basic_example_plugin() -> std::path::PathBuf {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("crates/streamling-e2e must sit two levels below the repo root")
-        .to_path_buf();
-    let plugin_dir = repo_root.join("plugin_examples/basic");
-
-    let status = tokio::process::Command::new("cargo")
-        .args(["build", "--lib"])
-        .current_dir(&plugin_dir)
-        .status()
-        .await
-        .expect("failed to invoke cargo build for plugin_examples/basic");
-    assert!(status.success(), "building plugin_examples/basic failed");
-
-    let debug_dir = plugin_dir.join("target/debug");
-    [
-        "libplugin_example_basic.so",
-        "libplugin_example_basic.dylib",
-    ]
-    .iter()
-    .map(|name| debug_dir.join(name))
-    .find(|p| p.exists())
-    .expect("built plugin cdylib not found in plugin_examples/basic/target/debug")
-}
 
 /// Job-mode pipelines with FFI plugin sinks must terminate: the terminal
 /// checkpoint marker rides the LAST batch of the stream, and the plugin's

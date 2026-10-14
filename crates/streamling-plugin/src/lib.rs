@@ -8,8 +8,10 @@ pub mod shutdown;
 
 use crate::api::PluginStateBackendFactory;
 pub use crate::api::{
-    CheckpointEpoch, PluginError, PluginStateBackend, PreprocessorPlugin, SideOutputPlugin,
-    SinkPlugin, SourcePlugin, TransformPlugin,
+    CheckpointEpoch, InputPlacement, PartitionCount, PartitionedSinkPlugin,
+    PartitionedSourcePlugin, PartitionedTransformPlugin, PluginError, PluginStateBackend,
+    PreprocessorPlugin, SideOutputPlugin, SinkDescription, SinkPlugin, SourceDescription,
+    SourcePlugin, TransformDescription, TransformPlugin,
 };
 use crate::r#async::PluginAsyncRuntimeObj;
 pub use crate::dispatch::{
@@ -22,6 +24,7 @@ pub use crate::ffi::{
     PluginChannel, PluginChannels, PluginCheckpointEpoch, PluginLogging, PluginMsg, PluginOptions,
     SafeArrowColumn, SafeUdfArg,
 };
+use abi_stable::derive_macro_reexports::NonExhaustive;
 use abi_stable::std_types::{RHashMap, RNone, ROption, RResult, RSome, RString, RVec};
 use abi_stable::traits::IntoReprC;
 use abi_stable::{
@@ -44,7 +47,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 pub use streamling_plugin_derive::*;
 pub use streamling_state::{StateKey, StateOperatorBackend};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// A single identity label for a plugin instance. Plugins use this to declare *what they
 /// are* — typically derived from their options at `create` time (e.g. a Kafka plugin
@@ -133,6 +136,78 @@ impl PluginResult {
         self.labels = labels.into();
         self
     }
+}
+
+/// Name of one partition instance of a node: `{reference_name}[{index}]`.
+/// Keys the instance's own state and, on the host, its registry entries.
+pub fn partition_instance_name(reference_name: &str, partition_index: u32) -> String {
+    format!("{reference_name}[{partition_index}]")
+}
+
+/// Which partition instance of a partitioned plugin node is being created.
+/// `create_partitioned` is called once per `partition_index` in
+/// `0..partition_count`, each call with its own channels.
+#[repr(C)]
+#[derive(StableAbi, Debug, Clone, PartialEq, Eq)]
+pub struct PluginInstanceContext {
+    /// The node's reference name (unique within the pipeline topology).
+    pub reference_name: RString,
+    pub partition_index: u32,
+    pub partition_count: u32,
+}
+
+/// How the host must place a partitioned transform's or sink's input rows
+/// before routing physical partition `i` to plugin instance `i`.
+///
+/// Non-exhaustive across the FFI boundary (like `PluginMsg`), so an older host
+/// can still load a library that adds a variant later. Unlike `PluginMsg` it
+/// has no Rust `#[non_exhaustive]`: this type appears in `extern "C"` signatures,
+/// and that attribute makes rustc flag every hand-written module function
+/// using it as not FFI-safe.
+#[repr(u8)]
+#[derive(StableAbi, Debug, Clone, PartialEq, Eq)]
+#[sabi(kind(WithNonExhaustive(
+    size = [usize;8],
+    traits(Debug, Clone, PartialEq),
+    assert_nonexhaustive(PluginInputPlacement),
+)))]
+pub enum PluginInputPlacement {
+    /// All rows of a primary key land on one instance. The key is the node's
+    /// configured (or inherited) primary key.
+    ByPrimaryKey,
+    /// All rows sharing these columns' values land on one instance.
+    ByColumns { columns: RVec<RString> },
+    /// Any instance will do.
+    RoundRobin,
+    /// Instance `i` reads input stream `i`, with no exchange in between: see
+    /// `InputPlacement::Forward`.
+    Forward,
+}
+
+/// Planning-time constraints on how many partitions a plugin node can run
+/// with. The host resolves the actual count before creating any instance.
+#[repr(C)]
+#[derive(StableAbi, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginPartitionCount {
+    pub minimum: u32,
+    pub maximum: ROption<u32>,
+    /// Width to use when the topology does not set `parallelism` on a source
+    /// (e.g. the source's native shard count). Ignored for transforms and
+    /// sinks, which inherit their input's width.
+    pub preferred: ROption<u32>,
+}
+
+/// What a partition-capable plugin reports about itself at planning time,
+/// without constructing a running instance.
+#[repr(C)]
+#[derive(StableAbi, Debug)]
+pub struct PartitionedPluginDescription {
+    /// Defined for sources and transforms, not for sinks.
+    pub output_schema: ROption<SafeArrowSchema>,
+    pub labels: RVec<PluginLabel>,
+    /// `RNone` for sources, which have no input.
+    pub input_placement: ROption<PluginInputPlacement_NE>,
+    pub partition_count: PluginPartitionCount,
 }
 
 #[repr(u8)]
@@ -309,9 +384,34 @@ where
         HashMap<String, String>,
     ) -> Result<Arc<dyn SourcePlugin>, PluginInitializationError>,
 {
+    start_source(
+        id,
+        factory,
+        options,
+        runtime,
+        PluginStateBackendFactory::new(state_backend_config),
+        message_channels,
+    )
+}
+
+fn start_source<F>(
+    id: RString,
+    factory: F,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_factory: PluginStateBackendFactory,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError>
+where
+    F: FnOnce(
+        PluginAsyncRuntimeObj,
+        PluginStateBackendFactory,
+        PluginMetricsRecorder,
+        HashMap<String, String>,
+    ) -> Result<Arc<dyn SourcePlugin>, PluginInitializationError>,
+{
     info!("Creating {} with options: {:?}", id, options);
 
-    let state_backend_factory = PluginStateBackendFactory::new(state_backend_config);
     let metrics_recorder = PluginMetricsRecorder::new(message_channels.metrics.sender.clone());
     // Rationale: Plugin factories are not necessarily `UnwindSafe`; we only convert panics into
     // `PluginInitializationError` and never observe partial plugin state after a panic.
@@ -369,9 +469,37 @@ where
         HashMap<String, String>,
     ) -> Result<Arc<dyn TransformPlugin>, PluginInitializationError>,
 {
+    start_transform(
+        id,
+        factory,
+        input_schema,
+        options,
+        runtime,
+        PluginStateBackendFactory::new(state_backend_config),
+        message_channels,
+    )
+}
+
+fn start_transform<F>(
+    id: RString,
+    factory: F,
+    input_schema: SafeArrowSchema,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_factory: PluginStateBackendFactory,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError>
+where
+    F: FnOnce(
+        SchemaRef,
+        PluginAsyncRuntimeObj,
+        PluginStateBackendFactory,
+        PluginMetricsRecorder,
+        HashMap<String, String>,
+    ) -> Result<Arc<dyn TransformPlugin>, PluginInitializationError>,
+{
     info!("Creating {} with options: {:?}", id, options);
 
-    let state_backend_factory = PluginStateBackendFactory::new(state_backend_config);
     let metrics_recorder = PluginMetricsRecorder::new(message_channels.metrics.sender.clone());
 
     // Rationale: See `transform_generator` — panics become initialization errors; no use-after-panic.
@@ -431,9 +559,37 @@ where
         HashMap<String, String>,
     ) -> Result<Arc<dyn SinkPlugin>, PluginInitializationError>,
 {
+    start_sink(
+        id,
+        factory,
+        input_schema,
+        options,
+        runtime,
+        PluginStateBackendFactory::new(state_backend_config),
+        message_channels,
+    )
+}
+
+fn start_sink<F>(
+    id: RString,
+    factory: F,
+    input_schema: SafeArrowSchema,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_factory: PluginStateBackendFactory,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError>
+where
+    F: FnOnce(
+        SchemaRef,
+        PluginAsyncRuntimeObj,
+        PluginStateBackendFactory,
+        PluginMetricsRecorder,
+        HashMap<String, String>,
+    ) -> Result<Arc<dyn SinkPlugin>, PluginInitializationError>,
+{
     info!("Creating {} with options: {:?}", id, options);
 
-    let state_backend_factory = PluginStateBackendFactory::new(state_backend_config);
     let metrics_recorder = PluginMetricsRecorder::new(message_channels.metrics.sender.clone());
     // Rationale: See `sink_generator` — panics become initialization errors; no use-after-panic.
     let sink = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -489,6 +645,357 @@ where
         spawn_dispatcher_worker(id, &runtime, async move { dispatcher.start().await });
 
     Ok(PluginResult::new(dispatcher_future, RNone)).into_c()
+}
+
+impl From<PartitionCount> for PluginPartitionCount {
+    fn from(value: PartitionCount) -> Self {
+        PluginPartitionCount {
+            minimum: value.minimum,
+            maximum: value.maximum.into_c(),
+            preferred: value.preferred.into_c(),
+        }
+    }
+}
+
+impl From<InputPlacement> for PluginInputPlacement_NE {
+    fn from(value: InputPlacement) -> Self {
+        NonExhaustive::new(match value {
+            InputPlacement::ByPrimaryKey => PluginInputPlacement::ByPrimaryKey,
+            InputPlacement::ByColumns(columns) => PluginInputPlacement::ByColumns {
+                columns: columns.into_iter().map(RString::from).collect(),
+            },
+            InputPlacement::RoundRobin => PluginInputPlacement::RoundRobin,
+            InputPlacement::Forward => PluginInputPlacement::Forward,
+        })
+    }
+}
+
+type DescribeResult = RResult<ROption<PartitionedPluginDescription>, PluginInitializationError>;
+
+/// Runs a plugin's `describe`, turning a panic into an initialization error
+/// like the create factories do.
+fn describe_catching_panics<F>(describe: F) -> DescribeResult
+where
+    F: FnOnce() -> Result<PartitionedPluginDescription, PluginInitializationError>,
+{
+    // Rationale: see `source_generator` — panics become initialization errors
+    // and no plugin state is observed after one.
+    match std::panic::catch_unwind(AssertUnwindSafe(describe)) {
+        Ok(Ok(description)) => RResult::ROk(RSome(description)),
+        Ok(Err(e)) => RResult::RErr(e),
+        Err(panic_payload) => RResult::RErr(PluginInitializationError::Configuration(
+            RString::from(panic_payload_to_string(panic_payload)),
+        )),
+    }
+}
+
+fn required_input_schema(
+    input_schema: ROption<SafeArrowSchema>,
+) -> Result<SchemaRef, PluginInitializationError> {
+    input_schema.into_option().map(Into::into).ok_or_else(|| {
+        PluginInitializationError::Configuration(RString::from(
+            "an input schema is required for transforms and sinks",
+        ))
+    })
+}
+
+/// `describe_partitioned` for a plugin registered with
+/// `register_partitioned_plugin_source!`.
+pub fn describe_partitioned_source<T: PartitionedSourcePlugin>(
+    options: PluginOptions,
+) -> DescribeResult {
+    describe_catching_panics(|| {
+        let description = T::describe(&options.as_rust())?;
+        Ok(PartitionedPluginDescription {
+            output_schema: RSome(description.output_schema.into()),
+            labels: description.labels.into(),
+            input_placement: RNone,
+            partition_count: description.partition_count.into(),
+        })
+    })
+}
+
+/// `describe_partitioned` for a plugin registered with
+/// `register_partitioned_plugin_transform!`.
+pub fn describe_partitioned_transform<T: PartitionedTransformPlugin>(
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+) -> DescribeResult {
+    describe_catching_panics(|| {
+        let description = T::describe(required_input_schema(input_schema)?, &options.as_rust())?;
+        Ok(PartitionedPluginDescription {
+            output_schema: RSome(description.output_schema.into()),
+            labels: description.labels.into(),
+            input_placement: RSome(description.input_placement.into()),
+            partition_count: description.partition_count.into(),
+        })
+    })
+}
+
+/// `describe_partitioned` for a plugin registered with
+/// `register_partitioned_plugin_sink!`.
+pub fn describe_partitioned_sink<T: PartitionedSinkPlugin>(
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+) -> DescribeResult {
+    describe_catching_panics(|| {
+        let description = T::describe(required_input_schema(input_schema)?, &options.as_rust())?;
+        Ok(PartitionedPluginDescription {
+            output_schema: RNone,
+            labels: description.labels.into(),
+            input_placement: RSome(description.input_placement.into()),
+            partition_count: description.partition_count.into(),
+        })
+    })
+}
+
+/// `create_partitioned` for a plugin registered with
+/// `register_partitioned_plugin_source!`.
+pub fn create_partitioned_source<T: PartitionedSourcePlugin>(
+    id: RString,
+    options: PluginOptions,
+    context: PluginInstanceContext,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    let state_backend_factory =
+        PluginStateBackendFactory::for_partition(state_backend_config, &context);
+    start_source(
+        id,
+        |rt, state, metrics, opts| {
+            T::create(context, rt, state, metrics, opts).map(|s| Arc::new(s) as _)
+        },
+        options,
+        runtime,
+        state_backend_factory,
+        message_channels,
+    )
+}
+
+/// `create_partitioned` for a plugin registered with
+/// `register_partitioned_plugin_transform!`.
+pub fn create_partitioned_transform<T: PartitionedTransformPlugin>(
+    id: RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    context: PluginInstanceContext,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    let input_schema = match required_input_schema(input_schema) {
+        Ok(schema) => schema,
+        Err(e) => return RResult::RErr(e),
+    };
+    let state_backend_factory =
+        PluginStateBackendFactory::for_partition(state_backend_config, &context);
+    start_transform(
+        id,
+        |schema, rt, state, metrics, opts| {
+            T::create(context, schema, rt, state, metrics, opts).map(|t| Arc::new(t) as _)
+        },
+        input_schema.into(),
+        options,
+        runtime,
+        state_backend_factory,
+        message_channels,
+    )
+}
+
+/// `create_partitioned` for a plugin registered with
+/// `register_partitioned_plugin_sink!`.
+pub fn create_partitioned_sink<T: PartitionedSinkPlugin>(
+    id: RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    context: PluginInstanceContext,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    let input_schema = match required_input_schema(input_schema) {
+        Ok(schema) => schema,
+        Err(e) => return RResult::RErr(e),
+    };
+    let state_backend_factory =
+        PluginStateBackendFactory::for_partition(state_backend_config, &context);
+    start_sink(
+        id,
+        |schema, rt, state, metrics, opts| {
+            T::create(context, schema, rt, state, metrics, opts).map(|s| Arc::new(s) as _)
+        },
+        input_schema.into(),
+        options,
+        runtime,
+        state_backend_factory,
+        message_channels,
+    )
+}
+
+/// The `parallelism` node field. A host that supports partitioned plugins
+/// reads it as a typed field and never passes it to a plugin; a host that
+/// predates them passes it through as an option.
+const PARALLELISM_OPTION: &str = "parallelism";
+
+/// The options for running a partition-aware plugin on a host that predates
+/// partitioned plugins. Such a host creates one instance through `create`, so
+/// it runs as partition 0 of 1: exactly what a partitioned host runs at width
+/// 1, down to the state keys (see [`PluginStateBackendFactory`]). A plugin can
+/// therefore ship before the engine, and the engine can be rolled back under
+/// it.
+///
+/// Refuses what one stream cannot honor instead of narrowing it silently: a
+/// requested `parallelism` other than 1, and a plugin whose `describe` needs
+/// more than one partition. Drops the `parallelism` option, which a plugin
+/// never sees on a partitioned host either.
+fn single_stream_options(
+    id: &RString,
+    options: PluginOptions,
+    partition_count: impl FnOnce(
+        &HashMap<String, String>,
+    ) -> Result<PartitionCount, PluginInitializationError>,
+) -> Result<PluginOptions, PluginInitializationError> {
+    let refuse = |why: String| {
+        Err(PluginInitializationError::Configuration(RString::from(
+            format!(
+                "plugin {id} {why}, which needs a streamling engine that supports partitioned plugins"
+            ),
+        )))
+    };
+    let mut options = options.as_rust();
+    if let Some(width) = options
+        .remove(PARALLELISM_OPTION)
+        .filter(|w| w.trim().parse::<u32>() != Ok(1))
+    {
+        return refuse(format!("is configured with parallelism {width}"));
+    }
+    // Rationale: see `source_generator`.
+    let count = std::panic::catch_unwind(AssertUnwindSafe(|| partition_count(&options)))
+        .unwrap_or_else(|payload| {
+            Err(PluginInitializationError::Configuration(RString::from(
+                panic_payload_to_string(payload),
+            )))
+        })?;
+    if count.minimum > 1 {
+        return refuse(format!("needs at least {} partitions", count.minimum));
+    }
+    if let Some(preferred) = count.preferred.filter(|p| *p > 1) {
+        warn!(
+            "plugin {id} runs as one stream: this streamling engine predates partitioned \
+             plugins (one that supports them runs it on {preferred} by default)"
+        );
+    }
+    Ok(PluginOptions::new(options))
+}
+
+/// [`single_stream_options`] for a transform or sink, whose `describe` also
+/// takes the input schema.
+fn single_stream_input(
+    id: &RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    partition_count: impl FnOnce(
+        SchemaRef,
+        &HashMap<String, String>,
+    ) -> Result<PartitionCount, PluginInitializationError>,
+) -> Result<(ROption<SafeArrowSchema>, PluginOptions), PluginInitializationError> {
+    let schema = required_input_schema(input_schema)?;
+    let options = single_stream_options(id, options, |o| partition_count(schema.clone(), o))?;
+    Ok((RSome(schema.into()), options))
+}
+
+fn single_stream_context(config: &PluginStateBackendConfig) -> PluginInstanceContext {
+    PluginInstanceContext {
+        reference_name: config.plugin_reference_name.clone(),
+        partition_index: 0,
+        partition_count: 1,
+    }
+}
+
+/// `create` for a plugin registered with `register_partitioned_plugin_source!`,
+/// which only a host that predates partitioned plugins calls: runs it as
+/// partition 0 of 1 (see `single_stream_options`).
+pub fn create_partitioned_source_as_single_stream<T: PartitionedSourcePlugin>(
+    id: RString,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    match single_stream_options(&id, options, |o| Ok(T::describe(o)?.partition_count)) {
+        Ok(options) => {
+            let context = single_stream_context(&state_backend_config);
+            create_partitioned_source::<T>(
+                id,
+                options,
+                context,
+                runtime,
+                state_backend_config,
+                message_channels,
+            )
+        }
+        Err(e) => RResult::RErr(e),
+    }
+}
+
+/// `create` for a plugin registered with
+/// `register_partitioned_plugin_transform!`: partition 0 of 1, as
+/// [`create_partitioned_source_as_single_stream`].
+pub fn create_partitioned_transform_as_single_stream<T: PartitionedTransformPlugin>(
+    id: RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    match single_stream_input(&id, input_schema, options, |schema, o| {
+        Ok(T::describe(schema, o)?.partition_count)
+    }) {
+        Ok((input_schema, options)) => {
+            let context = single_stream_context(&state_backend_config);
+            create_partitioned_transform::<T>(
+                id,
+                input_schema,
+                options,
+                context,
+                runtime,
+                state_backend_config,
+                message_channels,
+            )
+        }
+        Err(e) => RResult::RErr(e),
+    }
+}
+
+/// `create` for a plugin registered with `register_partitioned_plugin_sink!`:
+/// partition 0 of 1, as [`create_partitioned_source_as_single_stream`].
+pub fn create_partitioned_sink_as_single_stream<T: PartitionedSinkPlugin>(
+    id: RString,
+    input_schema: ROption<SafeArrowSchema>,
+    options: PluginOptions,
+    runtime: PluginAsyncRuntimeObj,
+    state_backend_config: PluginStateBackendConfig,
+    message_channels: PluginChannels,
+) -> RResult<PluginResult, PluginInitializationError> {
+    match single_stream_input(&id, input_schema, options, |schema, o| {
+        Ok(T::describe(schema, o)?.partition_count)
+    }) {
+        Ok((input_schema, options)) => {
+            let context = single_stream_context(&state_backend_config);
+            create_partitioned_sink::<T>(
+                id,
+                input_schema,
+                options,
+                context,
+                runtime,
+                state_backend_config,
+                message_channels,
+            )
+        }
+        Err(e) => RResult::RErr(e),
+    }
 }
 
 /// Descriptor for a single UDF provided by a plugin.
@@ -772,6 +1279,360 @@ mod dispatcher_worker_tests {
     }
 }
 
+#[cfg(test)]
+mod partitioned_generator_tests {
+    use super::*;
+    use crate::api::{
+        InputPlacement, PartitionCount, PartitionedSinkPlugin, PartitionedSourcePlugin,
+        PartitionedTransformPlugin, SinkDescription, SourceDescription, SupportsGracefulShutdown,
+        TransformDescription,
+    };
+    use crate::r#async::DirectTokioProxy;
+    use abi_stable::derive_macro_reexports::NonExhaustive;
+    use abi_stable::external_types::crossbeam_channel;
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Schema};
+    use async_trait::async_trait;
+    use ffi::PluginMetricsChannel;
+
+    const MINIMUM_PARTITIONS_OPTION: &str = "minimum_partitions";
+    const PARTITION_LABEL: &str = "partition";
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(crate::api::STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false),
+        ]))
+    }
+
+    fn partition_count(options: &HashMap<String, String>) -> PartitionCount {
+        PartitionCount {
+            minimum: options
+                .get(MINIMUM_PARTITIONS_OPTION)
+                .map_or(1, |m| m.parse().unwrap()),
+            maximum: Some(8),
+            preferred: Some(4),
+        }
+    }
+
+    /// Reports the partition it was created for as a label, so tests can see
+    /// the context that reached the plugin.
+    struct PartitionReporter {
+        context: PluginInstanceContext,
+    }
+
+    impl PartitionReporter {
+        fn partition_labels(&self) -> Vec<PluginLabel> {
+            vec![PluginLabel::new(
+                PARTITION_LABEL,
+                format!(
+                    "{}:{}/{}",
+                    self.context.reference_name,
+                    self.context.partition_index,
+                    self.context.partition_count
+                ),
+            )]
+        }
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for PartitionReporter {
+        fn is_running(&self) -> bool {
+            true
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourcePlugin for PartitionReporter {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(schema())
+        }
+        fn labels(&self) -> Vec<PluginLabel> {
+            self.partition_labels()
+        }
+        async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+            Ok(RecordBatch::new_empty(schema()))
+        }
+        async fn process_checkpoint_marker(&self, _: CheckpointEpoch) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _: CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    impl PartitionedSourcePlugin for PartitionReporter {
+        fn describe(
+            options: &HashMap<String, String>,
+        ) -> Result<SourceDescription, PluginInitializationError> {
+            Ok(SourceDescription {
+                output_schema: schema(),
+                labels: vec![PluginLabel::new("topic", "blocks")],
+                partition_count: partition_count(options),
+            })
+        }
+
+        fn create(
+            context: PluginInstanceContext,
+            _: PluginAsyncRuntimeObj,
+            _: PluginStateBackendFactory,
+            _: PluginMetricsRecorder,
+            _: HashMap<String, String>,
+        ) -> Result<Self, PluginInitializationError> {
+            Ok(PartitionReporter { context })
+        }
+    }
+
+    struct KeyedTransform;
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for KeyedTransform {
+        fn is_running(&self) -> bool {
+            true
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TransformPlugin for KeyedTransform {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(schema())
+        }
+        async fn process_batch(&self, data: RecordBatch) -> Result<RecordBatch, PluginError> {
+            Ok(data)
+        }
+        async fn process_checkpoint_marker(&self, _: CheckpointEpoch) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _: CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    impl PartitionedTransformPlugin for KeyedTransform {
+        fn describe(
+            input_schema: SchemaRef,
+            options: &HashMap<String, String>,
+        ) -> Result<TransformDescription, PluginInitializationError> {
+            Ok(TransformDescription {
+                output_schema: input_schema,
+                labels: Vec::new(),
+                input_placement: InputPlacement::ByColumns(vec!["id".to_string()]),
+                partition_count: partition_count(options),
+            })
+        }
+
+        fn create(
+            _: PluginInstanceContext,
+            _: SchemaRef,
+            _: PluginAsyncRuntimeObj,
+            _: PluginStateBackendFactory,
+            _: PluginMetricsRecorder,
+            _: HashMap<String, String>,
+        ) -> Result<Self, PluginInitializationError> {
+            Ok(KeyedTransform)
+        }
+    }
+
+    struct PanickingSink;
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for PanickingSink {
+        fn is_running(&self) -> bool {
+            true
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SinkPlugin for PanickingSink {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_batch(&self, _: RecordBatch) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_checkpoint_marker(&self, _: CheckpointEpoch) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _: CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    impl PartitionedSinkPlugin for PanickingSink {
+        fn describe(
+            _: SchemaRef,
+            _: &HashMap<String, String>,
+        ) -> Result<SinkDescription, PluginInitializationError> {
+            panic!("describe blew up");
+        }
+
+        fn create(
+            _: PluginInstanceContext,
+            _: SchemaRef,
+            _: PluginAsyncRuntimeObj,
+            _: PluginStateBackendFactory,
+            _: PluginMetricsRecorder,
+            _: HashMap<String, String>,
+        ) -> Result<Self, PluginInitializationError> {
+            Ok(PanickingSink)
+        }
+    }
+
+    fn options(entries: &[(&str, &str)]) -> PluginOptions {
+        PluginOptions::new(
+            entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn state_backend_config() -> PluginStateBackendConfig {
+        PluginStateBackendConfig::new(
+            "app".to_string(),
+            "blocks".to_string(),
+            r#"{"backend_type":"InMemory","postgres":null,"sqlite":null}"#.to_string(),
+        )
+    }
+
+    fn channels() -> PluginChannels {
+        PluginChannels {
+            input: PluginChannel::new(crossbeam_channel::bounded(8)),
+            output: PluginChannel::new(crossbeam_channel::bounded(8)),
+            metrics: PluginMetricsChannel::new(crossbeam_channel::bounded(64)),
+        }
+    }
+
+    fn label_value(result: &PluginResult, key: &str) -> Option<String> {
+        result
+            .labels
+            .iter()
+            .find(|l| l.key.as_str() == key)
+            .map(|l| l.value.to_string())
+    }
+
+    /// Starts the instance's dispatcher lifecycle and waits for it to exit.
+    async fn terminate(result: PluginResult, channels: &PluginChannels) {
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Terminate))
+            .unwrap();
+        assert!(matches!(result.execution_future.await, RResult::ROk(())));
+    }
+
+    #[test]
+    fn forward_placement_crosses_the_ffi_boundary() {
+        assert_eq!(
+            PluginInputPlacement_NE::from(InputPlacement::Forward)
+                .into_enum()
+                .unwrap(),
+            PluginInputPlacement::Forward
+        );
+    }
+
+    #[test]
+    fn transform_description_carries_placement_and_constraints() {
+        let description = describe_partitioned_transform::<KeyedTransform>(
+            RSome(schema().into()),
+            options(&[(MINIMUM_PARTITIONS_OPTION, "2")]),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            description.input_placement.unwrap().into_enum().unwrap(),
+            PluginInputPlacement::ByColumns {
+                columns: vec![RString::from("id")].into()
+            }
+        );
+        assert_eq!(
+            description.partition_count,
+            PluginPartitionCount {
+                minimum: 2,
+                maximum: RSome(8),
+                preferred: RSome(4),
+            }
+        );
+        let output_schema: SchemaRef = description.output_schema.unwrap().into();
+        assert_eq!(output_schema.fields(), schema().fields());
+    }
+
+    #[test]
+    fn source_description_has_no_input_placement() {
+        let description = describe_partitioned_source::<PartitionReporter>(options(&[]))
+            .unwrap()
+            .unwrap();
+
+        assert!(description.input_placement.is_none());
+        assert_eq!(description.labels.len(), 1);
+        assert_eq!(description.labels[0].key.as_str(), "topic");
+    }
+
+    #[test]
+    fn describe_panic_is_an_initialization_error() {
+        let result =
+            describe_partitioned_sink::<PanickingSink>(RSome(schema().into()), options(&[]));
+        match result {
+            RResult::RErr(PluginInitializationError::Configuration(message)) => {
+                assert!(message.contains("describe blew up"), "{message}")
+            }
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partition_instance_receives_its_context() {
+        let channels = channels();
+        let context = PluginInstanceContext {
+            reference_name: "blocks".into(),
+            partition_index: 1,
+            partition_count: 3,
+        };
+
+        let result = create_partitioned_source::<PartitionReporter>(
+            "test.source".into(),
+            options(&[]),
+            context,
+            DirectTokioProxy::new().into_async_runtime_obj(),
+            state_backend_config(),
+            channels.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            label_value(&result, PARTITION_LABEL).as_deref(),
+            Some("blocks:1/3")
+        );
+        assert!(result.output_schema.is_some());
+        terminate(result, &channels).await;
+    }
+}
+
 // New functions can be added to the end of the struct
 #[repr(C)]
 #[derive(StableAbi)]
@@ -820,6 +1681,37 @@ pub struct PluginModule {
     /// [`compat::PluginModuleRef`] before trusting the suffix accessors —
     /// see `compat` for the contract.
     pub set_shutdown_signal: extern "C" fn(crate::shutdown::ShutdownSignalObj),
+
+    /// Describes a partition-capable plugin without constructing an instance:
+    /// validates the options and reports schema, labels, input placement, and
+    /// partition-count constraints. Must not open channels, register
+    /// checkpoint participants, or reserve durable resources; read-only
+    /// external schema discovery is allowed.
+    ///
+    /// Returns `RNone` for a plugin id that only supports single-stream
+    /// execution through `create`. Absent (`None` accessor) for libraries
+    /// built before partitioning, whose plugins are all single-stream.
+    pub describe_partitioned:
+        extern "C" fn(
+            plugin_id: RString,
+            input_schema: ROption<SafeArrowSchema>,
+            options: PluginOptions,
+        )
+            -> RResult<ROption<PartitionedPluginDescription>, PluginInitializationError>,
+
+    /// Creates one partition instance of a plugin whose
+    /// `describe_partitioned` returned `RSome`. Called exactly once per
+    /// partition index, each call with its own channels and a
+    /// partition-scoped state backend.
+    pub create_partitioned: extern "C" fn(
+        plugin_id: RString,
+        input_schema: ROption<SafeArrowSchema>,
+        options: PluginOptions,
+        context: PluginInstanceContext,
+        runtime: PluginAsyncRuntimeObj,
+        state_backend_config: PluginStateBackendConfig,
+        message_channels: PluginChannels,
+    ) -> RResult<PluginResult, PluginInitializationError>,
 }
 
 impl RootModule for PluginModuleRef {

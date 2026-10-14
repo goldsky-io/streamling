@@ -163,6 +163,10 @@ pub(crate) mod test_util {
     impl MarkerSourceExec {
         pub(crate) fn new(partitions: Vec<Vec<RecordBatch>>) -> Self {
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            Self::with_schema(schema, partitions)
+        }
+
+        pub(crate) fn with_schema(schema: SchemaRef, partitions: Vec<Vec<RecordBatch>>) -> Self {
             let cache = PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
                 Partitioning::UnknownPartitioning(partitions.len()),

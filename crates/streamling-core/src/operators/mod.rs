@@ -21,15 +21,17 @@ pub mod wasm_runner;
 pub mod wrapping;
 
 use crate::checkpoints::checkpoint_management::{
-    CheckpointMessage, MarkerAligner, enrich_batch_metadata_with_checkpoints,
-    extract_checkpoint_messages, strip_checkpoint_messages,
+    CheckpointEpoch, CheckpointMessage, MarkerAligner, enrich_batch_metadata_with_checkpoints,
+    extract_checkpoint_messages, last_marker_epoch, strip_checkpoint_messages,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
-use datafusion::physical_plan::{ExecutionPlan, execute_input_stream};
+use datafusion::physical_plan::stream::{
+    RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter,
+};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_input_stream};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -64,6 +66,34 @@ pub(crate) fn schema_with_messages(
 /// when an input ends).
 pub(crate) fn marker_only_batch(schema: &SchemaRef, messages: &[CheckpointMessage]) -> RecordBatch {
     RecordBatch::new_empty(schema_with_messages(schema, messages))
+}
+
+/// The last checkpoint epoch whose marker a write stream handed its sink. Once
+/// the sink's write succeeded, it has flushed every epoch up to this one, which
+/// is what the sink's ack gate needs to know when the stream finishes.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LastMarker(Arc<Mutex<Option<CheckpointEpoch>>>);
+
+impl LastMarker {
+    /// Wraps `data` so that every marker it carries is recorded as it is read.
+    pub(crate) fn track(&self, data: SendableRecordBatchStream) -> SendableRecordBatchStream {
+        let last = self.clone();
+        let schema = data.schema();
+        let tracked = data.inspect(move |batch| {
+            if let Ok(batch) = batch
+                && let Some(epoch) =
+                    last_marker_epoch(&extract_checkpoint_messages(batch.schema().metadata()))
+            {
+                let mut recorded = last.0.lock();
+                *recorded = recorded.clone().max(Some(epoch));
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, tracked))
+    }
+
+    pub(crate) fn epoch(&self) -> Option<CheckpointEpoch> {
+        self.0.lock().clone()
+    }
 }
 
 /// Spawns a task on `builder` that forwards one input partition into the
@@ -159,6 +189,7 @@ pub(crate) fn spawn_aligning_forwarder(
 
     builder.spawn(async move {
         let mut stream = data;
+        let mut last_delivered = None;
 
         while let Some(batch) = stream.next().await {
             match batch {
@@ -179,6 +210,7 @@ pub(crate) fn spawn_aligning_forwarder(
                     {
                         return Ok(());
                     }
+                    last_delivered = last_delivered.max(last_marker_epoch(&messages));
                     let released = aligner.lock().observe(messages);
                     if !released.is_empty()
                         && tx
@@ -202,7 +234,7 @@ pub(crate) fn spawn_aligning_forwarder(
 
         // This input will never deliver another marker; release any epoch that
         // was only waiting on it.
-        let released = aligner.lock().input_done();
+        let released = aligner.lock().input_done(last_delivered);
         if !released.is_empty() {
             let _ = tx
                 .send(Ok(marker_only_batch(&output_schema, &released)))
