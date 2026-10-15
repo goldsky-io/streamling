@@ -530,6 +530,207 @@ sinks:
     );
 }
 
+/// Job mode + SIGTERM before the bounded range finishes must exit NON-zero.
+///
+/// Run as a k8s Job with `restartPolicy: Never`, exit 0 means "the range is
+/// done" and the Job goes `Complete`. A pod evicted mid-range (node drain,
+/// autoscaler consolidation) used to exit 0 too, so a partial backfill
+/// reported success and nothing ever resumed it. Run 1 is SIGTERM'd mid-range
+/// and must fail; run 2 reuses the application id (same state backend) and must
+/// resume from run 1's last checkpointed scan cursor — not restart, not skip
+/// the drained tail — and exit 0 once the whole range is written.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_job_mode_sigterm_mid_range_exits_nonzero_and_resumes() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    const NUM_ROWS: i64 = 300_000;
+    clickhouse
+        .execute(
+            "CREATE TABLE job_sigterm_source (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO job_sigterm_source
+             SELECT number, concat('js_', toString(number)), 'payload', 1000 + number, 0
+             FROM numbers({NUM_ROWS})"
+        ))
+        .await
+        .expect("Failed to seed ClickHouse table");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_job_sigterm (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    // One application id and one persistent state file across both runs:
+    // exactly what the Job controller's replacement pod sees.
+    let application_id = format!("job_sigterm_{}", ctx.test_id);
+    let state_path = std::env::temp_dir()
+        .join(format!("job_sigterm_state_{}.sqlite", ctx.test_id))
+        .to_string_lossy()
+        .into_owned();
+    let pipeline_for = |table: &str| {
+        format!(
+            r#"
+sources:
+  source_a:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: job_sigterm_source
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {topic}
+      table_name: kafka_offsets_job_sigterm
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: source_a
+    table: {table}
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 200
+    batch_flush_interval: 100ms
+"#,
+            topic = ctx.kafka_topic,
+            table = table,
+        )
+    };
+    let opts = || {
+        PipelineOpts::new()
+            .env("STREAMLING__JOB_MODE", "true")
+            .env("STREAMLING__APPLICATION_ID", &application_id)
+            .env("STREAMLING__RECORD_BATCH_SIZE", "100")
+            .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+            // Small pages so the scan's persisted cursor advances many times
+            // across the range; resume granularity is one page.
+            .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1000")
+            .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "1000")
+            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Sqlite")
+            .env(
+                "STREAMLING__STATE_BACKEND__SQLITE__DATABASE_PATH",
+                &state_path,
+            )
+    };
+
+    // Run 1: signal mid-range, 3s after rows first land, so at least one
+    // periodic checkpoint (1s interval) has finalized a scan cursor for run 2
+    // to resume from.
+    let rows_landed = async {
+        loop {
+            let landed = ctx
+                .postgres
+                .count("SELECT COUNT(*) FROM public.job_sigterm_run1")
+                .await
+                .is_ok_and(|n| n > 0);
+            if landed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    };
+    let (status, _stderr) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline_for("job_sigterm_run1"),
+            opts(),
+            rows_landed,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("run 1 must exit within the grace period after SIGTERM");
+
+    let run1_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.job_sigterm_run1")
+        .await
+        .expect("Failed to count run 1 rows");
+    assert!(
+        run1_count < NUM_ROWS,
+        "run 1 wrote the whole range before SIGTERM landed; the test needs a larger table"
+    );
+    assert!(
+        !status.success(),
+        "job-mode SIGTERM before the range finished must exit non-zero, got {:?} \
+         after writing {run1_count}/{NUM_ROWS} rows",
+        status.code()
+    );
+
+    // Run 2: the replacement pod. Runs to natural completion.
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline_for("job_sigterm_run2"),
+            opts().timeout(std::time::Duration::from_secs(240)),
+        )
+        .await
+        .expect("run 2 must complete the range");
+    assert!(
+        status.success(),
+        "job-mode natural completion must exit 0, got {:?}",
+        status.code()
+    );
+
+    let union: Vec<(i64,)> = ctx
+        .postgres
+        .query(
+            "SELECT COUNT(*) FROM (
+                SELECT id FROM public.job_sigterm_run1
+                UNION SELECT id FROM public.job_sigterm_run2
+            ) u",
+        )
+        .await
+        .expect("Failed to count union of both runs");
+    assert_eq!(
+        union[0].0, NUM_ROWS,
+        "runs 1 and 2 together must cover the whole range with no gaps"
+    );
+    let run2_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.job_sigterm_run2")
+        .await
+        .expect("Failed to count run 2 rows");
+    assert!(
+        run2_count < NUM_ROWS,
+        "run 2 rescanned the whole range ({run2_count} rows) instead of resuming \
+         from run 1's checkpoint ({run1_count} rows already written)"
+    );
+}
+
 // ============================================================================
 // Job mode: plugin sink terminal ack must finalize the terminal epoch
 // ============================================================================
