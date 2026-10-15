@@ -1,7 +1,7 @@
 //! `table` transform e2e tests.
 
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use streamling_e2e::resources::KafkaResource;
 use streamling_e2e::{init_tracing, PipelineOpts, TestContext};
 
@@ -333,6 +333,152 @@ sinks:
         .await
         .expect("Failed to query");
     assert_eq!(rows, vec![(1, Some(11)), (2, Some(20)), (3, None)]);
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimedRate {
+    address: String,
+    amount: i64,
+    block_timestamp: i64,
+}
+
+const TIMED_RATE_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "TimedRate",
+    "fields": [
+        {"name": "address", "type": "string"},
+        {"name": "amount", "type": "long"},
+        {"name": "block_timestamp", "type": "long"}
+    ]
+}"#;
+
+/// A windowed table garbage-collects the rows outside its window: a lookup
+/// of one misses, and a lookup of a row inside the window hits. The table's
+/// output still carries both rows.
+#[tokio::test]
+async fn test_table_window_evicts_rows_outside_it() {
+    const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+    const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+    const GC_INTERVAL: &str = "500ms";
+    /// A few of the table's GC intervals.
+    const GC_WAIT: Duration = Duration::from_secs(3);
+    const TWO_HOURS_SECS: i64 = 2 * 3600;
+    const RATES_LOADED: &str = "SELECT count(*) FROM public.window_rates";
+    const ENRICHED: &str = "SELECT count(*) FROM public.window_enriched";
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(TIMED_RATE_SCHEMA)
+        .await
+        .expect("Failed to register the rate schema");
+    let transactions = ctx
+        .create_kafka_topic("transactions")
+        .await
+        .expect("Failed to create the transactions topic");
+    transactions
+        .register_schema(TRANSACTION_SCHEMA)
+        .await
+        .expect("Failed to register the transaction schema");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Clock before the Unix epoch")
+        .as_secs() as i64;
+    let rate = |address: &str, amount, block_timestamp| TimedRate {
+        address: address.to_string(),
+        amount,
+        block_timestamp,
+    };
+    ctx.kafka
+        .produce_avro_records(&[rate("0xa", 10, now - TWO_HOURS_SECS), rate("0xb", 20, now)])
+        .await
+        .expect("Failed to produce rates");
+
+    let pipeline = format!(
+        r#"
+sources:
+  rates:
+    type: kafka
+    topic: {rates_topic}
+    starting_offsets: earliest
+    primary_key: address
+  transactions:
+    type: kafka
+    topic: {transactions_topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  rates_mapping:
+    type: table
+    backend_type: in_memory
+    primary_key: address
+    window: block_timestamp >= extract(epoch from now() - interval '1 hour')
+    sql: SELECT address, amount, block_timestamp FROM rates
+  enriched:
+    type: sql
+    primary_key: id
+    sql: SELECT id, lookup_eq('rates_mapping', 'address', address, 'amount') AS calc_amount FROM transactions
+sinks:
+  rates_pg:
+    type: postgres
+    from: rates_mapping
+    table: window_rates
+    schema: public
+    primary_key: address
+    batch_size: 1
+    batch_flush_interval: 100ms
+  enriched_pg:
+    type: postgres
+    from: enriched
+    table: window_enriched
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        rates_topic = ctx.kafka_topic,
+        transactions_topic = transactions.topic,
+    );
+
+    // Rates reach Postgres only after the table applied them. The idle rates
+    // source keeps delivering empty batches, which run the table's GC passes.
+    let signal_when = async {
+        if !wait_for_count(&ctx, RATES_LOADED, 2, LOAD_TIMEOUT).await {
+            return;
+        }
+        tokio::time::sleep(GC_WAIT).await;
+        let transaction = |id, address: &str| Transaction {
+            id,
+            address: address.to_string(),
+        };
+        transactions
+            .produce_avro_records(&[transaction(1, "0xa"), transaction(2, "0xb")])
+            .await
+            .expect("Failed to produce transactions");
+        wait_for_count(&ctx, ENRICHED, 2, LOAD_TIMEOUT).await;
+    };
+
+    let (status, _stderr) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__TABLE__WINDOW_GC_INTERVAL", GC_INTERVAL),
+            signal_when,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Streamling must exit after SIGTERM");
+    assert!(status.success());
+
+    let rows: Vec<(i64, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, calc_amount FROM public.window_enriched ORDER BY id")
+        .await
+        .expect("Failed to query");
+    assert_eq!(rows, vec![(1, None), (2, Some(20))]);
 }
 
 const SINGLE_PARTITION: i32 = 1;

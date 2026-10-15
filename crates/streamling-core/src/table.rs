@@ -7,15 +7,30 @@ pub mod side_output;
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt};
 use crate::telemetry::recorder::get_metrics_recorder;
-use crate::{streamling_user_bail, streamling_user_err};
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, new_null_array};
-use arrow::compute::{cast, interleave, interleave_record_batch};
-use arrow::datatypes::{FieldRef, Fields, Schema, SchemaRef};
+use crate::{streamling_err, streamling_user_bail, streamling_user_err};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, TimestampNanosecondArray, UInt64Array,
+    new_null_array,
+};
+use arrow::compute::{
+    cast, filter, interleave, interleave_record_batch, not, prep_null_mask_filter,
+};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, SortField};
-use parking_lot::RwLock;
-use std::collections::{HashMap, VecDeque};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, ScalarValue};
+use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion::logical_expr::{Accumulator, Expr, ExprSchemable, col};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 const OP_DELETE: &str = "d";
 const UPSERT_OPS: [&str; 4] = ["i", "c", "r", "u"];
@@ -26,6 +41,10 @@ const MEMORY_BYTES_GAUGE: &str = "table_memory_bytes";
 /// Floor of a cleaning step's budget, so tiny batches still merge old chunks
 /// into chunks of a useful size.
 const MIN_CLEANING_ROWS: usize = 1024;
+
+/// The column a window reads for the wall-clock time a row was applied.
+pub const WALL_CLOCK_COLUMN: &str = "__timestamp";
+const WALL_CLOCK_TIME_ZONE: &str = "UTC";
 
 #[derive(Clone, Copy)]
 enum RowOp {
@@ -43,6 +62,16 @@ struct Chunk {
     batch: RecordBatch,
     /// Rows of `batch` the index points to.
     live_rows: usize,
+    /// Bounds of the window's columns over all of `batch`'s rows, in
+    /// `Window::columns` order. Empty without a window.
+    statistics: Vec<ColumnStatistics>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ColumnStatistics {
+    min: ScalarValue,
+    max: ScalarValue,
+    null_count: usize,
 }
 
 #[derive(Default)]
@@ -73,10 +102,19 @@ impl TableState {
         self.first_chunk_id + self.chunks.len()
     }
 
-    fn push_chunk(&mut self, batch: RecordBatch, live_rows: usize) {
+    fn push_chunk(
+        &mut self,
+        batch: RecordBatch,
+        live_rows: usize,
+        statistics: Vec<ColumnStatistics>,
+    ) {
         self.total_rows += batch.num_rows();
         self.chunk_bytes += batch.get_array_memory_size();
-        self.chunks.push_back(Chunk { batch, live_rows });
+        self.chunks.push_back(Chunk {
+            batch,
+            live_rows,
+            statistics,
+        });
     }
 
     fn pop_front_chunk(&mut self) {
@@ -92,6 +130,245 @@ impl TableState {
     fn release(&mut self, location: RowLocation) {
         self.chunk_mut(location.chunk).live_rows -= 1;
     }
+}
+
+/// A table's `window`.
+pub struct WindowConfig<'a> {
+    /// SQL over the table's columns and [`WALL_CLOCK_COLUMN`]. The table
+    /// keeps the rows it is true for.
+    pub predicate: &'a str,
+    pub session_state: &'a SessionState,
+    /// Minimum time between GC passes.
+    pub gc_interval: Duration,
+}
+
+/// A planned [`WindowConfig`].
+struct Window {
+    /// Type-coerced but not simplified, so each GC pass folds `now()` anew.
+    predicate: Expr,
+    /// True for the rows outside the window: `NOT predicate`, or a NULL in
+    /// any column the predicate reads. Pruned against chunk statistics.
+    outside: Expr,
+    /// The stored schema, which `predicate` reads.
+    schema: DFSchemaRef,
+    /// The columns `predicate` reads, by name and position in `schema`.
+    columns: Vec<(String, usize)>,
+    reads_wall_clock: bool,
+    session_state: SessionState,
+    gc_interval: Duration,
+    /// When the last GC pass started. Locked while a pass runs.
+    last_pass: Mutex<Instant>,
+}
+
+/// A [`Window`] with `now()` folded to the current time.
+struct CompiledWindow {
+    predicate: Arc<dyn PhysicalExpr>,
+    /// Rules out the chunks without a row outside the window.
+    outside: PruningPredicate,
+}
+
+impl Window {
+    /// Plans `config.predicate` over `fields`, the stored columns, which get
+    /// [`WALL_CLOCK_COLUMN`] appended when the predicate reads it.
+    fn try_new(table: &str, config: &WindowConfig, fields: &Fields) -> Result<Self> {
+        if fields.find(WALL_CLOCK_COLUMN).is_some() {
+            streamling_user_bail!(
+                "table '{}': the SQL output cannot contain '{}', which a window reserves for the wall-clock time",
+                table,
+                WALL_CLOCK_COLUMN
+            );
+        }
+        let invalid = |err: DataFusionError| {
+            streamling_user_err!(
+                "table '{}': invalid window '{}': {}",
+                table,
+                config.predicate,
+                err
+            )
+        };
+        let wall_clock = Field::new(
+            WALL_CLOCK_COLUMN,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(WALL_CLOCK_TIME_ZONE.into())),
+            false,
+        );
+        let with_wall_clock = DFSchema::try_from(Schema::new(
+            fields
+                .iter()
+                .cloned()
+                .chain([Arc::new(wall_clock)])
+                .collect::<Fields>(),
+        ))?;
+        let predicate = config
+            .session_state
+            .create_logical_expr(config.predicate, &with_wall_clock)
+            .map_err(invalid)?;
+        let mut column_names: Vec<String> = predicate
+            .column_refs()
+            .into_iter()
+            .map(|column| column.name.clone())
+            .collect();
+        column_names.sort();
+        let reads_wall_clock = column_names.iter().any(|name| name == WALL_CLOCK_COLUMN);
+        let schema = Arc::new(if reads_wall_clock {
+            with_wall_clock
+        } else {
+            DFSchema::try_from(Schema::new(fields.clone()))?
+        });
+        let predicate = ExprSimplifier::new(Self::simplify_context(config.session_state, &schema))
+            .coerce(predicate, &schema)
+            .map_err(invalid)?;
+        let data_type = predicate.get_type(&schema).map_err(invalid)?;
+        if data_type != DataType::Boolean {
+            streamling_user_bail!(
+                "table '{}': the window must be a boolean expression, got {}",
+                table,
+                data_type
+            );
+        }
+        let outside = column_names
+            .iter()
+            .fold(Expr::Not(Box::new(predicate.clone())), |outside, name| {
+                outside.or(col(Column::new_unqualified(name)).is_null())
+            });
+        let columns = column_names
+            .into_iter()
+            .map(|name| {
+                let index = schema.inner().index_of(&name)?;
+                Ok((name, index))
+            })
+            .collect::<Result<_>>()?;
+        let window = Self {
+            predicate,
+            outside,
+            schema,
+            columns,
+            reads_wall_clock,
+            session_state: config.session_state.clone(),
+            gc_interval: config.gc_interval,
+            last_pass: Mutex::new(Instant::now()),
+        };
+        if window.compile().map_err(invalid)?.outside.always_true() {
+            warn!(
+                "table '{}': window '{}' can't skip chunks by their min/max, so each GC pass evaluates every stored row. Compare a column, not a function of it, with an expression of now(), such as `ts >= now() - interval '1 hour'`",
+                table, config.predicate
+            );
+        }
+        Ok(window)
+    }
+
+    fn simplify_context(session_state: &SessionState, schema: &DFSchemaRef) -> SimplifyContext {
+        SimplifyContext::builder()
+            .with_schema(Arc::clone(schema))
+            .with_config_options(Arc::clone(session_state.config_options()))
+            .with_current_time()
+            .build()
+    }
+
+    /// Simplifying folds `now()`, and pushes `outside`'s `NOT` into the
+    /// comparisons, which `PruningPredicate` can't see through otherwise.
+    fn compile(&self) -> datafusion::common::Result<CompiledWindow> {
+        let simplifier =
+            ExprSimplifier::new(Self::simplify_context(&self.session_state, &self.schema));
+        let predicate = simplifier.simplify(self.predicate.clone())?;
+        let outside = simplifier.simplify(self.outside.clone())?;
+        Ok(CompiledWindow {
+            predicate: self
+                .session_state
+                .create_physical_expr(predicate, &self.schema)?,
+            outside: PruningPredicate::try_new(
+                self.session_state
+                    .create_physical_expr(outside, &self.schema)?,
+                Arc::clone(self.schema.inner()),
+            )?,
+        })
+    }
+
+    /// The bounds of `columns` in `batch`, a chunk in the stored schema.
+    fn statistics(&self, batch: &RecordBatch) -> datafusion::common::Result<Vec<ColumnStatistics>> {
+        self.columns
+            .iter()
+            .map(|(_, index)| {
+                let values = [Arc::clone(batch.column(*index))];
+                let mut min = MinAccumulator::try_new(values[0].data_type())?;
+                min.update_batch(&values)?;
+                let mut max = MaxAccumulator::try_new(values[0].data_type())?;
+                max.update_batch(&values)?;
+                Ok(ColumnStatistics {
+                    min: min.evaluate()?,
+                    max: max.evaluate()?,
+                    null_count: values[0].null_count(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The statistics of the chunks a GC pass prunes, one container per chunk.
+struct ChunkStatistics<'a> {
+    window: &'a Window,
+    chunks: &'a [&'a Chunk],
+}
+
+impl ChunkStatistics<'_> {
+    fn values(
+        &self,
+        column: &Column,
+        value: impl Fn(&ColumnStatistics) -> ScalarValue,
+    ) -> Option<ArrayRef> {
+        let position = self
+            .window
+            .columns
+            .iter()
+            .position(|(name, _)| *name == column.name)?;
+        // Unknown on error, which keeps every chunk.
+        ScalarValue::iter_to_array(
+            self.chunks
+                .iter()
+                .map(|chunk| value(&chunk.statistics[position])),
+        )
+        .ok()
+    }
+}
+
+impl PruningStatistics for ChunkStatistics<'_> {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.values(column, |statistics| statistics.min.clone())
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.values(column, |statistics| statistics.max.clone())
+    }
+
+    fn num_containers(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        self.values(column, |statistics| {
+            ScalarValue::UInt64(Some(statistics.null_count as u64))
+        })
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        Some(Arc::new(UInt64Array::from_iter_values(
+            self.chunks
+                .iter()
+                .map(|chunk| chunk.batch.num_rows() as u64),
+        )))
+    }
+
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        None
+    }
+}
+
+/// A [`WALL_CLOCK_COLUMN`] array holding the current time.
+fn wall_clock(rows: usize) -> ArrayRef {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    Arc::new(TimestampNanosecondArray::from_value(now, rows).with_timezone(WALL_CLOCK_TIME_ZONE))
 }
 
 /// The `in_memory` backend of a `table` transform.
@@ -129,11 +406,20 @@ impl TableState {
 /// | apply `A10 -B`    | `c0:[A1 B2 C3]` `c1:[A10 -B]`  | A→c1 C→c0      | 5 / 2 / 3            |
 /// | clean             | `c2:[C3 A10]`                  | A→c2 C→c2      | 2 / 2 / 0            |
 ///
+/// With a window, an apply at least the window's GC interval after the last
+/// GC pass runs another: it removes the keys whose live row the window's
+/// predicate isn't true for, and the cleaner reclaims their rows like any
+/// other dead rows. Each chunk keeps the min, max and null count of the
+/// columns the predicate reads, so a pass skips the chunks they show to be
+/// wholly inside the window. A predicate that reads [`WALL_CLOCK_COLUMN`]
+/// makes each chunk store the time its rows were applied in that column.
+///
 /// Nothing is persisted, so the table starts empty after a restart.
 pub struct InMemoryTable {
     name: String,
     metric_metadata_id: String,
-    /// The input schema without `_gs_op`.
+    /// The input schema without `_gs_op`, plus [`WALL_CLOCK_COLUMN`] when the
+    /// window reads it.
     schema: SchemaRef,
     op_index: usize,
     /// Input columns stored in `schema`, in order.
@@ -147,6 +433,7 @@ pub struct InMemoryTable {
     converter: RowConverter,
     /// Cleaning runs while dead rows exceed this fraction of the live rows.
     max_dead_ratio: f64,
+    window: Option<Window>,
     state: RwLock<TableState>,
 }
 
@@ -160,6 +447,7 @@ impl InMemoryTable {
         primary_key: &[String],
         metric_metadata_id: String,
         max_dead_ratio: f64,
+        window: Option<WindowConfig>,
     ) -> Result<Self> {
         if !(max_dead_ratio.is_finite() && max_dead_ratio > 0.0) {
             streamling_user_bail!(
@@ -210,12 +498,17 @@ impl InMemoryTable {
         let value_indices: Vec<usize> = (0..input_schema.fields().len())
             .filter(|&index| index != op_index)
             .collect();
-        let schema = Arc::new(Schema::new(
-            value_indices
-                .iter()
-                .map(|&index| Arc::clone(&input_schema.fields()[index]))
-                .collect::<Vec<_>>(),
-        ));
+        let value_fields: Fields = value_indices
+            .iter()
+            .map(|&index| Arc::clone(&input_schema.fields()[index]))
+            .collect();
+        let window = window
+            .map(|config| Window::try_new(name, &config, &value_fields))
+            .transpose()?;
+        let schema = match &window {
+            Some(window) => Arc::clone(window.schema.inner()),
+            None => Arc::new(Schema::new(value_fields)),
+        };
         let stored_key_indices = key_indices
             .iter()
             .map(|&index| index - usize::from(index > op_index))
@@ -232,6 +525,7 @@ impl InMemoryTable {
             primary_key: primary_key.join(","),
             converter,
             max_dead_ratio,
+            window,
             state: RwLock::new(TableState::default()),
         })
     }
@@ -239,6 +533,7 @@ impl InMemoryTable {
     /// Applies `batch` (the table's SQL output) in row order: an upsert
     /// replaces its key's row, and a delete removes it.
     pub fn apply(&self, batch: &RecordBatch) -> Result<()> {
+        self.collect_garbage_if_due()?;
         let ops = self.parse_ops(batch.column(self.op_index))?;
         let key_columns: Vec<ArrayRef> = self
             .key_indices
@@ -259,28 +554,35 @@ impl InMemoryTable {
             .converter
             .convert_columns(&key_columns)
             .streamling_context("failed to encode the primary key")?;
-        let values = RecordBatch::try_new(
-            Arc::clone(&self.schema),
-            self.value_indices
-                .iter()
-                .map(|&index| Arc::clone(batch.column(index)))
-                .collect(),
-        )
-        .streamling_with_context(|| {
-            format!(
-                "table '{}': batch does not match the table schema",
-                self.name
-            )
-        })?;
-
+        let mut columns: Vec<ArrayRef> = self
+            .value_indices
+            .iter()
+            .map(|&index| Arc::clone(batch.column(index)))
+            .collect();
+        if self.reads_wall_clock() {
+            columns.push(wall_clock(batch.num_rows()));
+        }
+        let values = RecordBatch::try_new(Arc::clone(&self.schema), columns)
+            .streamling_with_context(|| {
+                format!(
+                    "table '{}': batch does not match the table schema",
+                    self.name
+                )
+            })?;
         let written_rows = values.num_rows();
+        let statistics = if written_rows > 0 {
+            self.chunk_statistics(&values)?
+        } else {
+            Vec::new()
+        };
+
         let mut guard = self.state.write();
         let state = &mut *guard;
         let new_chunk = state.next_chunk_id();
         // Stored before the loop, so a row the batch replaces in itself is
         // released like any other.
         if written_rows > 0 {
-            state.push_chunk(values, 0);
+            state.push_chunk(values, 0, statistics);
         }
         for (row, op) in ops.into_iter().enumerate() {
             let key = keys.row(row);
@@ -399,10 +701,27 @@ impl InMemoryTable {
         }
     }
 
+    /// The stored column a lookup reads. A window's wall clock is GC
+    /// bookkeeping, not part of the SQL output, so lookups can't read it.
     fn column_index(&self, column: &str) -> Result<usize> {
         self.schema
             .index_of(column)
-            .map_err(|_| streamling_user_err!("table '{}' has no column '{}'", self.name, column))
+            .ok()
+            .filter(|_| !(column == WALL_CLOCK_COLUMN && self.reads_wall_clock()))
+            .ok_or_else(|| streamling_user_err!("table '{}' has no column '{}'", self.name, column))
+    }
+
+    fn reads_wall_clock(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.reads_wall_clock)
+    }
+
+    fn chunk_statistics(&self, batch: &RecordBatch) -> Result<Vec<ColumnStatistics>> {
+        match &self.window {
+            Some(window) => Ok(window.statistics(batch)?),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn parse_ops(&self, column: &ArrayRef) -> Result<Vec<RowOp>> {
@@ -432,6 +751,108 @@ impl InMemoryTable {
                 )),
             })
             .collect()
+    }
+
+    /// Runs a GC pass when one is due and no other apply is running one.
+    fn collect_garbage_if_due(&self) -> Result<()> {
+        let Some(window) = &self.window else {
+            return Ok(());
+        };
+        let Some(mut last_pass) = window.last_pass.try_lock() else {
+            return Ok(());
+        };
+        if last_pass.elapsed() < window.gc_interval {
+            return Ok(());
+        }
+        *last_pass = Instant::now();
+        self.evict_outside(window)
+    }
+
+    /// Removes the keys whose live row the window's predicate isn't true
+    /// for. The predicate runs on a snapshot of the chunks, so lookups aren't
+    /// blocked meanwhile. A row an apply moves or replaces in the meantime is
+    /// no longer where the index points, so it stays until the next pass.
+    fn evict_outside(&self, window: &Window) -> Result<()> {
+        let compiled = window.compile()?;
+        let chunks = self.chunks_to_evaluate(window, &compiled)?;
+        // `(chunk, rows, keys)` of the rows outside the window, live or not.
+        let mut outside_rows = Vec::new();
+        for (chunk, batch) in chunks {
+            let inside = compiled
+                .predicate
+                .evaluate(&batch)?
+                .into_array(batch.num_rows())?;
+            let inside = inside.as_boolean_opt().ok_or_else(|| {
+                streamling_err!(
+                    "table '{}': the window must return booleans, got {}",
+                    self.name,
+                    inside.data_type()
+                )
+            })?;
+            // A null is outside the window. `prep_null_mask_filter` panics
+            // without a null buffer.
+            let outside = if inside.null_count() > 0 {
+                not(&prep_null_mask_filter(inside))?
+            } else {
+                not(inside)?
+            };
+            if !outside.has_true() {
+                continue;
+            }
+            let key_columns = self
+                .stored_key_indices
+                .iter()
+                .map(|&index| filter(batch.column(index), &outside))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let keys = self
+                .converter
+                .convert_columns(&key_columns)
+                .streamling_context("failed to encode the stored keys")?;
+            let rows: Vec<usize> = outside.values().set_indices().collect();
+            outside_rows.push((chunk, rows, keys));
+        }
+
+        let mut state = self.state.write();
+        for (chunk, rows, keys) in outside_rows {
+            for (row, key) in rows.into_iter().zip(keys.iter()) {
+                let location = RowLocation { chunk, row };
+                if state.index.get(key.as_ref()) == Some(&location) {
+                    state.index.remove(key.as_ref());
+                    state.key_bytes -= key.as_ref().len();
+                    state.release(location);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The chunks with a live row that their statistics don't show to be
+    /// wholly inside the window, by id. Their order of time doesn't matter,
+    /// but the more chunks cover narrow ranges, the more are skipped.
+    fn chunks_to_evaluate(
+        &self,
+        window: &Window,
+        compiled: &CompiledWindow,
+    ) -> Result<Vec<(usize, RecordBatch)>> {
+        let state = self.state.read();
+        let (ids, chunks): (Vec<usize>, Vec<&Chunk>) = (state.first_chunk_id..)
+            .zip(&state.chunks)
+            .filter(|(_, chunk)| chunk.live_rows > 0)
+            .unzip();
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let may_hold_outside_rows = compiled.outside.prune(&ChunkStatistics {
+            window,
+            chunks: &chunks,
+        })?;
+        Ok(ids
+            .into_iter()
+            .zip(chunks)
+            .zip(may_hold_outside_rows)
+            .filter(|(_, may_hold_outside_rows)| *may_hold_outside_rows)
+            .map(|((id, chunk), _)| (id, chunk.batch.clone()))
+            .collect())
     }
 
     /// While dead rows exceed `max_dead_ratio` of the live ones, moves the
@@ -518,7 +939,8 @@ impl InMemoryTable {
             let sources: Vec<&RecordBatch> = sources.iter().collect();
             let batch = interleave_record_batch(&sources, &moved)
                 .streamling_context("failed to move the live rows")?;
-            state.push_chunk(batch, moved.len());
+            let statistics = self.chunk_statistics(&batch)?;
+            state.push_chunk(batch, moved.len(), statistics);
         }
         Ok(())
     }
@@ -563,6 +985,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, Int64Array, LargeBinaryArray, StringArray, StringViewArray};
     use arrow::datatypes::{DataType, Field, Int64Type};
+    use datafusion::prelude::SessionContext;
     use streamling_common::types::decimal_arb::DecimalArbType;
 
     const TABLE: &str = "tokens";
@@ -596,6 +1019,7 @@ mod tests {
             &["id".to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
+            None,
         )
         .unwrap()
     }
@@ -705,6 +1129,7 @@ mod tests {
             &["chain".to_string(), "address".to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
+            None,
         )
         .unwrap();
         let input = |rows: &[(&str, &str, &str)]| {
@@ -744,6 +1169,7 @@ mod tests {
             &["id".to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
+            None,
         )
         .unwrap();
         let input = |op: &str| {
@@ -1032,6 +1458,7 @@ mod tests {
                 &["id".to_string()],
                 METRIC_KEY.to_string(),
                 ratio,
+                None,
             )
             .err()
             .expect("the ratio must be rejected")
@@ -1087,6 +1514,7 @@ mod tests {
             &["id".to_string(), "name".to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
+            None,
         )
         .unwrap();
         let err = composite.lookup_key_field("id").unwrap_err().to_string();
@@ -1105,6 +1533,7 @@ mod tests {
             &["id".to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
+            None,
         )
         .err()
         .expect("a schema without _gs_op must be rejected")
@@ -1120,10 +1549,313 @@ mod tests {
             &[COLUMN_NAME_OP.to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
+            None,
         )
         .err()
         .expect("a primary key on _gs_op must be rejected")
         .to_string();
         assert!(err.contains("primary key cannot be '_gs_op'"), "{err}");
+    }
+
+    const HOUR_NANOS: i64 = 3_600_000_000_000;
+    const KEEP_LAST_HOUR: &str = "ts >= now() - interval '1 hour'";
+    /// Long enough that applies don't run GC passes unless a test makes one
+    /// due.
+    const GC_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// `schema()` plus `ts`, the rows' event time.
+    fn timed_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(WALL_CLOCK_TIME_ZONE.into())),
+                true,
+            ),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
+        ]))
+    }
+
+    /// Upserts of `(id, name, ts)`.
+    fn timed_batch(rows: &[(i64, &str, Option<i64>)]) -> RecordBatch {
+        RecordBatch::try_new(
+            timed_schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(
+                    TimestampNanosecondArray::from_iter(rows.iter().map(|row| row.2))
+                        .with_timezone(WALL_CLOCK_TIME_ZONE),
+                ),
+                Arc::new(StringArray::from(vec!["i"; rows.len()])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn windowed_table(input_schema: &SchemaRef, predicate: &str) -> Result<InMemoryTable> {
+        InMemoryTable::try_new(
+            TABLE,
+            input_schema,
+            &["id".to_string()],
+            METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
+            Some(WindowConfig {
+                predicate,
+                session_state: &SessionContext::new().state(),
+                gc_interval: GC_INTERVAL,
+            }),
+        )
+    }
+
+    fn evict_outside(table: &InMemoryTable) {
+        table
+            .evict_outside(table.window.as_ref().expect("a windowed table"))
+            .unwrap();
+    }
+
+    fn now_nanos() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    }
+
+    #[test]
+    fn window_evicts_the_live_rows_it_is_not_true_for() {
+        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
+        assert!(
+            table.schema.field_with_name(WALL_CLOCK_COLUMN).is_err(),
+            "a window that doesn't read the wall clock doesn't store it"
+        );
+        let now = now_nanos();
+        let old = now - 2 * HOUR_NANOS;
+        table
+            .apply(&timed_batch(&[
+                (1, "old", Some(old)),
+                (2, "new", Some(now)),
+                (3, "null", None),
+                (4, "old", Some(old)),
+                (5, "new", Some(now)),
+            ]))
+            .unwrap();
+        // Key 4's live row is now inside the window, key 5's outside it.
+        table
+            .apply(&timed_batch(&[
+                (4, "new", Some(now)),
+                (5, "old", Some(old)),
+            ]))
+            .unwrap();
+
+        evict_outside(&table);
+
+        assert_eq!(
+            lookup_names(&table, &[Some(1), Some(2), Some(3), Some(4), Some(5)]),
+            [
+                None,
+                Some("new".to_string()),
+                None,
+                Some("new".to_string()),
+                None
+            ]
+        );
+        assert_live_rows_match_the_index(&table);
+        table.apply(&timed_batch(&[])).unwrap();
+        assert_eq!(
+            table.state.read().total_rows,
+            2,
+            "the cleaner reclaims them"
+        );
+    }
+
+    #[test]
+    fn wall_clock_window_reads_the_apply_time() {
+        let keep_last_hour = format!("{WALL_CLOCK_COLUMN} >= now() - interval '1 hour'");
+        let keep_older = format!("{WALL_CLOCK_COLUMN} < now() - interval '1 hour'");
+        for (predicate, expected) in [(keep_last_hour, Some("a".to_string())), (keep_older, None)] {
+            let table = windowed_table(&schema(), &predicate).unwrap();
+            table.apply(&batch(&[(1, "a", "i")])).unwrap();
+            evict_outside(&table);
+            assert_eq!(lookup_names(&table, &[Some(1)]), [expected], "{predicate}");
+        }
+    }
+
+    #[test]
+    fn apply_runs_a_gc_pass_once_it_is_due() {
+        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
+        let old = now_nanos() - 2 * HOUR_NANOS;
+        table.apply(&timed_batch(&[(1, "old", Some(old))])).unwrap();
+        table.apply(&timed_batch(&[])).unwrap();
+        assert_eq!(lookup_names(&table, &[Some(1)]), [Some("old".to_string())]);
+
+        let window = table.window.as_ref().unwrap();
+        *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
+        table.apply(&timed_batch(&[])).unwrap();
+        assert_eq!(lookup_names(&table, &[Some(1)]), [None]);
+    }
+
+    fn chunks_to_evaluate(table: &InMemoryTable) -> Vec<usize> {
+        let window = table.window.as_ref().expect("a windowed table");
+        table
+            .chunks_to_evaluate(window, &window.compile().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn gc_pass_evaluates_only_the_chunks_that_may_hold_rows_outside_the_window() {
+        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
+        let now = now_nanos();
+        let old = now - 2 * HOUR_NANOS;
+        // Chunks 0 to 3: inside, straddling, outside, inside but with a null.
+        table
+            .apply(&timed_batch(&[(1, "a", Some(now)), (2, "b", Some(now))]))
+            .unwrap();
+        table
+            .apply(&timed_batch(&[(3, "c", Some(old)), (4, "d", Some(now))]))
+            .unwrap();
+        table.apply(&timed_batch(&[(5, "e", Some(old))])).unwrap();
+        table
+            .apply(&timed_batch(&[(6, "f", Some(now)), (7, "g", None)]))
+            .unwrap();
+        assert_eq!(chunks_to_evaluate(&table), [1, 2, 3]);
+
+        evict_outside(&table);
+
+        assert_eq!(
+            lookup_names(&table, &(1..=7).map(Some).collect::<Vec<_>>()),
+            [
+                Some("a".to_string()),
+                Some("b".to_string()),
+                None,
+                Some("d".to_string()),
+                None,
+                Some("f".to_string()),
+                None
+            ]
+        );
+        assert_eq!(
+            chunks_to_evaluate(&table),
+            [1, 3],
+            "a chunk without live rows isn't evaluated, whatever its statistics"
+        );
+    }
+
+    #[test]
+    fn unprunable_window_evaluates_every_chunk() {
+        let unprunable = "date_trunc('second', ts) >= now() - interval '1 hour'";
+        for (predicate, expected) in [(KEEP_LAST_HOUR, vec![]), (unprunable, vec![0, 1])] {
+            let table = windowed_table(&timed_schema(), predicate).unwrap();
+            let now = now_nanos();
+            table.apply(&timed_batch(&[(1, "a", Some(now))])).unwrap();
+            table.apply(&timed_batch(&[(2, "b", Some(now))])).unwrap();
+            assert_eq!(chunks_to_evaluate(&table), expected, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn cleaned_chunks_get_statistics() {
+        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
+        let now = now_nanos();
+        table
+            .apply(&timed_batch(&[
+                (1, "a", Some(now - 4)),
+                (2, "b", Some(now - 3)),
+                (3, "c", Some(now - 2)),
+                (4, "d", Some(now - 1)),
+            ]))
+            .unwrap();
+        // Dead rows exceed the ratio, so chunk 0's live rows move to chunk 2.
+        table
+            .apply(&timed_batch(&[(1, "a", Some(now)), (2, "b", Some(now))]))
+            .unwrap();
+
+        let state = table.state.read();
+        assert_eq!((state.first_chunk_id, state.chunks.len()), (1, 2));
+        let window = table.window.as_ref().unwrap();
+        for chunk in &state.chunks {
+            assert_eq!(chunk.statistics.len(), 1);
+            assert_eq!(chunk.statistics, window.statistics(&chunk.batch).unwrap());
+        }
+        assert_eq!(
+            state.chunks[1].statistics[0].min,
+            ScalarValue::TimestampNanosecond(Some(now - 2), Some(WALL_CLOCK_TIME_ZONE.into()))
+        );
+    }
+
+    #[test]
+    fn lookups_cannot_read_the_window_wall_clock() {
+        let windowed = windowed_table(
+            &schema(),
+            &format!("{WALL_CLOCK_COLUMN} >= now() - interval '1 hour'"),
+        )
+        .unwrap();
+        let err = windowed
+            .lookup_field(WALL_CLOCK_COLUMN)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("table 'tokens' has no column '__timestamp'"),
+            "{err}"
+        );
+
+        let with_wall_clock = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new(WALL_CLOCK_COLUMN, DataType::Int64, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
+        ]));
+        let unwindowed = InMemoryTable::try_new(
+            TABLE,
+            &with_wall_clock,
+            &["id".to_string()],
+            METRIC_KEY.to_string(),
+            MAX_DEAD_RATIO,
+            None,
+        )
+        .unwrap();
+        assert!(
+            unwindowed.lookup_field(WALL_CLOCK_COLUMN).is_ok(),
+            "without a window, '__timestamp' is an ordinary column"
+        );
+    }
+
+    #[test]
+    fn invalid_windows_are_rejected() {
+        let with_wall_clock = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new(WALL_CLOCK_COLUMN, DataType::Int64, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
+        ]));
+        for (input_schema, predicate, expected) in [
+            (
+                timed_schema(),
+                "missing >= now()",
+                "invalid window 'missing >= now()'",
+            ),
+            (
+                timed_schema(),
+                "_gs_op = 'i'",
+                "invalid window '_gs_op = 'i''",
+            ),
+            (
+                timed_schema(),
+                "ts",
+                "the window must be a boolean expression, got Timestamp",
+            ),
+            (
+                with_wall_clock,
+                "id > 0",
+                "the SQL output cannot contain '__timestamp'",
+            ),
+        ] {
+            let err = windowed_table(&input_schema, predicate)
+                .err()
+                .expect("the window must be rejected")
+                .to_string();
+            assert!(err.contains(expected), "{predicate}: {err}");
+        }
     }
 }
