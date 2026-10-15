@@ -1149,7 +1149,8 @@ transforms:
     backend_type: in_memory # required
     primary_key: address # required; comma-separated for composite keys
     max_dead_ratio: 0.25 # optional, default 0.25
-    sql: SELECT address, symbol, decimals FROM token_events WHERE chain = 'eth'
+    window: block_time >= now() - interval '1 hour' # optional
+    sql: SELECT address, symbol, decimals, block_time FROM token_events WHERE chain = 'eth'
 
 sinks:
   tokens_pg:
@@ -1165,6 +1166,7 @@ sinks:
 | `backend_type` | Required. `in_memory` is the only backend.                                                                    |
 | `primary_key`  | Required. Key columns must be in the SQL output. A null key value fails the pipeline.                         |
 | `max_dead_ratio` | Default `0.25`. Storage stays within about (1 + `max_dead_ratio`) × the live rows. Each batch cleans up to (1 + 1/`max_dead_ratio`) stored rows per written row, at least 1024. Lower values use less memory and more CPU. |
+| `window`       | Optional. A SQL predicate; the table keeps only the rows it is true for. See [Windows](#windows). |
 | `sql`          | Required. Projections and filters over one source or transform. Anything else, including `UNNEST`, `UNION`, joins and aggregations, is rejected. |
 | `telemetry`    | Optional. Standard rules.                                                                                     |
 
@@ -1200,6 +1202,26 @@ transforms:
 - A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), sees every row that input's partition has produced up to and including the batch being processed, rows later in the same batch included. This is a lower bound: the lookup may also see rows from later batches, because the shared input can run ahead of its readers. Rows from the input's other partitions appear as those partitions produce them.
 - Lookups from other inputs are not synchronized with the table: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
 - After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
+
+### Windows
+
+`window` is a boolean SQL expression over the table's columns. Rows it is `false` or `NULL` for are garbage collected:
+
+```yaml
+window: block_time >= now() - interval '1 hour'
+```
+
+- Columns must be in the table's SQL output. `_gs_op` is not stored, so it can't be used.
+- `__timestamp` is the wall-clock time the row was applied to the table, for when the data has no event-time column: `window: __timestamp >= now() - interval '1 hour'`. An upsert refreshes it. The SQL output cannot contain a `__timestamp` column.
+- `__timestamp` can't be read by `lookup_eq`.
+- `now()` is wall-clock time, evaluated on each GC pass. When replaying data older than the window, such as with `starting_offsets: earliest`, rows are evicted as soon as a GC pass runs.
+- GC runs when the table's input delivers a batch, at most once per `table.window_gc_interval` in the app config (default `1s`, override with `STREAMLING__TABLE__WINDOW_GC_INTERVAL`). An idle input still delivers empty batches, at least one per checkpoint, so collection doesn't wait for new data. Until a row is collected, a lookup can still return it.
+- Each stored batch keeps the min, max and null count of the columns the window reads, and a GC pass skips the batches that are wholly inside the window. This works when the window compares a column, or a `CAST` of one, with an expression of `now()`:
+  - `block_time >= now() - interval '1 hour'` for a timestamp column
+  - `block_timestamp >= extract(epoch from now() - interval '1 hour')` for integer epoch seconds
+
+  A function of the column, such as `to_timestamp(block_timestamp) >= now() - interval '1 hour'`, still works, but every pass evaluates every stored row; startup logs a warning. Skipping pays off when rows arrive roughly in time order.
+- Eviction only changes the table's storage. The table's SQL output, which other nodes read, doesn't emit anything for evicted rows.
 
 ### Restarts (`in_memory`)
 

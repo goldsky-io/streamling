@@ -175,6 +175,7 @@ mod tests {
             &["address".to_string()],
             "app::rates".to_string(),
             crate::topology::DEFAULT_MAX_DEAD_RATIO,
+            None,
         )
         .unwrap();
         rates
@@ -284,6 +285,7 @@ mod tests {
                 &["id".to_string()],
                 "app::ids".to_string(),
                 crate::topology::DEFAULT_MAX_DEAD_RATIO,
+                None,
             )
             .unwrap(),
         ));
@@ -331,6 +333,7 @@ mod tests {
                 &["address".to_string()],
                 "app::decimals".to_string(),
                 crate::topology::DEFAULT_MAX_DEAD_RATIO,
+                None,
             )
             .unwrap(),
         ));
