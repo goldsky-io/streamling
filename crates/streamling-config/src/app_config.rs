@@ -700,6 +700,33 @@ impl Default for FileSourceConfig {
     }
 }
 
+/// Tunables for `table` transforms.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TableConfig {
+    /// Minimum time between a windowed table's GC passes, as a humantime
+    /// duration (`"1s"`, `"500ms"`). Shorter evicts expired rows sooner, at
+    /// the cost of more passes.
+    #[serde(deserialize_with = "deserialize_window_gc_interval")]
+    pub window_gc_interval: Duration,
+}
+
+/// The config crate doesn't attach the key path to deserialization errors, so
+/// the message names the setting itself.
+fn deserialize_window_gc_interval<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    humantime::parse_duration(&value)
+        .ok()
+        .filter(|interval| !interval.is_zero())
+        .ok_or_else(|| {
+            D::Error::custom(format!(
+                "table.window_gc_interval must be a positive duration like \"1s\" or \"500ms\", got '{value}'"
+            ))
+        })
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PrintSinkConfig {
     pub sample_every: u32,
@@ -1063,6 +1090,7 @@ pub struct AppConfig {
     pub clickhouse_sink: ClickHouseSinkConfig,
     #[serde(default)]
     pub file_source: FileSourceConfig,
+    pub table: TableConfig,
     pub print_sink: PrintSinkConfig,
     pub postgres_sink: PostgresSinkConfig,
     pub open_telemetry_metrics: OpenTelemetryMetricsConfig,
@@ -1533,6 +1561,56 @@ mod tests {
             rendered.contains("batch_flush_interval") && rendered.contains("1 fortnight"),
             "the error must name the field and the offending value, got: {rendered}"
         );
+    }
+
+    /// Loads the config with `name` set to `value`, restoring it afterwards.
+    fn load_with_env(name: &str, value: &str) -> anyhow::Result<AppConfig> {
+        let _guard = env_guard();
+        let previous = std::env::var(name).ok();
+
+        // SAFETY: we hold ENV_LOCK, serializing all env-var mutation in this test module.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+
+        let result = std::panic::catch_unwind(AppConfig::load);
+
+        // SAFETY: see above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        result.expect("test body panicked")
+    }
+
+    const WINDOW_GC_INTERVAL_VAR: &str = "STREAMLING__TABLE__WINDOW_GC_INTERVAL";
+
+    #[test]
+    fn table_window_gc_interval_defaults_to_a_second_and_is_env_overridable() {
+        assert_eq!(
+            base_app_config().table.window_gc_interval,
+            Duration::from_secs(1)
+        );
+        let config = load_with_env(WINDOW_GC_INTERVAL_VAR, "250ms")
+            .expect("embedded defaults plus env overrides must load");
+        assert_eq!(config.table.window_gc_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn table_window_gc_interval_rejects_unparseable_and_zero_durations_at_load() {
+        for value in ["1 fortnight", "0s"] {
+            let err = load_with_env(WINDOW_GC_INTERVAL_VAR, value)
+                .expect_err("an invalid window_gc_interval must fail the load");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("table.window_gc_interval must be a positive duration")
+                    && rendered.contains(value),
+                "the error must name the field and the offending value, got: {rendered}"
+            );
+        }
     }
 
     /// A zero sample reads no paths, so a Hive-partitioned source would silently

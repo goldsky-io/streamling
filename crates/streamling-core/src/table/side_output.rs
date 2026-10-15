@@ -182,6 +182,7 @@ mod tests {
             &["id".to_string()],
             "app::t".to_string(),
             DEFAULT_MAX_DEAD_RATIO,
+            None,
         )
         .unwrap();
         TableSideOutput::try_new(

@@ -312,6 +312,7 @@ mod tests {
             backend_type: streamling_config::TableBackendType::InMemory,
             primary_key: "id".to_string(),
             max_dead_ratio: topology::DEFAULT_MAX_DEAD_RATIO,
+            window: None,
             sql: sql.to_string(),
             telemetry: None,
         })

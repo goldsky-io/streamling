@@ -32,8 +32,8 @@ use streamling_core::operators::checkpointable::CheckpointableNode;
 use streamling_core::operators::external_handlers::{ExternalHandlerConfig, ExternalHandlerNode};
 use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
-use streamling_core::table::InMemoryTable;
 use streamling_core::table::side_output::TableSideOutput;
+use streamling_core::table::{InMemoryTable, WindowConfig};
 use streamling_core::topology::PipelineTopology;
 use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
@@ -1794,6 +1794,12 @@ impl Streamling {
                     }
 
                     let metric_metadata_id = metric_key(&application_id, reference_name.as_str());
+                    let session_state = session_manager.session_state();
+                    let window = table.window.as_deref().map(|predicate| WindowConfig {
+                        predicate,
+                        session_state: &session_state,
+                        gc_interval: app_config.table.window_gc_interval,
+                    });
                     let storage = match table.backend_type {
                         TableBackendType::InMemory => Arc::new(InMemoryTable::try_new(
                             &reference_name,
@@ -1801,6 +1807,7 @@ impl Streamling {
                             &primary_key,
                             metric_metadata_id.clone(),
                             table.max_dead_ratio,
+                            window,
                         )?),
                     };
                     session_manager.tables().register(Arc::clone(&storage));
@@ -1818,7 +1825,7 @@ impl Streamling {
                         storage,
                         &sql_plan,
                         upstream.clone(),
-                        session_manager.session_state(),
+                        session_state,
                     )
                     .streamling_with_context(|| {
                         format!("{}: unsupported table SQL", ctx.format())
