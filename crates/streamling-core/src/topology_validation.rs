@@ -69,12 +69,16 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
         // Skip dynamic_table transforms — they are consumed via dynamic_table_check()
         // UDF calls in SQL WHERE clauses, not via FROM clauses or `from:` fields.
         // They have dedicated validation in validate_dynamic_table_usage().
-        // Skip table transforms too: their driver always consumes them.
+        // Skip table transforms too: their driver always consumes them. And
+        // table_agg transforms, which only lookup_eq() calls read.
         let transform_type = transform_val
             .as_mapping()
             .and_then(|m| m.get("type"))
             .and_then(|v| v.as_str());
-        if !matches!(transform_type, Some("dynamic_table" | "table")) {
+        if !matches!(
+            transform_type,
+            Some("dynamic_table" | "table" | "table_agg")
+        ) {
             node_consumers.insert(name.to_lowercase(), 0);
         }
     }
@@ -841,6 +845,34 @@ sinks:
             validate_job_mode(true, &topology).is_ok(),
             "job_mode with a plugin source should succeed"
         );
+    }
+
+    #[test]
+    fn table_agg_read_only_by_lookups_is_not_an_orphan() {
+        let config = r#"
+sources:
+  src:
+    type: kafka
+    topic: test
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    sql: "SELECT id, address FROM src"
+  volumes:
+    type: table_agg
+    sql: "SELECT address, count(*) AS n FROM tokens GROUP BY address"
+  reader:
+    type: sql
+    primary_key: id
+    sql: "SELECT id, lookup_eq('volumes', 'address', address, 'n') AS n FROM src"
+sinks:
+  out:
+    type: print
+    from: reader
+"#;
+        assert!(validate_no_orphan_nodes(config).is_ok());
     }
 
     #[test]

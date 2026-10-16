@@ -10,7 +10,7 @@
 
 use crate::functions::decimal_arb_ops::exact_div_at_scale;
 use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION};
-use crate::{streamling_user_bail, streamling_user_err};
+use crate::{streamling_bail, streamling_user_bail, streamling_user_err};
 use arrow::array::{Array, ArrayRef, Int64Array, LargeBinaryArray, ListArray};
 use arrow_schema::{Field, FieldRef};
 use bigdecimal::BigDecimal;
@@ -335,6 +335,7 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
             }
             Ok(Box::new(SumAccumulator {
                 sum: None,
+                count: 0,
                 input_scale: s,
                 output_scale: s_out,
                 output_precision: p_out,
@@ -368,14 +369,19 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
         self.builtin.inner().create_groups_accumulator(args)
     }
     fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        // The decimal_arb `SumAccumulator` has no `retract_batch`, so it
-        // can't power window-frame sliding aggregation. Bail clearly for
-        // the decimal_arb branch; for everything else delegate to the
-        // built-in (which returns a retract-capable accumulator and
-        // avoids O(window_size) recompute per step).
+        // The decimal_arb `SumAccumulator` retracts, but the DISTINCT one
+        // doesn't, so it can't power window-frame sliding aggregation. Bail
+        // clearly for that; for everything else delegate to the built-in
+        // (which returns a retract-capable accumulator and avoids
+        // O(window_size) recompute per step).
         reject_bare_large_binary(&args, "decimal_arb sum")?;
         if input_is_decimal_arb(&args)? {
-            streamling_user_bail!("decimal_arb sum does not support sliding-window aggregation")
+            if args.is_distinct {
+                streamling_user_bail!(
+                    "decimal_arb sum(DISTINCT) does not support sliding-window aggregation"
+                )
+            }
+            return self.accumulator(args);
         }
         self.builtin.inner().create_sliding_accumulator(args)
     }
@@ -669,6 +675,10 @@ impl GroupsAccumulator for RetypedGroupsAccumulator {
 #[derive(Debug)]
 struct SumAccumulator {
     sum: Option<BigDecimal>,
+    /// Non-null values `update_batch` added and `retract_batch` hasn't
+    /// removed, so a fully retracted sum is NULL again. `merge_batch` doesn't
+    /// count: only sliding aggregation retracts, and it never merges.
+    count: u64,
     input_scale: u32,
     output_scale: u32,
     output_precision: u32,
@@ -688,9 +698,28 @@ impl Accumulator for SumAccumulator {
             if let Some(v) = decode_value(array, i, self.input_scale)? {
                 let acc = self.sum.take().unwrap_or_else(|| BigDecimal::from(0i32));
                 self.sum = Some(acc + v.into_bigdecimal());
+                self.count += 1;
             }
         }
         Ok(())
+    }
+
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let array = downcast_input(values, "sum")?;
+        for i in 0..array.len() {
+            if let Some(v) = decode_value(array, i, self.input_scale)? {
+                let (Some(acc), Some(count)) = (self.sum.take(), self.count.checked_sub(1)) else {
+                    streamling_bail!("decimal_arb sum: retracted a value it never added")
+                };
+                self.count = count;
+                self.sum = (count > 0).then(|| acc - v.into_bigdecimal());
+            }
+        }
+        Ok(())
+    }
+
+    fn supports_retract_batch(&self) -> bool {
+        true
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
@@ -1263,14 +1292,19 @@ impl AggregateUDFImpl for DecimalArbAvgUdaf {
         self.builtin.inner().create_groups_accumulator(args)
     }
     fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        // Mirrors SUM/MIN/MAX: the decimal_arb `AvgAccumulator` has no
-        // `retract_batch`, so it can't power window-frame sliding
+        // Mirrors SUM: the decimal_arb `AvgAccumulator` retracts, but the
+        // DISTINCT one doesn't, so it can't power window-frame sliding
         // aggregation — bail clearly instead of falling through to the
         // default non-retracting accumulator. For everything else delegate
         // to the built-in's retract-capable sliding accumulator.
         reject_bare_large_binary(&args, "decimal_arb avg")?;
         if input_is_decimal_arb(&args)? {
-            streamling_user_bail!("decimal_arb avg does not support sliding-window aggregation")
+            if args.is_distinct {
+                streamling_user_bail!(
+                    "decimal_arb avg(DISTINCT) does not support sliding-window aggregation"
+                )
+            }
+            return self.accumulator(args);
         }
         self.builtin.inner().create_sliding_accumulator(args)
     }
@@ -1314,6 +1348,22 @@ impl Accumulator for AvgAccumulator {
             }
         }
         Ok(())
+    }
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let array = downcast_input(values, "avg")?;
+        for i in 0..array.len() {
+            if let Some(v) = decode_value(array, i, self.input_scale)? {
+                if self.count == 0 {
+                    streamling_bail!("decimal_arb avg: retracted a value it never added")
+                }
+                self.sum -= v.into_bigdecimal();
+                self.count -= 1;
+            }
+        }
+        Ok(())
+    }
+    fn supports_retract_batch(&self) -> bool {
+        true
     }
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         if states.len() != 2 {
@@ -1532,6 +1582,7 @@ mod tests {
         let (p_out, s_out) = sum_output_precision_scale(p, s);
         Box::new(SumAccumulator {
             sum: None,
+            count: 0,
             input_scale: s,
             output_scale: s_out,
             output_precision: p_out,
@@ -1635,6 +1686,72 @@ mod tests {
         combined.merge_batch(&[Arc::new(state_arr)]).unwrap();
         let result = unwrap_decimal_arb(combined.evaluate().unwrap(), s_out).unwrap();
         assert_eq!(result, DecimalArbValue::from_str("10.00").unwrap());
+    }
+
+    /// The UDAF's sliding accumulator over a decimal_arb(`p`, `s`) column.
+    fn sliding_accumulator(udaf: &dyn AggregateUDFImpl, p: u32, s: u32) -> Box<dyn Accumulator> {
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::Column;
+        let field: FieldRef = Arc::new(DecimalArbType::field("x", p, s, true).unwrap());
+        let schema = arrow_schema::Schema::new(vec![Arc::clone(&field)]);
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("x", 0))];
+        udaf.create_sliding_accumulator(AccumulatorArgs {
+            return_field: udaf.return_field(std::slice::from_ref(&field)).unwrap(),
+            schema: &schema,
+            expr_fields: std::slice::from_ref(&field),
+            ignore_nulls: false,
+            order_bys: &[],
+            is_distinct: false,
+            name: "agg",
+            is_reversed: false,
+            exprs: &exprs,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn sliding_sum_retracts_values_and_is_null_once_emptied() {
+        let mut acc = sliding_accumulator(&DecimalArbSumUdaf::new(), 10, 2);
+        let (_, s_out) = sum_output_precision_scale(10, 2);
+        acc.update_batch(&[build_input(
+            2,
+            10,
+            &[Some("1.50"), Some("2.50"), Some("-1.50"), None],
+        )])
+        .unwrap();
+        acc.retract_batch(&[build_input(2, 10, &[Some("2.50"), None])])
+            .unwrap();
+        // 1.50 - 1.50: a zero sum of live values is 0, not NULL.
+        assert_eq!(
+            unwrap_decimal_arb(acc.evaluate().unwrap(), s_out),
+            Some(DecimalArbValue::from_str("0").unwrap())
+        );
+        acc.retract_batch(&[build_input(2, 10, &[Some("-1.50")])])
+            .unwrap();
+        assert_eq!(
+            unwrap_decimal_arb(acc.evaluate().unwrap(), s_out),
+            Some(DecimalArbValue::from_str("1.50").unwrap())
+        );
+        acc.retract_batch(&[build_input(2, 10, &[Some("1.50")])])
+            .unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::LargeBinary(None));
+    }
+
+    #[test]
+    fn sliding_avg_retracts_values_and_is_null_once_emptied() {
+        let mut acc = sliding_accumulator(&DecimalArbAvgUdaf::new(), 10, 0);
+        let (_, s_out) = avg_output_precision_scale(10, 0);
+        acc.update_batch(&[build_input(0, 10, &[Some("1"), Some("2"), Some("6"), None])])
+            .unwrap();
+        acc.retract_batch(&[build_input(0, 10, &[Some("6"), None])])
+            .unwrap();
+        assert_eq!(
+            unwrap_decimal_arb(acc.evaluate().unwrap(), s_out),
+            Some(DecimalArbValue::from_str("1.5").unwrap())
+        );
+        acc.retract_batch(&[build_input(0, 10, &[Some("1"), Some("2")])])
+            .unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::LargeBinary(None));
     }
 
     // ---- MIN / MAX ----

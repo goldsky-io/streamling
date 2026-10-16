@@ -1,8 +1,11 @@
 //! The `table` transform: the latest row per primary key, maintained from a
 //! changelog stream. The table is applied by its upstream's side output.
 
+pub mod aggregate;
 pub mod driver;
 pub mod side_output;
+
+use aggregate::TableAggregate;
 
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt};
@@ -13,7 +16,8 @@ use arrow::array::{
     new_null_array,
 };
 use arrow::compute::{
-    cast, filter, interleave, interleave_record_batch, not, prep_null_mask_filter,
+    cast, filter, filter_record_batch, interleave, interleave_record_batch, not,
+    prep_null_mask_filter,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, SortField};
@@ -129,6 +133,46 @@ impl TableState {
     /// The row at `location` is no longer the live row of its key.
     fn release(&mut self, location: RowLocation) {
         self.chunk_mut(location.chunk).live_rows -= 1;
+    }
+
+    /// The stored rows at `locations`, in order.
+    fn rows_at(&self, schema: &SchemaRef, locations: &[RowLocation]) -> Result<RecordBatch> {
+        if locations.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+        }
+        let mut sources: Vec<&RecordBatch> = Vec::new();
+        // Chunk number to its position in `sources`.
+        let mut chunk_sources: HashMap<usize, usize> = HashMap::new();
+        let mut indices = Vec::with_capacity(locations.len());
+        for location in locations {
+            let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
+                sources.push(&self.chunk(location.chunk).batch);
+                sources.len() - 1
+            });
+            indices.push((source, location.row));
+        }
+        interleave_record_batch(&sources, &indices)
+            .streamling_context("failed to read the stored rows")
+    }
+}
+
+/// What an apply changes in the live rows, for the table's aggregates.
+struct LiveRowChanges {
+    /// Rows of earlier chunks that stopped being live.
+    removed: Vec<RowLocation>,
+    /// Whether each row of the new chunk is live.
+    added: Vec<bool>,
+}
+
+impl LiveRowChanges {
+    /// The row at `location` is no longer live. A row of the new chunk was
+    /// never live before the apply, so it's neither removed nor added.
+    fn release(&mut self, location: RowLocation, new_chunk: usize) {
+        if location.chunk == new_chunk {
+            self.added[location.row] = false;
+        } else {
+            self.removed.push(location);
+        }
     }
 }
 
@@ -414,6 +458,9 @@ fn wall_clock(rows: usize) -> ArrayRef {
 /// wholly inside the window. A predicate that reads [`WALL_CLOCK_COLUMN`]
 /// makes each chunk store the time its rows were applied in that column.
 ///
+/// Each [`TableAggregate`] reading the table gets every change to the live
+/// rows, from applies and GC passes, before the write lock is released.
+///
 /// Nothing is persisted, so the table starts empty after a restart.
 pub struct InMemoryTable {
     name: String,
@@ -434,6 +481,8 @@ pub struct InMemoryTable {
     /// Cleaning runs while dead rows exceed this fraction of the live rows.
     max_dead_ratio: f64,
     window: Option<Window>,
+    /// Locked before `state`.
+    aggregates: RwLock<Vec<Arc<TableAggregate>>>,
     state: RwLock<TableState>,
 }
 
@@ -526,6 +575,7 @@ impl InMemoryTable {
             converter,
             max_dead_ratio,
             window,
+            aggregates: RwLock::new(Vec::new()),
             state: RwLock::new(TableState::default()),
         })
     }
@@ -576,6 +626,11 @@ impl InMemoryTable {
             Vec::new()
         };
 
+        let aggregates = self.aggregates.read();
+        let mut changes = (!aggregates.is_empty()).then(|| LiveRowChanges {
+            removed: Vec::new(),
+            added: vec![false; written_rows],
+        });
         let mut guard = self.state.write();
         let state = &mut *guard;
         let new_chunk = state.next_chunk_id();
@@ -602,15 +657,39 @@ impl InMemoryTable {
                     };
                     if let Some(replaced) = replaced {
                         state.release(replaced);
+                        if let Some(changes) = &mut changes {
+                            changes.release(replaced, new_chunk);
+                        }
                     }
                     state.chunk_mut(new_chunk).live_rows += 1;
+                    if let Some(changes) = &mut changes {
+                        changes.added[row] = true;
+                    }
                 }
                 RowOp::Delete => {
                     if let Some(stored) = state.index.remove(key.as_ref()) {
                         state.key_bytes -= key.as_ref().len();
                         state.release(stored);
+                        if let Some(changes) = &mut changes {
+                            changes.release(stored, new_chunk);
+                        }
                     }
                 }
+            }
+        }
+        // Before cleaning, which may drop the chunks of the removed rows.
+        if let Some(changes) = changes {
+            let removed = state.rows_at(&self.schema, &changes.removed)?;
+            let added = if written_rows > 0 {
+                filter_record_batch(
+                    &state.chunk(new_chunk).batch,
+                    &BooleanArray::from(changes.added),
+                )?
+            } else {
+                RecordBatch::new_empty(Arc::clone(&self.schema))
+            };
+            for aggregate in aggregates.iter() {
+                aggregate.update(&removed, &added)?;
             }
         }
 
@@ -620,6 +699,11 @@ impl InMemoryTable {
         drop(guard);
         self.record_gauges(live_rows, memory_bytes);
         Ok(())
+    }
+
+    /// Called before data flows, so the aggregate sees every change.
+    fn add_aggregate(&self, aggregate: Arc<TableAggregate>) {
+        self.aggregates.write().push(aggregate);
     }
 
     /// The primary key's field, if `key` names the table's single-column
@@ -775,7 +859,8 @@ impl InMemoryTable {
     fn evict_outside(&self, window: &Window) -> Result<()> {
         let compiled = window.compile()?;
         let chunks = self.chunks_to_evaluate(window, &compiled)?;
-        // `(chunk, rows, keys)` of the rows outside the window, live or not.
+        // `(chunk, batch, rows, keys)` of the rows outside the window, live or
+        // not.
         let mut outside_rows = Vec::new();
         for (chunk, batch) in chunks {
             let inside = compiled
@@ -809,18 +894,32 @@ impl InMemoryTable {
                 .convert_columns(&key_columns)
                 .streamling_context("failed to encode the stored keys")?;
             let rows: Vec<usize> = outside.values().set_indices().collect();
-            outside_rows.push((chunk, rows, keys));
+            outside_rows.push((chunk, batch, rows, keys));
         }
 
+        let aggregates = self.aggregates.read();
         let mut state = self.state.write();
-        for (chunk, rows, keys) in outside_rows {
-            for (row, key) in rows.into_iter().zip(keys.iter()) {
-                let location = RowLocation { chunk, row };
+        // `(position in outside_rows, row)` of the rows evicted.
+        let mut evicted = Vec::new();
+        for (position, (chunk, _, rows, keys)) in outside_rows.iter().enumerate() {
+            for (&row, key) in rows.iter().zip(keys.iter()) {
+                let location = RowLocation { chunk: *chunk, row };
                 if state.index.get(key.as_ref()) == Some(&location) {
                     state.index.remove(key.as_ref());
                     state.key_bytes -= key.as_ref().len();
                     state.release(location);
+                    evicted.push((position, row));
                 }
+            }
+        }
+        if !aggregates.is_empty() && !evicted.is_empty() {
+            let batches: Vec<&RecordBatch> =
+                outside_rows.iter().map(|(_, batch, _, _)| batch).collect();
+            let removed = interleave_record_batch(&batches, &evicted)
+                .streamling_context("failed to read the evicted rows")?;
+            let added = RecordBatch::new_empty(Arc::clone(&self.schema));
+            for aggregate in aggregates.iter() {
+                aggregate.update(&removed, &added)?;
             }
         }
         Ok(())
