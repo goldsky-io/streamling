@@ -403,6 +403,11 @@ impl SessionManager {
                         extension.node.inputs()[0],
                         subquery_handling,
                     ),
+                    // Inserted above a transform's scan by its `parallelism`.
+                    "RepartitionNode" => Self::validate_plan_and_extract_source_name(
+                        extension.node.inputs()[0],
+                        subquery_handling,
+                    ),
                     _ => Err(streamling_user_err!("unsupported extension: {}", name).into()),
                 }
             }
@@ -902,5 +907,47 @@ mod tests {
                 "wrong result for `{sql}`"
             );
         }
+    }
+
+    /// A SQL transform that reads another transform declaring `parallelism`
+    /// must plan: the upstream view carries the exchange that `parallelism`
+    /// inserts above its scan, and source-name extraction has to see through it
+    /// the same way it sees through the other wrapper nodes.
+    #[tokio::test]
+    async fn sql_over_a_parallelized_transform_plans() {
+        use crate::operators::repartition::{Placement, RepartitionNode};
+        use datafusion::datasource::{MemTable, ViewTable};
+        use datafusion::logical_expr::{Extension, LogicalPlanBuilder};
+
+        let sm = SessionManager::new(1024, 64, DynamicTableRegistry::new(), 4).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let blocks = MemTable::try_new(schema, vec![vec![]]).unwrap();
+        sm.register_table("blocks", Arc::new(blocks)).unwrap();
+
+        let (scan, _) = sm
+            .create_supported_logical_plan("SELECT * FROM blocks".to_string())
+            .await
+            .unwrap();
+        let widened = LogicalPlan::Extension(Extension {
+            node: Arc::new(RepartitionNode::new(
+                scan,
+                Placement::ByKey(vec!["id".to_string()]),
+                Some(4),
+                "widened".to_string(),
+            )),
+        });
+        let upstream = LogicalPlanBuilder::from(widened)
+            .filter(col("id").gt(lit(0i64)))
+            .unwrap()
+            .build()
+            .unwrap();
+        sm.register_table("widened", Arc::new(ViewTable::new(upstream, None)))
+            .unwrap();
+
+        let (_, source) = sm
+            .create_supported_logical_plan("SELECT id FROM widened WHERE id > 1".to_string())
+            .await
+            .expect("a SQL transform reading a parallelized transform must plan");
+        assert_eq!(source, "blocks");
     }
 }
