@@ -280,3 +280,56 @@ async fn matching_widths_need_no_exchange() {
         "an elided exchange must still deliver every row"
     );
 }
+
+/// A SQL transform may read another SQL transform that declares `parallelism`.
+/// The downstream SQL plans against the upstream view, which carries the
+/// exchange the upstream's `parallelism` inserted; it must plan, and the rows
+/// must come out once each.
+#[tokio::test]
+async fn sql_transform_reads_a_parallelized_sql_transform() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let (dir, total) = write_csv_files(&ctx, "chained", 4);
+
+    let pipeline = format!(
+        r#"
+sources:
+  file_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    parallelism: 1
+    mode:
+      type: bounded
+
+transforms:
+  widen:
+    type: sql
+    primary_key: id
+    parallelism: 4
+    sql: select * from file_src
+  downstream:
+    type: sql
+    primary_key: id
+    sql: select id, value from widen where id > 0
+
+sinks:
+  print_sink:
+    type: print
+    from: downstream
+    sample_every: 1
+"#,
+        path = dir.display(),
+    );
+    let ids = run_and_collect_ids(&ctx, &pipeline).await;
+
+    assert_eq!(
+        ids,
+        (1..=total).collect::<Vec<i64>>(),
+        "every row must pass through the widened transform and its reader exactly once"
+    );
+}
