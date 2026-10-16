@@ -563,6 +563,16 @@ pub struct TableTransform {
     pub telemetry: Option<Telemetry>,
 }
 
+/// `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's
+/// live rows, maintained incrementally. Only `lookup_eq` reads it, keyed by
+/// the GROUP BY expression.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TableAggTransform {
+    pub sql: String,
+    pub telemetry: Option<Telemetry>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SqlTransform {
@@ -648,6 +658,7 @@ define_typed_enum!(
     pub enum Transform {
         dynamic_table(DynamicTableTransform),
         table(TableTransform),
+        table_agg(TableAggTransform),
         sql(SqlTransform),
         handler(HandlerTransform),
         script(ScriptTransform),
@@ -662,6 +673,7 @@ impl Transform {
         match self {
             Transform::dynamic_table(t) => t.telemetry.as_ref(),
             Transform::table(t) => t.telemetry.as_ref(),
+            Transform::table_agg(t) => t.telemetry.as_ref(),
             Transform::sql(t) => t.telemetry.as_ref(),
             Transform::handler(t) => t.telemetry.as_ref(),
             Transform::script(t) => t.telemetry.as_ref(),
@@ -671,14 +683,15 @@ impl Transform {
 
     /// Requested output width for this transform.
     ///
-    /// `dynamic_table` and `table` are `SinglePartition` operators.
+    /// `dynamic_table` and `table` are `SinglePartition` operators, and a
+    /// `table_agg` runs inside its table's apply.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Transform::sql(t) => t.parallelism,
             Transform::handler(t) => t.parallelism,
             Transform::script(t) => t.parallelism,
             Transform::plugin(t) => t.parallelism,
-            Transform::dynamic_table(_) | Transform::table(_) => None,
+            Transform::dynamic_table(_) | Transform::table(_) | Transform::table_agg(_) => None,
         }
     }
 }
@@ -1058,7 +1071,8 @@ fn transform_per_type_reserved_keys(transform: &Transform) -> &'static [&'static
         Transform::sql(_)
         | Transform::handler(_)
         | Transform::dynamic_table(_)
-        | Transform::table(_) => &[],
+        | Transform::table(_)
+        | Transform::table_agg(_) => &[],
     }
 }
 
@@ -3529,6 +3543,26 @@ sinks: {}
             panic!("expected a table transform");
         };
         assert_eq!(table.max_dead_ratio, 0.1);
+    }
+
+    #[test]
+    fn table_agg_transform_parses_and_rejects_unknown_fields() {
+        const SQL: &str = "SELECT address, count(*) AS n FROM tokens GROUP BY address";
+        let parse = |extra: &str| {
+            PipelineTopology::load_from_string(&format!(
+                "sources:\n  src: {{ type: kafka, topic: t, primary_key: id }}\ntransforms:\n  volumes:\n    type: table_agg\n    sql: {SQL}\n{extra}sinks: {{}}\n"
+            ))
+        };
+
+        let topology = parse("").unwrap();
+        let Transform::table_agg(aggregate) = &topology.transforms["volumes"] else {
+            panic!("expected a table_agg transform");
+        };
+        assert_eq!(aggregate.sql, SQL);
+        assert_eq!(topology.transforms["volumes"].parallelism(), None);
+
+        let unknown = parse("    primary_key: address\n").unwrap_err().to_string();
+        assert!(unknown.contains("unknown field `primary_key`"), "{unknown}");
     }
 
     #[test]
