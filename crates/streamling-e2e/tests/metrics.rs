@@ -35,19 +35,12 @@ async fn setup_with_prometheus() -> Result<TestContext> {
 async fn test_basic_metrics_emission() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
-    // Skip if Prometheus is not available
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 25u64;
@@ -172,18 +165,12 @@ sinks:
 async fn test_checkpoint_metrics_emission() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 50u64;
@@ -327,18 +314,12 @@ sinks:
 async fn test_metrics_with_instance_id() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -433,18 +414,12 @@ sinks:
 async fn test_kafka_lag_reports_zero_when_caught_up() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -536,18 +511,12 @@ sinks:
 async fn test_event_time_metrics_kafka_source() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -654,18 +623,12 @@ sinks:
 async fn test_event_time_metrics_pre_filter_observation() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -766,18 +729,12 @@ sinks:
 async fn test_event_time_metrics_absent_when_not_configured() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 5u64;
@@ -862,18 +819,12 @@ sinks:
 async fn test_event_time_metrics_misconfigured_column_logs_once_and_skips() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 5u64;
@@ -975,18 +926,12 @@ sinks:
 async fn test_event_time_metrics_across_source_transform_and_sink() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 5u64;
@@ -1116,18 +1061,12 @@ sinks:
 async fn test_yaml_telemetry_labels_appear_on_emitted_metrics() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
