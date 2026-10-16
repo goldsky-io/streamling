@@ -32,6 +32,7 @@ use streamling_core::operators::checkpointable::CheckpointableNode;
 use streamling_core::operators::external_handlers::{ExternalHandlerConfig, ExternalHandlerNode};
 use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
+use streamling_core::table::aggregate as table_aggregate;
 use streamling_core::table::side_output::TableSideOutput;
 use streamling_core::table::{InMemoryTable, WindowConfig};
 use streamling_core::topology::PipelineTopology;
@@ -1143,6 +1144,14 @@ impl Streamling {
         // Analyze topology to determine which sources and transforms have multiple consumers
         let node_consumers = Self::find_source_consumers(&pipeline_topology);
         debug!("Node consumer analysis: {:?}", node_consumers);
+        // lookup_eq() calls, the only readers of a table_agg, aren't consumers.
+        for (name, transform) in &pipeline_topology.transforms {
+            if matches!(transform, topology::Transform::table_agg(_))
+                && node_consumers.get(name).is_some_and(|&count| count > 0)
+            {
+                streamling_user_bail!("'{}' is a table_agg; read it with lookup_eq", name);
+            }
+        }
 
         // Unless explicitly configured, derive the state backend's pool
         // acquire timeout from the shutdown budget so the two cannot be
@@ -1879,6 +1888,32 @@ impl Streamling {
                     {
                         streamling_user_bail!("{}: duplicate node name", ctx.format());
                     }
+                }
+                topology::Transform::table_agg(aggregate) => {
+                    let ctx = node_contexts
+                        .get(&reference_name)
+                        .expect("node context must exist");
+                    let sql = &aggregate.sql;
+                    let plan = session_manager
+                        .create_logical_plan(sql.clone())
+                        .await
+                        .streamling_with_context(|| {
+                            format!(
+                                "{}: failed to parse SQL\n--- SQL ---\n{}\n-----------",
+                                ctx.format(),
+                                sql.trim()
+                            )
+                        })?;
+                    // Updated inside its table's apply, so it has no plan of its
+                    // own, no driver and no checkpoint acks: the table's driver
+                    // acks the batches that update it.
+                    table_aggregate::register(
+                        &reference_name,
+                        &plan,
+                        session_manager.tables(),
+                        &session_manager.session_state(),
+                        metric_key(&application_id, &reference_name),
+                    )?;
                 }
                 topology::Transform::sql(sql_transform) => {
                     let ctx = node_contexts
@@ -3821,6 +3856,9 @@ impl Streamling {
                 topology::Transform::dynamic_table(_) => {
                     // Dynamic tables don't directly consume from sources in the same way
                 }
+                // Updated inside its table's apply, so it never runs the table's
+                // plan. Counting it would make scan sharing wait for it forever.
+                topology::Transform::table_agg(_) => {}
             }
         }
 
@@ -3871,6 +3909,7 @@ impl Streamling {
             let operator_type = match transform {
                 topology::Transform::dynamic_table(_) => "dynamic_table",
                 topology::Transform::table(_) => "table",
+                topology::Transform::table_agg(_) => "table_agg",
                 topology::Transform::sql(_) => "sql",
                 topology::Transform::handler(_) => "handler",
                 topology::Transform::script(_) => "script",
@@ -4001,7 +4040,8 @@ impl Streamling {
                 .clone();
             let (mut additional_tags, upstream_table_refs) = match transform {
                 topology::Transform::sql(topology::SqlTransform { sql, .. })
-                | topology::Transform::table(topology::TableTransform { sql, .. }) => {
+                | topology::Transform::table(topology::TableTransform { sql, .. })
+                | topology::Transform::table_agg(topology::TableAggTransform { sql, .. }) => {
                     let table_names = match extract_table_references_from_sql(sql) {
                         Ok(names) => names,
                         Err(e) => {
@@ -5773,6 +5813,47 @@ mod table_tests {
             "a reader-less table is consumed by its driver"
         );
         assert_eq!(consumers["tokens"], 3, "driver + SQL reader + sink");
+    }
+
+    const VOLUMES: &str = "  volumes:\n    type: table_agg\n    sql: SELECT num, count(*) AS n FROM tokens GROUP BY num\n";
+
+    #[test]
+    fn find_source_consumers_does_not_count_a_table_agg_against_its_table() {
+        let topology = PipelineTopology::load_from_string(&format!(
+            "sources:\n  src: {{ type: kafka, topic: t, primary_key: id }}\ntransforms:\n{TOKENS}{VOLUMES}sinks: {{}}\n"
+        ))
+        .unwrap();
+
+        let consumers = Streamling::find_source_consumers(&topology);
+
+        assert_eq!(
+            consumers["tokens"], 1,
+            "only the table's driver: a table_agg never runs its table's plan"
+        );
+        assert_eq!(consumers["volumes"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plans_a_table_agg_read_by_lookup_eq() {
+        dry_run(&format!(
+            "transforms:\n{TOKENS}{VOLUMES}  reader:\n    type: sql\n    primary_key: id\n    sql: SELECT id, lookup_eq('volumes', 'num', num, 'n') AS n FROM src\nsinks:\n  out:\n    type: print\n    from: reader\n"
+        ))
+        .await
+        .expect("a table_agg read by lookup_eq must plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_reading_a_table_agg_by_name() {
+        for readers in [
+            "  reader:\n    type: sql\n    primary_key: num\n    sql: SELECT num, n FROM volumes\nsinks:\n  out:\n    type: print\n    from: reader\n",
+            "sinks:\n  out:\n    type: print\n    from: volumes\n",
+        ] {
+            let err = dry_run_error(&format!("transforms:\n{TOKENS}{VOLUMES}{readers}")).await;
+            assert!(
+                err.contains("'volumes' is a table_agg; read it with lookup_eq"),
+                "{readers}: {err}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

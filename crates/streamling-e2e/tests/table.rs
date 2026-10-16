@@ -481,6 +481,190 @@ sinks:
     assert_eq!(rows, vec![(1, None), (2, Some(20))]);
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct Transfer {
+    id: i64,
+    address: String,
+    amount: i64,
+    block_timestamp: i64,
+}
+
+const TRANSFER_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "Transfer",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "address", "type": "string"},
+        {"name": "amount", "type": "long"},
+        {"name": "block_timestamp", "type": "long"}
+    ]
+}"#;
+
+/// A `table_agg` over a windowed table aggregates its live rows: an upsert
+/// replaces the key's previous amount, a delete and a window eviction drop
+/// theirs, and a lookup of an address without rows misses.
+#[tokio::test]
+async fn test_table_agg_sliding_window() {
+    const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+    const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+    const GC_INTERVAL: &str = "500ms";
+    /// A few of the table's GC intervals.
+    const GC_WAIT: Duration = Duration::from_secs(3);
+    const TWO_HOURS_SECS: i64 = 2 * 3600;
+    const UPSERTS_LOADED: &str = "SELECT count(*) FROM public.agg_transfers \
+         WHERE (id, amount) IN ((1, 30), (2, 5), (3, 7))";
+    const DELETED: &str = "SELECT count(*) FROM public.agg_transfers WHERE id = 4";
+    const ENRICHED: &str = "SELECT count(*) FROM public.agg_enriched";
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(TRANSFER_SCHEMA)
+        .await
+        .expect("Failed to register the transfer schema");
+    let transactions = ctx
+        .create_kafka_topic("transactions")
+        .await
+        .expect("Failed to create the transactions topic");
+    transactions
+        .register_schema(TRANSACTION_SCHEMA)
+        .await
+        .expect("Failed to register the transaction schema");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Clock before the Unix epoch")
+        .as_secs() as i64;
+    let transfer = |id, address: &str, amount, block_timestamp| Transfer {
+        id,
+        address: address.to_string(),
+        amount,
+        block_timestamp,
+    };
+    ctx.kafka
+        .produce_avro_records(&[
+            transfer(1, "0xa", 10, now),
+            transfer(2, "0xa", 5, now - TWO_HOURS_SECS),
+            transfer(3, "0xb", 7, now),
+            transfer(4, "0xb", 100, now),
+            transfer(1, "0xa", 30, now),
+        ])
+        .await
+        .expect("Failed to produce transfers");
+    ctx.kafka
+        .produce_avro_records_with_op(&[transfer(4, "0xb", 100, now)], "d")
+        .await
+        .expect("Failed to produce the delete");
+
+    let pipeline = format!(
+        r#"
+sources:
+  transfers:
+    type: kafka
+    topic: {transfers_topic}
+    starting_offsets: earliest
+    primary_key: id
+  transactions:
+    type: kafka
+    topic: {transactions_topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  transfer_window:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    window: block_timestamp >= extract(epoch from now() - interval '1 hour')
+    sql: SELECT id, address, amount, block_timestamp FROM transfers
+  volumes:
+    type: table_agg
+    sql: SELECT address, sum(amount) AS volume, count(*) AS transfers FROM transfer_window GROUP BY address
+  enriched:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT
+        id,
+        lookup_eq('volumes', 'address', address, 'volume') AS volume,
+        lookup_eq('volumes', 'address', address, 'transfers') AS transfers
+      FROM transactions
+sinks:
+  transfers_pg:
+    type: postgres
+    from: transfer_window
+    table: agg_transfers
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+  enriched_pg:
+    type: postgres
+    from: enriched
+    table: agg_enriched
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        transfers_topic = ctx.kafka_topic,
+        transactions_topic = transactions.topic,
+    );
+
+    // Transfers reach Postgres only after the table, and so the aggregate,
+    // applied them. The idle transfers source keeps delivering empty batches,
+    // which run the table's GC passes.
+    let signal_when = async {
+        if !wait_for_count(&ctx, UPSERTS_LOADED, 3, LOAD_TIMEOUT).await
+            || !wait_for_count(&ctx, DELETED, 0, LOAD_TIMEOUT).await
+        {
+            return;
+        }
+        tokio::time::sleep(GC_WAIT).await;
+        let transaction = |id, address: &str| Transaction {
+            id,
+            address: address.to_string(),
+        };
+        transactions
+            .produce_avro_records(&[
+                transaction(1, "0xa"),
+                transaction(2, "0xb"),
+                transaction(3, "0xc"),
+            ])
+            .await
+            .expect("Failed to produce transactions");
+        wait_for_count(&ctx, ENRICHED, 3, LOAD_TIMEOUT).await;
+    };
+
+    let (status, _stderr) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline,
+            PipelineOpts::new()
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__TABLE__WINDOW_GC_INTERVAL", GC_INTERVAL),
+            signal_when,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Streamling must exit after SIGTERM");
+    assert!(status.success());
+
+    let rows: Vec<(i64, Option<i64>, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, volume, transfers FROM public.agg_enriched ORDER BY id")
+        .await
+        .expect("Failed to query");
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some(30), Some(1)),
+            (2, Some(7), Some(1)),
+            (3, None, None)
+        ]
+    );
+}
+
 const SINGLE_PARTITION: i32 = 1;
 const SELF_JOIN_PARTITIONS: i32 = 2;
 

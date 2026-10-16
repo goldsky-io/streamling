@@ -9,7 +9,9 @@ use tracing::debug;
 /// Get priority for transform types (lower number = higher priority)
 fn get_transform_priority(transform: &topology::Transform) -> u8 {
     match transform {
-        topology::Transform::dynamic_table(_) | topology::Transform::table(_) => 0, // Highest priority
+        topology::Transform::dynamic_table(_)
+        | topology::Transform::table(_)
+        | topology::Transform::table_agg(_) => 0, // Highest priority
         topology::Transform::plugin(_) => 1, // Plugin transforms register tables
         topology::Transform::sql(_) => 2,
         _ => 3, // Other transforms have equal lower priority
@@ -35,7 +37,8 @@ pub fn sort_transforms(
     for (transform_name, transform) in transforms {
         let transform_dependencies: Vec<String> = match transform {
             topology::Transform::sql(topology::SqlTransform { sql, .. })
-            | topology::Transform::table(topology::TableTransform { sql, .. }) => {
+            | topology::Transform::table(topology::TableTransform { sql, .. })
+            | topology::Transform::table_agg(topology::TableAggTransform { sql, .. }) => {
                 // Extract table references from SQL to find dependencies on other transforms
                 extract_sql_dependencies(sql, transforms, existing_plans)
             }
@@ -362,6 +365,33 @@ mod tests {
         let order = sort_transforms(&transforms, &HashMap::new());
 
         assert_eq!(order, ["prep", "rates", "enriched"]);
+    }
+
+    /// By name, `a_volumes` sorts first and `b_reader` before `z_tokens`.
+    #[test]
+    fn table_aggs_sort_after_their_table_and_before_their_lookup_readers() {
+        let mut transforms = HashMap::new();
+        transforms.insert(
+            "a_volumes".to_string(),
+            topology::Transform::table_agg(topology::TableAggTransform {
+                sql: "SELECT address, count(*) AS n FROM z_tokens GROUP BY address".to_string(),
+                telemetry: None,
+            }),
+        );
+        transforms.insert(
+            "z_tokens".to_string(),
+            create_table_transform("SELECT id, address FROM src"),
+        );
+        transforms.insert(
+            "b_reader".to_string(),
+            create_sql_transform(
+                "SELECT id, lookup_eq('a_volumes', 'address', address, 'n') AS n FROM src",
+            ),
+        );
+
+        let order = sort_transforms(&transforms, &HashMap::new());
+
+        assert_eq!(order, ["z_tokens", "a_volumes", "b_reader"]);
     }
 
     fn create_handler_transform(from: &str, url: &str) -> topology::Transform {

@@ -1220,6 +1220,52 @@ window: block_time >= now() - interval '1 hour'
 
 The `in_memory` backend does not persist its contents. After a restart, the table starts empty and its source replays from the last committed offsets, so keys written before the last checkpoint are missing until they are written again.
 
+### Aggregates
+
+A `table_agg` transform keeps `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's rows, updated as the table changes. [`lookup_eq`](#lookups) reads it by the GROUP BY key. Over a [windowed](#windows) table it's a sliding aggregate: a row stops counting when the window evicts it.
+
+```yaml
+transforms:
+  hour_window:
+    type: table
+    backend_type: in_memory
+    primary_key: tx_hash
+    window: block_time >= now() - interval '1 hour'
+    sql: SELECT tx_hash, address, amount, block_time FROM transfers
+  hour_volumes:
+    type: table_agg
+    sql: SELECT address, sum(amount) AS hour_volume, count(*) AS transfers FROM hour_window GROUP BY address
+  enriched:
+    type: sql
+    primary_key: id
+    sql: SELECT *, lookup_eq('hour_volumes', 'address', sender, 'hour_volume') AS sender_hour_volume FROM transactions
+```
+
+| Field       | Notes                                 |
+| ----------- | ------------------------------------- |
+| `sql`       | Required. See below.                  |
+| `telemetry` | Optional. Standard rules.             |
+
+The SQL is `SELECT <key>, <select expressions> FROM <table> [WHERE ...] GROUP BY <key>`:
+
+- `FROM` names one `table`.
+- There is exactly one GROUP BY expression, and the SQL selects it. That column is the key `lookup_eq` uses. For a composite key, group by a concatenation: `SELECT address || ':' || token AS key, ... GROUP BY 1`.
+- The aggregates are `count(*)`, `count(expr)`, `sum(expr)` and `avg(expr)`, without `DISTINCT`, `FILTER` or `ORDER BY`. Select expressions can combine them: `sum(amount) / count(*) AS mean`.
+- `WHERE` filters the table's rows before they are grouped.
+- Every function must be deterministic, so `now()`, `random()` and `lookup_eq` are rejected.
+- `_gs_op` can't be read: tables don't store it.
+- `HAVING`, joins, subqueries, `ORDER BY`, `LIMIT` and window functions are rejected.
+
+How it's maintained:
+
+- The aggregate always equals its SQL run over the table's current rows. An upsert retracts the key's previous row and adds the new one. A delete or a window eviction retracts the row.
+- A group exists while it has rows, including rows whose aggregate arguments are `NULL`. Once its last row goes, lookups return `NULL`.
+- Rows with a `NULL` key aren't aggregated.
+- It's updated inside the table's apply, so a lookup has the same guarantees as a lookup on the table. Evictions follow the table's GC passes: an expired row counts until a pass evicts it.
+- Retracting floating-point values accumulates rounding error. Integers and decimals, `decimal_arb` included, are exact.
+- Only `lookup_eq` reads a `table_agg`. Naming it in `FROM` or `from:` is rejected.
+- Like its table, it starts empty after a restart.
+
 ## Side Outputs
 
 Side outputs allow emitting data to a "side" processor without modifying the main data flow. They're not part of the topology definition
