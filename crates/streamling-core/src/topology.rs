@@ -554,9 +554,10 @@ pub struct TableTransform {
     /// values use less memory and spend more time cleaning.
     #[serde(default = "default_max_dead_ratio")]
     pub max_dead_ratio: f64,
-    /// SQL predicate over the table's columns and `__timestamp`, the
-    /// wall-clock time a row was applied. The table keeps the rows it is true
-    /// for and garbage-collects the rest.
+    /// SQL predicate over the table's columns, `__timestamp`, the wall-clock
+    /// time a row was applied, and `watermark(column)`, the largest value of
+    /// `column` stored. The table keeps the rows it is true for and
+    /// garbage-collects the rest.
     pub window: Option<String>,
     /// Projection and filter over one source or transform.
     pub sql: String,

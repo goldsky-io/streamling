@@ -1149,7 +1149,7 @@ transforms:
     backend_type: in_memory # required
     primary_key: address # required; comma-separated for composite keys
     max_dead_ratio: 0.25 # optional, default 0.25
-    window: block_time >= now() - interval '1 hour' # optional
+    window: block_time >= watermark(block_time) - interval '1 hour' # optional
     sql: SELECT address, symbol, decimals, block_time FROM token_events WHERE chain = 'eth'
 
 sinks:
@@ -1208,20 +1208,48 @@ transforms:
 `window` is a boolean SQL expression over the table's columns. Rows it is `false` or `NULL` for are garbage collected:
 
 ```yaml
-window: block_time >= now() - interval '1 hour'
+window: block_time >= watermark(block_time) - interval '1 hour'
 ```
 
 - Columns must be in the table's SQL output. `_gs_op` is not stored, so it can't be used.
-- `__timestamp` is the wall-clock time the row was applied to the table, for when the data has no event-time column: `window: __timestamp >= now() - interval '1 hour'`. An upsert refreshes it. The SQL output cannot contain a `__timestamp` column.
+- `watermark(column)` is the largest value of `column` the table has stored, so the window follows the data's own time. Use it whenever the data has an event-time column. See [Event time](#event-time-watermark).
+- `now()` is wall-clock time, evaluated on each GC pass. When replaying data older than the window, such as with `starting_offsets: earliest`, rows are evicted as soon as a GC pass runs, so lookups during the replay miss them. `watermark()` doesn't have this problem.
+- `__timestamp` is the wall-clock time the row was applied to the table, for when the data has no event-time column: `window: __timestamp >= now() - interval '1 hour'`. An upsert refreshes it. The SQL output cannot contain a `__timestamp` column. During a replay every row is fresh, so the table holds everything applied in the last hour.
 - `__timestamp` can't be read by `lookup_eq`.
-- `now()` is wall-clock time, evaluated on each GC pass. When replaying data older than the window, such as with `starting_offsets: earliest`, rows are evicted as soon as a GC pass runs.
-- GC runs when the table's input delivers a batch, at most once per `table.window_gc_interval` in the app config (default `1s`, override with `STREAMLING__TABLE__WINDOW_GC_INTERVAL`). An idle input still delivers empty batches, at least one per checkpoint, so collection doesn't wait for new data. Until a row is collected, a lookup can still return it.
-- Each stored batch keeps the min, max and null count of the columns the window reads, and a GC pass skips the batches that are wholly inside the window. This works when the window compares a column, or a `CAST` of one, with an expression of `now()`:
-  - `block_time >= now() - interval '1 hour'` for a timestamp column
-  - `block_timestamp >= extract(epoch from now() - interval '1 hour')` for integer epoch seconds
+- GC passes run as the table's input delivers batches:
+  - with `watermark()`, inside every apply that stores rows, so a batch's rows are evicted as soon as they're outside the window;
+  - for any window, at the end of an apply, at most once per `table.window_gc_interval` in the app config (default `1s`, override with `STREAMLING__TABLE__WINDOW_GC_INTERVAL`). An idle input still delivers empty batches, at least one per checkpoint, so collection doesn't wait for new data. Until a row is collected, a lookup can still return it.
+- Each stored batch keeps the min, max and null count of the columns the window reads, and a GC pass skips the batches that are wholly inside the window. This works when the window compares a column, or a `CAST` of one, with an expression of `now()` or `watermark()`:
+  - `block_time >= watermark(block_time) - interval '1 hour'` for a timestamp column
+  - `block_timestamp >= watermark(block_timestamp) - 3600` for integer epoch seconds
+  - `block_time >= now() - interval '1 hour'`
+  - `block_timestamp >= extract(epoch from now() - interval '1 hour')`
 
   A function of the column, such as `to_timestamp(block_timestamp) >= now() - interval '1 hour'`, still works, but every pass evaluates every stored row; startup logs a warning. Skipping pays off when rows arrive roughly in time order.
 - Eviction only changes the table's storage. The table's SQL output, which other nodes read, doesn't emit anything for evicted rows.
+
+#### Event time (`watermark`)
+
+`watermark(column)` takes one column of the table. It starts `NULL` and rises to the largest non-null value of the column in every row the table stores, upserts and deletes alike. It never goes down: deleting, updating or evicting the row that set it doesn't lower it.
+
+With `window: block_time >= watermark(block_time) - interval '1 hour'`, applying in order:
+
+| Apply | Watermark | Effect |
+| --- | --- | --- |
+| A@10:00, B@10:20 | 10:20 | Both kept. |
+| C@11:10 | 11:10 | A is evicted: it's before 10:10. |
+| late D@09:30 | 11:10 | D is stored and evicted in the same apply. No lookup sees it. |
+| B updated to @10:05 | 11:10 | B's old row is replaced, and the new one is outside the window, so B is gone. |
+| C deleted | 11:10 | The watermark stays. |
+| input idle for 3 hours | 11:10 | Nothing is evicted. |
+| restart | `NULL` | The table starts empty and the replay rebuilds the watermark. |
+
+- Every apply that stores rows evicts under the same lock, so a lookup never sees a row outside the window as of the latest stored time.
+- During a replay, the table holds the hour before the latest stored time, so lookups and [aggregates](#aggregates) give close to the results they gave live, not exact ones. A lookup sees the table [after its own batch, and possibly later ones](#lookups): the table's input runs ahead of its readers by about `internal_buffer_size` batches (default 10). So a lookup can see rows later than its own, and miss older rows those later rows pushed out of the window. The error is bounded by the time those batches cover. For a tighter replay, lower `STREAMLING__INTERNAL_BUFFER_SIZE` or the batch size, at a cost in throughput. How far the table runs ahead depends on timing, so a replay isn't deterministic.
+- All partitions of the table's input share one watermark. A partition behind the others has its rows older than the window evicted as they arrive.
+- An out-of-order allowance is a larger interval: `watermark(block_time) - interval '1 hour 5 minutes'`.
+- One timestamp far in the future moves the watermark there for good and evicts everything else. Cap it with the wall clock: `block_time >= least(watermark(block_time), now()) - interval '1 hour'`.
+- `watermark()` can only be used in a `window`.
 
 ### Restarts (`in_memory`)
 
@@ -1237,7 +1265,7 @@ transforms:
     type: table
     backend_type: in_memory
     primary_key: tx_hash
-    window: block_time >= now() - interval '1 hour'
+    window: block_time >= watermark(block_time) - interval '1 hour'
     sql: SELECT tx_hash, address, amount, block_time FROM transfers
   hour_volumes:
     type: table_agg
