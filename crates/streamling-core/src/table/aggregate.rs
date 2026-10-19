@@ -846,13 +846,34 @@ mod tests {
         let fixture = Fixture::with_int_amounts(Some("amount >= 10")).await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
 
-        // A GC pass runs at the start of an apply, so it only sees earlier rows.
+        // A GC pass runs at the end of an apply, so it evicts the apply's rows
+        // too.
         fixture.apply(&[(1, Some("a"), Some(5), "i"), (2, Some("a"), Some(20), "i")]);
-        assert_eq!(fixture.ints(&["a"], "total"), [Some(25)]);
-
-        fixture.apply(&[]);
         assert_eq!(fixture.ints(&["a"], "total"), [Some(20)]);
         assert_eq!(fixture.ints(&["a"], "n"), [Some(1)]);
+    }
+
+    /// Amounts stand in for event times. Each apply's eviction happens before
+    /// any lookup sees it, so a late row never counts.
+    #[tokio::test]
+    async fn watermark_eviction_retracts_rows_in_the_same_apply() {
+        let fixture = Fixture::with_int_amounts(Some("amount >= watermark(amount) - 60")).await;
+        fixture.register(SUM_AND_COUNT).await.unwrap();
+        for (id, amount, expected) in [
+            (1, 0, 1),
+            (2, 30, 2),
+            (3, 50, 3),
+            (4, 120, 1),
+            (5, 10, 1),
+            (6, 125, 2),
+        ] {
+            fixture.apply(&[(id, Some("a"), Some(amount), "i")]);
+            assert_eq!(
+                fixture.ints(&["a"], "n"),
+                [Some(expected)],
+                "after {amount}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -904,8 +925,6 @@ mod tests {
         let mut live: HashMap<i64, (Option<&str>, Option<i64>)> = HashMap::new();
 
         for _ in 0..STEPS {
-            // The apply's GC pass evicts what the previous applies left outside.
-            live.retain(|_, (_, amount)| amount.is_some_and(|amount| amount >= WINDOW_MIN_AMOUNT));
             let mut rows = Vec::new();
             for _ in 0..rng.gen_range(0..8) {
                 let id = rng.gen_range(0..IDS);
@@ -921,6 +940,8 @@ mod tests {
                 }
             }
             fixture.apply(&rows);
+            // The apply's GC pass evicts what it left outside.
+            live.retain(|_, (_, amount)| amount.is_some_and(|amount| amount >= WINDOW_MIN_AMOUNT));
 
             let mut expected: BTreeMap<&str, (Option<i64>, i64)> = BTreeMap::new();
             for (address, amount) in live.values() {

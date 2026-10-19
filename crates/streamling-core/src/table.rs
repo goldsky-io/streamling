@@ -4,8 +4,10 @@
 pub mod aggregate;
 pub mod driver;
 pub mod side_output;
+mod watermark;
 
 use aggregate::TableAggregate;
+use watermark::{WATERMARK_NAME, WatermarkFunc, Watermarks};
 
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt};
@@ -20,12 +22,13 @@ use arrow::compute::{
     prep_null_mask_filter,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
-use arrow::row::{RowConverter, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, DFSchemaRef, ScalarValue};
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
+use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion::logical_expr::{Accumulator, Expr, ExprSchemable, col};
+use datafusion::logical_expr::{Accumulator, Expr, ExprSchemable, ScalarUDF, col};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
@@ -176,10 +179,14 @@ impl LiveRowChanges {
     }
 }
 
+/// `(chunk, rows, keys)`: rows of a chunk a GC pass found outside the window,
+/// and their primary keys.
+type OutsideRows = (usize, Vec<usize>, Rows);
+
 /// A table's `window`.
 pub struct WindowConfig<'a> {
-    /// SQL over the table's columns and [`WALL_CLOCK_COLUMN`]. The table
-    /// keeps the rows it is true for.
+    /// SQL over the table's columns, [`WALL_CLOCK_COLUMN`] and
+    /// `watermark(column)`. The table keeps the rows it is true for.
     pub predicate: &'a str,
     pub session_state: &'a SessionState,
     /// Minimum time between GC passes.
@@ -188,7 +195,8 @@ pub struct WindowConfig<'a> {
 
 /// A planned [`WindowConfig`].
 struct Window {
-    /// Type-coerced but not simplified, so each GC pass folds `now()` anew.
+    /// Type-coerced but not simplified, so each GC pass folds `now()` and
+    /// `watermark()` anew.
     predicate: Expr,
     /// True for the rows outside the window: `NOT predicate`, or a NULL in
     /// any column the predicate reads. Pruned against chunk statistics.
@@ -198,13 +206,18 @@ struct Window {
     /// The columns `predicate` reads, by name and position in `schema`.
     columns: Vec<(String, usize)>,
     reads_wall_clock: bool,
+    /// The columns `watermark()` reads, by name and position in `columns`.
+    watermark_columns: Vec<(String, usize)>,
+    watermarks: Watermarks,
+    /// Knows `watermark()`, unlike the pipeline's session.
     session_state: SessionState,
     gc_interval: Duration,
     /// When the last GC pass started. Locked while a pass runs.
     last_pass: Mutex<Instant>,
 }
 
-/// A [`Window`] with `now()` folded to the current time.
+/// A [`Window`] with `now()` folded to the current time and `watermark()` to
+/// the current watermarks.
 struct CompiledWindow {
     predicate: Arc<dyn PhysicalExpr>,
     /// Rules out the chunks without a row outside the window.
@@ -242,8 +255,12 @@ impl Window {
                 .chain([Arc::new(wall_clock)])
                 .collect::<Fields>(),
         ))?;
-        let predicate = config
-            .session_state
+        let watermarks = Watermarks::default();
+        let mut session_state = config.session_state.clone();
+        session_state.register_udf(Arc::new(ScalarUDF::from(WatermarkFunc::new(Arc::clone(
+            &watermarks,
+        )))))?;
+        let predicate = session_state
             .create_logical_expr(config.predicate, &with_wall_clock)
             .map_err(invalid)?;
         let mut column_names: Vec<String> = predicate
@@ -258,7 +275,7 @@ impl Window {
         } else {
             DFSchema::try_from(Schema::new(fields.clone()))?
         });
-        let predicate = ExprSimplifier::new(Self::simplify_context(config.session_state, &schema))
+        let predicate = ExprSimplifier::new(Self::simplify_context(&session_state, &schema))
             .coerce(predicate, &schema)
             .map_err(invalid)?;
         let data_type = predicate.get_type(&schema).map_err(invalid)?;
@@ -274,26 +291,54 @@ impl Window {
             .fold(Expr::Not(Box::new(predicate.clone())), |outside, name| {
                 outside.or(col(Column::new_unqualified(name)).is_null())
             });
-        let columns = column_names
+        let columns: Vec<(String, usize)> = column_names
             .into_iter()
             .map(|name| {
                 let index = schema.inner().index_of(&name)?;
                 Ok((name, index))
             })
             .collect::<Result<_>>()?;
+        let mut watermark_columns = Vec::new();
+        predicate
+            .apply(|expr| {
+                if let Expr::ScalarFunction(function) = expr
+                    && function.name() == WATERMARK_NAME
+                {
+                    let [Expr::Column(column)] = function.args.as_slice() else {
+                        return Err(DataFusionError::Plan(format!(
+                            "{WATERMARK_NAME}() takes one column of the table, got {expr}"
+                        )));
+                    };
+                    let position = columns
+                        .iter()
+                        .position(|(name, _)| *name == column.name)
+                        .expect("the predicate's columns include watermark()'s");
+                    watermark_columns.push((column.name.clone(), position));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .map_err(invalid)?;
+        for (name, position) in &watermark_columns {
+            let data_type = schema.field(columns[*position].1).data_type();
+            watermarks
+                .lock()
+                .insert(name.clone(), ScalarValue::try_from(data_type)?);
+        }
         let window = Self {
             predicate,
             outside,
             schema,
             columns,
             reads_wall_clock,
-            session_state: config.session_state.clone(),
+            watermark_columns,
+            watermarks,
+            session_state,
             gc_interval: config.gc_interval,
             last_pass: Mutex::new(Instant::now()),
         };
-        if window.compile().map_err(invalid)?.outside.always_true() {
+        if !window.prunable().map_err(invalid)? {
             warn!(
-                "table '{}': window '{}' can't skip chunks by their min/max, so each GC pass evaluates every stored row. Compare a column, not a function of it, with an expression of now(), such as `ts >= now() - interval '1 hour'`",
+                "table '{}': window '{}' can't skip chunks by their min/max, so each GC pass evaluates every stored row. Compare a column, not a function of it, with an expression of now() or watermark(), such as `ts >= watermark(ts) - interval '1 hour'`",
                 table, config.predicate
             );
         }
@@ -325,6 +370,43 @@ impl Window {
                 Arc::clone(self.schema.inner()),
             )?,
         })
+    }
+
+    /// Whether chunk statistics can rule chunks out. A NULL watermark folds
+    /// the comparisons to NULL, which rules nothing out, so the check
+    /// substitutes zeros. Only called before the table is in use.
+    fn prunable(&self) -> datafusion::common::Result<bool> {
+        let watermarks = self.watermarks.lock().clone();
+        for (name, value) in &watermarks {
+            if let Ok(zero) = ScalarValue::new_zero(&value.data_type()) {
+                self.watermarks.lock().insert(name.clone(), zero);
+            }
+        }
+        let prunable = self
+            .compile()
+            .map(|compiled| !compiled.outside.always_true());
+        *self.watermarks.lock() = watermarks;
+        prunable
+    }
+
+    fn reads_watermark(&self) -> bool {
+        !self.watermark_columns.is_empty()
+    }
+
+    /// Raises each watermark to its column's max in a new chunk's
+    /// `statistics`.
+    fn advance_watermarks(&self, statistics: &[ColumnStatistics]) {
+        let mut watermarks = self.watermarks.lock();
+        for (name, position) in &self.watermark_columns {
+            let max = &statistics[*position].max;
+            let watermark = watermarks
+                .get_mut(name)
+                .expect("every watermark column has a watermark");
+            // A null max is less than any value, and equal to a null watermark.
+            if *max > *watermark {
+                *watermark = max.clone();
+            }
+        }
     }
 
     /// The bounds of `columns` in `batch`, a chunk in the stored schema.
@@ -450,10 +532,12 @@ fn wall_clock(rows: usize) -> ArrayRef {
 /// | apply `A10 -B`    | `c0:[A1 B2 C3]` `c1:[A10 -B]`  | A→c1 C→c0      | 5 / 2 / 3            |
 /// | clean             | `c2:[C3 A10]`                  | A→c2 C→c2      | 2 / 2 / 0            |
 ///
-/// With a window, an apply at least the window's GC interval after the last
-/// GC pass runs another: it removes the keys whose live row the window's
+/// With a window, a GC pass removes the keys whose live row the window's
 /// predicate isn't true for, and the cleaner reclaims their rows like any
-/// other dead rows. Each chunk keeps the min, max and null count of the
+/// other dead rows. An apply ends with a pass when the window's GC interval
+/// has passed since the last one. A window that reads a watermark also runs
+/// one inside every apply that writes rows, under its write lock, so no
+/// lookup sees a row the batch pushed out of the window. Each chunk keeps the min, max and null count of the
 /// columns the predicate reads, so a pass skips the chunks they show to be
 /// wholly inside the window. A predicate that reads [`WALL_CLOCK_COLUMN`]
 /// makes each chunk store the time its rows were applied in that column.
@@ -583,7 +667,6 @@ impl InMemoryTable {
     /// Applies `batch` (the table's SQL output) in row order: an upsert
     /// replaces its key's row, and a delete removes it.
     pub fn apply(&self, batch: &RecordBatch) -> Result<()> {
-        self.collect_garbage_if_due()?;
         let ops = self.parse_ops(batch.column(self.op_index))?;
         let key_columns: Vec<ArrayRef> = self
             .key_indices
@@ -625,6 +708,12 @@ impl InMemoryTable {
         } else {
             Vec::new()
         };
+        if let Some(window) = &self.window
+            && window.reads_watermark()
+            && written_rows > 0
+        {
+            window.advance_watermarks(&statistics);
+        }
 
         let aggregates = self.aggregates.read();
         let mut changes = (!aggregates.is_empty()).then(|| LiveRowChanges {
@@ -677,6 +766,22 @@ impl InMemoryTable {
                 }
             }
         }
+        // The batch may have moved a watermark, or be older than it already.
+        // Evicting before the lock is released, and before the aggregates
+        // update, means no lookup sees the rows in between.
+        if let Some(window) = &self.window
+            && window.reads_watermark()
+            && written_rows > 0
+        {
+            let compiled = window.compile()?;
+            let chunks = self.chunks_to_evaluate(state, window, &compiled)?;
+            let outside_rows = self.outside_rows(&compiled, chunks)?;
+            for location in self.evict(state, &outside_rows) {
+                if let Some(changes) = &mut changes {
+                    changes.release(location, new_chunk);
+                }
+            }
+        }
         // Before cleaning, which may drop the chunks of the removed rows.
         if let Some(changes) = changes {
             let removed = state.rows_at(&self.schema, &changes.removed)?;
@@ -694,9 +799,13 @@ impl InMemoryTable {
         }
 
         self.clean(state, written_rows)?;
-        let live_rows = state.index.len();
-        let memory_bytes = state.chunk_bytes + state.key_bytes;
         drop(guard);
+        drop(aggregates);
+        // After the batch, so a pass evicts its rows too.
+        self.collect_garbage_if_due()?;
+        let state = self.state.read();
+        let (live_rows, memory_bytes) = (state.index.len(), state.chunk_bytes + state.key_bytes);
+        drop(state);
         self.record_gauges(live_rows, memory_bytes);
         Ok(())
     }
@@ -858,9 +967,27 @@ impl InMemoryTable {
     /// no longer where the index points, so it stays until the next pass.
     fn evict_outside(&self, window: &Window) -> Result<()> {
         let compiled = window.compile()?;
-        let chunks = self.chunks_to_evaluate(window, &compiled)?;
-        // `(chunk, batch, rows, keys)` of the rows outside the window, live or
-        // not.
+        let chunks = self.chunks_to_evaluate(&self.state.read(), window, &compiled)?;
+        let outside_rows = self.outside_rows(&compiled, chunks)?;
+        let aggregates = self.aggregates.read();
+        let mut state = self.state.write();
+        let evicted = self.evict(&mut state, &outside_rows);
+        if !aggregates.is_empty() && !evicted.is_empty() {
+            let removed = state.rows_at(&self.schema, &evicted)?;
+            let added = RecordBatch::new_empty(Arc::clone(&self.schema));
+            for aggregate in aggregates.iter() {
+                aggregate.update(&removed, &added)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows of `chunks` outside the window, live or not.
+    fn outside_rows(
+        &self,
+        compiled: &CompiledWindow,
+        chunks: Vec<(usize, RecordBatch)>,
+    ) -> Result<Vec<OutsideRows>> {
         let mut outside_rows = Vec::new();
         for (chunk, batch) in chunks {
             let inside = compiled
@@ -894,35 +1021,27 @@ impl InMemoryTable {
                 .convert_columns(&key_columns)
                 .streamling_context("failed to encode the stored keys")?;
             let rows: Vec<usize> = outside.values().set_indices().collect();
-            outside_rows.push((chunk, batch, rows, keys));
+            outside_rows.push((chunk, rows, keys));
         }
+        Ok(outside_rows)
+    }
 
-        let aggregates = self.aggregates.read();
-        let mut state = self.state.write();
-        // `(position in outside_rows, row)` of the rows evicted.
+    /// Removes the keys whose live row is among `outside_rows`, and returns
+    /// those rows.
+    fn evict(&self, state: &mut TableState, outside_rows: &[OutsideRows]) -> Vec<RowLocation> {
         let mut evicted = Vec::new();
-        for (position, (chunk, _, rows, keys)) in outside_rows.iter().enumerate() {
+        for (chunk, rows, keys) in outside_rows {
             for (&row, key) in rows.iter().zip(keys.iter()) {
                 let location = RowLocation { chunk: *chunk, row };
                 if state.index.get(key.as_ref()) == Some(&location) {
                     state.index.remove(key.as_ref());
                     state.key_bytes -= key.as_ref().len();
                     state.release(location);
-                    evicted.push((position, row));
+                    evicted.push(location);
                 }
             }
         }
-        if !aggregates.is_empty() && !evicted.is_empty() {
-            let batches: Vec<&RecordBatch> =
-                outside_rows.iter().map(|(_, batch, _, _)| batch).collect();
-            let removed = interleave_record_batch(&batches, &evicted)
-                .streamling_context("failed to read the evicted rows")?;
-            let added = RecordBatch::new_empty(Arc::clone(&self.schema));
-            for aggregate in aggregates.iter() {
-                aggregate.update(&removed, &added)?;
-            }
-        }
-        Ok(())
+        evicted
     }
 
     /// The chunks with a live row that their statistics don't show to be
@@ -930,10 +1049,10 @@ impl InMemoryTable {
     /// but the more chunks cover narrow ranges, the more are skipped.
     fn chunks_to_evaluate(
         &self,
+        state: &TableState,
         window: &Window,
         compiled: &CompiledWindow,
     ) -> Result<Vec<(usize, RecordBatch)>> {
-        let state = self.state.read();
         let (ids, chunks): (Vec<usize>, Vec<&Chunk>) = (state.first_chunk_id..)
             .zip(&state.chunks)
             .filter(|(_, chunk)| chunk.live_rows > 0)
@@ -1678,6 +1797,11 @@ mod tests {
 
     /// Upserts of `(id, name, ts)`.
     fn timed_batch(rows: &[(i64, &str, Option<i64>)]) -> RecordBatch {
+        timed_batch_of(rows, "i")
+    }
+
+    /// `op`s of `(id, name, ts)`.
+    fn timed_batch_of(rows: &[(i64, &str, Option<i64>)], op: &str) -> RecordBatch {
         RecordBatch::try_new(
             timed_schema(),
             vec![
@@ -1687,7 +1811,7 @@ mod tests {
                     TimestampNanosecondArray::from_iter(rows.iter().map(|row| row.2))
                         .with_timezone(WALL_CLOCK_TIME_ZONE),
                 ),
-                Arc::new(StringArray::from(vec!["i"; rows.len()])),
+                Arc::new(StringArray::from(vec![op; rows.len()])),
             ],
         )
         .unwrap()
@@ -1797,7 +1921,7 @@ mod tests {
     fn chunks_to_evaluate(table: &InMemoryTable) -> Vec<usize> {
         let window = table.window.as_ref().expect("a windowed table");
         table
-            .chunks_to_evaluate(window, &window.compile().unwrap())
+            .chunks_to_evaluate(&table.state.read(), window, &window.compile().unwrap())
             .unwrap()
             .into_iter()
             .map(|(id, _)| id)
@@ -1919,6 +2043,143 @@ mod tests {
             unwindowed.lookup_field(WALL_CLOCK_COLUMN).is_ok(),
             "without a window, '__timestamp' is an ordinary column"
         );
+    }
+
+    const KEEP_LAST_HOUR_OF_DATA: &str = "ts >= watermark(ts) - interval '1 hour'";
+    const MINUTE_NANOS: i64 = 60_000_000_000;
+
+    /// The README's walkthrough: every apply that writes rows runs a GC pass,
+    /// whatever the GC interval.
+    #[test]
+    fn watermark_window_keeps_the_hour_before_the_largest_stored_time() {
+        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR_OF_DATA).unwrap();
+        let at = |hour: i64, minute: i64| Some(hour * HOUR_NANOS + minute * MINUTE_NANOS);
+        let ids = [Some(1), Some(2), Some(3), Some(4), Some(5)];
+
+        table
+            .apply(&timed_batch(&[(1, "a", at(10, 0)), (2, "b", at(10, 20))]))
+            .unwrap();
+        assert_eq!(
+            lookup_names(&table, &ids),
+            [
+                Some("a".to_string()),
+                Some("b".to_string()),
+                None,
+                None,
+                None
+            ]
+        );
+
+        table.apply(&timed_batch(&[(3, "c", at(11, 10))])).unwrap();
+        assert_eq!(
+            lookup_names(&table, &ids),
+            [
+                None,
+                Some("b".to_string()),
+                Some("c".to_string()),
+                None,
+                None
+            ],
+            "the watermark moved to 11:10, so 10:00 is outside"
+        );
+
+        table
+            .apply(&timed_batch(&[(4, "late", at(9, 30))]))
+            .unwrap();
+        table.apply(&timed_batch(&[(2, "b", at(10, 5))])).unwrap();
+        assert_eq!(
+            lookup_names(&table, &ids),
+            [None, None, Some("c".to_string()), None, None],
+            "a late row and an update to before 10:10 are evicted in their own apply"
+        );
+
+        table
+            .apply(&timed_batch_of(&[(3, "c", at(11, 10))], "d"))
+            .unwrap();
+        table.apply(&timed_batch(&[(5, "e", at(10, 0))])).unwrap();
+        assert_eq!(
+            lookup_names(&table, &ids),
+            [None, None, None, None, None],
+            "deleting the latest row doesn't move the watermark back"
+        );
+        assert_live_rows_match_the_index(&table);
+    }
+
+    #[test]
+    fn watermark_reads_integer_columns() {
+        const HOUR_SECS: i64 = 3600;
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("block_timestamp", DataType::Int64, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
+        ]));
+        let table = windowed_table(
+            &input_schema,
+            "block_timestamp >= watermark(block_timestamp) - 3600",
+        )
+        .unwrap();
+        let input = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["old", "new"])),
+                Arc::new(Int64Array::from(vec![HOUR_SECS, 3 * HOUR_SECS])),
+                Arc::new(StringArray::from(vec!["i", "i"])),
+            ],
+        )
+        .unwrap();
+        table.apply(&input).unwrap();
+        assert_eq!(
+            lookup_names(&table, &[Some(1), Some(2)]),
+            [None, Some("new".to_string())]
+        );
+    }
+
+    #[test]
+    fn least_with_now_guards_against_future_timestamps() {
+        const DECADE_NANOS: i64 = 10 * 365 * 24 * HOUR_NANOS;
+        let guarded = "ts >= least(watermark(ts), now()) - interval '1 hour'";
+        for (predicate, expected) in [
+            (KEEP_LAST_HOUR_OF_DATA, None),
+            (guarded, Some("now".to_string())),
+        ] {
+            let table = windowed_table(&timed_schema(), predicate).unwrap();
+            let now = now_nanos();
+            table
+                .apply(&timed_batch(&[
+                    (1, "now", Some(now)),
+                    (2, "future", Some(now + DECADE_NANOS)),
+                ]))
+                .unwrap();
+            assert_eq!(lookup_names(&table, &[Some(1)]), [expected], "{predicate}");
+        }
+    }
+
+    #[test]
+    fn watermark_window_prunes_chunks() {
+        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR_OF_DATA).unwrap();
+        assert!(table.window.as_ref().unwrap().prunable().unwrap());
+        table.apply(&timed_batch(&[(1, "a", Some(0))])).unwrap();
+        table
+            .apply(&timed_batch(&[(2, "b", Some(MINUTE_NANOS))]))
+            .unwrap();
+        assert_eq!(chunks_to_evaluate(&table), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn watermark_takes_one_column() {
+        for predicate in [
+            "ts >= watermark(date_trunc('hour', ts))",
+            "ts >= watermark()",
+            "ts >= watermark(ts, ts)",
+        ] {
+            let err = windowed_table(&timed_schema(), predicate)
+                .err()
+                .expect("the window must be rejected")
+                .to_string();
+            assert!(err.contains("invalid window"), "{predicate}: {err}");
+        }
     }
 
     #[test]

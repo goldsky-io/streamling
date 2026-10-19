@@ -665,6 +665,123 @@ sinks:
     );
 }
 
+/// Replaying month-old transfers through a `watermark()` window keeps the
+/// hour before the latest transfer; a `now()` window would evict them all.
+/// The table runs ahead of the lookups, so a lookup may see later transfers,
+/// but never more than the window holds after some apply, and never the late
+/// transfer, which is evicted in its own apply. The last lookup sees the
+/// final window.
+#[tokio::test]
+async fn test_table_watermark_window_backfill() {
+    const MONTH_SECS: i64 = 30 * 24 * 3600;
+    const MINUTE_SECS: i64 = 60;
+    /// The most transfers the window holds after any apply: minutes 0, 30, 50.
+    const MOST_IN_WINDOW: i64 = 3;
+    const LATE_AMOUNT: i64 = 100;
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(TRANSFER_SCHEMA)
+        .await
+        .expect("Failed to register the transfer schema");
+    let start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Clock before the Unix epoch")
+        .as_secs() as i64
+        - MONTH_SECS;
+    let transfer = |id, minutes: i64, amount| Transfer {
+        id,
+        address: "0xa".to_string(),
+        amount,
+        block_timestamp: start + minutes * MINUTE_SECS,
+    };
+    let transfers = [
+        transfer(1, 0, 1),
+        transfer(2, 30, 1),
+        transfer(3, 50, 1),
+        transfer(4, 120, 1),
+        transfer(5, 10, LATE_AMOUNT),
+        transfer(6, 125, 1),
+    ];
+    ctx.kafka
+        .produce_avro_records(&transfers)
+        .await
+        .expect("Failed to produce transfers");
+
+    let pipeline = format!(
+        r#"
+sources:
+  transfers:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  transfer_window:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    window: block_timestamp >= watermark(block_timestamp) - 3600
+    sql: SELECT id, address, amount, block_timestamp FROM transfers
+  hour_counts:
+    type: table_agg
+    sql: SELECT address, count(*) AS transfers, sum(amount) AS volume FROM transfer_window GROUP BY address
+  enriched:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT
+        id,
+        lookup_eq('hour_counts', 'address', address, 'transfers') AS hour_transfers,
+        lookup_eq('hour_counts', 'address', address, 'volume') AS hour_volume
+      FROM transfers
+sinks:
+  enriched_pg:
+    type: postgres
+    from: enriched
+    table: backfill_enriched
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(transfers.len() as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success());
+
+    let rows: Vec<(i64, Option<i64>, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, hour_transfers, hour_volume FROM public.backfill_enriched ORDER BY id")
+        .await
+        .expect("Failed to query");
+    assert_eq!(rows.len(), transfers.len());
+    for (id, hour_transfers, hour_volume) in &rows {
+        assert!(
+            hour_transfers.is_some_and(|count| (1..=MOST_IN_WINDOW).contains(&count)),
+            "transfer {id} saw {hour_transfers:?} transfers"
+        );
+        assert!(
+            hour_volume.is_some_and(|volume| volume < LATE_AMOUNT),
+            "transfer {id} saw the late transfer: volume {hour_volume:?}"
+        );
+    }
+    // Minutes 120 and 125.
+    assert_eq!(rows.last(), Some(&(6, Some(2), Some(2))));
+}
+
 const SINGLE_PARTITION: i32 = 1;
 const SELF_JOIN_PARTITIONS: i32 = 2;
 
