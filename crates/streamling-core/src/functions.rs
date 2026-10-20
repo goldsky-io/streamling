@@ -4,6 +4,7 @@ use crate::dynamic_table::DynamicTableRegistry;
 use crate::functions::dynamic_table::DynamicTableCheckFunc;
 use crate::functions::lookup::LookupEqFunc;
 use crate::table::TableRegistry;
+use crate::table::read::TableUdf;
 use datafusion::logical_expr::ScalarUDF;
 
 pub mod dynamic_table;
@@ -20,7 +21,9 @@ impl StreamlingFunctions {
         funcs.push(ScalarUDF::from(DynamicTableCheckFunc::new(
             dynamic_table_registry,
         )));
-        funcs.push(ScalarUDF::from(LookupEqFunc::new(tables)));
+        funcs.push(ScalarUDF::new_from_impl(TableUdf::new(LookupEqFunc::new(
+            tables,
+        ))));
         funcs
     }
 }

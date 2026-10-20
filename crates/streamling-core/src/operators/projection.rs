@@ -19,6 +19,8 @@ use datafusion::physical_plan::{
 };
 use delegate::delegate;
 
+use crate::table::read::bind_table_positions;
+
 use futures::stream::{Stream, StreamExt};
 use tracing::log::trace;
 
@@ -58,8 +60,11 @@ impl StreamingProjectionExec {
             expr: original_projection
                 .expr()
                 .iter()
-                .map(|pe| (pe.expr.clone(), pe.alias.clone()))
-                .collect(),
+                .map(|pe| {
+                    let expr = bind_table_positions(pe.expr.clone(), original_projection.input())?;
+                    Ok((expr, pe.alias.clone()))
+                })
+                .collect::<Result<_>>()?,
             schema: original_projection.schema(),
             input: original_projection.input().clone(),
             metrics: ExecutionPlanMetricsSet::new(),

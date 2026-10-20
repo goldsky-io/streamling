@@ -667,16 +667,13 @@ sinks:
 
 /// Replaying month-old transfers through a `watermark()` window keeps the
 /// hour before the latest transfer; a `now()` window would evict them all.
-/// The table runs ahead of the lookups, so a lookup may see later transfers,
-/// but never more than the window holds after some apply, and never the late
-/// transfer, which is evicted in its own apply. The last lookup sees the
-/// final window.
+/// Each lookup reads the table as of its own transfer, so the replay gives
+/// exactly the results it gave live. The late transfer is evicted in its own
+/// apply, so no lookup sees it.
 #[tokio::test]
 async fn test_table_watermark_window_backfill() {
     const MONTH_SECS: i64 = 30 * 24 * 3600;
     const MINUTE_SECS: i64 = 60;
-    /// The most transfers the window holds after any apply: minutes 0, 30, 50.
-    const MOST_IN_WINDOW: i64 = 3;
     const LATE_AMOUNT: i64 = 100;
 
     init_tracing();
@@ -767,19 +764,132 @@ sinks:
         .query("SELECT id, hour_transfers, hour_volume FROM public.backfill_enriched ORDER BY id")
         .await
         .expect("Failed to query");
-    assert_eq!(rows.len(), transfers.len());
-    for (id, hour_transfers, hour_volume) in &rows {
-        assert!(
-            hour_transfers.is_some_and(|count| (1..=MOST_IN_WINDOW).contains(&count)),
-            "transfer {id} saw {hour_transfers:?} transfers"
-        );
-        assert!(
-            hour_volume.is_some_and(|volume| volume < LATE_AMOUNT),
-            "transfer {id} saw the late transfer: volume {hour_volume:?}"
-        );
-    }
-    // Minutes 120 and 125.
-    assert_eq!(rows.last(), Some(&(6, Some(2), Some(2))));
+    // Every transfer has amount 1 except the late one, so each hour's volume
+    // is its count.
+    let expected: Vec<(i64, Option<i64>, Option<i64>)> =
+        [(1, 1), (2, 2), (3, 3), (4, 1), (5, 1), (6, 2)]
+            .into_iter()
+            .map(|(id, transfers)| (id, Some(transfers), Some(transfers)))
+            .collect();
+    assert_eq!(rows, expected);
+}
+
+/// Two readers of the same table, each behind its own buffered channel, see
+/// exact per-transfer results: a count over the last hour, and the transfer
+/// right at the hour's edge, which any later transfer evicts.
+#[tokio::test]
+async fn test_table_read_by_two_consumers_at_once() {
+    const MONTH_SECS: i64 = 30 * 24 * 3600;
+    const MINUTE_SECS: i64 = 60;
+    const NUM_TRANSFERS: i64 = 100;
+    const MINUTES_APART: i64 = 10;
+    /// Transfers within the hour, the latest included.
+    const IN_WINDOW: i64 = 60 / MINUTES_APART + 1;
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(TRANSFER_SCHEMA)
+        .await
+        .expect("Failed to register the transfer schema");
+    let start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Clock before the Unix epoch")
+        .as_secs() as i64
+        - MONTH_SECS;
+    let transfers: Vec<Transfer> = (1..=NUM_TRANSFERS)
+        .map(|id| Transfer {
+            id,
+            address: "0xa".to_string(),
+            amount: 1,
+            block_timestamp: start + id * MINUTES_APART * MINUTE_SECS,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&transfers)
+        .await
+        .expect("Failed to produce transfers");
+
+    let pipeline = format!(
+        r#"
+sources:
+  transfers:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  transfer_window:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    window: block_timestamp >= watermark(block_timestamp) - 3600
+    sql: SELECT id, address, amount, block_timestamp FROM transfers
+  hour_counts:
+    type: table_agg
+    sql: SELECT address, count(*) AS transfers FROM transfer_window GROUP BY address
+  counted:
+    type: sql
+    primary_key: id
+    sql: SELECT id, lookup_eq('hour_counts', 'address', address, 'transfers') AS hour_transfers FROM transfers
+  edge:
+    type: sql
+    primary_key: id
+    sql: SELECT id, lookup_eq('transfer_window', 'id', id - {edge_offset}, 'amount') AS edge_amount FROM transfers
+sinks:
+  counted_pg:
+    type: postgres
+    from: counted
+    table: two_readers_counted
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+  edge_pg:
+    type: postgres
+    from: edge
+    table: two_readers_edge
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        topic = ctx.kafka_topic,
+        edge_offset = IN_WINDOW - 1,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(NUM_TRANSFERS as u64)
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success());
+
+    let counted: Vec<(i64, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, hour_transfers FROM public.two_readers_counted ORDER BY id")
+        .await
+        .expect("Failed to query");
+    let expected_counted: Vec<(i64, Option<i64>)> = (1..=NUM_TRANSFERS)
+        .map(|id| (id, Some(id.min(IN_WINDOW))))
+        .collect();
+    assert_eq!(counted, expected_counted);
+
+    let edge: Vec<(i64, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, edge_amount FROM public.two_readers_edge ORDER BY id")
+        .await
+        .expect("Failed to query");
+    let expected_edge: Vec<(i64, Option<i64>)> = (1..=NUM_TRANSFERS)
+        .map(|id| (id, (id >= IN_WINDOW).then_some(1)))
+        .collect();
+    assert_eq!(edge, expected_edge);
 }
 
 const SINGLE_PARTITION: i32 = 1;

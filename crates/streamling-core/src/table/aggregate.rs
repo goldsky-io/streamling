@@ -2,7 +2,8 @@
 //! <key>` over a table's live rows, maintained incrementally and read by
 //! `lookup_eq`.
 
-use super::{InMemoryTable, OP_DELETE, TableRegistry};
+use super::{InMemoryTable, OP_DELETE, Position, TableRegistry};
+use crate::checkpoints::checkpoint_management::CheckpointEpoch;
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
 use crate::topology::DEFAULT_MAX_DEAD_RATIO;
@@ -60,7 +61,9 @@ struct Group {
 /// A `table_agg`. Its table calls [`Self::update`] with every change to its
 /// live rows, under its write lock, so the groups always aggregate exactly
 /// the live rows. The groups are stored in `output`, an [`InMemoryTable`]
-/// keyed by the GROUP BY expression, which lookups read.
+/// keyed by the GROUP BY expression, which lookups read. The table publishes
+/// `output` at its own positions, and the accumulators are never read through
+/// a snapshot.
 pub(super) struct TableAggregate {
     name: String,
     /// `filter`, `key` and `arguments` read the table's stored schema.
@@ -227,6 +230,7 @@ impl TableAggregate {
             metric_metadata_id,
             DEFAULT_MAX_DEAD_RATIO,
             None,
+            base.retention().clone(),
         )?);
         let converter = RowConverter::new(vec![SortField::new(key_field.data_type().clone())])
             .map_err(|e| {
@@ -463,7 +467,16 @@ impl TableAggregate {
         columns.push(Arc::new(StringArray::from(ops)));
         let changelog = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
             .streamling_with_context(|| format!("table_agg '{}': invalid output", self.name))?;
-        self.output.apply(&changelog)
+        self.output.write(&changelog)
+    }
+
+    /// Publishes `output` as of `position` on the table's stream.
+    pub(super) fn publish(&self, position: Option<Position>) -> Result<()> {
+        self.output.publish_written(position)
+    }
+
+    pub(super) fn record_marker(&self, epoch: &CheckpointEpoch, position: Position) {
+        self.output.record_marker(epoch, position);
     }
 
     /// The rows of `batch` that count: those the filter keeps, without a
@@ -534,7 +547,7 @@ mod tests {
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::session::SessionManager;
-    use crate::table::{InMemoryTable, WindowConfig};
+    use crate::table::{InMemoryTable, Position, SnapshotRetention, WindowConfig};
     use crate::topology::DEFAULT_MAX_DEAD_RATIO;
     use arrow::array::{
         Array, ArrayRef, AsArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
@@ -570,6 +583,14 @@ mod tests {
     impl Fixture {
         /// A GC pass runs on every apply when `window` is set.
         async fn new(amount: Field, window: Option<&str>) -> Self {
+            Self::with_retention(amount, window, SnapshotRetention::Latest).await
+        }
+
+        async fn with_retention(
+            amount: Field,
+            window: Option<&str>,
+            retention: SnapshotRetention,
+        ) -> Self {
             let session_manager =
                 SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
             session_manager
@@ -601,6 +622,7 @@ mod tests {
                         session_state: &session_state,
                         gc_interval: Duration::ZERO,
                     }),
+                    retention,
                 )
                 .unwrap(),
             );
@@ -642,8 +664,16 @@ mod tests {
 
         /// Applies `(id, address, amount, _gs_op)` rows to the base table.
         fn apply(&self, rows: &[(i64, Option<&str>, Option<i64>, &str)]) {
+            self.apply_at(rows, None);
+        }
+
+        fn apply_at(
+            &self,
+            rows: &[(i64, Option<&str>, Option<i64>, &str)],
+            position: Option<Position>,
+        ) {
             let amounts: ArrayRef = Arc::new(Int64Array::from_iter(rows.iter().map(|row| row.2)));
-            self.apply_columns(rows, amounts);
+            self.apply_columns(rows, amounts, position);
         }
 
         fn apply_decimals(&self, rows: &[(i64, Option<&str>, Option<&str>, &str)]) {
@@ -665,13 +695,14 @@ mod tests {
                 .iter()
                 .map(|row| (row.0, row.1, None::<i64>, row.3))
                 .collect();
-            self.apply_columns(&rows, Arc::new(amounts));
+            self.apply_columns(&rows, Arc::new(amounts), None);
         }
 
         fn apply_columns(
             &self,
             rows: &[(i64, Option<&str>, Option<i64>, &str)],
             amounts: ArrayRef,
+            position: Option<Position>,
         ) {
             let batch = RecordBatch::try_new(
                 Arc::clone(&self.input_schema),
@@ -683,21 +714,34 @@ mod tests {
                 ],
             )
             .unwrap();
-            self.base.apply(&batch).unwrap();
+            self.base.apply(&batch, position).unwrap();
         }
 
         fn lookup(&self, keys: &[&str], column: &str) -> ArrayRef {
+            self.lookup_at(keys, column, None)
+        }
+
+        fn lookup_at(&self, keys: &[&str], column: &str, position: Option<Position>) -> ArrayRef {
             let keys: ArrayRef = Arc::new(StringArray::from(keys.to_vec()));
             self.session_manager
                 .tables()
                 .get(AGGREGATE)
                 .expect("the aggregate is registered as a table")
-                .lookup(&keys, column)
+                .lookup(&keys, column, position)
                 .unwrap()
         }
 
         fn ints(&self, keys: &[&str], column: &str) -> Vec<Option<i64>> {
-            self.lookup(keys, column)
+            self.ints_at(keys, column, None)
+        }
+
+        fn ints_at(
+            &self,
+            keys: &[&str],
+            column: &str,
+            position: Option<Position>,
+        ) -> Vec<Option<i64>> {
+            self.lookup_at(keys, column, position)
                 .as_primitive::<Int64Type>()
                 .iter()
                 .collect()
@@ -874,6 +918,48 @@ mod tests {
                 "after {amount}"
             );
         }
+    }
+
+    /// The README's watermark walkthrough, read back as of each apply after
+    /// all of them ran.
+    #[tokio::test]
+    async fn aggregates_read_as_of_a_position() {
+        let fixture = Fixture::with_retention(
+            Field::new("amount", DataType::Int64, true),
+            Some("amount >= watermark(amount) - 60"),
+            SnapshotRetention::PerPosition {
+                stream: "app::src".to_string(),
+            },
+        )
+        .await;
+        fixture.register(SUM_AND_COUNT).await.unwrap();
+        let applies = [
+            (1, 0, 1),
+            (2, 30, 2),
+            (3, 50, 3),
+            (4, 120, 1),
+            (5, 10, 1),
+            (6, 125, 2),
+        ];
+        for (seq, (id, amount, _)) in applies.iter().enumerate() {
+            let position = Position {
+                partition: 0,
+                seq: seq as u64,
+            };
+            fixture.apply_at(&[(*id, Some("a"), Some(*amount), "i")], Some(position));
+        }
+        for (seq, (_, amount, expected)) in applies.iter().enumerate() {
+            let position = Position {
+                partition: 0,
+                seq: seq as u64,
+            };
+            assert_eq!(
+                fixture.ints_at(&["a"], "n", Some(position)),
+                [Some(*expected)],
+                "after {amount}"
+            );
+        }
+        assert_eq!(fixture.ints(&["a"], "n"), [Some(2)], "the latest");
     }
 
     #[tokio::test]
