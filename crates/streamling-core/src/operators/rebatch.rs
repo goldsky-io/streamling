@@ -46,6 +46,11 @@ impl RebatchExec {
             name,
         }
     }
+
+    /// The node whose input this rebatches.
+    pub fn reference_name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// RebatchExec must be a *real* plan node, not a transparent alias for its

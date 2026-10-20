@@ -7,6 +7,8 @@ use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, SharedSourceRegistry};
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SideOutputPlacement, SourceSideOutput, SupportsSideOutputs};
+use crate::table::Position;
+use crate::table::read::stamp_position;
 use crate::telemetry::EventTimeReader;
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::types::RowCountMeasurementType;
@@ -328,6 +330,10 @@ impl SupportsSideOutputs for WrappingSourceTableProvider {
             warn!("Failed to acquire write lock for side outputs");
         }
     }
+
+    fn reference_name(&self) -> &str {
+        &self.reference_name
+    }
 }
 
 #[async_trait]
@@ -531,6 +537,10 @@ impl WrappingExec {
             adjusted_schema,
             event_time_instrumentation,
         }
+    }
+
+    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.inner
     }
 }
 
@@ -754,7 +764,9 @@ fn with_side_outputs(
 }
 
 /// Runs side outputs on each batch of `input` before yielding it, so every
-/// consumer receives a batch only after the side outputs processed it.
+/// consumer receives a batch only after the side outputs processed it. First
+/// stamps each batch with its [`Position`] in the partition, under
+/// `reference_name`, which tables applied here key their snapshots by.
 #[derive(Debug)]
 pub struct SideOutputExec {
     input: Arc<dyn ExecutionPlan>,
@@ -774,6 +786,10 @@ impl SideOutputExec {
             reference_name,
             side_outputs,
         }
+    }
+
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
     }
 }
 
@@ -841,14 +857,19 @@ impl ExecutionPlan for SideOutputExec {
         let reference_name = self.reference_name.clone();
         let side_outputs = self.side_outputs.clone();
         let processed = async_stream::stream! {
+            let mut seq = 0;
             while let Some(batch) = input.next().await {
-                let batch = match batch {
+                let stamped = batch.and_then(|batch| {
+                    Ok(stamp_position(batch, &reference_name, Position { partition, seq })?)
+                });
+                let batch = match stamped {
                     Ok(batch) => batch,
                     Err(e) => {
                         yield Err(e);
                         return;
                     }
                 };
+                seq += 1;
                 for side_output in &side_outputs {
                     if let Err(e) = side_output.process(&batch).await {
                         debug!("SideOutputExec [{}]: Side output error, stream will terminate: {}", reference_name, e);
@@ -1028,6 +1049,10 @@ impl SupportsSideOutputs for WrappingNode {
         } else {
             warn!("Failed to acquire lock for side outputs registry");
         }
+    }
+
+    fn reference_name(&self) -> &str {
+        &self.reference_name
     }
 }
 
@@ -1248,6 +1273,7 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
 mod tests {
     use super::*;
     use crate::operators::filter::StreamingFilterExec;
+    use crate::table::read::stamped_position;
     use arrow::array::{BooleanArray, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -1618,6 +1644,56 @@ mod tests {
             after.rows_seen(),
             3,
             "Side output placed after the filter should see the 3 rows it keeps"
+        );
+    }
+
+    /// Records the position stamped on each batch it processes.
+    #[derive(Debug, Default)]
+    struct PositionRecorder {
+        seen: parking_lot::Mutex<Vec<Option<Position>>>,
+    }
+
+    #[async_trait]
+    impl SourceSideOutput for PositionRecorder {
+        async fn process(&self, batch: &RecordBatch) -> Result<()> {
+            let position = stamped_position(batch.schema_ref().metadata(), "test_source")?;
+            self.seen.lock().push(position);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn side_output_exec_stamps_each_batch_with_its_position() {
+        let mem_table = MemTable::try_new(
+            test_schema(),
+            vec![vec![test_batch(), test_batch()], vec![test_batch()]],
+        )
+        .unwrap();
+        let source_exec = mem_table
+            .scan(&SessionContext::new().state(), None, &[], None)
+            .await
+            .unwrap();
+        let recorder = Arc::new(PositionRecorder::default());
+        let plan = with_side_outputs(source_exec, "test_source", vec![recorder.clone()]);
+
+        let mut yielded = Vec::new();
+        for partition in [0, 1] {
+            let mut stream = plan
+                .execute(partition, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(batch) = stream.next().await {
+                let metadata = batch.unwrap().schema_ref().metadata().clone();
+                yielded.push(stamped_position(&metadata, "test_source").unwrap());
+            }
+        }
+
+        let expected =
+            [(0, 0), (0, 1), (1, 0)].map(|(partition, seq)| Some(Position { partition, seq }));
+        assert_eq!(yielded, expected);
+        assert_eq!(
+            *recorder.seen.lock(),
+            expected,
+            "side outputs see the stamp"
         );
     }
 
