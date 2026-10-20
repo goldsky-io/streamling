@@ -34,7 +34,7 @@ use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
 use streamling_core::table::aggregate as table_aggregate;
 use streamling_core::table::side_output::TableSideOutput;
-use streamling_core::table::{InMemoryTable, WindowConfig};
+use streamling_core::table::{InMemoryTable, SnapshotRetention, WindowConfig};
 use streamling_core::topology::PipelineTopology;
 use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
@@ -1847,6 +1847,29 @@ impl Streamling {
                         session_state: &session_state,
                         gc_interval: app_config.table.window_gc_interval,
                     });
+
+                    // The table is applied by a side output of the node its SQL
+                    // reads, so every node downstream of that node reads the
+                    // table as of the batch it is processing. A node on a
+                    // sibling branch, even one reading the same source, reads
+                    // the latest snapshot.
+                    let upstream = SessionManager::validate_plan_and_extract_source_name(
+                        &sql_plan,
+                        SubqueryHandling::Return,
+                    )?;
+                    let Some(upstream_operator) = self.get_side_output_operator(&upstream) else {
+                        streamling_user_bail!(
+                            "{}: '{}' cannot feed a table",
+                            ctx.format(),
+                            upstream
+                        );
+                    };
+                    // Every source type rides the coordinator's checkpoint
+                    // markers on its batches, so finalized checkpoints collect
+                    // the snapshots.
+                    let retention = SnapshotRetention::PerPosition {
+                        stream: upstream_operator.reference_name().to_string(),
+                    };
                     let storage = match table.backend_type {
                         TableBackendType::InMemory => Arc::new(InMemoryTable::try_new(
                             &reference_name,
@@ -1855,19 +1878,11 @@ impl Streamling {
                             metric_metadata_id.clone(),
                             table.max_dead_ratio,
                             window,
+                            retention,
                         )?),
                     };
                     session_manager.tables().register(Arc::clone(&storage));
 
-                    // The table is applied by a side output of the node its SQL
-                    // reads, so every node downstream of that node reads the
-                    // table with its current batch already applied. A node on
-                    // a sibling branch, even one reading the same source, isn't
-                    // synchronized with the table.
-                    let upstream = SessionManager::validate_plan_and_extract_source_name(
-                        &sql_plan,
-                        SubqueryHandling::Return,
-                    )?;
                     let side_output = TableSideOutput::try_new(
                         storage,
                         &sql_plan,
@@ -1877,13 +1892,6 @@ impl Streamling {
                     .streamling_with_context(|| {
                         format!("{}: unsupported table SQL", ctx.format())
                     })?;
-                    let Some(upstream_operator) = self.get_side_output_operator(&upstream) else {
-                        streamling_user_bail!(
-                            "{}: '{}' cannot feed a table",
-                            ctx.format(),
-                            upstream
-                        );
-                    };
                     upstream_operator.add_side_output(Arc::new(side_output));
 
                     // The side output already applied every row, so the table's
@@ -6037,6 +6045,17 @@ mod table_tests {
         ))
         .await
         .expect("a table_agg read by lookup_eq must plan");
+    }
+
+    /// Binding lookups to their batch's position changes no schema: `SELECT
+    /// *` over a reader, a transform reading it and a sink all plan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plans_readers_of_lookups_bound_to_positions() {
+        dry_run(&format!(
+            "transforms:\n{TOKENS}{VOLUMES}  reader:\n    type: sql\n    primary_key: id\n    sql: SELECT *, lookup_eq('tokens', 'id', id, 'num') AS token_num FROM src WHERE lookup_eq('volumes', 'num', num, 'n') > 0\n  downstream:\n    type: sql\n    primary_key: id\n    sql: SELECT * FROM reader\nsinks:\n  out:\n    type: print\n    from: reader\n  downstream_out:\n    type: print\n    from: downstream\n"
+        ))
+        .await
+        .expect("readers of position-bound lookups must plan");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

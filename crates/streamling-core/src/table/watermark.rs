@@ -27,8 +27,8 @@ pub(super) struct WatermarkFunc {
     signature: Signature,
 }
 
-// Same identity rule as `LookupEqFunc`: the watermarks are runtime state, so
-// the UDF is identified by its signature.
+// Same identity rule as `TableUdf`: the watermarks are runtime state, so the
+// UDF is identified by its signature.
 impl PartialEq for WatermarkFunc {
     fn eq(&self, other: &Self) -> bool {
         self.signature == other.signature

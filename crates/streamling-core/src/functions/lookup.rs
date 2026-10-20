@@ -1,13 +1,14 @@
 //! `lookup_eq(table, key, value, column)`: `column` of the row in `table`
 //! whose primary key `key` equals `value`, or null.
 
-use crate::table::{InMemoryTable, TableRegistry};
-use crate::{streamling_err, streamling_user_bail, streamling_user_err};
+use crate::table::read::TableFunction;
+use crate::table::{InMemoryTable, Position, TableRegistry};
+use crate::{streamling_user_bail, streamling_user_err};
 use datafusion::arrow::compute::can_cast_types;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::datatypes::{Field, FieldRef};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, Signature, Volatility,
 };
 use std::sync::Arc;
 use streamling_common::types::decimal_arb::DecimalArbType;
@@ -22,20 +23,6 @@ pub struct LookupEqFunc {
     signature: Signature,
 }
 
-// Same identity rule as `DynamicTableCheckFunc`: the registry is runtime
-// state, so the UDF is identified by its signature.
-impl PartialEq for LookupEqFunc {
-    fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
-    }
-}
-impl Eq for LookupEqFunc {}
-impl std::hash::Hash for LookupEqFunc {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.signature.hash(state);
-    }
-}
-
 impl LookupEqFunc {
     pub fn new(tables: TableRegistry) -> Self {
         Self {
@@ -46,7 +33,7 @@ impl LookupEqFunc {
         }
     }
 
-    fn table(&self, name: &str) -> Result<Arc<InMemoryTable>> {
+    fn table_named(&self, name: &str) -> Result<Arc<InMemoryTable>> {
         self.tables.get(name).ok_or_else(|| {
             streamling_user_err!("{}: no table named '{}'", LOOKUP_EQ_NAME, name).into()
         })
@@ -78,21 +65,13 @@ fn type_name(field: &Field) -> String {
     }
 }
 
-impl ScalarUDFImpl for LookupEqFunc {
+impl TableFunction for LookupEqFunc {
     fn name(&self) -> &str {
         LOOKUP_EQ_NAME
     }
 
     fn signature(&self) -> &Signature {
         &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Err(streamling_err!(
-            "{}: the return type depends on the table; return_field_from_args resolves it",
-            LOOKUP_EQ_NAME
-        )
-        .into())
     }
 
     /// Resolves the table, key and column while planning, so a bad call fails
@@ -106,7 +85,7 @@ impl ScalarUDFImpl for LookupEqFunc {
                 ARGUMENT_COUNT
             );
         };
-        let table = self.table(string_literal(*table, "table name")?)?;
+        let table = self.table_named(string_literal(*table, "table name")?)?;
         let key = string_literal(*key, "key")?;
         let key_field = table.lookup_key_field(key)?;
         // A decimal_arb key holds unscaled bytes: a value of another type or
@@ -125,7 +104,16 @@ impl ScalarUDFImpl for LookupEqFunc {
         Ok(table.lookup_field(string_literal(*column, "column")?)?)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn table(&self, literals: &[Option<&ScalarValue>]) -> crate::error::Result<Arc<InMemoryTable>> {
+        let name = string_literal(literals.first().copied().flatten(), "table name")?;
+        Ok(self.table_named(name)?)
+    }
+
+    fn invoke(
+        &self,
+        args: ScalarFunctionArgs,
+        position: Option<Position>,
+    ) -> Result<ColumnarValue> {
         let [
             ColumnarValue::Scalar(table_name),
             _,
@@ -138,10 +126,10 @@ impl ScalarUDFImpl for LookupEqFunc {
                 LOOKUP_EQ_NAME
             );
         };
-        let table = self.table(string_literal(Some(table_name), "table name")?)?;
+        let table = self.table_named(string_literal(Some(table_name), "table name")?)?;
         let keys = keys.to_array(args.number_rows)?;
         let column = string_literal(Some(column), "column")?;
-        Ok(ColumnarValue::Array(table.lookup(&keys, column)?))
+        Ok(ColumnarValue::Array(table.lookup(&keys, column, position)?))
     }
 }
 
@@ -150,7 +138,7 @@ mod tests {
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::session::SessionManager;
-    use crate::table::InMemoryTable;
+    use crate::table::{InMemoryTable, SnapshotRetention};
     use arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
@@ -176,6 +164,7 @@ mod tests {
             "app::rates".to_string(),
             crate::topology::DEFAULT_MAX_DEAD_RATIO,
             None,
+            SnapshotRetention::Latest,
         )
         .unwrap();
         rates
@@ -189,6 +178,7 @@ mod tests {
                     ],
                 )
                 .unwrap(),
+                None,
             )
             .unwrap();
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
@@ -286,6 +276,7 @@ mod tests {
                 "app::ids".to_string(),
                 crate::topology::DEFAULT_MAX_DEAD_RATIO,
                 None,
+                SnapshotRetention::Latest,
             )
             .unwrap(),
         ));
@@ -334,6 +325,7 @@ mod tests {
                 "app::decimals".to_string(),
                 crate::topology::DEFAULT_MAX_DEAD_RATIO,
                 None,
+                SnapshotRetention::Latest,
             )
             .unwrap(),
         ));

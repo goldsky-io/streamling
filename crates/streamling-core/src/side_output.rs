@@ -25,4 +25,7 @@ pub trait SourceSideOutput: Send + Sync + Debug {
 
 pub trait SupportsSideOutputs: Send + Sync {
     fn add_side_output(&self, side_output: Arc<dyn SourceSideOutput>);
+
+    /// The name the node's `SideOutputExec` stamps batch positions under.
+    fn reference_name(&self) -> &str;
 }

@@ -1,9 +1,11 @@
 //! Applies a table's SQL output to the table from inside its upstream's
-//! `SideOutputExec`, before the upstream yields the batch to any consumer, so
-//! every node downstream of the upstream reads the table with the batch
-//! already applied. A node on a sibling branch, even one reading the same
-//! source, isn't synchronized with the table.
+//! `SideOutputExec`, before the upstream yields the batch to any consumer.
+//! The `SideOutputExec` stamps each batch with its position, and the table
+//! publishes a snapshot at it, so every node downstream of the upstream reads
+//! the table as of the batch it is processing. A node on a sibling branch,
+//! even one reading the same source, reads the latest snapshot.
 
+use crate::checkpoints::checkpoint_management::{CheckpointMessage, extract_checkpoint_messages};
 use crate::session::SessionManager;
 use crate::side_output::{SideOutputPlacement, SourceSideOutput};
 use crate::streamling_err;
@@ -125,7 +127,17 @@ impl TableSideOutput {
 #[async_trait]
 impl SourceSideOutput for TableSideOutput {
     async fn process(&self, batch: &RecordBatch) -> Result<()> {
-        Ok(self.table.apply(&self.evaluate(batch)?)?)
+        let metadata = batch.schema_ref().metadata();
+        let position = self.table.position(metadata)?;
+        self.table.apply(&self.evaluate(batch)?, position)?;
+        if let Some(position) = position {
+            for message in extract_checkpoint_messages(metadata) {
+                if let CheckpointMessage::Marker { epoch, .. } = message {
+                    self.table.record_marker(&epoch, position);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Readers of the source only see the rows its filter keeps.
@@ -148,6 +160,7 @@ mod tests {
     use super::*;
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
+    use crate::table::SnapshotRetention;
     use crate::topology::DEFAULT_MAX_DEAD_RATIO;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -183,6 +196,7 @@ mod tests {
             "app::t".to_string(),
             DEFAULT_MAX_DEAD_RATIO,
             None,
+            SnapshotRetention::Latest,
         )
         .unwrap();
         TableSideOutput::try_new(
@@ -210,7 +224,7 @@ mod tests {
     fn names(table: &InMemoryTable, ids: &[i64]) -> Vec<Option<String>> {
         let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
         table
-            .lookup(&keys, "name")
+            .lookup(&keys, "name", None)
             .unwrap()
             .as_string::<i32>()
             .iter()

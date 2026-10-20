@@ -1199,8 +1199,12 @@ transforms:
 
 - `table`, `key` and `column` are string literals. `key` must be the table's primary key, and the primary key must be a single column. Invalid calls fail at startup.
 - `value` is cast to the key's type. A `NULL` value, or one that cannot be cast, returns `NULL`.
-- A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), sees every row that input's partition has produced up to and including the batch being processed, rows later in the same batch included. This is a lower bound: the lookup may also see rows from later batches, because the shared input can run ahead of its readers. Rows from the input's other partitions appear as those partitions produce them.
-- Lookups from other inputs are not synchronized with the table: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
+- A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), reads the table as of the batch being processed: every row that input's partition has produced up to and including that batch, and nothing later, however far the input has run ahead of its readers. This holds for any number of readers, and for a [`table_agg`](#aggregates) over the table. Its limits:
+  - Within a batch, a row also sees the rows after it in the same batch.
+  - Rows from the input's other partitions appear as those partitions produce them.
+  - A script, handler or plugin transform with a `batch_size` or `batch_flush_interval` merges batches. A lookup that reads batches it merged after the table's input applied them is rejected at startup.
+- Lookups from other inputs read the table's latest state, not synchronized with it: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
+- The table keeps a snapshot per batch of its input until a checkpoint covering the batch is finalized. Snapshots share their rows with the table, so they cost what the batches changed, usually a checkpoint interval's worth of writes. A checkpoint that doesn't finalize, such as one stuck on a slow sink, holds them until the next one does. `table_snapshots` and `table_snapshot_bytes` show what they hold.
 - After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
 
 ### Windows
@@ -1244,8 +1248,8 @@ With `window: block_time >= watermark(block_time) - interval '1 hour'`, applying
 | input idle for 3 hours | 11:10 | Nothing is evicted. |
 | restart | `NULL` | The table starts empty and the replay rebuilds the watermark. |
 
-- Every apply that stores rows evicts under the same lock, so a lookup never sees a row outside the window as of the latest stored time.
-- During a replay, the table holds the hour before the latest stored time, so lookups and [aggregates](#aggregates) give close to the results they gave live, not exact ones. A lookup sees the table [after its own batch, and possibly later ones](#lookups): the table's input runs ahead of its readers by about `internal_buffer_size` batches (default 10). So a lookup can see rows later than its own, and miss older rows those later rows pushed out of the window. The error is bounded by the time those batches cover. For a tighter replay, lower `STREAMLING__INTERNAL_BUFFER_SIZE` or the batch size, at a cost in throughput. How far the table runs ahead depends on timing, so a replay isn't deterministic.
+- Every apply that stores rows evicts before lookups can see it, so a lookup never sees a row outside the window as of the latest stored time.
+- During a replay, the table holds the hour before the latest stored time, and a lookup reads the table [as of its own batch](#lookups). So lookups and [aggregates](#aggregates) give the results they gave live, within the limits there: rows later in the same batch, and other partitions.
 - All partitions of the table's input share one watermark. A partition behind the others has its rows older than the window evicted as they arrive.
 - An out-of-order allowance is a larger interval: `watermark(block_time) - interval '1 hour 5 minutes'`.
 - One timestamp far in the future moves the watermark there for good and evicts everything else. Cap it with the wall clock: `block_time >= least(watermark(block_time), now()) - interval '1 hour'`.
@@ -2546,6 +2550,8 @@ The following table shows all supported components and the metrics they emit:
 |                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)       |
 | **Table Transform**        |             | `table_live_rows`     | Gauge       | Rows currently stored in the table                   |
 |                            |             | `table_memory_bytes`  | Gauge       | Bytes held by the table's chunks and key index       |
+|                            |             | `table_snapshots`     | Gauge       | Snapshots kept for lookups, one per recent batch     |
+|                            |             | `table_snapshot_bytes`| Gauge       | Bytes of dropped chunks that snapshots still hold    |
 
 **Note**
 
