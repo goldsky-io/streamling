@@ -391,6 +391,8 @@ A hybrid source runs one or more **bounded** phases followed by an **unbounded**
 
 With `STREAMLING__JOB_MODE=true` (or `job_mode: true` in `config.yaml`), the pipeline terminates after all bounded phases complete instead of transitioning to the unbounded phase. All sources in the pipeline must be hybrid sources when job mode is enabled.
 
+A job-mode run exits 0 only when every source finished its range. If SIGTERM/SIGINT (e.g. pod eviction) stops it first, it drains, checkpoints, and exits non-zero; rerunning with the same application id resumes from the last checkpoint.
+
 Sample configuration:
 
 ```yaml

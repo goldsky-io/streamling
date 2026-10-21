@@ -237,25 +237,20 @@ async fn mixed_integer_native_decimal_expression_chains_are_exact() {
             let out = ctx.sql(sql).await.unwrap().collect().await.unwrap();
             let mut row = 0;
             for b in out {
-                let values: Vec<_> = (0..3)
-                    .map(|c| decoded(b.column(c).as_ref(), b.schema().field(c)))
-                    .collect();
-                for j in 0..b.num_rows() {
+                let [xs, ys, zs]: [_; 3] =
+                    std::array::from_fn(|c| decoded(b.column(c).as_ref(), b.schema().field(c)));
+                for ((x, y), z) in xs.into_iter().zip(ys).zip(zs) {
                     let a = ns[row]
                         .as_ref()
                         .map(|n| BigDecimal::new(n.clone(), sa as i64));
                     assert_eq!(
-                        values[0][j],
+                        x,
                         if bs[row].is_some() { a.clone() } else { None },
                         "{sql}, scales ({sa},{sb}), row {row}"
                     );
+                    assert_eq!(y, a.clone(), "{sql}, scales ({sa},{sb}), row {row}");
                     assert_eq!(
-                        values[1][j],
-                        a.clone(),
-                        "{sql}, scales ({sa},{sb}), row {row}"
-                    );
-                    assert_eq!(
-                        values[2][j],
+                        z,
                         if a.is_some() && bs[row].is_some() {
                             Some(BigDecimal::zero())
                         } else {

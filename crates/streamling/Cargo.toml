@@ -2,7 +2,7 @@
 name = "streamling"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.90.0"
+rust-version = "1.91.0"
 description = "Streamling: Performant and extensible streaming data runtime"
 readme = "../../README.md"
 license-file.workspace = true

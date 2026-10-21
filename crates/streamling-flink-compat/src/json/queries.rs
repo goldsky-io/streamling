@@ -439,18 +439,13 @@ struct JsonExistsOptions {
     on_error: JsonExistsBehavior,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 enum JsonExistsBehavior {
     True,
+    #[default]
     False,
     Error,
     Unknown,
-}
-
-impl Default for JsonExistsBehavior {
-    fn default() -> Self {
-        Self::False
-    }
 }
 
 impl JsonExistsOptions {

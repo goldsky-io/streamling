@@ -234,41 +234,43 @@ impl Drop for SafeKafkaConsumer {
 /// Same rationale as [`SafeKafkaConsumer`]: dropping the last handle runs
 /// `rd_kafka_destroy()`, which waits on internal librdkafka threads and can
 /// deadlock a tokio worker — at runtime teardown that wedges `Runtime::drop`
-/// and the process hangs until SIGKILL. The sink's producers are dropped with
-/// the DataFusion plan on a worker thread, so they need the same deferral.
-struct SafeKafkaProducers {
-    producers: Option<Vec<KafkaThreadedProducer>>,
+/// and the process hangs until SIGKILL. Each sink write stream drops its
+/// producer on a worker thread, so it needs the same deferral.
+struct SafeKafkaProducer {
+    producer: Option<KafkaThreadedProducer>,
 }
 
-impl SafeKafkaProducers {
-    fn new(producers: Vec<KafkaThreadedProducer>) -> Self {
+impl SafeKafkaProducer {
+    fn new(producer: KafkaThreadedProducer) -> Self {
         Self {
-            producers: Some(producers),
+            producer: Some(producer),
         }
     }
+}
 
-    fn as_slice(&self) -> &[KafkaThreadedProducer] {
-        self.producers.as_deref().unwrap_or(&[])
+impl std::ops::Deref for SafeKafkaProducer {
+    type Target = KafkaThreadedProducer;
+    fn deref(&self) -> &Self::Target {
+        self.producer.as_ref().expect("producer already taken")
     }
 }
 
-impl Drop for SafeKafkaProducers {
+impl Drop for SafeKafkaProducer {
     fn drop(&mut self) {
-        if let Some(producers) = self.producers.take() {
+        if let Some(producer) = self.producer.take() {
             // Detached OS thread, not spawn_blocking — see SafeKafkaConsumer:
             // a blocking task queued during runtime shutdown never runs and
             // its closure is dropped inline on the shutdown thread, restoring
-            // the very deadlock this wrapper exists to prevent. The sink has
-            // already flushed by the time producers drop, so abandoning the
-            // destroy at process exit loses nothing.
+            // the very deadlock this wrapper exists to prevent. The stream has
+            // already flushed by the time its producer drops, so abandoning
+            // the destroy at process exit loses nothing.
             tracing::info!(
-                "SafeKafkaProducers: moving rd_kafka_destroy of {} producer(s) \
-                 to a detached thread to prevent worker-thread deadlock",
-                producers.len()
+                "SafeKafkaProducer: moving rd_kafka_destroy to a detached thread \
+                 to prevent worker-thread deadlock"
             );
             std::thread::spawn(move || {
-                drop(producers);
-                tracing::info!("SafeKafkaProducers: rd_kafka_destroy completed");
+                drop(producer);
+                tracing::info!("SafeKafkaProducer: rd_kafka_destroy completed");
             });
         }
     }
@@ -2803,7 +2805,6 @@ pub struct KafkaSink {
     /// per-partition `write_all` streams (`ParallelSinkExec`).
     rows_received: AtomicU64,
     metric_metadata_id: String,
-    producers: OnceCell<SafeKafkaProducers>,
     primary_key: Option<String>,
     /// Maximum number of messages to batch before sending (maps to Kafka's batch.num.messages)
     batch_size: Option<u32>,
@@ -2844,7 +2845,6 @@ impl KafkaSink {
             num_records_before_stop,
             rows_received: AtomicU64::new(0),
             metric_metadata_id: reference_name,
-            producers: OnceCell::new(),
             primary_key,
             batch_size,
             batch_flush_interval_ms,
@@ -3003,14 +3003,13 @@ impl KafkaSink {
         builder
     }
 
-    /// One producer per sink, shared by every concurrent write stream.
+    /// Builds the producer for one write stream.
     ///
-    /// The sink used to fan out to N producers and route rows between them by
-    /// `hash(key) % N` — a hash exchange hand-rolled inside the sink. The
-    /// `parallelism` knob now drives a real `StreamingRepartitionExec` upstream,
-    /// which gives each key its own write stream, so the internal routing is
-    /// gone. `ThreadedProducer` is `Sync` and batches internally, so the streams
-    /// share it.
+    /// `ParallelSinkExec` runs one `write_all` per input partition, and each
+    /// stream owns its producer: its own broker connections, queue, and flush.
+    /// A marker flush therefore waits only on this stream's messages. Write
+    /// parallelism comes from the plan (`StreamingRepartitionExec` upstream),
+    /// not from routing rows between producers inside the sink.
     fn create_producer(&self) -> streamling_core::error::Result<KafkaThreadedProducer> {
         info!(
             "Creating Kafka producer for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={})",
@@ -3366,18 +3365,11 @@ impl DataSink for KafkaSink {
 
         self.ensure_topic_and_schema_exist().await?;
 
-        // One producer, shared by the concurrent per-partition write_all
-        // streams (write parallelism comes from the plan, not from producer
-        // fan-out) — still inside SafeKafkaProducers so its rdkafka teardown
-        // runs on a detached OS thread and can never deadlock the drain.
-        let producers: &[KafkaThreadedProducer] = self
-            .producers
-            .get_or_try_init(|| {
-                self.create_producer()
-                    .map(|producer| SafeKafkaProducers::new(vec![producer]))
-            })?
-            .as_slice();
-        let producer: &KafkaThreadedProducer = &producers[0];
+        // One producer per write stream, inside SafeKafkaProducer so its
+        // rdkafka teardown runs on a detached OS thread and can never deadlock
+        // the drain.
+        let safe_producer = SafeKafkaProducer::new(self.create_producer()?);
+        let producer: &KafkaThreadedProducer = &safe_producer;
         let metrics_recorder = get_metrics_recorder().clone();
         let shutdown = streamling_core::shutdown::subscribe();
 
@@ -3455,11 +3447,8 @@ impl DataSink for KafkaSink {
                         "Received marker for epoch {}, flushing Kafka producer for topic: {}",
                         epoch.0, self.topic,
                     );
-                    tokio::task::block_in_place(|| -> streamling_core::error::Result<()> {
-                        for producer in producers {
-                            Self::flush_producer(producer, &self.topic, &shutdown)?;
-                        }
-                        Ok(())
+                    tokio::task::block_in_place(|| {
+                        Self::flush_producer(producer, &self.topic, &shutdown)
                     })
                     .map_err(datafusion::error::DataFusionError::from)?;
 
@@ -3497,21 +3486,13 @@ impl DataSink for KafkaSink {
             }
         }
 
-        tokio::task::block_in_place(|| -> streamling_core::error::Result<()> {
-            for producer in producers {
-                Self::flush_producer(producer, &self.topic, &shutdown)?;
-            }
-            Ok(())
-        })
-        .map_err(datafusion::error::DataFusionError::from)?;
-        for producer in producers {
-            producer.context().check_error().map_err(|e| {
-                datafusion::error::DataFusionError::from(
-                    streamling_core::streamling_err!("Kafka producer error: {}", e)
-                        .mark_retriable(),
-                )
-            })?;
-        }
+        tokio::task::block_in_place(|| Self::flush_producer(producer, &self.topic, &shutdown))
+            .map_err(datafusion::error::DataFusionError::from)?;
+        producer.context().check_error().map_err(|e| {
+            datafusion::error::DataFusionError::from(
+                streamling_core::streamling_err!("Kafka producer error: {}", e).mark_retriable(),
+            )
+        })?;
 
         info!(
             "[{}] write_all completed with {} rows (topic '{}')",

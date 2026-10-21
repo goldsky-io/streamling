@@ -65,6 +65,9 @@ DETAILS.update({
     "try_to_decimal_arb_from_string": ("text, precision, scale[, native_int_kind]", "decimal_arb or NULL", "Like to_decimal_arb_from_string, but malformed or non-fitting values become NULL. Invalid declarations still error; precision/scale must be Int64 literals, and the optional native_int_kind literal obeys the same rules.", "SELECT try_to_decimal_arb_from_string('bad', 100, 2); -- NULL"),
     "to_decimal_arb_from_int": ("value, precision, scale", "decimal_arb", "Convert an Int8/16/32/64 or UInt8/16/32/64 value exactly. " + DECIMAL_DECLARATION, "SELECT to_decimal_arb_from_int(123, 100, 2);"),
     "legacy_wide_int_to_decimal_arb": ("value", "decimal_arb(78, 0)", "Upgrade a FixedSizeBinary(32) value carrying retired streamling.u256 or streamling.i256 metadata; preserves the native integer hint and NULL values. Untagged bytes are rejected.", "SELECT legacy_wide_int_to_decimal_arb(amount) FROM events;"),
+    "decimal_arb_cast_numeric": ("value, fallback", "decimal_arb, or the type of fallback", "Planner-generated for `CAST` / `TRY_CAST` / `::` to `NUMERIC` or `DECIMAL` without a precision; `fallback` is the cast as written. A decimal_arb value is returned unchanged (a bare NUMERIC has unconstrained precision); it stays decimal_arb, so `ROUND` or float arithmetic on it needs an explicit precision. Any other value takes `fallback`, DataFusion's `Decimal128(38, 10)` cast. The column is named as `fallback` would be.", "SELECT CAST(amount AS NUMERIC) FROM events; -- decimal_arb_cast_numeric(amount, CAST(amount AS NUMERIC))"),
+    "decimal_arb_cast_wide_decimal": ("value, fallback", "decimal_arb", "Planner-generated for `CAST(value AS DECIMAL(p, s))` with p > 76; `fallback` is `to_decimal_arb_from_string(CAST(value AS VARCHAR), p, s[, 'u256'])`. A decimal_arb value is rescaled to s, a dropped digit rounding half away from zero, and must then fit p (an error otherwise), as for `DECIMAL(p <= 76, s)`; the result takes fallback's precision, scale and native_int_kind. Any other value takes `fallback`.", "SELECT CAST(amount AS DECIMAL(80, 2)) FROM events;"),
+    "decimal_arb_try_cast_wide_decimal": ("value, fallback", "decimal_arb or NULL", "Like decimal_arb_cast_wide_decimal, for `TRY_CAST`: `fallback` is `try_to_decimal_arb_from_string(...)`, and a decimal_arb value that does not fit p after rounding becomes NULL.", "SELECT TRY_CAST(amount AS DECIMAL(80, 2)) FROM events;"),
 })
 for operation in ("add", "sub", "mul", "div", "mod"):
     name = f"decimal_arb_{operation}"
@@ -161,6 +164,9 @@ RUNTIME_TYPES.update({
     "to_decimal_arb_from_decimal128": "Decimal128 with nonnegative scale",
     "to_decimal_arb_from_decimal256": "Decimal256 with nonnegative scale",
     "legacy_wide_int_to_decimal_arb": "FixedSizeBinary(32) with streamling.u256 / streamling.i256 metadata",
+    "decimal_arb_cast_numeric": "any value, then the planner's cast of it",
+    "decimal_arb_cast_wide_decimal": "any value, then the planner's decimal_arb cast of it",
+    "decimal_arb_try_cast_wide_decimal": "any value, then the planner's decimal_arb cast of it",
 })
 RUNTIME_TYPES.update({name: "decimal_arb (or DataFusion built-in input types)"
                       for name in DECIMAL_AGGREGATE_DETAILS})
