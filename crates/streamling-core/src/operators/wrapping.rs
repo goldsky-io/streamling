@@ -712,20 +712,24 @@ impl ExecutionPlan for WrappingExec {
                         // below `starved` and `busy = elapsed_compute - starved`
                         // drift negative at high throughput — the exact failure
                         // the `MillisAccumulator` exists to prevent.
-                        if starved_ms > 0 {
-                            metrics_recorder.record_elapsed_compute(
-                                Duration::from_millis(starved_ms),
-                                &metric_metadata_id,
-                            );
-                        } else if record_wall_clock_compute {
+                        //
+                        // A SQL transform with subtree metrics folds it into the
+                        // batch's compute delta (`record_execution_plan_metrics`)
+                        // so the histogram keeps one observation per batch.
+                        let sql_input_wait_ms = if !record_wall_clock_compute {
+                            starved_ms
+                        } else {
                             // No whole starved millisecond this batch: keep #85's
                             // wall-clock path for non-SQL / passthrough SQL so
                             // sub-ms compute isn't dropped entirely.
-                            metrics_recorder.record_elapsed_compute(
-                                batch_elapsed,
-                                &metric_metadata_id,
-                            );
-                        }
+                            let folded = if starved_ms > 0 {
+                                Duration::from_millis(starved_ms)
+                            } else {
+                                batch_elapsed
+                            };
+                            metrics_recorder.record_elapsed_compute(folded, &metric_metadata_id);
+                            0
+                        };
 
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
@@ -733,6 +737,7 @@ impl ExecutionPlan for WrappingExec {
                             batch.num_rows(),
                             RowCountMeasurementType::OutputRowCount,
                             metrics.as_ref(),
+                            sql_input_wait_ms,
                         );
 
                         // Record checkpoint marker arrival time for transforms
@@ -876,6 +881,7 @@ impl DataSink for WrappingDataSink {
                             batch.num_rows(),
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
+                            0,
                         );
 
                         // End-to-end freshness at sink ingress. Same code
