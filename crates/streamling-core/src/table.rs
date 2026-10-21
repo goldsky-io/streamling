@@ -5,12 +5,12 @@ pub mod aggregate;
 pub mod driver;
 pub mod read;
 pub mod side_output;
-pub mod snapshot;
+mod versions;
 mod watermark;
 
 use aggregate::TableAggregate;
-use snapshot::{Index, Snapshot, Snapshots};
-pub use snapshot::{Position, SnapshotRetention};
+use versions::{ChangeRef, Versions};
+pub use versions::{Mark, Marks, VersionRetention};
 use watermark::{WATERMARK_NAME, WatermarkFunc, Watermarks};
 
 use crate::checkpoints::checkpoint_management::CheckpointEpoch;
@@ -38,7 +38,6 @@ use datafusion::logical_expr::{Accumulator, Expr, ExprSchemable, ScalarUDF, col}
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
-use imbl::Vector;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -51,8 +50,8 @@ const UPSERT_OPS: [&str; 4] = ["i", "c", "r", "u"];
 
 const LIVE_ROWS_GAUGE: &str = "table_live_rows";
 const MEMORY_BYTES_GAUGE: &str = "table_memory_bytes";
-const SNAPSHOTS_GAUGE: &str = "table_snapshots";
-const SNAPSHOT_BYTES_GAUGE: &str = "table_snapshot_bytes";
+const VERSIONS_GAUGE: &str = "table_versions";
+const RETIRED_BYTES_GAUGE: &str = "table_retired_bytes";
 
 /// Floor of a cleaning step's budget, so tiny batches still merge old chunks
 /// into chunks of a useful size.
@@ -68,17 +67,27 @@ enum RowOp {
     Delete,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowLocation {
     chunk: usize,
     row: usize,
 }
 
-/// A chunk's writer-only bookkeeping. Its rows are in `TableState::batches`.
+/// A live key's row and its newest change in the version history.
+#[derive(Clone, Copy)]
+struct IndexEntry {
+    location: RowLocation,
+    newest_change: Option<ChangeRef>,
+}
+
 struct Chunk {
-    /// Rows of the chunk the index points to.
+    batch: RecordBatch,
+    /// Rows of `batch` the index points to.
     live_rows: usize,
-    /// Bounds of the window's columns over all of the chunk's rows, in
+    /// History entries that point into `batch`, which keep it readable after
+    /// the cleaner drops the chunk.
+    held: usize,
+    /// Bounds of the window's columns over all of `batch`'s rows, in
     /// `Window::columns` order. Empty without a window.
     statistics: Vec<ColumnStatistics>,
 }
@@ -90,30 +99,41 @@ struct ColumnStatistics {
     null_count: usize,
 }
 
-/// The table's current contents. `batches` and `index` are persistent
-/// collections, so a [`Snapshot`] of them is a cheap clone that later writes
-/// don't change.
-#[derive(Default)]
 struct TableState {
     /// Oldest first. A chunk's id is its position plus `first_chunk_id`, so
     /// ids stay valid while the cleaner drops chunks from the front.
     chunks: VecDeque<Chunk>,
-    /// Each chunk's rows, in `chunks` order.
-    batches: Vector<RecordBatch>,
     first_chunk_id: usize,
     /// The front chunk's next row to clean.
     cleaning_cursor: usize,
-    index: Index,
+    /// Primary key, encoded by the table's `RowConverter`, to its live row.
+    index: HashMap<Box<[u8]>, IndexEntry>,
     total_rows: usize,
     chunk_bytes: usize,
     key_bytes: usize,
-    /// Dropped chunks that snapshots may still hold, oldest first, as `(id,
-    /// bytes)`.
-    retired_chunks: VecDeque<(usize, usize)>,
+    versions: Versions,
+    /// Chunks the cleaner dropped that history entries still point into, by
+    /// id, with how many do.
+    retired: HashMap<usize, (RecordBatch, usize)>,
     retired_bytes: usize,
 }
 
 impl TableState {
+    fn new(retention: &VersionRetention) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            first_chunk_id: 0,
+            cleaning_cursor: 0,
+            index: HashMap::new(),
+            total_rows: 0,
+            chunk_bytes: 0,
+            key_bytes: 0,
+            versions: Versions::new(retention),
+            retired: HashMap::new(),
+            retired_bytes: 0,
+        }
+    }
+
     fn chunk(&self, id: usize) -> &Chunk {
         &self.chunks[id - self.first_chunk_id]
     }
@@ -122,8 +142,75 @@ impl TableState {
         &mut self.chunks[id - self.first_chunk_id]
     }
 
+    /// The rows of a live or retired chunk.
     fn batch(&self, id: usize) -> &RecordBatch {
-        &self.batches[id - self.first_chunk_id]
+        match id.checked_sub(self.first_chunk_id) {
+            Some(offset) => &self.chunks[offset].batch,
+            None => &self.retired[&id].0,
+        }
+    }
+
+    /// How many history entries point into a live or retired chunk.
+    fn held_mut(&mut self, id: usize) -> &mut usize {
+        match id.checked_sub(self.first_chunk_id) {
+            Some(offset) => &mut self.chunks[offset].held,
+            None => {
+                &mut self
+                    .retired
+                    .get_mut(&id)
+                    .expect("a held chunk is live or retired")
+                    .1
+            }
+        }
+    }
+
+    fn hold(&mut self, location: RowLocation) {
+        *self.held_mut(location.chunk) += 1;
+    }
+
+    /// Frees a retired chunk once no history entry points into it.
+    fn unhold(&mut self, location: RowLocation) {
+        let held = self.held_mut(location.chunk);
+        *held -= 1;
+        if *held == 0
+            && let Some((batch, _)) = self.retired.remove(&location.chunk)
+        {
+            self.retired_bytes -= batch.get_array_memory_size();
+        }
+    }
+
+    /// Records a change of a key whose live row was `before` and whose
+    /// newest change was `previous`. Returns the new change, if recorded.
+    fn record(
+        &mut self,
+        previous: Option<ChangeRef>,
+        before: Option<RowLocation>,
+    ) -> Option<ChangeRef> {
+        let recorded = self.versions.record(previous, before);
+        if recorded.is_some()
+            && let Some(before) = before
+        {
+            self.hold(before);
+        }
+        recorded
+    }
+
+    /// Removes `key`'s live row, and returns it.
+    fn remove(&mut self, key: &[u8]) -> Option<RowLocation> {
+        let (key, entry) = self.index.remove_entry(key)?;
+        self.key_bytes -= key.len();
+        if let Some(change) = self.record(entry.newest_change, Some(entry.location)) {
+            self.versions.mark_removed(key, change);
+        }
+        self.release(entry.location);
+        Some(entry.location)
+    }
+
+    /// Drops the history up to the finalized `epoch`.
+    fn collect(&mut self, epoch: u64) {
+        for location in self.versions.collect(epoch) {
+            self.unhold(location);
+        }
     }
 
     fn next_chunk_id(&self) -> usize {
@@ -138,41 +225,28 @@ impl TableState {
     ) {
         self.total_rows += batch.num_rows();
         self.chunk_bytes += batch.get_array_memory_size();
-        self.batches.push_back(batch);
         self.chunks.push_back(Chunk {
+            batch,
             live_rows,
+            held: 0,
             statistics,
         });
     }
 
+    /// Drops the front chunk, retiring it while history entries point into
+    /// it.
     fn pop_front_chunk(&mut self) {
-        if let (Some(_), Some(batch)) = (self.chunks.pop_front(), self.batches.pop_front()) {
-            let bytes = batch.get_array_memory_size();
-            self.total_rows -= batch.num_rows();
+        if let Some(chunk) = self.chunks.pop_front() {
+            let bytes = chunk.batch.get_array_memory_size();
+            self.total_rows -= chunk.batch.num_rows();
             self.chunk_bytes -= bytes;
-            self.retired_chunks.push_back((self.first_chunk_id, bytes));
-            self.retired_bytes += bytes;
+            if chunk.held > 0 {
+                self.retired_bytes += bytes;
+                self.retired
+                    .insert(self.first_chunk_id, (chunk.batch, chunk.held));
+            }
             self.first_chunk_id += 1;
             self.cleaning_cursor = 0;
-        }
-    }
-
-    /// Forgets the retired chunks before `oldest_held`, which no snapshot
-    /// holds anymore.
-    fn release_retired_chunks(&mut self, oldest_held: usize) {
-        while let Some(&(id, bytes)) = self.retired_chunks.front()
-            && id < oldest_held
-        {
-            self.retired_chunks.pop_front();
-            self.retired_bytes -= bytes;
-        }
-    }
-
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            batches: self.batches.clone(),
-            first_chunk_id: self.first_chunk_id,
-            index: self.index.clone(),
         }
     }
 
@@ -475,7 +549,7 @@ impl Window {
 /// The statistics of the chunks a GC pass prunes, one container per chunk.
 struct ChunkStatistics<'a> {
     window: &'a Window,
-    chunks: &'a [(&'a Chunk, &'a RecordBatch)],
+    chunks: &'a [&'a Chunk],
 }
 
 impl ChunkStatistics<'_> {
@@ -493,7 +567,7 @@ impl ChunkStatistics<'_> {
         ScalarValue::iter_to_array(
             self.chunks
                 .iter()
-                .map(|(chunk, _)| value(&chunk.statistics[position])),
+                .map(|chunk| value(&chunk.statistics[position])),
         )
         .ok()
     }
@@ -520,7 +594,9 @@ impl PruningStatistics for ChunkStatistics<'_> {
 
     fn row_counts(&self) -> Option<ArrayRef> {
         Some(Arc::new(UInt64Array::from_iter_values(
-            self.chunks.iter().map(|(_, batch)| batch.num_rows() as u64),
+            self.chunks
+                .iter()
+                .map(|chunk| chunk.batch.num_rows() as u64),
         )))
     }
 
@@ -577,8 +653,8 @@ fn wall_clock(rows: usize) -> ArrayRef {
 /// predicate isn't true for, and the cleaner reclaims their rows like any
 /// other dead rows. An apply ends with a pass when the window's GC interval
 /// has passed since the last one. A window that reads a watermark also runs
-/// one inside every apply that writes rows, so no snapshot holds a row the
-/// batch pushed out of the window. Each chunk keeps the min, max and null count of the
+/// one inside every apply that writes rows, under its write lock, so no
+/// lookup sees a row the batch pushed out of the window. Each chunk keeps the min, max and null count of the
 /// columns the predicate reads, so a pass skips the chunks they show to be
 /// wholly inside the window. A predicate that reads [`WALL_CLOCK_COLUMN`]
 /// makes each chunk store the time its rows were applied in that column.
@@ -586,9 +662,20 @@ fn wall_clock(rows: usize) -> ArrayRef {
 /// Each [`TableAggregate`] reading the table gets every change to the live
 /// rows, from applies and GC passes, before the write lock is released.
 ///
-/// An apply ends by publishing a [`Snapshot`] of the table, and of each
-/// aggregate's output, at the batch's position. Lookups read snapshots, so
-/// they never wait for an apply; see [`snapshot`].
+/// With [`VersionRetention::PerBatch`], every change of a key (an upsert,
+/// a delete or an eviction) is recorded in a version history, in apply order
+/// across the input's partitions, with the key's live row before it, and so
+/// is every change to an aggregate's output. Each finished apply returns the
+/// history's end as its [`Mark`], for the table and its aggregates' outputs
+/// in one lock window. A lookup at a batch's mark undoes every change made
+/// after it, whatever its partition, so it sees the table and its aggregates
+/// as they were when the batch was applied. The dead rows such
+/// lookups need stay readable, even after the cleaner drops their chunk,
+/// until a finalized checkpoint collects them. Each change links to its
+/// key's previous change. A key's index entry points to its newest change,
+/// so a lookup of a live key probes the index once; a key without a live row
+/// keeps its newest change in a side map of the history until it's
+/// collected.
 ///
 /// Nothing is persisted, so the table starts empty after a restart.
 pub struct InMemoryTable {
@@ -610,12 +697,11 @@ pub struct InMemoryTable {
     /// Cleaning runs while dead rows exceed this fraction of the live rows.
     max_dead_ratio: f64,
     window: Option<Window>,
-    retention: SnapshotRetention,
+    retention: VersionRetention,
     /// Locked before `state`.
     aggregates: RwLock<Vec<Arc<TableAggregate>>>,
-    /// Locked before `snapshots`.
+    /// Locked before the `state` of each aggregate's output.
     state: RwLock<TableState>,
-    snapshots: RwLock<Snapshots>,
 }
 
 impl InMemoryTable {
@@ -629,7 +715,7 @@ impl InMemoryTable {
         metric_metadata_id: String,
         max_dead_ratio: f64,
         window: Option<WindowConfig>,
-        retention: SnapshotRetention,
+        retention: VersionRetention,
     ) -> Result<Self> {
         if !(max_dead_ratio.is_finite() && max_dead_ratio > 0.0) {
             streamling_user_bail!(
@@ -708,33 +794,59 @@ impl InMemoryTable {
             converter,
             max_dead_ratio,
             window,
-            snapshots: RwLock::new(Snapshots::new(&retention, TableState::default().snapshot())),
+            state: RwLock::new(TableState::new(&retention)),
             retention,
             aggregates: RwLock::new(Vec::new()),
-            state: RwLock::new(TableState::default()),
         })
     }
 
     /// Applies `batch` (the table's SQL output) in row order: an upsert
-    /// replaces its key's row, and a delete removes it. Then publishes the
-    /// table and its aggregates as of `position`, the batch's position on the
-    /// table's stream, which [`SnapshotRetention::PerPosition`] requires.
-    pub fn apply(&self, batch: &RecordBatch, position: Option<Position>) -> Result<()> {
+    /// replaces its key's row, and a delete removes it. `epochs` are the
+    /// checkpoint markers the batch carried. Returns the marks the batch's
+    /// readers see the table and its aggregates' outputs at: the end of this
+    /// apply.
+    pub fn apply(&self, batch: &RecordBatch, epochs: &[CheckpointEpoch]) -> Result<Marks> {
+        self.begin();
         self.write(batch)?;
         // After the batch, so a pass evicts its rows too.
         self.collect_garbage_if_due()?;
-        let aggregates = self.aggregates.read();
-        let mut state = self.state.write();
-        self.publish(&mut state, position)?;
-        // Every change to an aggregate's output holds the table's write lock,
-        // so the outputs are published as of the same apply.
-        for aggregate in aggregates.iter() {
-            aggregate.publish(position)?;
-        }
-        Ok(())
+        let marks = self.finish(epochs);
+        self.record_gauges();
+        Ok(marks)
     }
 
-    /// Applies `batch` without publishing it.
+    /// Starts an apply on the table and on its aggregates' outputs,
+    /// collecting the history a finalized checkpoint freed.
+    fn begin(&self) {
+        let aggregates = self.aggregates.read();
+        let mut state = self.state.write();
+        if let Some(epoch) = state.versions.latest_finalized() {
+            state.collect(epoch);
+        }
+        for aggregate in aggregates.iter() {
+            aggregate.begin();
+        }
+    }
+
+    /// Finishes an apply of a batch that carried the markers of `epochs`,
+    /// on the table and on its aggregates' outputs, in one lock window, so
+    /// the batch's readers see them at the same moment.
+    fn finish(&self, epochs: &[CheckpointEpoch]) -> Marks {
+        let aggregates = self.aggregates.read();
+        let mut state = self.state.write();
+        let mut marks: Marks = state
+            .versions
+            .finish(epochs)
+            .map(|mark| (self.name.clone(), mark))
+            .into_iter()
+            .collect();
+        for aggregate in aggregates.iter() {
+            marks.extend(aggregate.finish(epochs));
+        }
+        marks
+    }
+
+    /// Applies `batch`, recording its changes in the version history.
     fn write(&self, batch: &RecordBatch) -> Result<()> {
         let ops = self.parse_ops(batch.column(self.op_index))?;
         let key_columns: Vec<ArrayRef> = self
@@ -806,10 +918,27 @@ impl InMemoryTable {
                         row,
                     };
                     let replaced = match state.index.get_mut(key.as_ref()) {
-                        Some(existing) => Some(std::mem::replace(existing, location)),
+                        Some(entry) => {
+                            let replaced = std::mem::replace(&mut entry.location, location);
+                            // `TableState::record`, inlined: `entry` borrows the index.
+                            entry.newest_change =
+                                state.versions.record(entry.newest_change, Some(replaced));
+                            if entry.newest_change.is_some() {
+                                state.hold(replaced);
+                            }
+                            Some(replaced)
+                        }
                         None => {
                             state.key_bytes += key.as_ref().len();
-                            state.index.insert(key.as_ref().into(), location);
+                            let previous = state.versions.take_removed(key.as_ref());
+                            let newest_change = state.record(previous, None);
+                            state.index.insert(
+                                key.as_ref().into(),
+                                IndexEntry {
+                                    location,
+                                    newest_change,
+                                },
+                            );
                             None
                         }
                     };
@@ -825,12 +954,10 @@ impl InMemoryTable {
                     }
                 }
                 RowOp::Delete => {
-                    if let Some(stored) = state.index.remove(key.as_ref()) {
-                        state.key_bytes -= key.as_ref().len();
-                        state.release(stored);
-                        if let Some(changes) = &mut changes {
-                            changes.release(stored, new_chunk);
-                        }
+                    if let Some(stored) = state.remove(key.as_ref())
+                        && let Some(changes) = &mut changes
+                    {
+                        changes.release(stored, new_chunk);
                     }
                 }
             }
@@ -867,42 +994,12 @@ impl InMemoryTable {
         self.clean(state, written_rows)
     }
 
-    /// Publishes the table's current contents as of `position`.
-    fn publish(&self, state: &mut TableState, position: Option<Position>) -> Result<()> {
-        let mut snapshots = self.snapshots.write();
-        snapshots.publish(state.snapshot(), position)?;
-        state.release_retired_chunks(snapshots.oldest_chunk_id());
-        let snapshot_count = snapshots.count();
-        drop(snapshots);
-        self.record_gauges(state, snapshot_count);
-        Ok(())
-    }
-
-    /// Publishes an aggregate's output, which only its table writes.
-    fn publish_written(&self, position: Option<Position>) -> Result<()> {
-        self.publish(&mut self.state.write(), position)
-    }
-
-    /// `position`, on the table's stream, is the batch that carried the
-    /// marker of `epoch`. A finalized `epoch` frees the snapshots up to it.
-    pub fn record_marker(&self, epoch: &CheckpointEpoch, position: Position) {
-        self.snapshots.write().record_marker(epoch, position);
-        for aggregate in self.aggregates.read().iter() {
-            aggregate.record_marker(epoch, position);
-        }
-    }
-
-    pub fn retention(&self) -> &SnapshotRetention {
+    pub fn retention(&self) -> &VersionRetention {
         &self.retention
     }
 
-    /// The position on the table's stream stamped into a batch's schema
-    /// `metadata`, if the table keeps snapshots per position.
-    pub fn position(&self, metadata: &HashMap<String, String>) -> Result<Option<Position>> {
-        match &self.retention {
-            SnapshotRetention::Latest => Ok(None),
-            SnapshotRetention::PerPosition { stream } => read::stamped_position(metadata, stream),
-        }
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Called before data flows, so the aggregate sees every change.
@@ -933,15 +1030,9 @@ impl InMemoryTable {
     }
 
     /// For each of `keys`, `column` of the stored row with that primary key,
-    /// or null when no row has it, as of `position` on the table's stream, or
-    /// the latest apply without one. `keys` is cast to the primary key's
-    /// type.
-    pub fn lookup(
-        &self,
-        keys: &ArrayRef,
-        column: &str,
-        position: Option<Position>,
-    ) -> Result<ArrayRef> {
+    /// or null when no row has it, as of `mark`, or the latest apply without
+    /// one. `keys` is cast to the primary key's type.
+    pub fn lookup(&self, keys: &ArrayRef, column: &str, mark: Option<Mark>) -> Result<ArrayRef> {
         let column_index = self.column_index(column)?;
         // A safe cast: a value that can't be converted becomes null and misses.
         let keys = cast(keys, self.single_key()?.data_type())
@@ -955,10 +1046,10 @@ impl InMemoryTable {
             .streamling_context("failed to encode the lookup keys")?;
         let missing = new_null_array(self.schema.field(column_index).data_type(), 1);
 
-        let snapshot = self
-            .snapshots
-            .read()
-            .at(position)
+        let state = self.state.read();
+        state
+            .versions
+            .ensure_readable(mark)
             .map_err(|e| streamling_err!("table '{}': {}", self.name, e))?;
         // Source 0 is a single null for keys with no row. Each chunk a hit
         // reads from is added once, so the cost follows hits, not chunk count.
@@ -969,12 +1060,19 @@ impl InMemoryTable {
         // `sources[source][row]` for each into the output.
         let mut gather_indices = Vec::with_capacity(encoded.num_rows());
         for key in encoded.iter() {
-            let Some(location) = snapshot.index.get(key.as_ref()) else {
+            let (current, newest_change) = match state.index.get(key.as_ref()) {
+                Some(entry) => (Some(entry.location), entry.newest_change),
+                None if mark.is_some() => {
+                    (None, state.versions.removed_newest_change(key.as_ref()))
+                }
+                None => (None, None),
+            };
+            let Some(location) = state.versions.resolve(mark, current, newest_change) else {
                 gather_indices.push((0, 0));
                 continue;
             };
             let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
-                sources.push(snapshot.batch(location.chunk).column(column_index).as_ref());
+                sources.push(state.batch(location.chunk).column(column_index).as_ref());
                 sources.len() - 1
             });
             gather_indices.push((source, location.row));
@@ -1062,9 +1160,10 @@ impl InMemoryTable {
     }
 
     /// Removes the keys whose live row the window's predicate isn't true
-    /// for. The predicate runs on a snapshot of the chunks, so lookups aren't
-    /// blocked meanwhile. A row an apply moves or replaces in the meantime is
-    /// no longer where the index points, so it stays until the next pass.
+    /// for. The predicate runs on a snapshot of the chunks, so lookups
+    /// aren't blocked meanwhile. A row an apply moves or replaces in the
+    /// meantime is no longer where the index points, so it stays until the
+    /// next pass.
     fn evict_outside(&self, window: &Window) -> Result<()> {
         let compiled = window.compile()?;
         let chunks = self.chunks_to_evaluate(&self.state.read(), window, &compiled)?;
@@ -1133,10 +1232,12 @@ impl InMemoryTable {
         for (chunk, rows, keys) in outside_rows {
             for (&row, key) in rows.iter().zip(keys.iter()) {
                 let location = RowLocation { chunk: *chunk, row };
-                if state.index.get(key.as_ref()) == Some(&location) {
-                    state.index.remove(key.as_ref());
-                    state.key_bytes -= key.as_ref().len();
-                    state.release(location);
+                if state
+                    .index
+                    .get(key.as_ref())
+                    .is_some_and(|entry| entry.location == location)
+                {
+                    state.remove(key.as_ref());
                     evicted.push(location);
                 }
             }
@@ -1153,9 +1254,9 @@ impl InMemoryTable {
         window: &Window,
         compiled: &CompiledWindow,
     ) -> Result<Vec<(usize, RecordBatch)>> {
-        let (ids, chunks): (Vec<usize>, Vec<(&Chunk, &RecordBatch)>) = (state.first_chunk_id..)
-            .zip(state.chunks.iter().zip(&state.batches))
-            .filter(|(_, (chunk, _))| chunk.live_rows > 0)
+        let (ids, chunks): (Vec<usize>, Vec<&Chunk>) = (state.first_chunk_id..)
+            .zip(&state.chunks)
+            .filter(|(_, chunk)| chunk.live_rows > 0)
             .unzip();
         if chunks.is_empty() {
             return Ok(Vec::new());
@@ -1169,7 +1270,7 @@ impl InMemoryTable {
             .zip(chunks)
             .zip(may_hold_outside_rows)
             .filter(|(_, may_hold_outside_rows)| *may_hold_outside_rows)
-            .map(|((id, (_, batch)), _)| (id, batch.clone()))
+            .map(|((id, chunk), _)| (id, chunk.batch.clone()))
             .collect())
     }
 
@@ -1210,7 +1311,7 @@ impl InMemoryTable {
                 continue;
             }
             let front_id = state.first_chunk_id;
-            let batch = state.batch(front_id).clone();
+            let batch = front.batch.clone();
             let start = state.cleaning_cursor;
             let end = batch.num_rows().min(start.saturating_add(budget - visited));
             let key_columns: Vec<ArrayRef> = self
@@ -1227,14 +1328,14 @@ impl InMemoryTable {
             for (offset, key) in keys.iter().enumerate() {
                 let row = start + offset;
                 // A row is live if the index still points to it.
-                if let Some(location) = state.index.get_mut(key.as_ref())
-                    && *location
+                if let Some(entry) = state.index.get_mut(key.as_ref())
+                    && entry.location
                         == (RowLocation {
                             chunk: front_id,
                             row,
                         })
                 {
-                    *location = RowLocation {
+                    entry.location = RowLocation {
                         chunk: target,
                         row: moved.len(),
                     };
@@ -1267,17 +1368,23 @@ impl InMemoryTable {
         total_rows.saturating_sub(live_rows) as f64 > self.max_dead_ratio * live_rows as f64
     }
 
-    fn record_gauges(&self, state: &TableState, snapshot_count: usize) {
-        let recorder = get_metrics_recorder();
-        for (gauge, value) in [
-            (LIVE_ROWS_GAUGE, state.index.len()),
-            (MEMORY_BYTES_GAUGE, state.chunk_bytes + state.key_bytes),
-            (SNAPSHOTS_GAUGE, snapshot_count),
-            // Chunks the table dropped that snapshots still hold. Index nodes
-            // the snapshots hold aren't counted.
-            (SNAPSHOT_BYTES_GAUGE, state.retired_bytes),
-        ] {
-            recorder.record_gauge(gauge, value as u64, &self.metric_metadata_id);
+    /// Records the gauges of the table and of its aggregates' outputs.
+    fn record_gauges(&self) {
+        let aggregates = self.aggregates.read();
+        {
+            let state = self.state.read();
+            let recorder = get_metrics_recorder();
+            for (gauge, value) in [
+                (LIVE_ROWS_GAUGE, state.index.len()),
+                (MEMORY_BYTES_GAUGE, state.chunk_bytes + state.key_bytes),
+                (VERSIONS_GAUGE, state.versions.count()),
+                (RETIRED_BYTES_GAUGE, state.retired_bytes),
+            ] {
+                recorder.record_gauge(gauge, value as u64, &self.metric_metadata_id);
+            }
+        }
+        for aggregate in aggregates.iter() {
+            aggregate.record_gauges();
         }
     }
 }
@@ -1342,7 +1449,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap()
     }
@@ -1353,12 +1460,17 @@ mod tests {
         let gather: Vec<(usize, usize)> = state
             .index
             .values()
-            .map(|location| (location.chunk - state.first_chunk_id, location.row))
+            .map(|entry| {
+                (
+                    entry.location.chunk - state.first_chunk_id,
+                    entry.location.row,
+                )
+            })
             .collect();
         if gather.is_empty() {
             return Vec::new();
         }
-        let chunks: Vec<&RecordBatch> = state.batches.iter().collect();
+        let chunks: Vec<&RecordBatch> = state.chunks.iter().map(|chunk| &chunk.batch).collect();
         let live = interleave_record_batch(&chunks, &gather).unwrap();
         let ids = live
             .column_by_name("id")
@@ -1389,7 +1501,7 @@ mod tests {
     fn upserts_replace_and_deletes_remove_by_primary_key() {
         let table = table();
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "c"), (3, "c", "r")]), None)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "c"), (3, "c", "r")]), &[])
             .unwrap();
         assert_eq!(
             contents(&table),
@@ -1402,7 +1514,7 @@ mod tests {
         table
             .apply(
                 &batch(&[(1, "a2", "u"), (2, "b2", "C"), (3, "c2", "i")]),
-                None,
+                &[],
             )
             .unwrap();
         assert_eq!(
@@ -1414,7 +1526,7 @@ mod tests {
             ]
         );
         table
-            .apply(&batch(&[(1, "ignored", "d"), (2, "ignored", "D")]), None)
+            .apply(&batch(&[(1, "ignored", "d"), (2, "ignored", "D")]), &[])
             .unwrap();
         assert_eq!(contents(&table), vec![(3, "c2".to_string())]);
         assert_live_rows_match_the_index(&table);
@@ -1423,7 +1535,7 @@ mod tests {
     #[test]
     fn delete_of_an_unknown_key_changes_nothing() {
         let table = table();
-        table.apply(&batch(&[(9, "incoming", "d")]), None).unwrap();
+        table.apply(&batch(&[(9, "incoming", "d")]), &[]).unwrap();
         assert!(contents(&table).is_empty());
     }
 
@@ -1433,7 +1545,7 @@ mod tests {
         table
             .apply(
                 &batch(&[(1, "a", "i"), (1, "b", "u"), (2, "c", "i"), (2, "c", "d")]),
-                None,
+                &[],
             )
             .unwrap();
         assert_eq!(contents(&table), vec![(1, "b".to_string())]);
@@ -1454,7 +1566,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap();
         let input = |rows: &[(&str, &str, &str)]| {
@@ -1470,11 +1582,11 @@ mod tests {
         };
 
         table
-            .apply(&input(&[("eth", "0x1", "i"), ("sol", "0x1", "i")]), None)
+            .apply(&input(&[("eth", "0x1", "i"), ("sol", "0x1", "i")]), &[])
             .unwrap();
         assert_eq!(table.state.read().index.len(), 2);
         table
-            .apply(&input(&[("eth", "0x1", "u"), ("eth", "0x2", "i")]), None)
+            .apply(&input(&[("eth", "0x1", "u"), ("eth", "0x2", "i")]), &[])
             .unwrap();
         assert_eq!(table.state.read().index.len(), 3);
         assert_live_rows_match_the_index(&table);
@@ -1495,7 +1607,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap();
         let input = |op: &str| {
@@ -1509,7 +1621,7 @@ mod tests {
             )
             .unwrap()
         };
-        table.apply(&input("i"), None).unwrap();
+        table.apply(&input("i"), &[]).unwrap();
         assert_eq!(
             table.schema.field_with_name("amount").unwrap().metadata(),
             amount.metadata()
@@ -1524,15 +1636,15 @@ mod tests {
     fn cleaning_keeps_contents_and_remaps_the_index() {
         let table = table();
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), None)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), &[])
             .unwrap();
         // Each batch leaves 2 dead rows, more than a quarter of the 3 live ones,
         // so every chunk holding a dead row is cleaned.
         table
-            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]), None)
+            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]), &[])
             .unwrap();
         table
-            .apply(&batch(&[(1, "a3", "u"), (3, "c3", "u")]), None)
+            .apply(&batch(&[(1, "a3", "u"), (3, "c3", "u")]), &[])
             .unwrap();
 
         {
@@ -1542,9 +1654,9 @@ mod tests {
             assert_eq!(
                 state.chunk_bytes,
                 state
-                    .batches
+                    .chunks
                     .iter()
-                    .map(|batch| batch.get_array_memory_size())
+                    .map(|chunk| chunk.batch.get_array_memory_size())
                     .sum::<usize>()
             );
             assert_eq!(
@@ -1561,7 +1673,7 @@ mod tests {
             ]
         );
         // Key 2 was moved by the cleaner; the delete releases it at its new place.
-        table.apply(&batch(&[(2, "x", "d")]), None).unwrap();
+        table.apply(&batch(&[(2, "x", "d")]), &[]).unwrap();
         assert_eq!(
             contents(&table),
             vec![(1, "a3".to_string()), (3, "c3".to_string())]
@@ -1580,7 +1692,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, None).unwrap_err().to_string();
+        let err = table().apply(&input, &[]).unwrap_err().to_string();
         assert!(
             err.contains("primary key column 'id' contains a null value"),
             "{err}"
@@ -1599,7 +1711,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let err = table().apply(&input, None).unwrap_err().to_string();
+            let err = table().apply(&input, &[]).unwrap_err().to_string();
             assert!(err.contains("unrecognized '_gs_op' value"), "{err}");
         }
 
@@ -1617,7 +1729,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, None).unwrap_err().to_string();
+        let err = table().apply(&input, &[]).unwrap_err().to_string();
         assert!(err.contains("column '_gs_op' must be Utf8"), "{err}");
     }
 
@@ -1637,7 +1749,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, None).unwrap_err().to_string();
+        let err = table().apply(&input, &[]).unwrap_err().to_string();
         assert!(err.contains("does not match the table schema"), "{err}");
     }
 
@@ -1657,10 +1769,10 @@ mod tests {
         let table = table();
         assert_eq!(lookup_names(&table, &[Some(1)]), [None], "empty table");
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), None)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), &[])
             .unwrap();
         table
-            .apply(&batch(&[(1, "a2", "u"), (2, "x", "d")]), None)
+            .apply(&batch(&[(1, "a2", "u"), (2, "x", "d")]), &[])
             .unwrap();
         assert_eq!(
             lookup_names(&table, &[Some(1), Some(2), Some(3), Some(9), None, Some(1)]),
@@ -1679,11 +1791,11 @@ mod tests {
     fn lookup_follows_cleaning() {
         let table = table();
         table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i")]), None)
+            .apply(&batch(&[(1, "a", "i"), (2, "b", "i")]), &[])
             .unwrap();
-        table.apply(&batch(&[(1, "a2", "u")]), None).unwrap();
+        table.apply(&batch(&[(1, "a2", "u")]), &[]).unwrap();
         table
-            .apply(&batch(&[(1, "a3", "u"), (2, "b2", "u")]), None)
+            .apply(&batch(&[(1, "a3", "u"), (2, "b2", "u")]), &[])
             .unwrap();
         assert_eq!(table.state.read().first_chunk_id, 3);
         assert_eq!(
@@ -1703,13 +1815,13 @@ mod tests {
         for start in (0..KEYS).step_by(BATCH as usize) {
             let inserts: Vec<(i64, &str, &str)> =
                 (start..start + BATCH).map(|id| (id, "a", "i")).collect();
-            table.apply(&batch(&inserts), None).unwrap();
+            table.apply(&batch(&inserts), &[]).unwrap();
         }
         for round in 0..UPDATE_BATCHES {
             let updates: Vec<(i64, &str, &str)> = (0..BATCH)
                 .map(|i| (((round * BATCH + i) * STRIDE) % KEYS, "b", "u"))
                 .collect();
-            table.apply(&batch(&updates), None).unwrap();
+            table.apply(&batch(&updates), &[]).unwrap();
             let state = table.state.read();
             let live = state.index.len();
             let dead = state.total_rows - live;
@@ -1725,7 +1837,7 @@ mod tests {
         const UPDATES: usize = 1000;
         let table = table();
         for _ in 0..UPDATES {
-            table.apply(&batch(&[(1, "a", "u")]), None).unwrap();
+            table.apply(&batch(&[(1, "a", "u")]), &[]).unwrap();
             let state = table.state.read();
             assert_eq!((state.chunks.len(), state.total_rows), (1, 1));
         }
@@ -1743,12 +1855,12 @@ mod tests {
         let inserts: Vec<(i64, &str, &str)> = (0..KEYS)
             .map(|id| (id, names[id as usize].as_str(), "i"))
             .collect();
-        table.apply(&batch(&inserts), None).unwrap();
+        table.apply(&batch(&inserts), &[]).unwrap();
         for start in (0..UPDATE_BATCH * UPDATE_BATCHES).step_by(UPDATE_BATCH as usize) {
             let updates: Vec<(i64, &str, &str)> = (start..start + UPDATE_BATCH)
                 .map(|id| (id, "u", "u"))
                 .collect();
-            table.apply(&batch(&updates), None).unwrap();
+            table.apply(&batch(&updates), &[]).unwrap();
         }
 
         {
@@ -1769,7 +1881,7 @@ mod tests {
             ]
         );
         table
-            .apply(&batch(&[(900, "x", "d"), (2900, "x", "d")]), None)
+            .apply(&batch(&[(900, "x", "d"), (2900, "x", "d")]), &[])
             .unwrap();
         assert_eq!(lookup_names(&table, &[Some(900), Some(2900)]), [None, None]);
         assert_live_rows_match_the_index(&table);
@@ -1785,7 +1897,7 @@ mod tests {
                 METRIC_KEY.to_string(),
                 ratio,
                 None,
-                SnapshotRetention::Latest,
+                VersionRetention::Latest,
             )
             .err()
             .expect("the ratio must be rejected")
@@ -1800,7 +1912,7 @@ mod tests {
     #[test]
     fn lookup_casts_keys_to_the_primary_key_type() {
         let table = table();
-        table.apply(&batch(&[(7, "seven", "i")]), None).unwrap();
+        table.apply(&batch(&[(7, "seven", "i")]), &[]).unwrap();
         let narrower: ArrayRef = Arc::new(Int32Array::from(vec![7]));
         let text: ArrayRef = Arc::new(StringViewArray::from(vec!["7"]));
         for keys in [narrower, text] {
@@ -1842,7 +1954,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap();
         let err = composite.lookup_key_field("id").unwrap_err().to_string();
@@ -1862,7 +1974,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .err()
         .expect("a schema without _gs_op must be rejected")
@@ -1879,7 +1991,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .err()
         .expect("a primary key on _gs_op must be rejected")
@@ -1930,6 +2042,14 @@ mod tests {
     }
 
     fn windowed_table(input_schema: &SchemaRef, predicate: &str) -> Result<InMemoryTable> {
+        windowed_table_with(input_schema, predicate, VersionRetention::Latest)
+    }
+
+    fn windowed_table_with(
+        input_schema: &SchemaRef,
+        predicate: &str,
+        retention: VersionRetention,
+    ) -> Result<InMemoryTable> {
         InMemoryTable::try_new(
             TABLE,
             input_schema,
@@ -1941,16 +2061,14 @@ mod tests {
                 session_state: &SessionContext::new().state(),
                 gc_interval: GC_INTERVAL,
             }),
-            SnapshotRetention::Latest,
+            retention,
         )
     }
 
-    /// A GC pass, published so lookups see it.
     fn evict_outside(table: &InMemoryTable) {
         table
             .evict_outside(table.window.as_ref().expect("a windowed table"))
             .unwrap();
-        table.publish_written(None).unwrap();
     }
 
     fn now_nanos() -> i64 {
@@ -1978,14 +2096,14 @@ mod tests {
                     (4, "old", Some(old)),
                     (5, "new", Some(now)),
                 ]),
-                None,
+                &[],
             )
             .unwrap();
         // Key 4's live row is now inside the window, key 5's outside it.
         table
             .apply(
                 &timed_batch(&[(4, "new", Some(now)), (5, "old", Some(old))]),
-                None,
+                &[],
             )
             .unwrap();
 
@@ -2002,7 +2120,7 @@ mod tests {
             ]
         );
         assert_live_rows_match_the_index(&table);
-        table.apply(&timed_batch(&[]), None).unwrap();
+        table.apply(&timed_batch(&[]), &[]).unwrap();
         assert_eq!(
             table.state.read().total_rows,
             2,
@@ -2016,7 +2134,7 @@ mod tests {
         let keep_older = format!("{WALL_CLOCK_COLUMN} < now() - interval '1 hour'");
         for (predicate, expected) in [(keep_last_hour, Some("a".to_string())), (keep_older, None)] {
             let table = windowed_table(&schema(), &predicate).unwrap();
-            table.apply(&batch(&[(1, "a", "i")]), None).unwrap();
+            table.apply(&batch(&[(1, "a", "i")]), &[]).unwrap();
             evict_outside(&table);
             assert_eq!(lookup_names(&table, &[Some(1)]), [expected], "{predicate}");
         }
@@ -2027,14 +2145,14 @@ mod tests {
         let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
         let old = now_nanos() - 2 * HOUR_NANOS;
         table
-            .apply(&timed_batch(&[(1, "old", Some(old))]), None)
+            .apply(&timed_batch(&[(1, "old", Some(old))]), &[])
             .unwrap();
-        table.apply(&timed_batch(&[]), None).unwrap();
+        table.apply(&timed_batch(&[]), &[]).unwrap();
         assert_eq!(lookup_names(&table, &[Some(1)]), [Some("old".to_string())]);
 
         let window = table.window.as_ref().unwrap();
         *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
-        table.apply(&timed_batch(&[]), None).unwrap();
+        table.apply(&timed_batch(&[]), &[]).unwrap();
         assert_eq!(lookup_names(&table, &[Some(1)]), [None]);
     }
 
@@ -2057,20 +2175,20 @@ mod tests {
         table
             .apply(
                 &timed_batch(&[(1, "a", Some(now)), (2, "b", Some(now))]),
-                None,
+                &[],
             )
             .unwrap();
         table
             .apply(
                 &timed_batch(&[(3, "c", Some(old)), (4, "d", Some(now))]),
-                None,
+                &[],
             )
             .unwrap();
         table
-            .apply(&timed_batch(&[(5, "e", Some(old))]), None)
+            .apply(&timed_batch(&[(5, "e", Some(old))]), &[])
             .unwrap();
         table
-            .apply(&timed_batch(&[(6, "f", Some(now)), (7, "g", None)]), None)
+            .apply(&timed_batch(&[(6, "f", Some(now)), (7, "g", None)]), &[])
             .unwrap();
         assert_eq!(chunks_to_evaluate(&table), [1, 2, 3]);
 
@@ -2102,10 +2220,10 @@ mod tests {
             let table = windowed_table(&timed_schema(), predicate).unwrap();
             let now = now_nanos();
             table
-                .apply(&timed_batch(&[(1, "a", Some(now))]), None)
+                .apply(&timed_batch(&[(1, "a", Some(now))]), &[])
                 .unwrap();
             table
-                .apply(&timed_batch(&[(2, "b", Some(now))]), None)
+                .apply(&timed_batch(&[(2, "b", Some(now))]), &[])
                 .unwrap();
             assert_eq!(chunks_to_evaluate(&table), expected, "{predicate}");
         }
@@ -2123,23 +2241,23 @@ mod tests {
                     (3, "c", Some(now - 2)),
                     (4, "d", Some(now - 1)),
                 ]),
-                None,
+                &[],
             )
             .unwrap();
         // Dead rows exceed the ratio, so chunk 0's live rows move to chunk 2.
         table
             .apply(
                 &timed_batch(&[(1, "a", Some(now)), (2, "b", Some(now))]),
-                None,
+                &[],
             )
             .unwrap();
 
         let state = table.state.read();
         assert_eq!((state.first_chunk_id, state.chunks.len()), (1, 2));
         let window = table.window.as_ref().unwrap();
-        for (chunk, batch) in state.chunks.iter().zip(&state.batches) {
+        for chunk in &state.chunks {
             assert_eq!(chunk.statistics.len(), 1);
-            assert_eq!(chunk.statistics, window.statistics(batch).unwrap());
+            assert_eq!(chunk.statistics, window.statistics(&chunk.batch).unwrap());
         }
         assert_eq!(
             state.chunks[1].statistics[0].min,
@@ -2175,7 +2293,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap();
         assert!(
@@ -2198,7 +2316,7 @@ mod tests {
         table
             .apply(
                 &timed_batch(&[(1, "a", at(10, 0)), (2, "b", at(10, 20))]),
-                None,
+                &[],
             )
             .unwrap();
         assert_eq!(
@@ -2213,7 +2331,7 @@ mod tests {
         );
 
         table
-            .apply(&timed_batch(&[(3, "c", at(11, 10))]), None)
+            .apply(&timed_batch(&[(3, "c", at(11, 10))]), &[])
             .unwrap();
         assert_eq!(
             lookup_names(&table, &ids),
@@ -2228,10 +2346,10 @@ mod tests {
         );
 
         table
-            .apply(&timed_batch(&[(4, "late", at(9, 30))]), None)
+            .apply(&timed_batch(&[(4, "late", at(9, 30))]), &[])
             .unwrap();
         table
-            .apply(&timed_batch(&[(2, "b", at(10, 5))]), None)
+            .apply(&timed_batch(&[(2, "b", at(10, 5))]), &[])
             .unwrap();
         assert_eq!(
             lookup_names(&table, &ids),
@@ -2240,10 +2358,10 @@ mod tests {
         );
 
         table
-            .apply(&timed_batch_of(&[(3, "c", at(11, 10))], "d"), None)
+            .apply(&timed_batch_of(&[(3, "c", at(11, 10))], "d"), &[])
             .unwrap();
         table
-            .apply(&timed_batch(&[(5, "e", at(10, 0))]), None)
+            .apply(&timed_batch(&[(5, "e", at(10, 0))]), &[])
             .unwrap();
         assert_eq!(
             lookup_names(&table, &ids),
@@ -2277,7 +2395,7 @@ mod tests {
             ],
         )
         .unwrap();
-        table.apply(&input, None).unwrap();
+        table.apply(&input, &[]).unwrap();
         assert_eq!(
             lookup_names(&table, &[Some(1), Some(2)]),
             [None, Some("new".to_string())]
@@ -2300,7 +2418,7 @@ mod tests {
                         (1, "now", Some(now)),
                         (2, "future", Some(now + DECADE_NANOS)),
                     ]),
-                    None,
+                    &[],
                 )
                 .unwrap();
             assert_eq!(lookup_names(&table, &[Some(1)]), [expected], "{predicate}");
@@ -2312,10 +2430,10 @@ mod tests {
         let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR_OF_DATA).unwrap();
         assert!(table.window.as_ref().unwrap().prunable().unwrap());
         table
-            .apply(&timed_batch(&[(1, "a", Some(0))]), None)
+            .apply(&timed_batch(&[(1, "a", Some(0))]), &[])
             .unwrap();
         table
-            .apply(&timed_batch(&[(2, "b", Some(MINUTE_NANOS))]), None)
+            .apply(&timed_batch(&[(2, "b", Some(MINUTE_NANOS))]), &[])
             .unwrap();
         assert_eq!(chunks_to_evaluate(&table), Vec::<usize>::new());
     }
@@ -2374,7 +2492,7 @@ mod tests {
 
     const STREAM: &str = "app::src";
 
-    fn positioned_table() -> InMemoryTable {
+    fn versioned_table() -> InMemoryTable {
         InMemoryTable::try_new(
             TABLE,
             &schema(),
@@ -2382,25 +2500,35 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::PerPosition {
+            VersionRetention::PerBatch {
                 stream: STREAM.to_string(),
             },
         )
         .unwrap()
     }
 
-    fn at(partition: usize, seq: u64) -> Option<Position> {
-        Some(Position { partition, seq })
+    /// Applies `batch`, which carried the markers of `epochs`, and returns
+    /// the mark its readers see the table at.
+    fn apply_marked(table: &InMemoryTable, batch: &RecordBatch, epochs: &[u64]) -> Option<Mark> {
+        let epochs: Vec<CheckpointEpoch> = epochs.iter().copied().map(CheckpointEpoch).collect();
+        table_mark(table.apply(batch, &epochs).unwrap())
+    }
+
+    fn table_mark(marks: Marks) -> Option<Mark> {
+        marks
+            .into_iter()
+            .find(|(table, _)| table == TABLE)
+            .map(|(_, mark)| mark)
     }
 
     fn lookup_names_at(
         table: &InMemoryTable,
         ids: &[i64],
-        position: Option<Position>,
+        mark: Option<Mark>,
     ) -> Result<Vec<Option<String>>> {
         let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
         Ok(table
-            .lookup(&keys, "name", position)?
+            .lookup(&keys, "name", mark)?
             .as_string::<i32>()
             .iter()
             .map(|name| name.map(str::to_string))
@@ -2412,83 +2540,51 @@ mod tests {
     }
 
     #[test]
-    fn positioned_reads_do_not_see_later_applies() {
-        let table = positioned_table();
-        table
-            .apply(
-                &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
-                at(0, 0),
-            )
-            .unwrap();
-        table
-            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]), at(0, 1))
-            .unwrap();
-        table
-            .apply(&batch(&[(1, "x", "d"), (3, "c3", "u")]), at(0, 2))
-            .unwrap();
+    fn reads_at_a_mark_do_not_see_later_applies() {
+        let table = versioned_table();
+        let first = apply_marked(
+            &table,
+            &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
+            &[],
+        );
+        let second = apply_marked(&table, &batch(&[(1, "a2", "u"), (2, "b2", "u")]), &[]);
+        let third = apply_marked(&table, &batch(&[(1, "x", "d"), (3, "c3", "u")]), &[]);
         assert!(
             table.state.read().first_chunk_id > 0,
-            "the cleaner dropped chunks the earlier snapshots still read"
+            "the cleaner dropped chunks the history still points into"
         );
 
-        for (position, expected) in [
-            (at(0, 0), [Some("a"), Some("b"), Some("c")]),
-            (at(0, 1), [Some("a2"), Some("b2"), Some("c")]),
-            (at(0, 2), [None, Some("b2"), Some("c3")]),
+        for (mark, expected) in [
+            (first, [Some("a"), Some("b"), Some("c")]),
+            (second, [Some("a2"), Some("b2"), Some("c")]),
+            (third, [None, Some("b2"), Some("c3")]),
             (None, [None, Some("b2"), Some("c3")]),
         ] {
             assert_eq!(
-                lookup_names_at(&table, &[1, 2, 3], position).unwrap(),
+                lookup_names_at(&table, &[1, 2, 3], mark).unwrap(),
                 names(&expected),
-                "{position:?}"
+                "{mark:?}"
             );
         }
     }
 
     #[test]
-    fn a_partition_reads_its_own_positions() {
-        let table = positioned_table();
-        table.apply(&batch(&[(1, "p0", "i")]), at(0, 0)).unwrap();
-        table.apply(&batch(&[(1, "p1", "u")]), at(1, 0)).unwrap();
-        assert_eq!(
-            lookup_names_at(&table, &[1], at(0, 0)).unwrap(),
-            names(&[Some("p0")])
-        );
-        assert_eq!(
-            lookup_names_at(&table, &[1], at(1, 0)).unwrap(),
-            names(&[Some("p1")])
-        );
-    }
-
-    #[test]
-    fn latest_only_tables_ignore_positions() {
+    fn latest_only_tables_keep_no_versions() {
         let table = table();
-        table.apply(&batch(&[(1, "a", "i")]), at(0, 0)).unwrap();
-        table.apply(&batch(&[(1, "b", "u")]), at(0, 1)).unwrap();
-        table.record_marker(
-            &CheckpointEpoch(1),
-            Position {
-                partition: 0,
-                seq: 1,
-            },
-        );
+        let marks = table
+            .apply(&batch(&[(1, "a", "i")]), &[CheckpointEpoch(1)])
+            .unwrap();
+        assert!(marks.is_empty());
+        table.apply(&batch(&[(1, "b", "u")]), &[]).unwrap();
         assert_eq!(
-            lookup_names_at(&table, &[1], at(0, 0)).unwrap(),
+            lookup_names_at(&table, &[1], None).unwrap(),
             names(&[Some("b")])
         );
-        assert_eq!(table.snapshots.read().count(), 1);
+        assert_eq!(table.state.read().versions.count(), 0);
     }
 
-    #[test]
-    fn a_table_that_keeps_snapshots_per_position_needs_each_batch_position() {
-        let err = positioned_table()
-            .apply(&batch(&[(1, "a", "i")]), None)
-            .unwrap_err();
-        assert!(err.is_internal(), "{err}");
-    }
-
-    fn collected(table: &InMemoryTable, position: Option<Position>) -> bool {
-        match lookup_names_at(table, &[1], position) {
+    fn collected(table: &InMemoryTable, mark: Option<Mark>) -> bool {
+        match lookup_names_at(table, &[1], mark) {
             Ok(_) => false,
             Err(err) => {
                 assert!(err.is_internal(), "a bug, not bad input: {err}");
@@ -2498,75 +2594,184 @@ mod tests {
         }
     }
 
-    /// Partition 0 applies seqs 0 to 3 and partition 1 seqs 0 and 1. Epoch 1's
-    /// marker rides (0, 1) and (1, 0), epoch 2's (0, 3) and (1, 1).
-    fn table_with_markers() -> InMemoryTable {
-        let table = positioned_table();
-        for (partition, seq) in [(0, 0), (1, 0), (0, 1), (0, 2), (1, 1), (0, 3)] {
-            table
-                .apply(&batch(&[(1, "v", "u")]), at(partition, seq))
-                .unwrap();
-        }
-        for (epoch, partition, seq) in [(1, 0, 1), (1, 1, 0), (2, 0, 3), (2, 1, 1)] {
-            table.record_marker(&CheckpointEpoch(epoch), Position { partition, seq });
-        }
-        table
+    /// Six batches, each changing key 1, from two partitions taking turns.
+    /// Epoch 1's marker rides batches 1 and 2, epoch 2's batches 4 and 5.
+    /// Returns the table and the batches' marks.
+    fn table_with_markers() -> (InMemoryTable, Vec<Option<Mark>>) {
+        let table = versioned_table();
+        let marks = [&[][..], &[1], &[1], &[], &[2], &[2]]
+            .iter()
+            .map(|epochs| apply_marked(&table, &batch(&[(1, "v", "u")]), epochs))
+            .collect();
+        (table, marks)
     }
 
+    /// Epoch 1's cut is batch 1's mark, the earlier of its two marker
+    /// batches, so batch 2's change stays for a reader at batch 1.
     #[test]
-    fn a_finalized_epoch_collects_each_partition_up_to_its_marker() {
-        let table = table_with_markers();
-        table.snapshots.write().collect(1);
+    fn a_finalized_epoch_collects_up_to_its_earliest_marker_batch() {
+        let (table, marks) = table_with_markers();
+        table.state.write().collect(1);
         assert_eq!(
-            [at(0, 0), at(0, 1), at(0, 2), at(0, 3), at(1, 0), at(1, 1)]
-                .map(|position| collected(&table, position)),
-            [true, true, false, false, true, false]
+            marks
+                .iter()
+                .map(|mark| collected(&table, *mark))
+                .collect::<Vec<_>>(),
+            [true, false, false, false, false, false],
+            "a read at the cut is exact"
         );
+        assert_eq!(table.state.read().versions.count(), 4);
 
         // A repeated finalizer changes nothing.
-        table.snapshots.write().collect(1);
-        assert_eq!(table.snapshots.read().count(), 3);
+        table.state.write().collect(1);
+        assert_eq!(table.state.read().versions.count(), 4);
     }
 
     #[test]
-    fn a_later_finalized_epoch_covers_a_skipped_one_and_keeps_the_latest() {
-        let table = table_with_markers();
-        // Epoch 2's finalizer never came; 3 never had a marker here.
-        table.snapshots.write().collect(3);
+    fn a_lookup_of_no_keys_at_a_collected_mark_errors() {
+        let (table, marks) = table_with_markers();
+        table.state.write().collect(1);
+        assert!(collected(&table, marks[0]));
+        let err = lookup_names_at(&table, &[], marks[0]).unwrap_err();
+        assert!(err.to_string().contains("already collected"), "{err}");
+    }
+
+    #[test]
+    fn a_later_finalized_epoch_covers_a_skipped_one() {
+        let (table, marks) = table_with_markers();
+        // Epoch 1's finalizer never came. Epoch 2's cut is batch 4's mark.
+        table.state.write().collect(2);
         assert_eq!(
-            [at(0, 2), at(0, 3), at(1, 0), at(1, 1)].map(|position| collected(&table, position)),
-            [true, false, true, false],
-            "each partition keeps its latest snapshot"
+            marks
+                .iter()
+                .map(|mark| collected(&table, *mark))
+                .collect::<Vec<_>>(),
+            [true, true, true, true, false, false]
         );
-        assert_eq!(table.snapshots.read().count(), 2);
+        assert_eq!(table.state.read().versions.count(), 1);
     }
 
     #[test]
-    fn snapshots_hold_dropped_chunks_until_collected() {
-        let table = positioned_table();
-        table
-            .apply(
-                &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
-                at(0, 0),
-            )
-            .unwrap();
-        table
-            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]), at(0, 1))
-            .unwrap();
-        assert!(table.state.read().retired_bytes > 0);
-
-        table.record_marker(
-            &CheckpointEpoch(1),
-            Position {
-                partition: 0,
-                seq: 1,
-            },
+    fn history_holds_dropped_chunks_until_collected() {
+        let table = versioned_table();
+        let first = apply_marked(
+            &table,
+            &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
+            &[],
         );
-        table.snapshots.write().collect(1);
-        table.apply(&batch(&[]), at(0, 2)).unwrap();
+        let second = apply_marked(&table, &batch(&[(1, "a2", "u"), (2, "b2", "u")]), &[1]);
+        assert!(
+            table.state.read().retired_bytes > 0,
+            "the cleaner dropped the first chunk, which a read at the first batch needs"
+        );
+        assert_eq!(
+            lookup_names_at(&table, &[1, 2, 3], first).unwrap(),
+            names(&[Some("a"), Some("b"), Some("c")])
+        );
+
+        table.state.write().collect(1);
 
         assert_eq!(table.state.read().retired_bytes, 0);
-        assert_eq!(table.snapshots.read().count(), 2);
+        assert_eq!(table.state.read().versions.count(), 0);
+        assert_eq!(
+            lookup_names_at(&table, &[1, 2, 3], second).unwrap(),
+            names(&[Some("a2"), Some("b2"), Some("c")])
+        );
+    }
+
+    #[test]
+    fn a_retired_chunk_stays_until_its_last_change_is_collected() {
+        const KEYS: i64 = 10;
+        let table = versioned_table();
+        let rows: Vec<(i64, &str, &str)> = (1..=KEYS).map(|id| (id, "old", "i")).collect();
+        apply_marked(&table, &batch(&rows), &[]);
+        // Within the dead-row ratio, so the first chunk stays live.
+        let second = apply_marked(&table, &batch(&[(1, "new", "u")]), &[1]);
+        let rows: Vec<(i64, &str, &str)> = (2..=KEYS).map(|id| (id, "new", "u")).collect();
+        apply_marked(&table, &batch(&rows), &[2]);
+        assert!(
+            table.state.read().first_chunk_id > 0,
+            "the cleaner dropped the first chunk, held by the second and third batches' changes"
+        );
+
+        table.state.write().collect(1);
+        assert!(table.state.read().retired_bytes > 0);
+        assert_eq!(
+            lookup_names_at(&table, &[1, 2], second).unwrap(),
+            names(&[Some("new"), Some("old")])
+        );
+
+        table.state.write().collect(2);
+        assert_eq!(table.state.read().retired_bytes, 0);
+    }
+
+    #[test]
+    fn index_entries_take_24_bytes() {
+        const INDEX_ENTRY_BYTES: usize = 24;
+        const CHANGE_LINK_BYTES: usize = 8;
+        assert_eq!(size_of::<Option<ChangeRef>>(), CHANGE_LINK_BYTES);
+        assert_eq!(size_of::<IndexEntry>(), INDEX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn interval_window_evictions_are_versioned() {
+        let table = windowed_table_with(
+            &timed_schema(),
+            KEEP_LAST_HOUR,
+            VersionRetention::PerBatch {
+                stream: STREAM.to_string(),
+            },
+        )
+        .unwrap();
+        let old = now_nanos() - 2 * HOUR_NANOS;
+        let first = apply_marked(&table, &timed_batch(&[(1, "old", Some(old))]), &[]);
+        let window = table.window.as_ref().unwrap();
+        *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
+        let second = apply_marked(&table, &timed_batch(&[]), &[]);
+
+        assert_eq!(
+            lookup_names_at(&table, &[1], first).unwrap(),
+            names(&[Some("old")])
+        );
+        assert_eq!(
+            lookup_names_at(&table, &[1], second).unwrap(),
+            names(&[None])
+        );
+    }
+
+    /// Partition 1 applies between partition 0's write and the interval GC
+    /// pass at the end of the same apply: a reader of partition 1's batch
+    /// still sees the row the pass evicts, a reader of partition 0's doesn't.
+    #[test]
+    fn an_interval_gc_pass_is_inside_its_applys_moment() {
+        let table = windowed_table_with(
+            &timed_schema(),
+            KEEP_LAST_HOUR,
+            VersionRetention::PerBatch {
+                stream: STREAM.to_string(),
+            },
+        )
+        .unwrap();
+        let window = table.window.as_ref().unwrap();
+        let old = now_nanos() - 2 * HOUR_NANOS;
+        apply_marked(&table, &timed_batch(&[(1, "old", Some(old))]), &[]);
+
+        table.begin();
+        table.write(&timed_batch(&[])).unwrap();
+        let other_partition =
+            apply_marked(&table, &timed_batch(&[(2, "new", Some(now_nanos()))]), &[]);
+        *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
+        table.collect_garbage_if_due().unwrap();
+        let own = table_mark(table.finish(&[]));
+
+        assert_eq!(
+            lookup_names_at(&table, &[1, 2], other_partition).unwrap(),
+            names(&[Some("old"), Some("new")])
+        );
+        assert_eq!(
+            lookup_names_at(&table, &[1, 2], own).unwrap(),
+            names(&[None, Some("new")])
+        );
     }
 
     /// `#[serial]`: the coordinator channel is process-wide.
@@ -2575,15 +2780,9 @@ mod tests {
     fn a_finalizer_from_the_coordinator_collects_on_the_next_apply() {
         // Far above the epochs other tests record.
         const EPOCH: u64 = 1_000_000;
-        let table = positioned_table();
-        table.apply(&batch(&[(1, "a", "i")]), at(0, 0)).unwrap();
-        table.record_marker(
-            &CheckpointEpoch(EPOCH),
-            Position {
-                partition: 0,
-                seq: 0,
-            },
-        );
+        let table = versioned_table();
+        let first = apply_marked(&table, &batch(&[(1, "a", "i")]), &[]);
+        let second = apply_marked(&table, &batch(&[(1, "b", "u")]), &[EPOCH]);
         crate::checkpoints::channels::send(
             crate::checkpoints::checkpoint_management::CHECKPOINT_COORDINATOR_CHANNEL,
             crate::checkpoints::checkpoint_management::CheckpointMessage::Finalizer(
@@ -2591,10 +2790,11 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(!collected(&table, at(0, 0)));
+        assert!(!collected(&table, first));
 
-        table.apply(&batch(&[]), at(0, 1)).unwrap();
+        apply_marked(&table, &batch(&[]), &[]);
 
-        assert!(collected(&table, at(0, 0)));
+        assert!(collected(&table, first));
+        assert!(!collected(&table, second));
     }
 }

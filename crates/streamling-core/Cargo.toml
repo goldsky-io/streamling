@@ -49,7 +49,6 @@ dashmap.workspace = true
 fixed_deque.workspace = true
 indexmap.workspace = true
 hashbrown.workspace = true
-imbl.workspace = true
 
 # Serialization
 serde.workspace = true

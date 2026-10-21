@@ -1017,6 +1017,216 @@ async fn test_lookup_eq_self_join_never_misses_across_partitions() {
     assert_self_join_never_misses(&ctx, &topic, SELF_JOIN_PARTITIONS).await;
 }
 
+/// A smoke test of a `table_agg` over a windowed table read from two
+/// partitions, whose groups get rows from both: each lookup counts its own
+/// row, and once the input is idle a lookup from another source reads exact
+/// totals. Cross-partition consistency, the aggregate equal to its SQL over
+/// the table at the reader's moment, is proven by the `aggregate.rs` unit test
+/// `the_aggregate_and_its_table_agree_after_every_batch_across_partitions`.
+/// Records are keyed by id, so all versions of a transfer share a partition;
+/// some move to another address.
+#[tokio::test]
+async fn test_table_agg_across_partitions() {
+    const PARTITIONS: i32 = 2;
+    const NUM_IDS: i64 = 200;
+    const NUM_MOVED: i64 = 50;
+    const MOVED_AMOUNT_OFFSET: i64 = 1000;
+    const ADDRESSES: [&str; 4] = ["0xa", "0xb", "0xc", "0xd"];
+    const MONTH_SECS: i64 = 30 * 24 * 3600;
+    const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+    const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+    const ENRICHED: &str = "SELECT count(*) FROM public.xp_enriched";
+    const TOTALS: &str = "SELECT count(*) FROM public.xp_totals";
+    const MISSED_OWN_ROW: &str = "SELECT count(*) FROM public.xp_enriched \
+         WHERE looked_up_amount IS DISTINCT FROM amount \
+         OR transfers IS NULL OR transfers < 1 OR volume IS NULL OR volume < amount";
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let transfers_topic = ctx
+        .create_kafka_topic_with_partitions("xp_transfers", PARTITIONS)
+        .await
+        .expect("Failed to create the transfers topic");
+    transfers_topic
+        .register_schema(TRANSFER_SCHEMA)
+        .await
+        .expect("Failed to register the transfer schema");
+    let queries = ctx
+        .create_kafka_topic("xp_queries")
+        .await
+        .expect("Failed to create the queries topic");
+    queries
+        .register_schema(TRANSACTION_SCHEMA)
+        .await
+        .expect("Failed to register the query schema");
+
+    // A month old, within one hour, so the backfill evicts nothing.
+    let start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Clock before the Unix epoch")
+        .as_secs() as i64
+        - MONTH_SECS;
+    let address = |index: i64| ADDRESSES[index as usize % ADDRESSES.len()].to_string();
+    let transfers: Vec<Transfer> = (1..=NUM_IDS)
+        .map(|id| Transfer {
+            id,
+            address: address(id),
+            amount: id,
+            block_timestamp: start + id,
+        })
+        .chain((1..=NUM_MOVED).map(|id| Transfer {
+            id,
+            address: address(id + 1),
+            amount: MOVED_AMOUNT_OFFSET + id,
+            block_timestamp: start + NUM_IDS + id,
+        }))
+        .collect();
+    transfers_topic
+        .produce_avro_records_keyed(&transfers, |transfer| transfer.id.to_string())
+        .await
+        .expect("Failed to produce transfers");
+
+    let pipeline = format!(
+        r#"
+sources:
+  transfers:
+    type: kafka
+    topic: {transfers_topic}
+    starting_offsets: earliest
+    primary_key: id
+    parallelism: {PARTITIONS}
+  queries:
+    type: kafka
+    topic: {queries_topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  transfer_window:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    window: block_timestamp >= watermark(block_timestamp) - 3600
+    sql: SELECT id, address, amount, block_timestamp FROM transfers
+  volumes:
+    type: table_agg
+    sql: SELECT address, sum(amount) AS volume, count(*) AS transfers FROM transfer_window GROUP BY address
+  enriched:
+    type: sql
+    primary_key: block_timestamp
+    sql: |
+      SELECT
+        block_timestamp,
+        amount,
+        lookup_eq('transfer_window', 'id', id, 'amount') AS looked_up_amount,
+        lookup_eq('volumes', 'address', address, 'transfers') AS transfers,
+        lookup_eq('volumes', 'address', address, 'volume') AS volume
+      FROM transfers
+  totals:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT
+        id,
+        lookup_eq('volumes', 'address', address, 'volume') AS volume,
+        lookup_eq('volumes', 'address', address, 'transfers') AS transfers
+      FROM queries
+sinks:
+  enriched_pg:
+    type: postgres
+    from: enriched
+    table: xp_enriched
+    schema: public
+    primary_key: block_timestamp
+    batch_size: 1
+    batch_flush_interval: 100ms
+  totals_pg:
+    type: postgres
+    from: totals
+    table: xp_totals
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        transfers_topic = transfers_topic.topic,
+        queries_topic = queries.topic,
+    );
+
+    // A transfer reaches Postgres only after the table, and so the
+    // aggregate, applied it.
+    let signal_when = async {
+        if !wait_for_count(&ctx, ENRICHED, transfers.len() as i64, LOAD_TIMEOUT).await {
+            return;
+        }
+        let questions: Vec<Transaction> = (1..)
+            .zip(ADDRESSES)
+            .map(|(id, address)| Transaction {
+                id,
+                address: address.to_string(),
+            })
+            .collect();
+        queries
+            .produce_avro_records(&questions)
+            .await
+            .expect("Failed to produce queries");
+        wait_for_count(&ctx, TOTALS, ADDRESSES.len() as i64, LOAD_TIMEOUT).await;
+    };
+
+    let (status, _stderr) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline,
+            PipelineOpts::new().env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+            signal_when,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Streamling must exit after SIGTERM");
+    assert!(status.success());
+
+    assert_eq!(
+        ctx.postgres
+            .count(ENRICHED)
+            .await
+            .expect("Failed to count lookups"),
+        transfers.len() as i64
+    );
+    assert_eq!(
+        ctx.postgres
+            .count(MISSED_OWN_ROW)
+            .await
+            .expect("Failed to count lookups that missed their own row"),
+        0,
+        "every lookup must count the row being processed"
+    );
+
+    let mut latest: std::collections::BTreeMap<i64, &Transfer> = Default::default();
+    for transfer in &transfers {
+        latest.insert(transfer.id, transfer);
+    }
+    let expected: Vec<(i64, Option<i64>, Option<i64>)> = (1..)
+        .zip(ADDRESSES)
+        .map(|(id, address)| {
+            let rows: Vec<&&Transfer> = latest
+                .values()
+                .filter(|transfer| transfer.address == address)
+                .collect();
+            (
+                id,
+                Some(rows.iter().map(|transfer| transfer.amount).sum()),
+                Some(rows.len() as i64),
+            )
+        })
+        .collect();
+    let totals: Vec<(i64, Option<i64>, Option<i64>)> = ctx
+        .postgres
+        .query("SELECT id, volume, transfers FROM public.xp_totals ORDER BY id")
+        .await
+        .expect("Failed to query");
+    assert_eq!(totals, expected);
+}
+
 /// A table reading a SQL transform is applied inside that transform's node.
 #[tokio::test]
 async fn test_table_reads_a_sql_transform() {

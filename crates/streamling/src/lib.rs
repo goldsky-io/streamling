@@ -34,7 +34,7 @@ use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
 use streamling_core::table::aggregate as table_aggregate;
 use streamling_core::table::side_output::TableSideOutput;
-use streamling_core::table::{InMemoryTable, SnapshotRetention, WindowConfig};
+use streamling_core::table::{InMemoryTable, VersionRetention, WindowConfig};
 use streamling_core::topology::PipelineTopology;
 use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
@@ -1852,7 +1852,7 @@ impl Streamling {
                     // reads, so every node downstream of that node reads the
                     // table as of the batch it is processing. A node on a
                     // sibling branch, even one reading the same source, reads
-                    // the latest snapshot.
+                    // the latest rows.
                     let upstream = SessionManager::validate_plan_and_extract_source_name(
                         &sql_plan,
                         SubqueryHandling::Return,
@@ -1866,8 +1866,8 @@ impl Streamling {
                     };
                     // Every source type rides the coordinator's checkpoint
                     // markers on its batches, so finalized checkpoints collect
-                    // the snapshots.
-                    let retention = SnapshotRetention::PerPosition {
+                    // the version history.
+                    let retention = VersionRetention::PerBatch {
                         stream: upstream_operator.reference_name().to_string(),
                     };
                     let storage = match table.backend_type {

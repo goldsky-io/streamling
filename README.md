@@ -1199,12 +1199,12 @@ transforms:
 
 - `table`, `key` and `column` are string literals. `key` must be the table's primary key, and the primary key must be a single column. Invalid calls fail at startup.
 - `value` is cast to the key's type. A `NULL` value, or one that cannot be cast, returns `NULL`.
-- A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), reads the table as of the batch being processed: every row that input's partition has produced up to and including that batch, and nothing later, however far the input has run ahead of its readers. This holds for any number of readers, and for a [`table_agg`](#aggregates) over the table. Its limits:
+- A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), reads the table as it was when the input applied the batch being processed: every row up to and including that batch, and nothing later, however far the input has run ahead of its readers. With several input partitions, that moment includes what the other partitions had applied by then. Every key, and every [`table_agg`](#aggregates) over the table, is read at that same moment. This holds for any number of readers. Its limits:
   - Within a batch, a row also sees the rows after it in the same batch.
-  - Rows from the input's other partitions appear as those partitions produce them.
+  - With several input partitions, what the other partitions had applied depends on how their applies interleave, so results can differ between runs.
   - A script, handler or plugin transform with a `batch_size` or `batch_flush_interval` merges batches. A lookup that reads batches it merged after the table's input applied them is rejected at startup.
 - Lookups from other inputs read the table's latest state, not synchronized with it: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
-- The table keeps a snapshot per batch of its input until a checkpoint covering the batch is finalized. Snapshots share their rows with the table, so they cost what the batches changed, usually a checkpoint interval's worth of writes. A checkpoint that doesn't finalize, such as one stuck on a slow sink, holds them until the next one does. `table_snapshots` and `table_snapshot_bytes` show what they hold.
+- The table keeps the earlier versions of rows that changed, and the dropped chunks they live in, for a checkpoint interval plus the time to finalize the checkpoint. A checkpoint that doesn't finalize, such as one stuck on a slow sink, holds them until the next one does. No checkpoint finalizes after the final one starts, so a pipeline that keeps running past that point (one bounded source done, another still running) keeps every version until it stops. `table_versions` and `table_retired_bytes` show what's held.
 - After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
 
 ### Windows
@@ -1248,8 +1248,8 @@ With `window: block_time >= watermark(block_time) - interval '1 hour'`, applying
 | input idle for 3 hours | 11:10 | Nothing is evicted. |
 | restart | `NULL` | The table starts empty and the replay rebuilds the watermark. |
 
-- Every apply that stores rows evicts before lookups can see it, so a lookup never sees a row outside the window as of the latest stored time.
-- During a replay, the table holds the hour before the latest stored time, and a lookup reads the table [as of its own batch](#lookups). So lookups and [aggregates](#aggregates) give the results they gave live, within the limits there: rows later in the same batch, and other partitions.
+- A lookup sees the window as it was at its own batch. Rows evicted by that batch or earlier ones are gone; rows evicted by later batches are still visible.
+- During a replay, the table holds the window that ends at the latest stored time, and a lookup reads the table [as of its own batch](#lookups). So lookups and [aggregates](#aggregates) give the results they gave live, within the limits there: rows later in the same batch, and how other partitions interleave.
 - All partitions of the table's input share one watermark. A partition behind the others has its rows older than the window evicted as they arrive.
 - An out-of-order allowance is a larger interval: `watermark(block_time) - interval '1 hour 5 minutes'`.
 - One timestamp far in the future moves the watermark there for good and evicts everything else. Cap it with the wall clock: `block_time >= least(watermark(block_time), now()) - interval '1 hour'`.
@@ -1300,7 +1300,7 @@ How it's maintained:
 - The aggregate always equals its SQL run over the table's current rows. An upsert retracts the key's previous row and adds the new one. A delete or a window eviction retracts the row.
 - A group exists while it has rows, including rows whose aggregate arguments are `NULL`. Once its last row goes, lookups return `NULL`.
 - Rows with a `NULL` key aren't aggregated.
-- It's updated inside the table's apply, so a lookup has the same guarantees as a lookup on the table. Evictions follow the table's GC passes: an expired row counts until a pass evicts it.
+- It's updated inside the table's apply, so a lookup has the same guarantees as a lookup on the table, and reads the aggregate at the same moment as a lookup on the table from the same batch: the aggregate equals its SQL over the table's rows at that moment, whichever partitions they came from. Evictions follow the table's GC passes: an expired row counts until a pass evicts it.
 - Retracting floating-point values accumulates rounding error. Integers and decimals, `decimal_arb` included, are exact.
 - Only `lookup_eq` reads a `table_agg`. Naming it in `FROM` or `from:` is rejected.
 - Like its table, it starts empty after a restart.
@@ -2537,21 +2537,21 @@ Environment variables can also be used:
 
 The following table shows all supported components and the metrics they emit:
 
-| Component                  | Tags/Labels | Metric Name           | Metric Type | Description                                          |
-| -------------------------- | ----------- | --------------------- | ----------- | ---------------------------------------------------- |
-| **Kafka Source**           | `topic`     | `output_rows`         | Counter     | Total number of rows consumed from Kafka topics      |
-|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being consumed per time window  |
-|                            |             | `output_rows_latency` | Histogram   | Time taken to process Kafka message batches (ms)     |
-| **HTTP Handler Transform** |             | `output_rows`         | Counter     | Total number of rows processed by HTTP handlers      |
-|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being processed per time window |
-|                            |             | `output_rows_latency` | Histogram   | Time taken for HTTP request/response cycles (ms)     |
-| **Blackhole Sink**         |             | `output_rows`         | Counter     | Total number of rows discarded                       |
-|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being discarded per time window |
-|                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)       |
-| **Table Transform**        |             | `table_live_rows`     | Gauge       | Rows currently stored in the table                   |
-|                            |             | `table_memory_bytes`  | Gauge       | Bytes held by the table's chunks and key index       |
-|                            |             | `table_snapshots`     | Gauge       | Snapshots kept for lookups, one per recent batch     |
-|                            |             | `table_snapshot_bytes`| Gauge       | Bytes of dropped chunks that snapshots still hold    |
+| Component                  | Tags/Labels | Metric Name           | Metric Type | Description                                              |
+| -------------------------- | ----------- | --------------------- | ----------- | -------------------------------------------------------- |
+| **Kafka Source**           | `topic`     | `output_rows`         | Counter     | Total number of rows consumed from Kafka topics          |
+|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being consumed per time window      |
+|                            |             | `output_rows_latency` | Histogram   | Time taken to process Kafka message batches (ms)         |
+| **HTTP Handler Transform** |             | `output_rows`         | Counter     | Total number of rows processed by HTTP handlers          |
+|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being processed per time window     |
+|                            |             | `output_rows_latency` | Histogram   | Time taken for HTTP request/response cycles (ms)         |
+| **Blackhole Sink**         |             | `output_rows`         | Counter     | Total number of rows discarded                           |
+|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being discarded per time window     |
+|                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)           |
+| **Table Transform**        |             | `table_live_rows`     | Gauge       | Rows currently stored in the table                       |
+|                            |             | `table_memory_bytes`  | Gauge       | Bytes held by the table's chunks and key index           |
+|                            |             | `table_versions`      | Gauge       | History entries kept for positioned reads                |
+|                            |             | `table_retired_bytes` | Gauge       | Bytes of dropped chunks that earlier versions still read |
 
 **Note**
 

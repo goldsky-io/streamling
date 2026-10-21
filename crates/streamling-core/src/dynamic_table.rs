@@ -281,7 +281,7 @@ impl SourceSideOutput for DynamicTableSideOutput {
     /// - Then the projection expression is applied to extract the values to be stored in the dynamic table.
     /// - The projection expression must result in a single string column.
     /// - The resulting values are appended to the dynamic table backend.
-    async fn process(&self, batch: &RecordBatch) -> Result<()> {
+    async fn process(&self, batch: &RecordBatch) -> Result<HashMap<String, String>> {
         let mut current_batch = batch.clone();
         let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
 
@@ -338,7 +338,7 @@ impl SourceSideOutput for DynamicTableSideOutput {
         self.backend.append(value).await.map_err(|e| {
             DataFusionError::from(streamling_err!("dynamic table append failed: {e}"))
         })?;
-        Ok(())
+        Ok(HashMap::new())
     }
 }
 
