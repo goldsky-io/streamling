@@ -1561,4 +1561,52 @@ mod tests {
              reflect the compute-bound transform, not collapse to the per-batch seed"
         );
     }
+
+    /// The input-wait fold must ride the SQL node's per-batch compute
+    /// observation, not add a second one: per-batch histogram panels (p50/p95,
+    /// `_sum / _count`) would otherwise mix compute samples with wait samples.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sql_transform_records_one_elapsed_compute_sample_per_batch() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_one_sample_per_batch";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let deep_compute = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            Duration::from_millis(12),
+        ));
+        let checkpointable: Arc<dyn ExecutionPlan> = Arc::new(CheckpointableExec::new(
+            deep_compute,
+            1,
+            node_id.to_string(),
+        ));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        drain(&wrapping).await;
+
+        let samples = test_support::elapsed_compute_samples(node_id);
+        assert!(
+            (1..=NUM_BATCHES as u64).contains(&samples),
+            "expected at most one elapsed_compute observation per batch \
+             ({NUM_BATCHES} batches), got {samples}"
+        );
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            elapsed_compute >= starved + 24,
+            "elapsed_compute ({elapsed_compute}ms) must carry the folded input wait \
+             (starved {starved}ms) plus the subtree compute"
+        );
+    }
 }
