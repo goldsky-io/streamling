@@ -607,12 +607,17 @@ impl MetricsRecorder {
     /// Datafusion's `ExecutionPlanMetricsSet` is also recorded but only for transforms
     /// for transforms, we also emit `batch_count` as children node's `input_row` count
     /// under the assumption that output for a transform node is input for it's downstream nodes
+    ///
+    /// `input_wait_ms` is the SQL transform's whole-ms input wait for this batch.
+    /// It is added to the batch's subtree `elapsed_compute` delta, so the node
+    /// records one `elapsed_compute` observation per batch.
     pub(crate) fn record_execution_plan_metrics(
         &self,
         metadata_id: &str,
         batch_count: usize,
         measurement_type: RowCountMeasurementType,
         execution_plan_metrics: Option<&MetricsSet>,
+        input_wait_ms: u64,
     ) {
         let metric_metadata = self
             .metric_metadata_registry
@@ -727,7 +732,8 @@ impl MetricsRecorder {
             // subtree was folded in. Convert each to its per-batch DELTA,
             // batched into ONE MetricData so the tag set is cloned and the
             // attribute vector built once per batch, not once per metric.
-            let delta_values = self.subtree_delta_metric_values(metadata_id, metric_set);
+            let delta_values =
+                self.subtree_delta_metric_values(metadata_id, metric_set, input_wait_ms);
             if !delta_values.is_empty() {
                 all_metric_data.push(MetricData::new_with_owned_tags(
                     delta_values,
@@ -759,6 +765,7 @@ impl MetricsRecorder {
         &self,
         metadata_id: &str,
         metric_set: &MetricsSet,
+        input_wait_ms: u64,
     ) -> Vec<MetricValue> {
         // Aggregate by name manually instead of via
         // `MetricsSet::aggregate_by_name`: that panics when two operators in
@@ -848,6 +855,7 @@ impl MetricsRecorder {
             }
         }
 
+        let elapsed_ms = elapsed_ms.saturating_add(input_wait_ms);
         if elapsed_ms > 0 {
             deltas.push(MetricValue::ElapsedCompute(create_time_from_duration(
                 Duration::from_millis(elapsed_ms),
@@ -1792,12 +1800,24 @@ pub(crate) mod test_support {
     /// must use the same remainder-carrying quantization as `starved`, so the
     /// two never drift and `busy` can't go negative.
     pub(crate) fn elapsed_compute_ms(id: &str) -> u64 {
+        elapsed_compute_histogram(id).0
+    }
+
+    /// Number of `streamling_elapsed_compute` observations for `id`. Dashboards
+    /// read the histogram per batch (`_count`, quantiles), so a node must record
+    /// at most one observation per batch.
+    pub(crate) fn elapsed_compute_samples(id: &str) -> u64 {
+        elapsed_compute_histogram(id).1
+    }
+
+    /// `(sum_ms, count)` of the `streamling_elapsed_compute` histogram for `id`.
+    fn elapsed_compute_histogram(id: &str) -> (u64, u64) {
         let mut rm = ResourceMetrics::default();
         harness()
             .reader
             .collect(&mut rm)
             .expect("collect metrics from manual reader");
-        let mut total = 0u64;
+        let (mut sum, mut count) = (0u64, 0u64);
         for scope in rm.scope_metrics() {
             for metric in scope.metrics() {
                 if metric.name() != "streamling_elapsed_compute" {
@@ -1811,12 +1831,13 @@ pub(crate) mod test_support {
                         .attributes()
                         .any(|kv| kv.key.as_str() == "id" && &*kv.value.as_str() == id);
                     if id_ok {
-                        total += dp.sum();
+                        sum += dp.sum();
+                        count += dp.count();
                     }
                 }
             }
         }
-        total
+        (sum, count)
     }
 }
 
@@ -2434,6 +2455,31 @@ mod tests {
             })
         }
 
+        /// A SQL transform's input wait rides the batch's single
+        /// `elapsed_compute` delta, including a batch with no new compute.
+        #[test]
+        fn input_wait_is_folded_into_the_elapsed_compute_delta() {
+            let recorder = test_recorder();
+            let id = "app::input_wait_fold";
+
+            let mut set = MetricsSet::new();
+            set.push(Arc::new(Metric::new(
+                MetricValue::ElapsedCompute(create_time_from_duration(Duration::from_millis(4))),
+                None,
+            )));
+            let d = recorder.subtree_delta_metric_values(id, &set, 3);
+            assert_eq!(find_time_ms(&d, "elapsed_compute"), Some(7));
+            let n = d
+                .iter()
+                .filter(|v| matches!(v, MetricValue::ElapsedCompute(_)))
+                .count();
+            assert_eq!(n, 1, "one elapsed_compute observation per batch");
+
+            // Same cumulative snapshot: zero compute delta, the wait alone emits.
+            let d = recorder.subtree_delta_metric_values(id, &set, 2);
+            assert_eq!(find_time_ms(&d, "elapsed_compute"), Some(2));
+        }
+
         /// The core regression: a join's cumulative `build_time` must be emitted
         /// as the per-batch delta, not the ever-growing raw snapshot. Before the
         /// fix, the second batch re-emitted the full cumulative 8ms; now it emits
@@ -2445,7 +2491,7 @@ mod tests {
 
             let mut set1 = MetricsSet::new();
             set1.push(time_metric("build_time", 5_000_000));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(
                 find_time_ms(&d1, "df_build_time"),
                 Some(5),
@@ -2454,7 +2500,7 @@ mod tests {
 
             let mut set2 = MetricsSet::new();
             set2.push(time_metric("build_time", 8_000_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(
                 find_time_ms(&d2, "df_build_time"),
                 Some(3),
@@ -2471,12 +2517,12 @@ mod tests {
 
             let mut set1 = MetricsSet::new();
             set1.push(count_metric("build_input_rows", 100));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(find_count(&d1, "df_build_input_rows"), Some(100));
 
             let mut set2 = MetricsSet::new();
             set2.push(count_metric("build_input_rows", 175));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(
                 find_count(&d2, "df_build_input_rows"),
                 Some(75),
@@ -2496,7 +2542,7 @@ mod tests {
             let mut set1 = MetricsSet::new();
             set1.push(time_metric("join_time", 2_000_000));
             set1.push(time_metric("join_time", 3_000_000));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(
                 find_time_ms(&d1, "df_join_time"),
                 Some(5),
@@ -2506,7 +2552,7 @@ mod tests {
             let mut set2 = MetricsSet::new();
             set2.push(time_metric("join_time", 4_000_000));
             set2.push(time_metric("join_time", 5_000_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(
                 find_time_ms(&d2, "df_join_time"),
                 Some(4),
@@ -2523,12 +2569,12 @@ mod tests {
 
             let mut set1 = MetricsSet::new();
             set1.push(elapsed_compute_metric(10_000_000));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(find_time_ms(&d1, "elapsed_compute"), Some(10));
 
             let mut set2 = MetricsSet::new();
             set2.push(elapsed_compute_metric(14_000_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(
                 find_time_ms(&d2, "elapsed_compute"),
                 Some(4),
@@ -2547,7 +2593,7 @@ mod tests {
             let mut set1 = MetricsSet::new();
             set1.push(time_metric("build_time", 6_000_000));
             set1.push(time_metric("join_time", 2_000_000));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(find_time_ms(&d1, "df_build_time"), Some(6));
             assert_eq!(find_time_ms(&d1, "df_join_time"), Some(2));
 
@@ -2555,7 +2601,7 @@ mod tests {
             // value. The current value is taken as the delta.
             let mut set2 = MetricsSet::new();
             set2.push(time_metric("build_time", 1_000_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(
                 find_time_ms(&d2, "df_build_time"),
                 Some(1),
@@ -2573,14 +2619,14 @@ mod tests {
             // 0.6ms accrues: below 1ms, so nothing is emitted yet.
             let mut set1 = MetricsSet::new();
             set1.push(time_metric("build_time", 600_000));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(find_time_ms(&d1, "df_build_time"), None);
 
             // Another 0.6ms (cumulative 1.2ms): the carried remainder crosses
             // 1ms and a whole millisecond is emitted.
             let mut set2 = MetricsSet::new();
             set2.push(time_metric("build_time", 1_200_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(find_time_ms(&d2, "df_build_time"), Some(1));
         }
 
@@ -2603,7 +2649,7 @@ mod tests {
                 None,
             )));
             set1.push(count_metric("output_batches", 1));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(
                 find_count(&d1, "output_batches"),
                 None,
@@ -2623,7 +2669,7 @@ mod tests {
             let mut set1 = MetricsSet::new();
             set1.push(count_metric("spill_metric", 5));
             set1.push(time_metric("spill_metric", 200_000_000)); // 200ms
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(find_count(&d1, "df_spill_metric"), Some(5));
             assert_eq!(find_time_ms(&d1, "df_spill_metric"), Some(200));
 
@@ -2633,7 +2679,7 @@ mod tests {
             let mut set2 = MetricsSet::new();
             set2.push(count_metric("spill_metric", 5));
             set2.push(time_metric("spill_metric", 200_000_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(find_count(&d2, "df_spill_metric"), None);
             assert_eq!(find_time_ms(&d2, "df_spill_metric"), None);
         }
@@ -2650,7 +2696,7 @@ mod tests {
             let mut set1 = MetricsSet::new();
             set1.push(elapsed_compute_metric(10_000_000)); // 10ms typed
             set1.push(time_metric("elapsed_compute", 2_000_000)); // 2ms named
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(
                 find_time_ms(&d1, "elapsed_compute"),
                 Some(12),
@@ -2662,7 +2708,7 @@ mod tests {
             let mut set2 = MetricsSet::new();
             set2.push(elapsed_compute_metric(10_000_000));
             set2.push(time_metric("elapsed_compute", 2_000_000));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(find_time_ms(&d2, "elapsed_compute"), None);
         }
 
@@ -2678,7 +2724,7 @@ mod tests {
             let mut set1 = MetricsSet::new();
             set1.push(elapsed_compute_metric(10_000_000)); // 10ms typed
             set1.push(count_metric("elapsed_compute", 7));
-            let d1 = recorder.subtree_delta_metric_values(id, &set1);
+            let d1 = recorder.subtree_delta_metric_values(id, &set1, 0);
             assert_eq!(
                 find_time_ms(&d1, "elapsed_compute"),
                 Some(10),
@@ -2693,7 +2739,7 @@ mod tests {
             let mut set2 = MetricsSet::new();
             set2.push(elapsed_compute_metric(10_000_000));
             set2.push(count_metric("elapsed_compute", 7));
-            let d2 = recorder.subtree_delta_metric_values(id, &set2);
+            let d2 = recorder.subtree_delta_metric_values(id, &set2, 0);
             assert_eq!(
                 find_time_ms(&d2, "elapsed_compute"),
                 None,
@@ -2719,7 +2765,7 @@ mod tests {
             let mut set = MetricsSet::new();
             set.push(count_metric("input_rows", 500));
             set.push(count_metric("custom_operator_count", 3));
-            let d = recorder.subtree_delta_metric_values(id, &set);
+            let d = recorder.subtree_delta_metric_values(id, &set, 0);
             assert_eq!(
                 find_count(&d, "input_rows"),
                 None,
@@ -2748,7 +2794,7 @@ mod tests {
                 },
                 None,
             )));
-            let d = recorder.subtree_delta_metric_values(id, &set);
+            let d = recorder.subtree_delta_metric_values(id, &set, 0);
             let gauge = d.iter().find_map(|v| match v {
                 MetricValue::Gauge { name, gauge } if name == "df_mem_used" => {
                     Some(gauge.value() as u64)
