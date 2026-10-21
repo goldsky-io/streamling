@@ -1,16 +1,16 @@
-//! How reads find their position: the side output that applies a table
-//! stamps each batch's [`Position`] into the batch's schema metadata, which
-//! Streamling's operators carry along, and physical planning appends a
-//! [`PositionExpr`] reading that stamp to every call of a [`TableFunction`].
+//! How reads find their mark: the side output that applies a table stamps
+//! the [`Mark`] of each table it applied into the batch's schema metadata,
+//! which Streamling's operators carry along, and physical planning appends a
+//! [`MarkExpr`] reading that stamp to every call of a [`TableFunction`].
 
 use super::InMemoryTable;
-use super::snapshot::{Position, SnapshotRetention};
-use crate::error::{Result, ResultExt};
+use super::versions::{Mark, Marks, VersionRetention};
+use crate::error::Result;
 use crate::operators::rebatch::RebatchExec;
 use crate::operators::scan_sharing::BroadcastingExec;
 use crate::operators::wrapping::{SideOutputExec, WrappingExec};
 use crate::{streamling_err, streamling_user_err};
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Result as DataFusionResult, ScalarValue};
@@ -25,79 +25,64 @@ use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// Prefix of the batch metadata key holding a node's position; the node's
+/// Prefix of the batch metadata key holding a table's mark; the table's
 /// name follows.
-const POSITION_METADATA_PREFIX: &str = "streamling.table_position.";
-/// The name of the argument [`PositionExpr`] appends.
-const POSITION_ARGUMENT: &str = "__table_position";
+const MARK_METADATA_PREFIX: &str = "streamling.table_mark.";
+/// The name of the argument [`MarkExpr`] appends.
+const MARK_ARGUMENT: &str = "__table_mark";
 
-fn position_key(stream: &str) -> String {
-    format!("{POSITION_METADATA_PREFIX}{stream}")
+fn mark_key(table: &str) -> String {
+    format!("{MARK_METADATA_PREFIX}{table}")
 }
 
-/// `batch` with its position on `stream` in its schema metadata.
-pub fn stamp_position(batch: RecordBatch, stream: &str, position: Position) -> Result<RecordBatch> {
-    let mut metadata = batch.schema().metadata().clone();
-    metadata.insert(position_key(stream), position.to_string());
-    let schema = Arc::new(Schema::new_with_metadata(
-        batch.schema().fields().clone(),
-        metadata,
-    ));
-    RecordBatch::try_new_with_options(
-        schema,
-        batch.columns().to_vec(),
-        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-    )
-    .streamling_context("failed to stamp the batch's table position")
+/// The schema metadata entries that stamp `marks` on a batch.
+pub fn mark_stamps(marks: Marks) -> HashMap<String, String> {
+    marks
+        .into_iter()
+        .map(|(table, Mark(mark))| (mark_key(&table), mark.to_string()))
+        .collect()
 }
 
-/// The position on `stream` stamped into a batch's schema `metadata`.
-pub fn stamped_position(
-    metadata: &HashMap<String, String>,
-    stream: &str,
-) -> Result<Option<Position>> {
-    metadata
-        .get(&position_key(stream))
-        .map(|position| position.parse())
-        .transpose()
-}
-
-/// Evaluates to the position on `stream` stamped into the batch it
-/// evaluates, or null when there is none.
+/// Evaluates to the mark of `table` stamped into the batch it evaluates, or
+/// null when there is none.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct PositionExpr {
-    stream: String,
+pub struct MarkExpr {
+    table: String,
     key: String,
 }
 
-impl PositionExpr {
-    fn new(stream: &str) -> Self {
+impl MarkExpr {
+    fn new(table: &str) -> Self {
         Self {
-            stream: stream.to_string(),
-            key: position_key(stream),
+            table: table.to_string(),
+            key: mark_key(table),
         }
     }
 }
 
-impl fmt::Display for PositionExpr {
+impl fmt::Display for MarkExpr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "table_position({})", self.stream)
+        write!(f, "table_mark({})", self.table)
     }
 }
 
-impl PhysicalExpr for PositionExpr {
+impl PhysicalExpr for MarkExpr {
     fn return_field(&self, _input_schema: &Schema) -> DataFusionResult<FieldRef> {
-        Ok(Arc::new(Field::new(
-            POSITION_ARGUMENT,
-            DataType::Utf8,
-            true,
-        )))
+        Ok(Arc::new(Field::new(MARK_ARGUMENT, DataType::UInt64, true)))
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> DataFusionResult<ColumnarValue> {
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
-            batch.schema_ref().metadata().get(&self.key).cloned(),
-        )))
+        let mark = batch
+            .schema_ref()
+            .metadata()
+            .get(&self.key)
+            .map(|mark| {
+                mark.parse::<u64>().map_err(|_| {
+                    streamling_err!("invalid mark '{}' of table '{}'", mark, self.table)
+                })
+            })
+            .transpose()?;
+        Ok(ColumnarValue::Scalar(ScalarValue::UInt64(mark)))
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
@@ -122,7 +107,7 @@ impl PhysicalExpr for PositionExpr {
 }
 
 /// A scalar function that reads a table. Registered as a [`TableUdf`], each
-/// call reads the table as of the position of the batch it evaluates.
+/// call reads the table as of the mark of the batch it evaluates.
 pub trait TableFunction: Debug + Send + Sync + 'static {
     fn name(&self) -> &str;
 
@@ -133,11 +118,11 @@ pub trait TableFunction: Debug + Send + Sync + 'static {
     /// The table a call reads, from its literal arguments.
     fn table(&self, literals: &[Option<&ScalarValue>]) -> Result<Arc<InMemoryTable>>;
 
-    /// `position` is the position of the batch `args` come from, if known.
+    /// `mark` is the table's mark on the batch `args` come from, if any.
     fn invoke(
         &self,
         args: ScalarFunctionArgs,
-        position: Option<Position>,
+        mark: Option<Mark>,
     ) -> DataFusionResult<ColumnarValue>;
 }
 
@@ -166,8 +151,8 @@ impl Hash for TableUdf {
     }
 }
 
-fn is_position_argument(field: &FieldRef) -> bool {
-    field.name() == POSITION_ARGUMENT
+fn is_mark_argument(field: &FieldRef) -> bool {
+    field.name() == MARK_ARGUMENT
 }
 
 impl ScalarUDFImpl for TableUdf {
@@ -189,7 +174,7 @@ impl ScalarUDFImpl for TableUdf {
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> DataFusionResult<FieldRef> {
         let own_arguments = match args.arg_fields.last() {
-            Some(field) if is_position_argument(field) => args.arg_fields.len() - 1,
+            Some(field) if is_mark_argument(field) => args.arg_fields.len() - 1,
             _ => args.arg_fields.len(),
         };
         self.0.return_field_from_args(ReturnFieldArgs {
@@ -199,27 +184,27 @@ impl ScalarUDFImpl for TableUdf {
     }
 
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
-        let mut position = None;
-        if args.arg_fields.last().is_some_and(is_position_argument) {
+        let mut mark = None;
+        if args.arg_fields.last().is_some_and(is_mark_argument) {
             args.arg_fields.pop();
-            let Some(ColumnarValue::Scalar(ScalarValue::Utf8(stamp))) = args.args.pop() else {
+            let Some(ColumnarValue::Scalar(ScalarValue::UInt64(stamp))) = args.args.pop() else {
                 return Err(streamling_err!(
-                    "{}: the table position must be a string",
+                    "{}: the table mark must be a UInt64 scalar",
                     self.0.name()
                 )
                 .into());
             };
-            position = stamp.map(|stamp| stamp.parse()).transpose()?;
+            mark = stamp.map(Mark);
         }
-        self.0.invoke(args, position)
+        self.0.invoke(args, mark)
     }
 }
 
-/// Appends the position of the batch to each call in `expr` of a
-/// [`TableFunction`] whose table keeps snapshots per position, so it reads
-/// the table as of that batch. `input` is the plan whose batches `expr`
+/// Appends the table's mark on the batch to each call in `expr` of a
+/// [`TableFunction`] whose table keeps versions per batch, so it reads the
+/// table as of that batch. `input` is the plan whose batches `expr`
 /// evaluates. Calls that already have it are left alone.
-pub fn bind_table_positions(
+pub fn bind_table_marks(
     expr: Arc<dyn PhysicalExpr>,
     input: &Arc<dyn ExecutionPlan>,
 ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
@@ -232,8 +217,8 @@ pub fn bind_table_positions(
     .data()
 }
 
-/// `expr`'s arguments plus its position, if it's an unbound call of a table
-/// function whose table keeps snapshots per position.
+/// `expr`'s arguments plus its mark, if it's an unbound call of a table
+/// function whose table keeps versions per batch.
 fn bound_arguments(
     expr: &Arc<dyn PhysicalExpr>,
     input: &Arc<dyn ExecutionPlan>,
@@ -247,7 +232,7 @@ fn bound_arguments(
     if call
         .args()
         .last()
-        .is_some_and(|arg| arg.downcast_ref::<PositionExpr>().is_some())
+        .is_some_and(|arg| arg.downcast_ref::<MarkExpr>().is_some())
     {
         return Ok(None);
     }
@@ -257,7 +242,7 @@ fn bound_arguments(
         .map(|arg| arg.downcast_ref::<Literal>().map(Literal::value))
         .collect();
     let table = function.table(&literals)?;
-    let SnapshotRetention::PerPosition { stream } = table.retention() else {
+    let VersionRetention::PerBatch { stream } = table.retention() else {
         return Ok(None);
     };
     if let PathToStream::Merged(merger) = path_to_stream(input, stream) {
@@ -270,7 +255,7 @@ fn bound_arguments(
         ));
     }
     let mut args = call.args().to_vec();
-    args.push(Arc::new(PositionExpr::new(stream)));
+    args.push(Arc::new(MarkExpr::new(&table.name)));
     Ok(Some(args))
 }
 
@@ -326,6 +311,7 @@ mod tests {
     use crate::operators::filter::StreamingFilterExec;
     use crate::operators::projection::StreamingProjectionExec;
     use crate::session::SessionManager;
+    use crate::side_output::with_metadata;
     use crate::topology::DEFAULT_MAX_DEAD_RATIO;
     use arrow::array::{AsArray, Int64Array, StringArray};
     use datafusion::common::DFSchema;
@@ -341,22 +327,20 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    fn ids(position: Option<Position>) -> RecordBatch {
+    /// A batch of `src`, stamped with `marks` when given.
+    fn ids(marks: Option<&Marks>) -> RecordBatch {
         let batch =
             RecordBatch::try_new(ids_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
-        match position {
-            Some(position) => stamp_position(batch, STREAM, position).unwrap(),
+        match marks {
+            Some(marks) => with_metadata(batch, mark_stamps(marks.clone())).unwrap(),
             None => batch,
         }
     }
 
-    fn at(seq: u64) -> Option<Position> {
-        Some(Position { partition: 0, seq })
-    }
-
     /// A session with source `src` (`id`) and table `names` (key `id`), whose
-    /// stream is `STREAM`, applied at seq 0 with `1 → a` and seq 1 with `1 → b`.
-    fn session() -> SessionManager {
+    /// stream is `STREAM`, applied with `1 → a` and then `1 → b`. Returns the
+    /// session and the two applies' marks.
+    fn session() -> (SessionManager, Vec<Marks>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -369,12 +353,12 @@ mod tests {
             "app::names".to_string(),
             DEFAULT_MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::PerPosition {
+            VersionRetention::PerBatch {
                 stream: STREAM.to_string(),
             },
         )
         .unwrap();
-        for (seq, name) in [(0, "a"), (1, "b")] {
+        let marks = ["a", "b"].map(|name| {
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
@@ -384,8 +368,8 @@ mod tests {
                 ],
             )
             .unwrap();
-            names.apply(&batch, at(seq)).unwrap();
-        }
+            names.apply(&batch, &[]).unwrap()
+        });
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
         session_manager.tables().register(Arc::new(names));
         session_manager
@@ -395,7 +379,7 @@ mod tests {
                 Arc::new(MemTable::try_new(ids_schema(), vec![vec![ids(None)]]).unwrap()),
             )
             .unwrap();
-        session_manager
+        (session_manager, marks.to_vec())
     }
 
     async fn plan(session_manager: &SessionManager, sql: &str) -> Arc<dyn ExecutionPlan> {
@@ -421,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn projected_lookups_read_the_table_as_of_their_batch() {
-        let session_manager = session();
+        let (session_manager, marks) = session();
         let plan = plan(
             &session_manager,
             &format!("SELECT id, {LOOKUP} AS name FROM src"),
@@ -432,10 +416,7 @@ mod tests {
             .expect("a streaming projection");
         let (lookup, alias) = &projection.expr()[1];
         assert_eq!(alias, "name");
-        assert!(
-            lookup.to_string().contains("table_position(app::src)"),
-            "{lookup}"
-        );
+        assert!(lookup.to_string().contains("table_mark(names)"), "{lookup}");
         assert_eq!(
             plan.schema()
                 .fields()
@@ -443,21 +424,27 @@ mod tests {
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>(),
             ["id", "name"],
-            "the position is an argument, not a column"
+            "the mark is an argument, not a column"
         );
 
-        assert_eq!(evaluated_names(lookup, &ids(at(0))), Some("a".to_string()));
-        assert_eq!(evaluated_names(lookup, &ids(at(1))), Some("b".to_string()));
+        assert_eq!(
+            evaluated_names(lookup, &ids(Some(&marks[0]))),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            evaluated_names(lookup, &ids(Some(&marks[1]))),
+            Some("b".to_string())
+        );
         assert_eq!(
             evaluated_names(lookup, &ids(None)),
             Some("b".to_string()),
-            "a batch without a position reads the latest snapshot"
+            "a batch without a mark reads the latest rows"
         );
     }
 
     #[tokio::test]
     async fn filtered_lookups_read_the_table_as_of_their_batch() {
-        let session_manager = session();
+        let (session_manager, marks) = session();
         let plan = plan(
             &session_manager,
             &format!("SELECT id FROM src WHERE {LOOKUP} = 'a'"),
@@ -475,8 +462,8 @@ mod tests {
                 .unwrap();
             matched.as_boolean().value(0)
         };
-        assert!(matches(&ids(at(0))));
-        assert!(!matches(&ids(at(1))));
+        assert!(matches(&ids(Some(&marks[0]))));
+        assert!(!matches(&ids(Some(&marks[1]))));
     }
 
     /// The unbound `lookup_eq` call over `src`'s schema.
@@ -507,7 +494,7 @@ mod tests {
 
     #[test]
     fn rejects_a_lookup_after_its_stream_is_rebatched() {
-        let session_manager = session();
+        let (session_manager, _) = session();
         let source: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(ids_schema()));
         let rebatched: Arc<dyn ExecutionPlan> = Arc::new(RebatchExec::new(
             side_output(Arc::clone(&source)),
@@ -533,7 +520,7 @@ mod tests {
 
     #[test]
     fn binding_is_idempotent() {
-        let session_manager = session();
+        let (session_manager, _) = session();
         let projection = Arc::new(
             project(
                 lookup_call(&session_manager),
@@ -551,7 +538,7 @@ mod tests {
             rebuilt.expr()[0]
                 .0
                 .to_string()
-                .matches("table_position")
+                .matches("table_mark")
                 .count(),
             1
         );

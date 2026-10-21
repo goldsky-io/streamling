@@ -1,15 +1,15 @@
 //! Applies a table's SQL output to the table from inside its upstream's
 //! `SideOutputExec`, before the upstream yields the batch to any consumer.
-//! The `SideOutputExec` stamps each batch with its position, and the table
-//! publishes a snapshot at it, so every node downstream of the upstream reads
-//! the table as of the batch it is processing. A node on a sibling branch,
-//! even one reading the same source, reads the latest snapshot.
+//! The apply's marks are stamped on the batch, so every node downstream of
+//! the upstream reads the table as of the batch it is processing. A node on a
+//! sibling branch, even one reading the same source, reads the latest rows.
 
 use crate::checkpoints::checkpoint_management::{CheckpointMessage, extract_checkpoint_messages};
 use crate::session::SessionManager;
 use crate::side_output::{SideOutputPlacement, SourceSideOutput};
 use crate::streamling_err;
 use crate::table::InMemoryTable;
+use crate::table::read::mark_stamps;
 use arrow::array::{AsArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Fields, SchemaRef};
@@ -20,6 +20,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -126,18 +127,16 @@ impl TableSideOutput {
 
 #[async_trait]
 impl SourceSideOutput for TableSideOutput {
-    async fn process(&self, batch: &RecordBatch) -> Result<()> {
-        let metadata = batch.schema_ref().metadata();
-        let position = self.table.position(metadata)?;
-        self.table.apply(&self.evaluate(batch)?, position)?;
-        if let Some(position) = position {
-            for message in extract_checkpoint_messages(metadata) {
-                if let CheckpointMessage::Marker { epoch, .. } = message {
-                    self.table.record_marker(&epoch, position);
-                }
-            }
-        }
-        Ok(())
+    async fn process(&self, batch: &RecordBatch) -> Result<HashMap<String, String>> {
+        let epochs: Vec<_> = extract_checkpoint_messages(batch.schema_ref().metadata())
+            .into_iter()
+            .filter_map(|message| match message {
+                CheckpointMessage::Marker { epoch, .. } => Some(epoch),
+                _ => None,
+            })
+            .collect();
+        let marks = self.table.apply(&self.evaluate(batch)?, &epochs)?;
+        Ok(mark_stamps(marks))
     }
 
     /// Readers of the source only see the rows its filter keeps.
@@ -160,7 +159,7 @@ mod tests {
     use super::*;
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
-    use crate::table::SnapshotRetention;
+    use crate::table::VersionRetention;
     use crate::topology::DEFAULT_MAX_DEAD_RATIO;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -196,7 +195,7 @@ mod tests {
             "app::t".to_string(),
             DEFAULT_MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap();
         TableSideOutput::try_new(
