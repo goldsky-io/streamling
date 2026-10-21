@@ -2,7 +2,7 @@
 //! whose primary key `key` equals `value`, or null.
 
 use crate::table::read::TableFunction;
-use crate::table::{InMemoryTable, Position, TableRegistry};
+use crate::table::{InMemoryTable, Mark, TableRegistry};
 use crate::{streamling_user_bail, streamling_user_err};
 use datafusion::arrow::compute::can_cast_types;
 use datafusion::arrow::datatypes::{Field, FieldRef};
@@ -109,11 +109,7 @@ impl TableFunction for LookupEqFunc {
         Ok(self.table_named(name)?)
     }
 
-    fn invoke(
-        &self,
-        args: ScalarFunctionArgs,
-        position: Option<Position>,
-    ) -> Result<ColumnarValue> {
+    fn invoke(&self, args: ScalarFunctionArgs, mark: Option<Mark>) -> Result<ColumnarValue> {
         let [
             ColumnarValue::Scalar(table_name),
             _,
@@ -129,7 +125,7 @@ impl TableFunction for LookupEqFunc {
         let table = self.table_named(string_literal(Some(table_name), "table name")?)?;
         let keys = keys.to_array(args.number_rows)?;
         let column = string_literal(Some(column), "column")?;
-        Ok(ColumnarValue::Array(table.lookup(&keys, column, position)?))
+        Ok(ColumnarValue::Array(table.lookup(&keys, column, mark)?))
     }
 }
 
@@ -138,7 +134,7 @@ mod tests {
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::session::SessionManager;
-    use crate::table::{InMemoryTable, SnapshotRetention};
+    use crate::table::{InMemoryTable, VersionRetention};
     use arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
@@ -164,7 +160,7 @@ mod tests {
             "app::rates".to_string(),
             crate::topology::DEFAULT_MAX_DEAD_RATIO,
             None,
-            SnapshotRetention::Latest,
+            VersionRetention::Latest,
         )
         .unwrap();
         rates
@@ -178,7 +174,7 @@ mod tests {
                     ],
                 )
                 .unwrap(),
-                None,
+                &[],
             )
             .unwrap();
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
@@ -276,7 +272,7 @@ mod tests {
                 "app::ids".to_string(),
                 crate::topology::DEFAULT_MAX_DEAD_RATIO,
                 None,
-                SnapshotRetention::Latest,
+                VersionRetention::Latest,
             )
             .unwrap(),
         ));
@@ -325,7 +321,7 @@ mod tests {
                 "app::decimals".to_string(),
                 crate::topology::DEFAULT_MAX_DEAD_RATIO,
                 None,
-                SnapshotRetention::Latest,
+                VersionRetention::Latest,
             )
             .unwrap(),
         ));

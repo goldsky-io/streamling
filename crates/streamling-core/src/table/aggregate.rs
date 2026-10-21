@@ -2,7 +2,7 @@
 //! <key>` over a table's live rows, maintained incrementally and read by
 //! `lookup_eq`.
 
-use super::{InMemoryTable, OP_DELETE, Position, TableRegistry};
+use super::{InMemoryTable, Marks, OP_DELETE, TableRegistry};
 use crate::checkpoints::checkpoint_management::CheckpointEpoch;
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
@@ -61,9 +61,10 @@ struct Group {
 /// A `table_agg`. Its table calls [`Self::update`] with every change to its
 /// live rows, under its write lock, so the groups always aggregate exactly
 /// the live rows. The groups are stored in `output`, an [`InMemoryTable`]
-/// keyed by the GROUP BY expression, which lookups read. The table publishes
-/// `output` at its own positions, and the accumulators are never read through
-/// a snapshot.
+/// keyed by the GROUP BY expression, which lookups read. `output` keeps its
+/// own version history, written and marked in the table's lock windows, so a
+/// batch's readers see `output` at the same moment as the table. The
+/// accumulators are never read as of a mark.
 pub(super) struct TableAggregate {
     name: String,
     /// `filter`, `key` and `arguments` read the table's stored schema.
@@ -470,13 +471,20 @@ impl TableAggregate {
         self.output.write(&changelog)
     }
 
-    /// Publishes `output` as of `position` on the table's stream.
-    pub(super) fn publish(&self, position: Option<Position>) -> Result<()> {
-        self.output.publish_written(position)
+    /// Starts an apply of the table's batch on `output`.
+    pub(super) fn begin(&self) {
+        self.output.begin();
     }
 
-    pub(super) fn record_marker(&self, epoch: &CheckpointEpoch, position: Position) {
-        self.output.record_marker(epoch, position);
+    /// Finishes the table's apply of a batch that carried the markers of
+    /// `epochs` on `output`. Called under the table's lock, with the table's
+    /// own mark.
+    pub(super) fn finish(&self, epochs: &[CheckpointEpoch]) -> Marks {
+        self.output.finish(epochs)
+    }
+
+    pub(super) fn record_gauges(&self) {
+        self.output.record_gauges();
     }
 
     /// The rows of `batch` that count: those the filter keeps, without a
@@ -547,7 +555,7 @@ mod tests {
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::session::SessionManager;
-    use crate::table::{InMemoryTable, Position, SnapshotRetention, WindowConfig};
+    use crate::table::{InMemoryTable, Mark, VersionRetention, WindowConfig};
     use crate::topology::DEFAULT_MAX_DEAD_RATIO;
     use arrow::array::{
         Array, ArrayRef, AsArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
@@ -583,13 +591,13 @@ mod tests {
     impl Fixture {
         /// A GC pass runs on every apply when `window` is set.
         async fn new(amount: Field, window: Option<&str>) -> Self {
-            Self::with_retention(amount, window, SnapshotRetention::Latest).await
+            Self::with_retention(amount, window, VersionRetention::Latest).await
         }
 
         async fn with_retention(
             amount: Field,
             window: Option<&str>,
-            retention: SnapshotRetention,
+            retention: VersionRetention,
         ) -> Self {
             let session_manager =
                 SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
@@ -664,16 +672,18 @@ mod tests {
 
         /// Applies `(id, address, amount, _gs_op)` rows to the base table.
         fn apply(&self, rows: &[(i64, Option<&str>, Option<i64>, &str)]) {
-            self.apply_at(rows, None);
+            self.apply_marked(rows, &[]);
         }
 
-        fn apply_at(
+        /// Applies a batch that carried the markers of `epochs`, and returns
+        /// the marks its readers see.
+        fn apply_marked(
             &self,
             rows: &[(i64, Option<&str>, Option<i64>, &str)],
-            position: Option<Position>,
-        ) {
+            epochs: &[u64],
+        ) -> Marks {
             let amounts: ArrayRef = Arc::new(Int64Array::from_iter(rows.iter().map(|row| row.2)));
-            self.apply_columns(rows, amounts, position);
+            self.apply_columns(rows, amounts, epochs)
         }
 
         fn apply_decimals(&self, rows: &[(i64, Option<&str>, Option<&str>, &str)]) {
@@ -695,15 +705,15 @@ mod tests {
                 .iter()
                 .map(|row| (row.0, row.1, None::<i64>, row.3))
                 .collect();
-            self.apply_columns(&rows, Arc::new(amounts), None);
+            self.apply_columns(&rows, Arc::new(amounts), &[]);
         }
 
         fn apply_columns(
             &self,
             rows: &[(i64, Option<&str>, Option<i64>, &str)],
             amounts: ArrayRef,
-            position: Option<Position>,
-        ) {
+            epochs: &[u64],
+        ) -> Marks {
             let batch = RecordBatch::try_new(
                 Arc::clone(&self.input_schema),
                 vec![
@@ -714,34 +724,42 @@ mod tests {
                 ],
             )
             .unwrap();
-            self.base.apply(&batch, position).unwrap();
+            let epochs: Vec<CheckpointEpoch> =
+                epochs.iter().copied().map(CheckpointEpoch).collect();
+            self.base.apply(&batch, &epochs).unwrap()
         }
 
         fn lookup(&self, keys: &[&str], column: &str) -> ArrayRef {
             self.lookup_at(keys, column, None)
         }
 
-        fn lookup_at(&self, keys: &[&str], column: &str, position: Option<Position>) -> ArrayRef {
+        fn lookup_at(&self, keys: &[&str], column: &str, mark: Option<Mark>) -> ArrayRef {
             let keys: ArrayRef = Arc::new(StringArray::from(keys.to_vec()));
             self.session_manager
                 .tables()
                 .get(AGGREGATE)
                 .expect("the aggregate is registered as a table")
-                .lookup(&keys, column, position)
+                .lookup(&keys, column, mark)
                 .unwrap()
         }
 
         fn ints(&self, keys: &[&str], column: &str) -> Vec<Option<i64>> {
-            self.ints_at(keys, column, None)
+            self.ints_at_mark(keys, column, None)
         }
 
-        fn ints_at(
+        /// The aggregate's `column` as a reader of the batch that returned
+        /// `marks` sees it.
+        fn ints_at(&self, keys: &[&str], column: &str, marks: &Marks) -> Vec<Option<i64>> {
+            self.ints_at_mark(keys, column, mark_of(marks, AGGREGATE))
+        }
+
+        fn ints_at_mark(
             &self,
             keys: &[&str],
             column: &str,
-            position: Option<Position>,
+            mark: Option<Mark>,
         ) -> Vec<Option<i64>> {
-            self.lookup_at(keys, column, position)
+            self.lookup_at(keys, column, mark)
                 .as_primitive::<Int64Type>()
                 .iter()
                 .collect()
@@ -920,19 +938,31 @@ mod tests {
         }
     }
 
-    /// The README's watermark walkthrough, read back as of each apply after
-    /// all of them ran.
-    #[tokio::test]
-    async fn aggregates_read_as_of_a_position() {
+    fn mark_of(marks: &Marks, table: &str) -> Option<Mark> {
+        marks
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|(_, mark)| *mark)
+    }
+
+    async fn versioned_fixture(window: Option<&str>) -> Fixture {
         let fixture = Fixture::with_retention(
             Field::new("amount", DataType::Int64, true),
-            Some("amount >= watermark(amount) - 60"),
-            SnapshotRetention::PerPosition {
+            window,
+            VersionRetention::PerBatch {
                 stream: "app::src".to_string(),
             },
         )
         .await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
+        fixture
+    }
+
+    /// The README's watermark walkthrough, read back as of each apply after
+    /// all of them ran.
+    #[tokio::test]
+    async fn aggregates_read_as_of_a_batch() {
+        let fixture = versioned_fixture(Some("amount >= watermark(amount) - 60")).await;
         let applies = [
             (1, 0, 1),
             (2, 30, 2),
@@ -941,25 +971,173 @@ mod tests {
             (5, 10, 1),
             (6, 125, 2),
         ];
-        for (seq, (id, amount, _)) in applies.iter().enumerate() {
-            let position = Position {
-                partition: 0,
-                seq: seq as u64,
-            };
-            fixture.apply_at(&[(*id, Some("a"), Some(*amount), "i")], Some(position));
-        }
-        for (seq, (_, amount, expected)) in applies.iter().enumerate() {
-            let position = Position {
-                partition: 0,
-                seq: seq as u64,
-            };
+        let marks: Vec<Marks> = applies
+            .iter()
+            .map(|(id, amount, _)| {
+                fixture.apply_marked(&[(*id, Some("a"), Some(*amount), "i")], &[])
+            })
+            .collect();
+        for ((_, amount, expected), marks) in applies.iter().zip(&marks) {
             assert_eq!(
-                fixture.ints_at(&["a"], "n", Some(position)),
+                fixture.ints_at(&["a"], "n", marks),
                 [Some(*expected)],
                 "after {amount}"
             );
         }
         assert_eq!(fixture.ints(&["a"], "n"), [Some(2)], "the latest");
+    }
+
+    #[tokio::test]
+    async fn a_removed_group_reads_as_missing_in_between() {
+        let fixture = versioned_fixture(None).await;
+        let inserted = fixture.apply_marked(&[(1, Some("a"), Some(5), "i")], &[]);
+        let deleted = fixture.apply_marked(&[(1, Some("a"), Some(5), "d")], &[]);
+        let reinserted = fixture.apply_marked(&[(2, Some("a"), Some(7), "i")], &[]);
+
+        assert_eq!(fixture.ints_at(&["a"], "total", &inserted), [Some(5)]);
+        assert_eq!(fixture.ints_at(&["a"], "total", &deleted), [None]);
+        assert_eq!(fixture.ints_at(&["a"], "total", &reinserted), [Some(7)]);
+    }
+
+    fn finalize(epoch: u64) {
+        crate::checkpoints::channels::send(
+            crate::checkpoints::checkpoint_management::CHECKPOINT_COORDINATOR_CHANNEL,
+            crate::checkpoints::checkpoint_management::CheckpointMessage::Finalizer(
+                CheckpointEpoch(epoch),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Errors when the aggregate's history a reader of the batch that
+    /// returned `marks` needs was collected.
+    fn assert_aggregate_collected(fixture: &Fixture, marks: &Marks) {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+        let output = fixture.session_manager.tables().get(AGGREGATE).unwrap();
+        let err = output
+            .lookup(&keys, "total", mark_of(marks, AGGREGATE))
+            .unwrap_err();
+        assert!(err.to_string().contains("already collected"), "{err}");
+    }
+
+    /// `#[serial]`: the coordinator channel is process-wide.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_finalizer_collects_the_outputs_history_on_the_next_apply() {
+        // Far above the epochs other tests record.
+        const EPOCH: u64 = 2_000_000;
+        let fixture = versioned_fixture(None).await;
+        let first = fixture.apply_marked(&[(1, Some("a"), Some(5), "i")], &[]);
+        let second = fixture.apply_marked(&[(1, Some("a"), Some(6), "u")], &[EPOCH]);
+        finalize(EPOCH);
+
+        fixture.apply_marked(&[], &[]);
+
+        assert_aggregate_collected(&fixture, &first);
+        assert_eq!(fixture.ints_at(&["a"], "total", &second), [Some(6)]);
+    }
+
+    const MODEL_ADDRESSES: [&str; 2] = ["a", "b"];
+
+    /// `(id, address, amount, _gs_op)`.
+    type Row = (i64, Option<&'static str>, Option<i64>, &'static str);
+
+    /// Applies batches from two partitions taking turns, and returns their
+    /// marks in apply order. Partition 0 owns ids 1, 2 and 6, partition 1
+    /// the others, as a topic keyed by id would place them; group `a` gets
+    /// rows from both. `epochs`' markers ride partition 1's first batch and
+    /// partition 0's second.
+    fn apply_two_partitions(fixture: &Fixture, epochs: &[u64]) -> Vec<Marks> {
+        let batches: [(&[Row], &[u64]); 6] = [
+            (
+                &[(1, Some("a"), Some(10), "i"), (2, Some("b"), Some(20), "i")],
+                &[],
+            ),
+            (
+                &[(3, Some("a"), Some(1), "i"), (4, Some("b"), Some(2), "i")],
+                epochs,
+            ),
+            (
+                &[(1, Some("b"), Some(11), "u"), (2, None, None, "d")],
+                epochs,
+            ),
+            (
+                &[(3, Some("a"), Some(5), "u"), (5, Some("a"), Some(7), "i")],
+                &[],
+            ),
+            (&[(6, Some("b"), Some(100), "i")], &[]),
+            (&[(4, None, None, "d")], &[]),
+        ];
+        batches
+            .into_iter()
+            .map(|(rows, epochs)| fixture.apply_marked(rows, epochs))
+            .collect()
+    }
+
+    /// Asserts that the aggregate, as a reader of the batch that returned
+    /// `marks` sees it, is `SUM_AND_COUNT` over the table's rows as that
+    /// reader sees them.
+    fn assert_matches_the_table_at(fixture: &Fixture, marks: &Marks) {
+        const IDS: [i64; 6] = [1, 2, 3, 4, 5, 6];
+        let ids: ArrayRef = Arc::new(Int64Array::from(IDS.to_vec()));
+        let base_mark = mark_of(marks, BASE);
+        let addresses = fixture.base.lookup(&ids, "address", base_mark).unwrap();
+        let amounts = fixture.base.lookup(&ids, "amount", base_mark).unwrap();
+        let mut expected: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
+        for (address, amount) in addresses
+            .as_string::<i32>()
+            .iter()
+            .zip(amounts.as_primitive::<Int64Type>().iter())
+        {
+            if let (Some(address), Some(amount)) = (address, amount) {
+                let (total, n) = expected.entry(address).or_default();
+                *total += amount;
+                *n += 1;
+            }
+        }
+        for address in MODEL_ADDRESSES {
+            let (total, n) = match expected.get(address) {
+                Some((total, n)) => (Some(*total), Some(*n)),
+                None => (None, None),
+            };
+            assert_eq!(
+                fixture.ints_at(&[address], "total", marks),
+                [total],
+                "{address} at {marks:?}"
+            );
+            assert_eq!(
+                fixture.ints_at(&[address], "n", marks),
+                [n],
+                "{address} at {marks:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_aggregate_and_its_table_agree_after_every_batch_across_partitions() {
+        let fixture = versioned_fixture(None).await;
+        for marks in apply_two_partitions(&fixture, &[]) {
+            assert_matches_the_table_at(&fixture, &marks);
+        }
+    }
+
+    /// `#[serial]`: the coordinator channel is process-wide.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn after_collection_the_aggregate_and_its_table_still_agree() {
+        // Far above the epochs other tests record.
+        const EPOCH: u64 = 3_000_000;
+        let fixture = versioned_fixture(None).await;
+        // The cut is partition 1's first batch's mark, so reads from it on
+        // still work.
+        let marks = apply_two_partitions(&fixture, &[EPOCH]);
+        finalize(EPOCH);
+        let next = fixture.apply_marked(&[], &[]);
+
+        assert_aggregate_collected(&fixture, &marks[0]);
+        for marks in marks[1..].iter().chain([&next]) {
+            assert_matches_the_table_at(&fixture, marks);
+        }
     }
 
     #[tokio::test]

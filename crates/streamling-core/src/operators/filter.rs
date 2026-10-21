@@ -24,7 +24,7 @@ use datafusion::physical_plan::{
 };
 
 use crate::operators::projection::StreamingProjectionExec;
-use crate::table::read::bind_table_positions;
+use crate::table::read::bind_table_marks;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
@@ -122,7 +122,7 @@ impl StreamingFilterExec {
     /// (see `wrap_with_side_outputs`).
     pub fn from_original(original_filter: FilterExec) -> Result<Self> {
         Ok(Self {
-            predicate: bind_table_positions(
+            predicate: bind_table_marks(
                 Arc::clone(original_filter.predicate()),
                 original_filter.input(),
             )?,
