@@ -2231,6 +2231,17 @@ impl Streamling {
                         &source_schema,
                     )?;
 
+                    // The JSON payload carries every decimal_arb leaf, nested
+                    // ones included, as decimal text; only a leaf under a
+                    // union has no encoding, and that is a startup error
+                    // rather than a failed request per batch.
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::SqsJson,
+                        None,
+                        &reference_name,
+                    )?;
+
                     let batch_flush_interval =
                         parse_batch_flush_interval(&webhook.batch_flush_interval, &reference_name)?;
                     let http_sink_provider = Arc::new(HttpTableProvider::new(
@@ -2655,6 +2666,18 @@ impl Streamling {
                         _ => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
                     };
                     validate_sink_decimal_arb(&source_schema, kafka_kind, None, &reference_name)?;
+                    // A column the Avro writer has no encoding for (a union, a
+                    // time, a map with non-string keys, …) is a startup error
+                    // here rather than a panic on the first batch.
+                    if matches!(
+                        kafka_kind,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaAvro { .. }
+                    ) && let Err(e) = streamling_common::formats::avro::try_to_avro(
+                        topic.as_str(),
+                        source_schema.fields(),
+                    ) {
+                        streamling_user_bail!("sink '{}': {}", reference_name, e);
+                    }
 
                     let kafka_sink_provider = Arc::new(KafkaSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),

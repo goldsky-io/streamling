@@ -119,9 +119,8 @@ impl ScalarUDFImpl for JsonStringFunc {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Fields};
+    use datafusion::arrow::datatypes::Fields;
     use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::ScalarFunctionArgs;
 
     fn make_args_from_array(array: ArrayRef, field_name: &str) -> ScalarFunctionArgs {
         let arg_field = Arc::new(Field::new(field_name, array.data_type().clone(), true));
