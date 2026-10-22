@@ -949,9 +949,7 @@ mod tests {
         let fixture = Fixture::with_retention(
             Field::new("amount", DataType::Int64, true),
             window,
-            VersionRetention::PerBatch {
-                stream: "app::src".to_string(),
-            },
+            VersionRetention::PerBatch,
         )
         .await;
         fixture.register(SUM_AND_COUNT).await.unwrap();

@@ -1867,9 +1867,7 @@ impl Streamling {
                     // Every source type rides the coordinator's checkpoint
                     // markers on its batches, so finalized checkpoints collect
                     // the version history.
-                    let retention = VersionRetention::PerBatch {
-                        stream: upstream_operator.reference_name().to_string(),
-                    };
+                    let retention = VersionRetention::PerBatch;
                     let storage = match table.backend_type {
                         TableBackendType::InMemory => Arc::new(InMemoryTable::try_new(
                             &reference_name,

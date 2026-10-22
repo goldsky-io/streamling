@@ -61,7 +61,7 @@ impl StreamingProjectionExec {
                 .expr()
                 .iter()
                 .map(|pe| {
-                    let expr = bind_table_marks(pe.expr.clone(), original_projection.input())?;
+                    let expr = bind_table_marks(pe.expr.clone())?;
                     Ok((expr, pe.alias.clone()))
                 })
                 .collect::<Result<_>>()?,
