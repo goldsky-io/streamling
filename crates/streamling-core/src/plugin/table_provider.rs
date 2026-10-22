@@ -827,12 +827,18 @@ impl DataSink for PluginSink {
             let next = tokio::select! {
                 biased;
                 Ok(()) = ack_state.changed() => continue,
-                // An instance can also exit without reporting a failure (a hook
-                // that panicked); its unacked epochs are then never flushed.
-                () = exit.exited(), if input_ended => {
+                // An instance can also exit without reporting a failure (its
+                // `is_running()` went false). The host holds its channels open,
+                // so sends keep succeeding until the input channel fills, and
+                // its unacked epochs are never flushed.
+                () = exit.exited() => {
                     let state = ack_state.borrow();
                     let failure = state.failure.clone().unwrap_or_else(|| {
-                        format!("it exited with epochs {:?} unacked", state.unacked)
+                        if input_ended {
+                            format!("it exited with epochs {:?} unacked", state.unacked)
+                        } else {
+                            "it exited while its input was still open".to_string()
+                        }
                     });
                     return Err(crate::plugin::plugin_failure(&self.instance.key, &failure));
                 }
@@ -1140,12 +1146,14 @@ mod tests {
             futures::stream::iter(vec![Ok(batch)]),
         ));
 
+        // Held for the whole test: a dropped execution future counts as exited.
+        let (_execution, exit) = crate::plugin::track_exit(Box::pin(std::future::pending()));
         let sink = PluginSink::new(
             schema,
             PluginInstance {
                 key: "ack_after_last_batch_sink".to_string(),
                 channels: channels.clone(),
-                exit: crate::plugin::track_exit(Box::pin(std::future::pending())).1,
+                exit,
             },
             None,
             Arc::new(AtomicU64::new(0)),
