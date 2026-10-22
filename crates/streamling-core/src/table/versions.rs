@@ -35,9 +35,9 @@ pub enum VersionRetention {
     /// Only the latest, which every read gets.
     Latest,
     /// Every change since the last finalized checkpoint, so a node
-    /// downstream of `stream`, the node whose side output applies the table,
-    /// reads it as of its own batch.
-    PerBatch { stream: String },
+    /// downstream of the node whose side output applies the table reads it
+    /// as of its own batch.
+    PerBatch,
 }
 
 /// The moment a reader sees a table at: the end of its history when the
@@ -141,7 +141,7 @@ impl Versions {
         Self {
             history: match retention {
                 VersionRetention::Latest => None,
-                VersionRetention::PerBatch { .. } => Some(History {
+                VersionRetention::PerBatch => Some(History {
                     base: 0,
                     changes: VecDeque::new(),
                     removed: HashMap::new(),
@@ -299,9 +299,7 @@ mod tests {
     }
 
     fn per_batch() -> Versions {
-        Versions::new(&VersionRetention::PerBatch {
-            stream: "stream".to_string(),
-        })
+        Versions::new(&VersionRetention::PerBatch)
     }
 
     fn sorted(mut rows: Vec<RowLocation>) -> Vec<(usize, usize)> {
