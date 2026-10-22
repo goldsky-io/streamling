@@ -122,10 +122,7 @@ impl StreamingFilterExec {
     /// (see `wrap_with_side_outputs`).
     pub fn from_original(original_filter: FilterExec) -> Result<Self> {
         Ok(Self {
-            predicate: bind_table_marks(
-                Arc::clone(original_filter.predicate()),
-                original_filter.input(),
-            )?,
+            predicate: bind_table_marks(Arc::clone(original_filter.predicate()))?,
             input: original_filter.input().clone(),
             metrics: ExecutionPlanMetricsSet::new(),
             default_selectivity: original_filter.default_selectivity(),

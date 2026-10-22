@@ -2,6 +2,7 @@ use crate::checkpoints::checkpoint_management::{
     CheckpointMessage, enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages,
     strip_checkpoint_messages,
 };
+use crate::table::read::latest_mark_stamps;
 use crate::utils::batch::enrich_batch_with_metadata;
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, make_array};
 use datafusion::arrow::compute::concat_batches;
@@ -271,7 +272,8 @@ impl BatchAccumulator {
 
 /// Merge a VecDeque of RecordBatches into a single RecordBatch.
 ///
-/// Preserves all checkpoint messages from all batches. Only performs actual
+/// Preserves all checkpoint messages from all batches, and stamps each
+/// table's latest mark among the data batches. Only performs actual
 /// data copying (via `concat_batches`) when there are multiple data batches;
 /// a single data batch is returned directly.
 ///
@@ -295,6 +297,11 @@ pub fn merge_batches(
         }
     }
 
+    let marks = latest_mark_stamps(
+        data_batches
+            .iter()
+            .map(|batch| batch.schema_ref().metadata()),
+    )?;
     let merged = if data_batches.is_empty() {
         // All batches were empty (checkpoint-only). Return an empty batch preserving schema.
         strip_checkpoint_messages(&batches[0])
@@ -308,13 +315,16 @@ pub fn merge_batches(
         concat_batches(&schema, data_batches.iter())?
     };
 
-    if all_checkpoint_messages.is_empty() {
-        Ok(Some(merged))
-    } else {
-        let mut metadata: HashMap<String, String> = merged.schema().metadata().clone();
-        enrich_batch_metadata_with_checkpoints(&mut metadata, &all_checkpoint_messages);
-        Ok(Some(enrich_batch_with_metadata(merged, metadata)?))
+    if all_checkpoint_messages.is_empty() && marks.is_empty() {
+        return Ok(Some(merged));
     }
+    // Replaces the metadata, so it starts from the merged batch's.
+    let mut metadata: HashMap<String, String> = merged.schema().metadata().clone();
+    metadata.extend(marks);
+    if !all_checkpoint_messages.is_empty() {
+        enrich_batch_metadata_with_checkpoints(&mut metadata, &all_checkpoint_messages);
+    }
+    Ok(Some(enrich_batch_with_metadata(merged, metadata)?))
 }
 
 /// How far to shift one stream's flush timer so that accumulators created

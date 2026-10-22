@@ -2490,8 +2490,6 @@ mod tests {
         }
     }
 
-    const STREAM: &str = "app::src";
-
     fn versioned_table() -> InMemoryTable {
         InMemoryTable::try_new(
             TABLE,
@@ -2500,9 +2498,7 @@ mod tests {
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
-            VersionRetention::PerBatch {
-                stream: STREAM.to_string(),
-            },
+            VersionRetention::PerBatch,
         )
         .unwrap()
     }
@@ -2715,14 +2711,9 @@ mod tests {
 
     #[test]
     fn interval_window_evictions_are_versioned() {
-        let table = windowed_table_with(
-            &timed_schema(),
-            KEEP_LAST_HOUR,
-            VersionRetention::PerBatch {
-                stream: STREAM.to_string(),
-            },
-        )
-        .unwrap();
+        let table =
+            windowed_table_with(&timed_schema(), KEEP_LAST_HOUR, VersionRetention::PerBatch)
+                .unwrap();
         let old = now_nanos() - 2 * HOUR_NANOS;
         let first = apply_marked(&table, &timed_batch(&[(1, "old", Some(old))]), &[]);
         let window = table.window.as_ref().unwrap();
@@ -2744,14 +2735,9 @@ mod tests {
     /// still sees the row the pass evicts, a reader of partition 0's doesn't.
     #[test]
     fn an_interval_gc_pass_is_inside_its_applys_moment() {
-        let table = windowed_table_with(
-            &timed_schema(),
-            KEEP_LAST_HOUR,
-            VersionRetention::PerBatch {
-                stream: STREAM.to_string(),
-            },
-        )
-        .unwrap();
+        let table =
+            windowed_table_with(&timed_schema(), KEEP_LAST_HOUR, VersionRetention::PerBatch)
+                .unwrap();
         let window = table.window.as_ref().unwrap();
         let old = now_nanos() - 2 * HOUR_NANOS;
         apply_marked(&table, &timed_batch(&[(1, "old", Some(old))]), &[]);
