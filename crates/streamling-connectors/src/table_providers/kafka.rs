@@ -195,7 +195,7 @@ impl<C: ConsumerContext + 'static> SafeKafkaConsumer<C> {
     /// avoid the cleanup overhead entirely.
     fn forget(mut self) {
         if let Some(consumer) = self.consumer.take() {
-            tracing::info!("SafeKafkaConsumer: forget() called, skipping drop");
+            tracing::trace!("SafeKafkaConsumer: forget() called, skipping drop");
             std::mem::forget(consumer);
         }
     }
@@ -223,9 +223,7 @@ impl<C: ConsumerContext + 'static> Drop for SafeKafkaConsumer<C> {
                  moving rd_kafka_destroy to a detached thread to prevent deadlock"
             );
             std::thread::spawn(move || {
-                tracing::info!("SafeKafkaConsumer: detached rd_kafka_destroy starting");
                 drop(consumer);
-                tracing::info!("SafeKafkaConsumer: detached rd_kafka_destroy completed");
             });
         }
     }
