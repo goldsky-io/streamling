@@ -19,6 +19,7 @@
 mod report;
 mod scenario;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +46,14 @@ const METRICS_FLUSH_WAIT: Duration = Duration::from_secs(3);
 /// Upper bound on a single pipeline run; a hang (e.g. an empty topic) fails
 /// loudly instead of blocking forever.
 const RUN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A deterministic scenario with selectivity `1 / n` may reach its final
+/// required output up to `n - 1` source rows before the end of the topic.
+/// Preserve that small tail while still rejecting materially incomplete runs.
+fn maximum_source_row_shortfall(selectivity: f64) -> u64 {
+    debug_assert!(selectivity > 0.0 && selectivity <= 1.0);
+    ((1.0 / selectivity).ceil() as u64).saturating_sub(1)
+}
 
 /// Avro schema for the benchmark payload. Field types map to Arrow as:
 /// long→int64, string→utf8, double→float64, int→int32, and the `bytes` decimal
@@ -124,6 +133,11 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_WARMUP)]
     warmup: u32,
 
+    /// Tokio worker threads for each Streamling child process. This does not
+    /// resize the benchmark harness runtime.
+    #[arg(long)]
+    tokio_worker_threads: Option<NonZeroUsize>,
+
     /// Directory to write `<scenario>.json` result files (skipped if unset).
     #[arg(long)]
     out_dir: Option<PathBuf>,
@@ -143,6 +157,18 @@ struct Cli {
     update_baseline: bool,
 }
 
+/// Raw measurements for one non-warmup Streamling process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchSample {
+    pub instance: String,
+    pub wall_clock_seconds: f64,
+    pub throughput_input_records_per_sec: f64,
+    pub throughput_output_records_per_sec: f64,
+    pub throughput_mb_per_sec: f64,
+    pub compute_us_per_input_record: f64,
+    pub source_output_rows_observed: u64,
+}
+
 /// One benchmark result, serialized to JSON and used as the baseline schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchResult {
@@ -152,6 +178,15 @@ pub struct BenchResult {
     pub records: u64,
     pub payload_bytes: u64,
     pub iterations: u32,
+    /// Explicit child runtime size, when supplied through the benchmark CLI.
+    /// Defaults preserve compatibility with baselines written before this knob.
+    #[serde(default)]
+    pub tokio_worker_threads: Option<usize>,
+    /// Per-process measurements used to compute the aggregate fields below.
+    /// Older committed baselines contain only aggregates and deserialize to an
+    /// empty sample list.
+    #[serde(default)]
+    pub samples: Vec<BenchSample>,
     pub wall_clock_seconds_median: f64,
     pub wall_clock_seconds_min: f64,
     pub input_rows: u64,
@@ -312,20 +347,22 @@ sinks:
             instance,
         );
 
+        let mut pipeline_opts = PipelineOpts::new()
+            .record_limit(stop)
+            .timeout(RUN_TIMEOUT)
+            .env("STREAMLING__APPLICATION_ID", instance.clone())
+            .env(
+                "STREAMLING__KAFKA_SOURCE__CONSUMER_GROUP_ID",
+                instance.clone(),
+            );
+        if let Some(worker_threads) = cli.tokio_worker_threads {
+            pipeline_opts = pipeline_opts.env("TOKIO_WORKER_THREADS", worker_threads.to_string());
+        }
+
         let start = Instant::now();
-        ctx.run_pipeline_with_opts(
-            &pipeline_yaml,
-            PipelineOpts::new()
-                .record_limit(stop)
-                .timeout(RUN_TIMEOUT)
-                .env("STREAMLING__APPLICATION_ID", instance.clone())
-                .env(
-                    "STREAMLING__KAFKA_SOURCE__CONSUMER_GROUP_ID",
-                    instance.clone(),
-                ),
-        )
-        .await
-        .with_context(|| format!("pipeline run failed (iter {})", iter))?;
+        ctx.run_pipeline_with_opts(&pipeline_yaml, pipeline_opts)
+            .await
+            .with_context(|| format!("pipeline run failed (iter {})", iter))?;
         let wall = start.elapsed().as_secs_f64();
 
         if !is_warmup {
@@ -335,9 +372,7 @@ sinks:
 
     tokio::time::sleep(METRICS_FLUSH_WAIT).await;
 
-    let mut input_tps = Vec::new();
-    let mut output_tps = Vec::new();
-    let mut compute_us = Vec::new();
+    let mut samples = Vec::with_capacity(measured.len());
     let mut source_rows_observed = 0u64;
 
     for (instance, wall) in &measured {
@@ -345,17 +380,55 @@ sinks:
             "sum(streamling_elapsed_compute_milliseconds_sum{{instance=\"{}\"}})",
             instance
         );
-        let compute_ms = prometheus.query(&compute_query).await?.unwrap_or(0.0);
+        let compute_ms = prometheus
+            .query(&compute_query)
+            .await?
+            .with_context(|| format!("missing compute metric for measured instance {instance}"))?;
         let source_query = PrometheusResource::output_rows_query("kafka_source", Some(instance));
-        let src_rows = prometheus.query_count(&source_query).await?.unwrap_or(0);
+        let src_rows = prometheus
+            .query_count(&source_query)
+            .await?
+            .with_context(|| {
+                format!("missing source-row metric for measured instance {instance}")
+            })?;
+        let minimum_source_rows = cli
+            .records
+            .saturating_sub(maximum_source_row_shortfall(scenario.selectivity));
+        if src_rows < minimum_source_rows {
+            anyhow::bail!(
+                "source-row sanity check failed for {instance}: observed {src_rows}, expected at least {minimum_source_rows}"
+            );
+        }
         source_rows_observed = source_rows_observed.max(src_rows);
 
-        input_tps.push(cli.records as f64 / wall);
-        output_tps.push(stop as f64 / wall);
-        compute_us.push(compute_ms * 1e3 / cli.records as f64);
+        let input_tps = cli.records as f64 / wall;
+        samples.push(BenchSample {
+            instance: instance.clone(),
+            wall_clock_seconds: *wall,
+            throughput_input_records_per_sec: input_tps,
+            throughput_output_records_per_sec: stop as f64 / wall,
+            throughput_mb_per_sec: input_tps * payload_bytes as f64 / 1e6,
+            compute_us_per_input_record: compute_ms * 1e3 / cli.records as f64,
+            source_output_rows_observed: src_rows,
+        });
     }
 
-    let walls: Vec<f64> = measured.iter().map(|(_, w)| *w).collect();
+    let walls: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.wall_clock_seconds)
+        .collect();
+    let input_tps: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.throughput_input_records_per_sec)
+        .collect();
+    let output_tps: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.throughput_output_records_per_sec)
+        .collect();
+    let compute_us: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.compute_us_per_input_record)
+        .collect();
     let input_tps_median = report::median(&input_tps);
 
     Ok(BenchResult {
@@ -365,6 +438,8 @@ sinks:
         records: cli.records,
         payload_bytes,
         iterations: cli.iterations,
+        tokio_worker_threads: cli.tokio_worker_threads.map(NonZeroUsize::get),
+        samples,
         wall_clock_seconds_median: report::median(&walls),
         wall_clock_seconds_min: walls.iter().copied().fold(f64::INFINITY, f64::min),
         input_rows: cli.records,
@@ -401,4 +476,40 @@ fn write_json(path: &Path, result: &BenchResult) -> Result<()> {
     let json = serde_json::to_string_pretty(result)?;
     std::fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_baseline_defaults_new_measurement_fields() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bench/baselines/blacksmith-8vcpu/avro_cdc_projection.json"
+        ))
+        .expect("committed baseline must be valid JSON");
+        let object = value
+            .as_object_mut()
+            .expect("committed baseline must be a JSON object");
+        object.remove("tokio_worker_threads");
+        object.remove("samples");
+
+        let result: BenchResult =
+            serde_json::from_value(value).expect("legacy baseline must remain readable");
+
+        assert_eq!(result.tokio_worker_threads, None);
+        assert!(result.samples.is_empty());
+    }
+
+    #[test]
+    fn worker_thread_count_must_be_nonzero() {
+        let parsed = Cli::try_parse_from(["streamling-bench", "--tokio-worker-threads", "0"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn source_row_sanity_allows_only_the_final_filter_stride() {
+        assert_eq!(maximum_source_row_shortfall(1.0), 0);
+        assert_eq!(maximum_source_row_shortfall(0.1), 9);
+    }
 }
