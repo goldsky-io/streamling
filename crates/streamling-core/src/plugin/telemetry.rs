@@ -59,6 +59,9 @@ pub fn record_plugin_metric(
     };
 }
 
+/// `diagnostics_key` names the instance in shutdown diagnostics; metrics are
+/// recorded under the node's `metric_metadata_id`.
+///
 /// `cancel` is the owning scope's token. The channel never disconnects on its
 /// own — the host and the plugin each hold both ends for the process's whole
 /// life — so without observing the token this loop runs forever and its scope
@@ -71,15 +74,13 @@ pub async fn process_plugin_metrics(
     metrics_receiver: RReceiver<PluginMetric_NE>,
     metrics_recorder: Arc<MetricsRecorder>,
     metric_metadata_id: String,
+    diagnostics_key: String,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     info!(
         "Started plugin metrics processing task with metric_metadata_id: {}",
         metric_metadata_id
     );
-    let plugin_name =
-        crate::utils::metrics::metric_metadata_id_to_reference_name(&metric_metadata_id)
-            .unwrap_or_else(|| metric_metadata_id.clone());
     loop {
         let metrics_recorder = metrics_recorder.clone();
         match metrics_receiver.try_recv() {
@@ -87,7 +88,8 @@ pub async fn process_plugin_metrics(
                 Ok(metric_enum) => {
                     // Dispatcher liveness markers feed the shutdown
                     // diagnostics maps instead of telemetry.
-                    if crate::plugin::diagnostics::intercept_metric(&plugin_name, &metric_enum) {
+                    if crate::plugin::diagnostics::intercept_metric(&diagnostics_key, &metric_enum)
+                    {
                         continue;
                     }
                     record_plugin_metric(metric_enum, metric_metadata_id.clone(), metrics_recorder);
@@ -158,6 +160,7 @@ mod tests {
             rx,
             crate::telemetry::recorder::get_metrics_recorder(),
             "test-forwarder".to_string(),
+            "test-forwarder".to_string(),
             cancel.clone(),
         ));
 
@@ -168,6 +171,39 @@ mod tests {
             .expect("forwarder task must not panic");
         // The sender is still alive, proving exit came from the token, not a
         // channel disconnect.
+        drop(tx);
+    }
+
+    // A node's partition instances share its metric key but must be told
+    // apart in shutdown diagnostics, which name the dispatcher that wedged.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn liveness_is_attributed_to_the_instance_not_the_node() {
+        let (tx, rx) = crossbeam_channel::bounded::<PluginMetric_NE>(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tx.try_send(NonExhaustive::new(PluginMetric::Count {
+            name: RString::from(crate::plugin::diagnostics::HEARTBEAT_METRIC),
+            value: 1,
+            tags: RHashMap::new(),
+        }))
+        .unwrap();
+
+        let handle = tokio::spawn(process_plugin_metrics(
+            rx,
+            crate::telemetry::recorder::get_metrics_recorder(),
+            "app::liveness_node".to_string(),
+            "liveness_node[1]".to_string(),
+            cancel.clone(),
+        ));
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let pending = ["liveness_node[1]".to_string()].into_iter().collect();
+        let described = crate::plugin::diagnostics::describe_pending(&pending);
+        assert!(
+            described.contains("liveness_node[1]: last heard"),
+            "{described}"
+        );
         drop(tx);
     }
 
@@ -190,6 +226,7 @@ mod tests {
         let handle = scope.spawn(process_plugin_metrics(
             rx,
             crate::telemetry::recorder::get_metrics_recorder(),
+            "test-stage-forwarder".to_string(),
             "test-stage-forwarder".to_string(),
             scope.stage_token().clone(),
         ));
