@@ -26,6 +26,7 @@ use streamling_core::checkpoints::checkpoint_management::{
     CheckpointControl, CheckpointCoordinator,
 };
 use streamling_core::error::{Result, ResultExt};
+use streamling_core::functions::lookup::LOOKUP_NAMES;
 use streamling_core::node_context::{NodeContext, TopologyNodeType, init_node_registry};
 use streamling_core::operators::broadcast::{MultiSinkEntry, MultiSinkLogicalNode};
 use streamling_core::operators::checkpointable::CheckpointableNode;
@@ -1145,12 +1146,16 @@ impl Streamling {
         // Analyze topology to determine which sources and transforms have multiple consumers
         let node_consumers = Self::find_source_consumers(&pipeline_topology);
         debug!("Node consumer analysis: {:?}", node_consumers);
-        // lookup_eq() calls, the only readers of a table_agg, aren't consumers.
+        // Lookup calls, the only readers of a table_agg, aren't consumers.
         for (name, transform) in &pipeline_topology.transforms {
             if matches!(transform, topology::Transform::table_agg(_))
                 && node_consumers.get(name).is_some_and(|&count| count > 0)
             {
-                streamling_user_bail!("'{}' is a table_agg; read it with lookup_eq", name);
+                streamling_user_bail!(
+                    "'{}' is a table_agg; read it with {}",
+                    name,
+                    LOOKUP_NAMES.join(", ")
+                );
             }
         }
 
@@ -6037,12 +6042,18 @@ mod table_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn plans_a_table_agg_read_by_lookup_eq() {
-        dry_run(&format!(
-            "transforms:\n{TOKENS}{VOLUMES}  reader:\n    type: sql\n    primary_key: id\n    sql: SELECT id, lookup_eq('volumes', 'num', num, 'n') AS n FROM src\nsinks:\n  out:\n    type: print\n    from: reader\n"
-        ))
-        .await
-        .expect("a table_agg read by lookup_eq must plan");
+    async fn plans_a_table_agg_read_by_lookups() {
+        for lookup in [
+            "lookup_eq('volumes', 'num', num, 'n')",
+            "lookup_row('volumes', 'num', num)",
+            "lookup_exists('volumes', 'num', num)",
+        ] {
+            dry_run(&format!(
+                "transforms:\n{TOKENS}{VOLUMES}  reader:\n    type: sql\n    primary_key: id\n    sql: SELECT id, {lookup} AS looked_up FROM src\nsinks:\n  out:\n    type: print\n    from: reader\n"
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("a table_agg read by {lookup} must plan: {err}"));
+        }
     }
 
     /// Binding lookups to their batch's position changes no schema: `SELECT
@@ -6064,7 +6075,9 @@ mod table_tests {
         ] {
             let err = dry_run_error(&format!("transforms:\n{TOKENS}{VOLUMES}{readers}")).await;
             assert!(
-                err.contains("'volumes' is a table_agg; read it with lookup_eq"),
+                err.contains(
+                    "'volumes' is a table_agg; read it with lookup_eq, lookup_row, lookup_exists"
+                ),
                 "{readers}: {err}"
             );
         }

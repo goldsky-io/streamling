@@ -565,7 +565,7 @@ pub struct TableTransform {
 }
 
 /// `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's
-/// live rows, maintained incrementally. Only `lookup_eq` reads it, keyed by
+/// live rows, maintained incrementally. Only lookups read it, keyed by
 /// the GROUP BY expression.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]

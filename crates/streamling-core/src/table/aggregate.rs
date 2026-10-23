@@ -1,6 +1,6 @@
 //! The `table_agg` transform: `SELECT <key>, <aggregates> FROM <table> GROUP BY
 //! <key>` over a table's live rows, maintained incrementally and read by
-//! `lookup_eq`.
+//! lookups.
 
 use super::{InMemoryTable, Marks, OP_DELETE, TableRegistry};
 use crate::checkpoints::checkpoint_management::CheckpointEpoch;
@@ -31,7 +31,7 @@ const SQL_SHAPE: &str = "SELECT <key>, <aggregates> FROM <table> [WHERE ...] GRO
 const OP_UPDATE: &str = "u";
 
 /// Registers the `table_agg` named `name`, whose SQL `plan` reads a table in
-/// `tables`: `tables` gets its output, which `lookup_eq` reads, and the table
+/// `tables`: `tables` gets its output, which lookups read, and the table
 /// updates it on every change to its live rows.
 pub fn register(
     name: &str,
@@ -739,7 +739,7 @@ mod tests {
                 .tables()
                 .get(AGGREGATE)
                 .expect("the aggregate is registered as a table")
-                .lookup(&keys, column, mark)
+                .lookup(&[keys], column, mark)
                 .unwrap()
         }
 
@@ -820,6 +820,37 @@ mod tests {
             [Some(2), Some(1), None]
         );
         assert_eq!(fixture.floats(&["a", "b"], "mean"), [Some(7.5), Some(7.0)]);
+    }
+
+    #[tokio::test]
+    async fn lookup_row_and_lookup_exists_read_the_groups() {
+        let fixture = Fixture::with_int_amounts(None).await;
+        fixture.register(SUM_AND_COUNT).await.unwrap();
+        fixture.apply(&[(1, Some("a"), Some(10), "i"), (2, Some("a"), Some(5), "i")]);
+
+        let batches = fixture
+            .session_manager
+            .session_context()
+            .sql(&format!(
+                "SELECT lookup_row('{AGGREGATE}', 'address', address)['total'] AS total, \
+                 lookup_exists('{AGGREGATE}', 'address', address) AS found \
+                 FROM (VALUES ('a'), ('b')) AS v(address)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let totals: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| batch.column(0).as_primitive::<Int64Type>().iter())
+            .collect();
+        assert_eq!(totals, [Some(15), None]);
+        let found: Vec<Option<bool>> = batches
+            .iter()
+            .flat_map(|batch| batch.column(1).as_boolean().iter())
+            .collect();
+        assert_eq!(found, [Some(true), Some(false)]);
     }
 
     #[tokio::test]
@@ -1013,7 +1044,7 @@ mod tests {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
         let output = fixture.session_manager.tables().get(AGGREGATE).unwrap();
         let err = output
-            .lookup(&keys, "total", mark_of(marks, AGGREGATE))
+            .lookup(&[keys], "total", mark_of(marks, AGGREGATE))
             .unwrap_err();
         assert!(err.to_string().contains("already collected"), "{err}");
     }
@@ -1079,8 +1110,11 @@ mod tests {
         const IDS: [i64; 6] = [1, 2, 3, 4, 5, 6];
         let ids: ArrayRef = Arc::new(Int64Array::from(IDS.to_vec()));
         let base_mark = mark_of(marks, BASE);
-        let addresses = fixture.base.lookup(&ids, "address", base_mark).unwrap();
-        let amounts = fixture.base.lookup(&ids, "amount", base_mark).unwrap();
+        let addresses = fixture
+            .base
+            .lookup(&[Arc::clone(&ids)], "address", base_mark)
+            .unwrap();
+        let amounts = fixture.base.lookup(&[ids], "amount", base_mark).unwrap();
         let mut expected: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
         for (address, amount) in addresses
             .as_string::<i32>()
@@ -1265,6 +1299,18 @@ mod tests {
             ),
             (
                 "SELECT address, sum(amount) AS total, now() AS at FROM transfers GROUP BY address",
+                "deterministic",
+            ),
+            (
+                "SELECT address, sum(lookup_eq('transfers', 'id', id, 'amount')) FROM transfers GROUP BY address",
+                "deterministic",
+            ),
+            (
+                "SELECT address, count(*) FROM transfers WHERE lookup_exists('transfers', 'id', id) GROUP BY address",
+                "deterministic",
+            ),
+            (
+                "SELECT address, sum(lookup_row('transfers', 'id', id)['amount']) FROM transfers GROUP BY address",
                 "deterministic",
             ),
             (

@@ -584,7 +584,7 @@ impl SessionManager {
         self.ctx.clone()
     }
 
-    /// The `table` transforms `lookup_eq` can read.
+    /// The `table` and `table_agg` transforms lookups can read.
     pub fn tables(&self) -> &TableRegistry {
         &self.tables
     }

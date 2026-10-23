@@ -1140,7 +1140,7 @@ This input can be a source or another transform.
 
 ## Tables
 
-A `table` transform keeps the latest row per primary key, built from a stateless SQL query. Other nodes read the table's SQL output by name, and [`lookup_eq`](#lookups) reads its rows.
+A `table` transform keeps the latest row per primary key, built from a stateless SQL query. Other nodes read the table's SQL output by name, and [lookups](#lookups) read its rows.
 
 ```yaml
 transforms:
@@ -1178,11 +1178,17 @@ Each partition of that node applies its own batches. Keep all versions of a key 
 
 Each row of the SQL output is applied by primary key, in order. A row whose `_gs_op` is `i`, `c`, `r` or `u` replaces the key's row, or inserts it. A `d` removes the key's row, if there is one. Matching is case-insensitive. Any other `_gs_op` value fails the pipeline.
 
-`FROM tokens` in a SQL transform, or `from: tokens` on a sink, handler, script or plugin, reads the table's SQL output unchanged, `_gs_op` included: the same rows a SQL transform with the table's query would emit. Joins against a table are not supported yet; use [`lookup_eq`](#lookups) for primary-key lookups. A table with no readers is still maintained and still takes part in checkpointing.
+`FROM tokens` in a SQL transform, or `from: tokens` on a sink, handler, script or plugin, reads the table's SQL output unchanged, `_gs_op` included: the same rows a SQL transform with the table's query would emit. Joins against a table are not supported yet; use [lookups](#lookups) for primary-key lookups. A table with no readers is still maintained and still takes part in checkpointing.
 
 ### Lookups
 
-`lookup_eq(table, key, value, column)` returns `column` of the row in `table` whose primary key `key` equals `value`, or `NULL` if no row matches.
+Three functions read the row in `table` whose primary key `key` equals the values:
+
+| Function | Returns |
+| --- | --- |
+| `lookup_eq(table, key, value_1, ..., value_n, column)` | `column` of the row, or `NULL` if no row matches. |
+| `lookup_row(table, key, value_1, ..., value_n)` | A struct of the row's columns, or `NULL` if no row matches. Read a field with `lookup_row(...)['amount']`. |
+| `lookup_exists(table, key, value_1, ..., value_n)` | `true` if a row matches, otherwise `false`. Never `NULL`. |
 
 ```yaml
 transforms:
@@ -1195,10 +1201,24 @@ transforms:
     type: sql
     primary_key: id
     sql: SELECT *, lookup_eq('rates_mapping', 'address', address, 'amount') AS calc_amount FROM transactions
+  balances:
+    type: table
+    backend_type: in_memory
+    primary_key: address,token
+    sql: SELECT address, token, amount, updated_at FROM balance_events
+  payments_enriched:
+    type: sql
+    primary_key: id
+    sql: >-
+      SELECT *,
+        lookup_row('balances', 'address,token', sender, token) AS sender_balance,
+        lookup_exists('balances', 'address,token', receiver, token) AS receiver_holds_token
+      FROM payments
 ```
 
-- `table`, `key` and `column` are string literals. `key` must be the table's primary key, and the primary key must be a single column. Invalid calls fail at startup.
-- `value` is cast to the key's type. A `NULL` value, or one that cannot be cast, returns `NULL`.
+- `table`, `key` and `column` are string literals. `key` is the table's whole primary key, comma-separated as in its `primary_key`, and one value follows per key column, in that order. Invalid calls fail at startup.
+- Each value is cast to its key column's type. A `NULL` value, or one that cannot be cast, in any position is a miss: `NULL`, or `false` from `lookup_exists`.
+- `lookup_row`'s struct holds every column `lookup_eq` can read, with the table's column types. A `lookup_row` call probes the table once for all of them, where each `lookup_eq` call probes it again.
 - A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), reads the table as it was when the input applied the batch being processed: every row up to and including that batch, and nothing later, however far the input has run ahead of its readers. With several input partitions, that moment includes what the other partitions had applied by then. Every key, and every [`table_agg`](#aggregates) over the table, is read at that same moment. This holds for any number of readers. Its limits:
   - Within a batch, a row also sees the rows after it in the same batch.
   - With several input partitions, what the other partitions had applied depends on how their applies interleave, so results can differ between runs.
@@ -1219,7 +1239,7 @@ window: block_time >= watermark(block_time) - interval '1 hour'
 - `watermark(column)` is the largest value of `column` the table has stored, so the window follows the data's own time. Use it whenever the data has an event-time column. See [Event time](#event-time-watermark).
 - `now()` is wall-clock time, evaluated on each GC pass. When replaying data older than the window, such as with `starting_offsets: earliest`, rows are evicted as soon as a GC pass runs, so lookups during the replay miss them. `watermark()` doesn't have this problem.
 - `__timestamp` is the wall-clock time the row was applied to the table, for when the data has no event-time column: `window: __timestamp >= now() - interval '1 hour'`. An upsert refreshes it. The SQL output cannot contain a `__timestamp` column. During a replay every row is fresh, so the table holds everything applied in the last hour.
-- `__timestamp` can't be read by `lookup_eq`.
+- `__timestamp` can't be read by lookups, and isn't in `lookup_row`'s struct.
 - GC passes run as the table's input delivers batches:
   - with `watermark()`, inside every apply that stores rows, so a batch's rows are evicted as soon as they're outside the window;
   - for any window, at the end of an apply, at most once per `table.window_gc_interval` in the app config (default `1s`, override with `STREAMLING__TABLE__WINDOW_GC_INTERVAL`). An idle input still delivers empty batches, at least one per checkpoint, so collection doesn't wait for new data. Until a row is collected, a lookup can still return it.
@@ -1261,7 +1281,7 @@ The `in_memory` backend does not persist its contents. After a restart, the tabl
 
 ### Aggregates
 
-A `table_agg` transform keeps `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's rows, updated as the table changes. [`lookup_eq`](#lookups) reads it by the GROUP BY key. Over a [windowed](#windows) table it's a sliding aggregate: a row stops counting when the window evicts it.
+A `table_agg` transform keeps `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's rows, updated as the table changes. [Lookups](#lookups) read it by the GROUP BY key. Over a [windowed](#windows) table it's a sliding aggregate: a row stops counting when the window evicts it.
 
 ```yaml
 transforms:
@@ -1288,10 +1308,10 @@ transforms:
 The SQL is `SELECT <key>, <select expressions> FROM <table> [WHERE ...] GROUP BY <key>`:
 
 - `FROM` names one `table`.
-- There is exactly one GROUP BY expression, and the SQL selects it. That column is the key `lookup_eq` uses. For a composite key, group by a concatenation: `SELECT address || ':' || token AS key, ... GROUP BY 1`.
+- There is exactly one GROUP BY expression, and the SQL selects it. That column is the key lookups use. For a composite key, group by a concatenation: `SELECT address || ':' || token AS key, ... GROUP BY 1`.
 - The aggregates are `count(*)`, `count(expr)`, `sum(expr)` and `avg(expr)`, without `DISTINCT`, `FILTER` or `ORDER BY`. Select expressions can combine them: `sum(amount) / count(*) AS mean`.
 - `WHERE` filters the table's rows before they are grouped.
-- Every function must be deterministic, so `now()`, `random()` and `lookup_eq` are rejected.
+- Every function must be deterministic, so `now()`, `random()` and lookups are rejected.
 - `_gs_op` can't be read: tables don't store it.
 - `HAVING`, joins, subqueries, `ORDER BY`, `LIMIT` and window functions are rejected.
 
@@ -1302,7 +1322,7 @@ How it's maintained:
 - Rows with a `NULL` key aren't aggregated.
 - It's updated inside the table's apply, so a lookup has the same guarantees as a lookup on the table, and reads the aggregate at the same moment as a lookup on the table from the same batch: the aggregate equals its SQL over the table's rows at that moment, whichever partitions they came from. Evictions follow the table's GC passes: an expired row counts until a pass evicts it.
 - Retracting floating-point values accumulates rounding error. Integers and decimals, `decimal_arb` included, are exact.
-- Only `lookup_eq` reads a `table_agg`. Naming it in `FROM` or `from:` is rejected.
+- Only lookups read a `table_agg`. Naming it in `FROM` or `from:` is rejected.
 - Like its table, it starts empty after a restart.
 
 ## Side Outputs
