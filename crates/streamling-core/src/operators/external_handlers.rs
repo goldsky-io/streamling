@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::telemetry::recorder::get_metrics_recorder;
+use crate::telemetry::task_wait::TaskWaitMeter;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct ExternalHandlerConfig {
@@ -240,6 +241,7 @@ impl ExecutionPlan for ExternalHandlerExec {
             Some(self.config.metric_metadata_id.clone()),
         );
 
+        let task_wait = TaskWaitMeter::claim(&context);
         let input_stream = self.input.execute(partition, context)?;
 
         let buffer_size = self.config.buffer_size as usize;
@@ -250,7 +252,7 @@ impl ExecutionPlan for ExternalHandlerExec {
         builder.spawn(async move {
             let mut buffered_input = input_stream.ready_chunks(buffer_size);
 
-            while let Some(batches) = buffered_input.next().await {
+            while let Some(batches) = task_wait.next(&mut buffered_input).await {
                 let batches_futures =
                     futures::future::join_all(batches.into_iter().map(|item| async {
                         let data: Result<Option<RecordBatch>> = match item {
@@ -274,14 +276,14 @@ impl ExecutionPlan for ExternalHandlerExec {
 
                 let batches = batches_futures.await;
                 for item in batches {
-                    match item {
-                        Ok(Some(modified_batch)) => {
-                            tx.send(Ok(modified_batch)).await.unwrap();
-                        }
-                        Err(e) => {
-                            tx.send(Err(e)).await.unwrap();
-                        }
-                        _ => {}
+                    let item = match item {
+                        Ok(Some(modified_batch)) => Ok(modified_batch),
+                        Err(e) => Err(e),
+                        Ok(None) => continue,
+                    };
+                    // A dropped receiver means the consumer is gone; stop.
+                    if task_wait.send(tx.send(item)).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -1051,6 +1053,7 @@ mod tests {
                     "/handler_retriable_error",
                     post(http_handler_retriable_error),
                 )
+                .route("/handler_slow_batch", post(http_handler_slow_batch))
                 .with_state(state.clone());
 
             let port = find_available_port().unwrap();
@@ -1153,6 +1156,19 @@ mod tests {
                 .collect();
             (StatusCode::OK, Json(updated_payloads))
         }
+
+        /// Echoes the batch after `SLOW_HANDLER_DELAY`, so the operator spends
+        /// that long in its own HTTP work per request.
+        async fn http_handler_slow_batch(
+            State(state): State<HttpAppState>,
+            Json(payloads): Json<Vec<SlimTestMessage>>,
+        ) -> (StatusCode, Json<Vec<SlimTestMessage>>) {
+            state.inc_requests();
+            tokio::time::sleep(SLOW_HANDLER_DELAY).await;
+            (StatusCode::OK, Json(payloads))
+        }
+
+        pub const SLOW_HANDLER_DELAY: Duration = Duration::from_millis(40);
 
         async fn http_handler_slim_test_message_batch_with_envelope(
             State(state): State<HttpAppState>,
@@ -1680,6 +1696,90 @@ mod tests {
         assert!(
             result.is_err(),
             "expected timeout since retries should continue forever on connection errors"
+        );
+    }
+
+    /// A slow endpoint is the handler's own work, not upstream wait. Under a
+    /// fast input and a fast consumer, the handler node must report the HTTP
+    /// time as busy (`elapsed_compute - starved`), not as `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see wrapping_exec_emits_starved_when_input_is_slow
+    async fn slow_handler_reports_busy_not_starved() {
+        use crate::operators::wrapping::WrappingExec;
+        use crate::telemetry::recorder::test_support;
+        use datafusion::catalog::TableProvider;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "slow_handler_busy";
+        test_support::init_recorder_with_node(node_id);
+
+        let (http_server_address, _state) = start_http_server().await;
+
+        const NUM_BATCHES: u32 = 3;
+        let batches = (0..NUM_BATCHES)
+            .map(|i| {
+                RecordBatch::try_new(
+                    SlimTestMessage::schema(),
+                    vec![
+                        Arc::new(StringArray::from(vec![i.to_string()])) as ArrayRef,
+                        Arc::new(StringArray::from(vec!["alpha"])) as ArrayRef,
+                        Arc::new(StringArray::from(vec!["i"])) as ArrayRef,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let mem_table = MemTable::try_new(SlimTestMessage::schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let input = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let handler: Arc<dyn ExecutionPlan> = Arc::new(ExternalHandlerExec::new(
+            input,
+            ExternalHandlerConfig {
+                url: format!("http://{}/handler_slow_batch", http_server_address.0),
+                headers: None,
+                one_row_per_request: Some(false),
+                payload_version: Some(0),
+                trigger_max_count: DEFAULT_TRIGGER_MAX_COUNT,
+                operator_timeout_sec: DEFAULT_OPERATOR_TIMEOUT_SEC,
+                schema_override: None,
+                // One batch per request round, so the requests run back to back.
+                buffer_size: 1,
+                metric_metadata_id: node_id.to_string(),
+            },
+        ));
+        let wrapping = Arc::new(WrappingExec::new(
+            handler,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut rows = 0;
+        while let Some(batch) = stream.next().await {
+            rows += batch.expect("batch must be Ok").num_rows();
+        }
+        assert_eq!(rows, NUM_BATCHES as usize);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        let busy = elapsed_compute.saturating_sub(starved);
+        let handler_ms = SLOW_HANDLER_DELAY.as_millis() as u64 * NUM_BATCHES as u64;
+        // The input is in memory, so real input wait is near zero. Allow well
+        // under one request of slack for scheduling jitter.
+        assert!(
+            starved < SLOW_HANDLER_DELAY.as_millis() as u64 / 2,
+            "handler HTTP time must not be reported as starved: \
+             starved={starved}ms elapsed_compute={elapsed_compute}ms"
+        );
+        assert!(
+            busy >= handler_ms / 2,
+            "handler HTTP time (~{handler_ms}ms) must be reported as busy: \
+             busy={busy}ms starved={starved}ms elapsed_compute={elapsed_compute}ms"
         );
     }
 }
