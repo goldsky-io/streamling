@@ -336,6 +336,187 @@ sinks:
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct Balance {
+    address: String,
+    token: String,
+    amount: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Payment {
+    id: i64,
+    address: String,
+    token: String,
+}
+
+/// `(id, amount, row_token, row_amount, found)` of an enriched payment.
+type EnrichedPayment = (i64, Option<i64>, Option<String>, Option<i64>, bool);
+
+const BALANCE_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "Balance",
+    "fields": [
+        {"name": "address", "type": "string"},
+        {"name": "token", "type": "string"},
+        {"name": "amount", "type": "long"}
+    ]
+}"#;
+
+const PAYMENT_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "Payment",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "address", "type": "string"},
+        {"name": "token", "type": "string"}
+    ]
+}"#;
+
+/// `lookup_eq`, `lookup_row` and `lookup_exists` read a table with a
+/// composite primary key: every key column must match.
+#[tokio::test]
+async fn test_lookups_read_a_composite_key_table() {
+    const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+    const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+    const BALANCES_LOADED: &str = "SELECT count(*) FROM public.composite_balances \
+         WHERE (address, token, amount) IN (('0xa', 'usdc', 11), ('0xa', 'weth', 20))";
+    const ENRICHED: &str = "SELECT count(*) FROM public.composite_enriched";
+
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(BALANCE_SCHEMA)
+        .await
+        .expect("Failed to register the balance schema");
+    let payments = ctx
+        .create_kafka_topic("payments")
+        .await
+        .expect("Failed to create the payments topic");
+    payments
+        .register_schema(PAYMENT_SCHEMA)
+        .await
+        .expect("Failed to register the payment schema");
+    let balance = |address: &str, token: &str, amount| Balance {
+        address: address.to_string(),
+        token: token.to_string(),
+        amount,
+    };
+    ctx.kafka
+        .produce_avro_records(&[
+            balance("0xa", "usdc", 10),
+            balance("0xa", "weth", 20),
+            balance("0xa", "usdc", 11),
+        ])
+        .await
+        .expect("Failed to produce balances");
+
+    let pipeline = format!(
+        r#"
+sources:
+  balances_src:
+    type: kafka
+    topic: {balances_topic}
+    starting_offsets: earliest
+    primary_key: address,token
+  payments:
+    type: kafka
+    topic: {payments_topic}
+    starting_offsets: earliest
+    primary_key: id
+transforms:
+  balances:
+    type: table
+    backend_type: in_memory
+    primary_key: address,token
+    sql: SELECT address, token, amount FROM balances_src
+  enriched:
+    type: sql
+    primary_key: id
+    sql: >-
+      SELECT id,
+        lookup_eq('balances', 'address, token', address, token, 'amount') AS amount,
+        lookup_row('balances', 'address,token', address, token)['token'] AS row_token,
+        lookup_row('balances', 'address,token', address, token)['amount'] AS row_amount,
+        lookup_exists('balances', 'address,token', address, token) AS found
+      FROM payments
+sinks:
+  balances_pg:
+    type: postgres
+    from: balances
+    table: composite_balances
+    schema: public
+    primary_key: address,token
+    batch_size: 1
+    batch_flush_interval: 100ms
+  enriched_pg:
+    type: postgres
+    from: enriched
+    table: composite_enriched
+    schema: public
+    primary_key: id
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        balances_topic = ctx.kafka_topic,
+        payments_topic = payments.topic,
+    );
+
+    // Balances reach Postgres only after the table applied them, so
+    // payments are produced once lookups are certain to hit.
+    let signal_when = async {
+        if !wait_for_count(&ctx, BALANCES_LOADED, 2, LOAD_TIMEOUT).await {
+            return;
+        }
+        let payment = |id, address: &str, token: &str| Payment {
+            id,
+            address: address.to_string(),
+            token: token.to_string(),
+        };
+        payments
+            .produce_avro_records(&[
+                payment(1, "0xa", "usdc"),
+                payment(2, "0xa", "weth"),
+                payment(3, "0xa", "dai"),
+                payment(4, "0xb", "usdc"),
+            ])
+            .await
+            .expect("Failed to produce payments");
+        wait_for_count(&ctx, ENRICHED, 4, LOAD_TIMEOUT).await;
+    };
+
+    let (status, _stderr) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline,
+            PipelineOpts::new().env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+            signal_when,
+            EXIT_DEADLINE,
+        )
+        .await
+        .expect("Streamling must exit after SIGTERM");
+    assert!(status.success());
+
+    let rows: Vec<EnrichedPayment> = ctx
+        .postgres
+        .query(
+            "SELECT id, amount, row_token, row_amount, found \
+             FROM public.composite_enriched ORDER BY id",
+        )
+        .await
+        .expect("Failed to query");
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some(11), Some("usdc".to_string()), Some(11), true),
+            (2, Some(20), Some("weth".to_string()), Some(20), true),
+            (3, None, None, None, false),
+            (4, None, None, None, false),
+        ]
+    );
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct TimedRate {
     address: String,
     amount: i64,

@@ -70,7 +70,7 @@ pub fn validate_no_orphan_nodes(config: &str) -> crate::error::Result<()> {
         // UDF calls in SQL WHERE clauses, not via FROM clauses or `from:` fields.
         // They have dedicated validation in validate_dynamic_table_usage().
         // Skip table transforms too: their driver always consumes them. And
-        // table_agg transforms, which only lookup_eq() calls read.
+        // table_agg transforms, which only lookup calls read.
         let transform_type = transform_val
             .as_mapping()
             .and_then(|m| m.get("type"))
@@ -849,7 +849,13 @@ sinks:
 
     #[test]
     fn table_agg_read_only_by_lookups_is_not_an_orphan() {
-        let config = r#"
+        for lookup in [
+            "lookup_eq('volumes', 'address', address, 'n')",
+            "lookup_row('volumes', 'address', address)",
+            "lookup_exists('volumes', 'address', address)",
+        ] {
+            let config = format!(
+                r#"
 sources:
   src:
     type: kafka
@@ -866,13 +872,15 @@ transforms:
   reader:
     type: sql
     primary_key: id
-    sql: "SELECT id, lookup_eq('volumes', 'address', address, 'n') AS n FROM src"
+    sql: "SELECT id, {lookup} AS looked_up FROM src"
 sinks:
   out:
     type: print
     from: reader
-"#;
-        assert!(validate_no_orphan_nodes(config).is_ok());
+"#
+            );
+            assert!(validate_no_orphan_nodes(&config).is_ok(), "{lookup}");
+        }
     }
 
     #[test]
