@@ -430,6 +430,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_and_exists_lookups_read_the_table_as_of_their_batch() {
+        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]);
+        let plan = plan(
+            &session_manager,
+            "SELECT lookup_row('names', 'id', id)['name'] AS name, \
+             lookup_exists('names', 'id', id + 1) AS next_exists FROM src",
+        )
+        .await;
+        let projection = plan
+            .downcast_ref::<StreamingProjectionExec>()
+            .expect("a streaming projection");
+        let (row, _) = &projection.expr()[0];
+        let (exists, _) = &projection.expr()[1];
+        for call in [row, exists] {
+            assert!(call.to_string().contains("table_mark(names)"), "{call}");
+        }
+        assert_eq!(
+            evaluated_names(row, &ids(Some(&marks[0]))),
+            Some("a".to_string())
+        );
+        let next_exists = |batch: &RecordBatch| {
+            exists
+                .evaluate(batch)
+                .unwrap()
+                .into_array(1)
+                .unwrap()
+                .as_boolean()
+                .value(0)
+        };
+        assert!(!next_exists(&ids(Some(&marks[0]))));
+        assert!(next_exists(&ids(Some(&marks[1]))));
+    }
+
+    #[tokio::test]
     async fn filtered_lookups_read_the_table_as_of_their_batch() {
         let (session_manager, marks) = session();
         let plan = plan(

@@ -18,11 +18,12 @@ use crate::checkpoints::checkpoint_management::CheckpointEpoch;
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt};
 use crate::telemetry::recorder::get_metrics_recorder;
-use crate::{streamling_err, streamling_user_bail, streamling_user_err};
+use crate::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, TimestampNanosecondArray, UInt64Array,
-    new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, StructArray, TimestampNanosecondArray,
+    UInt64Array, new_null_array,
 };
+use arrow::buffer::NullBuffer;
 use arrow::compute::{
     cast, filter, filter_record_batch, interleave, interleave_record_batch, not,
     prep_null_mask_filter,
@@ -43,6 +44,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use streamling_common::utils::parse_primary_key_columns;
 use tracing::warn;
 
 const OP_DELETE: &str = "d";
@@ -1007,19 +1009,21 @@ impl InMemoryTable {
         self.aggregates.write().push(aggregate);
     }
 
-    /// The primary key's field, if `key` names the table's single-column
-    /// primary key.
-    pub fn lookup_key_field(&self, key: &str) -> Result<&FieldRef> {
-        let field = self.single_key()?;
-        if field.name() != key {
+    /// The primary key's fields, if `key` names the table's whole primary
+    /// key, comma-separated like the table's `primary_key`.
+    pub fn lookup_key_fields(&self, key: &str) -> Result<&Fields> {
+        if !parse_primary_key_columns(key)
+            .into_iter()
+            .eq(self.key_fields.iter().map(|field| field.name().as_str()))
+        {
             streamling_user_bail!(
                 "table '{}': lookups must use the primary key '{}', got '{}'",
                 self.name,
-                field.name(),
+                self.primary_key,
                 key
             );
         }
-        Ok(field)
+        Ok(&self.key_fields)
     }
 
     /// The field [`Self::lookup`] returns for `column`: nullable, because a
@@ -1029,28 +1033,114 @@ impl InMemoryTable {
         Ok(Arc::new(field.clone().with_nullable(true)))
     }
 
-    /// For each of `keys`, `column` of the stored row with that primary key,
-    /// or null when no row has it, as of `mark`, or the latest apply without
-    /// one. `keys` is cast to the primary key's type.
-    pub fn lookup(&self, keys: &ArrayRef, column: &str, mark: Option<Mark>) -> Result<ArrayRef> {
-        let column_index = self.column_index(column)?;
-        // A safe cast: a value that can't be converted becomes null and misses.
-        let keys = cast(keys, self.single_key()?.data_type())
-            .streamling_context("failed to cast the lookup keys to the primary key type")?;
-        // The converter that encoded the index's keys in `apply`, so an equal
-        // key yields equal bytes. A null encodes to bytes the index never holds,
-        // because `apply` rejects null keys.
-        let encoded = self
-            .converter
-            .convert_columns(&[keys])
-            .streamling_context("failed to encode the lookup keys")?;
-        let missing = new_null_array(self.schema.field(column_index).data_type(), 1);
+    /// The field [`Self::lookup_rows`] returns: a nullable struct of every
+    /// column [`Self::lookup`] can read.
+    pub fn lookup_row_field(&self) -> FieldRef {
+        Arc::new(Field::new_struct(&self.name, self.readable_fields(), true))
+    }
 
+    /// For each row of `keys`, one array per primary key column, `column` of
+    /// the stored row with that primary key, or null when no row has it, as
+    /// of `mark`, or the latest apply without one.
+    pub fn lookup(&self, keys: &[ArrayRef], column: &str, mark: Option<Mark>) -> Result<ArrayRef> {
+        let column_index = self.column_index(column)?;
+        let encoded = self.encode_lookup_keys(keys)?;
         let state = self.state.read();
+        let locations = self.locate(&state, &encoded, mark)?;
+        self.gather(&state, column_index, &locations)
+    }
+
+    /// Like [`Self::lookup`], for every column [`Self::lookup`] can read at
+    /// once, as a struct that is null when no row has the key.
+    pub fn lookup_rows(&self, keys: &[ArrayRef], mark: Option<Mark>) -> Result<StructArray> {
+        let encoded = self.encode_lookup_keys(keys)?;
+        let state = self.state.read();
+        let locations = self.locate(&state, &encoded, mark)?;
+        let columns = self
+            .readable_columns()
+            .map(|(index, _)| self.gather(&state, index, &locations))
+            .collect::<Result<Vec<_>>>()?;
+        let found = NullBuffer::from_iter(locations.iter().map(Option::is_some));
+        StructArray::try_new(self.readable_fields(), columns, Some(found))
+            .streamling_context("failed to read the looked-up rows")
+    }
+
+    /// For each row of `keys`, whether the table has a row with that primary
+    /// key, as of `mark`, or the latest apply without one.
+    pub fn lookup_exists(&self, keys: &[ArrayRef], mark: Option<Mark>) -> Result<BooleanArray> {
+        let encoded = self.encode_lookup_keys(keys)?;
+        let state = self.state.read();
+        let locations = self.locate(&state, &encoded, mark)?;
+        Ok(locations
+            .iter()
+            .map(|location| Some(location.is_some()))
+            .collect())
+    }
+
+    /// `keys`, one array per primary key column, cast to the key's types and
+    /// encoded by the converter that encoded the index's keys in `apply`, so
+    /// an equal key yields equal bytes. A safe cast: a value that can't be
+    /// converted becomes null. A null encodes to bytes the index never holds,
+    /// because `apply` rejects null keys, so it misses.
+    fn encode_lookup_keys(&self, keys: &[ArrayRef]) -> Result<Rows> {
+        if keys.len() != self.key_fields.len() {
+            streamling_bail!(
+                "table '{}': the primary key '{}' has {} columns, got {} lookup key columns",
+                self.name,
+                self.primary_key,
+                self.key_fields.len(),
+                keys.len()
+            );
+        }
+        let keys = keys
+            .iter()
+            .zip(self.key_fields.iter())
+            .map(|(keys, field)| {
+                cast(keys, field.data_type())
+                    .streamling_context("failed to cast the lookup keys to the primary key type")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.converter
+            .convert_columns(&keys)
+            .streamling_context("failed to encode the lookup keys")
+    }
+
+    /// The location of each of `keys`' rows as of `mark`, or the latest apply
+    /// without one.
+    fn locate(
+        &self,
+        state: &TableState,
+        keys: &Rows,
+        mark: Option<Mark>,
+    ) -> Result<Vec<Option<RowLocation>>> {
         state
             .versions
             .ensure_readable(mark)
             .map_err(|e| streamling_err!("table '{}': {}", self.name, e))?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                let (current, newest_change) = match state.index.get(key.as_ref()) {
+                    Some(entry) => (Some(entry.location), entry.newest_change),
+                    None if mark.is_some() => {
+                        (None, state.versions.removed_newest_change(key.as_ref()))
+                    }
+                    None => (None, None),
+                };
+                state.versions.resolve(mark, current, newest_change)
+            })
+            .collect())
+    }
+
+    /// The stored column at `column_index` of the rows at `locations`, null
+    /// where there is none.
+    fn gather(
+        &self,
+        state: &TableState,
+        column_index: usize,
+        locations: &[Option<RowLocation>],
+    ) -> Result<ArrayRef> {
+        let missing = new_null_array(self.schema.field(column_index).data_type(), 1);
         // Source 0 is a single null for keys with no row. Each chunk a hit
         // reads from is added once, so the cost follows hits, not chunk count.
         let mut sources: Vec<&dyn Array> = vec![missing.as_ref()];
@@ -1058,47 +1148,45 @@ impl InMemoryTable {
         let mut chunk_sources: HashMap<usize, usize> = HashMap::new();
         // One `(source, row)` per key, in input order. `interleave` copies
         // `sources[source][row]` for each into the output.
-        let mut gather_indices = Vec::with_capacity(encoded.num_rows());
-        for key in encoded.iter() {
-            let (current, newest_change) = match state.index.get(key.as_ref()) {
-                Some(entry) => (Some(entry.location), entry.newest_change),
-                None if mark.is_some() => {
-                    (None, state.versions.removed_newest_change(key.as_ref()))
+        let gather_indices: Vec<(usize, usize)> = locations
+            .iter()
+            .map(|location| match location {
+                Some(location) => {
+                    let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
+                        sources.push(state.batch(location.chunk).column(column_index).as_ref());
+                        sources.len() - 1
+                    });
+                    (source, location.row)
                 }
-                None => (None, None),
-            };
-            let Some(location) = state.versions.resolve(mark, current, newest_change) else {
-                gather_indices.push((0, 0));
-                continue;
-            };
-            let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
-                sources.push(state.batch(location.chunk).column(column_index).as_ref());
-                sources.len() - 1
-            });
-            gather_indices.push((source, location.row));
-        }
+                None => (0, 0),
+            })
+            .collect();
         interleave(&sources, &gather_indices)
             .streamling_context("failed to read the looked-up rows")
     }
 
-    fn single_key(&self) -> Result<&FieldRef> {
-        match self.key_fields.as_ref() {
-            [key] => Ok(key),
-            _ => Err(streamling_user_err!(
-                "table '{}': lookups need a single-column primary key, the table's is '{}'",
-                self.name,
-                self.primary_key
-            )),
-        }
+    /// The stored columns lookups read, with their positions. A window's
+    /// wall clock is GC bookkeeping, not part of the SQL output, so lookups
+    /// can't read it.
+    fn readable_columns(&self) -> impl Iterator<Item = (usize, &FieldRef)> {
+        self.schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !(field.name() == WALL_CLOCK_COLUMN && self.reads_wall_clock()))
     }
 
-    /// The stored column a lookup reads. A window's wall clock is GC
-    /// bookkeeping, not part of the SQL output, so lookups can't read it.
+    fn readable_fields(&self) -> Fields {
+        self.readable_columns()
+            .map(|(_, field)| Arc::clone(field))
+            .collect()
+    }
+
+    /// The stored column a lookup reads.
     fn column_index(&self, column: &str) -> Result<usize> {
-        self.schema
-            .index_of(column)
-            .ok()
-            .filter(|_| !(column == WALL_CLOCK_COLUMN && self.reads_wall_clock()))
+        self.readable_columns()
+            .find(|(_, field)| field.name() == column)
+            .map(|(index, _)| index)
             .ok_or_else(|| streamling_user_err!("table '{}' has no column '{}'", self.name, column))
     }
 
@@ -1756,7 +1844,7 @@ mod tests {
     fn lookup_names(table: &InMemoryTable, ids: &[Option<i64>]) -> Vec<Option<String>> {
         let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
         table
-            .lookup(&keys, "name", None)
+            .lookup(&[keys], "name", None)
             .unwrap()
             .as_string::<i32>()
             .iter()
@@ -1916,7 +2004,7 @@ mod tests {
         let narrower: ArrayRef = Arc::new(Int32Array::from(vec![7]));
         let text: ArrayRef = Arc::new(StringViewArray::from(vec!["7"]));
         for keys in [narrower, text] {
-            let names = table.lookup(&keys, "name", None).unwrap();
+            let names = table.lookup(&[Arc::clone(&keys)], "name", None).unwrap();
             assert_eq!(
                 names.as_string::<i32>().value(0),
                 "seven",
@@ -1924,16 +2012,22 @@ mod tests {
                 keys.data_type()
             );
         }
+        let uncastable: ArrayRef = Arc::new(StringViewArray::from(vec!["seven"]));
+        assert!(
+            !table.lookup_exists(&[uncastable], None).unwrap().value(0),
+            "a value that can't be cast misses"
+        );
     }
 
     #[test]
-    fn lookup_rejects_non_key_fields_unknown_columns_and_composite_keys() {
+    fn lookups_must_use_the_whole_primary_key() {
         let table = table();
         assert_eq!(
-            table.lookup_key_field("id").unwrap().data_type(),
-            &DataType::Int64
+            table.lookup_key_fields(" id ").unwrap().as_ref(),
+            schema().fields()[..1].as_ref(),
+            "key names are trimmed like the table's primary_key"
         );
-        let err = table.lookup_key_field("name").unwrap_err().to_string();
+        let err = table.lookup_key_fields("name").unwrap_err().to_string();
         assert!(
             err.contains("lookups must use the primary key 'id', got 'name'"),
             "{err}"
@@ -1947,20 +2041,141 @@ mod tests {
         }
         assert!(table.lookup_field("name").unwrap().is_nullable());
 
-        let composite = InMemoryTable::try_new(
+        let composite = balances();
+        assert_eq!(
+            composite.lookup_key_fields("chain, address").unwrap().len(),
+            2
+        );
+        for key in ["chain", "address,chain", "chain,address,amount"] {
+            let err = composite.lookup_key_fields(key).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "lookups must use the primary key 'chain,address', got '{key}'"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    fn balances_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("chain", DataType::Utf8, false),
+            Field::new("address", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+        ]))
+    }
+
+    /// A table keyed by `(chain, address)` holding `(eth, 0x1) → 10` and
+    /// `(sol, 0x1) → 20`.
+    fn balances() -> InMemoryTable {
+        let table = InMemoryTable::try_new(
             TABLE,
-            &schema(),
-            &["id".to_string(), "name".to_string()],
+            &balances_schema(),
+            &["chain".to_string(), "address".to_string()],
             METRIC_KEY.to_string(),
             MAX_DEAD_RATIO,
             None,
             VersionRetention::Latest,
         )
         .unwrap();
-        let err = composite.lookup_key_field("id").unwrap_err().to_string();
+        let batch = RecordBatch::try_new(
+            balances_schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["eth", "sol"])),
+                Arc::new(StringArray::from(vec!["0x1", "0x1"])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(StringArray::from(vec!["i", "i"])),
+            ],
+        )
+        .unwrap();
+        table.apply(&batch, &[]).unwrap();
+        table
+    }
+
+    #[test]
+    fn composite_key_lookups_match_every_key_column() {
+        let table = balances();
+        let chains: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("eth"),
+            Some("sol"),
+            Some("eth"),
+            None,
+            Some("eth"),
+        ]));
+        let addresses: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("0x1"),
+            Some("0x1"),
+            Some("0x2"),
+            Some("0x1"),
+            None,
+        ]));
+        let keys = [chains, addresses];
+        let amounts = table.lookup(&keys, "amount", None).unwrap();
+        assert_eq!(
+            amounts
+                .as_primitive::<Int64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(10), Some(20), None, None, None],
+            "a NULL in any key column misses"
+        );
+        assert_eq!(
+            table
+                .lookup_exists(&keys, None)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false)
+            ]
+        );
+
+        let err = table
+            .lookup(&keys[..1], "amount", None)
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("lookups need a single-column primary key"),
+            err.contains("has 2 columns, got 1 lookup key columns"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn row_lookups_read_every_column_once_per_key() {
+        let table = balances();
+        let keys: [ArrayRef; 2] = [
+            Arc::new(StringArray::from(vec!["sol", "eth"])),
+            Arc::new(StringArray::from(vec!["0x1", "0x2"])),
+        ];
+        let rows = table.lookup_rows(&keys, None).unwrap();
+        let DataType::Struct(fields) = table.lookup_row_field().data_type().clone() else {
+            panic!("a struct");
+        };
+        assert_eq!(rows.fields(), &fields);
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name().as_str(), field.data_type().clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("chain", DataType::Utf8),
+                ("address", DataType::Utf8),
+                ("amount", DataType::Int64)
+            ]
+        );
+        assert!(table.lookup_row_field().is_nullable());
+        assert!(rows.is_valid(0) && rows.is_null(1));
+        assert_eq!(
+            rows.column_by_name("amount")
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0),
+            20
         );
     }
 
@@ -2280,6 +2495,16 @@ mod tests {
             err.contains("table 'tokens' has no column '__timestamp'"),
             "{err}"
         );
+        let DataType::Struct(row_fields) = windowed.lookup_row_field().data_type().clone() else {
+            panic!("a struct");
+        };
+        assert_eq!(
+            row_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["id", "name"]
+        );
 
         let with_wall_clock = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -2524,7 +2749,7 @@ mod tests {
     ) -> Result<Vec<Option<String>>> {
         let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
         Ok(table
-            .lookup(&keys, "name", mark)?
+            .lookup(&[keys], "name", mark)?
             .as_string::<i32>()
             .iter()
             .map(|name| name.map(str::to_string))
@@ -2559,6 +2784,43 @@ mod tests {
             assert_eq!(
                 lookup_names_at(&table, &[1, 2, 3], mark).unwrap(),
                 names(&expected),
+                "{mark:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_and_exists_reads_at_a_mark_do_not_see_later_applies() {
+        let table = versioned_table();
+        let first = apply_marked(&table, &batch(&[(1, "a", "i"), (2, "b", "i")]), &[]);
+        let second = apply_marked(&table, &batch(&[(1, "x", "d"), (2, "b2", "u")]), &[]);
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+
+        for (mark, expected) in [
+            (first, [Some("a"), Some("b")]),
+            (second, [None, Some("b2")]),
+            (None, [None, Some("b2")]),
+        ] {
+            let rows = table.lookup_rows(&[Arc::clone(&keys)], mark).unwrap();
+            let row_names: Vec<Option<String>> = (0..rows.len())
+                .map(|row| {
+                    rows.is_valid(row).then(|| {
+                        rows.column_by_name("name")
+                            .unwrap()
+                            .as_string::<i32>()
+                            .value(row)
+                            .to_string()
+                    })
+                })
+                .collect();
+            assert_eq!(row_names, names(&expected), "{mark:?}");
+            assert_eq!(
+                table
+                    .lookup_exists(&[Arc::clone(&keys)], mark)
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected.map(|name| Some(name.is_some())),
                 "{mark:?}"
             );
         }

@@ -2,7 +2,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Word};
 use std::collections::{HashMap, VecDeque};
-use streamling_core::functions::lookup::LOOKUP_EQ_NAME;
+use streamling_core::functions::lookup::LOOKUP_NAMES;
 use streamling_core::topology;
 use tracing::debug;
 
@@ -138,8 +138,9 @@ struct SqlTokens {
     /// Lowercased multi-part dotted identifiers like `schema.table` or
     /// `receipt.value.logs`, reconstructed from consecutive Word.Word runs.
     dotted_sequences: Vec<String>,
-    /// Lowercased table names from `lookup_eq('<table>', ...)` calls. A string
-    /// literal is not a word, so these are collected separately.
+    /// Lowercased table names from lookup calls such as `lookup_eq('<table>',
+    /// ...)`. A string literal is not a word, so these are collected
+    /// separately.
     lookup_tables: Vec<String>,
 }
 
@@ -176,7 +177,12 @@ fn extract_sql_tokens(sql: &str) -> SqlTokens {
                 Token::Word(Word { value, .. }),
                 Token::LParen,
                 Token::SingleQuotedString(table),
-            ] if value.eq_ignore_ascii_case(LOOKUP_EQ_NAME) => Some(table.to_lowercase()),
+            ] if LOOKUP_NAMES
+                .iter()
+                .any(|name| value.eq_ignore_ascii_case(name)) =>
+            {
+                Some(table.to_lowercase())
+            }
             _ => None,
         })
         .collect();
@@ -365,6 +371,34 @@ mod tests {
         let order = sort_transforms(&transforms, &HashMap::new());
 
         assert_eq!(order, ["prep", "rates", "enriched"]);
+    }
+
+    #[test]
+    fn row_and_exists_lookup_readers_sort_after_their_table() {
+        for lookup in [
+            "lookup_row('rates', 'address', address)",
+            "Lookup_Exists('Rates', 'address', address)",
+        ] {
+            let mut transforms = HashMap::new();
+            transforms.insert(
+                "prep".to_string(),
+                create_sql_transform("SELECT address, amount FROM rates_src"),
+            );
+            transforms.insert(
+                "rates".to_string(),
+                create_table_transform("SELECT address, amount FROM prep"),
+            );
+            transforms.insert(
+                "enriched".to_string(),
+                create_sql_transform(&format!(
+                    "SELECT id, {lookup} AS looked_up FROM transactions"
+                )),
+            );
+
+            let order = sort_transforms(&transforms, &HashMap::new());
+
+            assert_eq!(order, ["prep", "rates", "enriched"], "{lookup}");
+        }
     }
 
     /// By name, `a_volumes` sorts first and `b_reader` before `z_tokens`.

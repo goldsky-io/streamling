@@ -223,7 +223,7 @@ mod tests {
     fn names(table: &InMemoryTable, ids: &[i64]) -> Vec<Option<String>> {
         let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
         table
-            .lookup(&keys, "name", None)
+            .lookup(&[keys], "name", None)
             .unwrap()
             .as_string::<i32>()
             .iter()

@@ -2,7 +2,7 @@ pub use streamling_common::functions::*;
 
 use crate::dynamic_table::DynamicTableRegistry;
 use crate::functions::dynamic_table::DynamicTableCheckFunc;
-use crate::functions::lookup::LookupEqFunc;
+use crate::functions::lookup::{LookupFunc, LookupResult};
 use crate::table::TableRegistry;
 use crate::table::read::TableUdf;
 use datafusion::logical_expr::ScalarUDF;
@@ -21,9 +21,9 @@ impl StreamlingFunctions {
         funcs.push(ScalarUDF::from(DynamicTableCheckFunc::new(
             dynamic_table_registry,
         )));
-        funcs.push(ScalarUDF::new_from_impl(TableUdf::new(LookupEqFunc::new(
-            tables,
-        ))));
+        funcs.extend(LookupResult::ALL.map(|result| {
+            ScalarUDF::new_from_impl(TableUdf::new(LookupFunc::new(tables.clone(), result)))
+        }));
         funcs
     }
 }
