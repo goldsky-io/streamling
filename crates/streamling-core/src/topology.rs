@@ -9,6 +9,7 @@ use serde::de;
 use serde::{Deserialize, Deserializer};
 use streamling_config::{
     ClickHouseCompression, DynamicTableBackendType, GzipCompressionLevel, KafkaCompression,
+    TableBackendType,
 };
 use tracing::log::info;
 
@@ -541,6 +542,38 @@ pub struct DynamicTableTransform {
     pub telemetry: Option<Telemetry>,
 }
 
+/// A primary-keyed table maintained from a stateless SQL query. Other nodes
+/// read its SQL output by name.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TableTransform {
+    pub backend_type: TableBackendType,
+    /// Comma-separated for composite keys.
+    pub primary_key: String,
+    /// Storage stays within about (1 + max_dead_ratio) × the live rows. Lower
+    /// values use less memory and spend more time cleaning.
+    #[serde(default = "default_max_dead_ratio")]
+    pub max_dead_ratio: f64,
+    /// SQL predicate over the table's columns, `__timestamp`, the wall-clock
+    /// time a row was applied, and `watermark(column)`, the largest value of
+    /// `column` stored. The table keeps the rows it is true for and
+    /// garbage-collects the rest.
+    pub window: Option<String>,
+    /// Projection and filter over one source or transform.
+    pub sql: String,
+    pub telemetry: Option<Telemetry>,
+}
+
+/// `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's
+/// live rows, maintained incrementally. Only lookups read it, keyed by
+/// the GROUP BY expression.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TableAggTransform {
+    pub sql: String,
+    pub telemetry: Option<Telemetry>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SqlTransform {
@@ -625,6 +658,8 @@ define_typed_enum!(
     #[derive(Debug, Clone)]
     pub enum Transform {
         dynamic_table(DynamicTableTransform),
+        table(TableTransform),
+        table_agg(TableAggTransform),
         sql(SqlTransform),
         handler(HandlerTransform),
         script(ScriptTransform),
@@ -638,6 +673,8 @@ impl Transform {
     pub fn telemetry(&self) -> Option<&Telemetry> {
         match self {
             Transform::dynamic_table(t) => t.telemetry.as_ref(),
+            Transform::table(t) => t.telemetry.as_ref(),
+            Transform::table_agg(t) => t.telemetry.as_ref(),
             Transform::sql(t) => t.telemetry.as_ref(),
             Transform::handler(t) => t.telemetry.as_ref(),
             Transform::script(t) => t.telemetry.as_ref(),
@@ -647,14 +684,15 @@ impl Transform {
 
     /// Requested output width for this transform.
     ///
-    /// `dynamic_table` is a `SinglePartition` operator.
+    /// `dynamic_table` and `table` are `SinglePartition` operators, and a
+    /// `table_agg` runs inside its table's apply.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Transform::sql(t) => t.parallelism,
             Transform::handler(t) => t.parallelism,
             Transform::script(t) => t.parallelism,
             Transform::plugin(t) => t.parallelism,
-            Transform::dynamic_table(_) => None,
+            Transform::dynamic_table(_) | Transform::table(_) | Transform::table_agg(_) => None,
         }
     }
 }
@@ -754,6 +792,13 @@ pub struct PostgresSink {
 
 fn default_on_conflict() -> String {
     "update".to_string()
+}
+
+/// Default for [`TableTransform::max_dead_ratio`].
+pub const DEFAULT_MAX_DEAD_RATIO: f64 = 0.25;
+
+fn default_max_dead_ratio() -> f64 {
+    DEFAULT_MAX_DEAD_RATIO
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1024,7 +1069,11 @@ fn transform_per_type_reserved_keys(transform: &Transform) -> &'static [&'static
     match transform {
         Transform::script(_) => &["language"],
         Transform::plugin(_) => &["type"],
-        Transform::sql(_) | Transform::handler(_) | Transform::dynamic_table(_) => &[],
+        Transform::sql(_)
+        | Transform::handler(_)
+        | Transform::dynamic_table(_)
+        | Transform::table(_)
+        | Transform::table_agg(_) => &[],
     }
 }
 
@@ -3450,5 +3499,101 @@ sinks: {}
                 .as_deref(),
             Some(&[99u32][..])
         );
+    }
+
+    #[test]
+    fn table_transform_parses_with_defaults() {
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory
+    primary_key: chain, address
+    sql: SELECT chain, address, symbol FROM src
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        let Transform::table(table) = &topology.transforms["tokens"] else {
+            panic!("expected a table transform");
+        };
+        assert_eq!(table.backend_type, TableBackendType::InMemory);
+        assert_eq!(table.primary_key, "chain, address");
+        assert_eq!(table.max_dead_ratio, DEFAULT_MAX_DEAD_RATIO);
+        assert_eq!(table.window, None);
+        assert_eq!(topology.transforms["tokens"].parallelism(), None);
+    }
+
+    #[test]
+    fn table_transform_parses_max_dead_ratio() {
+        let yaml = r#"
+sources:
+  src: { type: kafka, topic: t, primary_key: id }
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory
+    primary_key: id
+    max_dead_ratio: 0.1
+    sql: SELECT id FROM src
+sinks: {}
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        let Transform::table(table) = &topology.transforms["tokens"] else {
+            panic!("expected a table transform");
+        };
+        assert_eq!(table.max_dead_ratio, 0.1);
+    }
+
+    #[test]
+    fn table_agg_transform_parses_and_rejects_unknown_fields() {
+        const SQL: &str = "SELECT address, count(*) AS n FROM tokens GROUP BY address";
+        let parse = |extra: &str| {
+            PipelineTopology::load_from_string(&format!(
+                "sources:\n  src: {{ type: kafka, topic: t, primary_key: id }}\ntransforms:\n  volumes:\n    type: table_agg\n    sql: {SQL}\n{extra}sinks: {{}}\n"
+            ))
+        };
+
+        let topology = parse("").unwrap();
+        let Transform::table_agg(aggregate) = &topology.transforms["volumes"] else {
+            panic!("expected a table_agg transform");
+        };
+        assert_eq!(aggregate.sql, SQL);
+        assert_eq!(topology.transforms["volumes"].parallelism(), None);
+
+        let unknown = parse("    primary_key: address\n").unwrap_err().to_string();
+        assert!(unknown.contains("unknown field `primary_key`"), "{unknown}");
+    }
+
+    #[test]
+    fn table_transform_rejects_unknown_and_missing_fields() {
+        const REQUIRED: [&str; 3] = ["backend_type", "primary_key", "sql"];
+        let valid =
+            "    backend_type: in_memory\n    primary_key: id\n    sql: SELECT id FROM src\n";
+        let parse = |body: &str| {
+            let yaml = format!(
+                "sources:\n  src: {{ type: kafka, topic: t, primary_key: id }}\ntransforms:\n  tokens:\n    type: table\n{body}sinks: {{}}\n"
+            );
+            PipelineTopology::load_from_string(&yaml)
+                .err()
+                .map(|err| err.to_string())
+        };
+
+        assert_eq!(parse(valid), None);
+        let unknown = parse(&format!("{valid}    parallelism: 2\n")).expect("must fail");
+        assert!(unknown.contains("unknown field `parallelism`"), "{unknown}");
+        for field in REQUIRED {
+            let body: String = valid
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(field))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            let missing = parse(&body).expect("must fail");
+            assert!(
+                missing.contains(&format!("missing field `{field}`")),
+                "{missing}"
+            );
+        }
     }
 }

@@ -27,6 +27,7 @@ Install with one command (see [Quick start](#quick-start)) or read more at [stre
 - [Engine SQL functions](docs/sql-udfs.md)
 - [Topology](#topology)
 - [Dynamic Tables](#dynamic-tables)
+- [Tables](#tables)
 - [Side Outputs](#side-outputs)
 - [Checkpointing](#checkpointing)
 - [State Backends](#state-backends)
@@ -1137,13 +1138,200 @@ This input can be a source or another transform.
 - **Backend Choice**: Choose backends based on your latency and persistence requirements
 - **Indexing**: PostgreSQL backend automatically creates an index for optimal lookup performance
 
+## Tables
+
+A `table` transform keeps the latest row per primary key, built from a stateless SQL query. Other nodes read the table's SQL output by name, and [lookups](#lookups) read its rows.
+
+```yaml
+transforms:
+  tokens:
+    type: table
+    backend_type: in_memory # required
+    primary_key: address # required; comma-separated for composite keys
+    max_dead_ratio: 0.25 # optional, default 0.25
+    window: block_time >= watermark(block_time) - interval '1 hour' # optional
+    sql: SELECT address, symbol, decimals, block_time FROM token_events WHERE chain = 'eth'
+
+sinks:
+  tokens_pg:
+    type: postgres
+    from: tokens # reads the table's SQL output
+    table: tokens
+    schema: public
+    primary_key: address
+```
+
+| Field          | Notes                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------- |
+| `backend_type` | Required. `in_memory` is the only backend.                                                                    |
+| `primary_key`  | Required. Key columns must be in the SQL output. A null key value fails the pipeline.                         |
+| `max_dead_ratio` | Default `0.25`. Storage stays within about (1 + `max_dead_ratio`) × the live rows. Each batch cleans up to (1 + 1/`max_dead_ratio`) stored rows per written row, at least 1024. Lower values use less memory and more CPU. |
+| `window`       | Optional. A SQL predicate; the table keeps only the rows it is true for. See [Windows](#windows). |
+| `sql`          | Required. Projections and filters over one source or transform. Anything else, including `UNNEST`, `UNION`, joins and aggregations, is rejected. |
+| `telemetry`    | Optional. Standard rules.                                                                                     |
+
+The table is applied inside the node its SQL reads, before that node hands the batch to anyone else. On a source with a `filter`, the table gets only the rows the filter keeps.
+
+Each partition of that node applies its own batches. Keep all versions of a key in one partition (for Kafka, key the topic by the table's primary key); otherwise the table keeps whichever version is applied last.
+
+### Applying and reading
+
+Each row of the SQL output is applied by primary key, in order. A row whose `_gs_op` is `i`, `c`, `r` or `u` replaces the key's row, or inserts it. A `d` removes the key's row, if there is one. Matching is case-insensitive. Any other `_gs_op` value fails the pipeline.
+
+`FROM tokens` in a SQL transform, or `from: tokens` on a sink, handler, script or plugin, reads the table's SQL output unchanged, `_gs_op` included: the same rows a SQL transform with the table's query would emit. Joins against a table are not supported yet; use [lookups](#lookups) for primary-key lookups. A table with no readers is still maintained and still takes part in checkpointing.
+
+### Lookups
+
+Three functions read the row in `table` whose primary key `key` equals the values:
+
+| Function | Returns |
+| --- | --- |
+| `lookup_eq(table, key, value_1, ..., value_n, column)` | `column` of the row, or `NULL` if no row matches. |
+| `lookup_row(table, key, value_1, ..., value_n)` | A struct of the row's columns, or `NULL` if no row matches. Read a field with `lookup_row(...)['amount']`. |
+| `lookup_exists(table, key, value_1, ..., value_n)` | `true` if a row matches, otherwise `false`. Never `NULL`. |
+
+```yaml
+transforms:
+  rates_mapping:
+    type: table
+    backend_type: in_memory
+    primary_key: address
+    sql: SELECT address, amount FROM rates
+  enriched:
+    type: sql
+    primary_key: id
+    sql: SELECT *, lookup_eq('rates_mapping', 'address', address, 'amount') AS calc_amount FROM transactions
+  balances:
+    type: table
+    backend_type: in_memory
+    primary_key: address,token
+    sql: SELECT address, token, amount, updated_at FROM balance_events
+  payments_enriched:
+    type: sql
+    primary_key: id
+    sql: >-
+      SELECT *,
+        lookup_row('balances', 'address,token', sender, token) AS sender_balance,
+        lookup_exists('balances', 'address,token', receiver, token) AS receiver_holds_token
+      FROM payments
+```
+
+- `table`, `key` and `column` are string literals. `key` is the table's whole primary key, comma-separated as in its `primary_key`, and one value follows per key column, in that order. Invalid calls fail at startup.
+- Each value is cast to its key column's type. A `NULL` value, or one that cannot be cast, in any position is a miss: `NULL`, or `false` from `lookup_exists`.
+- `lookup_row`'s struct holds every column `lookup_eq` can read, with the table's column types. A `lookup_row` call probes the table once for all of them, where each `lookup_eq` call probes it again.
+- A lookup from a node downstream of the table's input, such as a SQL transform reading the same source (a self-join), reads the table as it was when the input applied the batch being processed: every row up to and including that batch, and nothing later, however far the input has run ahead of its readers. With several input partitions, that moment includes what the other partitions had applied by then. Every key, and every [`table_agg`](#aggregates) over the table, is read at that same moment. This holds for any number of readers. Its limits:
+  - Within a batch, a row also sees the rows after it in the same batch.
+  - With several input partitions, what the other partitions had applied depends on how their applies interleave, so results can differ between runs.
+  - A script, handler or plugin transform with a `batch_size` or `batch_flush_interval` merges batches. A lookup that reads batches it merged after the table's input applied them reads the table as of the last batch merged, so a row also sees the batches merged after its own, up to that transform's `batch_size` rows or `batch_flush_interval`, whichever comes first.
+- Lookups from other inputs read the table's latest state, not synchronized with it: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
+- The table keeps the earlier versions of rows that changed, and the dropped chunks they live in, for a checkpoint interval plus the time to finalize the checkpoint. A checkpoint that doesn't finalize, such as one stuck on a slow sink, holds them until the next one does. No checkpoint finalizes after the final one starts, so a pipeline that keeps running past that point (one bounded source done, another still running) keeps every version until it stops. `table_versions` and `table_retired_bytes` show what's held.
+- After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
+
+### Windows
+
+`window` is a boolean SQL expression over the table's columns. Rows it is `false` or `NULL` for are garbage collected:
+
+```yaml
+window: block_time >= watermark(block_time) - interval '1 hour'
+```
+
+- Columns must be in the table's SQL output. `_gs_op` is not stored, so it can't be used.
+- `watermark(column)` is the largest value of `column` the table has stored, so the window follows the data's own time. Use it whenever the data has an event-time column. See [Event time](#event-time-watermark).
+- `now()` is wall-clock time, evaluated on each GC pass. When replaying data older than the window, such as with `starting_offsets: earliest`, rows are evicted as soon as a GC pass runs, so lookups during the replay miss them. `watermark()` doesn't have this problem.
+- `__timestamp` is the wall-clock time the row was applied to the table, for when the data has no event-time column: `window: __timestamp >= now() - interval '1 hour'`. An upsert refreshes it. The SQL output cannot contain a `__timestamp` column. During a replay every row is fresh, so the table holds everything applied in the last hour.
+- `__timestamp` can't be read by lookups, and isn't in `lookup_row`'s struct.
+- GC passes run as the table's input delivers batches:
+  - with `watermark()`, inside every apply that stores rows, so a batch's rows are evicted as soon as they're outside the window;
+  - for any window, at the end of an apply, at most once per `table.window_gc_interval` in the app config (default `1s`, override with `STREAMLING__TABLE__WINDOW_GC_INTERVAL`). An idle input still delivers empty batches, at least one per checkpoint, so collection doesn't wait for new data. Until a row is collected, a lookup can still return it.
+- Each stored batch keeps the min, max and null count of the columns the window reads, and a GC pass skips the batches that are wholly inside the window. This works when the window compares a column, or a `CAST` of one, with an expression of `now()` or `watermark()`:
+  - `block_time >= watermark(block_time) - interval '1 hour'` for a timestamp column
+  - `block_timestamp >= watermark(block_timestamp) - 3600` for integer epoch seconds
+  - `block_time >= now() - interval '1 hour'`
+  - `block_timestamp >= extract(epoch from now() - interval '1 hour')`
+
+  A function of the column, such as `to_timestamp(block_timestamp) >= now() - interval '1 hour'`, still works, but every pass evaluates every stored row; startup logs a warning. Skipping pays off when rows arrive roughly in time order.
+- Eviction only changes the table's storage. The table's SQL output, which other nodes read, doesn't emit anything for evicted rows.
+
+#### Event time (`watermark`)
+
+`watermark(column)` takes one column of the table. It starts `NULL` and rises to the largest non-null value of the column in every row the table stores, upserts and deletes alike. It never goes down: deleting, updating or evicting the row that set it doesn't lower it.
+
+With `window: block_time >= watermark(block_time) - interval '1 hour'`, applying in order:
+
+| Apply | Watermark | Effect |
+| --- | --- | --- |
+| A@10:00, B@10:20 | 10:20 | Both kept. |
+| C@11:10 | 11:10 | A is evicted: it's before 10:10. |
+| late D@09:30 | 11:10 | D is stored and evicted in the same apply. No lookup sees it. |
+| B updated to @10:05 | 11:10 | B's old row is replaced, and the new one is outside the window, so B is gone. |
+| C deleted | 11:10 | The watermark stays. |
+| input idle for 3 hours | 11:10 | Nothing is evicted. |
+| restart | `NULL` | The table starts empty and the replay rebuilds the watermark. |
+
+- A lookup sees the window as it was at its own batch. Rows evicted by that batch or earlier ones are gone; rows evicted by later batches are still visible.
+- During a replay, the table holds the window that ends at the latest stored time, and a lookup reads the table [as of its own batch](#lookups). So lookups and [aggregates](#aggregates) give the results they gave live, within the limits there: rows later in the same batch, and how other partitions interleave.
+- All partitions of the table's input share one watermark. A partition behind the others has its rows older than the window evicted as they arrive.
+- An out-of-order allowance is a larger interval: `watermark(block_time) - interval '1 hour 5 minutes'`.
+- One timestamp far in the future moves the watermark there for good and evicts everything else. Cap it with the wall clock: `block_time >= least(watermark(block_time), now()) - interval '1 hour'`.
+- `watermark()` can only be used in a `window`.
+
+### Restarts (`in_memory`)
+
+The `in_memory` backend does not persist its contents. After a restart, the table starts empty and its source replays from the last committed offsets, so keys written before the last checkpoint are missing until they are written again.
+
+### Aggregates
+
+A `table_agg` transform keeps `SELECT <key>, <aggregates> FROM <table> GROUP BY <key>` over a table's rows, updated as the table changes. [Lookups](#lookups) read it by the GROUP BY key. Over a [windowed](#windows) table it's a sliding aggregate: a row stops counting when the window evicts it.
+
+```yaml
+transforms:
+  hour_window:
+    type: table
+    backend_type: in_memory
+    primary_key: tx_hash
+    window: block_time >= watermark(block_time) - interval '1 hour'
+    sql: SELECT tx_hash, address, amount, block_time FROM transfers
+  hour_volumes:
+    type: table_agg
+    sql: SELECT address, sum(amount) AS hour_volume, count(*) AS transfers FROM hour_window GROUP BY address
+  enriched:
+    type: sql
+    primary_key: id
+    sql: SELECT *, lookup_eq('hour_volumes', 'address', sender, 'hour_volume') AS sender_hour_volume FROM transactions
+```
+
+| Field       | Notes                                 |
+| ----------- | ------------------------------------- |
+| `sql`       | Required. See below.                  |
+| `telemetry` | Optional. Standard rules.             |
+
+The SQL is `SELECT <key>, <select expressions> FROM <table> [WHERE ...] GROUP BY <key>`:
+
+- `FROM` names one `table`.
+- There is exactly one GROUP BY expression, and the SQL selects it. That column is the key lookups use. For a composite key, group by a concatenation: `SELECT address || ':' || token AS key, ... GROUP BY 1`.
+- The aggregates are `count(*)`, `count(expr)`, `sum(expr)` and `avg(expr)`, without `DISTINCT`, `FILTER` or `ORDER BY`. Select expressions can combine them: `sum(amount) / count(*) AS mean`.
+- `WHERE` filters the table's rows before they are grouped.
+- Every function must be deterministic, so `now()`, `random()` and lookups are rejected.
+- `_gs_op` can't be read: tables don't store it.
+- `HAVING`, joins, subqueries, `ORDER BY`, `LIMIT` and window functions are rejected.
+
+How it's maintained:
+
+- The aggregate always equals its SQL run over the table's current rows. An upsert retracts the key's previous row and adds the new one. A delete or a window eviction retracts the row.
+- A group exists while it has rows, including rows whose aggregate arguments are `NULL`. Once its last row goes, lookups return `NULL`.
+- Rows with a `NULL` key aren't aggregated.
+- It's updated inside the table's apply, so a lookup has the same guarantees as a lookup on the table, and reads the aggregate at the same moment as a lookup on the table from the same batch: the aggregate equals its SQL over the table's rows at that moment, whichever partitions they came from. Evictions follow the table's GC passes: an expired row counts until a pass evicts it.
+- Retracting floating-point values accumulates rounding error. Integers and decimals, `decimal_arb` included, are exact.
+- Only lookups read a `table_agg`. Naming it in `FROM` or `from:` is rejected.
+- Like its table, it starts empty after a restart.
+
 ## Side Outputs
 
 Side outputs allow emitting data to a "side" processor without modifying the main data flow. They're not part of the topology definition
 (not visible in the LogicalPlan). The implementation can slightly differ between operators, but the general idea is that side outputs are executed
 right before the data is emitted (by receiving a `RecordBatch`).
 
-Currently, the only use case for side outputs is populating dynamic tables (when a SQL query is defined).
+Side outputs populate dynamic tables (when a SQL query is defined) and tables. On a source with a `filter`, side outputs see every row the source reads, except a table's, which sees only the rows the filter keeps.
 
 ## Checkpointing
 
@@ -2369,17 +2557,21 @@ Environment variables can also be used:
 
 The following table shows all supported components and the metrics they emit:
 
-| Component                  | Tags/Labels | Metric Name           | Metric Type | Description                                          |
-| -------------------------- | ----------- | --------------------- | ----------- | ---------------------------------------------------- |
-| **Kafka Source**           | `topic`     | `output_rows`         | Counter     | Total number of rows consumed from Kafka topics      |
-|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being consumed per time window  |
-|                            |             | `output_rows_latency` | Histogram   | Time taken to process Kafka message batches (ms)     |
-| **HTTP Handler Transform** |             | `output_rows`         | Counter     | Total number of rows processed by HTTP handlers      |
-|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being processed per time window |
-|                            |             | `output_rows_latency` | Histogram   | Time taken for HTTP request/response cycles (ms)     |
-| **Blackhole Sink**         |             | `output_rows`         | Counter     | Total number of rows discarded                       |
-|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being discarded per time window |
-|                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)       |
+| Component                  | Tags/Labels | Metric Name           | Metric Type | Description                                              |
+| -------------------------- | ----------- | --------------------- | ----------- | -------------------------------------------------------- |
+| **Kafka Source**           | `topic`     | `output_rows`         | Counter     | Total number of rows consumed from Kafka topics          |
+|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being consumed per time window      |
+|                            |             | `output_rows_latency` | Histogram   | Time taken to process Kafka message batches (ms)         |
+| **HTTP Handler Transform** |             | `output_rows`         | Counter     | Total number of rows processed by HTTP handlers          |
+|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being processed per time window     |
+|                            |             | `output_rows_latency` | Histogram   | Time taken for HTTP request/response cycles (ms)         |
+| **Blackhole Sink**         |             | `output_rows`         | Counter     | Total number of rows discarded                           |
+|                            |             | `output_rows_rate`    | Gauge       | Current rate of rows being discarded per time window     |
+|                            |             | `output_rows_latency` | Histogram   | Time taken to process and discard batches (ms)           |
+| **Table Transform**        |             | `table_live_rows`     | Gauge       | Rows currently stored in the table                       |
+|                            |             | `table_memory_bytes`  | Gauge       | Bytes held by the table's chunks and key index           |
+|                            |             | `table_versions`      | Gauge       | History entries kept for positioned reads                |
+|                            |             | `table_retired_bytes` | Gauge       | Bytes of dropped chunks that earlier versions still read |
 
 **Note**
 

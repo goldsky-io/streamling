@@ -1,8 +1,8 @@
 //! Regression tests for two DataFusion 54 upgrade hazards.
 //!
-//! 1. `WrappingExec` (telemetry wrapper) must not be deleted by DataFusion
-//!    54's hook-driven optimizer rules — same elision hazard as `RebatchExec`
-//!    (see tests/rebatch_elision.rs): delegated
+//! 1. `WrappingExec` (telemetry wrapper) and `SideOutputExec` must not be
+//!    deleted by DataFusion 54's hook-driven optimizer rules — same elision
+//!    hazard as `RebatchExec` (see tests/rebatch_elision.rs): delegated
 //!    `try_swapping_with_projection`/`with_fetch`/`repartitioned` returned
 //!    inner subtrees that do not contain the wrapper.
 //! 2. `ExtractLeafExpressions` (`__datafusion_extracted_N` aliasing) must be
@@ -24,11 +24,11 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 
 use streamling_core::dynamic_table::DynamicTableRegistry;
-use streamling_core::operators::wrapping::WrappingExec;
+use streamling_core::operators::wrapping::{SideOutputExec, WrappingExec};
 use streamling_core::session::SessionManager;
 
 #[test]
-fn projection_pushdown_must_not_elide_wrapping_exec() {
+fn projection_pushdown_must_not_elide_the_wrappers() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int64, false),
         Field::new("b", DataType::Utf8, false),
@@ -48,13 +48,17 @@ fn projection_pushdown_must_not_elide_wrapping_exec() {
         inner_proj,
         "source_1".to_string(),
         vec![],
-        vec![],
         None,
     ));
+    let with_side_outputs: Arc<dyn ExecutionPlan> =
+        Arc::new(SideOutputExec::new(wrapped, "source_1".to_string(), vec![]));
     let plan: Arc<dyn ExecutionPlan> = Arc::new(
         ProjectionExec::try_new(
-            vec![(col("a", &wrapped.schema()).unwrap(), "a".to_string())],
-            wrapped,
+            vec![(
+                col("a", &with_side_outputs.schema()).unwrap(),
+                "a".to_string(),
+            )],
+            with_side_outputs,
         )
         .unwrap(),
     );
@@ -69,13 +73,17 @@ fn projection_pushdown_must_not_elide_wrapping_exec() {
     // the tree structurally instead of by name: the projection's child must
     // still be the wrapper (schema adjusted by WrappingExec), and the plan
     // must not have collapsed to projection-over-source.
-    fn contains_wrapping(plan: &Arc<dyn ExecutionPlan>) -> bool {
-        plan.downcast_ref::<WrappingExec>().is_some()
-            || plan.children().iter().any(|c| contains_wrapping(c))
+    fn contains<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        plan.downcast_ref::<T>().is_some() || plan.children().iter().any(|c| contains::<T>(c))
     }
     assert!(
-        contains_wrapping(&optimized),
+        contains::<WrappingExec>(&optimized),
         "WrappingExec was ELIDED by ProjectionPushdown under df54!\n\
+         === BEFORE ===\n{before}\n=== AFTER ===\n{after}"
+    );
+    assert!(
+        contains::<SideOutputExec>(&optimized),
+        "SideOutputExec was ELIDED by ProjectionPushdown under df54!\n\
          === BEFORE ===\n{before}\n=== AFTER ===\n{after}"
     );
 }
