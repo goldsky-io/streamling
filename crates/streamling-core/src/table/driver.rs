@@ -2,8 +2,8 @@
 //! acked, even when nothing reads it.
 
 use crate::checkpoints::checkpoint_management::{
-    CheckpointControl, extract_checkpoint_messages, now_ms, process_checkpoint_acks,
-    register_sink_streams, send_checkpoint_ack, sink_stream_done,
+    CheckpointControl, extract_checkpoint_messages, last_marker_epoch, now_ms,
+    process_checkpoint_acks, register_sink_streams, send_checkpoint_ack, sink_stream_done,
 };
 use crate::session::SessionManager;
 use crate::shutdown::ComponentScope;
@@ -111,9 +111,12 @@ async fn drive_partition(
     metric_metadata_id: String,
 ) -> Result<()> {
     let metrics_recorder = get_metrics_recorder();
+    let mut last_flushed = None;
     while let Some(batch) = stream.next().await {
+        let messages = extract_checkpoint_messages(batch?.schema().metadata());
+        last_flushed = last_flushed.max(last_marker_epoch(&messages));
         process_checkpoint_acks(
-            extract_checkpoint_messages(batch?.schema().metadata()),
+            messages,
             now_ms(),
             Instant::now(),
             &metrics_recorder,
@@ -122,9 +125,9 @@ async fn drive_partition(
         );
     }
     // An ended stream never delivers another marker, so the gate counts its
-    // share of every pending epoch as delivered. A failed stream returns
+    // share of every epoch after `last_flushed` as delivered. A failed stream returns
     // above, so the epochs it touched aren't acked.
-    for epoch in sink_stream_done(&table_name) {
+    for epoch in sink_stream_done(&table_name, last_flushed) {
         send_checkpoint_ack(epoch, &table_name);
     }
     Ok(())
