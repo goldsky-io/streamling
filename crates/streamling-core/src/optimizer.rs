@@ -287,8 +287,9 @@ fn attribute_downstream(
         .downcast_ref::<DataSinkExec>()
         .map(|dse| wrapping_downstream_name(dse.sink(), named_downstream))
         .or_else(|| {
+            // Every partition's sink writes the same node, so partition 0 names it.
             node.downcast_ref::<ParallelSinkExec>()
-                .map(|pse| wrapping_downstream_name(pse.sink(), named_downstream))
+                .map(|pse| wrapping_downstream_name(pse.sink_for(0), named_downstream))
         });
     if let Some(sink_downstream) = sink_downstream {
         let new_children = node
