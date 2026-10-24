@@ -987,6 +987,7 @@ mod tests {
             vec!["fanout_per_partition_sink".to_string()],
             vec![RebatchConfig::default()],
             10,
+            None,
             crate::shutdown::ComponentScope::detached("test"),
         );
 
