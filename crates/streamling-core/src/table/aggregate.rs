@@ -558,7 +558,8 @@ mod tests {
     use crate::table::{InMemoryTable, Mark, VersionRetention, WindowConfig};
     use crate::topology::DEFAULT_MAX_DEAD_RATIO;
     use arrow::array::{
-        Array, ArrayRef, AsArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
+        Array, ArrayRef, AsArray, Decimal128Array, Float64Array, Int64Array, LargeBinaryArray,
+        RecordBatch, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, SchemaRef};
     use datafusion::catalog::view::ViewTable;
@@ -1336,6 +1337,126 @@ mod tests {
         ] {
             let err = fixture.register_error(sql).await;
             assert!(err.contains(expected), "{sql}: {err}");
+        }
+    }
+
+    /// A table backend stores each group's `state()` and restores it with
+    /// `merge_batch`, so a restored group must retract and evaluate exactly
+    /// like the group it came from, for every function and type `table_agg`
+    /// supports.
+    #[tokio::test]
+    async fn every_supported_aggregate_round_trips_its_state() {
+        const ROUND_TRIP: &str = "SELECT address, count(*) AS n, count(amount) AS counted, sum(amount) AS total, avg(amount) AS mean FROM transfers GROUP BY address";
+        let mut decimal_arb_amounts =
+            DecimalArbArrayBuilder::with_capacity(4, "amount", DECIMAL_PRECISION, DECIMAL_SCALE)
+                .unwrap();
+        for amount in [Some("1.50"), Some("2.25"), None, Some("4.00")] {
+            match amount {
+                Some(amount) => decimal_arb_amounts.append_str(amount).unwrap(),
+                None => decimal_arb_amounts.append_null(),
+            }
+        }
+        let (decimal_arb_amounts, _, _) = decimal_arb_amounts.finish().into_inner();
+        let cases: [(Field, ArrayRef); 4] = [
+            (
+                Field::new("amount", DataType::Int64, true),
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(4)])),
+            ),
+            (
+                Field::new("amount", DataType::Float64, true),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.5),
+                    Some(2.25),
+                    None,
+                    Some(4.0),
+                ])),
+            ),
+            (
+                Field::new(
+                    "amount",
+                    DataType::Decimal128(DECIMAL_PRECISION as u8, DECIMAL_SCALE as i8),
+                    true,
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(150), Some(225), None, Some(400)])
+                        .with_precision_and_scale(DECIMAL_PRECISION as u8, DECIMAL_SCALE as i8)
+                        .unwrap(),
+                ),
+            ),
+            (
+                DecimalArbType::field("amount", DECIMAL_PRECISION, DECIMAL_SCALE, true).unwrap(),
+                Arc::new(decimal_arb_amounts),
+            ),
+        ];
+
+        for (amount, amounts) in cases {
+            let data_type = amount.data_type().clone();
+            let fixture = Fixture::new(amount, None).await;
+            let session_state = fixture.session_manager.session_state();
+            let plan = fixture
+                .session_manager
+                .create_logical_plan(ROUND_TRIP.to_string())
+                .await
+                .unwrap();
+            let plan = session_state
+                .analyzer()
+                .execute_and_check(plan, session_state.config_options(), |_, _| {})
+                .unwrap();
+            let (aggregate, _) = TableAggregate::try_new(
+                AGGREGATE,
+                &plan,
+                fixture.session_manager.tables(),
+                &session_state,
+                format!("app::{AGGREGATE}"),
+            )
+            .unwrap();
+            let rows = amounts.len();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&fixture.input_schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+                    Arc::new(StringArray::from(vec!["a"; rows])),
+                    amounts,
+                    Arc::new(StringArray::from(vec!["i"; rows])),
+                ],
+            )
+            .unwrap();
+
+            for (function, arguments) in aggregate.aggregates.iter().zip(&aggregate.arguments) {
+                let case = format!("{} over {data_type}", function.name());
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| argument.evaluate(&batch)?.into_array(rows))
+                    .collect::<datafusion::common::Result<Vec<_>>>()
+                    .unwrap();
+                let mut live = function.create_sliding_accumulator().unwrap();
+                live.update_batch(&arguments).unwrap();
+                let state = live
+                    .state()
+                    .unwrap()
+                    .iter()
+                    .map(ScalarValue::to_array)
+                    .collect::<datafusion::common::Result<Vec<_>>>()
+                    .unwrap();
+                let mut restored = function.create_sliding_accumulator().unwrap();
+                restored.merge_batch(&state).unwrap();
+
+                for retracted in [0..1, 1..rows] {
+                    let retracted: Vec<ArrayRef> = arguments
+                        .iter()
+                        .map(|argument| argument.slice(retracted.start, retracted.len()))
+                        .collect();
+                    live.retract_batch(&retracted).unwrap();
+                    restored
+                        .retract_batch(&retracted)
+                        .unwrap_or_else(|err| panic!("{case}: {err}"));
+                    assert_eq!(
+                        restored.evaluate().unwrap(),
+                        live.evaluate().unwrap(),
+                        "{case}"
+                    );
+                }
+            }
         }
     }
 }
