@@ -4,11 +4,17 @@ use datafusion::common::{Result, ToDFSchema};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use std::sync::Arc;
+use streamling_core::functions::decimal_arb_ops::{
+    DecimalArbToStringFunc, LegacyWideIntToDecimalArbFunc,
+};
 use streamling_core::functions::json_string::JsonStringFunc;
-use streamling_core::functions::{i256_ops::I256ToStringFunc, u256_ops::U256ToStringFunc};
-use streamling_core::types::{i256::I256Type, u256::U256Type};
+use streamling_core::types::decimal_arb::DecimalArbType;
+use streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind;
+// The retired U256/I256 imports are gone; only
+// decimal_arb and nested types need projection to Utf8 for PG insert.
 
-/// Build projection expressions to convert U256/I256 and nested types to Utf8 for PostgreSQL insertion
+/// Build projection expressions to convert decimal_arb and nested types to
+/// Utf8 for PostgreSQL insertion. (The U256/I256 paths are retired.)
 pub fn build_projection_for_postgres(
     state: &dyn Session,
     input: Arc<dyn ExecutionPlan>,
@@ -20,14 +26,11 @@ pub fn build_projection_for_postgres(
     let mut needs_projection = false;
 
     for f in input_schema.fields() {
-        let is_u256 = matches!(
-            f.data_type(),
-            datafusion::arrow::datatypes::DataType::FixedSizeBinary(32)
-        ) && U256Type::is_u256_metadata(f.metadata());
-        let is_i256 = matches!(
-            f.data_type(),
-            datafusion::arrow::datatypes::DataType::FixedSizeBinary(32)
-        ) && I256Type::is_i256_metadata(f.metadata());
+        let is_decimal_arb = DecimalArbType::is_decimal_arb_field(f);
+        // Retired plugin wide-int columns are upgraded to decimal_arb first,
+        // then projected to text like any decimal_arb; left alone they bound
+        // their raw big-endian bytes into a BYTEA column.
+        let is_legacy_wide_int = legacy_wide_int_kind(f).is_some();
         let is_nested_json = matches!(
             f.data_type(),
             datafusion::arrow::datatypes::DataType::Struct(_)
@@ -37,29 +40,29 @@ pub fn build_projection_for_postgres(
                 | datafusion::arrow::datatypes::DataType::Map(_, _)
         );
 
-        let logical_expr: datafusion::logical_expr::Expr = if is_u256 {
+        let logical_expr: datafusion::logical_expr::Expr = if is_decimal_arb || is_legacy_wide_int {
             needs_projection = true;
+            let column = datafusion::logical_expr::Expr::Column(
+                datafusion::common::Column::from_name(f.name()),
+            );
+            let decimal = if is_legacy_wide_int {
+                datafusion::logical_expr::Expr::ScalarFunction(
+                    datafusion::logical_expr::expr::ScalarFunction {
+                        func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
+                            LegacyWideIntToDecimalArbFunc::new(),
+                        )),
+                        args: vec![column],
+                    },
+                )
+            } else {
+                column
+            };
             datafusion::logical_expr::Expr::ScalarFunction(
                 datafusion::logical_expr::expr::ScalarFunction {
                     func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
-                        U256ToStringFunc::new(),
+                        DecimalArbToStringFunc::new(),
                     )),
-                    args: vec![datafusion::logical_expr::Expr::Column(
-                        datafusion::common::Column::from_name(f.name()),
-                    )],
-                },
-            )
-            .alias(f.name())
-        } else if is_i256 {
-            needs_projection = true;
-            datafusion::logical_expr::Expr::ScalarFunction(
-                datafusion::logical_expr::expr::ScalarFunction {
-                    func: Arc::new(datafusion::logical_expr::ScalarUDF::from(
-                        I256ToStringFunc::new(),
-                    )),
-                    args: vec![datafusion::logical_expr::Expr::Column(
-                        datafusion::common::Column::from_name(f.name()),
-                    )],
+                    args: vec![decimal],
                 },
             )
             .alias(f.name())

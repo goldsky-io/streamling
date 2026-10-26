@@ -1,9 +1,12 @@
 pub mod diagnostics;
 pub mod operator;
+pub mod partitioned;
 mod preprocessor;
 pub mod side_output;
 pub mod table_provider;
 mod telemetry;
+#[cfg(test)]
+mod test_plugins;
 pub mod udf;
 
 pub use preprocessor::build_plugin_preprocessors;
@@ -364,8 +367,16 @@ fn initialize_plugin_library(
     app_config: &AppConfig,
 ) -> Result<InitializedPluginLibrary> {
     info!("Loading plugin from: {:?}", path);
+    initialize_plugin_module(load_plugin_module(path)?, app_config, path)
+}
 
-    let module = Arc::new(load_plugin_module(path)?);
+/// Runs a loaded module's `init`. `path` names the module in logs.
+fn initialize_plugin_module(
+    module: PluginModuleRef,
+    app_config: &AppConfig,
+    path: &Path,
+) -> Result<InitializedPluginLibrary> {
+    let module = Arc::new(module);
 
     let init_fn = module.init();
     let configuration = init_fn(create_logging(app_config))
@@ -625,7 +636,9 @@ const PLUGIN_BLOCKING_SEND_BOUND: Duration = Duration::from_secs(5);
 /// abandoned with an error, so the caller's drain can wind down instead of
 /// holding a runtime worker hostage until the watchdog hard-exits. A
 /// disconnected channel (dispatcher already exited) errors immediately — the
-/// `.unwrap()`s this replaces panicked the host there.
+/// `.unwrap()`s this replaces panicked the host there. A full channel whose
+/// dispatcher exited errors too: the host holds the channel open, so it never
+/// disconnects, and nothing would ever drain it.
 ///
 /// On a multi-thread runtime each blocking slice runs under `block_in_place`
 /// so sibling tasks migrate off the worker; on a current-thread runtime
@@ -634,9 +647,10 @@ pub async fn send_to_plugin<T>(
     sender: &crossbeam_channel::RSender<T>,
     msg: T,
     plugin_id: &str,
+    exit: &InstanceExit,
 ) -> Result<()> {
     let rx = crate::shutdown::subscribe();
-    send_to_plugin_with(sender, msg, plugin_id, move || *rx.borrow(), {
+    send_to_plugin_with(sender, msg, plugin_id, exit, move || *rx.borrow(), {
         PLUGIN_SHUTDOWN_SEND_GRACE
     })
     .await
@@ -649,6 +663,7 @@ async fn send_to_plugin_with<T>(
     sender: &crossbeam_channel::RSender<T>,
     msg: T,
     plugin_id: &str,
+    exit: &InstanceExit,
     is_shutting_down: impl Fn() -> bool,
     shutdown_grace: Duration,
 ) -> Result<()> {
@@ -678,6 +693,15 @@ async fn send_to_plugin_with<T>(
                 return Err(plugin_channel_closed(plugin_id));
             }
         };
+        // Only a full channel checks for an exit: a send that fits cannot
+        // wedge, and failing it would turn a source forwarder racing its
+        // instance's clean completion into a stream error.
+        if exit.has_exited() {
+            return Err(streamling_err!(
+                "plugin '{}' dispatcher exited with its input channel full; cannot deliver message",
+                plugin_id
+            ));
+        }
         if is_shutting_down() {
             let deadline =
                 *grace_deadline.get_or_insert_with(|| std::time::Instant::now() + shutdown_grace);
@@ -720,6 +744,25 @@ pub fn send_to_plugin_blocking<T>(
     }
 }
 
+/// The stream error a host forwarder raises when a plugin instance reports,
+/// through `PluginMsg::Error`, that it failed.
+pub(crate) fn plugin_failure(
+    instance_key: &str,
+    message: &str,
+) -> datafusion::error::DataFusionError {
+    streamling_err!("plugin {} failed: {}", instance_key, message).into()
+}
+
+/// The stream error a host forwarder raises when a plugin instance's
+/// dispatcher exits (e.g. a panicking hook) without a `PluginMsg::Error`, so
+/// the forwarder would otherwise wait for output that can never arrive.
+pub(crate) fn plugin_exited(instance_key: &str) -> datafusion::error::DataFusionError {
+    plugin_failure(
+        instance_key,
+        "its dispatcher exited without reporting a failure",
+    )
+}
+
 fn plugin_channel_closed(plugin_id: &str) -> crate::error::StreamlingError {
     streamling_err!(
         "plugin '{}' input channel is closed (dispatcher exited); cannot deliver message",
@@ -738,9 +781,43 @@ fn create_logging(app_config: &AppConfig) -> PluginLogging {
 pub type ExecutionFuture =
     Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send + 'static>>;
 
+/// Resolves once a plugin instance's dispatcher has exited.
+///
+/// Observed through its execution future, which the run loop polls; an
+/// execution future that is dropped unpolled counts as exited.
+#[derive(Clone, Debug)]
+pub struct InstanceExit(tokio::sync::watch::Receiver<bool>);
+
+impl InstanceExit {
+    pub async fn exited(&mut self) {
+        // An error means the execution future was dropped: exited as well.
+        let _ = self.0.wait_for(|exited| *exited).await;
+    }
+
+    /// Whether the dispatcher has exited. Read it BEFORE draining the
+    /// instance's output channel: everything the dispatcher sent precedes its
+    /// exit, so an empty channel after an observed exit is final.
+    pub fn has_exited(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
+}
+
+/// Wraps `execution_future` so the returned [`InstanceExit`] resolves when it
+/// completes.
+pub(crate) fn track_exit(execution_future: ExecutionFuture) -> (ExecutionFuture, InstanceExit) {
+    let (exited, exit) = tokio::sync::watch::channel(false);
+    let tracked = Box::pin(async move {
+        let result = execution_future.await;
+        let _ = exited.send(true);
+        result
+    });
+    (tracked, InstanceExit(exit))
+}
+
 pub struct InitializedPlugin {
     pub plugin_id: String,
     pub execution_future: ExecutionFuture,
+    pub exit: InstanceExit,
     pub channels: PluginChannels,
     /// Expected to be defined for sources and transforms, but not for sinks.
     pub output_schema: Option<SchemaRef>,
@@ -759,12 +836,23 @@ impl InitializedPlugin {
             streamling_user_bail!("Output schema must contain the column '{}'", COLUMN_NAME_OP);
         }
 
+        let (execution_future, exit) = track_exit(execution_future);
         Ok(InitializedPlugin {
             plugin_id,
             execution_future,
+            exit,
             channels,
             output_schema,
         })
+    }
+
+    /// This plugin as the single instance of node `reference_name`.
+    pub fn instance(&self, reference_name: String) -> partitioned::PluginInstance {
+        partitioned::PluginInstance {
+            key: reference_name,
+            channels: Arc::new(self.channels.clone()),
+            exit: self.exit.clone(),
+        }
     }
 }
 
@@ -964,9 +1052,11 @@ pub fn create_preprocessor_plugin(
     let mapped_future = result
         .execution_future
         .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let (execution_future, exit) = track_exit(Box::pin(mapped_future));
     Ok(InitializedPlugin {
         plugin_id: plugin_type.to_string(),
-        execution_future: Box::pin(mapped_future),
+        execution_future,
+        exit,
         channels: plugin_channels,
         output_schema: None,
     })
@@ -1072,7 +1162,8 @@ mod tests {
     async fn send_to_plugin_errors_on_disconnected_channel() {
         let (rtx, rrx) = crossbeam_channel::bounded::<u32>(1);
         drop(rrx);
-        let err = send_to_plugin_with(&rtx, 7u32, "p", || false, Duration::from_secs(1))
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
+        let err = send_to_plugin_with(&rtx, 7u32, "p", &exit, || false, Duration::from_secs(1))
             .await
             .expect_err("disconnected channel must error");
         assert!(err.to_string().contains("closed"), "got: {err}");
@@ -1085,8 +1176,9 @@ mod tests {
         let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
         rtx.try_send(1).unwrap(); // fill the single slot; nothing ever drains it
 
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
         let start = std::time::Instant::now();
-        let err = send_to_plugin_with(&rtx, 2u32, "p", || true, Duration::from_millis(300))
+        let err = send_to_plugin_with(&rtx, 2u32, "p", &exit, || true, Duration::from_millis(300))
             .await
             .expect_err("wedged channel must be abandoned");
         assert!(err.to_string().contains("abandoning"), "got: {err}");
@@ -1109,12 +1201,33 @@ mod tests {
             let v = rrx.recv().unwrap();
             (v, rrx)
         });
-        send_to_plugin_with(&rtx, 2u32, "p", || false, Duration::from_millis(100))
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
+        send_to_plugin_with(&rtx, 2u32, "p", &exit, || false, Duration::from_millis(100))
             .await
             .expect("send must succeed once a slot frees up");
         let (first, rrx) = drainer.join().unwrap();
         assert_eq!(first, 1);
         assert_eq!(rrx.recv().unwrap(), 2);
+    }
+
+    /// A transform or sink whose `is_running()` goes false returns from its
+    /// dispatcher cleanly while the host keeps the channel open, so nothing
+    /// drains it again: a full channel must fail the send, not wait forever.
+    #[tokio::test]
+    async fn send_to_plugin_errors_on_full_channel_once_dispatcher_exited() {
+        let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
+        rtx.try_send(1).unwrap();
+        let (execution, exit) = track_exit(Box::pin(async { Ok(()) }));
+        execution.await.unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_to_plugin_with(&rtx, 2u32, "p", &exit, || false, Duration::from_secs(1)),
+        )
+        .await
+        .expect("must not wait on a dispatcher that exited")
+        .expect_err("an exited dispatcher must fail the send");
+        assert!(err.to_string().contains("exited"), "got: {err}");
     }
 
     /// Regression: the panic hook calls

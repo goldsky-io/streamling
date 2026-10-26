@@ -445,11 +445,16 @@ fn flatten_struct_cols(
                             // Use the actual array type, not the schema field type
                             // This handles cases where safe_take upgraded Utf8 -> LargeUtf8
                             let actual_array = &columns_expanded[expanded_idx];
-                            new_fields.push(Field::new(
-                                field.name(),
-                                actual_array.data_type().clone(),
-                                field.is_nullable(),
-                            ));
+                            // Keep the child field's metadata: a decimal_arb
+                            // leaf is only recognisable by its extension keys.
+                            new_fields.push(
+                                Field::new(
+                                    field.name(),
+                                    actual_array.data_type().clone(),
+                                    field.is_nullable(),
+                                )
+                                .with_metadata(field.metadata().clone()),
+                            );
                             expanded_idx += 1;
                         }
                     }
@@ -460,11 +465,14 @@ fn flatten_struct_cols(
                 // Non-struct columns: use actual array type
                 let actual_array = &columns_expanded[expanded_idx];
                 let original_field = schema.field(idx);
-                new_fields.push(Field::new(
-                    original_field.name(),
-                    actual_array.data_type().clone(),
-                    original_field.is_nullable(),
-                ));
+                new_fields.push(
+                    Field::new(
+                        original_field.name(),
+                        actual_array.data_type().clone(),
+                        original_field.is_nullable(),
+                    )
+                    .with_metadata(original_field.metadata().clone()),
+                );
                 expanded_idx += 1;
             }
         }

@@ -59,7 +59,6 @@ use streamling_state::StateBackendErrorKind;
 use streamling_state::StateKey;
 use streamling_state::StateOperatorBackend;
 
-use crate::util::lag::LagResult;
 use apache_avro::types::Value::Union;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::sink::DataSink;
@@ -68,7 +67,10 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::consumer::{
+    BaseConsumer, CommitMode, Consumer, ConsumerContext, DefaultConsumerContext, Rebalance,
+    StreamConsumer,
+};
 use rdkafka::message::{BorrowedHeaders, BorrowedMessage, Header, Headers, OwnedHeaders, ToBytes};
 use rdkafka::producer::{BaseRecord, Producer, ThreadedProducer};
 use rdkafka::util::Timeout;
@@ -84,7 +86,7 @@ use schema_registry_converter::schema_registry_common::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -93,7 +95,7 @@ use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
-use streamling_core::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
+use streamling_core::telemetry::recorder::{MetricsRecorder, SnapshotGauge, get_metrics_recorder};
 use streamling_core::topology::Telemetry;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
@@ -176,12 +178,12 @@ static QUEUE_FULL_SHUTDOWN_RETRY_WINDOW: StdDuration = StdDuration::from_secs(10
 /// finish, but those threads may also be waiting for cleanup coordination.
 ///
 /// This wrapper moves the drop operation to a blocking thread to prevent deadlock.
-struct SafeKafkaConsumer {
-    consumer: Option<Arc<StreamConsumer>>,
+struct SafeKafkaConsumer<C: ConsumerContext + 'static = DefaultConsumerContext> {
+    consumer: Option<Arc<StreamConsumer<C>>>,
 }
 
-impl SafeKafkaConsumer {
-    fn new(consumer: StreamConsumer) -> Self {
+impl<C: ConsumerContext + 'static> SafeKafkaConsumer<C> {
+    fn new(consumer: StreamConsumer<C>) -> Self {
         tracing::debug!("SafeKafkaConsumer: created");
         Self {
             consumer: Some(Arc::new(consumer)),
@@ -199,14 +201,14 @@ impl SafeKafkaConsumer {
     }
 }
 
-impl std::ops::Deref for SafeKafkaConsumer {
-    type Target = Arc<StreamConsumer>;
+impl<C: ConsumerContext + 'static> std::ops::Deref for SafeKafkaConsumer<C> {
+    type Target = Arc<StreamConsumer<C>>;
     fn deref(&self) -> &Self::Target {
         self.consumer.as_ref().expect("consumer already taken")
     }
 }
 
-impl Drop for SafeKafkaConsumer {
+impl<C: ConsumerContext + 'static> Drop for SafeKafkaConsumer<C> {
     fn drop(&mut self) {
         if let Some(consumer) = self.consumer.take() {
             // Run rd_kafka_destroy on a detached OS thread, NOT spawn_blocking:
@@ -229,46 +231,117 @@ impl Drop for SafeKafkaConsumer {
     }
 }
 
+/// Live Kafka partition assignment of every consumer instance of one source
+/// in this process, kept current by [`AssignmentTrackingContext`]. Per-pod
+/// telemetry must cover exactly the partitions this pod owns now: a startup
+/// snapshot goes stale on the first rebalance, and with several pods in one
+/// group each pod would keep reporting partitions another pod now owns.
+#[derive(Clone, Default)]
+struct PartitionAssignments(Arc<std::sync::Mutex<BTreeMap<usize, BTreeSet<i32>>>>);
+
+impl PartitionAssignments {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<usize, BTreeSet<i32>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, instance: usize, partitions: BTreeSet<i32>) {
+        self.lock().insert(instance, partitions);
+    }
+
+    /// Partitions owned by any instance of the source in this process.
+    fn owned(&self) -> BTreeSet<i32> {
+        self.lock().values().flatten().copied().collect()
+    }
+
+    /// Max known lag over the partitions one instance owns; see [`own_max_lag`].
+    fn own_max_lag(&self, instance: usize, lags: &BTreeMap<i32, i64>) -> Option<i64> {
+        self.lock()
+            .get(&instance)
+            .map_or(Some(0), |own| own_max_lag(lags, own))
+    }
+}
+
+/// Consumer context that records the instance's partition assignment after
+/// every rebalance.
+struct AssignmentTrackingContext {
+    instance: usize,
+    topic: String,
+    assignments: PartitionAssignments,
+}
+
+impl ClientContext for AssignmentTrackingContext {}
+
+impl ConsumerContext for AssignmentTrackingContext {
+    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, _rebalance: &Rebalance<'_>) {
+        // The default `rebalance` has already (un)assigned synchronously, so
+        // `assignment()` reflects this rebalance for eager and cooperative alike.
+        match base_consumer.assignment() {
+            Ok(assignment) => self.assignments.set(
+                self.instance,
+                assignment
+                    .elements_for_topic(&self.topic)
+                    .iter()
+                    .map(|element| element.partition())
+                    .collect(),
+            ),
+            Err(e) => warn!(
+                "Failed to read the partition assignment of topic '{}' after a rebalance: {}",
+                self.topic, e
+            ),
+        }
+    }
+}
+
+/// Latest lag per owned partition, published by the source's lag task.
+/// `None` until the first lag computation.
+type PartitionLags = Option<Arc<BTreeMap<i32, i64>>>;
+
+const KAFKA_CONSUMER_LAG_METRIC: &str = "kafka_consumer_messages_lag";
+
 /// Wrapper that keeps rdkafka *producer* teardown off tokio worker threads.
 ///
 /// Same rationale as [`SafeKafkaConsumer`]: dropping the last handle runs
 /// `rd_kafka_destroy()`, which waits on internal librdkafka threads and can
 /// deadlock a tokio worker — at runtime teardown that wedges `Runtime::drop`
-/// and the process hangs until SIGKILL. The sink's producers are dropped with
-/// the DataFusion plan on a worker thread, so they need the same deferral.
-struct SafeKafkaProducers {
-    producers: Option<Vec<KafkaThreadedProducer>>,
+/// and the process hangs until SIGKILL. Each sink write stream drops its
+/// producer on a worker thread, so it needs the same deferral.
+struct SafeKafkaProducer {
+    producer: Option<KafkaThreadedProducer>,
 }
 
-impl SafeKafkaProducers {
-    fn new(producers: Vec<KafkaThreadedProducer>) -> Self {
+impl SafeKafkaProducer {
+    fn new(producer: KafkaThreadedProducer) -> Self {
         Self {
-            producers: Some(producers),
+            producer: Some(producer),
         }
     }
+}
 
-    fn as_slice(&self) -> &[KafkaThreadedProducer] {
-        self.producers.as_deref().unwrap_or(&[])
+impl std::ops::Deref for SafeKafkaProducer {
+    type Target = KafkaThreadedProducer;
+    fn deref(&self) -> &Self::Target {
+        self.producer.as_ref().expect("producer already taken")
     }
 }
 
-impl Drop for SafeKafkaProducers {
+impl Drop for SafeKafkaProducer {
     fn drop(&mut self) {
-        if let Some(producers) = self.producers.take() {
+        if let Some(producer) = self.producer.take() {
             // Detached OS thread, not spawn_blocking — see SafeKafkaConsumer:
             // a blocking task queued during runtime shutdown never runs and
             // its closure is dropped inline on the shutdown thread, restoring
-            // the very deadlock this wrapper exists to prevent. The sink has
-            // already flushed by the time producers drop, so abandoning the
-            // destroy at process exit loses nothing.
+            // the very deadlock this wrapper exists to prevent. The stream has
+            // already flushed by the time its producer drops, so abandoning
+            // the destroy at process exit loses nothing.
             tracing::info!(
-                "SafeKafkaProducers: moving rd_kafka_destroy of {} producer(s) \
-                 to a detached thread to prevent worker-thread deadlock",
-                producers.len()
+                "SafeKafkaProducer: moving rd_kafka_destroy to a detached thread \
+                 to prevent worker-thread deadlock"
             );
             std::thread::spawn(move || {
-                drop(producers);
-                tracing::info!("SafeKafkaProducers: rd_kafka_destroy completed");
+                drop(producer);
+                tracing::info!("SafeKafkaProducer: rd_kafka_destroy completed");
             });
         }
     }
@@ -289,8 +362,12 @@ pub struct TopicPartition {
 
 impl TopicPartition {
     fn state_key(&self, reference_name: String) -> String {
-        format!("{}:{}:{}", reference_name, self.topic, self.partition)
+        partition_state_key(&reference_name, &self.topic, self.partition)
     }
+}
+
+fn partition_state_key(reference_name: &str, topic: &str, partition: i32) -> String {
+    format!("{}:{}:{}", reference_name, topic, partition)
 }
 
 pub struct TopicPartitionList {
@@ -563,6 +640,16 @@ fn json_payload_to_string(
     })
 }
 
+/// Do two Avro schemas differ in anything the encoder cares about?
+///
+/// Compared as serialised JSON, not with `Schema`'s `PartialEq`: that
+/// implementation follows Parsing Canonical Form, which strips `logicalType`
+/// and would call a plain `bytes` field and a `decimal` field equal — the one
+/// difference this check exists to see.
+fn avro_schemas_differ(a: &AvroSchema, b: &AvroSchema) -> bool {
+    serde_json::to_value(a).ok() != serde_json::to_value(b).ok()
+}
+
 struct KafkaCommon {}
 
 impl KafkaCommon {
@@ -683,6 +770,8 @@ struct KafkaSourceExec {
     /// instance would then read the whole topic instead of a disjoint slice.
     group_id: String,
     lag_group_id: String,
+    assignments: PartitionAssignments,
+    partition_lags: Arc<watch::Sender<PartitionLags>>,
 }
 
 impl Debug for KafkaSourceExec {
@@ -775,6 +864,8 @@ impl KafkaSourceExec {
             parallelism,
             group_id,
             lag_group_id,
+            assignments: PartitionAssignments::default(),
+            partition_lags: Arc::new(watch::channel(None).0),
         }
     }
 
@@ -811,8 +902,8 @@ impl KafkaSourceExec {
     /// must not tear down the stream; but the terminal caller MUST NOT log
     /// its "drained tail committed" line on it — the offsets were not
     /// committed and the tail replays.
-    async fn commit_offsets_for_finalized_epoch(
-        consumer: &StreamConsumer,
+    async fn commit_offsets_for_finalized_epoch<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
         state_backend: &Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
         reference_name: &str,
         consumer_offsets: &mut BTreeMap<CheckpointEpoch, KafkaTopicPartitionList>,
@@ -872,19 +963,12 @@ impl KafkaSourceExec {
                 //
                 // rd_kafka_commit with async=0 blocks the calling thread for a
                 // full broker round trip — coordinator rediscovery and retry
-                // backoff included — so run it under block_in_place: during a
-                // drain every async worker is needed, and a slow commit
-                // (observed multi-second in the field) must not pin one. The
-                // flavor check keeps current_thread runtimes (unit tests) on
-                // the direct call, where block_in_place would panic.
+                // backoff included: during a drain every async worker is
+                // needed, and a slow commit (observed multi-second in the
+                // field) must not pin one.
                 let commit_started = std::time::Instant::now();
-                let commit_result = if tokio::runtime::Handle::current().runtime_flavor()
-                    == tokio::runtime::RuntimeFlavor::MultiThread
-                {
-                    tokio::task::block_in_place(|| consumer.commit(position, CommitMode::Sync))
-                } else {
-                    consumer.commit(position, CommitMode::Sync)
-                };
+                let commit_result =
+                    block_in_place_if_multi_thread(|| consumer.commit(position, CommitMode::Sync));
                 let commit_elapsed = commit_started.elapsed();
                 if commit_elapsed > Duration::from_secs(1) {
                     warn!(
@@ -1049,13 +1133,14 @@ impl KafkaSourceExec {
         }
     }
 
-    fn create_consumer(
+    fn create_consumer<C: ConsumerContext + 'static>(
         config: &KafkaConfig,
         starting_offsets: &Option<String>,
         reference_name: &str,
         group_id: &str,
         is_lag_consumer: bool,
-    ) -> StreamConsumer {
+        context: C,
+    ) -> StreamConsumer<C> {
         let mut builder = KafkaCommon::build_client(config);
 
         debug!(
@@ -1080,7 +1165,9 @@ impl KafkaSourceExec {
                 builder.set(key, value);
             });
 
-        builder.create().expect("Failed to create client")
+        builder
+            .create_with_context(context)
+            .expect("Failed to create client")
     }
 
     fn extract_op_from_headers(headers: Option<&BorrowedHeaders>) -> Option<&str> {
@@ -1098,8 +1185,8 @@ impl KafkaSourceExec {
         })
     }
 
-    async fn wait_for_assignment(
-        consumer: &StreamConsumer,
+    async fn wait_for_assignment<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
     ) -> streamling_core::error::Result<KafkaTopicPartitionList> {
         let timeout = Duration::from_secs(CONSUMER_ASSIGNMENT_TIMEOUT_SEC);
         let tpl = tokio::time::timeout(timeout, async {
@@ -1128,8 +1215,8 @@ impl KafkaSourceExec {
     ///
     /// If no message arrives within the fetch timeout, we keep retrying
     /// so idle topics do not fail source startup.
-    async fn wait_for_initial_assignment_or_message(
-        consumer: &StreamConsumer,
+    async fn wait_for_initial_assignment_or_message<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
         topic: &str,
     ) -> streamling_core::error::Result<()> {
         let shutdown = streamling_core::shutdown::subscribe();
@@ -1143,8 +1230,8 @@ impl KafkaSourceExec {
     /// A SIGTERM during startup used to be unobservable here: this wait looped
     /// forever (broker unreachable, stuck rebalance, idle topic) and the
     /// consume loop's shutdown handling hadn't been reached yet.
-    async fn wait_for_initial_assignment_or_message_cancellable(
-        consumer: &StreamConsumer,
+    async fn wait_for_initial_assignment_or_message_cancellable<C: ConsumerContext + 'static>(
+        consumer: &StreamConsumer<C>,
         topic: &str,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> streamling_core::error::Result<()> {
@@ -1232,6 +1319,31 @@ impl KafkaSourceExec {
     }
 }
 
+/// Runs a blocking librdkafka call under `block_in_place` so a slow broker
+/// round trip does not pin an async worker. A current_thread runtime (unit
+/// tests) calls it directly, where `block_in_place` would panic.
+fn block_in_place_if_multi_thread<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+/// Max known lag over an instance's own partitions; `Some(0)` when it owns
+/// none (nothing to consume), `None` when no owned partition's lag is known.
+fn own_max_lag(lags: &BTreeMap<i32, i64>, own: &BTreeSet<i32>) -> Option<i64> {
+    if own.is_empty() {
+        return Some(0);
+    }
+    own.iter()
+        .filter_map(|partition| lags.get(partition))
+        .copied()
+        .max()
+}
+
 fn is_stalled_with_lag(
     has_received_data: bool,
     elapsed_since_last_input: Duration,
@@ -1262,11 +1374,18 @@ struct KafkaSourceWatchdogState {
     stall_timeout: Duration,
     stall_check_count: u64,
     last_stall_log_at: Option<Instant>,
-    lag_rx: watch::Receiver<Option<i64>>,
+    lag_rx: watch::Receiver<PartitionLags>,
+    assignments: PartitionAssignments,
+    instance: usize,
 }
 
 impl KafkaSourceWatchdogState {
-    fn new(stall_timeout: Duration, lag_rx: watch::Receiver<Option<i64>>) -> Self {
+    fn new(
+        stall_timeout: Duration,
+        lag_rx: watch::Receiver<PartitionLags>,
+        assignments: PartitionAssignments,
+        instance: usize,
+    ) -> Self {
         Self {
             has_received_data: false,
             last_input_row_at: Instant::now(),
@@ -1276,6 +1395,8 @@ impl KafkaSourceWatchdogState {
             stall_check_count: 0,
             last_stall_log_at: None,
             lag_rx,
+            assignments,
+            instance,
         }
     }
 
@@ -1291,7 +1412,11 @@ impl KafkaSourceWatchdogState {
             return;
         }
 
-        self.max_observed_lag = *self.lag_rx.borrow();
+        self.max_observed_lag = self
+            .lag_rx
+            .borrow()
+            .as_deref()
+            .and_then(|lags| self.assignments.own_max_lag(self.instance, lags));
 
         if self.max_observed_lag.is_some() {
             self.lag_unavailable_since = None;
@@ -1357,15 +1482,18 @@ impl KafkaSourceWatchdogState {
     }
 }
 
+/// Reports the lag of the partitions the source's local instances own at each
+/// tick, both as the `kafka_consumer_messages_lag` gauge and to the stall
+/// watchdogs through `partition_lags`.
 async fn calculate_lag_task(
     reference_name: String,
-    metric_metadata_id: String,
-    kafka_topic_partition_list: KafkaTopicPartitionList,
+    topic: String,
+    assignments: PartitionAssignments,
     consumer: SafeKafkaConsumer,
     state_backend: Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
-    metrics_recorder: Arc<MetricsRecorder>,
+    lag_gauge: Option<SnapshotGauge>,
     lag_report_interval_ms: Option<u64>,
-    max_lag_tx: watch::Sender<Option<i64>>,
+    partition_lags: Arc<watch::Sender<PartitionLags>>,
     mut shutdown_rx: watch::Receiver<bool>,
     cancel: Option<streamling_core::shutdown::CancellationToken>,
 ) {
@@ -1418,92 +1546,86 @@ async fn calculate_lag_task(
             },
             _ = interval.tick() => {
                 trace!("Calculating lag for reference_name: {}", reference_name);
-                let mut lag_results = Vec::new();
-        let topic_partition_list = TopicPartitionList::from(kafka_topic_partition_list.clone());
-
-        let mut max_lag: Option<i64> = None;
-
-        for topic_partition in topic_partition_list.topic_partitions {
-            // Add yield point for better cancellation responsiveness
-            tokio::task::yield_now().await;
-
-            trace!(
-                "Calculating lag for reference_name: {}, topic: {}, partition: {}",
-                reference_name, topic_partition.topic, topic_partition.partition
-            );
-            let (_, high_watermark) = match consumer.fetch_watermarks(
-                &topic_partition.topic,
-                topic_partition.partition,
-                Duration::from_secs(5),
-            ) {
-                Ok(watermarks) => watermarks,
-                Err(e) => {
-                    error!(
-                        "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
-                        topic_partition.topic, topic_partition.partition, e
-                    );
-                    continue;
+                let lags = Arc::new(
+                    owned_partition_lags(
+                        &reference_name,
+                        &topic,
+                        &assignments.owned(),
+                        &consumer,
+                        &state_backend,
+                    )
+                    .await,
+                );
+                if let Some(lag_gauge) = &lag_gauge {
+                    lag_gauge.replace(lags.iter().map(|(partition, lag)| {
+                        (vec![("partition", partition.to_string())], *lag as u64)
+                    }));
                 }
-            };
-
-            let state_key = StateKey::from(topic_partition.state_key(reference_name.to_string()));
-            let tail_at = match state_backend.get(state_key).await {
-                Ok(Some(offset_state)) => offset_state.offset,
-                Ok(None) => {
-                    trace!(
-                        "No offset found in state backend for topic: {}, partition {}; fallback to 0",
-                        topic_partition.topic, topic_partition.partition
-                    );
-                    0
-                }
-                Err(_) => {
-                    error!(
-                        "Failed to fetch offsets from state backend for topic: {}, partition {}, lag metric will not be reported",
-                        topic_partition.topic, topic_partition.partition,
-                    );
-                    continue;
-                }
-            };
-
-            let partition_lag = (high_watermark - tail_at).max(0);
-            max_lag = Some(max_lag.unwrap_or(0).max(partition_lag));
-
-            lag_results.push(LagResult {
-                metric_metadata_id: metric_metadata_id.to_string(),
-                unit: "messages".to_string(),
-                head_at_provider: "kafka_consumer".to_string(),
-                head_at: high_watermark as u64,
-                tail_at: tail_at as u64,
-                tags: vec![(
-                    String::from("partition"),
-                    topic_partition.partition.to_string(),
-                )],
-            });
-        }
-
-        let _ = max_lag_tx.send(max_lag);
-
-        lag_results.iter().for_each(|lag_result| {
-            let tags = lag_result
-                .tags
-                .iter()
-                .map(|tuple| (tuple.0.as_str(), tuple.1.as_str()))
-                .collect();
-            let metric_name = &format!("{}_{}_lag", lag_result.head_at_provider, lag_result.unit);
-            debug!("Recording lag result with metric_name: {}", metric_name);
-            metrics_recorder.record_gauge_w_tags(
-                metric_name,
-                lag_result.head_at - lag_result.tail_at,
-                tags,
-                lag_result.metric_metadata_id.as_str(),
-            );
-        });
-
+                partition_lags.send_replace(Some(lags));
             }
         }
     }
 
+    partition_lags.send_replace(None);
     info!("Lag task shutting down for {}", reference_name);
+}
+
+/// Lag (high watermark minus the committed offset in the state backend) of
+/// each `owned` partition. A partition whose lag cannot be read this tick is
+/// left out, so the gauge and the stall watchdog see it as unknown rather
+/// than as a stale value.
+async fn owned_partition_lags(
+    reference_name: &str,
+    topic: &str,
+    owned: &BTreeSet<i32>,
+    consumer: &SafeKafkaConsumer,
+    state_backend: &Arc<dyn StateOperatorBackend<TopicPartitionOffset>>,
+) -> BTreeMap<i32, i64> {
+    let mut lags = BTreeMap::new();
+    for &partition in owned {
+        // Add yield point for better cancellation responsiveness
+        tokio::task::yield_now().await;
+
+        trace!(
+            "Calculating lag for reference_name: {}, topic: {}, partition: {}",
+            reference_name, topic, partition
+        );
+        // A blocking broker round trip (up to the 5s timeout) per partition.
+        let high_watermark = match block_in_place_if_multi_thread(|| {
+            consumer.fetch_watermarks(topic, partition, Duration::from_secs(5))
+        }) {
+            Ok((_, high_watermark)) => high_watermark,
+            Err(e) => {
+                error!(
+                    "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
+                    topic, partition, e
+                );
+                continue;
+            }
+        };
+
+        let state_key = StateKey::from(partition_state_key(reference_name, topic, partition));
+        let tail_at = match state_backend.get(state_key).await {
+            Ok(Some(offset_state)) => offset_state.offset,
+            Ok(None) => {
+                trace!(
+                    "No offset found in state backend for topic: {}, partition {}; fallback to 0",
+                    topic, partition
+                );
+                0
+            }
+            Err(_) => {
+                error!(
+                    "Failed to fetch offsets from state backend for topic: {}, partition {}; lag metric will not be reported",
+                    topic, partition,
+                );
+                continue;
+            }
+        };
+
+        lags.insert(partition, (high_watermark - tail_at).max(0));
+    }
+    lags
 }
 
 impl DisplayAs for KafkaSourceExec {
@@ -1563,6 +1685,11 @@ impl ExecutionPlan for KafkaSourceExec {
             &self.reference_name,
             &self.group_id,
             false,
+            AssignmentTrackingContext {
+                instance: partition,
+                topic: self.topic.clone(),
+                assignments: self.assignments.clone(),
+            },
         ));
         consumer
             .subscribe(&[&*self.topic])
@@ -1585,7 +1712,10 @@ impl ExecutionPlan for KafkaSourceExec {
                     .expect("schema_registry_url is required for Avro format");
                 let reader_schema_json = serde_json::to_string(&avro.avro_schema)
                     .expect("reader avro schema serializes to JSON");
+                // The consume loop flushes after at most `record_batch_size` messages and always
+                // takes at least one, so that is the most rows one arrow-avro generation holds.
                 let mut decoder = ConfluentAvroDecoder::new()
+                    .with_batch_size(self.record_batch_size.max(1) as usize)
                     .with_reader_schema(&avro.avro_schema)
                     .map_err(|e| streamling_err!("failed to set arrow-avro reader schema: {e}"))?
                     // Honor `skip_schema_resolution`: when set, decode each message against its own
@@ -1667,8 +1797,8 @@ impl ExecutionPlan for KafkaSourceExec {
         let metric_metadata_id = self.metric_metadata_id.clone();
         let kafka_lag_reporter_interval = self.kafka_config.lag_report_interval_ms;
         let metrics_recorder = get_metrics_recorder().clone();
-        // Lag is a per-source metric, and every instance would report the same
-        // topic-wide numbers, so only instance 0 runs the reporter.
+        // One lag reporter per source in this process: instance 0 runs it for
+        // the partitions every local instance currently owns.
         //
         // Wrap the lag consumer so its rd_kafka_destroy is deferred to a
         // blocking thread on drop, instead of running inline on a tokio worker
@@ -1680,13 +1810,48 @@ impl ExecutionPlan for KafkaSourceExec {
                 &self.reference_name,
                 &self.lag_group_id,
                 true,
+                DefaultConsumerContext,
             ))
         });
         let topic = self.topic.clone();
+        let assignments = self.assignments.clone();
+        let partition_lags = self.partition_lags.clone();
         let stall_watchdog_timeout = Duration::from_secs(Self::stall_watchdog_timeout_sec());
         builder.spawn(async move {
-            let (max_lag_tx, max_lag_rx) = watch::channel(None);
-            let mut watchdog = KafkaSourceWatchdogState::new(stall_watchdog_timeout, max_lag_rx);
+            // Only the instance that was handed the lag consumer reports lag
+            // (one per source, not one per parallel instance); it spawns
+            // through the scope so the drain ladder tracks it. Spawn before
+            // this instance's own assignment: it may own no partition (more
+            // consumers in the group than partitions) while its siblings do.
+            if let Some(lag_consumer) = lag_consumer {
+                let lag_gauge = metrics_recorder
+                    .resolve_snapshot_gauge(KAFKA_CONSUMER_LAG_METRIC, &metric_metadata_id);
+                if lag_gauge.is_none() {
+                    warn!(
+                        "Kafka source '{}': metric '{}' is denied or metadata_id '{}' is not registered; lag will not be exported",
+                        reference_name, KAFKA_CONSUMER_LAG_METRIC, metric_metadata_id
+                    );
+                }
+                let lag_task = calculate_lag_task(
+                    reference_name.clone(),
+                    topic.clone(),
+                    assignments.clone(),
+                    lag_consumer,
+                    state_backend.clone(),
+                    lag_gauge,
+                    kafka_lag_reporter_interval,
+                    partition_lags.clone(),
+                    shutdown_rx.clone(),
+                    Some(scope.token().clone()),
+                );
+                scope.spawn(lag_task);
+            }
+            let mut watchdog = KafkaSourceWatchdogState::new(
+                stall_watchdog_timeout,
+                partition_lags.subscribe(),
+                assignments.clone(),
+                partition,
+            );
             // first, wait for the consumer to be assigned partitions and then check the offsets
             // in the state backend
 
@@ -1717,24 +1882,6 @@ impl ExecutionPlan for KafkaSourceExec {
 
             // A blocking call to wait for the assignment to finish
             let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
-            // Only the instance that was handed the lag consumer reports lag
-            // (one per source, not one per parallel instance); it spawns
-            // through the scope so the drain ladder tracks it.
-            if let Some(lag_consumer) = lag_consumer {
-                let lag_task = calculate_lag_task(
-                    reference_name.clone(),
-                    metric_metadata_id.clone(),
-                    kafka_topic_partition_list.clone(),
-                    lag_consumer,
-                    state_backend.clone(),
-                    metrics_recorder.clone(),
-                    kafka_lag_reporter_interval,
-                    max_lag_tx,
-                    shutdown_rx.clone(),
-                    Some(scope.token().clone()),
-                );
-                scope.spawn(lag_task);
-            }
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
@@ -2790,7 +2937,6 @@ pub struct KafkaSink {
     /// per-partition `write_all` streams (`ParallelSinkExec`).
     rows_received: AtomicU64,
     metric_metadata_id: String,
-    producers: OnceCell<SafeKafkaProducers>,
     primary_key: Option<String>,
     /// Maximum number of messages to batch before sending (maps to Kafka's batch.num.messages)
     batch_size: Option<u32>,
@@ -2831,7 +2977,6 @@ impl KafkaSink {
             num_records_before_stop,
             rows_received: AtomicU64::new(0),
             metric_metadata_id: reference_name,
-            producers: OnceCell::new(),
             primary_key,
             batch_size,
             batch_flush_interval_ms,
@@ -2990,14 +3135,13 @@ impl KafkaSink {
         builder
     }
 
-    /// One producer per sink, shared by every concurrent write stream.
+    /// Builds the producer for one write stream.
     ///
-    /// The sink used to fan out to N producers and route rows between them by
-    /// `hash(key) % N` — a hash exchange hand-rolled inside the sink. The
-    /// `parallelism` knob now drives a real `StreamingRepartitionExec` upstream,
-    /// which gives each key its own write stream, so the internal routing is
-    /// gone. `ThreadedProducer` is `Sync` and batches internally, so the streams
-    /// share it.
+    /// `ParallelSinkExec` runs one `write_all` per input partition, and each
+    /// stream owns its producer: its own broker connections, queue, and flush.
+    /// A marker flush therefore waits only on this stream's messages. Write
+    /// parallelism comes from the plan (`StreamingRepartitionExec` upstream),
+    /// not from routing rows between producers inside the sink.
     fn create_producer(&self) -> streamling_core::error::Result<KafkaThreadedProducer> {
         info!(
             "Creating Kafka producer for topic: {} (message.timeout.ms=600000, acks=all, batch_size={:?}, batch_flush_interval_ms={:?}, message_max_bytes={:?}, compression={})",
@@ -3265,26 +3409,39 @@ impl KafkaSink {
             }
         }
 
-        // Ensure the schema exists in the schema registry
-        // Only need to do it after the initial topic creation
+        // Make sure the schema this sink encodes with is the subject's latest
+        // version. The encoder fetches the registered schema itself, so a
+        // subject left holding an older shape — a wide-int column registered
+        // as plain `bytes` before the decimal_arb migration gave it a
+        // `decimal` logicalType — made every record fail validation on the
+        // first encode, forever (the subject was never re-registered). When
+        // the registered schema differs, register ours as a new version; the
+        // registry's compatibility check decides whether that is allowed.
         if self.format == KafkaFormat::Avro {
             let schema_registry_settings =
                 self.config.get_schema_registry_settings().ok_or_else(|| {
                     streamling_user_err!("schema_registry_url is required for Avro format")
                 })?;
-            let existing_avro_schema = KafkaCommon::fetch_avro_schema(&self.config, &self.topic);
-
-            if existing_avro_schema.is_ok() {
-                debug!(
-                    "Schema already exists in schema registry for topic: {}",
-                    self.topic
-                );
-                return Ok(());
-            }
-
             let avro_schema = to_avro(&self.topic, &self.schema.fields);
             let avro_schema =
                 post_process_avro_schema_for_writing(avro_schema, self.primary_key.clone());
+
+            if let Ok((existing, existing_id)) =
+                KafkaCommon::fetch_avro_schema(&self.config, &self.topic)
+            {
+                if !avro_schemas_differ(&existing, &avro_schema) {
+                    debug!(
+                        "Schema already registered for topic {} (id {}); nothing to register",
+                        self.topic, existing_id
+                    );
+                    return Ok(());
+                }
+                info!(
+                    "Registered Avro schema for topic {} (id {}) differs from the schema this \
+                     sink writes; registering a new version",
+                    self.topic, existing_id
+                );
+            }
 
             let subject = self
                 .subject_name_strategy
@@ -3306,7 +3463,10 @@ impl KafkaSink {
 
             let registered_schema = registered_schema.streamling_with_context(|| {
                 format!(
-                    "failed to register schema with Schema Registry (topic: {}, subject: {})",
+                    "failed to register schema with Schema Registry (topic: {}, subject: {}). \
+                     A schema already registered for this subject must be compatible with the \
+                     one this sink writes under the subject's compatibility level — wide \
+                     integers are now written as `bytes` with a `decimal` logicalType",
                     self.topic, subject
                 )
             })?;
@@ -3337,18 +3497,11 @@ impl DataSink for KafkaSink {
 
         self.ensure_topic_and_schema_exist().await?;
 
-        // One producer, shared by the concurrent per-partition write_all
-        // streams (write parallelism comes from the plan, not from producer
-        // fan-out) — still inside SafeKafkaProducers so its rdkafka teardown
-        // runs on a detached OS thread and can never deadlock the drain.
-        let producers: &[KafkaThreadedProducer] = self
-            .producers
-            .get_or_try_init(|| {
-                self.create_producer()
-                    .map(|producer| SafeKafkaProducers::new(vec![producer]))
-            })?
-            .as_slice();
-        let producer: &KafkaThreadedProducer = &producers[0];
+        // One producer per write stream, inside SafeKafkaProducer so its
+        // rdkafka teardown runs on a detached OS thread and can never deadlock
+        // the drain.
+        let safe_producer = SafeKafkaProducer::new(self.create_producer()?);
+        let producer: &KafkaThreadedProducer = &safe_producer;
         let metrics_recorder = get_metrics_recorder().clone();
         let shutdown = streamling_core::shutdown::subscribe();
 
@@ -3426,11 +3579,8 @@ impl DataSink for KafkaSink {
                         "Received marker for epoch {}, flushing Kafka producer for topic: {}",
                         epoch.0, self.topic,
                     );
-                    tokio::task::block_in_place(|| -> streamling_core::error::Result<()> {
-                        for producer in producers {
-                            Self::flush_producer(producer, &self.topic, &shutdown)?;
-                        }
-                        Ok(())
+                    tokio::task::block_in_place(|| {
+                        Self::flush_producer(producer, &self.topic, &shutdown)
                     })
                     .map_err(datafusion::error::DataFusionError::from)?;
 
@@ -3468,21 +3618,13 @@ impl DataSink for KafkaSink {
             }
         }
 
-        tokio::task::block_in_place(|| -> streamling_core::error::Result<()> {
-            for producer in producers {
-                Self::flush_producer(producer, &self.topic, &shutdown)?;
-            }
-            Ok(())
-        })
-        .map_err(datafusion::error::DataFusionError::from)?;
-        for producer in producers {
-            producer.context().check_error().map_err(|e| {
-                datafusion::error::DataFusionError::from(
-                    streamling_core::streamling_err!("Kafka producer error: {}", e)
-                        .mark_retriable(),
-                )
-            })?;
-        }
+        tokio::task::block_in_place(|| Self::flush_producer(producer, &self.topic, &shutdown))
+            .map_err(datafusion::error::DataFusionError::from)?;
+        producer.context().check_error().map_err(|e| {
+            datafusion::error::DataFusionError::from(
+                streamling_core::streamling_err!("Kafka producer error: {}", e).mark_retriable(),
+            )
+        })?;
 
         info!(
             "[{}] write_all completed with {} rows (topic '{}')",
@@ -3629,6 +3771,26 @@ impl TableProvider for KafkaSinkTableProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn avro_schemas_differ_sees_a_logical_type() {
+        // `Schema::eq` is Parsing-Canonical-Form equality and ignores
+        // logicalType, so it cannot tell the pre-migration `bytes` field
+        // from the decimal it became.
+        let plain = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[{"name":"v","type":"bytes"}]}"#,
+        )
+        .unwrap();
+        let decimal = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[{"name":"v","type":{"type":"bytes","logicalType":"decimal","precision":78,"scale":0}}]}"#,
+        )
+        .unwrap();
+        assert!(super::avro_schemas_differ(&plain, &decimal));
+        assert!(!super::avro_schemas_differ(&decimal, &decimal.clone()));
+        let reparsed = apache_avro::Schema::parse_str(&decimal.canonical_form()).unwrap();
+        // Canonical form drops the logical type: the two really do differ
+        // for the encoder, and the check says so.
+        assert!(super::avro_schemas_differ(&decimal, &reparsed));
+    }
     use super::*;
 
     /// A topology-level source `filter:` is defined against the source's full
@@ -4112,10 +4274,21 @@ mod tests {
         ));
     }
 
+    fn lags(points: &[(i32, i64)]) -> PartitionLags {
+        Some(Arc::new(points.iter().copied().collect()))
+    }
+
+    fn assigned(instance: usize, partitions: &[i32]) -> PartitionAssignments {
+        let assignments = PartitionAssignments::default();
+        assignments.set(instance, partitions.iter().copied().collect());
+        assignments
+    }
+
     #[test]
     fn test_watchdog_reads_lag_from_channel() {
         let (tx, rx) = watch::channel(None);
-        let mut watchdog = KafkaSourceWatchdogState::new(Duration::from_secs(60), rx);
+        let mut watchdog =
+            KafkaSourceWatchdogState::new(Duration::from_secs(60), rx, assigned(0, &[0, 1]), 0);
 
         watchdog.on_record();
 
@@ -4125,18 +4298,18 @@ mod tests {
         assert!(watchdog.lag_unavailable_since.is_some());
 
         // Lag task publishes positive lag
-        tx.send(Some(500)).unwrap();
+        tx.send(lags(&[(0, 500), (1, 20)])).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, Some(500));
         assert!(watchdog.lag_unavailable_since.is_none());
 
         // Lag task publishes caught-up
-        tx.send(Some(0)).unwrap();
+        tx.send(lags(&[(0, 0), (1, 0)])).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, Some(0));
         assert!(watchdog.lag_unavailable_since.is_none());
 
-        // Lag task publishes None (watermarks temporarily unavailable)
+        // Lag task stopped
         tx.send(None).unwrap();
         watchdog.refresh_lag();
         assert_eq!(watchdog.max_observed_lag, None);
@@ -4146,13 +4319,64 @@ mod tests {
     #[test]
     fn test_watchdog_skips_refresh_before_data() {
         let (tx, rx) = watch::channel(None);
-        let mut watchdog = KafkaSourceWatchdogState::new(Duration::from_secs(60), rx);
+        let mut watchdog =
+            KafkaSourceWatchdogState::new(Duration::from_secs(60), rx, assigned(0, &[0]), 0);
 
-        tx.send(Some(100)).unwrap();
+        tx.send(lags(&[(0, 100)])).unwrap();
         watchdog.refresh_lag();
 
         // Should not read from channel before first record
         assert_eq!(watchdog.max_observed_lag, None);
+    }
+
+    /// Every local instance's watchdog sees the lag of its own partitions,
+    /// not of partitions another instance (or pod) consumes.
+    #[test]
+    fn test_watchdog_uses_only_own_partitions() {
+        let assignments = assigned(0, &[0]);
+        assignments.set(1, [1].into());
+        let (tx, rx) = watch::channel(lags(&[(0, 900), (1, 7)]));
+        let mut watchdog =
+            KafkaSourceWatchdogState::new(Duration::from_secs(60), rx, assignments.clone(), 1);
+        watchdog.on_record();
+
+        watchdog.refresh_lag();
+        assert_eq!(watchdog.max_observed_lag, Some(7));
+
+        // A rebalance moves partition 0 to instance 1.
+        assignments.set(0, BTreeSet::new());
+        assignments.set(1, [0, 1].into());
+        tx.send(lags(&[(0, 900), (1, 7)])).unwrap();
+        watchdog.refresh_lag();
+        assert_eq!(watchdog.max_observed_lag, Some(900));
+    }
+
+    #[test]
+    fn test_own_max_lag() {
+        let lags: BTreeMap<i32, i64> = [(0, 5), (1, 9)].into();
+        assert_eq!(own_max_lag(&lags, &[0, 1].into()), Some(9));
+        assert_eq!(own_max_lag(&lags, &[0].into()), Some(5));
+        // Owning nothing means nothing to consume, not unknown lag.
+        assert_eq!(own_max_lag(&lags, &BTreeSet::new()), Some(0));
+        // Partitions without a known lag are skipped; none known is unknown.
+        assert_eq!(own_max_lag(&lags, &[0, 2].into()), Some(5));
+        assert_eq!(own_max_lag(&lags, &[2].into()), None);
+    }
+
+    #[test]
+    fn test_partition_assignments_track_each_instance() {
+        let assignments = PartitionAssignments::default();
+        assignments.set(0, [0, 1].into());
+        assignments.set(1, [2].into());
+        assert_eq!(assignments.owned(), [0, 1, 2].into());
+        let lags = [(0, 5), (1, 9), (2, 3)].into();
+        assert_eq!(assignments.own_max_lag(1, &lags), Some(3));
+        // An instance with no recorded assignment owns nothing.
+        assert_eq!(assignments.own_max_lag(7, &lags), Some(0));
+
+        // A rebalance replaces an instance's assignment, it never accumulates.
+        assignments.set(0, [1].into());
+        assert_eq!(assignments.owned(), [1, 2].into());
     }
 
     mod filter_validation {
@@ -4253,6 +4477,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn bigint_column_filter_casts_integer_literals() {
+            use arrow::array::{Array, BooleanArray, Int64Array, RecordBatch};
+            use streamling_core::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType};
+
+            let value_field =
+                DecimalArbType::field("value", 78, 0, false).expect("decimal_arb field");
+            let schema: SchemaRef = Arc::new(Schema::new(vec![
+                Field::new("status", DataType::Int64, false),
+                value_field,
+            ]));
+
+            let (values, _, _) = {
+                let mut b =
+                    DecimalArbArrayBuilder::with_capacity(3, "value", 78, 0).expect("builder");
+                for v in ["0", "7", "0"] {
+                    b.append_str(v).expect("append");
+                }
+                b.finish().into_inner()
+            };
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 1, 0])), Arc::new(values)],
+            )
+            .expect("batch");
+
+            let predicate = KafkaSourceTableProvider::prepare_filter_expression(
+                "value > 0 AND status = 1",
+                &schema,
+                &test_session_manager(),
+            )
+            .expect("literal compared to a decimal_arb column should be auto-cast");
+            let result = predicate
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(result, &BooleanArray::from(vec![false, true, false]));
+        }
+
+        #[tokio::test]
         async fn validate_filter_columns_with_existing_columns() {
             let schema = test_schema();
             let session_manager = test_session_manager();
@@ -4297,16 +4562,17 @@ mod tests {
 /// Real-payload regression check for the arrow-avro decode path (`ConfluentAvroDecoder` +
 /// recursive `coerce_batch_to_target`): decoding the real blockchain `traces` schema + payload
 /// must produce a `RecordBatch` whose schema matches streamling's `convert_avro_schema_to_arrow`
-/// mapping (top-level u256 + nested `List<Struct{…Decimal128(100,0)}>`) and whose u256 column
-/// round-trips. Lives inline per repo convention (no standalone test files in library crates).
+/// mapping (top-level wide decimal → `decimal_arb` + nested `List<Struct{…decimal_arb}>`) and
+/// whose `decimal_arb` column round-trips. Lives inline per repo convention (no standalone test
+/// files in library crates).
 #[cfg(test)]
 mod arrow_avro_real_payload_tests {
     use apache_avro::Schema as AvroSchema;
-    use arrow::array::{Array, FixedSizeBinaryArray};
+    use arrow::array::{Array, LargeBinaryArray};
     use arrow_schema::DataType;
     use streamling_core::formats::avro::arrow_avro::ConfluentAvroDecoder;
     use streamling_core::formats::avro::convert_avro_schema_to_arrow;
-    use streamling_core::types::u256::U256Type;
+    use streamling_core::types::decimal_arb::{DecimalArbType, DecimalArbValue};
 
     fn manifest_path(rel: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
@@ -4373,7 +4639,7 @@ mod arrow_avro_real_payload_tests {
             let schema = batch.schema();
 
             // The decoded batch must carry exactly streamling's target Arrow schema, recursively
-            // (field types, nullability, and u256/i256 extension metadata).
+            // (field types, nullability, and decimal_arb extension metadata).
             assert_eq!(
                 schema.fields(),
                 target.fields(),
@@ -4381,26 +4647,31 @@ mod arrow_avro_real_payload_tests {
             );
             assert_eq!(batch.num_rows(), 1, "expected one decoded row");
 
-            // Top-level `value` (avro decimal precision 100, scale 0) → u256 FixedSizeBinary(32).
+            // Top-level `value` (avro decimal precision 100, scale 0) → streamling.decimal_arb.
             let value_idx = target.index_of("value").unwrap();
             let value_field = schema.field(value_idx).clone();
             assert!(
-                U256Type::is_u256_field(&value_field),
-                "`value` field is not tagged u256: {value_field:?}"
+                DecimalArbType::is_decimal_arb_field(&value_field),
+                "`value` field is not tagged decimal_arb: {value_field:?}"
             );
+            let (_p, scale) = DecimalArbType::precision_scale_from_field(&value_field)
+                .expect("decimal_arb metadata");
             let value_col = batch
                 .column(value_idx)
                 .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .expect("u256 column is FixedSizeBinary(32)");
+                .downcast_ref::<LargeBinaryArray>()
+                .expect("decimal_arb column is LargeBinary");
             assert!(
                 !value_col.is_null(0),
                 "`value` should be non-null in this row"
             );
-            assert_eq!(value_col.value(0).len(), 32, "u256 is 32 bytes");
+            // The canonical payload decodes to a valid decimal_arb value at the declared scale.
+            DecimalArbValue::from_canonical_bytes_at_scale(value_col.value(0), scale)
+                .expect("`value` decodes as decimal_arb");
 
-            // Nested high-precision decimals inside the array-of-records become Decimal128(100,0)
-            // (matching streamling's top-level-only u256 fixup — nested decimals fall through).
+            // Nested high-precision decimals inside the array-of-records route to
+            // streamling.decimal_arb (precision 100 > 76), lossless — they no longer fall
+            // through to the truncating Decimal128(100,0) path.
             let xfers_idx = target.index_of("after_evm_transfers").unwrap();
             let DataType::List(elem) = schema.field(xfers_idx).data_type() else {
                 panic!("after_evm_transfers is not a List");
@@ -4409,14 +4680,14 @@ mod arrow_avro_real_payload_tests {
                 panic!("after_evm_transfers element is not a Struct");
             };
             let nested_value = fields.iter().find(|f| f.name() == "value").unwrap();
-            assert_eq!(
-                nested_value.data_type(),
-                &DataType::Decimal128(100, 0),
-                "nested transfer `value` should be Decimal128(100,0)"
+            assert!(
+                DecimalArbType::is_decimal_arb_field(nested_value),
+                "nested transfer `value` should be decimal_arb, got {:?}",
+                nested_value.data_type()
             );
 
             println!(
-                "  OK: {} cols, schema + u256 + nested types verified",
+                "  OK: {} cols, schema + decimal_arb + nested types verified",
                 batch.num_columns()
             );
         }

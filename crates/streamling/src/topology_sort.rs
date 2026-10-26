@@ -308,6 +308,7 @@ mod tests {
             schema: None,
             parallelism: None,
             batch_size: None,
+            batch_flush_interval: None,
             telemetry: None,
         })
     }
@@ -552,6 +553,7 @@ mod tests {
             from: "script_transform".to_string(),
             options: None,
             primary_key: None,
+            parallelism: None,
             telemetry: None,
             batch_size: None,
             batch_flush_interval: None,
@@ -770,6 +772,7 @@ mod tests {
             from: "solana_source".to_string(),
             options: None,
             primary_key: None,
+            parallelism: None,
             telemetry: None,
             batch_size: None,
             batch_flush_interval: None,

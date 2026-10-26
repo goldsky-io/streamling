@@ -1,6 +1,13 @@
 use crate::formats::avro::MAX_SCHEMA_PRECISION;
 use crate::formats::avro::arrow_avro::AVRO_DECIMAL_SCALE_META;
-use crate::types::u256::U256Type;
+use crate::types::decimal_arb::DecimalArbType;
+// Note: the U256Type/I256Type Arrow types have been retired.
+// The Avro schema → Arrow type mapping routes all wide-precision decimals
+// through `decimal_arb`. Every integer-shaped `decimal(p > 76, 0)` also
+// carries a `native_int_kind=u256` hint so a downstream ClickHouse sink
+// keeps emitting `UInt256` storage (the routing the retired type had);
+// there is no native Avro convention for signed-vs-unsigned, so the source
+// path does not infer signedness.
 use apache_avro::schema::{
     Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordField, RecordSchema,
     Schema as AvroSchema, UnionSchema,
@@ -38,7 +45,11 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
 
     let arrow_schema = to_arrow_schema(&updated_avro_schema).unwrap();
 
-    // Update decimal fields to use appropriate Arrow decimal type or extension types for u256/i256
+    // Update decimal fields to use appropriate Arrow decimal type. Wide
+    // precisions (p > 76) route to streamling.decimal_arb; integer-shaped
+    // wide values (s == 0) get the native_int_kind hint so downstream
+    // sinks with matching native channels (ClickHouse UInt256/Int256) can
+    // round-trip without forcing a schema migration.
     let updated_fields: Vec<Arc<Field>> = arrow_schema
         .fields()
         .iter()
@@ -51,15 +62,37 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                 && let Some(decimal_schema) = find_decimal_schema(&avro_field.schema)
             {
                 return match (decimal_schema.precision, decimal_schema.scale) {
-                    // Assuming it's UInt256 based on blockchain context, but ideally we have a schema override
-                    // in the kafka source config that will let us make a better decision. When that happens we can
-                    // default to I256Type instead and maybe introduce 512 byte types.
+                    // Wide integer-shaped (scale 0) decimals route to
+                    // decimal_arb with a u256 native_int_kind hint so a
+                    // downstream ClickHouse sink keeps emitting native
+                    // `UInt256` storage. This is the historic routing — every
+                    // `decimal(p > 76, 0)` was `U256Type` — kept at every
+                    // precision, because a pipeline reading e.g. a traces
+                    // `value decimal(100, 0)` into ClickHouse must still
+                    // load. What changes is what happens to a value above
+                    // 2^256 − 1: the retired path silently truncated it, the
+                    // ClickHouse sink now range-checks on write and fails the
+                    // batch. Sinks other than ClickHouse ignore the hint.
+                    //
+                    // There is no Avro convention for signed-vs-unsigned wide
+                    // decimals; a pipeline that needs signed `Int256` pins the
+                    // column with the ClickHouse sink's `schema_override`.
                     (p, 0) if p > 76 => {
-                        // Unsigned 256-bit integer - use U256 type with metadata
-                        Arc::new(
-                            Field::new(field.name(), U256Type::new(), field.is_nullable())
-                                .with_metadata(U256Type::metadata()),
-                        )
+                        DecimalArbType::field(field.name(), p as u32, 0, field.is_nullable())
+                            .and_then(|f| {
+                                DecimalArbType::with_native_int_kind(
+                                    f,
+                                    crate::types::decimal_arb::NativeIntKind::U256,
+                                )
+                            })
+                            .map(Arc::new)
+                            .unwrap_or_else(|_| {
+                                Arc::new(Field::new(
+                                    field.name(),
+                                    DataType::Utf8,
+                                    field.is_nullable(),
+                                ))
+                            })
                     }
                     (p, s) if p > 38 && p <= 76 => {
                         // Use Decimal256 for high precision decimals (up to 76 digits)
@@ -77,17 +110,29 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
                             field.is_nullable(),
                         ))
                     }
-                    // precision > 76 with non-zero scale: too wide for Decimal256 and not a scale-0
-                    // u256/i256. Map to Utf8, but carry the scale so the arrow-avro decode path
-                    // (`coerce_array`) formats the raw decimal bytes as a scale-aware decimal string
-                    // instead of reinterpreting them as text.
-                    (_, s) => Arc::new(
-                        Field::new(field.name(), DataType::Utf8, field.is_nullable())
-                            .with_metadata(HashMap::from([(
-                                AVRO_DECIMAL_SCALE_META.to_string(),
-                                s.to_string(),
-                            )])),
-                    ),
+                    // p > 76 with non-zero scale: route to streamling.decimal_arb
+                    // (replaces the prior Utf8 fallback that lost numeric semantics).
+                    // Negative scales are documented as unsupported for decimal_arb; fall back to
+                    // the (still-lossy) Utf8 mapping for that edge case so the field at least
+                    // transmits, carrying the scale so the arrow-avro decode path (`coerce_array`)
+                    // formats the raw decimal bytes as a scale-aware decimal string instead of
+                    // reinterpreting them as text.
+                    (p, s) if p > 76 => {
+                        DecimalArbType::field(field.name(), p as u32, s as u32, field.is_nullable())
+                            .map(Arc::new)
+                            .unwrap_or_else(|_| {
+                                Arc::new(utf8_avro_decimal_field(
+                                    field.name(),
+                                    s,
+                                    field.is_nullable(),
+                                ))
+                            })
+                    }
+                    (_, s) => Arc::new(utf8_avro_decimal_field(
+                        field.name(),
+                        s,
+                        field.is_nullable(),
+                    )),
                 };
             }
             field.clone()
@@ -95,6 +140,17 @@ pub fn convert_avro_schema_to_arrow(root_avro_schema: AvroSchema) -> SchemaRef {
         .collect();
 
     SchemaRef::new(Schema::new(updated_fields))
+}
+
+/// Utf8 fallback for avro `decimal` fields that neither Arrow's fixed-width decimals nor
+/// `decimal_arb` can represent. The scale rides along in field metadata so the arrow-avro
+/// decode path (`coerce_array`) renders the raw decimal bytes as a scale-aware decimal
+/// string instead of reinterpreting them as text.
+fn utf8_avro_decimal_field(name: &str, scale: usize, nullable: bool) -> Field {
+    Field::new(name, DataType::Utf8, nullable).with_metadata(HashMap::from([(
+        AVRO_DECIMAL_SCALE_META.to_string(),
+        scale.to_string(),
+    )]))
 }
 
 pub fn post_process_avro_schema_for_reading(root_avro_schema: AvroSchema) -> AvroSchema {
@@ -337,11 +393,38 @@ fn schema_to_field_with_props(
         AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
     };
 
+    // Route decimals by precision, mirroring the top-level
+    // `convert_avro_schema_to_arrow` fixup, so NESTED decimals (inside
+    // List/Struct/Map) aren't left as the malformed `Decimal128(p, s)` the
+    // match above produces for every precision — which is invalid for p > 38
+    // and silently truncates to 128 bits on decode. p <= 38 -> Decimal128;
+    // 38 < p <= 76 -> Decimal256; p > 76 -> streamling.decimal_arb. Top-level
+    // fields are re-processed (with the ClickHouse `native_int_kind` hint) by
+    // `convert_avro_schema_to_arrow` afterward, so this only changes nested
+    // decimals in practice. `find_decimal_schema` sees through nullable unions.
+    let mut props = props.unwrap_or_default();
+    let mut field_type = field_type;
+    if let Some(decimal) = find_decimal_schema(schema) {
+        let (precision, scale) = (decimal.precision, decimal.scale);
+        if precision > 76 {
+            // decimal_arb is the only lossless representation for >76-digit
+            // values. On an unsupported (precision, scale) (e.g. negative
+            // scale) leave the field as-is rather than failing the whole schema.
+            if let Ok(meta) = DecimalArbType::metadata(precision as u32, scale as u32) {
+                field_type = DecimalArbType::new();
+                props.extend(meta);
+            }
+        } else if precision > 38 {
+            field_type = DataType::Decimal256(precision as u8, scale as i8);
+        }
+        // precision <= 38 is already Decimal128(p, s) from the match above.
+    }
+
     let data_type = field_type.clone();
     let name = name.unwrap_or_else(|| default_field_name(&data_type));
 
     let mut field = Field::new(name, field_type, nullable);
-    field.set_metadata(props.unwrap_or_default());
+    field.set_metadata(props);
     Ok(field)
 }
 
@@ -582,16 +665,107 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_avro_schema_u256() {
-        // Test decimal with precision > 76 and scale = 0 converts to U256Type
+    fn test_convert_avro_schema_wide_decimal_routes_to_decimal_arb_with_hint() {
+        // decimal(p, 0) with p > 76 routes to streamling.decimal_arb now
+        // that u256/i256 are retired. The historic streamling routing was
+        // "all decimal(p > 76, 0) → U256Type" — we preserve that semantics
+        // by stamping u256 at every such precision (no signed inference;
+        // pipelines needing Int256 round-trip pin the column with a sink
+        // schema_override). A value above 2^256 − 1 fails the ClickHouse
+        // write loudly instead of being truncated as it was on the old path.
+        use crate::types::decimal_arb::NativeIntKind;
         let avro_schema = AvroSchema::parse_str(
             r#"
             {
                 "type": "record",
                 "name": "test",
                 "fields": [
-                    {"name": "u256_field", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 0}},
-                    {"name": "large_u256", "type": {"type": "bytes", "logicalType": "decimal", "precision": 100, "scale": 0}}
+                    {"name": "p77_field",         "type": {"type": "bytes", "logicalType": "decimal", "precision": 77,  "scale": 0}},
+                    {"name": "p78_field",         "type": {"type": "bytes", "logicalType": "decimal", "precision": 78,  "scale": 0}},
+                    {"name": "just_past_native",  "type": {"type": "bytes", "logicalType": "decimal", "precision": 79,  "scale": 0}},
+                    {"name": "large_wide",        "type": {"type": "bytes", "logicalType": "decimal", "precision": 100, "scale": 0}}
+                ]
+            }
+        "#,
+        )
+        .unwrap();
+
+        let arrow_schema = convert_avro_schema_to_arrow(avro_schema);
+
+        assert_eq!(arrow_schema.fields().len(), 4);
+
+        // p == 77, s == 0 → decimal_arb(77, 0) + native_int_kind=u256
+        // (matches the pre-feature-002 routing for unsigned-by-default
+        // wide-decimal storage; signed semantics require an explicit
+        // sink-side directive).
+        let f0 = arrow_schema.field(0);
+        assert_eq!(f0.name(), "p77_field");
+        assert!(DecimalArbType::is_decimal_arb_field(f0));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(f0),
+            Some((77, 0)),
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(f0),
+            Some(NativeIntKind::U256),
+        );
+
+        // p == 78, s == 0 → decimal_arb(78, 0) + native_int_kind=u256
+        let f1 = arrow_schema.field(1);
+        assert_eq!(f1.name(), "p78_field");
+        assert!(DecimalArbType::is_decimal_arb_field(f1));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(f1),
+            Some((78, 0)),
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(f1),
+            Some(NativeIntKind::U256),
+        );
+
+        // p == 79 and p == 100, s == 0 → still hinted. A traces `value
+        // decimal(100, 0)` → ClickHouse pipeline loaded as UInt256 on the
+        // retired path and must keep loading; the sink's write-time range
+        // check is what guards values above 2^256 − 1 now.
+        let f2 = arrow_schema.field(2);
+        assert_eq!(f2.name(), "just_past_native");
+        assert!(DecimalArbType::is_decimal_arb_field(f2));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(f2),
+            Some((79, 0)),
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(f2),
+            Some(NativeIntKind::U256),
+        );
+
+        let f3 = arrow_schema.field(3);
+        assert_eq!(f3.name(), "large_wide");
+        assert!(DecimalArbType::is_decimal_arb_field(f3));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(f3),
+            Some((100, 0)),
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(f3),
+            Some(NativeIntKind::U256),
+        );
+    }
+
+    #[test]
+    fn test_convert_avro_schema_decimal_with_scale_routes_to_decimal_arb() {
+        // Previously, precision > 76 with non-zero scale fell back to
+        // Utf8 (lossy — broke arithmetic semantics on the destination side).
+        // It now routes to the streamling.decimal_arb extension type so the
+        // value is preserved as a numeric column end-to-end.
+        let avro_schema = AvroSchema::parse_str(
+            r#"
+            {
+                "type": "record",
+                "name": "test",
+                "fields": [
+                    {"name": "wide_decimal", "type": {"type": "bytes", "logicalType": "decimal", "precision": 100, "scale": 18}},
+                    {"name": "boundary_77", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 1}}
                 ]
             }
         "#,
@@ -601,34 +775,16 @@ mod tests {
         let arrow_schema = convert_avro_schema_to_arrow(avro_schema);
 
         assert_eq!(arrow_schema.fields().len(), 2);
-        assert_eq!(arrow_schema.field(0).name(), "u256_field");
-        assert_eq!(arrow_schema.field(0).data_type(), &U256Type::new());
-        assert_eq!(arrow_schema.field(0).metadata(), &U256Type::metadata());
-        assert_eq!(arrow_schema.field(1).name(), "large_u256");
-        assert_eq!(arrow_schema.field(1).data_type(), &U256Type::new());
-    }
-
-    #[test]
-    fn test_convert_avro_schema_decimal_with_scale_to_string() {
-        // Test decimal with precision > 76 and scale > 0 falls back to Utf8
-        let avro_schema = AvroSchema::parse_str(
-            r#"
-            {
-                "type": "record",
-                "name": "test",
-                "fields": [
-                    {"name": "unsupported_decimal", "type": {"type": "bytes", "logicalType": "decimal", "precision": 77, "scale": 1}}
-                ]
-            }
-        "#,
-        )
-        .unwrap();
-
-        let arrow_schema = convert_avro_schema_to_arrow(avro_schema);
-
-        assert_eq!(arrow_schema.fields().len(), 1);
-        assert_eq!(arrow_schema.field(0).name(), "unsupported_decimal");
-        assert_eq!(arrow_schema.field(0).data_type(), &DataType::Utf8);
+        assert!(DecimalArbType::is_decimal_arb_field(arrow_schema.field(0)));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(arrow_schema.field(0)),
+            Some((100, 18))
+        );
+        assert!(DecimalArbType::is_decimal_arb_field(arrow_schema.field(1)));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(arrow_schema.field(1)),
+            Some((77, 1))
+        );
     }
 
     #[test]
@@ -695,7 +851,19 @@ mod tests {
             arrow_schema.field(3).data_type(),
             &DataType::Decimal256(76, 18)
         );
-        assert_eq!(arrow_schema.field(4).data_type(), &U256Type::new());
+        // decimal(100, 0) routes to decimal_arb(100, 0) with the u256 hint:
+        // every integer-shaped wide decimal keeps the native UInt256 route
+        // the retired type gave it (the sink range-checks values on write).
+        let large_int = arrow_schema.field(4);
+        assert!(DecimalArbType::is_decimal_arb_field(large_int));
+        assert_eq!(
+            DecimalArbType::precision_scale_from_field(large_int),
+            Some((100, 0)),
+        );
+        assert_eq!(
+            DecimalArbType::native_int_kind_from_field(large_int),
+            Some(crate::types::decimal_arb::NativeIntKind::U256),
+        );
         assert_eq!(arrow_schema.field(5).data_type(), &DataType::Boolean);
     }
 

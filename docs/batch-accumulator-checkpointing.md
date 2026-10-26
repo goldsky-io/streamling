@@ -89,7 +89,7 @@ flowchart TD
 
 A checkpoint marker on batch N means "all data up to this point has been delivered." If the accumulator returns a marker-bearing batch immediately (before prior accumulated data is flushed), the sink might ack epoch N before writing data from batches 1..N-1.
 
-**Solution:** Empty checkpoint batches are **queued** (added to `accumulated_batches`), not returned immediately. They flush together with any preceding data batches. The sink only sees the marker after all prior data has been included in a flush.
+**Solution:** Empty checkpoint batches are queued behind any pending data rows and flush together with them. When no data rows are pending there is nothing the marker could be acked ahead of, so `push()` returns it at once.
 
 ```mermaid
 sequenceDiagram
@@ -136,7 +136,7 @@ flowchart LR
 **BatchAccumulator's role (step 5)** is to ensure markers survive the batching layer intact:
 - Not lost (empty batch preservation)
 - Not duplicated (strip on split)
-- Not premature (queue, don't return immediately)
+- Not premature (queued behind pending data, released at once when none is pending)
 
 ---
 
@@ -169,4 +169,4 @@ Each marker is attached to its own batch. The accumulator preserves ordering. Wh
 
 ### Idle stream
 
-When no data arrives but the stream is still open, the timer tick fires `flush()` which returns empty. The `AsyncBatchAccumulator` calls the output function with an empty batch list, allowing sinks to perform heartbeat-like operations (e.g., ack checkpoint markers that arrived on earlier empty batches).
+When no data arrives but the stream is still open, the timer tick fires `flush()`, which returns `None` on an empty queue and nothing is yielded downstream.

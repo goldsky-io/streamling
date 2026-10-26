@@ -63,13 +63,14 @@ pub mod error_format;
 mod topology_sort;
 pub mod validate;
 use streamling_core::plugin::operator::PluginNode;
+use streamling_core::plugin::partitioned::{PartitionedPlugin, PluginInstances, PluginKind};
 use streamling_core::plugin::side_output::{
     register_plugin_side_outputs, shutdown_plugin_side_outputs,
 };
 use streamling_core::plugin::table_provider::{PluginSinkProvider, PluginSourceProvider};
 use streamling_core::plugin::{
-    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, InitializedPlugin, create_sink_plugin,
-    create_source_plugin, create_transform_plugin, terminate_all_plugins,
+    DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY, ExecutionFuture, InitializedPlugin,
+    create_sink_plugin, create_source_plugin, create_transform_plugin, terminate_all_plugins,
 };
 use streamling_core::side_output::SupportsSideOutputs;
 use streamling_core::sql_parse::extract_table_references_from_sql;
@@ -707,6 +708,18 @@ fn parse_batch_flush_interval(
         .transpose()
 }
 
+/// Without a timer a partial batch, and any marker behind it, waits for rows a filtered stream may never deliver.
+const DEFAULT_SCRIPT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+fn script_batch_flush_interval(
+    batch_size: Option<usize>,
+    configured: Option<Duration>,
+) -> Option<Duration> {
+    configured.or_else(|| {
+        matches!(batch_size, Some(n) if n > 0).then_some(DEFAULT_SCRIPT_BATCH_FLUSH_INTERVAL)
+    })
+}
+
 fn wrap_with_rebatch(
     plan: LogicalPlan,
     batch_size: Option<usize>,
@@ -724,6 +737,39 @@ fn wrap_with_rebatch(
     } else {
         plan
     }
+}
+
+/// Walk a sink's resolved schema and reject any decimal_arb column the
+/// connector cannot carry. Surfaces every Reject error at once (not just
+/// the first), prefixed with the sink's reference name so the user knows
+/// which YAML block to fix.
+fn validate_sink_decimal_arb(
+    schema: &arrow_schema::Schema,
+    kind: streamling_common::types::decimal_arb_capability::ConnectorKind,
+    directives: Option<&[streamling_config::ColumnDirective]>,
+    sink_name: &str,
+) -> Result<()> {
+    use streamling_common::types::decimal_arb_capability::{
+        ColumnDirectiveView, validate_pipeline_decimal_arb,
+    };
+    let views: Vec<ColumnDirectiveView<'_>> = directives
+        .into_iter()
+        .flatten()
+        .map(|d| ColumnDirectiveView {
+            name: d.name.as_str(),
+            coerce_to_string: d.coerces_to_string(),
+        })
+        .collect();
+    if let Err(errs) = validate_pipeline_decimal_arb(schema, kind, &views) {
+        let joined = errs
+            .into_inner()
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        streamling_user_bail!("sink '{}': {}", sink_name, joined);
+    }
+    Ok(())
 }
 
 pub struct Streamling {
@@ -1138,6 +1184,9 @@ impl Streamling {
 
         // Unified registry of initialized plugins keyed by a stable id.
         let mut plugins: BTreeMap<String, InitializedPlugin> = BTreeMap::new();
+        // Partition-capable plugins, whose instances are created during
+        // physical planning; their execution futures are collected after it.
+        let mut partitioned_plugins: Vec<Arc<PartitionedPlugin>> = Vec::new();
 
         let mut checkpoint_coordinator = CheckpointCoordinator::new();
         // Control handle shared with bounded sources (to begin the terminal
@@ -1492,32 +1541,66 @@ impl Streamling {
                     let ctx = node_contexts
                         .get(reference_name)
                         .expect("node context must exist");
-                    let opts = plugin.options.clone().unwrap_or_default();
+                    let opts =
+                        Self::convert_plugin_options(plugin.options.clone().unwrap_or_default());
                     let primary_key_opt = &plugin.primary_key;
 
-                    // Keying by reference name (no cross-source sharing)
-                    if !plugins.contains_key(reference_name) {
-                        let created = create_source_plugin(
-                            &app_config,
-                            reference_name.clone(),
-                            plugin.r#type.clone(),
-                            Self::convert_plugin_options(opts.clone()),
-                        )
-                        .map_err(|e| {
-                            e.context(format!("{}: failed to initialize plugin", ctx.format()))
-                        })?;
-                        plugins.insert(reference_name.clone(), created);
-                    }
-                    let created = plugins.get(reference_name).expect("plugin must exist");
-                    let channels = created.channels.clone();
-                    let output_schema = created
-                        .output_schema
-                        .clone()
-                        .expect("Source plugin must have output schema");
+                    let described = PartitionedPlugin::describe(
+                        &app_config,
+                        reference_name,
+                        &plugin.r#type,
+                        PluginKind::Source,
+                        None,
+                        opts.clone(),
+                        plugin.parallelism,
+                    )
+                    .map_err(|e| {
+                        e.context(format!("{}: failed to describe plugin", ctx.format()))
+                    })?;
+                    let (output_schema, instances) = match described {
+                        // Instances are created during physical planning, one
+                        // per stream.
+                        Some(partitioned) => {
+                            partitioned_plugins.push(partitioned.clone());
+                            (
+                                partitioned
+                                    .output_schema()
+                                    .expect("a source description has an output schema"),
+                                PluginInstances::Partitioned(partitioned),
+                            )
+                        }
+                        None => {
+                            // Keying by reference name (no cross-source sharing)
+                            if !plugins.contains_key(reference_name) {
+                                let created = create_source_plugin(
+                                    &app_config,
+                                    reference_name.clone(),
+                                    plugin.r#type.clone(),
+                                    opts,
+                                )
+                                .map_err(|e| {
+                                    e.context(format!(
+                                        "{}: failed to initialize plugin",
+                                        ctx.format()
+                                    ))
+                                })?;
+                                plugins.insert(reference_name.clone(), created);
+                            }
+                            let created = plugins.get(reference_name).expect("plugin must exist");
+                            let output_schema = created
+                                .output_schema
+                                .clone()
+                                .expect("Source plugin must have output schema");
+                            (
+                                output_schema,
+                                PluginInstances::Single(created.instance(reference_name.clone())),
+                            )
+                        }
+                    };
                     let plugin_source_provider: Arc<PluginSourceProvider> =
                         Arc::new(PluginSourceProvider::new(
                             output_schema,
-                            Arc::new(channels),
+                            instances,
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
                             shutdown_controller.scope_at(
@@ -1908,6 +1991,13 @@ impl Streamling {
                     let schema = &script_transform.schema;
                     let parallelism = script_transform.parallelism;
                     let batch_size = script_transform.batch_size;
+                    let batch_flush_interval = script_batch_flush_interval(
+                        batch_size,
+                        parse_batch_flush_interval(
+                            &script_transform.batch_flush_interval,
+                            &ctx.format(),
+                        )?,
+                    );
                     let source_plan = pipeline_plans
                         .get(from.as_str())
                         .ok_or_else(|| {
@@ -1978,7 +2068,7 @@ impl Streamling {
                             reference_name.clone(),
                         ),
                         batch_size,
-                        None,
+                        batch_flush_interval,
                         reference_name.clone(),
                     );
                     let wasm_node = WasmRunnerNode::with_options(
@@ -2061,37 +2151,102 @@ impl Streamling {
                             streamling_user_err!("{}: source '{}' not found", ctx.format(), from)
                         })?
                         .clone();
+                    let options = Self::convert_plugin_options(options.clone().unwrap_or_default());
 
-                    let transform_input = wrap_with_rebatch(
-                        source_plan.clone(),
-                        batch_size,
-                        batch_flush_interval,
-                        reference_name.clone(),
-                    );
-
-                    let initialized_plugin = create_transform_plugin(
+                    let described = PartitionedPlugin::describe(
                         &app_config,
-                        reference_name.clone(), // name
-                        r#type.clone(),         // plugin_type
-                        Self::convert_plugin_options(options.clone().unwrap_or_default()),
-                        transform_input.schema().inner().clone(),
+                        &reference_name,
+                        r#type,
+                        PluginKind::Transform,
+                        Some(source_plan.schema().inner().clone()),
+                        options.clone(),
+                        plugin_transform.parallelism,
                     )
                     .map_err(|e| {
-                        e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                        e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
-                    let output_schema = Arc::new(DFSchema::try_from(
-                        initialized_plugin
-                            .output_schema
-                            .as_ref()
-                            .expect("Transform plugin must have output schema")
-                            .as_ref()
-                            .clone(),
-                    )?);
+                    let (transform_input, output_schema, instances) = match described {
+                        Some(partitioned) => {
+                            let own_key = primary_key_opt
+                                .as_deref()
+                                .map(|pk| {
+                                    PrimaryKeyMetadata::from_str(
+                                        pk,
+                                        PrimaryKeySource::TopologyDefined,
+                                        reference_name.clone(),
+                                    )
+                                    .columns
+                                })
+                                .unwrap_or_default();
+                            // Read-only lookup: `propagate` would re-register
+                            // the key under this node.
+                            let upstream_key = pk_registry.get(from.as_str()).map(|m| m.columns);
+                            let placement = partitioned.input_placement(
+                                &own_key,
+                                upstream_key.as_deref(),
+                                source_plan.schema().inner(),
+                            )?;
+                            // The exchange goes below the rebatcher, as at the
+                            // sink edge: rebatching after the split keeps each
+                            // instance's batches whole.
+                            let transform_input = wrap_with_rebatch(
+                                wrap_with_repartition(
+                                    source_plan,
+                                    &placement,
+                                    plugin_transform.parallelism,
+                                    reference_name.clone(),
+                                ),
+                                batch_size,
+                                batch_flush_interval,
+                                reference_name.clone(),
+                            );
+                            partitioned_plugins.push(partitioned.clone());
+                            (
+                                transform_input,
+                                partitioned
+                                    .output_schema()
+                                    .expect("a transform description has an output schema"),
+                                PluginInstances::Partitioned(partitioned),
+                            )
+                        }
+                        None => {
+                            let transform_input = wrap_with_rebatch(
+                                source_plan,
+                                batch_size,
+                                batch_flush_interval,
+                                reference_name.clone(),
+                            );
+                            let initialized_plugin = create_transform_plugin(
+                                &app_config,
+                                reference_name.clone(), // name
+                                r#type.clone(),         // plugin_type
+                                options,
+                                transform_input.schema().inner().clone(),
+                            )
+                            .map_err(|e| {
+                                e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                            })?;
+                            let output_schema = initialized_plugin
+                                .output_schema
+                                .clone()
+                                .expect("Transform plugin must have output schema");
+                            let instance = initialized_plugin.instance(reference_name.clone());
+                            // Register transform plugin under its reference name
+                            plugins.insert(reference_name.clone(), initialized_plugin);
+                            (
+                                transform_input,
+                                output_schema,
+                                PluginInstances::Single(instance),
+                            )
+                        }
+                    };
+                    let output_schema =
+                        Arc::new(DFSchema::try_from(output_schema.as_ref().clone())?);
                     let logical_plan = LogicalPlan::Extension(Extension {
                         node: Arc::new(PluginNode::new(
                             transform_input,
                             output_schema,
-                            Arc::new(initialized_plugin.channels.clone()),
+                            instances,
                             app_config.internal_buffer_size,
                             metric_key(&application_id, reference_name.as_str()),
                             shutdown_controller.scope_at(
@@ -2128,9 +2283,6 @@ impl Streamling {
                     let logical_plan_with_telemetry = LogicalPlan::Extension(Extension {
                         node: wrapping_node,
                     });
-
-                    // Register transform plugin under its reference name
-                    plugins.insert(reference_name.clone(), initialized_plugin);
 
                     // also register this as a view in case another transform (e.g. SQL) refers to it
                     let view = ViewTable::new(logical_plan_with_telemetry.clone(), None);
@@ -2317,6 +2469,13 @@ impl Streamling {
                         validate_update_where(uw, &source_schema, &reference_name)?;
                     }
 
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+                        None,
+                        &reference_name,
+                    )?;
+
                     // Per-sink connection: two postgres sinks in one pipeline can
                     // target two different databases (STRM-6516). Falls back to the
                     // global postgres_sink block when no per-sink keys are set.
@@ -2454,6 +2613,13 @@ impl Streamling {
                             .await?;
                     }
 
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+                        None,
+                        &reference_name,
+                    )?;
+
                     let postgres_sink_provider = Arc::new(PostgresSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema.clone(),
@@ -2583,6 +2749,13 @@ impl Streamling {
                         &source_schema,
                     )?;
 
+                    let kafka_kind = match data_format.to_lowercase().as_str() {
+                        "avro" => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaAvro { declared_bytes: None },
+                        "json" => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+                        _ => streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+                    };
+                    validate_sink_decimal_arb(&source_schema, kafka_kind, None, &reference_name)?;
+
                     let kafka_sink_provider = Arc::new(KafkaSinkTableProvider::new(
                         metric_key(&application_id, reference_name.as_str()),
                         source_schema,
@@ -2653,6 +2826,21 @@ impl Streamling {
                             .parsed_batch_flush_interval()
                             .map_err(|e| streamling_user_err!("{}: {e:#}", ctx.format()))?,
                     });
+                    // A `schema_override` of `UInt256` / `Int256` on an
+                    // integer-shaped decimal_arb column is the operator pinning
+                    // its native type; the validator has to see it as the hint
+                    // it is, or it rejects a column the sink would carry.
+                    let validated_schema =
+                        streamling_connectors::table_providers::clickhouse::ClickHouseClient::apply_native_int_overrides(
+                            &source_schema,
+                            clickhouse_sink.schema_override.as_ref(),
+                        );
+                    validate_sink_decimal_arb(
+                        &validated_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+                        app_config.clickhouse_sink.connection.columns.as_deref(),
+                        &reference_name,
+                    )?;
                     let clickhouse_sink_provider = Arc::new(ClickHouseTableProvider::new_sink(
                         metric_key(&application_id, reference_name.as_str()),
                         table.as_str(),
@@ -2703,11 +2891,18 @@ impl Streamling {
                     let (source_plan, source_schema) =
                         Self::find_plan_and_schema(&pipeline_plans, from.as_str())?;
 
-                    pk_registry.track_primary_key_for_transform_or_sink(
+                    let pk_metadata_opt = pk_registry.track_primary_key_for_transform_or_sink(
                         primary_key_opt,
                         from.clone(),
                         reference_name.clone(),
                         &source_schema,
+                    )?;
+
+                    validate_sink_decimal_arb(
+                        &source_schema,
+                        streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
+                        None,
+                        &reference_name,
                     )?;
 
                     let mut plugin_opts = options.clone().unwrap_or_default();
@@ -2717,24 +2912,65 @@ impl Streamling {
                             serde_yaml::Value::String(pk.clone()),
                         );
                     }
+                    let plugin_opts = Self::convert_plugin_options(plugin_opts);
 
-                    let initialized_plugin = create_sink_plugin(
+                    let described = PartitionedPlugin::describe(
                         &app_config,
-                        reference_name.clone(), // name
-                        r#type.clone(),         // plugin_type
-                        Self::convert_plugin_options(plugin_opts),
-                        source_schema.clone(),
+                        &reference_name,
+                        r#type,
+                        PluginKind::Sink,
+                        Some(source_schema.clone()),
+                        plugin_opts.clone(),
+                        plugin_sink.parallelism,
                     )
                     .map_err(|e| {
-                        e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                        e.context(format!("{}: failed to describe plugin", ctx.format()))
                     })?;
+                    let (instances, placement, parallelism) = match described {
+                        // One instance per write stream, created when the sink
+                        // is planned against its input's width.
+                        Some(partitioned) => {
+                            // A sink's key is tracked against its input, so
+                            // there is no upstream key to fall back to.
+                            let placement = partitioned.input_placement(
+                                &pk_columns(&pk_metadata_opt),
+                                None,
+                                &source_schema,
+                            )?;
+                            partitioned_plugins.push(partitioned.clone());
+                            (
+                                PluginInstances::Partitioned(partitioned),
+                                placement,
+                                plugin_sink.parallelism,
+                            )
+                        }
+                        None => {
+                            let initialized_plugin = create_sink_plugin(
+                                &app_config,
+                                reference_name.clone(), // name
+                                r#type.clone(),         // plugin_type
+                                plugin_opts,
+                                source_schema.clone(),
+                            )
+                            .map_err(|e| {
+                                e.context(format!("{}: failed to initialize plugin", ctx.format()))
+                            })?;
+                            let instance = initialized_plugin.instance(reference_name.clone());
+                            // Register sink plugin under its reference name for lifecycle management
+                            plugins.insert(reference_name.clone(), initialized_plugin);
+                            // One instance serves every stream, so its input is
+                            // narrowed to one stream — and in a fan-out, so is
+                            // every sibling's.
+                            (PluginInstances::Single(instance), Placement::Single, None)
+                        }
+                    };
                     let batch_flush_interval = parse_batch_flush_interval(
                         &plugin_sink.batch_flush_interval,
                         &ctx.format(),
                     )?;
                     let plugin_sink_provider = Arc::new(PluginSinkProvider::new(
                         source_schema.clone(),
-                        Arc::new(initialized_plugin.channels.clone()),
+                        instances,
                         app_config.num_records_before_stop,
                         metric_key(&application_id, reference_name.as_str()),
                         sink_telemetry.clone(),
@@ -2754,18 +2990,11 @@ impl Streamling {
                             reference_name.clone(),
                             plugin_sink_provider,
                             RebatchConfig::new(plugin_sink.batch_size, batch_flush_interval),
-                            // A plugin acks epochs from inside the plugin, on a
-                            // channel poll decoupled from the marker that triggered
-                            // it, so the per-stream ack gate cannot see its markers.
-                            // The plugin ABI has no partition dimension either.
-                            Placement::Single,
-                            None,
+                            placement,
+                            parallelism,
                         ),
                     );
                     checkpoint_sink_names.push(reference_name.clone());
-
-                    // Register sink plugin under its reference name for lifecycle management
-                    plugins.insert(reference_name.clone(), initialized_plugin);
                 }
             }
         }
@@ -2777,8 +3006,6 @@ impl Streamling {
         // (`merge_metadata_tags`), so the seeded samples land on the final
         // label set instead of an orphan pre-merge series.
         get_metrics_recorder().seed_elapsed_compute_series();
-
-        let mut dry_run_plans: Vec<(String, LogicalPlan)> = Vec::new();
 
         // A plain `for` loop, NOT `.for_each`: plan-build failures below must
         // propagate as typed, contextualized errors via `?` — inside a
@@ -2853,75 +3080,62 @@ impl Streamling {
                 })?
             };
 
-            if !dry_run {
-                let session_manager = session_manager.clone();
-                let checkpoint_control = checkpoint_control.clone();
-                let sink_future = async move {
-                    // `DataFrame::collect`, split so the planned physical
-                    // plan can be logged before execution starts.
-                    let df = session_manager.new_df(sink_plan);
-                    let task_ctx = Arc::new(df.task_ctx());
-                    let result = match df.create_physical_plan().await {
-                        Ok(plan) => {
-                            info!(
-                                "Pipeline physical plan:\n{}",
-                                displayable(plan.as_ref()).indent(true)
-                            );
-                            collect(plan, task_ctx).await
-                        }
-                        Err(err) => Err(err),
-                    };
-                    match &result {
-                        Ok(_) => {
-                            // The sink has SUCCESSFULLY drained its input and
-                            // will not ack any further checkpoint epochs. Tell
-                            // the coordinator so it drops these sinks from the
-                            // expected-ack set and can finalize in-flight
-                            // epochs the remaining live sinks already acked,
-                            // instead of blocking on a sink that is gone (the
-                            // multi-source completion case).
-                            for sink_name in &sink_names {
-                                checkpoint_control.sink_completed(sink_name);
-                            }
-                        }
-                        Err(err) => {
-                            // A FAILED sink must NOT be deregistered: its
-                            // missing acks are the coordinator's only signal
-                            // that the epochs it touched are not durable.
-                            // Removing it would let those epochs (including
-                            // the terminal one) finalize as if the data had
-                            // been written. The pipeline is failing anyway —
-                            // let the epochs stall and the error propagate.
-                            error!(
-                                "Sink future [{}] completed with error: {}",
-                                future_name, err
-                            );
+            // Planned here rather than inside the sink future: physical
+            // planning creates partitioned plugins' instances (one per
+            // stream, once the widths are known), and every instance must be
+            // in `plugin_set` below so teardown terminates and drains it —
+            // dry runs included. Planning also catches type coercion and
+            // other SQL errors that only manifest at physical planning time.
+            let df = session_manager.new_df(sink_plan);
+            let task_ctx = Arc::new(df.task_ctx());
+            let physical_plan = df
+                .create_physical_plan()
+                .await
+                .streamling_with_context(|| {
+                    format!(
+                        "failed to plan sink [{future_name}]: the query plan would fail at runtime"
+                    )
+                })?;
+            if dry_run {
+                continue;
+            }
+            info!(
+                "Pipeline physical plan:\n{}",
+                displayable(physical_plan.as_ref()).indent(true)
+            );
+            let checkpoint_control = checkpoint_control.clone();
+            let sink_future = async move {
+                let result = collect(physical_plan, task_ctx).await;
+                match &result {
+                    Ok(_) => {
+                        // The sink has SUCCESSFULLY drained its input and
+                        // will not ack any further checkpoint epochs. Tell
+                        // the coordinator so it drops these sinks from the
+                        // expected-ack set and can finalize in-flight
+                        // epochs the remaining live sinks already acked,
+                        // instead of blocking on a sink that is gone (the
+                        // multi-source completion case).
+                        for sink_name in &sink_names {
+                            checkpoint_control.sink_completed(sink_name);
                         }
                     }
-                    result
-                };
-                sink_futures.push(sink_future);
-            } else {
-                dry_run_plans.push((future_name, sink_plan));
-            }
-        }
-
-        // During dry_run, create physical plans to catch type coercion
-        // and other SQL errors that only manifest at physical planning time.
-        if dry_run {
-            for (name, plan) in dry_run_plans {
-                session_manager
-                    .new_df(plan)
-                    .create_physical_plan()
-                    .await
-                    .streamling_with_context(|| {
-                        format!(
-                            "SQL validation failed for sink [{}]: \
-                             the query plan contains type errors that would crash at runtime",
-                            name
-                        )
-                    })?;
-            }
+                    Err(err) => {
+                        // A FAILED sink must NOT be deregistered: its
+                        // missing acks are the coordinator's only signal
+                        // that the epochs it touched are not durable.
+                        // Removing it would let those epochs (including
+                        // the terminal one) finalize as if the data had
+                        // been written. The pipeline is failing anyway —
+                        // let the epochs stall and the error propagate.
+                        error!(
+                            "Sink future [{}] completed with error: {}",
+                            future_name, err
+                        );
+                    }
+                }
+                result
+            };
+            sink_futures.push(sink_future);
         }
 
         // Start checkpoint coordinator only if not in dry_run mode
@@ -2936,13 +3150,19 @@ impl Streamling {
         // signal (sources drain front-to-back) and arms the watchdog. This
         // replaces the per-component signal handlers (notably the plugin
         // watcher that used to kill plugins first, inverting the drain order).
+        // `interrupted_by_signal` records that the drain was signal-initiated:
+        // the shared shutdown flag can't tell, since a bounded plugin source
+        // also flips it when its range completes naturally.
+        let interrupted_by_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if !dry_run {
+            let interrupted_by_signal = interrupted_by_signal.clone();
             // The trigger task itself: it initiates the drain, so it cannot be
             // tracked by it. Exits right after flipping the signal.
             #[allow(clippy::disallowed_methods)]
             tokio::spawn(async move {
                 Self::wait_for_shutdown_signal().await;
                 info!("Shutdown signal received; draining pipeline front-to-back");
+                interrupted_by_signal.store(true, std::sync::atomic::Ordering::SeqCst);
                 streamling_core::shutdown::request_shutdown();
                 Self::arm_shutdown_watchdog(Self::shutdown_budget());
             });
@@ -2976,14 +3196,25 @@ impl Streamling {
         type NamedPluginFuture = std::pin::Pin<
             Box<dyn std::future::Future<Output = (String, std::result::Result<(), String>)> + Send>,
         >;
-        let mut pending_plugins: std::collections::BTreeSet<String> =
-            plugins.keys().cloned().collect();
-        let mut plugin_set: futures::stream::FuturesUnordered<NamedPluginFuture> = plugins
+        // Every instance exists by now: single-stream plugins were created
+        // while the topology was built, partition instances while the sinks
+        // were planned. Each is keyed by its own instance key.
+        let plugin_futures: Vec<(String, ExecutionFuture)> = plugins
             .into_iter()
-            .map(|(plugin_id, p)| {
-                let fut = p.execution_future;
-                Box::pin(async move { (plugin_id, fut.await) }) as _
-            })
+            .map(|(plugin_id, p)| (plugin_id, p.execution_future))
+            .chain(
+                partitioned_plugins
+                    .iter()
+                    .flat_map(|plugin| plugin.take_execution_futures()),
+            )
+            .collect();
+        let mut pending_plugins: std::collections::BTreeSet<String> = plugin_futures
+            .iter()
+            .map(|(plugin_id, _)| plugin_id.clone())
+            .collect();
+        let mut plugin_set: futures::stream::FuturesUnordered<NamedPluginFuture> = plugin_futures
+            .into_iter()
+            .map(|(plugin_id, fut)| Box::pin(async move { (plugin_id, fut.await) }) as _)
             .collect();
 
         // Drive to completion. The terminal condition is "all sinks drained"
@@ -3052,6 +3283,10 @@ impl Streamling {
                 Some(e) => Err(e),
             }
         };
+        // Snapshot once the sinks have drained: a signal landing during
+        // teardown, after every source already finished its range, must not
+        // turn a completed job into a failure.
+        let interrupted_by_signal = interrupted_by_signal.load(std::sync::atomic::Ordering::SeqCst);
 
         // Teardown. Everything below is bounded by a single deadline shared
         // with the watchdog: arming is idempotent and returns the deadline of
@@ -3244,6 +3479,26 @@ impl Streamling {
         // the teardown drain above), without masking an earlier app error.
         if let Some(e) = teardown_plugin_error {
             return Err(e);
+        }
+        Self::job_completion_result(self.app_config.job_mode, interrupted_by_signal)
+    }
+
+    /// The run's outcome once the drain itself succeeded.
+    ///
+    /// In job mode the exit code is the only completion signal the k8s Job
+    /// controller sees: exit 0 marks the Job `Complete` and nothing resumes
+    /// it. A drain started by SIGTERM/SIGINT (pod eviction, node drain) ends
+    /// the sources at a batch boundary, part-way through the range, so it
+    /// must fail the run; the terminal checkpoint already recorded where the
+    /// replacement pod resumes. Streaming mode is never "done", so a signal
+    /// there is an ordinary clean shutdown.
+    fn job_completion_result(job_mode: bool, interrupted_by_signal: bool) -> Result<()> {
+        if job_mode && interrupted_by_signal {
+            return Err(streamling_err!(
+                "Job-mode pipeline was interrupted by a shutdown signal before its bounded \
+                 range finished; a rerun with the same application id resumes from the \
+                 last checkpoint"
+            ));
         }
         Ok(())
     }
@@ -3899,10 +4154,23 @@ impl Streamling {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, script_input_placement};
+    use super::{Placement, Streamling, script_input_placement};
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Regression: a job-mode run drained by SIGTERM (pod eviction) exited 0,
+    /// so the k8s Job went `Complete` on a partial range and was never resumed.
+    #[test]
+    fn job_mode_signal_interrupted_run_fails() {
+        assert!(Streamling::job_completion_result(true, true).is_err());
+    }
+
+    #[test]
+    fn job_mode_natural_completion_and_streaming_signal_succeed() {
+        assert!(Streamling::job_completion_result(true, false).is_ok());
+        assert!(Streamling::job_completion_result(false, true).is_ok());
     }
 
     /// Regression: a script whose key includes a column it PRODUCES must not be
@@ -4257,6 +4525,103 @@ mod tests {
         );
     }
 
+    async fn rendered_script_plan(
+        batch_size: Option<usize>,
+        batch_flush_interval: Option<Duration>,
+    ) -> String {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let source =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![], vec![], vec![]])
+                .unwrap();
+
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        session_manager
+            .session_context()
+            .register_table("blocks", Arc::new(source))
+            .unwrap();
+
+        let (source_plan, _) = session_manager
+            .create_supported_logical_plan("select * from blocks".to_string())
+            .await
+            .unwrap();
+
+        let script_input = wrap_with_rebatch(
+            wrap_with_repartition(
+                source_plan,
+                &by_key(&["id"]),
+                Some(4),
+                "normalize".to_string(),
+            ),
+            batch_size,
+            batch_flush_interval,
+            "normalize".to_string(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                WasmRunnerNode::with_options(
+                    script_input,
+                    "javascript".to_string(),
+                    "function(input) { return input; }".to_string(),
+                    None,
+                    10,
+                    None,
+                )
+                .unwrap(),
+            ),
+        });
+
+        displayable(
+            session_manager
+                .new_df(logical_plan)
+                .create_physical_plan()
+                .await
+                .unwrap()
+                .as_ref(),
+        )
+        .indent(true)
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn script_transform_batch_flush_interval_reaches_rebatch_node() {
+        let rendered = rendered_script_plan(Some(2), Some(Duration::from_secs(1))).await;
+        assert!(
+            rendered.contains("RebatchExec(batch_size=2, interval=1s, partitions=4)"),
+            "expected the flush interval in plan:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_batch_size_alone_defaults_the_flush_interval() {
+        let defaulted =
+            rendered_script_plan(Some(100), script_batch_flush_interval(Some(100), None)).await;
+        assert!(
+            defaulted.contains("RebatchExec(batch_size=100, interval=1s, partitions=4)"),
+            "expected the default flush interval in plan:\n{defaulted}"
+        );
+
+        let explicit = rendered_script_plan(
+            Some(100),
+            script_batch_flush_interval(Some(100), Some(Duration::from_millis(500))),
+        )
+        .await;
+        assert!(
+            explicit.contains("RebatchExec(batch_size=100, interval=500ms, partitions=4)"),
+            "an explicit interval must win:\n{explicit}"
+        );
+
+        assert_eq!(script_batch_flush_interval(Some(0), None), None);
+        assert_eq!(script_batch_flush_interval(None, None), None);
+    }
+
     fn empty_plan() -> LogicalPlan {
         LogicalPlanBuilder::empty(true).build().unwrap()
     }
@@ -4370,6 +4735,20 @@ mod tests {
         assert_eq!(node.placement, Placement::ByKey(vec!["id".to_string()]));
     }
 
+    /// A `Forward` plugin transform is planned as round-robin with no
+    /// `parallelism`, and relies on this to keep stream `i` on instance `i`.
+    #[test]
+    fn round_robin_without_a_parallelism_plans_no_exchange() {
+        let plan = wrap_with_repartition(
+            empty_plan(),
+            &Placement::RoundRobin,
+            None,
+            "forward".to_string(),
+        );
+
+        assert!(repartition_node(&plan).is_none());
+    }
+
     /// Print and blackhole neither dedupe nor depend on ordering, so a group of
     /// them widens round-robin — no primary key required.
     #[test]
@@ -4384,6 +4763,108 @@ mod tests {
         let node = repartition_node(&plan).expect("expected a RepartitionNode");
         assert_eq!(node.placement, Placement::RoundRobin);
         assert_eq!(node.target_parallelism, Some(4));
+    }
+
+    // ----- validate_sink_decimal_arb -----
+
+    fn arb_schema(precision: u32, scale: u32) -> arrow_schema::Schema {
+        let f = streamling_common::types::decimal_arb::DecimalArbType::field(
+            "amount", precision, scale, false,
+        )
+        .unwrap();
+        arrow_schema::Schema::new(vec![f])
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_postgres_native() {
+        let schema = arb_schema(100, 18);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::Postgres,
+            None,
+            "pg_sink",
+        )
+        .expect("Postgres at p=100 should be Native");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_clickhouse_rejects_without_directive() {
+        let schema = arb_schema(100, 18);
+        let err = validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            None,
+            "ch_sink",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ch_sink"), "error names sink: {}", msg);
+        assert!(msg.contains("amount"), "error names column: {}", msg);
+        assert!(
+            msg.contains("coerce_to: string"),
+            "error suggests directive: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_clickhouse_passes_with_directive() {
+        let schema = arb_schema(100, 18);
+        let directives = vec![streamling_config::ColumnDirective {
+            name: "amount".to_string(),
+            coerce_to: Some(streamling_config::CoercionTarget::String),
+        }];
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            Some(&directives),
+            "ch_sink",
+        )
+        .expect("ClickHouse with coerce_to: string should be OptInOnly (OK)");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_kafka_json_native() {
+        let schema = arb_schema(200, 50);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::KafkaJson,
+            None,
+            "kafka_sink",
+        )
+        .expect("Kafka JSON should accept any precision");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_plugin_passes_through() {
+        // The host hands the batch to the plugin unchanged; a wide-int
+        // pipeline into a plugin sink must start, as it did before the type
+        // was retired.
+        let schema = arb_schema(50, 10);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::Plugin,
+            None,
+            "my_plugin",
+        )
+        .expect("plugin sinks carry decimal_arb as-is");
+    }
+
+    #[test]
+    fn validate_sink_decimal_arb_no_decimal_arb_columns_passes() {
+        // Schema with only plain types — no decimal_arb fields, validator is a no-op.
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        validate_sink_decimal_arb(
+            &schema,
+            streamling_common::types::decimal_arb_capability::ConnectorKind::ClickHouse,
+            None,
+            "any_sink",
+        )
+        .expect("schema without decimal_arb columns is always OK");
     }
 
     #[test]
