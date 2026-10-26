@@ -161,6 +161,31 @@ async fn aggregate_outputs_carry_precision_and_scale() {
     assert_eq!(decimals(&b, 3), vec![d("2.50")]);
 }
 
+/// Partial sums reach the final one through `state()` and `merge_batch`,
+/// whose state carries each partial's non-null count.
+#[tokio::test]
+async fn partial_sums_merge_into_the_final_sum() {
+    let ctx = session();
+    let mut rows = FIVE_GROUPS.to_vec();
+    rows.extend([(6, None), (6, None)]);
+    table(&ctx, &rows);
+    let b = query(&ctx, "SELECT k, SUM(v) AS s FROM t GROUP BY k ORDER BY k").await;
+    assert_eq!(ints(&b, 0), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        decimals(&b, 1),
+        vec![
+            d("-4.00"),
+            d("2.00"),
+            d("0.50"),
+            d("-0.50"),
+            d("100.00"),
+            None
+        ]
+    );
+    let b = query(&ctx, "SELECT SUM(v) AS s FROM t").await;
+    assert_eq!(decimals(&b, 0), vec![d("98.00")]);
+}
+
 #[tokio::test]
 async fn order_by_sum_is_numeric() {
     let ctx = session();

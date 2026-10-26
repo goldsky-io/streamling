@@ -11,7 +11,7 @@
 use crate::functions::decimal_arb_ops::exact_div_at_scale;
 use crate::types::decimal_arb::{DecimalArbType, DecimalArbValue, MAX_PRECISION};
 use crate::{streamling_bail, streamling_user_bail, streamling_user_err};
-use arrow::array::{Array, ArrayRef, Int64Array, LargeBinaryArray, ListArray};
+use arrow::array::{Array, ArrayRef, Int64Array, LargeBinaryArray, ListArray, UInt64Array};
 use arrow_schema::{Field, FieldRef};
 use bigdecimal::BigDecimal;
 use datafusion::arrow::datatypes::DataType;
@@ -304,11 +304,14 @@ impl AggregateUDFImpl for DecimalArbSumUdaf {
             }
             let (p, s) = require_decimal_arb(args.input_fields[0].as_ref(), "decimal_arb sum")?;
             let (p_out, s_out) = sum_output_precision_scale(p, s);
-            Ok(vec![decimal_arb_field(
-                &format!("{}_state", args.name),
-                p_out,
-                s_out,
-            )?])
+            Ok(vec![
+                decimal_arb_field(&format!("{}_state", args.name), p_out, s_out)?,
+                Arc::new(Field::new(
+                    format!("{}_count", args.name),
+                    DataType::UInt64,
+                    true,
+                )),
+            ])
         } else {
             self.builtin.inner().state_fields(args)
         }
@@ -676,8 +679,8 @@ impl GroupsAccumulator for RetypedGroupsAccumulator {
 struct SumAccumulator {
     sum: Option<BigDecimal>,
     /// Non-null values `update_batch` added and `retract_batch` hasn't
-    /// removed, so a fully retracted sum is NULL again. `merge_batch` doesn't
-    /// count: only sliding aggregation retracts, and it never merges.
+    /// removed, so a fully retracted sum is NULL again. It's part of the
+    /// state, so a sum restored through `merge_batch` retracts too.
     count: u64,
     input_scale: u32,
     output_scale: u32,
@@ -723,18 +726,32 @@ impl Accumulator for SumAccumulator {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let array = states[0]
+        let [sums, counts] = states else {
+            streamling_user_bail!("decimal_arb sum: expected (sum, count) state");
+        };
+        let sums = sums
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::from(streamling_user_err!(
-                    "decimal_arb sum: state must be LargeBinary"
+                    "decimal_arb sum: sum state must be LargeBinary"
                 ))
             })?;
-        for i in 0..array.len() {
-            if let Some(v) = decode_value(array, i, self.output_scale)? {
+        let counts = counts
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::from(streamling_user_err!(
+                    "decimal_arb sum: count state must be UInt64"
+                ))
+            })?;
+        for i in 0..sums.len() {
+            if let Some(v) = decode_value(sums, i, self.output_scale)? {
                 let acc = self.sum.take().unwrap_or_else(|| BigDecimal::from(0i32));
                 self.sum = Some(acc + v.into_bigdecimal());
+            }
+            if !counts.is_null(i) {
+                self.count += counts.value(i);
             }
         }
         Ok(())
@@ -757,14 +774,14 @@ impl Accumulator for SumAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        match self.sum.as_ref() {
-            None => Ok(vec![ScalarValue::LargeBinary(None)]),
-            Some(sum) => {
-                let v = DecimalArbValue::from_bigdecimal(sum.clone());
-                let bytes = v.to_canonical_bytes_at_scale(self.output_scale);
-                Ok(vec![ScalarValue::LargeBinary(Some(bytes))])
-            }
-        }
+        let sum = self.sum.as_ref().map(|sum| {
+            DecimalArbValue::from_bigdecimal(sum.clone())
+                .to_canonical_bytes_at_scale(self.output_scale)
+        });
+        Ok(vec![
+            ScalarValue::LargeBinary(sum),
+            ScalarValue::UInt64(Some(self.count)),
+        ])
     }
 }
 
@@ -1675,17 +1692,22 @@ mod tests {
         let state2 = acc2.state().unwrap();
 
         let mut combined = make_sum_accumulator(10, 2);
-        // Pack the two state ScalarValues into a single LargeBinaryArray and
-        // call merge_batch.
-        let state_arr = LargeBinaryArray::from_iter_values([&state1[0], &state2[0]].iter().map(
-            |sv| match sv {
-                ScalarValue::LargeBinary(Some(b)) => b.as_slice(),
-                _ => &[],
-            },
-        ));
-        combined.merge_batch(&[Arc::new(state_arr)]).unwrap();
+        let states = (0..state1.len())
+            .map(|field| ScalarValue::iter_to_array([state1[field].clone(), state2[field].clone()]))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        combined.merge_batch(&states).unwrap();
         let result = unwrap_decimal_arb(combined.evaluate().unwrap(), s_out).unwrap();
         assert_eq!(result, DecimalArbValue::from_str("10.00").unwrap());
+        // The merged count lets the combined sum retract back to NULL.
+        combined
+            .retract_batch(&[build_input(
+                2,
+                10,
+                &[Some("1.00"), Some("2.00"), Some("3.00"), Some("4.00")],
+            )])
+            .unwrap();
+        assert_eq!(combined.evaluate().unwrap(), ScalarValue::LargeBinary(None));
     }
 
     /// The UDAF's sliding accumulator over a decimal_arb(`p`, `s`) column.
