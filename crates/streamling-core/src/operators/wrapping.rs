@@ -717,15 +717,6 @@ impl WrappingExec {
     }
 }
 
-/// Wall-clock around `data.next().await` is idle-wait dominated. SQL nodes
-/// that already expose a DataFusion subtree emit per-batch compute via
-/// `record_execution_plan_metrics`; recording wall-clock too would fold
-/// idle-wait into the same `elapsed_compute` series. A passthrough SQL
-/// node with no subtree metrics keeps wall-clock as the only signal.
-fn should_record_wall_clock_compute(has_subtree_metrics: bool, is_sql_node: bool) -> bool {
-    !has_subtree_metrics || !is_sql_node
-}
-
 /// Used to intercept `execute()` calls and run additional logic like telemetry processing
 impl ExecutionPlan for WrappingExec {
     delegate! {
@@ -828,19 +819,10 @@ impl ExecutionPlan for WrappingExec {
         // this single read stays live as batches flow.
         let metrics = self.metrics();
 
-        // Static per node: resolve once per stream, not per batch. SQL
-        // transforms get accurate per-batch compute from the DataFusion
-        // subtree delta; the wall-clock span below is measured around
-        // `data.next().await` (dominated by upstream idle-wait) and would
-        // pollute the same `elapsed_compute` series for them. When the
-        // subtree exposes NO metrics at all (e.g. a passthrough transform
-        // whose input is directly the upstream topology boundary), the delta
-        // path can never emit, so wall-clock stays on as the only available
-        // signal rather than leaving the series dead.
-        let record_wall_clock_compute = should_record_wall_clock_compute(
-            metrics.is_some(),
-            metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
-        );
+        // Static per node: resolve once per stream, not per batch. A SQL
+        // transform's own work is its DataFusion subtree compute. A
+        // passthrough transform with no subtree metrics has none to measure.
+        let is_sql_node = metrics_recorder.resolve_is_sql_node(&metric_metadata_id);
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
 
@@ -850,12 +832,11 @@ impl ExecutionPlan for WrappingExec {
         // SQL transform the poll also runs the transform's own operators, so
         // their compute is `busy`, not `starved`.
         let task_claimed = task_wait.is_claimed();
-        let own_work = match &metrics {
-            Some(metrics) if !record_wall_clock_compute => {
-                Some(OwnWork::new(metrics.clone(), partition))
-            }
-            _ => None,
-        };
+        let own_work = metrics
+            .as_ref()
+            .filter(|_| is_sql_node)
+            .map(|metrics| OwnWork::new(metrics.clone(), partition));
+        let has_own_work = own_work.is_some();
         let starved_time = (!task_claimed).then(|| match &own_work {
             Some(work) => NodeTime::wall_excluding(
                 Arc::clone(&metrics_recorder),
@@ -900,10 +881,10 @@ impl ExecutionPlan for WrappingExec {
         let measured_stream = async_stream::stream! {
             // Lives as long as the stream: it accrues without spans.
             let _busy_time = busy_time;
-            // Deprecated back-compat dual-emit: `starved` (and a task operator's
-            // `busy`) is also folded into `elapsed_compute` so existing panels
-            // are unchanged. `folded_through` is the high-water mark of the
-            // accrued time already folded.
+            // `starved` (and a task operator's `busy`) is also folded into
+            // `elapsed_compute`, so that series keeps input wait plus compute.
+            // `folded_through` is the high-water mark of the accrued time
+            // already folded.
             let mut fold = MillisAccumulator::default();
             let mut folded_through = Duration::ZERO;
             let mut empty_batches =
@@ -937,7 +918,7 @@ impl ExecutionPlan for WrappingExec {
                 // the histogram keeps one observation per batch. A terminal poll
                 // records no batch, so its wait is folded on its own.
                 let sql_input_wait_ms =
-                    if !record_wall_clock_compute && matches!(batch_result, Some(Ok(_))) {
+                    if has_own_work && matches!(batch_result, Some(Ok(_))) {
                         fold_ms
                     } else {
                         0
@@ -1554,22 +1535,6 @@ mod tests {
             shared.supports_filters_pushdown(&[&filter]).unwrap(),
             vec![TableProviderFilterPushDown::Unsupported]
         );
-    }
-
-    #[test]
-    fn sql_with_subtree_metrics_suppresses_wall_clock() {
-        assert!(!should_record_wall_clock_compute(true, true));
-    }
-
-    #[test]
-    fn sql_passthrough_without_subtree_metrics_keeps_wall_clock() {
-        assert!(should_record_wall_clock_compute(false, true));
-    }
-
-    #[test]
-    fn non_sql_always_records_wall_clock() {
-        assert!(should_record_wall_clock_compute(true, false));
-        assert!(should_record_wall_clock_compute(false, false));
     }
 
     #[derive(Debug)]
