@@ -971,6 +971,8 @@ pub(crate) const RESERVED_LABEL_KEYS: &[&str] = &[
     "topology_node_type",
     "operator_type",
     "service_instance_id",
+    "state",
+    "downstream_id",
 ];
 
 /// Allowed shape for a YAML `telemetry.labels` key. Matches Prometheus
@@ -2767,6 +2769,27 @@ sinks: {}
         assert!(msg.contains("my_source"), "message: {msg}");
         assert!(msg.contains("'id'"), "message: {msg}");
         assert!(msg.contains("Reserved keys"), "message: {msg}");
+    }
+
+    #[test]
+    fn test_labels_reserved_key_node_wait_tags_rejected() {
+        for key in ["state", "downstream_id"] {
+            let yaml = format!(
+                r#"
+sources:
+  s1:
+    type: kafka
+    topic: blocks
+    telemetry:
+      labels:
+        {key}: x
+transforms: {{}}
+sinks: {{}}
+"#
+            );
+            let err = PipelineTopology::load_from_string(&yaml).expect_err("should reject");
+            assert!(err.to_string().contains(&format!("'{key}'")), "{err}");
+        }
     }
 
     #[test]
