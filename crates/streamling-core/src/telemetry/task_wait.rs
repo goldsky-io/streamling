@@ -4,7 +4,7 @@ use datafusion::execution::TaskContext;
 use futures::{Stream, StreamExt};
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -26,8 +26,9 @@ pub struct TaskWaitMeter {
     metadata_id: String,
     /// Set by the first claim; from then on the meter owns `starved`/`busy`.
     timers: OnceLock<Timers>,
-    /// Whether a live handle holds the meter. One timeline at a time.
-    held: AtomicBool,
+    /// The latest claim. One timeline at a time: an older handle becomes a
+    /// pass-through, so a finishing phase cannot disturb the next one.
+    generation: AtomicU64,
 }
 
 struct Timers {
@@ -64,7 +65,7 @@ impl TaskWaitMeter {
             recorder,
             metadata_id: metadata_id.to_string(),
             timers: OnceLock::new(),
-            held: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         });
         let child = TaskContext::new(
             context.task_id(),
@@ -82,17 +83,19 @@ impl TaskWaitMeter {
         (Arc::new(child), meter)
     }
 
-    /// Operator side: take the meter, if a wrapper installed one and no live
-    /// handle holds it. The busy clock runs from here until the handle drops.
+    /// Operator side: take the meter, if a wrapper installed one. The busy
+    /// clock runs from here until the handle drops or a later claim takes over.
     pub fn claim(context: &TaskContext) -> TaskWaitHandle {
-        let meter = context
-            .session_config()
-            .get_extension::<TaskWaitMeter>()
-            .filter(|meter| !meter.held.swap(true, Ordering::AcqRel));
-        if let Some(meter) = &meter {
-            meter.timers().busy.open();
-        }
-        TaskWaitHandle(meter)
+        TaskWaitHandle(
+            context
+                .session_config()
+                .get_extension::<TaskWaitMeter>()
+                .map(|meter| {
+                    let generation = meter.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    meter.timers().busy.open();
+                    (meter, generation)
+                }),
+        )
     }
 
     /// Operator side: take over this node's `starved`/`busy` without timing
@@ -128,10 +131,10 @@ impl TaskWaitMeter {
 }
 
 /// The operator's view of its (possibly absent) [`TaskWaitMeter`]. Without a
-/// meter every method is a plain pass-through. Dropping it stops the busy
-/// clock and frees the meter for the next claim.
+/// meter, or after a later claim, every method is a plain pass-through.
+/// Dropping it stops the busy clock.
 #[derive(Debug, Default)]
-pub struct TaskWaitHandle(Option<Arc<TaskWaitMeter>>);
+pub struct TaskWaitHandle(Option<(Arc<TaskWaitMeter>, u64)>);
 
 impl TaskWaitHandle {
     /// Await the next input item. Only a delivered item counts as `starved`;
@@ -159,8 +162,16 @@ impl TaskWaitHandle {
         send.await
     }
 
+    /// The meter's timers while this handle holds the latest claim.
+    fn timers(&self) -> Option<&Timers> {
+        self.0
+            .as_ref()
+            .filter(|(meter, generation)| meter.generation.load(Ordering::Acquire) == *generation)
+            .map(|(meter, _)| meter.timers())
+    }
+
     fn bracket(&self, end: Bracket) -> WaitGuard<'_> {
-        let timers = self.0.as_ref().map(|meter| meter.timers());
+        let timers = self.timers();
         if let Some(timers) = timers {
             timers.busy.close();
             if end == Bracket::Input {
@@ -206,9 +217,8 @@ impl Drop for WaitGuard<'_> {
 
 impl Drop for TaskWaitHandle {
     fn drop(&mut self) {
-        if let Some(meter) = &self.0 {
-            meter.timers().busy.close();
-            meter.held.store(false, Ordering::Release);
+        if let Some(timers) = self.timers() {
+            timers.busy.close();
         }
     }
 }
@@ -237,18 +247,22 @@ mod tests {
         assert!(TaskWaitMeter::claim(&ctx).0.is_none());
     }
 
-    #[test]
-    fn one_live_handle_at_a_time() {
+    #[tokio::test]
+    async fn a_later_claim_takes_over_the_timeline() {
         let ctx = SessionContext::new().task_ctx();
-        let (child, _meter) = install(&ctx);
+        let (child, meter) = install(&ctx);
         let first = TaskWaitMeter::claim(&child);
-        assert!(first.0.is_some());
-        assert!(TaskWaitMeter::claim(&child).0.is_none());
+        let second = TaskWaitMeter::claim(&child);
+        // The first phase finishes after the second started: its brackets and
+        // drop must not stop the second phase's busy clock.
+        first
+            .send(tokio::time::sleep(Duration::from_millis(1)))
+            .await;
         drop(first);
-        assert!(
-            TaskWaitMeter::claim(&child).0.is_some(),
-            "a dropped handle frees the meter for the next phase"
-        );
+        let before = meter.totals().busy;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(meter.totals().busy >= before + Duration::from_millis(20));
+        drop(second);
     }
 
     #[test]

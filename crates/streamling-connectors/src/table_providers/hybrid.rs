@@ -30,6 +30,7 @@ use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
 use streamling_core::telemetry::provider::{
     metric_key, metric_key_hybrid_src_bounded, metric_key_hybrid_src_unbounded,
 };
+use streamling_core::telemetry::task_wait::TaskWaitMeter;
 use streamling_core::topology::{
     HybridBoundedSource, HybridOffsetTable, HybridUnboundedSource, Telemetry,
 };
@@ -1090,6 +1091,9 @@ impl ExecutionPlan for HybridSourceExec {
         let schema = self.schema();
         let builder = RecordBatchReceiverStreamBuilder::new(schema.clone(), 16);
         let tx = builder.tx();
+        // Each phase source claims the node's meter when it executes; reserve
+        // it now so the wrapper never times the phases' channel as `starved`.
+        TaskWaitMeter::reserve(&context);
         let provider = self.provider.clone();
         let context_clone = context.clone();
         let projection = self.projection.clone();
@@ -3058,6 +3062,44 @@ mod tests {
             state.completed_phases.iter().all(|&c| c),
             "All bounded phases should be marked complete"
         );
+    }
+
+    /// The wrapper decides once, at `execute`, whether it or the operator
+    /// measures `starved`. Phases claim the meter later, inside the spawned
+    /// task, so the hybrid source must reserve it up front.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_source_reserves_the_node_meter_at_execute() {
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend =
+            create_state_backend("test_hybrid_source_reserves_the_node_meter_at_execute").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_reserves_meter".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+        let plan = hybrid_provider
+            .scan(&SESSION_MANAGER.session_state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "test_reserves_meter",
+        );
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        assert!(meter.is_claimed(), "reserved before any phase runs");
+        let _: Vec<_> = stream.collect().await;
     }
 
     /// A bounded phase that behaves like the real ClickHouse provider: its
