@@ -36,6 +36,9 @@ struct Clock {
     open_since: Option<Instant>,
     work_mark: u64,
     banked: Duration,
+    /// Banked by flushes in the open span: work recorded later in the span
+    /// can take it back.
+    span_banked: Duration,
     emitted_ms: u64,
 }
 
@@ -141,6 +144,7 @@ impl NodeTime {
         if clock.open_since.is_none() {
             clock.open_since = Some(Instant::now());
             clock.work_mark = self.work_nanos();
+            clock.span_banked = Duration::ZERO;
         }
     }
 
@@ -165,7 +169,8 @@ impl NodeTime {
     /// [`Self::discard`], so readers keep a high-water mark.
     pub fn total(&self) -> Duration {
         let clock = self.clock.lock();
-        clock.banked + self.pending(&clock, Instant::now(), self.work_nanos())
+        let (add, take_back) = self.unbanked(&clock, Instant::now(), self.work_nanos());
+        clock.banked + add - take_back
     }
 
     fn flush(&self) {
@@ -187,14 +192,25 @@ impl NodeTime {
         }
     }
 
-    /// Unbanked time up to `now`, given the work counter read at `now`.
-    fn pending(&self, clock: &Clock, now: Instant, work: u64) -> Duration {
+    /// Unbanked time up to `now`, given the work counter read at `now`, and
+    /// the part of this span's flushed time it takes back. DataFusion records
+    /// compute when a poll ends, so a flush in the middle of a long poll
+    /// banked that compute as wall time.
+    fn unbanked(&self, clock: &Clock, now: Instant, work: u64) -> (Duration, Duration) {
         let work_done = Duration::from_nanos(work.saturating_sub(clock.work_mark));
         match &self.measure {
-            Measure::Wall { .. } => clock.open_since.map_or(Duration::ZERO, |since| {
-                (now - since).saturating_sub(work_done)
-            }),
-            Measure::Work(_) => work_done,
+            Measure::Wall { .. } => {
+                clock
+                    .open_since
+                    .map_or((Duration::ZERO, Duration::ZERO), |since| {
+                        let wall = now - since;
+                        (
+                            wall.saturating_sub(work_done),
+                            work_done.saturating_sub(wall).min(clock.span_banked),
+                        )
+                    })
+            }
+            Measure::Work(_) => (work_done, Duration::ZERO),
         }
     }
 
@@ -203,7 +219,9 @@ impl NodeTime {
     fn bank(&self, clock: &mut Clock) {
         let now = Instant::now();
         let work = self.work_nanos();
-        clock.banked += self.pending(clock, now, work);
+        let (add, take_back) = self.unbanked(clock, now, work);
+        clock.banked = clock.banked + add - take_back;
+        clock.span_banked = clock.span_banked + add - take_back;
         if clock.open_since.is_some() {
             clock.open_since = Some(now);
         }
@@ -212,8 +230,10 @@ impl NodeTime {
 
     fn take_whole_millis(clock: &mut Clock) -> u64 {
         let total_ms = u64::try_from(clock.banked.as_millis()).unwrap_or(u64::MAX);
+        // A take-back can drop `banked` below what the counter already shows;
+        // later time then fills that gap before anything more is emitted.
         let ms = total_ms.saturating_sub(clock.emitted_ms);
-        clock.emitted_ms = total_ms;
+        clock.emitted_ms = clock.emitted_ms.max(total_ms);
         ms
     }
 
@@ -350,6 +370,49 @@ mod tests {
             "span {span:?} - 30ms compute, got {starved_total:?}"
         );
         assert_eq!(busy.total(), Duration::from_millis(30));
+    }
+
+    /// DataFusion records compute when a poll ends, so a flush in the middle
+    /// of a long poll banks compute as wall time. The compute recorded later
+    /// in the same span takes that back.
+    #[test]
+    fn work_recorded_after_a_flush_takes_back_the_flushed_part() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "node_time::flush_mid_work";
+        init_recorder_with_node(id);
+        let plan_metrics = ExecutionPlanMetricsSet::new();
+        let compute = MetricBuilder::new(&plan_metrics).elapsed_compute(0);
+        let starved = NodeTime::wall_excluding(
+            get_metrics_recorder(),
+            id,
+            "starved",
+            OwnWork::new(plan_metrics.clone_inner(), 0),
+        );
+
+        let started = Instant::now();
+        starved.open();
+        std::thread::sleep(Duration::from_millis(20));
+        starved.flush();
+        std::thread::sleep(Duration::from_millis(20));
+        // The whole span was one poll of compute.
+        compute.add_duration(started.elapsed());
+        starved.close();
+        // Only the µs between recording the compute and the close remain.
+        assert!(
+            starved.total() < Duration::from_millis(1),
+            "{:?}",
+            starved.total()
+        );
+
+        // The take-back is limited to this span: earlier waits stay.
+        starved.open();
+        std::thread::sleep(Duration::from_millis(10));
+        starved.close();
+        let wait = starved.total();
+        starved.open();
+        compute.add_duration(Duration::from_secs(1));
+        starved.close();
+        assert_eq!(starved.total(), wait);
     }
 
     #[test]
