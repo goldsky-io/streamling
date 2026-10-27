@@ -990,6 +990,11 @@ transforms:
     type: dynamic_table
     backend_type: Postgres
     backend_entity_name: persistent_data
+    # Optional: size of this table's connection pool. Each PostgreSQL dynamic
+    # table opens its own pool. When omitted, the global
+    # `dynamic_table_backend.postgres.max_connections` applies, then 20. Must be
+    # at least 1.
+    max_connections: 5
 ```
 
 Enable the in-memory cache in the application config (or with

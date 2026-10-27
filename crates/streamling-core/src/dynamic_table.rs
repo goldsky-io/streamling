@@ -14,6 +14,7 @@ use datafusion::logical_expr::{ColumnarValue, Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
 use streamling_config::app_config::{DynamicTableBackendConfig, DynamicTableBackendType};
 
@@ -103,7 +104,8 @@ impl DynamicTableBackendFactory {
     /// Likewise `cache_enabled_override` wins when `Some`; `None` falls back to
     /// the global `cache_enabled`. Note that caching additionally requires a
     /// `time_column`; without one the cache is disabled regardless of either
-    /// setting.
+    /// setting. `max_connections_override` likewise wins over the global
+    /// `max_connections` for this table's pool.
     pub async fn create(
         &self,
         backend_type: DynamicTableBackendType,
@@ -113,6 +115,7 @@ impl DynamicTableBackendFactory {
         time_column: Option<String>,
         cache_refresh_debounce_ms_override: Option<u64>,
         cache_enabled_override: Option<bool>,
+        max_connections_override: Option<NonZeroU32>,
     ) -> Result<Arc<dyn DynamicTableBackend>, DynamicTableBackendError> {
         let max_batch_size = self.config.max_batch_size.unwrap_or(1000);
         match backend_type {
@@ -125,11 +128,14 @@ impl DynamicTableBackendFactory {
                 // InMemory has no freshness-check cache; the debounce window does not apply.
             ))),
             DynamicTableBackendType::Postgres => {
-                let postgres_config = self.config.postgres.clone().ok_or_else(|| {
+                let mut postgres_config = self.config.postgres.clone().ok_or_else(|| {
                     DynamicTableBackendError::Initialization(
                         "Postgres backend config is required".to_string(),
                     )
                 })?;
+                if let Some(max_connections) = max_connections_override {
+                    postgres_config.max_connections = Some(max_connections.get());
+                }
 
                 let (cache_refresh_debounce_ms, debounce_is_default) =
                     resolve_cache_refresh_debounce_ms(
@@ -645,6 +651,7 @@ mod tests {
                 time_column: None,
                 cache: None,
                 cache_refresh_debounce_ms: None,
+                max_connections: None,
                 telemetry: None,
             }),
         );
@@ -660,6 +667,7 @@ mod tests {
                 time_column: None,
                 cache: None,
                 cache_refresh_debounce_ms: None,
+                max_connections: None,
                 telemetry: None,
             }),
         );
@@ -675,6 +683,7 @@ mod tests {
                 time_column: None,
                 cache: None,
                 cache_refresh_debounce_ms: None,
+                max_connections: None,
                 telemetry: None,
             }),
         );

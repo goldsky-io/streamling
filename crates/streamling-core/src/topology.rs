@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 
 use crate::error::ResultExt;
 use config::Config;
@@ -538,6 +539,11 @@ pub struct DynamicTableTransform {
     /// stay visible immediately (see `append`).
     #[serde(default)]
     pub cache_refresh_debounce_ms: Option<u64>,
+    /// Size of this table's Postgres connection pool. When omitted, falls back
+    /// to the global `dynamic_table_backend.postgres.max_connections` config,
+    /// then to 20. Each Postgres dynamic table opens its own pool.
+    #[serde(default)]
+    pub max_connections: Option<NonZeroU32>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -1303,6 +1309,37 @@ sinks: {}
             }
             _ => panic!("expected dynamic_table transform"),
         }
+    }
+
+    #[test]
+    fn dynamic_table_max_connections_parses_and_rejects_zero() {
+        let topology_with = |max_connections: &str| {
+            PipelineTopology::load_from_string(&format!(
+                r#"
+sources:
+  src: {{ type: kafka, topic: t, primary_key: id }}
+transforms:
+  dt:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    {max_connections}
+sinks: {{}}
+"#
+            ))
+        };
+        let max_connections = |topology: PipelineTopology| match topology.transforms.get("dt") {
+            Some(Transform::dynamic_table(dt)) => dt.max_connections.map(NonZeroU32::get),
+            _ => panic!("expected dynamic_table transform"),
+        };
+
+        assert_eq!(max_connections(topology_with("").unwrap()), None);
+        assert_eq!(
+            max_connections(topology_with("max_connections: 5").unwrap()),
+            Some(5)
+        );
+        // A zero-sized pool can never hand out a connection.
+        assert!(topology_with("max_connections: 0").is_err());
     }
 
     #[test]
