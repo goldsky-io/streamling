@@ -22,6 +22,16 @@ pub struct NodeTime {
     clock: Mutex<Clock>,
 }
 
+impl std::fmt::Debug for NodeTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeTime")
+            .field("metadata_id", &self.metadata_id)
+            .field("state", &self.state)
+            .field("downstream_id", &self.downstream_id)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 enum Measure {
     /// Wall time of open spans, minus the node's own work done inside them

@@ -8,7 +8,6 @@ use datafusion::{
 use futures::StreamExt;
 use futures::future;
 use futures::stream::Stream;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     pin::Pin,
@@ -53,9 +52,11 @@ struct BroadcastState {
 /// output).
 #[derive(Clone, Debug)]
 struct ConsumerSlot {
-    downstream_id: Arc<str>,
     tx: Sender<DFResult<RecordBatch>>,
     abandoned: Arc<AtomicBool>,
+    /// This consumer's blocked-send time. One per consumer: two consumers can
+    /// feed the same downstream, and their sends overlap.
+    blocked_time: Option<Arc<NodeTime>>,
 }
 
 /// Why a send to one consumer gave up.
@@ -157,9 +158,6 @@ impl BroadcastStream {
         // `upstream_metadata_id` is always set; consumers with an empty
         // `downstream_id` (passthrough output, or a fan-out edge the rule couldn't
         // reach) are not attributed.
-        let data_plane_recorder = crate::telemetry::recorder::get_metrics_recorder();
-        let upstream_metadata_id = self.upstream_metadata_id.clone();
-        let mut blocked_times: HashMap<Arc<str>, Arc<NodeTime>> = HashMap::new();
         let shutdown = crate::shutdown::subscribe();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
@@ -180,25 +178,7 @@ impl BroadcastStream {
                     let send_futures: Vec<_> = consumers
                         .iter()
                         .map(|slot| {
-                            // Not attributed: no producer id (tests only) or an
-                            // empty downstream id (passthrough output).
-                            let blocked_time = upstream_metadata_id
-                                .as_deref()
-                                .filter(|_| !slot.downstream_id.is_empty())
-                                .map(|metadata_id| {
-                                    Arc::clone(
-                                        blocked_times
-                                            .entry(Arc::clone(&slot.downstream_id))
-                                            .or_insert_with(|| {
-                                                NodeTime::wall(
-                                                    Arc::clone(&data_plane_recorder),
-                                                    metadata_id,
-                                                    "blocked",
-                                                    &slot.downstream_id,
-                                                )
-                                            }),
-                                    )
-                                });
+                            let blocked_time = &slot.blocked_time;
                             let batch_result = &batch_result;
                             let shutdown = &shutdown;
                             async move {
@@ -280,12 +260,26 @@ impl BroadcastStream {
         // Each consumer gets its own bounded receiver
         let (tx, rx) = channel(self.channel_capacity);
         let abandoned = Arc::new(AtomicBool::new(false));
+        // Not attributed: no producer id (tests only) or an empty downstream id
+        // (passthrough output).
+        let blocked_time = self
+            .upstream_metadata_id
+            .as_deref()
+            .filter(|_| !downstream_id.is_empty())
+            .map(|metadata_id| {
+                NodeTime::wall(
+                    crate::telemetry::recorder::get_metrics_recorder(),
+                    metadata_id,
+                    "blocked",
+                    &downstream_id,
+                )
+            });
 
         let mut consumers = self.inner.consumers.lock().unwrap();
         consumers.push(ConsumerSlot {
-            downstream_id: Arc::from(downstream_id),
             tx,
             abandoned: abandoned.clone(),
+            blocked_time,
         });
 
         BroadcastConsumer {
@@ -858,6 +852,49 @@ mod tests {
         assert_eq!(received, 3);
     }
 
+    /// Two consumers can feed the same downstream (a self-join). A fast twin
+    /// must not end the stuck twin's blocked span.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_broadcast_times_each_consumer_of_one_downstream_on_its_own() {
+        use crate::telemetry::recorder::test_support;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let producer_id = "bcast_producer_twins";
+        test_support::init_recorder_with_node(producer_id);
+
+        let schema = one_row_batch().schema();
+        let broadcast = BroadcastStream::new(schema.clone(), 1)
+            .with_upstream_metadata_id(Some(Arc::from(producer_id)));
+        // The stuck twin is polled first, so its span opens before the fast
+        // twin's send closes.
+        let mut stuck_twin = broadcast.add_consumer("self_join".to_string());
+        let mut fast_twin = broadcast.add_consumer("self_join".to_string());
+        let batches: Vec<DFResult<RecordBatch>> = (0..3).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source, &test_scope());
+
+        // The stuck twin reads nothing, so the second send to it stays blocked
+        // while the fast twin takes its batches.
+        let (_, ()) = tokio::join!(
+            async {
+                fast_twin.next().await;
+                fast_twin.next().await;
+            },
+            tokio::time::sleep(Duration::from_millis(2_300)),
+        );
+        let during_stall = test_support::node_wait_ms(producer_id, "blocked", Some("self_join"));
+        assert!(
+            during_stall >= 1_000,
+            "the stuck twin's open send must be reported, got {during_stall}ms"
+        );
+        while stuck_twin.next().await.is_some() {}
+    }
+
     /// A closed consumer channel surfaces as `Err`, which `run_broadcast` logs
     /// (typically during shutdown) rather than attributing as backpressure.
     #[tokio::test]
@@ -911,9 +948,8 @@ mod tests {
                 1,
                 "the closed consumer must be pruned after its first failed send"
             );
-            assert_eq!(
-                remaining[0].downstream_id.as_ref(),
-                "live",
+            assert!(
+                !remaining[0].tx.is_closed(),
                 "the surviving consumer is the live one"
             );
         }
