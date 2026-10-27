@@ -137,47 +137,70 @@ impl TaskWaitHandle {
     /// Await the next input item. Only a delivered item counts as `starved`;
     /// the wait that ends in end-of-stream is teardown, not starvation.
     pub async fn next<S: Stream + Unpin>(&self, input: &mut S) -> Option<S::Item> {
-        let Some(meter) = &self.0 else {
-            return input.next().await;
-        };
-        let timers = meter.timers();
-        timers.busy.close();
-        timers.starved.open();
+        let mut wait = self.bracket(Bracket::Input);
         let item = input.next().await;
-        if item.is_some() {
-            timers.starved.close();
-            timers.busy.open();
-        } else {
+        if item.is_none() {
             // The input is exhausted: the task has no more work to time.
-            timers.starved.discard();
+            wait.end = Bracket::Exhausted;
         }
         item
     }
 
-    /// Await new input from an external system: `starved`.
+    /// Await new input from an external system: `starved`. A cancelled wait
+    /// (a losing `select!` branch) still counts up to its cancellation.
     pub async fn wait_input<F: Future>(&self, wait: F) -> F::Output {
-        let Some(meter) = &self.0 else {
-            return wait.await;
-        };
-        let timers = meter.timers();
-        timers.busy.close();
-        timers.starved.open();
-        let output = wait.await;
-        timers.starved.close();
-        timers.busy.open();
-        output
+        let _wait = self.bracket(Bracket::Input);
+        wait.await
     }
 
     /// Await an output send. Excluded from both `starved` and `busy`.
     pub async fn send<F: Future>(&self, send: F) -> F::Output {
-        let Some(meter) = &self.0 else {
-            return send.await;
+        let _wait = self.bracket(Bracket::Send);
+        send.await
+    }
+
+    fn bracket(&self, end: Bracket) -> WaitGuard<'_> {
+        let timers = self.0.as_ref().map(|meter| meter.timers());
+        if let Some(timers) = timers {
+            timers.busy.close();
+            if end == Bracket::Input {
+                timers.starved.open();
+            }
+        }
+        WaitGuard { timers, end }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bracket {
+    /// A wait for input: `starved`.
+    Input,
+    /// A wait for input that ended the input: teardown, and no work follows.
+    Exhausted,
+    /// An output send: the edge's `blocked`, owned by the wrapper.
+    Send,
+}
+
+/// Ends a bracketed await when it completes or is cancelled.
+struct WaitGuard<'a> {
+    timers: Option<&'a Timers>,
+    end: Bracket,
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        let Some(timers) = self.timers else {
+            return;
         };
-        let timers = meter.timers();
-        timers.busy.close();
-        let output = send.await;
+        match self.end {
+            Bracket::Input => timers.starved.close(),
+            Bracket::Exhausted => {
+                timers.starved.discard();
+                return;
+            }
+            Bracket::Send => {}
+        }
         timers.busy.open();
-        output
     }
 }
 
@@ -274,6 +297,25 @@ mod tests {
         let totals = meter.totals();
         assert!(totals.starved >= Duration::from_millis(30), "{totals:?}");
         assert!(totals.busy < Duration::from_millis(30), "{totals:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_input_wait_still_counts_as_starved() {
+        let (meter, handle) = claimed_meter();
+        tokio::select! {
+            _ = handle.wait_input(futures::future::pending::<()>()) => unreachable!(),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        let after_cancel = meter.totals();
+        assert!(
+            after_cancel.starved >= Duration::from_millis(30),
+            "{after_cancel:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            meter.totals().busy >= after_cancel.busy + Duration::from_millis(30),
+            "the busy clock restarts after the cancelled wait"
+        );
     }
 
     #[tokio::test]
