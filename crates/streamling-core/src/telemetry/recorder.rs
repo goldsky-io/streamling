@@ -2255,16 +2255,25 @@ mod tests {
             assert_eq!(tags.get("tier"), Some(&"gold".to_string()));
         }
 
-        /// The node_wait counter must be pre-registered by
-        /// `initialize_metrics_recorder`. Emission paths look counters up by
-        /// name and panic if missing (see `record_metric_data`), so this guards
-        /// against a refactor silently dropping the registration.
+        /// The node_wait counter must be pre-registered. Emission paths look
+        /// counters up by name and panic if missing (see `record_metric_data`),
+        /// so this guards against a refactor silently dropping the
+        /// registration. Built directly, not through the singleton: an unlocked
+        /// test's `get_metrics_recorder` can install the empty fallback
+        /// recorder between a reset and the seed.
         #[test]
         fn node_wait_counter_is_registered() {
-            let _guard = TEST_LOCK.lock().unwrap();
-            reset_instance();
-            seed_metadata("app::blocks");
-            let recorder = get_metrics_recorder();
+            let mut map = HashMap::new();
+            map.insert(
+                "app::blocks".to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(TopologyNodeType::Source, "plugin", "blocks"),
+                    service_instance_id: "test-instance".to_string(),
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+            let recorder = build_metrics_recorder(map);
             let counters = recorder.count_registry.lock().unwrap();
             assert!(
                 counters.contains_key("node_wait"),

@@ -137,20 +137,18 @@ impl NodeTime {
 
     /// Start a span. No-op while one is open.
     pub fn open(&self) {
-        let work = self.work_nanos();
         let mut clock = self.clock.lock();
         if clock.open_since.is_none() {
             clock.open_since = Some(Instant::now());
-            clock.work_mark = work;
+            clock.work_mark = self.work_nanos();
         }
     }
 
     /// End the open span and report it.
     pub fn close(&self) {
-        let work = self.work_nanos();
         let ms = {
             let mut clock = self.clock.lock();
-            self.bank(&mut clock, Instant::now(), work);
+            self.bank(&mut clock);
             clock.open_since = None;
             Self::take_whole_millis(&mut clock)
         };
@@ -163,29 +161,17 @@ impl NodeTime {
         self.clock.lock().open_since = None;
     }
 
-    /// Report a span measured by the caller.
-    pub fn add(&self, span: Duration) {
-        let ms = {
-            let mut clock = self.clock.lock();
-            clock.banked += span;
-            Self::take_whole_millis(&mut clock)
-        };
-        self.emit(ms);
-    }
-
     /// Everything accrued so far, the open span included. Not monotonic across
     /// [`Self::discard`], so readers keep a high-water mark.
     pub fn total(&self) -> Duration {
-        let work = self.work_nanos();
         let clock = self.clock.lock();
-        clock.banked + self.pending(&clock, Instant::now(), work)
+        clock.banked + self.pending(&clock, Instant::now(), self.work_nanos())
     }
 
     fn flush(&self) {
-        let work = self.work_nanos();
         let ms = {
             let mut clock = self.clock.lock();
-            self.bank(&mut clock, Instant::now(), work);
+            self.bank(&mut clock);
             Self::take_whole_millis(&mut clock)
         };
         self.emit(ms);
@@ -212,7 +198,11 @@ impl NodeTime {
         }
     }
 
-    fn bank(&self, clock: &mut Clock, now: Instant, work: u64) {
+    /// Bank the unbanked time. The work counter is read under the clock lock:
+    /// a read taken before it could be older than `work_mark` and rewind it.
+    fn bank(&self, clock: &mut Clock) {
+        let now = Instant::now();
+        let work = self.work_nanos();
         clock.banked += self.pending(clock, now, work);
         if clock.open_since.is_some() {
             clock.open_since = Some(now);
@@ -247,10 +237,8 @@ impl Drop for NodeTime {
     /// cancellation, so it was teardown, like [`Self::discard`].
     fn drop(&mut self) {
         if let Measure::Work(_) = self.measure {
-            let work = self.work_nanos();
-            let now = Instant::now();
             let mut clock = self.clock.lock();
-            self.bank(&mut clock, now, work);
+            self.bank(&mut clock);
         }
         let ms = Self::take_whole_millis(self.clock.get_mut());
         self.emit(ms);
@@ -321,13 +309,20 @@ mod tests {
         init_recorder_with_node(id);
         let timer = NodeTime::wall(get_metrics_recorder(), id, "starved", "");
 
+        let started = Instant::now();
         timer.open();
         std::thread::sleep(Duration::from_millis(20));
         timer.discard();
-        timer.add(Duration::from_micros(2_500));
-        assert_eq!(timer.total(), Duration::from_micros(2_500));
+        // Only a flusher tick that landed inside the span banked part of it.
+        let flushed = timer.total();
+        assert!(flushed < started.elapsed(), "{flushed:?}");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(timer.total(), flushed, "a discarded span stops accruing");
         drop(timer);
-        assert_eq!(node_wait_ms(id, "starved", None), 2);
+        assert_eq!(
+            node_wait_ms(id, "starved", None),
+            flushed.as_millis() as u64
+        );
     }
 
     #[test]

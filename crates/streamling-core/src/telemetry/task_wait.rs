@@ -92,7 +92,11 @@ impl TaskWaitMeter {
                 .get_extension::<TaskWaitMeter>()
                 .map(|meter| {
                     let generation = meter.generation.fetch_add(1, Ordering::AcqRel) + 1;
-                    meter.timers().busy.open();
+                    let timers = meter.timers();
+                    // The older claim's open input wait ends here, not when its
+                    // now pass-through guard drops.
+                    timers.starved.close();
+                    timers.busy.open();
                     (meter, generation)
                 }),
         )
@@ -171,14 +175,13 @@ impl TaskWaitHandle {
     }
 
     fn bracket(&self, end: Bracket) -> WaitGuard<'_> {
-        let timers = self.timers();
-        if let Some(timers) = timers {
+        if let Some(timers) = self.timers() {
             timers.busy.close();
             if end == Bracket::Input {
                 timers.starved.open();
             }
         }
-        WaitGuard { timers, end }
+        WaitGuard { handle: self, end }
     }
 }
 
@@ -192,15 +195,16 @@ enum Bracket {
     Send,
 }
 
-/// Ends a bracketed await when it completes or is cancelled.
+/// Ends a bracketed await when it completes or is cancelled. A later claim
+/// that took over meanwhile owns the clocks, so the guard then does nothing.
 struct WaitGuard<'a> {
-    timers: Option<&'a Timers>,
+    handle: &'a TaskWaitHandle,
     end: Bracket,
 }
 
 impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
-        let Some(timers) = self.timers else {
+        let Some(timers) = self.handle.timers() else {
             return;
         };
         match self.end {
@@ -263,6 +267,33 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(meter.totals().busy >= before + Duration::from_millis(20));
         drop(second);
+    }
+
+    /// A wait an older claim started before a later claim must not touch the
+    /// later claim's clocks when it ends.
+    #[tokio::test]
+    async fn an_older_claims_wait_ending_late_leaves_the_new_timeline_alone() {
+        let ctx = SessionContext::new().task_ctx();
+        let (child, meter) = install(&ctx);
+        let first = TaskWaitMeter::claim(&child);
+        let (release, input) = tokio::sync::oneshot::channel::<()>();
+        let mut first_wait = std::pin::pin!(first.wait_input(input));
+        assert!(futures::poll!(first_wait.as_mut()).is_pending());
+
+        let second = TaskWaitMeter::claim(&child);
+        let mut second_send =
+            std::pin::pin!(second.send(tokio::time::sleep(Duration::from_millis(60))));
+        assert!(futures::poll!(second_send.as_mut()).is_pending());
+        release.send(()).unwrap();
+        let _ = first_wait.await;
+        let before_send_ends = meter.totals();
+        second_send.await;
+
+        let after = meter.totals();
+        assert!(
+            after.busy < before_send_ends.busy + Duration::from_millis(30),
+            "the later claim's send must not read as busy: {before_send_ends:?} -> {after:?}"
+        );
     }
 
     #[test]
