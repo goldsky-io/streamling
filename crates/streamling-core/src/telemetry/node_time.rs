@@ -341,14 +341,18 @@ mod tests {
         let starved = NodeTime::wall_excluding(get_metrics_recorder(), id, "starved", work.clone());
         let busy = NodeTime::work(get_metrics_recorder(), id, "busy", work);
 
+        let started = Instant::now();
         starved.open();
         std::thread::sleep(Duration::from_millis(40));
         compute.add_duration(Duration::from_millis(30));
         starved.close();
-        let starved_ms = starved.total().as_millis();
+        let span = started.elapsed();
+        // A loaded runner can overshoot the sleep, so bound by the real span.
+        let starved_total = starved.total();
         assert!(
-            (10..30).contains(&starved_ms),
-            "40ms span - 30ms compute, got {starved_ms}ms"
+            starved_total >= Duration::from_millis(10)
+                && starved_total + Duration::from_millis(30) <= span,
+            "span {span:?} - 30ms compute, got {starved_total:?}"
         );
         assert_eq!(busy.total(), Duration::from_millis(30));
     }

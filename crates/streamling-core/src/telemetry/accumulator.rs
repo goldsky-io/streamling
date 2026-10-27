@@ -4,10 +4,8 @@ use std::time::Duration;
 /// sub-millisecond remainder forward so many small spans aren't each truncated
 /// to zero (which would undercount at high throughput).
 ///
-/// Shared by every `node_wait` emission: `blocked` (yield->resume suspension in
-/// `WrappingExec`, and blocked-send time in `BroadcastStream`) and `starved`
-/// (upstream input wait). Side-effect-free so the math is unit testable with
-/// hand-fed durations.
+/// Used by `WrappingExec`'s `elapsed_compute` fold. Side-effect-free so the
+/// math is unit testable with hand-fed durations.
 #[derive(Debug, Default)]
 pub struct MillisAccumulator {
     total: Duration,

@@ -1064,10 +1064,10 @@ pub fn initialize_metrics_recorder(
 ///
 /// # Compatibility
 ///
-/// This helper registers both `node_wait` and `elapsed_compute`. The deprecated
-/// input-wait fold into `elapsed_compute` is implemented in `WrappingExec` for
-/// dashboard compatibility; keep that runtime behavior separate from this
-/// registration helper.
+/// This helper registers both `node_wait` and `elapsed_compute`. The input-wait
+/// fold into `elapsed_compute` is implemented in `WrappingExec` for dashboard
+/// compatibility; keep that runtime behavior separate from this registration
+/// helper.
 fn build_metrics_recorder(
     metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
 ) -> MetricsRecorder {
@@ -1283,9 +1283,8 @@ fn build_metrics_recorder(
             .build(),
     );
 
-    // Node-wait metric — a monotonic ms counter for time a node is idle
-    // (not doing useful work), split by the `state` tag into the two idle
-    // states of the starved/busy/blocked triad (`busy` = `elapsed_compute`):
+    // Node-wait metric — a monotonic ms counter of a node's time, split by the
+    // `state` tag into the starved/busy/blocked triad:
     //  - `state="blocked"` — held back by a downstream consumer; an edge
     //    property, so it also carries `downstream_id` (or "" when unresolved).
     //    Exactly one emitter per edge: a single-downstream `WrappingExec`
@@ -1293,9 +1292,10 @@ fn build_metrics_recorder(
     //    is suppressed while the `BroadcastStream` emits one edge per consumer
     //    (blocked-send time). The two layers never coexist for a node, so
     //    `sum`/`max by (id)` and `... by (downstream_id)` don't double count.
-    //  - `state="starved"` — waiting on upstream (`data.next().await`);
-    //    node-local, so `downstream_id` is "".
-    // Both states share an identical label key set. The OTel Prometheus
+    //  - `state="starved"` — waiting for input; node-local, so `downstream_id`
+    //    is "".
+    //  - `state="busy"` — the node's own work; node-local.
+    // All states share an identical label key set. The OTel Prometheus
     // exporter appends unit/`_total`, giving
     // `streamling_node_wait_milliseconds_total`.
     count_registry.insert(
@@ -1303,7 +1303,7 @@ fn build_metrics_recorder(
         meter
             .u64_counter(add_service_prefix("node_wait"))
             .with_description(
-                "Time a node is idle rather than doing useful work, split by the state tag: blocked (held back by a downstream consumer, attributed via downstream_id) or starved (waiting on upstream for input), milliseconds",
+                "Time a node spends in each state of the state tag: busy (its own work), starved (waiting for input) or blocked (held back by a downstream consumer, attributed via downstream_id), milliseconds",
             )
             .with_unit("ms")
             .build(),
@@ -1837,10 +1837,9 @@ pub(crate) mod test_support {
     }
 
     /// Sum the `streamling_elapsed_compute` histogram's recorded values (in ms)
-    /// for the given node `id`. Used to assert the `busy = elapsed_compute -
-    /// starved` invariant: the input-wait span folded into `elapsed_compute`
-    /// must use the same remainder-carrying quantization as `starved`, so the
-    /// two never drift and `busy` can't go negative.
+    /// for the given node `id`. The input-wait span folded into
+    /// `elapsed_compute` must use the same remainder-carrying quantization as
+    /// `starved`, so the two never drift.
     pub(crate) fn elapsed_compute_ms(id: &str) -> u64 {
         elapsed_compute_histogram(id).0
     }

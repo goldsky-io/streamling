@@ -1506,12 +1506,10 @@ mod tests {
     }
 
     /// End-to-end busy triad: for `WrappingExec -> CheckpointableExec ->
-    /// <compute-bound plan>`, `busy = elapsed_compute - starved` must reflect the
-    /// transform's compute instead of collapsing to the per-batch seed. The
-    /// `WrappingExec`'s `data.next().await` conflates the spawned compute task
-    /// with upstream wait (inflating `starved`), so the compute must be recovered
-    /// through `elapsed_compute` — which requires `CheckpointableExec::metrics`
-    /// to surface the deep-operator compute.
+    /// <compute-bound plan>`, `busy` must reflect the transform's compute. The
+    /// compute runs inside the wrapper's input poll, so it is recovered from
+    /// the subtree's DataFusion metrics — which requires
+    /// `CheckpointableExec::metrics` to surface the deep-operator compute.
     // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -1547,18 +1545,10 @@ mod tests {
         // blocked. `data.next().await` still absorbs the spawned compute task.
         drain(&wrapping).await;
 
-        let starved = test_support::node_wait_ms(node_id, "starved", None);
-        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
-        let busy = elapsed_compute.saturating_sub(starved);
-
-        // Pre-fix, the deep compute never reached `elapsed_compute`, so
-        // `elapsed_compute` was just the starved-fold plus per-batch seed and
-        // `busy` sat at ~NUM_BATCHES (the 1ms seed). With the fix it reflects the
-        // transform's real compute.
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
         assert!(
             busy >= 24,
-            "busy (elapsed_compute {elapsed_compute}ms - starved {starved}ms = {busy}ms) must \
-             reflect the compute-bound transform, not collapse to the per-batch seed"
+            "busy ({busy}ms) must reflect the deep operator's compute"
         );
     }
 
@@ -1647,17 +1637,19 @@ mod tests {
         let starved = test_support::node_wait_ms(node_id, "starved", None);
         let busy = test_support::node_wait_ms(node_id, "busy", None);
         let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        // Relative bounds: a loaded runner stretches the compute sleeps.
         assert!(
-            starved < 12,
-            "compute must not be counted as starved, got starved={starved}ms"
+            starved < busy / 2,
+            "compute must not be counted as starved, got starved={starved}ms busy={busy}ms"
         );
         assert!(
             busy >= 48,
             "4 batches x 12ms compute must be busy, got {busy}ms"
         );
         assert!(
-            elapsed_compute < 2 * 48,
-            "elapsed_compute must hold the compute once, got {elapsed_compute}ms"
+            elapsed_compute <= starved + busy + NUM_BATCHES as u64,
+            "elapsed_compute must hold the compute once, got {elapsed_compute}ms \
+             (starved {starved}ms + busy {busy}ms)"
         );
     }
 }

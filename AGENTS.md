@@ -154,9 +154,9 @@ Label constraints (enforced at config load):
 
 **Hybrid sources:** `telemetry.labels` on a hybrid source automatically propagate to both the bounded and unbounded phase-child metric series — declare them once on the parent.
 
-### Node-wait metric (starved / blocked)
+### Node-wait metric (starved / busy / blocked)
 
-A node's idle time — time spent *not* doing useful work — is exported as a single counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the two idle states of the utilization triad. The third state, **busy**, is derived from the existing `streamling_elapsed_compute_milliseconds`; together the three localize a bottleneck at a glance:
+A node's time is exported as one counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the three states of the utilization triad. Together they localize a bottleneck at a glance:
 
 > **Measurement model:** `blocked` is measured at async polling/channel
 > boundaries, not as downstream service latency. Prefetch, bounded queues, and
@@ -166,26 +166,38 @@ A node's idle time — time spent *not* doing useful work — is exported as a s
 
 | State | Series | Meaning |
 |-------|--------|---------|
-| **starved** | `node_wait{state="starved"}` | waiting on upstream for input (slow source, or backpressure arriving from below) |
-| **busy** | `elapsed_compute - node_wait{state="starved"}` | this node is the CPU/service bottleneck |
+| **starved** | `node_wait{state="starved"}` | waiting for input: upstream, or new data from a source's external system |
+| **busy** | `node_wait{state="busy"}` | this node's own work: the CPU/service bottleneck |
 | **blocked** | `node_wait{state="blocked", downstream_id=...}` | held back by a specific downstream consumer |
 
-> **`elapsed_compute` compatibility.** For backward compatibility, a `WrappingExec` node's input-wait (`data.next().await`) is *still folded into* `elapsed_compute` in addition to being emitted as `node_wait{state="starved"}`. Every node records at most one `elapsed_compute` observation per batch, meaning input-wait + compute: for non-SQL nodes this is the historical meaning, while a SQL transform's (compute only since #85) now also includes input-wait, so its per-batch latency panels rise. Pure compute is `elapsed_compute - node_wait{state="starved"}`. During startup or sub-millisecond windows, dashboard-derived `busy` can transiently overstate busy for non-SQL nodes because starved remainder has not emitted a whole millisecond while raw batch elapsed is still folded into `elapsed_compute`. The double-fold is deprecated; a future release will drop the `elapsed_compute` input-wait contribution so it means compute only. (Sink `elapsed_compute` is connector-recorded service time and is unaffected either way.)
+Who measures each state:
 
-Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved` and for unresolved `blocked`), so the two states share an identical label key set and cross-state math needs no per-series label surgery.
+| Node | starved | busy |
+|------|---------|------|
+| SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute in it | that compute (`OwnWork`) |
+| Handler / WASM / plugin transform | `TaskWaitMeter`: the task's input await | `TaskWaitMeter`: task time outside input and send awaits |
+| Kafka / ClickHouse / file / hybrid source | `TaskWaitMeter`: broker wait, failure backoff, idle file poll | `TaskWaitMeter`: fetch and decode |
+| Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | none |
+| Sink | `WrappingDataSink` input poll | time the connector holds a batch before it asks for the next one |
+
+A task-decoupled operator must claim the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext`, and bracket its input waits (`next`, `wait_input`) and sends (`send`); otherwise its work reads as `starved`. An operator that runs inner sources one after another reserves the meter (`TaskWaitMeter::reserve`) and lets each claim it in turn.
+
+Every series is a `NodeTime` (`telemetry/node_time.rs`): a process-wide flusher reports open spans every second, so a stalled wait shows while it lasts. Whole milliseconds are emitted and the sub-millisecond remainder carries.
+
+Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved`, `busy`, and unresolved `blocked`). Each partition of a node adds into the same series, so a node with N partitions can accrue N seconds per second: compare states as ratios, not as absolute rates.
+
+> **`elapsed_compute` compatibility.** A `WrappingExec` node still folds its `starved` time (and a task operator's `busy`) into `elapsed_compute`, one observation per batch, so existing latency panels keep their meaning. A SQL transform's observation is its input wait plus its subtree compute. Do not derive busy from `elapsed_compute`; use `state="busy"`. Sink `elapsed_compute` is connector-recorded service time.
 
 **`blocked`** is modeled as a property of an **edge** (`producer → consumer`): the `downstream_id` names the consumer, so a linear chain is a sequence of single edges and a fan-out is several edges. The core invariant is **exactly one blocked emitter per edge**:
 
 - A single-downstream node's `WrappingExec` emits its one edge (`id=self, downstream_id=the_consumer`), measured as yield→resume suspension.
 - A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` blocked emission **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel. `each_consumer` is the **immediate** downstream: for a multi-sink fan-out that is each terminal sink; for a scan-sharing fan-out that is each consuming transform reading the shared source (falling back to the sink only when a sink reads the shared source directly, with no transform in between).
 
-Because the two blocked layers never coexist for the same node, no single edge is ever counted twice, and `... by (downstream_id)` is always the correct per-consumer signal (which consumer is slow). **Aggregating across edges needs care for fan-outs, though:** a fan-out producer sends to all consumers concurrently (`join_all`), so their per-edge blocked spans overlap in wall-clock. The producer's real block on a batch is the *slowest* edge (`join_all == max`), so `sum by (id) (node_wait{state="blocked"})` measures aggregate per-edge blocking *effort* and can exceed the producer's wall-clock blocked time — up to N× for N simultaneously-full channels. Use **`max by (id)`** for a wall-clock "is this node backpressured?" signal; `sum`/`by (downstream_id)` for per-edge attribution. For a linear single-edge node the two coincide. The only `downstream_id=""` blocked series is a rare fallback where a linear node's downstream name can't be resolved (still one series for that node).
-
-**`starved`** is node-local (not an edge property), always emitted with `downstream_id=""` regardless of the node's blocked-attribution role. By default it is the `WrappingExec`'s time in `data.next().await`: for a source that is upstream I/O wait; for a SQL transform it is input starvation (including the inline SQL compute that runs inside the poll). An operator that runs its loop in a spawned task (HTTP handler, WASM, plugin) instead claims the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext` and brackets its own input and send awaits, so its work is busy, not starved. A new task-decoupled operator must do the same. `WrappingDataSink` emits a sink's `starved` (sink `elapsed_compute` is untouched).
+Because the two blocked layers never coexist for the same node, no single edge is ever counted twice, and `... by (downstream_id)` is always the correct per-consumer signal. A fan-out producer sends to all consumers concurrently (`join_all`), so its per-edge blocked spans overlap: for the producer's own blocked time take the slowest edge, `max by (id) (sum by (id, downstream_id) (rate(...)))`. The only `downstream_id=""` blocked series is a rare fallback where a linear node's downstream name can't be resolved.
 
 **`streamling_node_empty_batches_total`** counts zero-row data batches a `WrappingExec` emitted. A zero-row batch that carries checkpoint messages is control traffic and is not counted. A node with a rising empty count and flat `output_rows` runs but moves no rows. Each stream sends this count at most once per millisecond and sends the remainder when the stream ends or is dropped.
 
-Blocked attribution is stamped by the `DownstreamAttributionRule` physical-optimizer pass (`optimizer.rs`); scan-sharing producers are suppressed at construction (they are unreachable by the pass). Both states share the remainder-carrying `MillisAccumulator` (`telemetry/accumulator.rs`) so sub-millisecond spans are not truncated to zero at high throughput.
+Blocked attribution is stamped by the `DownstreamAttributionRule` physical-optimizer pass (`optimizer.rs`); scan-sharing producers are suppressed at construction (they are unreachable by the pass).
 
 ## Key Architecture Concepts
 

@@ -1701,7 +1701,7 @@ mod tests {
 
     /// A slow endpoint is the handler's own work, not upstream wait. Under a
     /// fast input and a fast consumer, the handler node must report the HTTP
-    /// time as busy (`elapsed_compute - starved`), not as `starved`.
+    /// time as busy, not as `starved`.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // see wrapping_exec_emits_starved_when_input_is_slow
     async fn slow_handler_reports_busy_not_starved() {
@@ -1766,20 +1766,18 @@ mod tests {
         assert_eq!(rows, NUM_BATCHES as usize);
 
         let starved = test_support::node_wait_ms(node_id, "starved", None);
-        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
-        let busy = elapsed_compute.saturating_sub(starved);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
         let handler_ms = SLOW_HANDLER_DELAY.as_millis() as u64 * NUM_BATCHES as u64;
         // The input is in memory, so real input wait is near zero. Allow well
         // under one request of slack for scheduling jitter.
         assert!(
             starved < SLOW_HANDLER_DELAY.as_millis() as u64 / 2,
-            "handler HTTP time must not be reported as starved: \
-             starved={starved}ms elapsed_compute={elapsed_compute}ms"
+            "handler HTTP time must not be reported as starved: starved={starved}ms"
         );
         assert!(
             busy >= handler_ms / 2,
             "handler HTTP time (~{handler_ms}ms) must be reported as busy: \
-             busy={busy}ms starved={starved}ms elapsed_compute={elapsed_compute}ms"
+             busy={busy}ms starved={starved}ms"
         );
     }
 }

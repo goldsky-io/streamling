@@ -827,8 +827,7 @@ impl ExecutionPlan for WrappingExec {
         // (`elapsed_compute`, ...) when its `execute` is called. Snapshotting
         // before that returned an empty set whose live Arc-backed counters were
         // never captured, so a SQL transform's compute never reached
-        // `elapsed_compute` and `busy = elapsed_compute - starved` collapsed to
-        // the per-batch seed. The `MetricsSet` holds Arc-shared counters, so
+        // `elapsed_compute` or `busy`. The `MetricsSet` holds Arc-shared counters, so
         // this single read stays live as batches flow.
         let metrics = self.metrics();
 
@@ -2269,9 +2268,9 @@ mod tests {
         }
     }
 
-    /// Task work that ends in an error is still the node's work: the wrapper
-    /// must fold the busy time it drains on the terminal poll into
-    /// `elapsed_compute`, not only on polls that deliver a batch.
+    /// Task work that ends in an error is still the node's work: it is
+    /// `busy`, and the wrapper folds it into `elapsed_compute` on the terminal
+    /// poll, not only on polls that deliver a batch.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
     async fn task_work_before_a_terminal_error_is_reported_as_busy() {
@@ -2300,13 +2299,15 @@ mod tests {
         assert!(stream.next().await.expect("one item").is_err());
         assert!(stream.next().await.is_none());
 
-        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
         let elapsed_compute = test_support::elapsed_compute_ms(node_id);
-        let busy = elapsed_compute.saturating_sub(starved);
         assert!(
             busy >= 20,
-            "30ms of task work before the error must be busy: \
-             busy={busy}ms starved={starved}ms elapsed_compute={elapsed_compute}ms"
+            "30ms of task work before the error must be busy, got {busy}ms"
+        );
+        assert!(
+            elapsed_compute >= 20,
+            "the terminal poll must fold that work, got {elapsed_compute}ms"
         );
     }
 
@@ -2475,10 +2476,9 @@ mod tests {
     }
 
     /// Regression: the input-wait span dual-emitted into `elapsed_compute` and
-    /// `node_wait{state="starved"}` must use identical quantization, otherwise
-    /// the advertised `busy = elapsed_compute - starved` accounting drifts.
+    /// `node_wait{state="starved"}` must use identical quantization.
     ///
-    /// `starved` carries the sub-ms remainder (via `MillisAccumulator`), so if
+    /// `starved` carries the sub-ms remainder, so if
     /// `elapsed_compute` instead floors each batch independently it drops that
     /// remainder and its input-wait portion falls *below* `starved` — exactly
     /// the case the accumulator was meant to fix. This node is a non-SQL source
@@ -2545,8 +2545,7 @@ mod tests {
             "expected real starvation to be recorded, got starved={starved}ms"
         );
         // Folded input-wait must equal `starved` exactly (identical
-        // quantization). This keeps `busy = elapsed_compute - starved` == pure
-        // compute (here 0), never corrupted by dropped sub-ms remainders.
+        // quantization), never corrupted by dropped sub-ms remainders.
         assert_eq!(
             elapsed_compute, starved,
             "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms); \

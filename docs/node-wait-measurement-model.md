@@ -20,31 +20,52 @@ For a normal single-consumer node, `WrappingExec` records:
 - `state="starved"`: time spent awaiting the next input batch from upstream.
   End-of-stream is not counted as starvation.
 
+Every series is a `NodeTime`. A process-wide flusher reports each open span
+every second, so a wait shows while it lasts, not as one spike when it ends.
+The unflushed tail of a wait that ends in end-of-stream, an error, or
+cancellation is dropped.
+
 ### Task-decoupled operators
 
-An operator that runs its loop in a spawned task (HTTP handler, WASM, plugin)
-hides that loop behind an output channel. The wrapper's input poll then waits
+An operator that runs its loop in a spawned task (HTTP handler, WASM, plugin,
+and the Kafka, ClickHouse, file, and hybrid sources) hides that loop behind an
+output channel. The wrapper's input poll then waits
 on the operator's own work, not on upstream, so it cannot measure `starved`.
 
 Such an operator claims the `TaskWaitMeter` its wrapper installs in the
 `TaskContext` and brackets its awaits:
 
-- input await → `starved`;
+- input await (`next`, or `wait_input` for an external system) → `starved`;
 - output send await → neither (the edge's `blocked`, owned by the wrapper);
-- everything else in the task → busy, folded into `elapsed_compute`.
+- everything else in the task → `busy`.
 
-The wrapper then reports the meter instead of its own poll. A new
-task-decoupled operator must claim the meter, or its work reads as `starved`.
+The meter then reports the node's `starved` and `busy`, and the wrapper only
+folds them into `elapsed_compute`. A new task-decoupled operator must claim the
+meter, or its work reads as `starved`. Brackets end when their future is
+dropped, so a wait inside a losing `select!` branch still counts.
+
+A source is `starved` only while its external system has no data for it: a
+Kafka broker wait, a ClickHouse failure backoff, an idle file poll. Fetching
+and decoding available data is `busy`. A hybrid source reserves the meter at
+`execute`, and each phase source claims it in turn; the latest claim owns it.
+
+A plugin source cannot be split: the plugin fetches and decodes out of
+process, and the plugin protocol carries no wait signal. Its whole input poll
+is `starved`, and its `busy` is zero.
 
 A SQL transform's forwarder task cannot use the meter: its input await drives
-the SQL subtree inline, so compute runs inside the await. Its busy signal is
-the DataFusion compute in `elapsed_compute`.
+the SQL subtree inline, so compute runs inside the await. The wrapper reads the
+subtree's DataFusion compute for its partition (`OwnWork`): that compute is
+`busy`, and it is subtracted from the poll's `starved`. The split is exact when
+the subtree keeps its input partitioning; a repartition inside the subtree
+spreads one partition's compute across others.
 
 ### Sinks
 
 `WrappingDataSink` records `state="starved"` for the time the sink waits on
-its input stream. A sink that prefetches moves that wait like any consumer
-(see below).
+its input stream, and `state="busy"` for the time the connector holds a
+delivered batch before it asks for the next one. A sink that prefetches moves
+that wait like any consumer (see below).
 
 The blocked series is attributed to the edge:
 
@@ -63,18 +84,28 @@ consumers. Its `WrappingExec` blocked emission is therefore suppressed.
 `BroadcastStream` measures time blocked sending to each bounded consumer
 channel and emits one series per edge.
 
-Per-consumer sends happen concurrently. Their spans overlap:
+Per-consumer sends happen concurrently, so their spans overlap. The producer's
+own blocked time is the slowest edge:
+`max by (id) (sum by (id, downstream_id) (rate(node_wait{state="blocked"}[w])))`.
+`sum by (id)` over edges is aggregate per-edge effort and may be up to N times
+wall-clock blocking for N simultaneous consumers.
 
-- `max by (id)` approximates producer wall-clock blocking.
-- `sum by (id)` is aggregate per-edge blocking effort and may be up to N times
-  wall-clock blocking for N simultaneous consumers.
+### Partitions
+
+Each partition of a node runs its own `WrappingExec` stream, and all of them add
+into the same series: there is no partition label. A node with N partitions
+can accrue up to N seconds per second in each state. Compare a node's states
+as ratios (`state / (starved + busy + blocked)`); a ratio does not change with
+the partition count.
 
 ### Sink service time
 
 Connector work such as an HTTP request or database insert is a different
 measurement. Connectors record it as sink `elapsed_compute`. It should not
 automatically be interpreted as producer blocked time: the sink may have queue
-or concurrency capacity available while doing that work.
+or concurrency capacity available while doing that work. A connector that
+writes in a background task accepts batches quickly, so its `busy` grows only
+once its own queue is full.
 
 ## Why wait moves between nodes
 
@@ -193,15 +224,19 @@ can duplicate the host-owned edge.
   blocked/starved edges.
 - A high starved value does not prove the pipeline lacks input. A decoupling
   consumer can shift downstream pressure into a node-local upstream await.
-- For fan-out, use `max`, not `sum`, when estimating wall-clock blocking.
+- For fan-out, use `max` over edges, not `sum`, when estimating wall-clock
+  blocking.
+- Compare states as ratios: every partition adds into the same series.
 - Counter resets occur on process restart; do not compare raw totals across
   service instances.
 - `downstream_id=""` is only the unresolved linear fallback. It should be rare.
 
-`elapsed_compute` currently retains historical semantics for `WrappingExec`:
-input wait is included there and also emitted as `state="starved"`. Pure compute
-is therefore `elapsed_compute - starved` until that compatibility behavior is
-removed. Sink connector service time is unaffected by this compatibility rule.
+`elapsed_compute` retains historical semantics for `WrappingExec`: the node's
+`starved` time (and a task operator's `busy`) is folded into it, one
+observation per batch. A SQL transform's observation is its input wait plus its
+subtree compute. Read busy from `state="busy"`, never as
+`elapsed_compute - starved`. Sink connector service time is unaffected by this
+compatibility rule.
 
 ## Test design
 
@@ -222,8 +257,9 @@ A useful wait-metric test should:
 10. Run with realistic streaming arrival timing; a fully preloaded source can
     produce different polling behavior.
 
-For sub-millisecond spans, use the shared `MillisAccumulator`; truncating every
-batch independently can turn real high-throughput wait into zero.
+Emit through `NodeTime`: it carries the sub-millisecond remainder (truncating
+every batch independently can turn real high-throughput wait into zero) and
+reports open spans while they last.
 
 ## Review checklist for new operators and connectors
 
