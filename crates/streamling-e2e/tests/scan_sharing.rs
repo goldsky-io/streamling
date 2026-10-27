@@ -56,21 +56,13 @@ async fn test_scan_sharing_backpressure_attribution() {
 
     use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
-    let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
-    };
-
-    let prometheus = match &ctx.prometheus {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
-    };
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
 
     ctx.kafka
         .register_schema(TEST_SCHEMA)
@@ -217,41 +209,29 @@ sinks:
     );
 }
 
-/// Guards **bug 1's wiring**: the edge INTO a scan-sharing *producer* must carry a
-/// `downstream_id`, not emit as an untagged series.
+/// The edge INTO a scan-sharing *producer* must carry a `downstream_id`, not
+/// emit as an untagged series.
 ///
 /// Here the scan-shared node is a **transform over a source**
-/// (`up_source -> shared_producer(scan-shared) -> {sp_fast, sp_slow}`), not a raw
-/// source leaf as in the test above. Because `shared_producer` has two consumers,
-/// scan sharing stashes its whole sub-plan
-/// (`W(shared_producer) -> ... -> W(up_source)`) inside a `SharedSourceHandle`
-/// before `DownstreamAttributionRule` runs, so the main pass can't reach
-/// `W(up_source)`. Without the construction-time attribution fix, `W(up_source)`
-/// stays `Unattributed` and the `up_source -> shared_producer` edge emits with
-/// **no** `downstream_id` — i.e. `downstream_id="shared_producer"` would be absent
-/// (query = 0). The slow webhook branch pushes backpressure all the way up to the
-/// source, so with the fix the upstream edge is tagged and non-zero.
+/// (`up_source -> shared_producer(scan-shared) -> {sp_fast, sp_slow}`). Scan
+/// sharing stashes `W(shared_producer) -> ... -> W(up_source)` inside a
+/// `SharedSourceHandle` before `DownstreamAttributionRule` runs, so only the
+/// construction-time attribution can tag `up_source -> shared_producer`. The
+/// slow webhook branch pushes backpressure up to the source, so the tagged edge
+/// is non-zero.
 #[tokio::test]
 async fn test_scan_sharing_upstream_edge_attribution() {
     init_tracing();
 
     use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
-    let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
-    };
-
-    let prometheus = match &ctx.prometheus {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
-    };
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
 
     ctx.kafka
         .register_schema(TEST_SCHEMA)
@@ -382,21 +362,13 @@ sinks:
     );
 }
 
-/// Guards **bug 2's wiring** end-to-end in the exact shape it was first observed
-/// (QA case B): a *linear* `source -> transform -> webhook` chain where the single
-/// webhook sink sets `batch_size: 1`, so the pipeline inserts a `RebatchExec`
-/// between the feeding transform and the sink.
-///
-/// The attribution rule recurses into `RebatchExec::inner()` (plus the
-/// `WrappingExec` inner-recursion), so the feeding transform is tagged
-/// `downstream_id="<webhook sink>"` even with the sink-local rebatcher between
-/// the transform and sink.
+/// A *linear* `source -> transform -> webhook` chain where the single webhook
+/// sink sets `batch_size: 1`, so the pipeline inserts a `RebatchExec` between the
+/// feeding transform and the sink. The feeding transform must still be tagged
+/// `downstream_id="<webhook sink>"`.
 ///
 /// The assertion pins BOTH `id` (the feeding transform) and `downstream_id` (the
-/// sink). This matters: pre-fix the sink name was stamped on the *wrong* node, so
-/// a downstream-only query could pass spuriously — this exact
-/// `(id="bp2_xform", downstream_id="bp2_web")` series only exists once the feeding
-/// transform itself is correctly attributed. `bp2_xform` carries a `WHERE` so it
+/// sink), so a sink name stamped on the wrong node cannot satisfy it. `bp2_xform` carries a `WHERE` so it
 /// is not an identity projection that could be inlined away (which would leave no
 /// transform node to attribute).
 #[tokio::test]
@@ -405,21 +377,13 @@ async fn test_linear_rebatch_webhook_edge_attribution() {
 
     use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
-    let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
-    };
-
-    let prometheus = match &ctx.prometheus {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
-    };
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
 
     ctx.kafka
         .register_schema(TEST_SCHEMA)
@@ -543,21 +507,13 @@ async fn test_source_starved_on_slow_upstream() {
 
     use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
-    let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
-    };
-
-    let prometheus = match &ctx.prometheus {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
-    };
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
 
     ctx.kafka
         .register_schema(TEST_SCHEMA)
@@ -661,21 +617,13 @@ async fn test_linear_source_to_slow_sink_blocked_edge() {
 
     use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
-    let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
-    };
-
-    let prometheus = match &ctx.prometheus {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
-    };
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
 
     ctx.kafka
         .register_schema(TEST_SCHEMA)
