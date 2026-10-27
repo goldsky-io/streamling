@@ -1,5 +1,6 @@
 pub mod accumulator;
 pub mod event_time_reader;
+pub mod node_time;
 pub mod provider;
 pub mod recorder;
 pub mod task_wait;
