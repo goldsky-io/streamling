@@ -2275,9 +2275,13 @@ impl ExecutionPlan for KafkaSourceExec {
                 // "committed in" is the broker commit + state-backend
                 // persistence that follows.
                 let wait_started = std::time::Instant::now();
-                if tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
-                    .await
-                    .is_ok()
+                // A wait on the sinks, like a send, is neither starved nor busy.
+                if tokio::time::timeout(
+                    finalize_timeout,
+                    task_wait.send(control.await_terminal_finalized()),
+                )
+                .await
+                .is_ok()
                 {
                     let waited = wait_started.elapsed();
                     let commit_started = std::time::Instant::now();
