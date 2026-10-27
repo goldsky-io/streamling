@@ -3221,8 +3221,11 @@ mod tests {
             .await
             .expect("scan should succeed");
 
-        let (context, meter) =
-            TaskWaitMeter::install(&TaskContext::default(), get_metrics_recorder(), "phase_meter");
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "phase_meter",
+        );
         let stream = plan.execute(0, context).expect("execute should succeed");
         let _: Vec<_> = stream.collect().await;
         let busy = meter.totals().busy;
