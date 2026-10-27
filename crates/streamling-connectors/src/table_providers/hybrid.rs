@@ -545,6 +545,15 @@ impl HybridTableProvider {
         }
     }
 
+    /// A bounded field can back the unbounded one: the same type up to list
+    /// child names, or a ClickHouse encoding of a `decimal_arb` leaf. A
+    /// non-nullable bounded field fits a nullable unbounded one, not the reverse.
+    fn is_compatible_field(bounded: &Field, unbounded: &Field) -> bool {
+        (!bounded.is_nullable() || unbounded.is_nullable())
+            && (Self::is_compatible_data_type(bounded.data_type(), unbounded.data_type())
+                || Self::clickhouse_reads_as_decimal_arb(bounded.data_type(), unbounded))
+    }
+
     fn is_compatible_data_type(
         bounded_type: &arrow_schema::DataType,
         unbounded_type: &arrow_schema::DataType,
@@ -556,28 +565,27 @@ impl HybridTableProvider {
         }
 
         match (bounded_type, unbounded_type) {
+            // Nested field names can differ (for example "item" vs "element"):
+            // Arrow/DataFusion producers label list children differently even
+            // when the list semantics are identical.
             (DataType::List(bounded_field), DataType::List(unbounded_field))
             | (DataType::LargeList(bounded_field), DataType::LargeList(unbounded_field)) => {
-                // Safe to ignore nested field names (for example "item" vs "element"):
-                // Arrow/DataFusion producers can label list children differently even when
-                // the list semantics are identical. We still require matching child
-                // nullability and recursively compatible element types.
-                bounded_field.is_nullable() == unbounded_field.is_nullable()
-                    && Self::is_compatible_data_type(
-                        bounded_field.data_type(),
-                        unbounded_field.data_type(),
-                    )
+                Self::is_compatible_field(bounded_field, unbounded_field)
             }
             (
                 DataType::FixedSizeList(bounded_field, bounded_size),
                 DataType::FixedSizeList(unbounded_field, unbounded_size),
             ) => {
                 bounded_size == unbounded_size
-                    && bounded_field.is_nullable() == unbounded_field.is_nullable()
-                    && Self::is_compatible_data_type(
-                        bounded_field.data_type(),
-                        unbounded_field.data_type(),
-                    )
+                    && Self::is_compatible_field(bounded_field, unbounded_field)
+            }
+            (DataType::Struct(bounded_fields), DataType::Struct(unbounded_fields)) => {
+                bounded_fields.len() == unbounded_fields.len()
+                    && unbounded_fields.iter().all(|unbounded_field| {
+                        bounded_fields
+                            .find(unbounded_field.name())
+                            .is_some_and(|(_, b)| Self::is_compatible_field(b, unbounded_field))
+                    })
             }
             _ => false,
         }
@@ -2114,6 +2122,52 @@ mod tests {
         assert!(!HybridTableProvider::clickhouse_reads_as_decimal_arb(
             &DataType::Int64,
             &narrow
+        ));
+    }
+
+    #[test]
+    fn nested_decimal_arb_under_list_of_struct_is_compatible() {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        // ClickHouse `Array(Tuple(purpose Nullable(String), value String))`
+        // backing a Kafka `List<Struct<purpose, value decimal_arb>>` column.
+        let bounded = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Field::new("purpose", DataType::Utf8, true),
+                    Field::new("value", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        )));
+        let unbounded = DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(
+                vec![
+                    Field::new("purpose", DataType::Utf8, true),
+                    DecimalArbType::field("value", 100, 0, true).unwrap(),
+                ]
+                .into(),
+            ),
+            true,
+        )));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &bounded, &unbounded
+        ));
+    }
+
+    #[test]
+    fn nullable_bounded_list_item_cannot_back_a_non_nullable_one() {
+        let list =
+            |nullable| DataType::List(Arc::new(Field::new("item", DataType::Utf8, nullable)));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &list(false),
+            &list(true)
+        ));
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &list(true),
+            &list(false)
         ));
     }
 
