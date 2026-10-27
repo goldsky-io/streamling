@@ -506,8 +506,8 @@ impl ExecutionPlan for PluginExec {
                                     // Buffered markers are dropped with the
                                     // stream: an epoch covering rows the
                                     // failed plugin lost must never finalize.
-                                    let _ = tx
-                                        .send(Err(crate::plugin::plugin_failure(&plugin_label, &message)))
+                                    let _ = task_wait
+                                        .send(tx.send(Err(crate::plugin::plugin_failure(&plugin_label, &message))))
                                         .await;
                                     break 'outer;
                                 }
@@ -516,8 +516,8 @@ impl ExecutionPlan for PluginExec {
                                 }
                                 // A clean end would read as completion downstream.
                                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                                    let _ = tx
-                                        .send(Err(crate::plugin::plugin_exited(&plugin_label)))
+                                    let _ = task_wait
+                                        .send(tx.send(Err(crate::plugin::plugin_exited(&plugin_label))))
                                         .await;
                                     break 'outer;
                                 }

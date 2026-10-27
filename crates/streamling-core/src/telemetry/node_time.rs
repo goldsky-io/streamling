@@ -76,7 +76,13 @@ impl NodeTime {
         state: &'static str,
         downstream_id: &str,
     ) -> Arc<Self> {
-        Self::register(recorder, metadata_id, state, downstream_id, Measure::Wall { exclude: None })
+        Self::register(
+            recorder,
+            metadata_id,
+            state,
+            downstream_id,
+            Measure::Wall { exclude: None },
+        )
     }
 
     /// Wall time of open spans minus the `work` done while they are open: the
@@ -87,7 +93,15 @@ impl NodeTime {
         state: &'static str,
         work: OwnWork,
     ) -> Arc<Self> {
-        Self::register(recorder, metadata_id, state, "", Measure::Wall { exclude: Some(work) })
+        Self::register(
+            recorder,
+            metadata_id,
+            state,
+            "",
+            Measure::Wall {
+                exclude: Some(work),
+            },
+        )
     }
 
     /// Accrues `work` continuously; no spans.
@@ -179,7 +193,10 @@ impl NodeTime {
 
     fn work_nanos(&self) -> u64 {
         match &self.measure {
-            Measure::Wall { exclude: Some(work) } | Measure::Work(work) => work.nanos(),
+            Measure::Wall {
+                exclude: Some(work),
+            }
+            | Measure::Work(work) => work.nanos(),
             Measure::Wall { exclude: None } => 0,
         }
     }
@@ -188,9 +205,9 @@ impl NodeTime {
     fn pending(&self, clock: &Clock, now: Instant, work: u64) -> Duration {
         let work_done = Duration::from_nanos(work.saturating_sub(clock.work_mark));
         match &self.measure {
-            Measure::Wall { .. } => clock
-                .open_since
-                .map_or(Duration::ZERO, |since| (now - since).saturating_sub(work_done)),
+            Measure::Wall { .. } => clock.open_since.map_or(Duration::ZERO, |since| {
+                (now - since).saturating_sub(work_done)
+            }),
             Measure::Work(_) => work_done,
         }
     }
@@ -215,7 +232,10 @@ impl NodeTime {
             self.recorder.record_count_w_tags(
                 "node_wait",
                 ms,
-                vec![("state", self.state), ("downstream_id", &self.downstream_id)],
+                vec![
+                    ("state", self.state),
+                    ("downstream_id", &self.downstream_id),
+                ],
                 &self.metadata_id,
             );
         }
@@ -223,7 +243,15 @@ impl NodeTime {
 }
 
 impl Drop for NodeTime {
+    /// Work already done is reported. An open wall span is not: it ends in
+    /// cancellation, so it was teardown, like [`Self::discard`].
     fn drop(&mut self) {
+        if let Measure::Work(_) = self.measure {
+            let work = self.work_nanos();
+            let now = Instant::now();
+            let mut clock = self.clock.lock();
+            self.bank(&mut clock, now, work);
+        }
         let ms = Self::take_whole_millis(self.clock.get_mut());
         self.emit(ms);
     }
@@ -280,7 +308,10 @@ mod tests {
 
         timer.close();
         let closed = node_wait_ms(id, "blocked", Some("down"));
-        assert!(closed >= 2_300 && closed < 3_000, "closed span = its wall time, got {closed}ms");
+        assert!(
+            (2_300..3_000).contains(&closed),
+            "closed span = its wall time, got {closed}ms"
+        );
     }
 
     #[test]
@@ -315,7 +346,10 @@ mod tests {
         compute.add_duration(Duration::from_millis(30));
         starved.close();
         let starved_ms = starved.total().as_millis();
-        assert!((10..30).contains(&starved_ms), "40ms span - 30ms compute, got {starved_ms}ms");
+        assert!(
+            (10..30).contains(&starved_ms),
+            "40ms span - 30ms compute, got {starved_ms}ms"
+        );
         assert_eq!(busy.total(), Duration::from_millis(30));
     }
 
@@ -328,7 +362,13 @@ mod tests {
         MetricBuilder::new(&plan_metrics)
             .elapsed_compute(0)
             .add_duration(Duration::from_millis(3));
-        assert_eq!(OwnWork::new(plan_metrics.clone_inner(), 0).nanos(), 3_000_000);
-        assert_eq!(OwnWork::new(plan_metrics.clone_inner(), 1).nanos(), 5_000_000);
+        assert_eq!(
+            OwnWork::new(plan_metrics.clone_inner(), 0).nanos(),
+            3_000_000
+        );
+        assert_eq!(
+            OwnWork::new(plan_metrics.clone_inner(), 1).nanos(),
+            5_000_000
+        );
     }
 }

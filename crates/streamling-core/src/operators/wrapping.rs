@@ -9,8 +9,9 @@ use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
 use crate::telemetry::MillisAccumulator;
+use crate::telemetry::node_time::{NodeTime, OwnWork};
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
-use crate::telemetry::task_wait::{TaskWaitMeter, TaskWaitMillis};
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::telemetry::types::RowCountMeasurementType;
 use crate::topology::Telemetry;
 use crate::utils::dedup::deduplicate_record_batch;
@@ -524,18 +525,15 @@ pub enum BackpressureRole {
     FanOutProducer,
 }
 
-/// The span of an input poll to attribute to `starved`. A poll only counts as
-/// starvation when it actually yields an input batch (`Some(Ok(_))`). A `None`
-/// result is end-of-stream, so its poll-to-EOF wait is pipeline
-/// shutdown/teardown (source teardown, a producer finishing); a `Some(Err(_))`
-/// is an upstream failure/termination, not a batch that arrived. Neither is
-/// time genuinely spent waiting for the next batch, and neither is folded into
-/// `elapsed_compute` (which also only counts `Ok` batches) — attribute nothing
-/// for them.
-fn starved_span_for_poll<T, E>(poll_result: &Option<Result<T, E>>, waited: Duration) -> Duration {
-    match poll_result {
-        Some(Ok(_)) => waited,
-        _ => Duration::ZERO,
+/// End an input wait. Only a poll that delivered a batch (`Some(Ok(_))`) was
+/// a wait for data. A `None` result is end-of-stream, so its wait is pipeline
+/// shutdown/teardown; a `Some(Err(_))` is an upstream failure. Neither is
+/// `starved`, and neither is folded into `elapsed_compute`.
+fn end_input_wait<T, E>(starved: &NodeTime, poll_result: &Option<Result<T, E>>) {
+    if matches!(poll_result, Some(Ok(_))) {
+        starved.close();
+    } else {
+        starved.discard();
     }
 }
 
@@ -815,7 +813,8 @@ impl ExecutionPlan for WrappingExec {
         // An inner operator that runs its loop in a spawned task claims this
         // meter, so its own work is not mistaken for `starved` (see
         // `TaskWaitMeter`).
-        let (inner_context, task_wait) = TaskWaitMeter::install(&context);
+        let (inner_context, task_wait) =
+            TaskWaitMeter::install(&context, Arc::clone(&metrics_recorder), &metric_metadata_id);
         let mut data = execute_input_stream(
             Arc::clone(&self.inner),
             Arc::clone(&self.schema()),
@@ -848,113 +847,105 @@ impl ExecutionPlan for WrappingExec {
         );
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
-        let backpressure_role = self.backpressure_role.clone();
+
+        // `node_wait` series of this stream. A task-decoupled inner operator
+        // claimed the meter in its `execute`, so the meter reports `starved`
+        // and `busy`. Otherwise `starved` is this wrapper's input poll; for a
+        // SQL transform the poll also runs the transform's own operators, so
+        // their compute is `busy`, not `starved`.
+        let task_claimed = task_wait.is_claimed();
+        let own_work = match &metrics {
+            Some(metrics) if !record_wall_clock_compute => {
+                Some(OwnWork::new(metrics.clone(), partition))
+            }
+            _ => None,
+        };
+        let starved_time = (!task_claimed).then(|| match &own_work {
+            Some(work) => NodeTime::wall_excluding(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "starved",
+                work.clone(),
+            ),
+            None => NodeTime::wall(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "starved",
+                "",
+            ),
+        });
+        let busy_time = own_work.filter(|_| !task_claimed).map(|work| {
+            NodeTime::work(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "busy",
+                work,
+            )
+        });
+        // One `blocked` emitter per edge: a fan-out producer's
+        // `BroadcastStream` emits per consumer instead.
+        let blocked_time = match &self.backpressure_role {
+            BackpressureRole::Edge(downstream_id) => Some(downstream_id.as_str()),
+            BackpressureRole::Unattributed => Some(""),
+            BackpressureRole::FanOutProducer => None,
+        }
+        .map(|downstream_id| {
+            NodeTime::wall(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "blocked",
+                downstream_id,
+            )
+        });
 
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
-            // node-wait idle states:
-            //  - `blocked`: suspended at `yield`, waiting for the downstream to
-            //    poll again (backpressure from below).
-            //  - `starved`: in `data.next().await`, waiting on upstream.
-            // Both use the remainder-carrying accumulator so sub-ms spans aren't
-            // truncated to zero at high throughput.
-            let mut blocked = MillisAccumulator::default();
-            let mut starved = MillisAccumulator::default();
-            let mut last_yield: Option<Instant> = None;
+            // Lives as long as the stream: it accrues without spans.
+            let _busy_time = busy_time;
+            // Deprecated back-compat dual-emit: `starved` (and a task operator's
+            // `busy`) is also folded into `elapsed_compute` so existing panels
+            // are unchanged. `folded_through` is the high-water mark of the
+            // accrued time already folded.
+            let mut fold = MillisAccumulator::default();
+            let mut folded_through = Duration::ZERO;
             let mut empty_batches =
                 EmptyBatchCounter::new(Arc::clone(&metrics_recorder), metric_metadata_id.clone());
             loop {
-                // Resume point: the span since the previous `yield` is the
-                // downstream-induced suspension (blocked). The first iteration
-                // has no prior yield. Upstream wait is measured below as `starved`.
-                if let Some(yielded_at) = last_yield.take() {
-                    blocked.add(yielded_at.elapsed());
-                }
-                let blocked_ms = blocked.take_whole_millis();
-                if blocked_ms > 0 {
-                    // `node_wait{state="blocked"}`, one emitter per edge:
-                    //  - Edge(id): downstream_id=name.
-                    //  - Unattributed: downstream_id="".
-                    //  - FanOutProducer: suppressed (the BroadcastStream emits
-                    //    per-edge instead — no double count).
-                    let downstream_id = match &backpressure_role {
-                        BackpressureRole::Edge(downstream_id) => Some(downstream_id.as_str()),
-                        BackpressureRole::Unattributed => Some(""),
-                        BackpressureRole::FanOutProducer => None,
-                    };
-                    if let Some(downstream_id) = downstream_id {
-                        metrics_recorder.record_count_w_tags(
-                            "node_wait",
-                            blocked_ms,
-                            vec![("state", "blocked"), ("downstream_id", downstream_id)],
-                            &metric_metadata_id,
-                        );
-                    }
+                // Resume point: the downstream asked for the next batch.
+                if let Some(blocked_time) = &blocked_time {
+                    blocked_time.close();
                 }
 
-                let batch_start = Instant::now();
+                if let Some(starved_time) = &starved_time {
+                    starved_time.open();
+                }
                 let batch_result = data.next().await;
-                let batch_elapsed = batch_start.elapsed();
-                // `starved`: time waiting on upstream for input. Node-local (not
-                // an edge), so downstream_id="" to match the blocked label set.
-                // A task-decoupled inner operator measures it at its own input
-                // await, and its remaining task time is `task_busy_ms`. Otherwise
-                // it is this poll: only a delivered batch (`Some(Ok)`) counts; a
-                // `None` poll is EOF and a `Some(Err)` is an upstream failure —
-                // attribute nothing for either.
-                let task_wait_claimed = task_wait.is_claimed();
-                let TaskWaitMillis { starved: starved_ms, busy: task_busy_ms } = if task_wait_claimed {
-                    task_wait.take_whole_millis()
-                } else {
-                    starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
-                    // After a successful drain only a <1ms remainder remains; EOF/error polls
-                    // add zero, so they cannot emit a carried whole millisecond.
-                    TaskWaitMillis { starved: starved.take_whole_millis(), busy: 0 }
-                };
-                if starved_ms > 0 {
-                    metrics_recorder.record_count_w_tags(
-                        "node_wait",
-                        starved_ms,
-                        vec![("state", "starved"), ("downstream_id", "")],
-                        &metric_metadata_id,
-                    );
+                if let Some(starved_time) = &starved_time {
+                    end_input_wait(starved_time, &batch_result);
                 }
 
-                // Deprecated back-compat dual-emit: input-wait is also folded
-                // into `elapsed_compute` so existing dashboards are unchanged.
-                // Pure compute is `elapsed_compute - node_wait{state="starved"}`;
-                // remove once consumers migrate to the `starved` state.
-                //
-                // Fold the SAME remainder-carrying whole-ms value drained for
-                // `starved` (not the raw `batch_elapsed`) so both series quantize
-                // the span identically. Flooring each batch here instead would
-                // drop the sub-ms remainder that `starved` carries, making the
-                // folded input-wait fall below `starved` and `busy =
-                // elapsed_compute - starved` drift negative at high throughput —
-                // the exact failure the `MillisAccumulator` exists to prevent.
-                //
-                // A task-decoupled operator has no DataFusion compute signal, so
-                // its measured task work is folded too. Folded on every poll, not
-                // only on a delivered batch, so work drained on the terminal
-                // EOF/error poll is not lost.
-                //
-                // A SQL transform with subtree metrics folds a delivered batch's
-                // input wait into that batch's compute delta
-                // (`record_execution_plan_metrics`) so the histogram keeps one
-                // observation per batch. A terminal poll records no batch, so
-                // its wait is folded on its own.
+                let accrued = match &starved_time {
+                    Some(starved_time) => starved_time.total(),
+                    None => {
+                        let totals = task_wait.totals();
+                        totals.starved + totals.busy
+                    }
+                };
+                fold.add(accrued.saturating_sub(folded_through));
+                folded_through = folded_through.max(accrued);
+                let fold_ms = fold.take_whole_millis();
+                // A SQL transform folds a delivered batch's wait into that
+                // batch's compute delta (`record_execution_plan_metrics`), so
+                // the histogram keeps one observation per batch. A terminal poll
+                // records no batch, so its wait is folded on its own.
                 let sql_input_wait_ms =
                     if !record_wall_clock_compute && matches!(batch_result, Some(Ok(_))) {
-                        starved_ms
+                        fold_ms
                     } else {
                         0
                     };
-                let folded_ms = if record_wall_clock_compute {
-                    starved_ms + task_busy_ms
-                } else {
-                    starved_ms - sql_input_wait_ms
-                };
+                let folded_ms = fold_ms - sql_input_wait_ms;
                 if folded_ms > 0 {
                     metrics_recorder.record_elapsed_compute(
                         Duration::from_millis(folded_ms),
@@ -969,16 +960,6 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        if folded_ms == 0 && record_wall_clock_compute && !task_wait_claimed {
-                            // No whole starved millisecond this batch: keep #85's
-                            // wall-clock path for non-SQL / passthrough SQL so
-                            // sub-ms compute isn't dropped entirely.
-                            metrics_recorder.record_elapsed_compute(
-                                batch_elapsed,
-                                &metric_metadata_id,
-                            );
-                        }
-
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
@@ -1033,14 +1014,15 @@ impl ExecutionPlan for WrappingExec {
 
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
-                        // Mark the yield instant; the loop's resume point measures
-                        // the downstream's request delay (the blocked span).
-                        last_yield = Some(Instant::now());
+                        // Until the downstream asks again, this node is blocked.
+                        if let Some(blocked_time) = &blocked_time {
+                            blocked_time.open();
+                        }
                         yield Ok(batch);
                     }
                     Err(e) => {
                         debug!("WrappingExec [{}]: Error from input stream, stream will terminate: {}", metric_metadata_id, e);
-                        // Intentionally do not set last_yield: terminal error yields are not blocked time.
+                        // A terminal error yield is not blocked time.
                         yield Err(e);
                         return;
                     }
@@ -1135,23 +1117,32 @@ impl DataSink for WrappingDataSink {
         let schema = data.schema();
         let primary_key = self.primary_key.clone();
 
+        // `starved`: the sink waiting on upstream, measured like
+        // `WrappingExec`'s. `busy`: the sink holding a delivered batch until it
+        // asks for the next one (connector write, and backpressure from the
+        // destination). No fold into `elapsed_compute`: a sink's is
+        // connector-recorded service time.
+        let starved_time = NodeTime::wall(
+            Arc::clone(&metrics_recorder),
+            &metric_metadata_id,
+            "starved",
+            "",
+        );
+        let busy_time = NodeTime::wall(
+            Arc::clone(&metrics_recorder),
+            &metric_metadata_id,
+            "busy",
+            "",
+        );
+
         let measured_stream = async_stream::stream! {
-            // `starved`: the sink waiting on upstream, measured like
-            // `WrappingExec`'s. No fold into `elapsed_compute`: a sink's is
-            // connector-recorded service time.
-            let mut starved = MillisAccumulator::default();
             loop {
-                let poll_start = Instant::now();
+                busy_time.close();
+                starved_time.open();
                 let batch_result = data.next().await;
-                starved.add(starved_span_for_poll(&batch_result, poll_start.elapsed()));
-                let starved_ms = starved.take_whole_millis();
-                if starved_ms > 0 {
-                    metrics_recorder.record_count_w_tags(
-                        "node_wait",
-                        starved_ms,
-                        vec![("state", "starved"), ("downstream_id", "")],
-                        &metric_metadata_id,
-                    );
+                end_input_wait(&starved_time, &batch_result);
+                if matches!(batch_result, Some(Ok(_))) {
+                    busy_time.open();
                 }
                 let Some(batch_result) = batch_result else {
                     break;
@@ -2667,29 +2658,21 @@ mod tests {
 
     /// A poll that yields a batch counts its wait as `starved`, but a poll that
     /// returns `None` (end-of-stream) or `Some(Err)` (upstream failure) must
-    /// contribute nothing — those waits are pipeline shutdown / error handling,
-    /// not upstream starvation, and neither is folded into `elapsed_compute`.
+    /// contribute nothing.
     #[test]
     fn only_delivered_batch_poll_is_counted_as_starved() {
-        let waited = Duration::from_millis(50);
+        let starved = NodeTime::wall(get_metrics_recorder(), "only_delivered", "starved", "");
+        let wait = |result: &Option<Result<(), ()>>| {
+            starved.open();
+            std::thread::sleep(Duration::from_millis(5));
+            end_input_wait(&starved, result);
+        };
 
-        // Delivered input: the wait is genuine starvation.
-        assert_eq!(
-            starved_span_for_poll(&Some(Ok::<(), ()>(())), waited),
-            waited
-        );
-
-        // End-of-stream: the teardown wait is not starvation.
-        assert_eq!(
-            starved_span_for_poll::<(), ()>(&None, waited),
-            Duration::ZERO
-        );
-
-        // Upstream error: no batch arrived, so this is not starvation either.
-        assert_eq!(
-            starved_span_for_poll(&Some(Err::<(), ()>(())), waited),
-            Duration::ZERO
-        );
+        wait(&None);
+        wait(&Some(Err(())));
+        assert_eq!(starved.total(), Duration::ZERO);
+        wait(&Some(Ok(())));
+        assert!(starved.total() >= Duration::from_millis(5));
     }
 
     /// Records every row the inner sink actually receives.
@@ -2821,6 +2804,149 @@ mod tests {
             starved >= 10,
             "expected sink starved >= 10ms for a 3×10ms slow input, got {starved}ms"
         );
+    }
+
+    /// A sink that takes `per_batch` to write each batch.
+    #[derive(Debug)]
+    struct SlowWriteSink {
+        schema: SchemaRef,
+        per_batch: Duration,
+    }
+
+    impl DisplayAs for SlowWriteSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "SlowWriteSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for SlowWriteSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            mut data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut rows = 0u64;
+            while let Some(batch) = data.next().await {
+                rows += batch?.num_rows() as u64;
+                tokio::time::sleep(self.per_batch).await;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// A sink's own write time is `busy`, so `busy` must not be derived from
+    /// the connector's `elapsed_compute` minus `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn wrapping_data_sink_reports_write_time_as_busy() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_unit_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let input = futures::stream::iter([test_batch(), test_batch(), test_batch()]).map(Ok);
+        let sink = WrappingDataSink::new(
+            Arc::new(SlowWriteSink {
+                schema: schema.clone(),
+                per_batch: Duration::from_millis(20),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        sink.write_all(
+            Box::pin(RecordBatchStreamAdapter::new(schema, input)),
+            &Arc::new(TaskContext::default()),
+        )
+        .await
+        .unwrap();
+
+        let busy = test_support::node_wait_ms(node_id, "busy", Some(""));
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(busy >= 60, "3 x 20ms writes must be busy, got {busy}ms");
+        assert!(
+            starved < 20,
+            "an in-memory input is not a wait, got {starved}ms"
+        );
+    }
+
+    /// A wait must show while it lasts. Reporting it only when it ends hides a
+    /// stalled pipeline until it recovers, or forever if the pod dies first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn starved_stall_is_reported_before_the_batch_arrives() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_stall_in_progress";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let stalled_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(3_000),
+        });
+        let wrapping = Arc::new(WrappingExec::new(
+            stalled_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let (arrived, during_stall) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(2_300)).await;
+            test_support::node_wait_ms(node_id, "starved", None)
+        });
+        assert!(
+            during_stall >= 1_000,
+            "the open input wait must be reported while it lasts, got {during_stall}ms"
+        );
+        assert!(arrived.is_some(), "the stalled batch still arrives");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn blocked_stall_is_reported_before_the_downstream_resumes() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_stall_in_progress";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![test_batch(), test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(
+            WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                .with_downstream_id("stuck_sink".to_string()),
+        );
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        stream.next().await.unwrap().unwrap();
+
+        // The downstream does not ask for the next batch.
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
+        let during_stall = test_support::node_wait_ms(node_id, "blocked", Some("stuck_sink"));
+        assert!(
+            during_stall >= 1_000,
+            "the open blocked span must be reported while it lasts, got {during_stall}ms"
+        );
+        while stream.next().await.is_some() {}
     }
 
     #[tokio::test]

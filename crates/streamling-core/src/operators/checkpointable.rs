@@ -1609,4 +1609,55 @@ mod tests {
              (starved {starved}ms) plus the subtree compute"
         );
     }
+
+    /// The transform's own compute runs inside the wrapper's input poll, so it
+    /// must be reported as `busy`, not `starved`. The input here is in memory,
+    /// so the real input wait is near zero.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sql_transform_compute_is_busy_not_starved() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_compute_is_busy";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let deep_compute = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            Duration::from_millis(12),
+        ));
+        let checkpointable: Arc<dyn ExecutionPlan> = Arc::new(CheckpointableExec::new(
+            deep_compute,
+            1,
+            node_id.to_string(),
+        ));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        drain(&wrapping).await;
+        drop(wrapping);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            starved < 12,
+            "compute must not be counted as starved, got starved={starved}ms"
+        );
+        assert!(
+            busy >= 48,
+            "4 batches x 12ms compute must be busy, got {busy}ms"
+        );
+        assert!(
+            elapsed_compute < 2 * 48,
+            "elapsed_compute must hold the compute once, got {elapsed_compute}ms"
+        );
+    }
 }
