@@ -146,8 +146,8 @@ impl PrometheusResource {
         Self::build_node_wait_query("busy", &[("id", node_id)], instance_id)
     }
 
-    /// Build `streamling_node_wait_milliseconds_total{state="<state>",<labels>[,service_instance_id="..."]}`.
-    /// `instance_id` is the run's `service_instance_id` (the test context's
+    /// Build `streamling_node_wait_milliseconds_total{state="<state>",<labels>[,instance="..."]}`.
+    /// `instance_id` is the run's `instance` label (the test context's
     /// `test_id`), so a query sees only its own run. All values are trusted
     /// Prometheus label values and must not contain unescaped quote characters.
     fn build_node_wait_query(
@@ -160,7 +160,7 @@ impl PrometheusResource {
             selector.push_str(&format!(",{key}=\"{value}\""));
         }
         if let Some(instance) = instance_id {
-            selector.push_str(&format!(",service_instance_id=\"{instance}\""));
+            selector.push_str(&format!(",instance=\"{instance}\""));
         }
         format!("streamling_node_wait_milliseconds_total{{{selector}}}")
     }
