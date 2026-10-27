@@ -691,20 +691,6 @@ impl WrappingExec {
         self
     }
 
-    /// Clone this node with a different `backpressure_role` stamped on it.
-    ///
-    /// The `DownstreamAttributionRule` reaches each node behind an `Arc`, so it
-    /// can't mutate in place and must rebuild. Only `backpressure_role` changes;
-    /// every other field is carried over by the clone — notably `side_outputs`
-    /// (a `Vec<Arc<_>>`), so each call is one `Vec` allocation plus arc refcount
-    /// bumps. Cheap enough for a once-per-plan optimizer pass. (A struct-update
-    /// literal can't be used here because `WrappingExec` implements `Drop`.)
-    pub fn clone_with_role(&self, role: BackpressureRole) -> Self {
-        let mut cloned = self.clone();
-        cloned.backpressure_role = role;
-        cloned
-    }
-
     /// The immediate wrapped plan. `children()` is *see-through* (it delegates to
     /// `inner`, exposing `inner`'s children rather than `inner` itself), so the
     /// `DownstreamAttributionRule` must use this accessor to recurse into `inner`
@@ -2568,8 +2554,14 @@ mod tests {
         let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
 
         let wrapping = Arc::new(
-            WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
-                .clone_with_role(role),
+            WrappingExec::new(
+                Arc::clone(&source_exec),
+                node_id.to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .clone_with_role_and_inner(role, source_exec),
         );
 
         let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
@@ -2667,11 +2659,18 @@ mod tests {
             end_input_wait(&starved, result);
         };
 
+        let started = Instant::now();
         wait(&None);
         wait(&Some(Err(())));
-        assert_eq!(starved.total(), Duration::ZERO);
+        // The 1s flusher can bank part of at most one of the two spans before
+        // it is discarded, so at least one whole span is dropped.
+        let discarded = starved.total();
+        assert!(
+            discarded + Duration::from_millis(5) <= started.elapsed(),
+            "{discarded:?}"
+        );
         wait(&Some(Ok(())));
-        assert!(starved.total() >= Duration::from_millis(5));
+        assert!(starved.total() >= discarded + Duration::from_millis(5));
     }
 
     /// Records every row the inner sink actually receives.
