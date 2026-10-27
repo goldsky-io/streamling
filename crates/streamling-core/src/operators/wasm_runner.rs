@@ -704,6 +704,64 @@ mod tests {
         }
     }
 
+    /// The script runs in the operator's spawned task, so its time must be the
+    /// node's `busy`: the operator claims the meter its wrapper installs.
+    #[tokio::test]
+    async fn test_wasm_reports_script_time_through_the_node_meter() {
+        use crate::telemetry::recorder::get_metrics_recorder;
+        use crate::telemetry::task_wait::TaskWaitMeter;
+        use futures::StreamExt;
+        use std::time::Duration;
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let mut input_converter = JsonToArrowConverter::new(input_schema, true, None);
+        input_converter.buffer(r#"{"id": 1}"#.to_string());
+        ctx.register_batch("meter_table", input_converter.convert_to_batch().unwrap())
+            .unwrap();
+        let wasm_node = WasmRunnerNode::new(
+            ctx.table("meter_table")
+                .await
+                .unwrap()
+                .into_optimized_plan()
+                .unwrap(),
+            "javascript".to_string(),
+            "function invoke(data) { return { id: data.id }; }".to_string(),
+            None,
+            1000,
+            None,
+        );
+        let plan = ctx
+            .execute_logical_plan(wasm_node.into())
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let (context, meter) =
+            TaskWaitMeter::install(&ctx.task_ctx(), get_metrics_recorder(), "wasm_meter");
+        let batches: Vec<_> = plan.execute(0, context).unwrap().collect().await;
+        assert!(batches.iter().all(Result::is_ok));
+        assert!(
+            meter.is_claimed(),
+            "the WASM operator must claim the node meter"
+        );
+        assert!(
+            meter.totals().busy > Duration::ZERO,
+            "the script's time must be busy: {:?}",
+            meter.totals()
+        );
+    }
+
     /// The `process_batch` decode path must report an input-schema type arrow_json can't
     /// decode (here `Interval`, which an upstream source schema can carry) as an error, not
     /// panic the process: the output schema defaults to the input schema when no `schema:`

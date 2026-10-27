@@ -858,6 +858,54 @@ mod tests {
         shut_down(&transform).await;
     }
 
+    /// The plugin runs out of the operator's spawned task, so its time must be
+    /// the node's `busy`: the operator claims the meter its wrapper installs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transform_reports_plugin_time_through_the_node_meter() {
+        use crate::telemetry::recorder::get_metrics_recorder;
+        use crate::telemetry::task_wait::TaskWaitMeter;
+
+        let transform = describe("metered_transform", &[]);
+        let instances = transform
+            .instantiate(1, Some(source_schema()))
+            .await
+            .unwrap();
+        let exec = PluginExec::new(
+            test_plugins::input(vec![vec![batch(&[1, 2], &[]), batch(&[3], &[])]]),
+            transform.output_schema().unwrap(),
+            10,
+            instances,
+            metric_id("metered_transform"),
+            crate::shutdown::ComponentScope::detached("test"),
+        );
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "metered_transform",
+        );
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, context)
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            batches.iter().flat_map(ids).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            meter.is_claimed(),
+            "the plugin operator must claim the node meter"
+        );
+        assert!(
+            meter.totals().busy > Duration::ZERO,
+            "the plugin's time must be busy: {:?}",
+            meter.totals()
+        );
+        shut_down(&transform).await;
+    }
+
     /// The failed instance keeps draining until teardown, so the stream must
     /// learn of the failure from the instance's report instead.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
