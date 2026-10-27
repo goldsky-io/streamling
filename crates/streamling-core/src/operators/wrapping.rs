@@ -890,7 +890,9 @@ impl ExecutionPlan for WrappingExec {
             let mut empty_batches =
                 EmptyBatchCounter::new(Arc::clone(&metrics_recorder), metric_metadata_id.clone());
             loop {
-                // Resume point: the downstream asked for the next batch.
+                // Resume point: the downstream asked for the next batch. Kept even
+                // when that poll turns out to be EOF: the downstream spent the gap
+                // on our last batch, unlike `starved`'s EOF wait (teardown).
                 if let Some(blocked_time) = &blocked_time {
                     blocked_time.close();
                 }
