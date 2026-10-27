@@ -798,9 +798,20 @@ impl ExecutionPlan for WrappingExec {
 
         // An inner operator that runs its loop in a spawned task claims this
         // meter, so its own work is not mistaken for `starved` (see
-        // `TaskWaitMeter`).
-        let (inner_context, task_wait) =
-            TaskWaitMeter::install(&context, Arc::clone(&metrics_recorder), &metric_metadata_id);
+        // `TaskWaitMeter`). An inner phase of a node that reserved its meter
+        // (hybrid source) shares that meter and reports no `node_wait` of its
+        // own: its output feeds the enclosing node, not a topology edge.
+        let (inner_context, task_wait, inner_phase) = match TaskWaitMeter::reserved(&context) {
+            Some(meter) => (context, meter, true),
+            None => {
+                let (inner_context, meter) = TaskWaitMeter::install(
+                    &context,
+                    Arc::clone(&metrics_recorder),
+                    &metric_metadata_id,
+                );
+                (inner_context, meter, false)
+            }
+        };
         let mut data = execute_input_stream(
             Arc::clone(&self.inner),
             Arc::clone(&self.schema()),
@@ -870,6 +881,7 @@ impl ExecutionPlan for WrappingExec {
         // One `blocked` emitter per edge: a fan-out producer's
         // `BroadcastStream` emits per consumer instead.
         let blocked_time = match &self.backpressure_role {
+            _ if inner_phase => None,
             BackpressureRole::Edge(downstream_id) => Some(downstream_id.as_str()),
             BackpressureRole::Unattributed => Some(""),
             BackpressureRole::FanOutProducer => None,

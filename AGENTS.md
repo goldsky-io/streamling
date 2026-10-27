@@ -180,7 +180,7 @@ Who measures each state:
 | Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | none |
 | Sink | `WrappingDataSink` input poll | time the connector holds a batch before it asks for the next one |
 
-A task-decoupled operator must claim the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext`, and bracket its input waits (`next`, `wait_input`) and sends (`send`); otherwise its work reads as `starved`. An operator that runs inner sources one after another reserves the meter (`TaskWaitMeter::reserve`) and lets each claim it in turn.
+A task-decoupled operator must claim the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext`, and bracket its input waits (`next`, `wait_input`) and sends (`send`); otherwise its work reads as `starved`. An operator that runs inner sources one after another reserves the meter (`TaskWaitMeter::reserve`) and lets each claim it in turn. The inner sources' own `WrappingExec`s share that reserved meter and emit no `node_wait`, so a hybrid source's whole triad is under its YAML name.
 
 Every series is a `NodeTime` (`telemetry/node_time.rs`): a process-wide flusher reports open spans every second, so a stalled wait shows while it lasts. Whole milliseconds are emitted and the sub-millisecond remainder carries.
 

@@ -48,6 +48,8 @@ A source is `starved` only while its external system has no data for it: a
 Kafka broker wait, a ClickHouse failure backoff, an idle file poll. Fetching
 and decoding available data is `busy`. A hybrid source reserves the meter at
 `execute`, and each phase source claims it in turn; the latest claim owns it.
+Each phase's own `WrappingExec` shares the reserved meter and emits no
+`node_wait`, so the hybrid's triad is under its YAML name, not the phase ids.
 
 A plugin source cannot be split: the plugin fetches and decodes out of
 process, and the plugin protocol carries no wait signal. Its whole input poll

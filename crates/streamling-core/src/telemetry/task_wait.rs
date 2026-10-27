@@ -4,7 +4,7 @@ use datafusion::execution::TaskContext;
 use futures::{Stream, StreamExt};
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -29,6 +29,8 @@ pub struct TaskWaitMeter {
     /// The latest claim. One timeline at a time: an older handle becomes a
     /// pass-through, so a finishing phase cannot disturb the next one.
     generation: AtomicU64,
+    /// Set by [`Self::reserve`]: inner operators share this meter.
+    reserved: AtomicBool,
 }
 
 struct Timers {
@@ -66,6 +68,7 @@ impl TaskWaitMeter {
             metadata_id: metadata_id.to_string(),
             timers: OnceLock::new(),
             generation: AtomicU64::new(0),
+            reserved: AtomicBool::new(false),
         });
         let child = TaskContext::new(
             context.task_id(),
@@ -109,7 +112,18 @@ impl TaskWaitMeter {
     pub fn reserve(context: &TaskContext) {
         if let Some(meter) = context.session_config().get_extension::<TaskWaitMeter>() {
             meter.timers();
+            meter.reserved.store(true, Ordering::Release);
         }
+    }
+
+    /// Wrapper side: the meter an enclosing operator reserved for its inner
+    /// operators. An inner operator's own wrapper shares it instead of
+    /// installing a fresh one, so the inner work stays the enclosing node's.
+    pub fn reserved(context: &TaskContext) -> Option<Arc<TaskWaitMeter>> {
+        context
+            .session_config()
+            .get_extension::<TaskWaitMeter>()
+            .filter(|meter| meter.reserved.load(Ordering::Acquire))
     }
 
     /// Whether an operator took over this node's `starved` measurement.
@@ -304,6 +318,21 @@ mod tests {
         assert!(meter.is_claimed());
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(meter.totals(), TaskWaitTotals::default());
+    }
+
+    /// Only a reserved meter is shared with inner wrappers. A claimed one
+    /// belongs to its node: the node's input wrapper installs its own.
+    #[test]
+    fn only_a_reserved_meter_is_shared() {
+        let ctx = SessionContext::new().task_ctx();
+        let (claimed, _meter) = install(&ctx);
+        let _handle = TaskWaitMeter::claim(&claimed);
+        assert!(TaskWaitMeter::reserved(&claimed).is_none());
+
+        let (reserved, meter) = install(&ctx);
+        TaskWaitMeter::reserve(&reserved);
+        let shared = TaskWaitMeter::reserved(&reserved).expect("reserved meter");
+        assert!(Arc::ptr_eq(&shared, &meter));
     }
 
     #[tokio::test]

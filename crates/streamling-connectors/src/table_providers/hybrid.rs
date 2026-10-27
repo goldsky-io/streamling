@@ -3102,6 +3102,136 @@ mod tests {
         let _: Vec<_> = stream.collect().await;
     }
 
+    /// A phase source that claims its node meter and works for 40ms.
+    #[derive(Debug)]
+    struct ClaimingMockProvider;
+
+    #[async_trait]
+    impl TableProvider for ClaimingMockProvider {
+        fn schema(&self) -> SchemaRef {
+            create_test_schema()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = create_test_schema();
+            Ok(Arc::new(ClaimingMockExec {
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+                schema,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClaimingMockExec {
+        schema: SchemaRef,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ClaimingMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ClaimingMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ClaimingMockExec {
+        fn name(&self) -> &str {
+            "ClaimingMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let work = futures::stream::once(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                drop(task_wait);
+            })
+            .filter_map(|()| futures::future::ready(None));
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    work,
+                ),
+            ))
+        }
+    }
+
+    /// Phases run behind their own `WrappingExec`, which must not shadow the
+    /// meter the hybrid reserved: the phase work is the hybrid node's `busy`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_phase_work_reaches_the_hybrid_node_meter() {
+        use streamling_core::operators::wrapping::WrappingSourceTableProvider;
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let phase = |name: &str| -> Arc<dyn TableProvider> {
+            Arc::new(WrappingSourceTableProvider::new(
+                Arc::new(ClaimingMockProvider),
+                name.to_string(),
+                None,
+                None,
+            ))
+        };
+        let config = HybridSourceConfig {
+            bounded_sources: vec![phase("phase_meter_bounded_0")],
+            unbounded_source: phase("phase_meter_unbounded"),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend =
+            create_state_backend("test_hybrid_phase_work_reaches_the_hybrid_node_meter").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "phase_meter".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+        let plan = hybrid_provider
+            .scan(&SESSION_MANAGER.session_state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let (context, meter) =
+            TaskWaitMeter::install(&TaskContext::default(), get_metrics_recorder(), "phase_meter");
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        let _: Vec<_> = stream.collect().await;
+        let busy = meter.totals().busy;
+        assert!(
+            busy >= Duration::from_millis(40),
+            "the bounded phase's 40ms of work must be the hybrid node's busy, got {busy:?}"
+        );
+    }
+
     /// A bounded phase that behaves like the real ClickHouse provider: its
     /// scan IGNORES the pushed-down projection and emits one full-width batch
     /// whose column order differs from the hybrid (unbounded/Kafka) schema.
