@@ -671,6 +671,44 @@ mod tests {
         );
     }
 
+    /// The idle wait for new files is `starved`; reading a file is the source's
+    /// own work (`busy`). Without the split, all of it read as `starved`.
+    #[tokio::test]
+    async fn continuous_source_reports_idle_polls_as_starved() {
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+        use streamling_core::telemetry::task_wait::TaskWaitMeter;
+
+        let dir = temp_dir_with("node_wait", &csv_files(1));
+        let (session_manager, provider) =
+            continuous_provider(&format!("{}/", dir.to_str().unwrap()), "node_wait_src", 1).await;
+        let plan = provider
+            .scan(&session_manager.session_state(), None, &[], None)
+            .await
+            .unwrap();
+        let (context, meter) = TaskWaitMeter::install(
+            &session_manager.session_context().task_ctx(),
+            get_metrics_recorder(),
+            "node_wait_src",
+        );
+        let mut stream = plan.execute(0, context).unwrap();
+
+        // One data batch, then idle polls 100ms apart.
+        pull_continuous(&mut stream, 5).await;
+        drop(stream);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(meter.is_claimed(), "the source must measure its own task");
+        let totals = meter.totals();
+        assert!(
+            totals.starved >= Duration::from_millis(200),
+            "idle polls must be starved: {totals:?}"
+        );
+        assert!(
+            totals.busy < totals.starved,
+            "an idle source is not busy: {totals:?}"
+        );
+    }
+
     /// A poll's files are split across the session's target partitions and read
     /// concurrently, but the source still emits from one stream: every row must
     /// arrive exactly once (the watermark's boundary set covers the files sharing
