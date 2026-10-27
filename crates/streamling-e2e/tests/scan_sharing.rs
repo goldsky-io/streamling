@@ -188,7 +188,7 @@ sinks:
     // under test).
     let slow_edge_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("slow_branch", None)
+        PrometheusResource::backpressure_by_downstream_query("slow_branch", Some(&ctx.test_id))
     );
     let slow_edge = prometheus
         .wait_for_metric_at_least(&slow_edge_query, 50, 30, 500)
@@ -204,7 +204,7 @@ sinks:
     // consumer cannot smear backpressure onto its fast sibling.
     let fast_edge_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("fast_branch", None)
+        PrometheusResource::backpressure_by_downstream_query("fast_branch", Some(&ctx.test_id))
     );
     let fast_edge = prometheus
         .query_count(&fast_edge_query)
@@ -368,7 +368,7 @@ sinks:
     // edge emitted untagged (no `downstream_id`), so this query would be 0.
     let upstream_edge_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("shared_producer", None)
+        PrometheusResource::backpressure_by_downstream_query("shared_producer", Some(&ctx.test_id))
     );
     let upstream_edge = prometheus
         .wait_for_metric_at_least(&upstream_edge_query, 1, 30, 500)
@@ -403,7 +403,7 @@ sinks:
 async fn test_linear_rebatch_webhook_edge_attribution() {
     init_tracing();
 
-    use streamling_e2e::resources::WebhookResource;
+    use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
     let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
         Ok(ctx) => ctx,
@@ -510,12 +510,12 @@ sinks:
     // (`id="bp2_xform"`) AND the *sink* (`downstream_id="bp2_web"`). Both labels are
     // pinned so the pre-fix mislabel (sink name stamped on the wrong upstream node)
     // cannot satisfy this query.
-    let edge_query = concat!(
-        "sum(streamling_node_wait_milliseconds_total",
-        "{state=\"blocked\",id=\"bp2_xform\",downstream_id=\"bp2_web\"})"
+    let edge_query = format!(
+        "sum({})",
+        PrometheusResource::blocked_edge_query("bp2_xform", "bp2_web", Some(&ctx.test_id))
     );
     let edge = prometheus
-        .wait_for_metric_at_least(edge_query, 1, 30, 500)
+        .wait_for_metric_at_least(&edge_query, 1, 30, 500)
         .await
         .expect("bp2_xform -> bp2_web edge must be tagged (id=bp2_xform, downstream_id=bp2_web)");
     assert!(
@@ -525,16 +525,12 @@ sinks:
 }
 
 /// `starved` coverage: a linear `source -> slow webhook sink` pipeline. The
-/// source's `WrappingExec` measures time in `data.next().await` (waiting on
-/// upstream Kafka I/O) as `node_wait{state="starved", id=<source>}`. Two effects
-/// make this reliably non-zero: the initial consumer-group join / first-fetch
-/// latency before the first batch, and — because the slow webhook (100ms/req,
-/// tiny buffers) gates the pipeline for seconds — repeated Kafka polls whose
-/// waits are charged to the source each time a batch eventually arrives.
+/// Kafka source counts its broker waits (partition assignment, and the record
+/// wait once the topic is drained) as `node_wait{state="starved", id=<source>}`,
+/// so the initial consumer-group join alone makes this non-zero.
 ///
-/// `starved` is node-local, so `downstream_id` is always `""`; we pin only `id`
-/// via the (previously unused) `starved_by_id_query` helper and sum across
-/// series so cross-run series from other tests can't mask this run.
+/// `starved` is node-local, so `downstream_id` is always `""`; we pin `id` and
+/// this run's `service_instance_id`.
 ///
 /// NOTE: `starved` classification is timing-sensitive (see
 /// `docs/node-wait-measurement-model.md`) — prefetch and buffering can move wait
@@ -641,7 +637,7 @@ sinks:
 
     let starved_query = format!(
         "sum({})",
-        PrometheusResource::starved_by_id_query("starved_source", None)
+        PrometheusResource::starved_by_id_query("starved_source", Some(&ctx.test_id))
     );
     let starved = prometheus
         .wait_for_metric_at_least(&starved_query, 1, 30, 500)
@@ -663,7 +659,7 @@ sinks:
 async fn test_linear_source_to_slow_sink_blocked_edge() {
     init_tracing();
 
-    use streamling_e2e::resources::WebhookResource;
+    use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
     let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
         Ok(ctx) => ctx,
@@ -757,20 +753,199 @@ sinks:
     // Give metrics time to flush to Prometheus.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    // Pin BOTH id (the source) and downstream_id (the sink); sum across series
-    // so cross-run series from other tests can only add to the total.
-    let edge_query = concat!(
-        "sum(streamling_node_wait_milliseconds_total",
-        "{state=\"blocked\",id=\"bp3_source\",downstream_id=\"bp3_web\"})"
+    // Pin BOTH id (the source) and downstream_id (the sink), and this run.
+    let edge_query = format!(
+        "sum({})",
+        PrometheusResource::blocked_edge_query("bp3_source", "bp3_web", Some(&ctx.test_id))
     );
     let edge = prometheus
-        .wait_for_metric_at_least(edge_query, 1, 30, 500)
+        .wait_for_metric_at_least(&edge_query, 1, 30, 500)
         .await
         .expect("bp3_source -> bp3_web edge must be tagged (id=bp3_source, downstream_id=bp3_web)");
     assert!(
         edge >= 1,
         "expected the bp3_source->bp3_web blocked edge to be tagged and non-zero, got {edge}ms"
     );
+
+    // The sink's own write time is `busy`: 30 requests x 100ms webhook delay.
+    let busy_query = format!(
+        "sum({})",
+        PrometheusResource::busy_by_id_query("bp3_web", Some(&ctx.test_id))
+    );
+    let busy = prometheus
+        .wait_for_metric_at_least(&busy_query, 1_000, 30, 500)
+        .await
+        .expect("the slow sink's write time must be busy");
+    assert!(busy >= 1_000, "expected sink busy >= 1000ms, got {busy}ms");
+}
+
+/// Scan sharing and a multi-sink fan-out in one pipeline: the shared source
+/// feeds two transforms, and one of them feeds two sinks. Each layer has its
+/// own `BroadcastStream`, and each must keep exactly one blocked emitter per
+/// edge: the shared source's edge to `ssm_multi`, and `ssm_multi`'s edge to its
+/// slow webhook sink.
+#[tokio::test]
+async fn test_scan_sharing_into_a_multi_sink_attributes_both_layers() {
+    init_tracing();
+
+    use streamling_e2e::resources::{PrometheusResource, WebhookResource};
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let webhook = WebhookResource::new()
+        .await
+        .expect("Failed to start webhook server");
+    webhook.set_delay(std::time::Duration::from_millis(100));
+
+    let records_to_produce: i64 = 30;
+    let records: Vec<TestRecord> = (1..=records_to_produce)
+        .map(|i| TestRecord {
+            id: i,
+            value: format!("value_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  ssm_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  ssm_multi:
+    type: sql
+    sql: "SELECT id, value, timestamp FROM ssm_source"
+    primary_key: id
+  ssm_single:
+    type: sql
+    sql: "SELECT id, value, timestamp FROM ssm_source"
+    primary_key: id
+
+sinks:
+  ssm_web:
+    type: webhook
+    from: ssm_multi
+    url: {webhook_url}
+    one_row_per_request: true
+    payload_version: 0
+    batch_size: 1
+
+  ssm_pg_multi:
+    type: postgres
+    from: ssm_multi
+    table: ssm_multi
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+
+  ssm_pg_single:
+    type: postgres
+    from: ssm_single
+    table: ssm_single
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+"#,
+        topic = ctx.kafka_topic,
+        webhook_url = webhook.webhook_url(),
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(records_to_produce as u64)
+                .timeout(std::time::Duration::from_secs(120))
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1"),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+
+    let single_rows = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.ssm_single")
+        .await
+        .expect("Failed to query PostgreSQL count");
+    assert_eq!(
+        single_rows, records_to_produce,
+        "the other branch gets every row"
+    );
+    assert!(
+        webhook
+            .wait_for_requests(1, std::time::Duration::from_secs(10))
+            .await,
+        "the slow webhook sink should have received traffic"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Multi-sink layer: `ssm_multi` is held back by its slow webhook sink.
+    let sink_edge_query = format!(
+        "sum({})",
+        PrometheusResource::blocked_edge_query("ssm_multi", "ssm_web", Some(&ctx.test_id))
+    );
+    let sink_edge = prometheus
+        .wait_for_metric_at_least(&sink_edge_query, 50, 30, 500)
+        .await
+        .expect("ssm_multi -> ssm_web must accrue blocked time");
+    assert!(
+        sink_edge >= 50,
+        "ssm_multi -> ssm_web blocked {sink_edge}ms"
+    );
+
+    // Scan-sharing layer: the shared source is held back by `ssm_multi`.
+    let shared_edge_query = format!(
+        "sum({})",
+        PrometheusResource::blocked_edge_query("ssm_source", "ssm_multi", Some(&ctx.test_id))
+    );
+    let shared_edge = prometheus
+        .wait_for_metric_at_least(&shared_edge_query, 1, 30, 500)
+        .await
+        .expect("ssm_source -> ssm_multi must be attributed");
+    assert!(
+        shared_edge >= 1,
+        "ssm_source -> ssm_multi blocked {shared_edge}ms"
+    );
+
+    // No unattributed blocked series may appear for either fan-out producer.
+    for producer in ["ssm_source", "ssm_multi"] {
+        let untagged_query = format!(
+            "sum({})",
+            PrometheusResource::blocked_edge_query(producer, "", Some(&ctx.test_id))
+        );
+        let untagged = prometheus
+            .query_count(&untagged_query)
+            .await
+            .expect("query failed")
+            .unwrap_or(0);
+        assert_eq!(
+            untagged, 0,
+            "{producer} emitted an unattributed blocked series"
+        );
+    }
 }
 
 /// Two transforms share one parallel Kafka source. Both must receive every row

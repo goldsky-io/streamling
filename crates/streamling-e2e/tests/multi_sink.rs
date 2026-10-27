@@ -402,7 +402,7 @@ sinks:
     // add to the total and cannot mask this run's backpressure.
     let blocked_webhook_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("webhook_sink", None)
+        PrometheusResource::backpressure_by_downstream_query("webhook_sink", Some(&ctx.test_id))
     );
     let blocked_webhook = prometheus
         .wait_for_metric_at_least(&blocked_webhook_query, 50, 30, 500)
@@ -419,7 +419,7 @@ sinks:
     // to recover the node-level total.
     let source_backpressure_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_id_query("kafka_source", None)
+        PrometheusResource::backpressure_by_id_query("kafka_source", Some(&ctx.test_id))
     );
     let source_backpressure = prometheus
         .wait_for_metric_at_least(&source_backpressure_query, 1, 30, 500)
