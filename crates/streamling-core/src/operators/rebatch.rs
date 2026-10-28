@@ -22,8 +22,8 @@ use std::time::Duration;
 /// A physical operator that accumulates input batches and emits merged,
 /// re-sized batches based on row count and/or time interval thresholds.
 ///
-/// Unlike `WrappingExec`, this operator performs no telemetry, side output
-/// processing, or live inspection — it only re-batches.
+/// Unlike `WrappingExec` and `SideOutputExec`, this operator performs no
+/// telemetry, side output processing, or live inspection — it only re-batches.
 #[derive(Debug)]
 pub struct RebatchExec {
     inner: Arc<dyn ExecutionPlan>,
@@ -45,6 +45,11 @@ impl RebatchExec {
             batch_flush_interval,
             name,
         }
+    }
+
+    /// The node whose input this rebatches.
+    pub fn reference_name(&self) -> &str {
+        &self.name
     }
 }
 

@@ -89,6 +89,9 @@ file_source:
   # Discovered files sampled to detect the Hive partition layout before the
   # first scan.
   partition_sample_size: 10
+table:
+  # Minimum time between a windowed table's GC passes.
+  window_gc_interval: "1s"
 print_sink:
   sample_every: "1"
 postgres_sink:
