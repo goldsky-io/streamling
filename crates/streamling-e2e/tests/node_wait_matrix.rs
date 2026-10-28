@@ -532,7 +532,13 @@ async fn hybrid_source_reports_under_its_name_and_is_blocked_by_a_slow_sink() {
 #[tokio::test]
 async fn hybrid_source_waiting_on_kafka_is_starved() {
     let (ctx, webhook) = hybrid_context(3).await;
+    // Produce only once the bounded rows are through, so the Kafka phase
+    // really waits between records.
     let produce_slowly = async {
+        assert!(
+            webhook.wait_for_requests(1, Duration::from_secs(60)).await,
+            "the bounded rows must reach the sink"
+        );
         for i in 1..=8 {
             ctx.kafka
                 .produce_avro_records(&hybrid_records(i..=i))
@@ -675,4 +681,82 @@ async fn continuous_file_source_idle_polls_are_starved() {
     assert!(s.starved("f_src") >= 2_000, "{s:?}");
     assert!(s.starved("f_src") > s.busy("f_src"), "{s:?}");
     assert!(s.starved("f_sink") > s.busy("f_sink"), "{s:?}");
+}
+
+// ============================================================================
+// Plugin transform (`plugin_examples/basic`)
+// ============================================================================
+
+const PLUGIN_NODES: [&str; 3] = ["p_src", "p_plugin", "p_sink"];
+
+/// A slow plugin transform: its per-batch work is `busy`, the source feeding
+/// it is `blocked` on it, and the sink after it is `starved`.
+#[tokio::test]
+async fn slow_plugin_transform_is_busy_blocks_upstream_and_starves_downstream() {
+    init_tracing();
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    ctx.kafka
+        .produce_avro_records(&records(1..=40))
+        .await
+        .expect("Failed to produce records");
+    let webhook = WebhookResource::new()
+        .await
+        .expect("Failed to start webhook server");
+    let plugin_lib = streamling_e2e::build_basic_example_plugin().await;
+
+    let pipeline = format!(
+        r#"
+sources:
+  p_src:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  p_plugin:
+    type: basic_plugin.filter_transform
+    from: p_src
+    primary_key: id
+    work_ms: "75"
+
+sinks:
+  p_sink:
+    type: webhook
+    from: p_plugin
+    url: {webhook_url}
+    one_row_per_request: false
+    payload_version: 0
+"#,
+        topic = ctx.kafka_topic,
+        webhook_url = webhook.webhook_url(),
+    );
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(40)
+                .timeout(Duration::from_secs(180))
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1")
+                .env(
+                    "STREAMLING__PLUGIN__PATH",
+                    plugin_lib.to_string_lossy().as_ref(),
+                ),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+    let s = snapshot(&ctx, &PLUGIN_NODES).await;
+
+    s.assert_busiest("p_plugin");
+    assert!(s.busy("p_plugin") >= 2_000, "{s:?}");
+    assert!(s.blocked("p_src") >= 1_000, "{s:?}");
+    assert!(s.starved("p_sink") > s.busy("p_sink"), "{s:?}");
 }
