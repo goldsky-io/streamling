@@ -1731,6 +1731,7 @@ impl Streamling {
                             time_column,
                             cache_refresh_debounce_ms,
                             dt.cache,
+                            dt.max_connections,
                         )
                         .await
                         .map_err(|e| {
