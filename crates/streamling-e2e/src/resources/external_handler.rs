@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::info;
 
@@ -30,6 +31,7 @@ pub struct CapturedHandlerRequest {
 struct HandlerState {
     requests: Arc<Mutex<Vec<CapturedHandlerRequest>>>,
     capture_file: Option<PathBuf>,
+    response_delay: Arc<Mutex<Duration>>,
 }
 
 impl HandlerState {
@@ -37,6 +39,14 @@ impl HandlerState {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             capture_file,
+            response_delay: Arc::new(Mutex::new(Duration::ZERO)),
+        }
+    }
+
+    async fn delay(&self) {
+        let delay = *self.response_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -177,6 +187,12 @@ impl ExternalHandlerResource {
     }
 
     /// Get the URL for the passthrough handler
+    /// Set an artificial per-request processing delay, making this a
+    /// deliberately slow handler. Takes effect for subsequent requests.
+    pub fn set_delay(&self, delay: Duration) {
+        *self.state.response_delay.lock().unwrap() = delay;
+    }
+
     pub fn passthrough_handler_url(&self) -> String {
         format!("{}/handler_passthrough", self.url)
     }
@@ -248,6 +264,7 @@ async fn handle_slim_single(
     State(state): State<HandlerState>,
     body: Bytes,
 ) -> (StatusCode, String) {
+    state.delay().await;
     let body_str = String::from_utf8_lossy(&body).to_string();
     state.add_request("handler_slim", body_str.clone());
 
@@ -270,6 +287,7 @@ async fn handle_slim_single_envelope(
     State(state): State<HandlerState>,
     body: Bytes,
 ) -> (StatusCode, String) {
+    state.delay().await;
     let body_str = String::from_utf8_lossy(&body).to_string();
     state.add_request("handler_slim_envelope", body_str.clone());
 
@@ -292,6 +310,7 @@ async fn handle_slim_single_envelope(
 
 /// Handle batch requests without envelope (payload_version=0)
 async fn handle_slim_batch(State(state): State<HandlerState>, body: Bytes) -> (StatusCode, String) {
+    state.delay().await;
     let body_str = String::from_utf8_lossy(&body).to_string();
     state.add_request("handler_slim_batch", body_str.clone());
 
@@ -319,6 +338,7 @@ async fn handle_slim_batch_envelope(
     State(state): State<HandlerState>,
     body: Bytes,
 ) -> (StatusCode, String) {
+    state.delay().await;
     let body_str = String::from_utf8_lossy(&body).to_string();
     state.add_request("handler_slim_batch_envelope", body_str.clone());
 
@@ -350,6 +370,7 @@ async fn handle_passthrough(
     State(state): State<HandlerState>,
     body: Bytes,
 ) -> (StatusCode, String) {
+    state.delay().await;
     let body_str = String::from_utf8_lossy(&body).to_string();
     state.add_request("handler_passthrough", body_str.clone());
     (StatusCode::OK, body_str)
