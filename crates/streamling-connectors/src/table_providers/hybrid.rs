@@ -545,6 +545,15 @@ impl HybridTableProvider {
         }
     }
 
+    /// A bounded field can back the unbounded one: the same type up to list
+    /// child names, or a ClickHouse encoding of a `decimal_arb` leaf. A
+    /// non-nullable bounded field fits a nullable unbounded one, not the reverse.
+    fn is_compatible_field(bounded: &Field, unbounded: &Field) -> bool {
+        (!bounded.is_nullable() || unbounded.is_nullable())
+            && (Self::is_compatible_data_type(bounded.data_type(), unbounded.data_type())
+                || Self::clickhouse_reads_as_decimal_arb(bounded.data_type(), unbounded))
+    }
+
     fn is_compatible_data_type(
         bounded_type: &arrow_schema::DataType,
         unbounded_type: &arrow_schema::DataType,
@@ -556,28 +565,29 @@ impl HybridTableProvider {
         }
 
         match (bounded_type, unbounded_type) {
+            // Nested field names can differ (for example "item" vs "element"):
+            // Arrow/DataFusion producers label list children differently even
+            // when the list semantics are identical.
             (DataType::List(bounded_field), DataType::List(unbounded_field))
             | (DataType::LargeList(bounded_field), DataType::LargeList(unbounded_field)) => {
-                // Safe to ignore nested field names (for example "item" vs "element"):
-                // Arrow/DataFusion producers can label list children differently even when
-                // the list semantics are identical. We still require matching child
-                // nullability and recursively compatible element types.
-                bounded_field.is_nullable() == unbounded_field.is_nullable()
-                    && Self::is_compatible_data_type(
-                        bounded_field.data_type(),
-                        unbounded_field.data_type(),
-                    )
+                Self::is_compatible_field(bounded_field, unbounded_field)
             }
             (
                 DataType::FixedSizeList(bounded_field, bounded_size),
                 DataType::FixedSizeList(unbounded_field, unbounded_size),
             ) => {
                 bounded_size == unbounded_size
-                    && bounded_field.is_nullable() == unbounded_field.is_nullable()
-                    && Self::is_compatible_data_type(
-                        bounded_field.data_type(),
-                        unbounded_field.data_type(),
-                    )
+                    && Self::is_compatible_field(bounded_field, unbounded_field)
+            }
+            // Fields match by name: Kafka and ClickHouse can order struct
+            // fields differently, and the bounded read reorders them.
+            (DataType::Struct(bounded_fields), DataType::Struct(unbounded_fields)) => {
+                bounded_fields.len() == unbounded_fields.len()
+                    && unbounded_fields.iter().all(|unbounded_field| {
+                        bounded_fields
+                            .find(unbounded_field.name())
+                            .is_some_and(|(_, b)| Self::is_compatible_field(b, unbounded_field))
+                    })
             }
             _ => false,
         }
@@ -1282,11 +1292,10 @@ impl ExecutionPlan for HybridSourceExec {
                                 // align each batch to the declared (projected)
                                 // schema by name before anything downstream sees it.
                                 let batch = align_batch_to_schema(&batch, &schema_clone)?;
-                                // Bounded sources (ClickHouse) emit u256/i256 columns as
-                                // FixedSizeBinary(32) without extension metadata and in
-                                // little-endian. Reverse the bytes and adopt the target
-                                // schema's metadata so downstream arithmetic UDFs (which
-                                // assume big-endian + metadata) see correct values.
+                                // Bounded sources (ClickHouse) emit decimal_arb values as
+                                // native ints, Decimal or text, and may order struct fields
+                                // differently. Convert those leaves, at any depth, and
+                                // reorder struct fields to the target schema.
                                 // No-op for sources that already match (e.g. Kafka/Avro).
                                 ClickHouseClient::normalize_batch_from_clickhouse(
                                     &batch,
@@ -2114,6 +2123,74 @@ mod tests {
         assert!(!HybridTableProvider::clickhouse_reads_as_decimal_arb(
             &DataType::Int64,
             &narrow
+        ));
+    }
+
+    #[test]
+    fn nested_decimal_arb_under_list_of_struct_is_compatible() {
+        use streamling_core::types::decimal_arb::DecimalArbType;
+        // ClickHouse `Array(Tuple(purpose Nullable(String), value String))`
+        // backing a Kafka `List<Struct<purpose, value decimal_arb>>` column.
+        let bounded = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Field::new("purpose", DataType::Utf8, true),
+                    Field::new("value", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        )));
+        let unbounded = DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(
+                vec![
+                    Field::new("purpose", DataType::Utf8, true),
+                    DecimalArbType::field("value", 100, 0, true).unwrap(),
+                ]
+                .into(),
+            ),
+            true,
+        )));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &bounded, &unbounded
+        ));
+    }
+
+    #[test]
+    fn struct_with_reordered_fields_is_compatible() {
+        // Kafka and ClickHouse can declare struct fields in different orders;
+        // the bounded read reorders them to the unbounded schema.
+        let strukt = |names: [&str; 2]| {
+            DataType::Struct(
+                names
+                    .iter()
+                    .map(|n| Field::new(*n, DataType::Utf8, true))
+                    .collect(),
+            )
+        };
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &strukt(["b", "a"]),
+            &strukt(["a", "b"])
+        ));
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &strukt(["a", "c"]),
+            &strukt(["a", "b"])
+        ));
+    }
+
+    #[test]
+    fn nullable_bounded_list_item_cannot_back_a_non_nullable_one() {
+        let list =
+            |nullable| DataType::List(Arc::new(Field::new("item", DataType::Utf8, nullable)));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &list(false),
+            &list(true)
+        ));
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &list(true),
+            &list(false)
         ));
     }
 

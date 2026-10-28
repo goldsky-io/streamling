@@ -3060,18 +3060,20 @@ impl ClickHouseClient {
     /// field (matched **by name**) is a `decimal_arb` column with a
     /// `native_int_kind` hint, reinterpret the little-endian bytes as a
     /// `decimal_arb` value and adopt the target field on that column only.
+    /// The same applies to leaves nested under lists and structs, for example
+    /// a `List<Struct<value decimal_arb>>` read from `Array(Tuple(value String))`.
+    /// Struct fields are also reordered to the target's order, because Kafka
+    /// and ClickHouse can declare them in different orders.
     ///
-    /// Columns without a wide-int target match pass through unchanged, keeping
-    /// their original Field — the hybrid layer deliberately tolerates List
-    /// inner-field-name differences (`item` vs `element`), which forcing
+    /// Columns that need no conversion or reordering pass through unchanged,
+    /// keeping their original Field. The hybrid layer deliberately tolerates
+    /// List inner-field-name differences (`item` vs `element`), which forcing
     /// `target_schema` onto every column would reject at `RecordBatch::try_new`.
     pub(crate) fn normalize_batch_from_clickhouse(
         batch: &RecordBatch,
         target_schema: &SchemaRef,
     ) -> Result<RecordBatch, DataFusionError> {
-        use arrow::datatypes::DataType;
         use std::collections::HashMap;
-        use streamling_core::types::decimal_arb::DecimalArbType;
 
         let target_by_name: HashMap<&str, &FieldRef> = target_schema
             .fields()
@@ -3086,67 +3088,15 @@ impl ClickHouseClient {
 
         for (column, original_field) in batch.columns().iter().zip(original_schema.fields().iter())
         {
-            // A decimal_arb target column is fetched from ClickHouse as native
-            // UInt256/Int256 (FixedSizeBinary(32), for native_int_kind hints),
-            // as the native `Decimal(p, s)` the sink itself writes within the
-            // Decimal cap (Arrow Decimal128 / Decimal256), or as canonical
-            // decimal text (Utf8, the wide / `coerce_to: string` path).
-            // Reinterpret each into decimal_arb. A retired `streamling.u256` /
-            // `i256` target (a plugin schema that still declares it) gets the
-            // native bytes flipped to its big-endian wire form. Everything else
-            // passes through unchanged.
-            let mut converted: Option<(ArrayRef, &FieldRef)> = None;
-            if let Some(tf) = target_by_name.get(original_field.name().as_str()).copied() {
-                if DecimalArbType::is_decimal_arb_field(tf) {
-                    match original_field.data_type() {
-                        DataType::FixedSizeBinary(32)
-                            if DecimalArbType::native_int_kind_from_field(tf).is_some() =>
-                        {
-                            converted = Some((
-                                clickhouse_native_to_decimal_arb(column.as_ref(), tf)
-                                    .map_err(DataFusionError::from)?,
-                                tf,
-                            ));
-                        }
-                        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-                            converted = Some((
-                                clickhouse_decimal_to_decimal_arb(column.as_ref(), tf)
-                                    .map_err(DataFusionError::from)?,
-                                tf,
-                            ));
-                        }
-                        DataType::Utf8 | DataType::LargeUtf8 => {
-                            converted = Some((
-                                clickhouse_string_to_decimal_arb(column.as_ref(), tf)
-                                    .map_err(DataFusionError::from)?,
-                                tf,
-                            ));
-                        }
-                        _ => {}
-                    }
-                } else if matches!(original_field.data_type(), DataType::FixedSizeBinary(32))
-                    && streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind(tf)
-                        .is_some()
-                    && streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind(
-                        original_field,
-                    )
-                    .is_none()
-                {
-                    // ClickHouse ships UInt256 / Int256 little-endian; the
-                    // legacy wire form is big-endian. Without the flip `1`
-                    // arrives as 2^248.
-                    converted = Some((
-                        reverse_fixed_size_binary_32(column.as_ref(), tf)
-                            .map_err(DataFusionError::from)?,
-                        tf,
-                    ));
-                }
-            }
-
+            let converted = match target_by_name.get(original_field.name().as_str()) {
+                Some(tf) => clickhouse_column_to_target(column, original_field, tf)
+                    .map_err(DataFusionError::from)?,
+                None => None,
+            };
             match converted {
                 Some((col, tf)) => {
                     new_columns.push(col);
-                    new_fields.push((*tf).clone());
+                    new_fields.push(tf);
                     changed = true;
                 }
                 None => {
@@ -6584,6 +6534,123 @@ pub fn clickhouse_decimal_to_decimal_arb(
     Ok(Arc::new(converted.into_inner().0))
 }
 
+/// Rebuild a ClickHouse column (`source` describes it) so that every
+/// `decimal_arb` or retired wide-int leaf `target` declares, at any depth
+/// under lists and structs, holds the target's encoding. A `decimal_arb` leaf
+/// arrives as native `UInt256`/`Int256` (hinted targets), `Decimal(p, s)` or
+/// decimal text. Struct fields are reordered to the target's order, matched by
+/// name. Containers on a changed path adopt the target's field, so the item vs
+/// element naming and widened nullability match the target.
+/// `None` when nothing below `target` needs converting or reordering.
+fn clickhouse_column_to_target(
+    column: &ArrayRef,
+    source: &arrow::datatypes::Field,
+    target: &FieldRef,
+) -> streamling_core::error::Result<Option<(ArrayRef, FieldRef)>> {
+    use arrow::array::{Array, AsArray, LargeListArray, ListArray, StructArray};
+    use arrow::datatypes::{DataType, Field};
+    use streamling_core::types::decimal_arb::DecimalArbType;
+    use streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind;
+
+    if DecimalArbType::is_decimal_arb_field(target) {
+        let converted = match column.data_type() {
+            DataType::FixedSizeBinary(32)
+                if DecimalArbType::native_int_kind_from_field(target).is_some() =>
+            {
+                clickhouse_native_to_decimal_arb(column.as_ref(), target)?
+            }
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+                clickhouse_decimal_to_decimal_arb(column.as_ref(), target)?
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                clickhouse_string_to_decimal_arb(column.as_ref(), target)?
+            }
+            _ => return Ok(None),
+        };
+        return Ok(Some((converted, Arc::clone(target))));
+    }
+    // ClickHouse ships UInt256 / Int256 little-endian; the legacy wire form
+    // is big-endian. Without the flip `1` arrives as 2^248.
+    if matches!(column.data_type(), DataType::FixedSizeBinary(32))
+        && legacy_wide_int_kind(target).is_some()
+        && legacy_wide_int_kind(source).is_none()
+    {
+        let flipped = reverse_fixed_size_binary_32(column.as_ref(), target)?;
+        return Ok(Some((flipped, Arc::clone(target))));
+    }
+
+    let rebuilt: ArrayRef = match (column.data_type(), target.data_type()) {
+        (DataType::List(s), DataType::List(t)) => {
+            let list = column.as_list::<i32>();
+            let Some((values, child)) = clickhouse_column_to_target(list.values(), s, t)? else {
+                return Ok(None);
+            };
+            Arc::new(ListArray::try_new(
+                child,
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?)
+        }
+        (DataType::LargeList(s), DataType::LargeList(t)) => {
+            let list = column.as_list::<i64>();
+            let Some((values, child)) = clickhouse_column_to_target(list.values(), s, t)? else {
+                return Ok(None);
+            };
+            Arc::new(LargeListArray::try_new(
+                child,
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?)
+        }
+        (DataType::Struct(s_fields), DataType::Struct(t_fields)) => {
+            let st = column.as_struct();
+            let mut changed = false;
+            let mut fields = Vec::with_capacity(t_fields.len());
+            let mut columns = Vec::with_capacity(t_fields.len());
+            for (i, t) in t_fields.iter().enumerate() {
+                // The hybrid validator rejects this at startup; fail loud if
+                // an unvalidated batch gets here.
+                let (j, s) = s_fields.find(t.name()).ok_or_else(|| {
+                    streamling_err!(
+                        "struct field '{}' of column '{}' is missing from the ClickHouse batch",
+                        t.name(),
+                        target.name()
+                    )
+                })?;
+                let col = st.column(j);
+                changed |= i != j;
+                let (col, field) = match clickhouse_column_to_target(col, s, t)? {
+                    Some(c) => {
+                        changed = true;
+                        c
+                    }
+                    None => (Arc::clone(col), Arc::clone(s)),
+                };
+                columns.push(col);
+                fields.push(field);
+            }
+            if !changed {
+                return Ok(None);
+            }
+            Arc::new(StructArray::try_new(
+                fields.into(),
+                columns,
+                st.nulls().cloned(),
+            )?)
+        }
+        _ => return Ok(None),
+    };
+    let field = Field::new(
+        target.name(),
+        rebuilt.data_type().clone(),
+        target.is_nullable(),
+    )
+    .with_metadata(target.metadata().clone());
+    Ok(Some((rebuilt, Arc::new(field))))
+}
+
 /// Flip every 32-byte value between ClickHouse's little-endian native
 /// integers and the big-endian wire form a retired `streamling.u256` /
 /// `i256` target declares. Nulls are kept.
@@ -7265,6 +7332,177 @@ mod feature_002_byte_conversion_tests {
         // Non-wide columns pass through unchanged.
         assert_eq!(out.schema().field(0).data_type(), &DataType::Int32);
         assert_eq!(out.schema().field(2).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn normalize_converts_decimal_arb_nested_in_a_list_of_structs() {
+        use arrow::array::{AsArray, ListArray, StringArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::str::FromStr;
+        use streamling_core::types::decimal_arb::DecimalArbValue;
+
+        // ClickHouse `Array(Tuple(purpose Nullable(String), value String))`.
+        let ch_struct = StructArray::try_new(
+            vec![
+                Field::new("purpose", DataType::Utf8, true),
+                Field::new("value", DataType::Utf8, false),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("gas"), None])),
+                Arc::new(StringArray::from(vec![
+                    "123",
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                ])),
+            ],
+            None,
+        )
+        .unwrap();
+        let ch_list = ListArray::try_new(
+            Arc::new(Field::new("item", ch_struct.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 2, 2].into()),
+            Arc::new(ch_struct),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "transfers",
+                ch_list.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(ch_list)],
+        )
+        .unwrap();
+
+        // Kafka-side target: List<Struct<purpose, value decimal_arb(100, 0)>>.
+        let target_field = Field::new(
+            "transfers",
+            DataType::List(Arc::new(Field::new(
+                "element",
+                DataType::Struct(
+                    vec![
+                        Field::new("purpose", DataType::Utf8, true),
+                        DecimalArbType::field("value", 100, 0, true).unwrap(),
+                    ]
+                    .into(),
+                ),
+                true,
+            ))),
+            true,
+        );
+        let target = Arc::new(Schema::new(vec![target_field.clone()]));
+
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+
+        assert_eq!(out.schema().field(0), &target_field);
+        let list = out.column(0).as_list::<i32>();
+        assert_eq!(list.value_offsets(), &[0, 2, 2]);
+        let values = list.values().as_struct().column(1).as_binary::<i64>();
+        let decode =
+            |i| DecimalArbValue::from_canonical_bytes_at_scale(values.value(i), 0).unwrap();
+        assert_eq!(decode(0), DecimalArbValue::from_str("123").unwrap());
+        assert_eq!(
+            decode(1),
+            DecimalArbValue::from_str(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn normalize_reorders_struct_fields_to_the_target_order() {
+        use arrow::array::{AsArray, Int32Array, ListArray, StringArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // ClickHouse `Array(Tuple(b String, a Int32))`; Kafka declares `a` first.
+        let ch_struct = StructArray::try_new(
+            vec![
+                Field::new("b", DataType::Utf8, true),
+                Field::new("a", DataType::Int32, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec!["x", "y"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+            None,
+        )
+        .unwrap();
+        let target_item = Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let ch_list = ListArray::try_new(
+            Arc::new(Field::new("item", ch_struct.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(ch_struct),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "rows",
+                ch_list.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(ch_list)],
+        )
+        .unwrap();
+        let target_field = Field::new("rows", DataType::List(Arc::new(target_item)), true);
+        let target = Arc::new(Schema::new(vec![target_field.clone()]));
+
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+
+        assert_eq!(out.schema().field(0), &target_field);
+        let rows = out.column(0).as_list::<i32>().values().as_struct().clone();
+        assert_eq!(
+            rows.column(0)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[1, 2]
+        );
+        assert_eq!(rows.column(1).as_string::<i32>().value(1), "y");
+    }
+
+    #[test]
+    fn normalize_errors_when_a_target_struct_field_is_missing() {
+        use arrow::array::{Int32Array, StructArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ch_struct = StructArray::try_new(
+            vec![Field::new("a", DataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                ch_struct.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(ch_struct)],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("b", DataType::Int32, true)].into()),
+            true,
+        )]));
+
+        let err = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap_err();
+        assert!(err.to_string().contains("struct field 'b'"), "{err}");
     }
 }
 
