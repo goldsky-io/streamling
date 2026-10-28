@@ -282,7 +282,9 @@ async fn heavy_sql_compute_is_busy_not_starved() {
     let s = m.snapshot().await;
 
     s.assert_busiest("m_sql");
-    assert!(s.busy("m_sql") >= 1_000, "{s:?}");
+    // Compute time depends on the machine; the relative checks below carry
+    // the claim, this only proves the compute was measured.
+    assert!(s.busy("m_sql") >= 200, "{s:?}");
     // `m_sql` waits only while `m_src` has nothing for it. Compute leaking
     // into `starved` would push it a whole `busy` past the source's time.
     assert!(
