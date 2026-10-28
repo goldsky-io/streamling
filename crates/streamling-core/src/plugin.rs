@@ -213,6 +213,7 @@ impl PluginAsyncRuntime for PluginTokioWrapper {
 /// Loads every plugin library under `plugin.path` and registers them in a
 /// deterministic order: libraries providing `plugin.preprocessor_ids` first,
 /// in that configured order, then the remaining libraries by file name.
+/// Fails when two libraries provide the same plugin id.
 pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
     let Some(ref path) = app_config.plugin.path else {
         info!("No plugin path specified in the configuration, skipping plugin loading.");
@@ -238,6 +239,11 @@ pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
                 .collect()
         })
         .collect();
+    let paths: Vec<&Path> = libraries
+        .iter()
+        .map(|library| library.path.as_path())
+        .collect();
+    ensure_unique_plugin_ids(&paths, &provided_ids)?;
     let order = registration_order(&provided_ids, &app_config.plugin.preprocessor_ids);
 
     let mut libraries: Vec<Option<InitializedPluginLibrary>> =
@@ -277,6 +283,25 @@ fn plugin_library_paths(path: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+/// The registry maps each id to one module, so a second provider would
+/// silently shadow the first.
+fn ensure_unique_plugin_ids(paths: &[&Path], provided_ids: &[Vec<String>]) -> Result<()> {
+    let mut providers: HashMap<&str, usize> = HashMap::new();
+    for (index, ids) in provided_ids.iter().enumerate() {
+        for id in ids {
+            if let Some(first) = providers.insert(id, index) {
+                streamling_user_bail!(
+                    "Plugin id '{}' is provided by both {:?} and {:?}",
+                    id,
+                    paths[first],
+                    paths[index]
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns library indices in registration order. For each configured
@@ -1154,6 +1179,33 @@ mod tests {
             .map(|path| path.file_name().expect("file name").to_owned())
             .collect();
         assert_eq!(names, vec!["liba.so", "libb.so", "libc.so"]);
+    }
+
+    #[test]
+    fn ensure_unique_plugin_ids_rejects_an_id_provided_twice() {
+        let paths = [Path::new("liba.so"), Path::new("libb.so")];
+        ensure_unique_plugin_ids(&paths, &provided(&[&["s3_sink"], &["s2_sink"]]))
+            .expect("distinct ids are accepted");
+
+        let err = ensure_unique_plugin_ids(
+            &paths,
+            &provided(&[&["s2_sink", "s3_sink"], &["pubsub", "s2_sink"]]),
+        )
+        .expect_err("a shared id must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("'s2_sink'")
+                && message.contains("liba.so")
+                && message.contains("libb.so"),
+            "got {message}"
+        );
+    }
+
+    #[test]
+    fn ensure_unique_plugin_ids_rejects_a_library_providing_an_id_twice() {
+        let paths = [Path::new("liba.so")];
+        ensure_unique_plugin_ids(&paths, &provided(&[&["s2_sink", "s2_sink"]]))
+            .expect_err("a repeated id within one library must be rejected");
     }
 
     /// §1.2 facade: a disconnected input channel (dispatcher exited) must be

@@ -1573,7 +1573,7 @@ export STREAMLING__PLUGIN__PATH=/opt/streamling-plugins/libcommunity_plugins.so
 export STREAMLING__PLUGIN__PATH=/opt/streamling-plugins
 ```
 
-Loaded plugins are then referenced by id as the `type` of any source, transform, or sink (see [Plugin Pipeline Configuration](#plugin-pipeline-configuration)). Plugin ids may be bare (`s3_sink`) or namespaced (`basic_plugin.random_source`).
+Loaded plugins are then referenced by id as the `type` of any source, transform, or sink (see [Plugin Pipeline Configuration](#plugin-pipeline-configuration)). Plugin ids may be bare (`s3_sink`) or namespaced (`basic_plugin.random_source`). Each id must be provided by exactly one library; startup fails if two libraries provide the same id.
 
 #### Community plugins
 
