@@ -112,8 +112,13 @@ pub(crate) fn install() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         let app_config = AppConfig::load().expect("embedded config must load");
-        super::initialize_plugin_module(get_module(), &app_config, "in-process test plugins")
-            .expect("test plugins must register");
+        let library = super::initialize_plugin_module(
+            get_module(),
+            &app_config,
+            std::path::Path::new("in-process test plugins"),
+        )
+        .expect("test plugins must initialize");
+        super::register_plugin_library(library).expect("test plugins must register");
     });
 }
 
