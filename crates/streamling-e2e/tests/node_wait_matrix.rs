@@ -129,45 +129,57 @@ sinks:
     }
 
     fn prometheus(&self) -> &PrometheusResource {
-        self.ctx.prometheus.as_ref().expect("Prometheus")
+        prometheus(&self.ctx)
     }
 
-    async fn ms(&self, query: String) -> u64 {
-        self.prometheus()
-            .query_count(&format!("sum({query})"))
-            .await
-            .expect("Prometheus query failed")
-            .unwrap_or(0)
-    }
-
-    /// Final `node_wait` totals of this run, once the last export landed.
     async fn snapshot(&self) -> Snapshot {
-        // The exporter pushes every second; give the final push time to land.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let id = Some(self.ctx.test_id.as_str());
-        let mut snapshot = Snapshot::default();
-        for node in NODES {
-            snapshot.starved.push((
-                node,
-                self.ms(PrometheusResource::starved_by_id_query(node, id))
-                    .await,
-            ));
-            snapshot.busy.push((
-                node,
-                self.ms(PrometheusResource::busy_by_id_query(node, id))
-                    .await,
-            ));
-        }
-        for edge in NODES.windows(2) {
-            snapshot.blocked.push((
-                edge[0],
-                self.ms(PrometheusResource::blocked_edge_query(edge[0], edge[1], id))
-                    .await,
-            ));
-        }
-        eprintln!("node_wait snapshot: {snapshot:?}");
-        snapshot
+        snapshot(&self.ctx, &NODES).await
     }
+}
+
+fn prometheus(ctx: &TestContext) -> &PrometheusResource {
+    ctx.prometheus
+        .as_ref()
+        .expect("Prometheus must be configured")
+}
+
+async fn ms(ctx: &TestContext, query: String) -> u64 {
+    prometheus(ctx)
+        .query_count(&format!("sum({query})"))
+        .await
+        .expect("Prometheus query failed")
+        .unwrap_or(0)
+}
+
+/// Final `node_wait` totals of this run for a linear chain of `nodes`, once
+/// the last export landed.
+async fn snapshot(ctx: &TestContext, nodes: &[&'static str]) -> Snapshot {
+    // The exporter pushes every second; give the final push time to land.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let id = Some(ctx.test_id.as_str());
+    let mut snapshot = Snapshot::default();
+    for &node in nodes {
+        snapshot.starved.push((
+            node,
+            ms(ctx, PrometheusResource::starved_by_id_query(node, id)).await,
+        ));
+        snapshot.busy.push((
+            node,
+            ms(ctx, PrometheusResource::busy_by_id_query(node, id)).await,
+        ));
+    }
+    for edge in nodes.windows(2) {
+        snapshot.blocked.push((
+            edge[0],
+            ms(
+                ctx,
+                PrometheusResource::blocked_edge_query(edge[0], edge[1], id),
+            )
+            .await,
+        ));
+    }
+    eprintln!("node_wait snapshot: {snapshot:?}");
+    snapshot
 }
 
 /// Milliseconds per node (`starved`, `busy`) and per edge (`blocked`, keyed by
@@ -352,4 +364,315 @@ async fn a_hanging_sink_is_reported_while_it_hangs() {
         seen_at + Duration::from_secs(3) < run_done,
         "busy must be visible during the hang: seen at {seen_at:?}, run ended at {run_done:?}"
     );
+}
+
+// ============================================================================
+// Hybrid source: ClickHouse (bounded) then Kafka (unbounded)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct HybridRecord {
+    block: i64,
+    id: String,
+    data: String,
+    timestamp: i64,
+}
+
+const HYBRID_SCHEMA: &str = r#"{"type":"record","name":"HybridRecord","fields":[
+    {"name":"block","type":"long"},
+    {"name":"id","type":"string"},
+    {"name":"data","type":"string"},
+    {"name":"timestamp","type":"long"}
+]}"#;
+
+const HYBRID_NODES: [&str; 2] = ["h_src", "h_sink"];
+
+fn hybrid_records(range: std::ops::RangeInclusive<i64>) -> Vec<HybridRecord> {
+    range
+        .map(|i| HybridRecord {
+            block: 1_000 + i,
+            id: format!("kafka_{i}"),
+            data: format!("data_{i}"),
+            timestamp: 2_000 + i,
+        })
+        .collect()
+}
+
+/// A hybrid source with `bounded_rows` rows in ClickHouse, then Kafka.
+async fn hybrid_context(bounded_rows: i64) -> (TestContext, WebhookResource) {
+    init_tracing();
+    let ctx = TestContext::with_options(
+        TestContextOptions::new()
+            .with_prometheus()
+            .with_clickhouse(),
+    )
+    .await
+    .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+    clickhouse
+        .execute(
+            "CREATE TABLE nw_hybrid (block Int64, id String, data String, timestamp Int64, \
+             is_deleted UInt8) ENGINE = MergeTree() ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+    let rows: Vec<String> = (1..=bounded_rows)
+        .map(|i| format!("({i}, 'ch_{i}', 'ch_data_{i}', {i}, 0)"))
+        .collect();
+    clickhouse
+        .execute(&format!("INSERT INTO nw_hybrid VALUES {}", rows.join(", ")))
+        .await
+        .expect("Failed to insert ClickHouse rows");
+    clickhouse
+        .execute(
+            "CREATE TABLE nw_hybrid_offsets (topic String, partition Int32, offset UInt32) \
+             ENGINE = MergeTree() ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+    ctx.kafka
+        .register_schema(HYBRID_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    let webhook = WebhookResource::new()
+        .await
+        .expect("Failed to start webhook server");
+    (ctx, webhook)
+}
+
+fn hybrid_pipeline(ctx: &TestContext, webhook: &WebhookResource) -> String {
+    format!(
+        r#"
+sources:
+  h_src:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: nw_hybrid
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {topic}
+      table_name: nw_hybrid_offsets
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  h_sink:
+    type: webhook
+    from: h_src
+    url: {webhook_url}
+    one_row_per_request: false
+    payload_version: 0
+"#,
+        topic = ctx.kafka_topic,
+        webhook_url = webhook.webhook_url(),
+    )
+}
+
+async fn run_hybrid(ctx: &TestContext, webhook: &WebhookResource, record_limit: u64) {
+    let status = ctx
+        .run_pipeline_with_opts(
+            &hybrid_pipeline(ctx, webhook),
+            PipelineOpts::new()
+                .record_limit(record_limit)
+                .timeout(Duration::from_secs(180))
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1"),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+}
+
+/// Every `node_wait` series a hybrid's phases (`h_src_bounded_N`,
+/// `h_src_unbounded`) emitted in this run.
+async fn hybrid_phase_node_wait(ctx: &TestContext) -> u64 {
+    ms(
+        ctx,
+        format!(
+            "streamling_node_wait_milliseconds_total{{id=~\"h_src_.+\",instance=\"{}\"}}",
+            ctx.test_id
+        ),
+    )
+    .await
+}
+
+/// A hybrid source feeding a slow sink: the triad is under the hybrid's YAML
+/// name (its phases emit none), the sink is busy, and the hybrid is blocked
+/// on it.
+#[tokio::test]
+async fn hybrid_source_reports_under_its_name_and_is_blocked_by_a_slow_sink() {
+    let (ctx, webhook) = hybrid_context(20).await;
+    webhook.set_delay(Duration::from_millis(100));
+    ctx.kafka
+        .produce_avro_records(&hybrid_records(1..=20))
+        .await
+        .expect("Failed to produce records");
+
+    run_hybrid(&ctx, &webhook, 40).await;
+    let s = snapshot(&ctx, &HYBRID_NODES).await;
+
+    s.assert_busiest("h_sink");
+    assert!(s.busy("h_sink") >= 1_000, "{s:?}");
+    assert!(s.blocked("h_src") >= 500, "{s:?}");
+    assert!(
+        s.starved("h_src") + s.busy("h_src") > 0,
+        "the hybrid's own meter must be claimed by its phases: {s:?}"
+    );
+    assert_eq!(hybrid_phase_node_wait(&ctx).await, 0, "{s:?}");
+}
+
+/// A hybrid source whose unbounded phase mostly waits for Kafka: it is
+/// `starved`, and so is the sink after it.
+#[tokio::test]
+async fn hybrid_source_waiting_on_kafka_is_starved() {
+    let (ctx, webhook) = hybrid_context(3).await;
+    let produce_slowly = async {
+        for i in 1..=8 {
+            ctx.kafka
+                .produce_avro_records(&hybrid_records(i..=i))
+                .await
+                .expect("Failed to produce record");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    tokio::join!(run_hybrid(&ctx, &webhook, 11), produce_slowly);
+    let s = snapshot(&ctx, &HYBRID_NODES).await;
+
+    assert!(s.starved("h_src") >= 2_000, "{s:?}");
+    assert!(s.starved("h_src") > s.busy("h_src"), "{s:?}");
+    assert!(s.starved("h_sink") > s.busy("h_sink"), "{s:?}");
+    assert_eq!(hybrid_phase_node_wait(&ctx).await, 0, "{s:?}");
+}
+
+// ============================================================================
+// File source
+// ============================================================================
+
+const FILE_NODES: [&str; 2] = ["f_src", "f_sink"];
+
+/// Write one single-row CSV file, renamed into place so a poll never sees it
+/// half-written.
+fn write_csv(dir: &std::path::Path, id: i64) {
+    let staged = dir.join(format!("part_{id:04}.csv.tmp"));
+    std::fs::write(&staged, format!("id,name\n{id},name_{id}\n")).expect("write csv");
+    std::fs::rename(&staged, dir.join(format!("part_{id:04}.csv"))).expect("rename csv");
+}
+
+async fn file_context() -> (TestContext, WebhookResource, std::path::PathBuf) {
+    init_tracing();
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let dir = ctx.temp_dir.path().join("node_wait_files");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let webhook = WebhookResource::new()
+        .await
+        .expect("Failed to start webhook server");
+    (ctx, webhook, dir)
+}
+
+fn file_pipeline(dir: &std::path::Path, mode: &str, webhook: &WebhookResource) -> String {
+    format!(
+        r#"
+sources:
+  f_src:
+    type: file
+    path: {path}/
+    format: csv
+    primary_key: id
+    parallelism: 1
+    mode:
+{mode}
+
+transforms: {{}}
+
+sinks:
+  f_sink:
+    type: webhook
+    from: f_src
+    url: {webhook_url}
+    one_row_per_request: false
+    payload_version: 0
+"#,
+        path = dir.display(),
+        webhook_url = webhook.webhook_url(),
+    )
+}
+
+/// A bounded file source feeding a slow sink: the sink is busy and the file
+/// source is blocked on it. One partition, so batches reach the sink one after
+/// another and fill its write queue.
+#[tokio::test]
+async fn file_source_is_blocked_by_a_slow_sink() {
+    let (ctx, webhook, dir) = file_context().await;
+    webhook.set_delay(Duration::from_millis(100));
+    for id in 1..=30 {
+        write_csv(&dir, id);
+    }
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &file_pipeline(&dir, "      type: bounded", &webhook),
+            PipelineOpts::new()
+                .timeout(Duration::from_secs(180))
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1"),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "Streamling should exit successfully");
+    let s = snapshot(&ctx, &FILE_NODES).await;
+
+    s.assert_busiest("f_sink");
+    assert!(s.busy("f_sink") >= 2_000, "{s:?}");
+    assert!(s.blocked("f_src") >= 500, "{s:?}");
+}
+
+/// A continuous file source between new files: its idle polls are `starved`,
+/// and so is the sink after it.
+#[tokio::test]
+async fn continuous_file_source_idle_polls_are_starved() {
+    let (ctx, webhook, dir) = file_context().await;
+    write_csv(&dir, 1);
+
+    // Start-up takes seconds; add files only once the pipeline is running, so
+    // the polls between them are really idle.
+    let add_files_slowly = async {
+        assert!(
+            webhook.wait_for_requests(1, Duration::from_secs(60)).await,
+            "the first file must reach the sink"
+        );
+        for id in 2..=5 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            write_csv(&dir, id);
+        }
+    };
+    let run = async {
+        let status = ctx
+            .run_pipeline_with_opts(
+                &file_pipeline(
+                    &dir,
+                    "      type: continuous\n      poll_interval: 1s",
+                    &webhook,
+                ),
+                PipelineOpts::new()
+                    .record_limit(5)
+                    .timeout(Duration::from_secs(180)),
+            )
+            .await
+            .expect("Streamling execution failed");
+        assert!(status.success(), "Streamling should exit successfully");
+    };
+    tokio::join!(run, add_files_slowly);
+    let s = snapshot(&ctx, &FILE_NODES).await;
+
+    assert!(s.starved("f_src") >= 2_000, "{s:?}");
+    assert!(s.starved("f_src") > s.busy("f_src"), "{s:?}");
+    assert!(s.starved("f_sink") > s.busy("f_sink"), "{s:?}");
 }
