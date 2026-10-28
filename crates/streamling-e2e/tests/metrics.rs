@@ -525,6 +525,149 @@ sinks:
     );
 }
 
+/// Two replicas of one pipeline share a consumer group over a 4-partition
+/// topic. After the second replica joins and the group rebalances, each
+/// partition's lag must be reported by exactly one replica — the one that owns
+/// it now — and the first replica must stop reporting the partitions it lost.
+#[tokio::test]
+async fn test_kafka_lag_reported_only_by_owning_replica_after_rebalance() {
+    let ctx = match setup_with_prometheus().await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("Skipping test - could not create context: {}", e);
+            return;
+        }
+    };
+
+    let prometheus = match &ctx.prometheus {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test - Prometheus not configured");
+            return;
+        }
+    };
+
+    let kafka = ctx
+        .create_kafka_topic_with_partitions("lag_rebalance", 4)
+        .await
+        .expect("Failed to create topic");
+    kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    let records: Vec<TestRecord> = (1..=40)
+        .map(|i| TestRecord {
+            id: i,
+            data: format!("data_{}", i),
+            timestamp: 1000 + i,
+        })
+        .collect();
+    kafka
+        .produce_avro_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline_yaml = |replica: &str| {
+        format!(
+            r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {}
+    primary_key: id
+    telemetry:
+      labels:
+        replica: {}
+
+transforms: {{}}
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: kafka_source
+"#,
+            kafka.topic, replica
+        )
+    };
+    let opts = || {
+        // An upper bound only: the test drops both runs once it has observed them.
+        PipelineOpts::new()
+            .timeout(std::time::Duration::from_secs(300))
+            .env("STREAMLING__KAFKA_SOURCE__LAG_REPORT_INTERVAL_MS", "1000")
+    };
+
+    let instance = &ctx.test_id;
+    // Series that received a sample in the last 5s: Prometheus keeps
+    // returning a series that stopped being pushed for its 5m lookback.
+    let fresh = |selector: &str| {
+        format!(
+            "(timestamp(streamling_kafka_consumer_messages_lag{{instance=\"{instance}\"{selector}}}) > time() - 5)"
+        )
+    };
+    let count = |query: String| async move {
+        prometheus
+            .query_count(&query)
+            .await
+            .expect("Failed to query lag metric")
+    };
+    // (partitions reported by a, by b, partitions reported at all, max
+    // replicas reporting one partition)
+    let observe = || async {
+        (
+            count(format!("count({})", fresh(r#",replica="a""#))).await,
+            count(format!("count({})", fresh(r#",replica="b""#))).await,
+            count(format!("count(count by (partition) ({}))", fresh(""))).await,
+            count(format!("max(count by (partition) ({}))", fresh(""))).await,
+        )
+    };
+    // Polls `observe` until `done` holds; returns the last observation.
+    let wait_for = |done: fn(&Observation) -> bool| async move {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let observation = observe().await;
+            if done(&observation) || tokio::time::Instant::now() > deadline {
+                return observation;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    };
+    type Observation = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
+
+    let (yaml_a, yaml_b) = (pipeline_yaml("a"), pipeline_yaml("b"));
+    // Dropping a run future kills its process.
+    let replica_a = ctx.run_pipeline_with_opts(&yaml_a, opts());
+    tokio::pin!(replica_a);
+
+    let alone = tokio::select! {
+        exit = &mut replica_a => panic!("replica a exited early: {exit:?}"),
+        observation = wait_for(|o| o.0 == Some(4)) => observation,
+    };
+    assert_eq!(alone.0, Some(4), "replica a alone owns every partition");
+
+    let replica_b = ctx.run_pipeline_with_opts(&yaml_b, opts());
+    tokio::pin!(replica_b);
+    let rebalanced = tokio::select! {
+        exit = &mut replica_a => panic!("replica a exited early: {exit:?}"),
+        exit = &mut replica_b => panic!("replica b exited early: {exit:?}"),
+        // Rebalances settle over several ticks; wait for the end state and
+        // let the asserts below report the last observation if it never comes.
+        observation = wait_for(|o| *o == (Some(2), Some(2), Some(4), Some(1))) => observation,
+    };
+
+    let (a_partitions, b_partitions, partitions, reporters_per_partition) = rebalanced;
+    assert_eq!(partitions, Some(4), "every partition reports lag");
+    assert_eq!(
+        reporters_per_partition,
+        Some(1),
+        "each partition's lag is reported by one replica only"
+    );
+    assert_eq!(
+        (a_partitions, b_partitions),
+        (Some(2), Some(2)),
+        "each replica reports only the partitions it owns after the rebalance"
+    );
+}
+
 // =====================================================================
 // Event-time freshness metrics (Unit 5)
 // =====================================================================

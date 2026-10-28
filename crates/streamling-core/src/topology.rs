@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 
 use crate::error::ResultExt;
 use config::Config;
@@ -235,6 +236,9 @@ pub struct PluginSource {
     pub r#type: String,
     pub options: Option<HashMap<String, serde_yaml::Value>>,
     pub primary_key: Option<String>,
+    /// Number of partition instances, for plugins that support partitioned
+    /// execution. Defaults to the plugin's preferred count, or 1.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -242,7 +246,8 @@ impl PluginSource {
     /// Must list exactly this struct's fields (see `merge_plugin_options`).
     /// Anything listed here is invisible to the plugin as an option;
     /// anything missing leaks a typed field into the plugin's options map.
-    const TYPED_FIELDS: &'static [&'static str] = &["type", "primary_key", "telemetry"];
+    const TYPED_FIELDS: &'static [&'static str] =
+        &["type", "primary_key", "parallelism", "telemetry"];
 }
 
 /// Source that reads files from `path` in the given `format`. `path` may be a
@@ -502,7 +507,8 @@ impl Source {
         match self {
             Source::kafka(s) => s.parallelism,
             Source::file(s) => s.parallelism,
-            Source::clickhouse(_) | Source::hybrid(_) | Source::plugin(_) => None,
+            Source::plugin(s) => s.parallelism,
+            Source::clickhouse(_) | Source::hybrid(_) => None,
         }
     }
 }
@@ -533,6 +539,11 @@ pub struct DynamicTableTransform {
     /// stay visible immediately (see `append`).
     #[serde(default)]
     pub cache_refresh_debounce_ms: Option<u64>,
+    /// Size of this table's Postgres connection pool. When omitted, falls back
+    /// to the global `dynamic_table_backend.postgres.max_connections` config,
+    /// then to 20. Each Postgres dynamic table opens its own pool.
+    #[serde(default)]
+    pub max_connections: Option<NonZeroU32>,
     pub telemetry: Option<Telemetry>,
 }
 
@@ -594,6 +605,9 @@ pub struct PluginTransform {
     pub from: String,
     pub options: Option<HashMap<String, serde_yaml::Value>>,
     pub primary_key: Option<String>,
+    /// Number of partition instances, for plugins that support partitioned
+    /// execution. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -605,6 +619,7 @@ impl PluginTransform {
         "type",
         "from",
         "primary_key",
+        "parallelism",
         "telemetry",
         "batch_size",
         "batch_flush_interval",
@@ -638,13 +653,14 @@ impl Transform {
 
     /// Requested output width for this transform.
     ///
-    /// `plugin` and `dynamic_table` are `SinglePartition` operators.
+    /// `dynamic_table` is a `SinglePartition` operator.
     pub fn parallelism(&self) -> Option<usize> {
         match self {
             Transform::sql(t) => t.parallelism,
             Transform::handler(t) => t.parallelism,
             Transform::script(t) => t.parallelism,
-            Transform::dynamic_table(_) | Transform::plugin(_) => None,
+            Transform::plugin(t) => t.parallelism,
+            Transform::dynamic_table(_) => None,
         }
     }
 }
@@ -876,6 +892,9 @@ pub struct PluginSink {
     pub r#type: String,
     pub options: Option<HashMap<String, serde_yaml::Value>>,
     pub primary_key: Option<String>,
+    /// Number of partition instances (concurrent write streams), for plugins
+    /// that support partitioned execution. Defaults to the input's width.
+    pub parallelism: Option<usize>,
     pub telemetry: Option<Telemetry>,
     pub batch_size: Option<u32>,
     pub batch_flush_interval: Option<String>,
@@ -887,6 +906,7 @@ impl PluginSink {
         "type",
         "from",
         "primary_key",
+        "parallelism",
         "telemetry",
         "batch_size",
         "batch_flush_interval",
@@ -937,7 +957,7 @@ impl Sink {
             Sink::blackhole(s) => s.parallelism,
             Sink::memory(s) => s.parallelism,
             Sink::webhook(s) => s.parallelism,
-            Sink::plugin(_) => None,
+            Sink::plugin(s) => s.parallelism,
         }
     }
 }
@@ -992,11 +1012,13 @@ pub(crate) const MAX_LABEL_VALUE_LEN: usize = 256;
 /// would find zero series with no diagnostic. Hybrid reserves both
 /// `table` and `topic` because its bounded phase emits `table` and its
 /// unbounded phase emits `topic`, and parent labels propagate to both.
+/// Kafka consumption (including hybrid's unbounded phase) also reserves
+/// `partition`, which tags each point of the consumer lag gauge.
 fn source_per_type_reserved_keys(source: &Source) -> &'static [&'static str] {
     match source {
-        Source::kafka(_) => &["topic"],
+        Source::kafka(_) => &["topic", "partition"],
         Source::clickhouse(_) => &["table"],
-        Source::hybrid(_) => &["table", "topic"],
+        Source::hybrid(_) => &["table", "topic", "partition"],
         Source::file(_) => &["path"],
         Source::plugin(_) => &["type"],
     }
@@ -1290,6 +1312,37 @@ sinks: {}
     }
 
     #[test]
+    fn dynamic_table_max_connections_parses_and_rejects_zero() {
+        let topology_with = |max_connections: &str| {
+            PipelineTopology::load_from_string(&format!(
+                r#"
+sources:
+  src: {{ type: kafka, topic: t, primary_key: id }}
+transforms:
+  dt:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: tbl
+    {max_connections}
+sinks: {{}}
+"#
+            ))
+        };
+        let max_connections = |topology: PipelineTopology| match topology.transforms.get("dt") {
+            Some(Transform::dynamic_table(dt)) => dt.max_connections.map(NonZeroU32::get),
+            _ => panic!("expected dynamic_table transform"),
+        };
+
+        assert_eq!(max_connections(topology_with("").unwrap()), None);
+        assert_eq!(
+            max_connections(topology_with("max_connections: 5").unwrap()),
+            Some(5)
+        );
+        // A zero-sized pool can never hand out a connection.
+        assert!(topology_with("max_connections: 0").is_err());
+    }
+
+    #[test]
     fn script_transform_parses_batch_flush_interval() {
         let yaml = r#"
 primary_key: id
@@ -1504,6 +1557,56 @@ sinks:
         } else {
             panic!("Expected plugin sink");
         }
+    }
+
+    // `parallelism` is a host-level knob on every plugin node: it binds to the
+    // typed field, and like every typed field it never reaches the plugin as
+    // an option, even when misplaced under `options:`.
+    #[test]
+    fn test_plugin_parallelism_is_typed_on_every_node_kind() {
+        let yaml = r#"
+sources:
+  src:
+    type: test_source_plugin
+    parallelism: 3
+    options:
+      start_block: "100"
+transforms:
+  xform:
+    type: test_transform_plugin
+    from: src
+    parallelism: 2
+sinks:
+  out:
+    type: test_sink_plugin
+    from: xform
+    options:
+      parallelism: 4
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+
+        let source = topology.sources.get("src").unwrap();
+        assert_eq!(source.parallelism(), Some(3));
+        let transform = topology.transforms.get("xform").unwrap();
+        assert_eq!(transform.parallelism(), Some(2));
+        let sink = topology.sinks.get("out").unwrap();
+        assert_eq!(sink.parallelism(), None);
+
+        let Source::plugin(source) = source else {
+            panic!("Expected plugin source")
+        };
+        assert!(!source.options.as_ref().unwrap().contains_key("parallelism"));
+        let Transform::plugin(transform) = transform else {
+            panic!("Expected plugin transform")
+        };
+        assert!(transform.options.is_none());
+        let Sink::plugin(sink) = sink else {
+            panic!("Expected plugin sink")
+        };
+        assert!(
+            sink.options.is_none(),
+            "a misplaced parallelism must not reach the plugin"
+        );
     }
 
     // PluginSource has NO typed batch fields, so `batch_size` /
@@ -2917,6 +3020,51 @@ sources:
     telemetry:
       labels:
         table: override
+transforms: {}
+sinks: {}
+"#;
+        let err = PipelineTopology::load_from_string(yaml).expect_err("should reject");
+        assert!(err.to_string().contains("reserved for this source kind"));
+    }
+
+    #[test]
+    fn test_labels_partition_rejected_on_kafka_source() {
+        // The Kafka lag gauge tags each point with the real `partition`.
+        let yaml = r#"
+sources:
+  s1:
+    type: kafka
+    topic: real_topic
+    telemetry:
+      labels:
+        partition: override
+transforms: {}
+sinks: {}
+"#;
+        let err = PipelineTopology::load_from_string(yaml).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved for this source kind"),
+            "message: {msg}"
+        );
+        assert!(msg.contains("'partition'"), "message: {msg}");
+    }
+
+    #[test]
+    fn test_labels_partition_rejected_on_hybrid_source() {
+        let yaml = r#"
+sources:
+  s1:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: blocks_historic
+    unbounded_source:
+      source_type: kafka
+      topic: blocks_live
+    telemetry:
+      labels:
+        partition: override
 transforms: {}
 sinks: {}
 "#;

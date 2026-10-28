@@ -23,6 +23,7 @@
 use crate::checkpoints::checkpoint_management::{
     register_sink_streams, send_checkpoint_ack, sink_stream_done,
 };
+use crate::operators::LastMarker;
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -81,12 +82,56 @@ fn prefetch(mut input: SendableRecordBatchStream, capacity: usize) -> SendableRe
     builder.build()
 }
 
+/// The sink(s) a [`ParallelSinkExec`] writes its input partitions through.
+#[derive(Clone)]
+pub enum ParallelSinks {
+    /// One sink serves every write stream. Each `write_all` call builds its
+    /// own per-stream state (a producer, a batch processor, a request) or
+    /// draws from a shared pool, so any call can serve any partition.
+    Shared(Arc<dyn DataSink>),
+    /// Write stream `i` goes to sink `i`, which holds that stream's state (a
+    /// partitioned plugin sink's instance). `DataSink::write_all` has no
+    /// partition argument, so the binding has to be made here: letting each
+    /// call claim the next free sink would follow task scheduling, and the
+    /// partition-to-sink mapping — and the per-stream state behind it —
+    /// would change from run to run.
+    PerPartition(Vec<Arc<dyn DataSink>>),
+}
+
+impl<T: DataSink + 'static> From<Arc<T>> for ParallelSinks {
+    fn from(sink: Arc<T>) -> Self {
+        ParallelSinks::Shared(sink)
+    }
+}
+
+impl ParallelSinks {
+    fn for_partition(&self, partition: usize) -> &Arc<dyn DataSink> {
+        match self {
+            ParallelSinks::Shared(sink) => sink,
+            ParallelSinks::PerPartition(sinks) => &sinks[partition],
+        }
+    }
+
+    /// Fails when per-partition sinks do not match the input's width.
+    fn check_width(&self, input_partitions: usize) -> Result<()> {
+        match self {
+            ParallelSinks::PerPartition(sinks) if sinks.len() != input_partitions => {
+                internal_err!(
+                    "ParallelSinkExec has {} per-partition sinks but an input {input_partitions} partitions wide",
+                    sinks.len()
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Executes all input partitions and writes each through `sink.write_all`
 /// concurrently, returning a single-row batch with the total written count
 /// (the same output contract as `DataSinkExec`).
 pub struct ParallelSinkExec {
     input: Arc<dyn ExecutionPlan>,
-    sink: Arc<dyn DataSink>,
+    sinks: ParallelSinks,
     /// The sink's reference name. Must match the `sink_id` the sink itself acks
     /// with (`get_reference_name_from_metric_key(metric_metadata_id)`), or the
     /// ack gate registered here will not be found and the sink acks on the first
@@ -97,12 +142,16 @@ pub struct ParallelSinkExec {
 }
 
 impl ParallelSinkExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, sink: Arc<dyn DataSink>, sink_id: String) -> Self {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        sinks: impl Into<ParallelSinks>,
+        sink_id: String,
+    ) -> Self {
         let count_schema = make_count_schema();
         let cache = Self::compute_properties(&input, count_schema.clone());
         Self {
             input,
-            sink,
+            sinks: sinks.into(),
             sink_id,
             count_schema,
             cache: Arc::new(cache),
@@ -114,9 +163,14 @@ impl ParallelSinkExec {
         &self.input
     }
 
-    /// The wrapped sink.
-    pub fn sink(&self) -> &dyn DataSink {
-        self.sink.as_ref()
+    /// The sink that writes input partition `partition`.
+    pub fn sink_for(&self, partition: usize) -> &dyn DataSink {
+        self.sinks.for_partition(partition).as_ref()
+    }
+
+    /// Fails unless this sink can write an input `partitions` streams wide.
+    pub fn check_sink_width(&self, partitions: usize) -> Result<()> {
+        self.sinks.check_width(partitions)
     }
 
     fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
@@ -155,9 +209,9 @@ impl DisplayAs for ParallelSinkExec {
                     "ParallelSinkExec: partitions={}, sink=",
                     self.input.output_partitioning().partition_count()
                 )?;
-                self.sink.fmt_as(t, f)
+                self.sink_for(0).fmt_as(t, f)
             }
-            DisplayFormatType::TreeRender => self.sink.fmt_as(t, f),
+            DisplayFormatType::TreeRender => self.sink_for(0).fmt_as(t, f),
         }
     }
 }
@@ -185,9 +239,11 @@ impl ExecutionPlan for ParallelSinkExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.sinks
+            .check_width(children[0].output_partitioning().partition_count())?;
         Ok(Arc::new(ParallelSinkExec::new(
             Arc::clone(&children[0]),
-            Arc::clone(&self.sink),
+            self.sinks.clone(),
             self.sink_id.clone(),
         )))
     }
@@ -204,19 +260,20 @@ impl ExecutionPlan for ParallelSinkExec {
         }
 
         let input_partitions = self.input.output_partitioning().partition_count();
-        let streams: Vec<SendableRecordBatchStream> = (0..input_partitions)
+        self.sinks.check_width(input_partitions)?;
+        let streams: Vec<(Arc<dyn DataSink>, SendableRecordBatchStream)> = (0..input_partitions)
             .map(|input_partition| {
+                let sink = Arc::clone(self.sinks.for_partition(input_partition));
                 let data = execute_input_stream(
                     Arc::clone(&self.input),
-                    Arc::clone(self.sink.schema()),
+                    Arc::clone(sink.schema()),
                     input_partition,
                     Arc::clone(&context),
                 )?;
-                Ok(prefetch(data, WRITE_STREAM_PREFETCH))
+                Ok((sink, prefetch(data, WRITE_STREAM_PREFETCH)))
             })
             .collect::<Result<_>>()?;
 
-        let sink = Arc::clone(&self.sink);
         let count_schema = Arc::clone(&self.count_schema);
         let sink_id = self.sink_id.clone();
         register_sink_streams(&sink_id, input_partitions);
@@ -227,27 +284,31 @@ impl ExecutionPlan for ParallelSinkExec {
             // thread. `JoinSet` aborts the remaining writes when the first
             // error propagates out.
             let mut writes = JoinSet::new();
-            for data in streams {
-                let sink = Arc::clone(&sink);
+            for (sink, data) in streams {
                 let context = Arc::clone(&context);
+                let last_marker = LastMarker::default();
+                let data = last_marker.track(data);
                 // Sanctioned: structured concurrency — every task is joined
                 // via `join_next` below before this stream completes, and the
                 // JoinSet's abort-on-drop is the intended first-error
                 // behavior (cancel the sibling writes when one fails).
                 #[allow(clippy::disallowed_methods)]
-                writes.spawn(async move { sink.write_all(data, &context).await });
+                writes.spawn(async move { (sink.write_all(data, &context).await, last_marker) });
             }
             let mut total_count: u64 = 0;
-            while let Some(write_result) = writes.join_next().await {
+            while let Some(joined) = writes.join_next().await {
+                // Only a successful write releases its stream's share of the ack
+                // gate, so the `?`s come first. A failed stream stays required:
+                // an epoch it didn't flush may cover rows it lost, so that epoch
+                // must never be acked, even after every other stream flushed it.
+                // Otherwise the source would commit offsets for rows that were
+                // never written.
+                let (write_result, last_marker) =
+                    joined.map_err(|e| internal_datafusion_err!("sink write task failed: {e}"))?;
+                let written = write_result?;
                 // A finished stream will never report another epoch; releasing
                 // its share here keeps a late epoch from waiting forever on it.
-                // The epochs freed by a FAILED write are deliberately not acked —
-                // acking them would let the source commit offsets for rows that
-                // never landed, hence the `?`s before the ack loop.
-                let freed_epochs = sink_stream_done(&sink_id);
-                let written = write_result
-                    .map_err(|e| internal_datafusion_err!("sink write task failed: {e}"))??;
-                for epoch in freed_epochs {
+                for epoch in sink_stream_done(&sink_id, last_marker.epoch()) {
                     send_checkpoint_ack(epoch, &sink_id);
                 }
                 total_count += written;
@@ -267,7 +328,7 @@ impl ExecutionPlan for ParallelSinkExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        self.sink.metrics()
+        self.sink_for(0).metrics()
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -451,11 +512,79 @@ mod tests {
         );
     }
 
+    /// A sink whose instance holds one stream's state must get that stream,
+    /// and only that stream, on every run.
+    #[tokio::test]
+    async fn per_partition_sinks_each_receive_only_their_stream() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch_of = |rows: i32| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from((0..rows).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+        let input: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            &[vec![batch_of(1)], vec![batch_of(2)], vec![batch_of(3)]],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        let sinks: Vec<Arc<CountingSink>> = (0..3)
+            .map(|_| {
+                Arc::new(CountingSink {
+                    schema: schema.clone(),
+                    rows_written: AtomicU64::new(0),
+                })
+            })
+            .collect();
+        let exec = ParallelSinkExec::new(
+            input,
+            ParallelSinks::PerPartition(
+                sinks
+                    .iter()
+                    .map(|s| Arc::clone(s) as Arc<dyn DataSink>)
+                    .collect(),
+            ),
+            "per_partition_sink".to_string(),
+        );
+
+        let mut stream = exec.execute(0, SessionContext::new().task_ctx()).unwrap();
+        stream.next().await.unwrap().unwrap();
+
+        let written: Vec<u64> = sinks
+            .iter()
+            .map(|s| s.rows_written.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(written, [1, 2, 3]);
+    }
+
+    #[test]
+    fn per_partition_sinks_reject_an_input_of_another_width() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let input_of_width = |width: usize| -> Arc<dyn ExecutionPlan> {
+            MemorySourceConfig::try_new_exec(&vec![vec![]; width], schema.clone(), None).unwrap()
+        };
+        let sink = || -> Arc<dyn DataSink> {
+            Arc::new(CountingSink {
+                schema: schema.clone(),
+                rows_written: AtomicU64::new(0),
+            })
+        };
+        let exec = Arc::new(ParallelSinkExec::new(
+            input_of_width(2),
+            ParallelSinks::PerPartition(vec![sink(), sink()]),
+            "per_partition_sink".to_string(),
+        ));
+
+        assert!(exec.with_new_children(vec![input_of_width(3)]).is_err());
+    }
+
     const FREED_EPOCH: CheckpointEpoch = CheckpointEpoch(7);
 
-    /// One stream flushes an epoch and stays open, the other fails: finishing the
-    /// failed stream frees that epoch from the ack gate, and acking it there
-    /// would let the source commit offsets for the rows the failed write lost.
+    /// One stream flushes an epoch and stays open, the other fails: the epoch
+    /// covers the rows the failed write lost, and acking it would let the source
+    /// commit offsets for them.
     #[derive(Debug)]
     struct OneStreamFailsSink {
         schema: SchemaRef,

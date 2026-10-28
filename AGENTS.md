@@ -147,7 +147,7 @@ Label constraints (enforced at config load):
 | Keys match `^[a-zA-Z_][a-zA-Z0-9_]*$` | Prometheus label-name grammar. |
 | Keys cannot start with `__` | Prometheus reserves that prefix for internal use. |
 | Keys cannot be `id`, `topology_node_type`, `operator_type`, `service_instance_id` | These collide with built-in metric dimensions. |
-| Keys cannot shadow a node kind's per-type tag | `topic` on Kafka, `table` on ClickHouse/Postgres, `url` on webhooks, `type` on plugins, `language` on script transforms. Hybrid sources reserve both `table` and `topic`. Overriding would silently replace the real identity on every emitted metric. |
+| Keys cannot shadow a node kind's per-type tag | `topic` and `partition` on Kafka sources (`topic` on Kafka sinks), `table` on ClickHouse/Postgres, `url` on webhooks, `type` on plugins, `language` on script transforms. Hybrid sources reserve `table`, `topic` and `partition`. Overriding would silently replace the real identity on every emitted metric. |
 | Values max 256 bytes, no control characters (except tab) | A raw newline in a value can corrupt Prometheus scrape output. |
 
 **Precedence when labels collide with plugin-declared labels:** plugin wins, and a WARN log names the colliding key and both values. Plugins are authoritative about their own identity (`chain_slug`, `topic`, etc.); YAML cannot override them, but the WARN surfaces misconfigurations rather than letting them go silent.

@@ -20,7 +20,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 #[repr(C)]
-#[derive(StableAbi, Debug)]
+#[derive(StableAbi, Debug, Clone)]
 pub struct PluginOptions(RHashMap<RString, RString>);
 
 impl PluginOptions {

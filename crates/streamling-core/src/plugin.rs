@@ -1,9 +1,12 @@
 pub mod diagnostics;
 pub mod operator;
+pub mod partitioned;
 mod preprocessor;
 pub mod side_output;
 pub mod table_provider;
 mod telemetry;
+#[cfg(test)]
+mod test_plugins;
 pub mod udf;
 
 pub use preprocessor::build_plugin_preprocessors;
@@ -27,10 +30,11 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use streamling_plugin::PluginRuntimeConfiguration;
 use streamling_plugin::r#async::{
     PluginAsyncRuntime, PluginAsyncRuntime_TO, PluginAsyncRuntimeObj,
 };
@@ -206,38 +210,94 @@ impl PluginAsyncRuntime for PluginTokioWrapper {
     }
 }
 
+/// Loads every plugin library under `plugin.path` and registers them in a
+/// deterministic order: libraries providing `plugin.preprocessor_ids` first,
+/// in that configured order, then the remaining libraries by file name.
 pub fn load_and_initialize_plugins(app_config: &AppConfig) -> Result<()> {
-    if let Some(ref path) = app_config.plugin.path {
-        if path.is_empty() {
-            return Ok(());
-        }
-
-        let plugin_path = Path::new(path);
-
-        if !plugin_path.exists() {
-            streamling_user_bail!("Plugin path '{}' does not exist", path);
-        }
-
-        if plugin_path.is_file() {
-            // If the path is a file, just load that specific plugin file
-            load_and_initialize_plugin(path, app_config)?;
-        } else if plugin_path.is_dir() {
-            // If the path is a directory, load all plugin files in the directory
-            for entry in std::fs::read_dir(plugin_path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
-                    load_and_initialize_plugin(path.to_str().unwrap(), app_config)?
-                }
-            }
-        } else {
-            streamling_user_bail!("Plugin path '{}' is neither a file nor a directory", path);
-        }
-    } else {
+    let Some(ref path) = app_config.plugin.path else {
         info!("No plugin path specified in the configuration, skipping plugin loading.");
+        return Ok(());
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    let libraries = plugin_library_paths(Path::new(path))?
+        .iter()
+        .map(|library_path| initialize_plugin_library(library_path, app_config))
+        .collect::<Result<Vec<_>>>()?;
+
+    let provided_ids: Vec<Vec<String>> = libraries
+        .iter()
+        .map(|library| {
+            library
+                .configuration
+                .plugin_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect()
+        })
+        .collect();
+    let order = registration_order(&provided_ids, &app_config.plugin.preprocessor_ids);
+
+    let mut libraries: Vec<Option<InitializedPluginLibrary>> =
+        libraries.into_iter().map(Some).collect();
+    for index in order {
+        let library = libraries[index]
+            .take()
+            .expect("registration_order yields each library index exactly once");
+        register_plugin_library(library)?;
     }
 
     Ok(())
+}
+
+/// Resolves `path` to plugin library files: the file itself, or every file
+/// in the directory sorted by path.
+fn plugin_library_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        streamling_user_bail!("Plugin path '{}' does not exist", path.display());
+    }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !path.is_dir() {
+        streamling_user_bail!(
+            "Plugin path '{}' is neither a file nor a directory",
+            path.display()
+        );
+    }
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry_path = entry?.path();
+        if entry_path.is_file() {
+            files.push(entry_path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Returns library indices in registration order. For each configured
+/// preprocessor id in sequence, the first library that provides it comes
+/// next; every other library follows in its original order.
+fn registration_order(provided_ids: &[Vec<String>], preprocessor_ids: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> = Vec::with_capacity(provided_ids.len());
+    for preprocessor_id in preprocessor_ids {
+        if let Some(index) = provided_ids
+            .iter()
+            .position(|ids| ids.contains(preprocessor_id))
+            && !order.contains(&index)
+        {
+            order.push(index);
+        }
+    }
+    let remaining: Vec<usize> = (0..provided_ids.len())
+        .filter(|index| !order.contains(index))
+        .collect();
+    order.extend(remaining);
+    order
 }
 
 /// Load the root module from a plugin library, tolerating libraries built
@@ -295,35 +355,69 @@ fn load_plugin_module(plugin_path: &Path) -> Result<PluginModuleRef> {
     }
 }
 
-pub fn load_and_initialize_plugin(path: &str, app_config: &AppConfig) -> Result<()> {
-    let plugin_path = Path::new(path);
-    info!("Loading plugin from: {:?}", plugin_path);
+/// A plugin library whose `init` has run but whose ids are not yet registered.
+struct InitializedPluginLibrary {
+    path: PathBuf,
+    module: Arc<PluginModuleRef>,
+    configuration: PluginRuntimeConfiguration,
+}
 
-    let plugin_module = Arc::new(load_plugin_module(plugin_path)?);
+fn initialize_plugin_library(
+    path: &Path,
+    app_config: &AppConfig,
+) -> Result<InitializedPluginLibrary> {
+    info!("Loading plugin from: {:?}", path);
+    initialize_plugin_module(load_plugin_module(path)?, app_config, path)
+}
 
-    let logging_config = create_logging(app_config);
-    let init_fn = plugin_module.init();
-    let init_result = init_fn(logging_config);
+/// Runs a loaded module's `init`. `path` names the module in logs.
+fn initialize_plugin_module(
+    module: PluginModuleRef,
+    app_config: &AppConfig,
+    path: &Path,
+) -> Result<InitializedPluginLibrary> {
+    let module = Arc::new(module);
 
-    let plugin_runtime_configuration = init_result
+    let init_fn = module.init();
+    let configuration = init_fn(create_logging(app_config))
         .into_rust()
         .map_err(|e| streamling_err!("Plugin initialization failed: {:?}", e))?;
 
-    let mut module_registry = PLUGIN_MODULE_REGISTRY.write().unwrap();
-    let mut caps_registry = PLUGIN_DEFAULT_CAPS.write().unwrap();
+    Ok(InitializedPluginLibrary {
+        path: path.to_path_buf(),
+        module,
+        configuration,
+    })
+}
 
-    // Register the plugin module for each plugin ID it provides
-    for plugin_id in plugin_runtime_configuration.plugin_ids.into_iter() {
-        let plugin_id_string = plugin_id.into_rust();
-        let plugin_id_key: PluginId = plugin_id_string.clone().into();
-        module_registry.insert(plugin_id_key.clone(), plugin_module.clone());
+fn register_plugin_library(library: InitializedPluginLibrary) -> Result<()> {
+    let InitializedPluginLibrary {
+        path,
+        module: plugin_module,
+        configuration: plugin_runtime_configuration,
+    } = library;
 
-        // If init provided default caps for this id, store them
-        if let Some(caps) = plugin_runtime_configuration
-            .default_channel_caps
-            .get(plugin_id_string.as_str())
-        {
-            caps_registry.insert(plugin_id_key, *caps);
+    {
+        let mut module_registry = PLUGIN_MODULE_REGISTRY
+            .write()
+            .expect("plugin module registry lock poisoned");
+        let mut caps_registry = PLUGIN_DEFAULT_CAPS
+            .write()
+            .expect("plugin default caps lock poisoned");
+
+        // Register the plugin module for each plugin ID it provides
+        for plugin_id in plugin_runtime_configuration.plugin_ids.into_iter() {
+            let plugin_id_string = plugin_id.into_rust();
+            let plugin_id_key: PluginId = plugin_id_string.clone().into();
+            module_registry.insert(plugin_id_key.clone(), plugin_module.clone());
+
+            // If init provided default caps for this id, store them
+            if let Some(caps) = plugin_runtime_configuration
+                .default_channel_caps
+                .get(plugin_id_string.as_str())
+            {
+                caps_registry.insert(plugin_id_key, *caps);
+            }
         }
     }
 
@@ -542,7 +636,9 @@ const PLUGIN_BLOCKING_SEND_BOUND: Duration = Duration::from_secs(5);
 /// abandoned with an error, so the caller's drain can wind down instead of
 /// holding a runtime worker hostage until the watchdog hard-exits. A
 /// disconnected channel (dispatcher already exited) errors immediately — the
-/// `.unwrap()`s this replaces panicked the host there.
+/// `.unwrap()`s this replaces panicked the host there. A full channel whose
+/// dispatcher exited errors too: the host holds the channel open, so it never
+/// disconnects, and nothing would ever drain it.
 ///
 /// On a multi-thread runtime each blocking slice runs under `block_in_place`
 /// so sibling tasks migrate off the worker; on a current-thread runtime
@@ -551,9 +647,10 @@ pub async fn send_to_plugin<T>(
     sender: &crossbeam_channel::RSender<T>,
     msg: T,
     plugin_id: &str,
+    exit: &InstanceExit,
 ) -> Result<()> {
     let rx = crate::shutdown::subscribe();
-    send_to_plugin_with(sender, msg, plugin_id, move || *rx.borrow(), {
+    send_to_plugin_with(sender, msg, plugin_id, exit, move || *rx.borrow(), {
         PLUGIN_SHUTDOWN_SEND_GRACE
     })
     .await
@@ -566,6 +663,7 @@ async fn send_to_plugin_with<T>(
     sender: &crossbeam_channel::RSender<T>,
     msg: T,
     plugin_id: &str,
+    exit: &InstanceExit,
     is_shutting_down: impl Fn() -> bool,
     shutdown_grace: Duration,
 ) -> Result<()> {
@@ -595,6 +693,15 @@ async fn send_to_plugin_with<T>(
                 return Err(plugin_channel_closed(plugin_id));
             }
         };
+        // Only a full channel checks for an exit: a send that fits cannot
+        // wedge, and failing it would turn a source forwarder racing its
+        // instance's clean completion into a stream error.
+        if exit.has_exited() {
+            return Err(streamling_err!(
+                "plugin '{}' dispatcher exited with its input channel full; cannot deliver message",
+                plugin_id
+            ));
+        }
         if is_shutting_down() {
             let deadline =
                 *grace_deadline.get_or_insert_with(|| std::time::Instant::now() + shutdown_grace);
@@ -637,6 +744,25 @@ pub fn send_to_plugin_blocking<T>(
     }
 }
 
+/// The stream error a host forwarder raises when a plugin instance reports,
+/// through `PluginMsg::Error`, that it failed.
+pub(crate) fn plugin_failure(
+    instance_key: &str,
+    message: &str,
+) -> datafusion::error::DataFusionError {
+    streamling_err!("plugin {} failed: {}", instance_key, message).into()
+}
+
+/// The stream error a host forwarder raises when a plugin instance's
+/// dispatcher exits (e.g. a panicking hook) without a `PluginMsg::Error`, so
+/// the forwarder would otherwise wait for output that can never arrive.
+pub(crate) fn plugin_exited(instance_key: &str) -> datafusion::error::DataFusionError {
+    plugin_failure(
+        instance_key,
+        "its dispatcher exited without reporting a failure",
+    )
+}
+
 fn plugin_channel_closed(plugin_id: &str) -> crate::error::StreamlingError {
     streamling_err!(
         "plugin '{}' input channel is closed (dispatcher exited); cannot deliver message",
@@ -655,9 +781,43 @@ fn create_logging(app_config: &AppConfig) -> PluginLogging {
 pub type ExecutionFuture =
     Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send + 'static>>;
 
+/// Resolves once a plugin instance's dispatcher has exited.
+///
+/// Observed through its execution future, which the run loop polls; an
+/// execution future that is dropped unpolled counts as exited.
+#[derive(Clone, Debug)]
+pub struct InstanceExit(tokio::sync::watch::Receiver<bool>);
+
+impl InstanceExit {
+    pub async fn exited(&mut self) {
+        // An error means the execution future was dropped: exited as well.
+        let _ = self.0.wait_for(|exited| *exited).await;
+    }
+
+    /// Whether the dispatcher has exited. Read it BEFORE draining the
+    /// instance's output channel: everything the dispatcher sent precedes its
+    /// exit, so an empty channel after an observed exit is final.
+    pub fn has_exited(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
+}
+
+/// Wraps `execution_future` so the returned [`InstanceExit`] resolves when it
+/// completes.
+pub(crate) fn track_exit(execution_future: ExecutionFuture) -> (ExecutionFuture, InstanceExit) {
+    let (exited, exit) = tokio::sync::watch::channel(false);
+    let tracked = Box::pin(async move {
+        let result = execution_future.await;
+        let _ = exited.send(true);
+        result
+    });
+    (tracked, InstanceExit(exit))
+}
+
 pub struct InitializedPlugin {
     pub plugin_id: String,
     pub execution_future: ExecutionFuture,
+    pub exit: InstanceExit,
     pub channels: PluginChannels,
     /// Expected to be defined for sources and transforms, but not for sinks.
     pub output_schema: Option<SchemaRef>,
@@ -676,12 +836,23 @@ impl InitializedPlugin {
             streamling_user_bail!("Output schema must contain the column '{}'", COLUMN_NAME_OP);
         }
 
+        let (execution_future, exit) = track_exit(execution_future);
         Ok(InitializedPlugin {
             plugin_id,
             execution_future,
+            exit,
             channels,
             output_schema,
         })
+    }
+
+    /// This plugin as the single instance of node `reference_name`.
+    pub fn instance(&self, reference_name: String) -> partitioned::PluginInstance {
+        partitioned::PluginInstance {
+            key: reference_name,
+            channels: Arc::new(self.channels.clone()),
+            exit: self.exit.clone(),
+        }
     }
 }
 
@@ -881,9 +1052,11 @@ pub fn create_preprocessor_plugin(
     let mapped_future = result
         .execution_future
         .map(|r| r.into_rust().map_err(|msg| msg.into_string()));
+    let (execution_future, exit) = track_exit(Box::pin(mapped_future));
     Ok(InitializedPlugin {
         plugin_id: plugin_type.to_string(),
-        execution_future: Box::pin(mapped_future),
+        execution_future,
+        exit,
         channels: plugin_channels,
         output_schema: None,
     })
@@ -929,13 +1102,68 @@ pub fn terminate_plugins(
 mod tests {
     use super::*;
 
+    fn provided(libraries: &[&[&str]]) -> Vec<Vec<String>> {
+        libraries
+            .iter()
+            .map(|ids| ids.iter().map(|id| id.to_string()).collect())
+            .collect()
+    }
+
+    fn configured(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn registration_order_puts_preprocessor_libraries_first_in_configured_order() {
+        let order = registration_order(
+            &provided(&[&["sink_a"], &["second_pre"], &["source_b"], &["first_pre"]]),
+            &configured(&["first_pre", "second_pre"]),
+        );
+        assert_eq!(order, vec![3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn registration_order_lists_a_library_providing_several_preprocessors_once() {
+        let order = registration_order(
+            &provided(&[&["sink_a"], &["pre_x", "pre_y"]]),
+            &configured(&["pre_x", "pre_y"]),
+        );
+        assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn registration_order_ignores_unprovided_preprocessor_ids() {
+        let order = registration_order(
+            &provided(&[&["sink_a"], &["source_b"]]),
+            &configured(&["missing_pre"]),
+        );
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[test]
+    fn plugin_library_paths_lists_directory_files_sorted() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        for name in ["libc.so", "liba.so", "libb.so"] {
+            std::fs::write(dir.path().join(name), b"").expect("write file");
+        }
+        std::fs::create_dir(dir.path().join("nested")).expect("create nested dir");
+
+        let paths = plugin_library_paths(dir.path()).expect("list plugin paths");
+        let names: Vec<_> = paths
+            .iter()
+            .map(|path| path.file_name().expect("file name").to_owned())
+            .collect();
+        assert_eq!(names, vec!["liba.so", "libb.so", "libc.so"]);
+    }
+
     /// §1.2 facade: a disconnected input channel (dispatcher exited) must be
     /// a typed error, not the panic the old `send().unwrap()` produced.
     #[tokio::test]
     async fn send_to_plugin_errors_on_disconnected_channel() {
         let (rtx, rrx) = crossbeam_channel::bounded::<u32>(1);
         drop(rrx);
-        let err = send_to_plugin_with(&rtx, 7u32, "p", || false, Duration::from_secs(1))
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
+        let err = send_to_plugin_with(&rtx, 7u32, "p", &exit, || false, Duration::from_secs(1))
             .await
             .expect_err("disconnected channel must error");
         assert!(err.to_string().contains("closed"), "got: {err}");
@@ -948,8 +1176,9 @@ mod tests {
         let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
         rtx.try_send(1).unwrap(); // fill the single slot; nothing ever drains it
 
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
         let start = std::time::Instant::now();
-        let err = send_to_plugin_with(&rtx, 2u32, "p", || true, Duration::from_millis(300))
+        let err = send_to_plugin_with(&rtx, 2u32, "p", &exit, || true, Duration::from_millis(300))
             .await
             .expect_err("wedged channel must be abandoned");
         assert!(err.to_string().contains("abandoning"), "got: {err}");
@@ -972,12 +1201,33 @@ mod tests {
             let v = rrx.recv().unwrap();
             (v, rrx)
         });
-        send_to_plugin_with(&rtx, 2u32, "p", || false, Duration::from_millis(100))
+        let (_execution, exit) = track_exit(Box::pin(std::future::pending()));
+        send_to_plugin_with(&rtx, 2u32, "p", &exit, || false, Duration::from_millis(100))
             .await
             .expect("send must succeed once a slot frees up");
         let (first, rrx) = drainer.join().unwrap();
         assert_eq!(first, 1);
         assert_eq!(rrx.recv().unwrap(), 2);
+    }
+
+    /// A transform or sink whose `is_running()` goes false returns from its
+    /// dispatcher cleanly while the host keeps the channel open, so nothing
+    /// drains it again: a full channel must fail the send, not wait forever.
+    #[tokio::test]
+    async fn send_to_plugin_errors_on_full_channel_once_dispatcher_exited() {
+        let (rtx, _rrx) = crossbeam_channel::bounded::<u32>(1);
+        rtx.try_send(1).unwrap();
+        let (execution, exit) = track_exit(Box::pin(async { Ok(()) }));
+        execution.await.unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_to_plugin_with(&rtx, 2u32, "p", &exit, || false, Duration::from_secs(1)),
+        )
+        .await
+        .expect("must not wait on a dispatcher that exited")
+        .expect_err("an exited dispatcher must fail the send");
+        assert!(err.to_string().contains("exited"), "got: {err}");
     }
 
     /// Regression: the panic hook calls
