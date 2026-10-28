@@ -29,6 +29,17 @@ const TEST_SCHEMA: &str = r#"{"type":"record","name":"TestMessage","fields":[
     {"name":"timestamp","type":"long"}
 ]}"#;
 
+/// Record with a nullable field, for tests where the Kafka schema declares a
+/// column the ClickHouse backfill table does not have.
+#[derive(Debug, Clone, Serialize)]
+struct TestRecordNullable {
+    block: i64,
+    id: String,
+    data: String,
+    timestamp: i64,
+    is_deleted: Option<bool>,
+}
+
 // ============================================================================
 // Scenario 1: Hybrid source from ClickHouse to Kafka
 // ============================================================================
@@ -1811,5 +1822,186 @@ sinks:
         Some(&None),
         "Nullable u256 must propagate NULL, got {:?}",
         by_id.get("null")
+    );
+}
+
+// ============================================================================
+// Scenario 9: Nullable Kafka field absent from the ClickHouse table
+// ============================================================================
+
+/// Nullable `is_deleted` field exists only in the Kafka (Avro) schema — the
+/// ClickHouse backfill table dropped it (mirrors arbitrum_one.native_transfers,
+/// whose Avro schema carries nitro-only `after_evm_transfers` fields the stored
+/// dataset lacks).
+const NULLABLE_FIELD_SCHEMA: &str = r#"{"type":"record","name":"TestMessageNullable","fields":[
+    {"name":"block","type":"long"},
+    {"name":"id","type":"string"},
+    {"name":"data","type":"string"},
+    {"name":"timestamp","type":"long"},
+    {"name":"is_deleted","type":["null","boolean"],"default":null}
+]}"#;
+
+/// Bounded-phase records must null-fill the absent nullable column instead of
+/// failing startup with "column not found in ClickHouse table"; unbounded
+/// Kafka records must pass the field through untouched.
+#[tokio::test]
+async fn test_hybrid_clickhouse_null_fills_absent_nullable_kafka_field() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    // No is_deleted column: the stored dataset predates the Kafka schema field.
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_nullable_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    clickhouse
+        .execute(
+            "INSERT INTO hybrid_nullable_test VALUES
+            (1, 'Alice', 'A', 0),
+            (2, 'Bob', 'B', 0),
+            (3, 'Charlie', 'C', 0)",
+        )
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    ctx.kafka
+        .register_schema(NULLABLE_FIELD_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let kafka_records: Vec<TestRecordNullable> = vec![
+        TestRecordNullable {
+            block: 101,
+            id: "kafka_deleted_1".to_string(),
+            data: "kafka_data_1".to_string(),
+            timestamp: 2001,
+            is_deleted: Some(true),
+        },
+        TestRecordNullable {
+            block: 102,
+            id: "kafka_deleted_2".to_string(),
+            data: "kafka_data_2".to_string(),
+            timestamp: 2002,
+            is_deleted: Some(false),
+        },
+        TestRecordNullable {
+            block: 103,
+            id: "kafka_deleted_3".to_string(),
+            data: "kafka_data_3".to_string(),
+            timestamp: 2003,
+            is_deleted: None,
+        },
+    ];
+
+    ctx.kafka
+        .produce_avro_records(&kafka_records)
+        .await
+        .expect("Failed to produce Kafka records");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_nullable (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_nullable_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_nullable
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: hybrid_nullable_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(6) // 3 from ClickHouse + 3 from Kafka
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(
+        status.success(),
+        "Pipeline must not fail when a nullable Kafka field is absent from the ClickHouse table"
+    );
+
+    let rows: Vec<(String, Option<bool>)> = ctx
+        .postgres
+        .query("SELECT id, is_deleted FROM public.hybrid_nullable_results ORDER BY id")
+        .await
+        .expect("Failed to query postgres");
+
+    let by_id: std::collections::HashMap<String, Option<bool>> = rows.into_iter().collect();
+
+    // Bounded (ClickHouse) records: the absent nullable column arrives as NULL.
+    for id in ["Alice", "Bob", "Charlie"] {
+        assert_eq!(
+            by_id.get(id),
+            Some(&None),
+            "ClickHouse record '{id}' must null-fill the absent is_deleted column"
+        );
+    }
+
+    // Unbounded (Kafka) records: the field passes through untouched.
+    assert_eq!(
+        by_id.get("kafka_deleted_1"),
+        Some(&Some(true)),
+        "Kafka is_deleted=true must survive the pipeline"
+    );
+    assert_eq!(
+        by_id.get("kafka_deleted_2"),
+        Some(&Some(false)),
+        "Kafka is_deleted=false must survive the pipeline"
+    );
+    assert_eq!(
+        by_id.get("kafka_deleted_3"),
+        Some(&None),
+        "Kafka is_deleted=null must survive the pipeline"
     );
 }
