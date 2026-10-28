@@ -3062,10 +3062,12 @@ impl ClickHouseClient {
     /// `decimal_arb` value and adopt the target field on that column only.
     /// The same applies to leaves nested under lists and structs, for example
     /// a `List<Struct<value decimal_arb>>` read from `Array(Tuple(value String))`.
+    /// Struct fields are also reordered to the target's order, because Kafka
+    /// and ClickHouse can declare them in different orders.
     ///
-    /// Columns without a wide-int target match pass through unchanged, keeping
-    /// their original Field — the hybrid layer deliberately tolerates List
-    /// inner-field-name differences (`item` vs `element`), which forcing
+    /// Columns that need no conversion or reordering pass through unchanged,
+    /// keeping their original Field. The hybrid layer deliberately tolerates
+    /// List inner-field-name differences (`item` vs `element`), which forcing
     /// `target_schema` onto every column would reject at `RecordBatch::try_new`.
     pub(crate) fn normalize_batch_from_clickhouse(
         batch: &RecordBatch,
@@ -6536,9 +6538,10 @@ pub fn clickhouse_decimal_to_decimal_arb(
 /// `decimal_arb` or retired wide-int leaf `target` declares, at any depth
 /// under lists and structs, holds the target's encoding. A `decimal_arb` leaf
 /// arrives as native `UInt256`/`Int256` (hinted targets), `Decimal(p, s)` or
-/// decimal text. Containers on a converted path adopt the target's field, so
-/// the item vs element naming and widened nullability match the target.
-/// `None` when nothing below `target` needs converting.
+/// decimal text. Struct fields are reordered to the target's order, matched by
+/// name. Containers on a changed path adopt the target's field, so the item vs
+/// element naming and widened nullability match the target.
+/// `None` when nothing below `target` needs converting or reordering.
 fn clickhouse_column_to_target(
     column: &ArrayRef,
     source: &arrow::datatypes::Field,
@@ -6604,14 +6607,21 @@ fn clickhouse_column_to_target(
         (DataType::Struct(s_fields), DataType::Struct(t_fields)) => {
             let st = column.as_struct();
             let mut changed = false;
-            let mut fields = Vec::with_capacity(s_fields.len());
-            let mut columns = Vec::with_capacity(s_fields.len());
-            for (s, col) in s_fields.iter().zip(st.columns()) {
-                let converted = match t_fields.find(s.name()) {
-                    Some((_, t)) => clickhouse_column_to_target(col, s, t)?,
-                    None => None,
-                };
-                let (col, field) = match converted {
+            let mut fields = Vec::with_capacity(t_fields.len());
+            let mut columns = Vec::with_capacity(t_fields.len());
+            for (i, t) in t_fields.iter().enumerate() {
+                // The hybrid validator rejects this at startup; fail loud if
+                // an unvalidated batch gets here.
+                let (j, s) = s_fields.find(t.name()).ok_or_else(|| {
+                    streamling_err!(
+                        "struct field '{}' of column '{}' is missing from the ClickHouse batch",
+                        t.name(),
+                        target.name()
+                    )
+                })?;
+                let col = st.column(j);
+                changed |= i != j;
+                let (col, field) = match clickhouse_column_to_target(col, s, t)? {
                     Some(c) => {
                         changed = true;
                         c
@@ -7400,6 +7410,99 @@ mod feature_002_byte_conversion_tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn normalize_reorders_struct_fields_to_the_target_order() {
+        use arrow::array::{AsArray, Int32Array, ListArray, StringArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // ClickHouse `Array(Tuple(b String, a Int32))`; Kafka declares `a` first.
+        let ch_struct = StructArray::try_new(
+            vec![
+                Field::new("b", DataType::Utf8, true),
+                Field::new("a", DataType::Int32, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec!["x", "y"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+            None,
+        )
+        .unwrap();
+        let target_item = Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let ch_list = ListArray::try_new(
+            Arc::new(Field::new("item", ch_struct.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(ch_struct),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "rows",
+                ch_list.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(ch_list)],
+        )
+        .unwrap();
+        let target_field = Field::new("rows", DataType::List(Arc::new(target_item)), true);
+        let target = Arc::new(Schema::new(vec![target_field.clone()]));
+
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+
+        assert_eq!(out.schema().field(0), &target_field);
+        let rows = out.column(0).as_list::<i32>().values().as_struct().clone();
+        assert_eq!(
+            rows.column(0)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[1, 2]
+        );
+        assert_eq!(rows.column(1).as_string::<i32>().value(1), "y");
+    }
+
+    #[test]
+    fn normalize_errors_when_a_target_struct_field_is_missing() {
+        use arrow::array::{Int32Array, StructArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ch_struct = StructArray::try_new(
+            vec![Field::new("a", DataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                ch_struct.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(ch_struct)],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("b", DataType::Int32, true)].into()),
+            true,
+        )]));
+
+        let err = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap_err();
+        assert!(err.to_string().contains("struct field 'b'"), "{err}");
     }
 }
 

@@ -579,6 +579,8 @@ impl HybridTableProvider {
                 bounded_size == unbounded_size
                     && Self::is_compatible_field(bounded_field, unbounded_field)
             }
+            // Fields match by name: Kafka and ClickHouse can order struct
+            // fields differently, and the bounded read reorders them.
             (DataType::Struct(bounded_fields), DataType::Struct(unbounded_fields)) => {
                 bounded_fields.len() == unbounded_fields.len()
                     && unbounded_fields.iter().all(|unbounded_field| {
@@ -1290,11 +1292,10 @@ impl ExecutionPlan for HybridSourceExec {
                                 // align each batch to the declared (projected)
                                 // schema by name before anything downstream sees it.
                                 let batch = align_batch_to_schema(&batch, &schema_clone)?;
-                                // Bounded sources (ClickHouse) emit u256/i256 columns as
-                                // FixedSizeBinary(32) without extension metadata and in
-                                // little-endian. Reverse the bytes and adopt the target
-                                // schema's metadata so downstream arithmetic UDFs (which
-                                // assume big-endian + metadata) see correct values.
+                                // Bounded sources (ClickHouse) emit decimal_arb values as
+                                // native ints, Decimal or text, and may order struct fields
+                                // differently. Convert those leaves, at any depth, and
+                                // reorder struct fields to the target schema.
                                 // No-op for sources that already match (e.g. Kafka/Avro).
                                 ClickHouseClient::normalize_batch_from_clickhouse(
                                     &batch,
@@ -2154,6 +2155,28 @@ mod tests {
         )));
         assert!(HybridTableProvider::is_compatible_data_type(
             &bounded, &unbounded
+        ));
+    }
+
+    #[test]
+    fn struct_with_reordered_fields_is_compatible() {
+        // Kafka and ClickHouse can declare struct fields in different orders;
+        // the bounded read reorders them to the unbounded schema.
+        let strukt = |names: [&str; 2]| {
+            DataType::Struct(
+                names
+                    .iter()
+                    .map(|n| Field::new(*n, DataType::Utf8, true))
+                    .collect(),
+            )
+        };
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &strukt(["b", "a"]),
+            &strukt(["a", "b"])
+        ));
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &strukt(["a", "c"]),
+            &strukt(["a", "b"])
         ));
     }
 
