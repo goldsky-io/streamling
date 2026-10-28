@@ -5,6 +5,7 @@ pub mod provider;
 pub mod recorder;
 pub mod task_wait;
 pub mod types;
+pub mod wake_timed;
 
 pub use accumulator::MillisAccumulator;
 pub use event_time_reader::{EventTimeReadError, EventTimeReader};

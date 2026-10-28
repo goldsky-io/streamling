@@ -66,8 +66,8 @@ spreads one partition's compute across others.
 
 `WrappingDataSink` records `state="starved"` for the time the sink waits on
 its input stream, and `state="busy"` for the time the connector holds a
-delivered batch before it asks for the next one. A sink that prefetches moves
-that wait like any consumer (see below).
+delivered batch before it asks for the next one. For a sink that prefetches,
+`busy` starts when its input wakes, not when it polls again (see below).
 
 The blocked series is attributed to the edge:
 
@@ -126,24 +126,25 @@ continues to propagate through the rebatcher.
 
 Batching alone is not the same as prefetch.
 
-### Prefetch can absorb a yield-to-resume signal
+### Prefetch: an input wait ends at the input's wake
 
-A consumer such as `ready_chunks(N)` may repeatedly poll all currently-ready
-input before doing slow work. If the input returns `Pending` before the window
-fills, the producer has already been resumed after its last yield, so that
-yield-to-resume gap is short. Slow work then happens while the producer is
-parked awaiting its own input, which appears as `starved`, or while an upstream
-edge is blocked.
+A consumer such as `ready_chunks(N)` polls all currently-ready input, gets
+`Pending`, and then does slow work before it polls again. The node's input
+poll stays `Pending` through that work. `WakeTimed` (`telemetry/wake_timed.rs`)
+records when the input wakes the task, so the wait ends there:
 
-Consequences:
+- the input wait (`starved`) runs from the poll to the wake;
+- the gap from the wake to the consumer's next poll is the consumer's: `busy`
+  for a sink, `blocked` on the edge for a `WrappingExec`;
+- the final poll, which runs upstream work, is input wait again.
 
-- A slow sink can have high `elapsed_compute` while its feeding edge has little
-  `blocked`.
-- The visible blocked edge may move one hop upstream.
-- A node can look starved even when the pipeline-level cause is downstream.
-  `starved` describes the node's local await state, not root cause.
-- Short, preloaded tests and sustained streaming workloads may classify the
-  same topology differently because `Ready`/`Pending` timing differs.
+Limits:
+
+- The gap includes scheduler delay between the wake and the task running.
+- A connector that prefetches past end-of-stream writes its last chunk after
+  the measured stream ended; that last write is not measured.
+- A wake that brings no batch (the next poll is `Pending` again) leaves the
+  wait open, as it should.
 
 ### Bounded channels hide work until full
 

@@ -67,7 +67,7 @@ impl OwnWork {
     /// Metrics without a partition are counted once, by partition 0. Exact
     /// when the subtree keeps its input partitioning; a repartition inside the
     /// subtree spreads one partition's work across others.
-    fn nanos(&self) -> u64 {
+    pub(crate) fn nanos(&self) -> u64 {
         self.metrics
             .iter()
             .filter(|metric| metric.partition().unwrap_or(0) == self.partition)
@@ -164,6 +164,44 @@ impl NodeTime {
             let mut clock = self.clock.lock();
             self.bank(&mut clock);
             clock.open_since = None;
+            Self::take_whole_millis(&mut clock)
+        };
+        self.emit(ms);
+    }
+
+    /// Start a span at `at`, an instant already past, with the work counter
+    /// read then. No-op while one is open.
+    pub(crate) fn open_at(&self, at: Instant, work_at: Option<u64>) {
+        let mut clock = self.clock.lock();
+        if clock.open_since.is_none() {
+            clock.open_since = Some(at.min(Instant::now()));
+            clock.work_mark = work_at.unwrap_or_else(|| self.work_nanos());
+            clock.span_banked = Duration::ZERO;
+        }
+    }
+
+    /// End the open span at `at`, an instant already past, with the work
+    /// counter read then, and report it.
+    pub(crate) fn close_at(&self, at: Instant, work_at: Option<u64>) {
+        let ms = {
+            let mut clock = self.clock.lock();
+            let current = self.work_nanos();
+            match clock.open_since {
+                // A flush already banked past `at`: take that part back.
+                Some(since) if at < since => {
+                    let over = (since - at).min(clock.span_banked);
+                    clock.banked -= over;
+                    clock.span_banked -= over;
+                }
+                _ => {
+                    let (add, take_back) =
+                        self.unbanked(&clock, at.min(Instant::now()), work_at.unwrap_or(current));
+                    clock.banked = clock.banked + add - take_back;
+                    clock.span_banked = clock.span_banked + add - take_back;
+                }
+            }
+            clock.open_since = None;
+            clock.work_mark = current;
             Self::take_whole_millis(&mut clock)
         };
         self.emit(ms);
@@ -423,6 +461,29 @@ mod tests {
         compute.add_duration(Duration::from_secs(1));
         starved.close();
         assert_eq!(starved.total(), wait);
+    }
+
+    /// Closing at an instant before a flush takes back what the flush banked
+    /// after that instant.
+    #[test]
+    fn close_at_takes_back_time_flushed_after_it() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "node_time::close_at";
+        init_recorder_with_node(id);
+        let timer = NodeTime::wall(get_metrics_recorder(), id, "starved", "");
+
+        timer.open();
+        std::thread::sleep(Duration::from_millis(10));
+        let ready = Instant::now();
+        std::thread::sleep(Duration::from_millis(30));
+        timer.flush();
+        timer.close_at(ready, None);
+
+        let total = timer.total();
+        assert!(
+            total >= Duration::from_millis(10) && total < Duration::from_millis(30),
+            "only the span up to `ready` counts, got {total:?}"
+        );
     }
 
     #[test]

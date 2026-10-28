@@ -13,6 +13,7 @@ use crate::telemetry::node_time::{NodeTime, OwnWork};
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::telemetry::types::RowCountMeasurementType;
+use crate::telemetry::wake_timed::{Readiness, WakeTimed};
 use crate::topology::Telemetry;
 use crate::utils::dedup::deduplicate_record_batch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
@@ -37,7 +38,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use delegate::delegate;
-use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Debug;
@@ -537,6 +537,23 @@ fn end_input_wait<T, E>(starved: &NodeTime, poll_result: &Option<Result<T, E>>) 
     }
 }
 
+/// End an input wait whose batch was ready at `readiness.woke_at` but taken
+/// only at `readiness.polled_at`. The gap between them is the consumer's
+/// (`gap`). The final poll runs upstream work, so it is input wait again.
+fn end_ready_wait(starved: Option<&NodeTime>, gap: Option<&NodeTime>, readiness: &Readiness) {
+    if let Some(starved) = starved {
+        starved.close_at(readiness.woke_at, readiness.work_before_poll);
+    }
+    if let Some(gap) = gap {
+        gap.open_at(readiness.woke_at, None);
+        gap.close_at(readiness.polled_at, None);
+    }
+    if let Some(starved) = starved {
+        starved.open_at(readiness.polled_at, readiness.work_before_poll);
+        starved.close();
+    }
+}
+
 /// Counts zero-row data batches for `node_empty_batches`. A selective filter
 /// emits one empty batch per input batch, so one recorder call per batch would
 /// cost a tag-map clone and global locks at the input rate. This emits at most
@@ -803,7 +820,7 @@ impl ExecutionPlan for WrappingExec {
                 (inner_context, meter, false)
             }
         };
-        let mut data = execute_input_stream(
+        let data = execute_input_stream(
             Arc::clone(&self.inner),
             Arc::clone(&self.schema()),
             partition,
@@ -851,6 +868,7 @@ impl ExecutionPlan for WrappingExec {
                 "",
             ),
         });
+        let mut input = WakeTimed::new(data, own_work.clone());
         let busy_time = own_work.filter(|_| !task_claimed).map(|work| {
             NodeTime::work(
                 Arc::clone(&metrics_recorder),
@@ -900,9 +918,18 @@ impl ExecutionPlan for WrappingExec {
                 if let Some(starved_time) = &starved_time {
                     starved_time.open();
                 }
-                let batch_result = data.next().await;
-                if let Some(starved_time) = &starved_time {
-                    end_input_wait(starved_time, &batch_result);
+                let (batch_result, readiness) = input.next().await;
+                match readiness.filter(|_| matches!(batch_result, Some(Ok(_)))) {
+                    // The downstream polled again only after our input was
+                    // ready: that gap is the downstream holding us back.
+                    Some(readiness) => {
+                        end_ready_wait(starved_time.as_deref(), blocked_time.as_deref(), &readiness)
+                    }
+                    None => {
+                        if let Some(starved_time) = &starved_time {
+                            end_input_wait(starved_time, &batch_result);
+                        }
+                    }
                 }
 
                 let accrued = match &starved_time {
@@ -1086,15 +1113,16 @@ impl DataSink for WrappingDataSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let metric_metadata_id = self.reference_name.clone();
+        let schema = data.schema();
+        let mut input = WakeTimed::new(data, None);
         let metrics = self.metrics();
         let metrics_recorder = get_metrics_recorder().clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
 
-        let schema = data.schema();
         let primary_key = self.primary_key.clone();
 
         // `starved`: the sink waiting on upstream, measured like
@@ -1119,8 +1147,14 @@ impl DataSink for WrappingDataSink {
             loop {
                 busy_time.close();
                 starved_time.open();
-                let batch_result = data.next().await;
-                end_input_wait(&starved_time, &batch_result);
+                let (batch_result, readiness) = input.next().await;
+                match readiness.filter(|_| matches!(batch_result, Some(Ok(_)))) {
+                    // A prefetching connector (`ready_chunks`) polls, gets
+                    // `Pending`, and writes before it polls again: from the
+                    // input's wake on, that time is its own.
+                    Some(readiness) => end_ready_wait(Some(&starved_time), Some(&busy_time), &readiness),
+                    None => end_input_wait(&starved_time, &batch_result),
+                }
                 if matches!(batch_result, Some(Ok(_))) {
                     busy_time.open();
                 }
@@ -1476,6 +1510,7 @@ mod tests {
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A shared scan is built once from the first consumer's arguments, so only
@@ -2858,6 +2893,94 @@ mod tests {
         );
     }
 
+    /// Writes slowly like `SlowWriteSink`, but reads its input with
+    /// `ready_chunks`, as `HttpSink` does: after each batch it polls once more,
+    /// gets `Pending`, and writes without polling again.
+    #[derive(Debug)]
+    struct PrefetchingSlowSink {
+        schema: SchemaRef,
+        per_chunk: Duration,
+    }
+
+    impl DisplayAs for PrefetchingSlowSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "PrefetchingSlowSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for PrefetchingSlowSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut rows = 0u64;
+            let mut chunks = data.ready_chunks(4);
+            while let Some(batches) = chunks.next().await {
+                for batch in batches {
+                    rows += batch?.num_rows() as u64;
+                }
+                tokio::time::sleep(self.per_chunk).await;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// A sink that prefetches with `ready_chunks` leaves its input poll
+    /// `Pending` while it writes. That write is still `busy`: the input was
+    /// ready long before the sink asked again.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_prefetching_sink_write_is_busy_not_starved() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_prefetching_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // Each batch is ready one scheduler turn after it is asked for. The
+        // write after the last batch follows end-of-stream, which ends the
+        // measured stream, so only the first three writes are measured.
+        let input = futures::stream::iter([test_batch(), test_batch(), test_batch(), test_batch()])
+            .then(|batch| async move {
+                tokio::task::yield_now().await;
+                Ok(batch)
+            });
+        let sink = WrappingDataSink::new(
+            Arc::new(PrefetchingSlowSink {
+                schema: schema.clone(),
+                per_chunk: Duration::from_millis(30),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        sink.write_all(
+            Box::pin(RecordBatchStreamAdapter::new(schema, input)),
+            &Arc::new(TaskContext::default()),
+        )
+        .await
+        .unwrap();
+
+        let busy = test_support::node_wait_ms(node_id, "busy", Some(""));
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(busy >= 80, "3 x 30ms writes must be busy, got {busy}ms");
+        assert!(
+            starved < 20,
+            "the input was ready during each write, got starved {starved}ms"
+        );
+    }
+
     /// A wait must show while it lasts. Reporting it only when it ends hides a
     /// stalled pipeline until it recovers, or forever if the pod dies first.
     #[tokio::test(flavor = "multi_thread")]
@@ -2924,6 +3047,49 @@ mod tests {
             "the open blocked span must be reported while it lasts, got {during_stall}ms"
         );
         while stream.next().await.is_some() {}
+    }
+
+    /// A downstream that prefetches with `ready_chunks` leaves this node's
+    /// input poll `Pending` while it works. From the input's wake on, the
+    /// batch waits for the downstream: that is `blocked`, not `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_prefetching_downstream_blocks_instead_of_starving() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_prefetching_downstream";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let batches = vec![test_batch(), test_batch(), test_batch(), test_batch()];
+        let mem_table = MemTable::try_new(schema, vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(1),
+        });
+        let wrapping = Arc::new(
+            WrappingExec::new(slow_input, node_id.to_string(), vec![], vec![], None)
+                .with_downstream_id("prefetching_sink".to_string()),
+        );
+
+        let mut chunks = wrapping.execute(0, ctx.task_ctx()).unwrap().ready_chunks(4);
+        while chunks.next().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("prefetching_sink"));
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(
+            blocked >= 80,
+            "3 x 30ms downstream work must be blocked, got {blocked}ms"
+        );
+        assert!(
+            starved < 20,
+            "the input was ready within 1ms, got starved {starved}ms"
+        );
     }
 
     #[tokio::test]
