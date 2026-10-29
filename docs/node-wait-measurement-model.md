@@ -236,8 +236,9 @@ can duplicate the host-owned edge.
 
 `elapsed_compute` retains historical semantics for `WrappingExec`: the node's
 `starved` time (and a task operator's `busy`) is folded into it, one
-observation per batch. A SQL transform's observation is its input wait plus its
-subtree compute. Read busy from `state="busy"`, never as
+observation per batch. A SQL transform's observation is its subtree compute
+only, as before `node_wait`. The fold is temporary: it goes once dashboards
+read `state="busy"` and a batch counter. Read busy from `state="busy"`, never as
 `elapsed_compute - starved`. Sink connector service time is unaffected by this
 compatibility rule.
 

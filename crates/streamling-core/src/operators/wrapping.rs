@@ -907,10 +907,13 @@ impl ExecutionPlan for WrappingExec {
         let measured_stream = async_stream::stream! {
             // Lives as long as the stream: it accrues without spans.
             let _busy_time = busy_time;
-            // `starved` (and a task operator's `busy`) is also folded into
-            // `elapsed_compute`, so that series keeps input wait plus compute.
-            // `folded_through` is the high-water mark of the accrued time
-            // already folded.
+            // Outside a SQL transform, `elapsed_compute` keeps its `main`
+            // meaning: the node's poll time, so `starved` (and a task
+            // operator's `busy`) is folded into it. A SQL transform's is its
+            // DataFusion compute alone. `folded_through` is the high-water mark
+            // of the accrued time already folded.
+            // TODO(node-wait stage 3): delete the fold once dashboards read
+            // `node_wait{state="busy"}` and a batch counter.
             let mut fold = MillisAccumulator::default();
             let mut folded_through = fold_baseline;
             let mut empty_batches =
@@ -941,11 +944,8 @@ impl ExecutionPlan for WrappingExec {
                 }
 
                 // Only a delivered batch gets a sample: a terminal poll's wait
-                // belongs to no batch. A SQL transform folds the wait into that
-                // batch's compute delta (`record_execution_plan_metrics`), so
-                // the histogram keeps one observation per batch.
-                let mut sql_input_wait_ms = 0;
-                if matches!(batch_result, Some(Ok(_))) {
+                // belongs to no batch.
+                if !has_own_work && matches!(batch_result, Some(Ok(_))) {
                     let accrued = match &starved_time {
                         Some(starved_time) => starved_time.total(),
                         None => {
@@ -956,9 +956,7 @@ impl ExecutionPlan for WrappingExec {
                     fold.add(accrued.saturating_sub(folded_through));
                     folded_through = folded_through.max(accrued);
                     let fold_ms = fold.take_whole_millis();
-                    if has_own_work {
-                        sql_input_wait_ms = fold_ms;
-                    } else if fold_ms > 0 {
+                    if fold_ms > 0 {
                         metrics_recorder.record_elapsed_compute(
                             Duration::from_millis(fold_ms),
                             &metric_metadata_id,
@@ -979,7 +977,6 @@ impl ExecutionPlan for WrappingExec {
                             batch.num_rows(),
                             RowCountMeasurementType::OutputRowCount,
                             metrics.as_ref(),
-                            sql_input_wait_ms,
                         );
 
                         // Record checkpoint marker arrival time for transforms
@@ -1174,7 +1171,6 @@ impl DataSink for WrappingDataSink {
                             batch.num_rows(),
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
-                            0,
                         );
 
                         // End-to-end freshness at sink ingress. Same code

@@ -828,6 +828,9 @@ mod tests {
     struct ComputeExec {
         input: Arc<dyn ExecutionPlan>,
         per_batch_compute: Duration,
+        /// Waited before each input poll, outside the compute timer: the
+        /// transform's input wait.
+        input_delay: Duration,
         metrics: ExecutionPlanMetricsSet,
     }
 
@@ -836,8 +839,14 @@ mod tests {
             Self {
                 input,
                 per_batch_compute,
+                input_delay: Duration::ZERO,
                 metrics: ExecutionPlanMetricsSet::new(),
             }
+        }
+
+        fn with_input_delay(mut self, input_delay: Duration) -> Self {
+            self.input_delay = input_delay;
+            self
         }
     }
 
@@ -864,10 +873,10 @@ mod tests {
             self: Arc<Self>,
             mut children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(ComputeExec::new(
-                children.swap_remove(0),
-                self.per_batch_compute,
-            )))
+            Ok(Arc::new(
+                ComputeExec::new(children.swap_remove(0), self.per_batch_compute)
+                    .with_input_delay(self.input_delay),
+            ))
         }
         fn metrics(&self) -> Option<MetricsSet> {
             Some(self.metrics.clone_inner())
@@ -880,9 +889,16 @@ mod tests {
             let baseline = BaselineMetrics::new(&self.metrics, partition);
             let mut input = self.input.execute(partition, context)?;
             let compute = self.per_batch_compute;
+            let input_delay = self.input_delay;
             let schema = self.schema();
             let stream = async_stream::stream! {
-                while let Some(item) = input.next().await {
+                loop {
+                    if !input_delay.is_zero() {
+                        tokio::time::sleep(input_delay).await;
+                    }
+                    let Some(item) = input.next().await else {
+                        break;
+                    };
                     match item {
                         Ok(batch) => {
                             // The timer measures wall-clock exactly as a real
@@ -1650,6 +1666,53 @@ mod tests {
             elapsed_compute <= starved + busy + NUM_BATCHES as u64,
             "elapsed_compute must hold the compute once, got {elapsed_compute}ms \
              (starved {starved}ms + busy {busy}ms)"
+        );
+    }
+
+    /// A SQL transform's `elapsed_compute` is its own compute only, as before
+    /// `node_wait`: its input wait is `starved`, not processing time.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sql_elapsed_compute_excludes_input_wait() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_compute_excludes_wait";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let slow_input = Arc::new(
+            ComputeExec::new(
+                multi_batch_source(NUM_BATCHES).await,
+                Duration::from_millis(5),
+            )
+            .with_input_delay(Duration::from_millis(30)),
+        );
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(slow_input, 1, node_id.to_string()));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        drain(&wrapping).await;
+        drop(wrapping);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            starved >= 90,
+            "3+ x 30ms input waits must be starved, got {starved}ms"
+        );
+        assert!(
+            elapsed_compute <= busy + NUM_BATCHES as u64,
+            "elapsed_compute must be the compute only, got {elapsed_compute}ms \
+             (busy {busy}ms, starved {starved}ms)"
         );
     }
 }

@@ -186,7 +186,7 @@ Every series is a `NodeTime` (`telemetry/node_time.rs`): a process-wide flusher 
 
 Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved`, `busy`, and unresolved `blocked`). Each partition of a node adds into the same series, so a node with N partitions can accrue N seconds per second: compare states as ratios, not as absolute rates.
 
-> **`elapsed_compute` compatibility.** A `WrappingExec` node still folds its `starved` time (and a task operator's `busy`) into `elapsed_compute`, one observation per batch, so existing latency panels keep their meaning. A SQL transform's observation is its input wait plus its subtree compute. Do not derive busy from `elapsed_compute`; use `state="busy"`. Sink `elapsed_compute` is connector-recorded service time.
+> **`elapsed_compute` compatibility.** A `WrappingExec` node still folds its `starved` time (and a task operator's `busy`) into `elapsed_compute`, one observation per batch, so existing latency panels keep their meaning. A SQL transform's observation is its subtree compute only, as before `node_wait`. The fold is temporary: it goes once dashboards read `state="busy"` and a batch counter. Do not derive busy from `elapsed_compute`; use `state="busy"`. Sink `elapsed_compute` is connector-recorded service time.
 
 **`blocked`** is modeled as a property of an **edge** (`producer → consumer`): the `downstream_id` names the consumer, so a linear chain is a sequence of single edges and a fan-out is several edges. The core invariant is **exactly one blocked emitter per edge**:
 
