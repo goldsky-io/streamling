@@ -883,6 +883,7 @@ mod tests {
             &TaskContext::default(),
             get_metrics_recorder(),
             "metered_transform",
+            None,
         );
         let batches: Vec<RecordBatch> = exec
             .execute(0, context)

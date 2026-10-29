@@ -1093,7 +1093,8 @@ impl ExecutionPlan for HybridSourceExec {
         let tx = builder.tx();
         // Each phase source claims the node's meter when it executes; reserve
         // it now so the wrapper never times the phases' channel as `starved`.
-        TaskWaitMeter::reserve(&context);
+        // This driver's own work (normalize) and edge sends are the node's too.
+        let reserved_meter = TaskWaitMeter::reserve(&context);
         let provider = self.provider.clone();
         let context_clone = context.clone();
         let projection = self.projection.clone();
@@ -1279,7 +1280,7 @@ impl ExecutionPlan for HybridSourceExec {
                     match batch_result {
                         Ok(batch) => {
                             let schema_clone = schema_for_main.clone();
-                            let normalized = match run_blocking(move || {
+                            let normalized = match reserved_meter.work(run_blocking(move || {
                                 // Inner phases do not reliably honor the pushed-down
                                 // projection (the bounded ClickHouse scan ignores it
                                 // and emits every column, in ClickHouse order), so
@@ -1296,7 +1297,7 @@ impl ExecutionPlan for HybridSourceExec {
                                     &batch,
                                     &schema_clone,
                                 )
-                            })
+                            }))
                             .await
                             {
                                 Ok(b) => b,
@@ -1306,7 +1307,7 @@ impl ExecutionPlan for HybridSourceExec {
                                 }
                             };
                             let merged = merge_pending_markers(normalized, &pending_for_main);
-                            if tx.send(Ok(merged)).await.is_err() {
+                            if reserved_meter.send(tx.send(Ok(merged))).await.is_err() {
                                 break 'outer;
                             }
                         }
@@ -3096,6 +3097,7 @@ mod tests {
             &TaskContext::default(),
             get_metrics_recorder(),
             "test_reserves_meter",
+            None,
         );
         let stream = plan.execute(0, context).expect("execute should succeed");
         assert!(meter.is_claimed(), "reserved before any phase runs");
@@ -3225,6 +3227,7 @@ mod tests {
             &TaskContext::default(),
             get_metrics_recorder(),
             "phase_meter",
+            None,
         );
         let stream = plan.execute(0, context).expect("execute should succeed");
         let _: Vec<_> = stream.collect().await;

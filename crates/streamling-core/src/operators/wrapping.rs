@@ -779,15 +779,31 @@ impl ExecutionPlan for WrappingExec {
         // `TaskWaitMeter`). An inner phase of a node that reserved its meter
         // (hybrid source) shares that meter and reports no `node_wait` of its
         // own: its output feeds the enclosing node, not a topology edge.
-        let (inner_context, task_wait, inner_phase) = match TaskWaitMeter::reserved(&context) {
-            Some(meter) => (context, meter, true),
+        // One `blocked` emitter per edge: a fan-out producer's
+        // `BroadcastStream` emits per consumer instead.
+        let edge_blocked = |downstream_id: &str| {
+            NodeTime::wall(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "blocked",
+                downstream_id,
+            )
+        };
+        let (inner_context, task_wait, blocked_time) = match TaskWaitMeter::reserved(&context) {
+            Some(meter) => (context, meter, None),
             None => {
+                let blocked_time = match &self.backpressure_role {
+                    BackpressureRole::Edge(downstream_id) => Some(edge_blocked(downstream_id)),
+                    BackpressureRole::Unattributed => Some(edge_blocked("")),
+                    BackpressureRole::FanOutProducer => None,
+                };
                 let (inner_context, meter) = TaskWaitMeter::install(
                     &context,
                     Arc::clone(&metrics_recorder),
                     &metric_metadata_id,
+                    blocked_time.clone(),
                 );
-                (inner_context, meter, false)
+                (inner_context, meter, blocked_time)
             }
         };
         let data = execute_input_stream(
@@ -846,22 +862,9 @@ impl ExecutionPlan for WrappingExec {
                 work,
             )
         });
-        // One `blocked` emitter per edge: a fan-out producer's
-        // `BroadcastStream` emits per consumer instead.
-        let blocked_time = match &self.backpressure_role {
-            _ if inner_phase => None,
-            BackpressureRole::Edge(downstream_id) => Some(downstream_id.as_str()),
-            BackpressureRole::Unattributed => Some(""),
-            BackpressureRole::FanOutProducer => None,
-        }
-        .map(|downstream_id| {
-            NodeTime::wall(
-                Arc::clone(&metrics_recorder),
-                &metric_metadata_id,
-                "blocked",
-                downstream_id,
-            )
-        });
+        // A task operator times `blocked` as its output send wait; otherwise
+        // it is this wrapper's yield->resume.
+        let blocked_time = blocked_time.filter(|_| !task_claimed);
 
         let mut input = WakeTimed::new(data, starved_time.clone(), blocked_time.clone());
 
@@ -2305,6 +2308,51 @@ mod tests {
                 stream,
             )))
         }
+    }
+
+    /// A task operator's `blocked` is its wait to send into a full output
+    /// channel. A slow downstream that never fills the channel holds nothing
+    /// back, so the task's time is all `starved` and `busy`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_task_operator_is_blocked_only_while_its_send_waits() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "task_blocked_is_send_wait";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(5).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(
+            WrappingExec::new(
+                Arc::new(BufferedWorkExec {
+                    inner: source_exec,
+                    work: Duration::from_millis(20),
+                }),
+                node_id.to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .with_downstream_id("slow_sink".to_string()),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("slow_sink"));
+        assert!(busy >= 80, "5 x 20ms task work is busy, got {busy}ms");
+        assert!(
+            blocked < 10,
+            "the 16-slot channel never filled, got blocked {blocked}ms"
+        );
     }
 
     /// Outside a SQL transform, `elapsed_compute` keeps its `main` meaning:

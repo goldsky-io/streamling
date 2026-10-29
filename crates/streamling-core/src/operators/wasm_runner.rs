@@ -748,7 +748,7 @@ mod tests {
             .unwrap();
 
         let (context, meter) =
-            TaskWaitMeter::install(&ctx.task_ctx(), get_metrics_recorder(), "wasm_meter");
+            TaskWaitMeter::install(&ctx.task_ctx(), get_metrics_recorder(), "wasm_meter", None);
         let batches: Vec<_> = plan.execute(0, context).unwrap().collect().await;
         assert!(batches.iter().all(Result::is_ok));
         assert!(

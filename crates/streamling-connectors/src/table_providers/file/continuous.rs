@@ -689,6 +689,7 @@ mod tests {
             &session_manager.session_context().task_ctx(),
             get_metrics_recorder(),
             "node_wait_src",
+            None,
         );
         let mut stream = plan.execute(0, context).unwrap();
 

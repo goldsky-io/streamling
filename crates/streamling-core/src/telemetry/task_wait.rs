@@ -20,8 +20,9 @@ use std::time::Duration;
 /// in the `TaskContext` and brackets its awaits; the meter then reports the
 /// node's `starved` and `busy` instead of the wrapper.
 ///
-/// Time awaiting an output send is neither starved nor busy: that is the
-/// edge's `blocked`, which the wrapper already owns.
+/// Time awaiting an output send is the edge's `blocked`: the wrapper hands its
+/// `blocked` series to the meter at install. A slow downstream holds the task
+/// back only once the output channel is full.
 pub struct TaskWaitMeter {
     recorder: Arc<MetricsRecorder>,
     metadata_id: String,
@@ -32,11 +33,17 @@ pub struct TaskWaitMeter {
     generation: AtomicU64,
     /// Set by [`Self::reserve`]: inner operators share this meter.
     reserved: AtomicBool,
+    /// The edge's `blocked`, timed by output sends. `None` for a fan-out
+    /// producer, whose broadcast times each edge.
+    blocked: Option<Arc<NodeTime>>,
 }
 
 struct Timers {
     starved: Arc<NodeTime>,
     busy: Arc<NodeTime>,
+    /// Output sends. A reserved meter's inner operators send into the
+    /// enclosing operator, not along the edge, so theirs time nothing.
+    send: Option<Arc<NodeTime>>,
 }
 
 impl fmt::Debug for TaskWaitMeter {
@@ -63,6 +70,7 @@ impl TaskWaitMeter {
         context: &TaskContext,
         recorder: Arc<MetricsRecorder>,
         metadata_id: &str,
+        blocked: Option<Arc<NodeTime>>,
     ) -> (Arc<TaskContext>, Arc<TaskWaitMeter>) {
         let meter = Arc::new(TaskWaitMeter {
             recorder,
@@ -70,6 +78,7 @@ impl TaskWaitMeter {
             timers: OnceLock::new(),
             generation: AtomicU64::new(0),
             reserved: AtomicBool::new(false),
+            blocked,
         });
         let child = TaskContext::new(
             context.task_id(),
@@ -113,12 +122,27 @@ impl TaskWaitMeter {
     /// Operator side: take over this node's `starved`/`busy` without timing
     /// anything yet. An operator that runs inner operators one after another
     /// (hybrid source phases) reserves at `execute`, and each inner operator
-    /// claims the meter in turn.
-    pub fn reserve(context: &TaskContext) {
-        if let Some(meter) = context.session_config().get_extension::<TaskWaitMeter>() {
-            meter.timers();
-            meter.reserved.store(true, Ordering::Release);
-        }
+    /// claims the meter in turn. The returned handle times the operator's own
+    /// work between them and its sends along the edge.
+    pub fn reserve(context: &TaskContext) -> ReservedMeter {
+        ReservedMeter(
+            context
+                .session_config()
+                .get_extension::<TaskWaitMeter>()
+                .map(|meter| {
+                    meter.reserved.store(true, Ordering::Release);
+                    meter.timers();
+                    ReservedTimers {
+                        busy: NodeTime::wall(
+                            Arc::clone(&meter.recorder),
+                            &meter.metadata_id,
+                            "busy",
+                            "",
+                        ),
+                        send: meter.blocked.clone(),
+                    }
+                }),
+        )
     }
 
     /// Wrapper side: the meter an enclosing operator reserved for its inner
@@ -149,6 +173,10 @@ impl TaskWaitMeter {
         self.timers.get_or_init(|| Timers {
             starved: NodeTime::wall(Arc::clone(&self.recorder), &self.metadata_id, "starved", ""),
             busy: NodeTime::wall(Arc::clone(&self.recorder), &self.metadata_id, "busy", ""),
+            send: self
+                .blocked
+                .clone()
+                .filter(|_| !self.reserved.load(Ordering::Acquire)),
         })
     }
 }
@@ -196,11 +224,63 @@ impl TaskWaitHandle {
     fn bracket(&self, end: Bracket) -> WaitGuard<'_> {
         if let Some(timers) = self.timers() {
             timers.busy.close();
-            if end == Bracket::Input {
-                timers.starved.open();
+            match end {
+                Bracket::Input => timers.starved.open(),
+                Bracket::Send => {
+                    if let Some(send) = &timers.send {
+                        send.open();
+                    }
+                }
+                Bracket::Exhausted => {}
             }
         }
         WaitGuard { handle: self, end }
+    }
+}
+
+/// An enclosing operator's view of the meter it reserved. Its own work runs
+/// alongside the inner operators' tasks, so it is timed on its own `busy`
+/// timeline. Without a meter every method is a plain pass-through.
+#[derive(Debug, Default)]
+pub struct ReservedMeter(Option<ReservedTimers>);
+
+#[derive(Debug)]
+struct ReservedTimers {
+    busy: Arc<NodeTime>,
+    send: Option<Arc<NodeTime>>,
+}
+
+impl ReservedMeter {
+    /// The operator's own work: `busy`.
+    pub async fn work<F: Future>(&self, work: F) -> F::Output {
+        let _span = self.0.as_ref().map(|timers| Span::open(&timers.busy));
+        work.await
+    }
+
+    /// A send along the edge: `blocked`.
+    pub async fn send<F: Future>(&self, send: F) -> F::Output {
+        let _span = self
+            .0
+            .as_ref()
+            .and_then(|timers| timers.send.as_deref())
+            .map(Span::open);
+        send.await
+    }
+}
+
+/// An open span, closed when the timed future completes or is dropped.
+struct Span<'a>(&'a NodeTime);
+
+impl<'a> Span<'a> {
+    fn open(time: &'a NodeTime) -> Self {
+        time.open();
+        Span(time)
+    }
+}
+
+impl Drop for Span<'_> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -210,7 +290,7 @@ enum Bracket {
     Input,
     /// A wait for input that ended the input: teardown, and no work follows.
     Exhausted,
-    /// An output send: the edge's `blocked`, owned by the wrapper.
+    /// An output send: the edge's `blocked`.
     Send,
 }
 
@@ -232,7 +312,11 @@ impl Drop for WaitGuard<'_> {
                 timers.starved.discard();
                 return;
             }
-            Bracket::Send => {}
+            Bracket::Send => {
+                if let Some(send) = &timers.send {
+                    send.close();
+                }
+            }
         }
         timers.busy.open();
     }
@@ -253,7 +337,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
 
     fn install(ctx: &TaskContext) -> (Arc<TaskContext>, Arc<TaskWaitMeter>) {
-        TaskWaitMeter::install(ctx, get_metrics_recorder(), "task_wait::test")
+        TaskWaitMeter::install(ctx, get_metrics_recorder(), "task_wait::test", None)
     }
 
     fn claimed_meter() -> (Arc<TaskWaitMeter>, TaskWaitHandle) {
@@ -365,6 +449,61 @@ mod tests {
             totals.starved + totals.busy < Duration::from_millis(300),
             "the send wait is neither starved nor busy: {totals:?}"
         );
+    }
+
+    /// The send wait is the edge's `blocked`, unless the meter is reserved:
+    /// an inner operator sends into the enclosing one, not along the edge.
+    #[tokio::test]
+    async fn a_send_wait_is_blocked_unless_the_meter_is_reserved() {
+        let ctx = SessionContext::new().task_ctx();
+        let blocked =
+            || NodeTime::wall(get_metrics_recorder(), "task_wait::test", "blocked", "down");
+
+        let edge = blocked();
+        let (child, _meter) = TaskWaitMeter::install(
+            &ctx,
+            get_metrics_recorder(),
+            "task_wait::test",
+            Some(Arc::clone(&edge)),
+        );
+        let handle = TaskWaitMeter::claim(&child);
+        handle
+            .send(tokio::time::sleep(Duration::from_millis(30)))
+            .await;
+        assert!(
+            edge.total() >= Duration::from_millis(30),
+            "{:?}",
+            edge.total()
+        );
+
+        let edge = blocked();
+        let (child, _meter) = TaskWaitMeter::install(
+            &ctx,
+            get_metrics_recorder(),
+            "task_wait::test",
+            Some(Arc::clone(&edge)),
+        );
+        let reserved = TaskWaitMeter::reserve(&child);
+        let handle = TaskWaitMeter::claim(&child);
+        handle
+            .send(tokio::time::sleep(Duration::from_millis(30)))
+            .await;
+        assert_eq!(edge.total(), Duration::ZERO);
+
+        // The reserving operator's own work and edge sends are its node's.
+        reserved
+            .work(tokio::time::sleep(Duration::from_millis(30)))
+            .await;
+        reserved
+            .send(tokio::time::sleep(Duration::from_millis(30)))
+            .await;
+        assert!(
+            edge.total() >= Duration::from_millis(30),
+            "{:?}",
+            edge.total()
+        );
+        let own_busy = reserved.0.as_ref().expect("a meter").busy.total();
+        assert!(own_busy >= Duration::from_millis(30), "{own_busy:?}");
     }
 
     #[tokio::test]
