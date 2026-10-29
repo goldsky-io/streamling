@@ -146,7 +146,7 @@ Label constraints (enforced at config load):
 | Max 20 labels per node | Each label is a Prometheus dimension; unbounded maps blow up storage. |
 | Keys match `^[a-zA-Z_][a-zA-Z0-9_]*$` | Prometheus label-name grammar. |
 | Keys cannot start with `__` | Prometheus reserves that prefix for internal use. |
-| Keys cannot be `id`, `topology_node_type`, `operator_type`, `service_instance_id`, `state`, `downstream_id` | These collide with built-in metric dimensions. |
+| Keys cannot be `id`, `topology_node_type`, `operator_type`, `service_instance_id` | These collide with built-in metric dimensions. |
 | Keys cannot shadow a node kind's per-type tag | `topic` and `partition` on Kafka sources (`topic` on Kafka sinks), `table` on ClickHouse/Postgres, `url` on webhooks, `type` on plugins, `language` on script transforms. Hybrid sources reserve `table`, `topic` and `partition`. Overriding would silently replace the real identity on every emitted metric. |
 | Values max 256 bytes, no control characters (except tab) | A raw newline in a value can corrupt Prometheus scrape output. |
 
