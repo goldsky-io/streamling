@@ -2310,6 +2310,48 @@ mod tests {
         }
     }
 
+    /// A SQL transform without subtree metrics (`SELECT * FROM src`) has no
+    /// compute to report, so its `elapsed_compute` is its poll time, as on
+    /// `main`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_sql_transform_without_subtree_metrics_records_poll_time() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_without_subtree_metrics";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(3).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(20),
+        });
+        assert!(slow_input.metrics().is_none());
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert_eq!(test_support::elapsed_compute_samples(node_id), 3);
+        assert!(
+            elapsed_compute >= 50,
+            "3 x 20ms polls, got elapsed_compute {elapsed_compute}ms"
+        );
+    }
+
     /// A task operator's `blocked` is its wait to send into a full output
     /// channel. A slow downstream that never fills the channel holds nothing
     /// back, so the task's time is all `starved` and `busy`.
