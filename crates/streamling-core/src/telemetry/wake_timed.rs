@@ -127,7 +127,13 @@ impl WakeTimed {
         }
         // Not under the state lock: the input may wake the task synchronously.
         let waker = self.recording_waker(cx.waker());
+        if let Some(starved) = &self.wait.starved {
+            starved.poll_started();
+        }
         let poll = self.inner.poll_next_unpin(&mut Context::from_waker(&waker));
+        if let Some(starved) = &self.wait.starved {
+            starved.poll_ended();
+        }
 
         let mut state = self.wait.state.lock();
         state.polling = false;
@@ -266,6 +272,51 @@ mod tests {
         assert!(
             delivered >= Duration::from_millis(20) && delivered < Duration::from_millis(40),
             "{delivered:?}"
+        );
+    }
+
+    /// DataFusion records a SQL node's compute when its poll ends. A flush in
+    /// the middle of a long poll must not report that compute as `starved`.
+    #[test]
+    fn a_flush_inside_a_long_poll_does_not_report_its_compute_as_starved() {
+        use crate::telemetry::node_time::{OwnWork, flush_live};
+        use crate::telemetry::recorder::test_support::node_wait_ms;
+        use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "wake_timed::long_poll";
+        init_recorder_with_node(id);
+        let plan_metrics = ExecutionPlanMetricsSet::new();
+        let compute = MetricBuilder::new(&plan_metrics).elapsed_compute(0);
+        let starved = NodeTime::wall_excluding(
+            get_metrics_recorder(),
+            id,
+            "starved",
+            OwnWork::new(plan_metrics.clone_inner(), 0),
+        );
+        // One poll of pure compute, recorded when it ends.
+        let poll = futures::stream::poll_fn(move |_| {
+            let started = Instant::now();
+            std::thread::sleep(Duration::from_millis(60));
+            flush_live();
+            std::thread::sleep(Duration::from_millis(60));
+            compute.add_duration(started.elapsed());
+            Poll::Ready(Some(Ok(batch())))
+        });
+        let mut input = WakeTimed::new(
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                poll,
+            )),
+            Some(Arc::clone(&starved)),
+            None,
+        );
+
+        assert!(futures::executor::block_on(input.next()).is_some());
+        let reported = node_wait_ms(id, "starved", None);
+        assert!(
+            reported < 5,
+            "the poll was compute, got starved {reported}ms"
         );
     }
 }

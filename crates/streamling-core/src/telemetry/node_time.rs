@@ -48,6 +48,10 @@ struct Clock {
     open_since: Option<Instant>,
     /// The open span stopped accruing here, until it resumes or ends.
     paused_at: Option<Instant>,
+    /// A poll that runs the node's own work started here, with the work
+    /// counter then. Its compute is recorded only when it ends, so nothing
+    /// past its start is banked before that.
+    poll: Option<(Instant, u64)>,
     work_mark: u64,
     banked: Duration,
     /// Banked by flushes in the open span: work recorded later in the span
@@ -183,6 +187,18 @@ impl NodeTime {
         }
     }
 
+    /// A poll that may run the node's own work starts. No-op unless own work
+    /// is excluded.
+    pub(crate) fn poll_started(&self) {
+        if let Measure::Wall { exclude: Some(_) } = self.measure {
+            self.clock.lock().poll = Some((Instant::now(), self.work_nanos()));
+        }
+    }
+
+    pub(crate) fn poll_ended(&self) {
+        self.clock.lock().poll = None;
+    }
+
     /// Continue a paused span: the pause is not part of it.
     pub(crate) fn resume(&self) {
         let mut clock = self.clock.lock();
@@ -251,8 +267,10 @@ impl NodeTime {
     /// Bank the unbanked time. The work counter is read under the clock lock:
     /// a read taken before it could be older than `work_mark` and rewind it.
     fn bank(&self, clock: &mut Clock) {
-        let now = Self::now(clock);
-        let work = self.work_nanos();
+        let (now, work) = match clock.poll {
+            Some((started, work)) => (started.min(Self::now(clock)), work),
+            None => (Self::now(clock), self.work_nanos()),
+        };
         let (add, take_back) = self.unbanked(clock, now, work);
         clock.banked = clock.banked + add - take_back;
         clock.span_banked = clock.span_banked + add - take_back;
