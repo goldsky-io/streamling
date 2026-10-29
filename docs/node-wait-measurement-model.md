@@ -131,20 +131,24 @@ Batching alone is not the same as prefetch.
 A consumer such as `ready_chunks(N)` polls all currently-ready input, gets
 `Pending`, and then does slow work before it polls again. The node's input
 poll stays `Pending` through that work. `WakeTimed` (`telemetry/wake_timed.rs`)
-records when the input wakes the task, so the wait ends there:
+switches state in the waker, so the switch shows live, while the consumer
+still works:
 
 - the input wait (`starved`) runs from the poll to the wake;
 - the gap from the wake to the consumer's next poll is the consumer's: `busy`
   for a sink, `blocked` on the edge for a `WrappingExec`;
 - the final poll, which runs upstream work, is input wait again.
 
+The wait pauses at the wake rather than ending, so a wait that ends in
+end-of-stream or an error is still dropped, not `starved`.
+
 Limits:
 
 - The gap includes scheduler delay between the wake and the task running.
 - A connector that prefetches past end-of-stream writes its last chunk after
   the measured stream ended; that last write is not measured.
-- A wake that brings no batch (the next poll is `Pending` again) leaves the
-  wait open, as it should.
+- A wake that brings no batch (the next poll is `Pending` again) still
+  counts its gap as the consumer's; the wait then resumes.
 
 ### Bounded channels hide work until full
 

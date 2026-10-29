@@ -13,7 +13,7 @@ use crate::telemetry::node_time::{NodeTime, OwnWork};
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::telemetry::types::RowCountMeasurementType;
-use crate::telemetry::wake_timed::{Readiness, WakeTimed};
+use crate::telemetry::wake_timed::WakeTimed;
 use crate::topology::Telemetry;
 use crate::utils::dedup::deduplicate_record_batch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
@@ -525,35 +525,6 @@ pub enum BackpressureRole {
     FanOutProducer,
 }
 
-/// End an input wait. Only a poll that delivered a batch (`Some(Ok(_))`) was
-/// a wait for data. A `None` result is end-of-stream, so its wait is pipeline
-/// shutdown/teardown; a `Some(Err(_))` is an upstream failure. Neither is
-/// `starved`, and neither is folded into `elapsed_compute`.
-fn end_input_wait<T, E>(starved: &NodeTime, poll_result: &Option<Result<T, E>>) {
-    if matches!(poll_result, Some(Ok(_))) {
-        starved.close();
-    } else {
-        starved.discard();
-    }
-}
-
-/// End an input wait whose batch was ready at `readiness.woke_at` but taken
-/// only at `readiness.polled_at`. The gap between them is the consumer's
-/// (`gap`). The final poll runs upstream work, so it is input wait again.
-fn end_ready_wait(starved: Option<&NodeTime>, gap: Option<&NodeTime>, readiness: &Readiness) {
-    if let Some(starved) = starved {
-        starved.close_at(readiness.woke_at, readiness.work_before_poll);
-    }
-    if let Some(gap) = gap {
-        gap.open_at(readiness.woke_at, None);
-        gap.close_at(readiness.polled_at, None);
-    }
-    if let Some(starved) = starved {
-        starved.open_at(readiness.polled_at, readiness.work_before_poll);
-        starved.close();
-    }
-}
-
 /// Counts zero-row data batches for `node_empty_batches`. A selective filter
 /// emits one empty batch per input batch, so one recorder call per batch would
 /// cost a tag-map clone and global locks at the input rate. This emits at most
@@ -868,7 +839,6 @@ impl ExecutionPlan for WrappingExec {
                 "",
             ),
         });
-        let mut input = WakeTimed::new(data, own_work.clone());
         let busy_time = own_work.filter(|_| !task_claimed).map(|work| {
             NodeTime::work(
                 Arc::clone(&metrics_recorder),
@@ -893,6 +863,8 @@ impl ExecutionPlan for WrappingExec {
                 downstream_id,
             )
         });
+
+        let mut input = WakeTimed::new(data, starved_time.clone(), blocked_time.clone());
 
         let schema = self.schema();
         // A hybrid phase shares a meter that already holds the earlier
@@ -926,22 +898,9 @@ impl ExecutionPlan for WrappingExec {
                     blocked_time.close();
                 }
 
-                if let Some(starved_time) = &starved_time {
-                    starved_time.open();
-                }
-                let (batch_result, readiness) = input.next().await;
-                match readiness.filter(|_| matches!(batch_result, Some(Ok(_)))) {
-                    // The downstream polled again only after our input was
-                    // ready: that gap is the downstream holding us back.
-                    Some(readiness) => {
-                        end_ready_wait(starved_time.as_deref(), blocked_time.as_deref(), &readiness)
-                    }
-                    None => {
-                        if let Some(starved_time) = &starved_time {
-                            end_input_wait(starved_time, &batch_result);
-                        }
-                    }
-                }
+                // A downstream that polls again only after our input is
+                // ready holds us back from that wake: `blocked`.
+                let batch_result = input.next().await;
 
                 // Only a delivered batch gets a sample: a terminal poll's wait
                 // belongs to no batch.
@@ -1121,7 +1080,6 @@ impl DataSink for WrappingDataSink {
     ) -> Result<u64> {
         let metric_metadata_id = self.reference_name.clone();
         let schema = data.schema();
-        let mut input = WakeTimed::new(data, None);
         let metrics = self.metrics();
         let metrics_recorder = get_metrics_recorder().clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
@@ -1146,18 +1104,15 @@ impl DataSink for WrappingDataSink {
             "",
         );
 
+        // A prefetching connector (`ready_chunks`) polls, gets `Pending`, and
+        // writes before it polls again: from the input's wake on, that time is
+        // its own.
+        let mut input = WakeTimed::new(data, Some(starved_time), Some(Arc::clone(&busy_time)));
+
         let measured_stream = async_stream::stream! {
             loop {
                 busy_time.close();
-                starved_time.open();
-                let (batch_result, readiness) = input.next().await;
-                match readiness.filter(|_| matches!(batch_result, Some(Ok(_)))) {
-                    // A prefetching connector (`ready_chunks`) polls, gets
-                    // `Pending`, and writes before it polls again: from the
-                    // input's wake on, that time is its own.
-                    Some(readiness) => end_ready_wait(Some(&starved_time), Some(&busy_time), &readiness),
-                    None => end_input_wait(&starved_time, &batch_result),
-                }
+                let batch_result = input.next().await;
                 if matches!(batch_result, Some(Ok(_))) {
                     busy_time.open();
                 }
@@ -2705,32 +2660,6 @@ mod tests {
         );
     }
 
-    /// A poll that yields a batch counts its wait as `starved`, but a poll that
-    /// returns `None` (end-of-stream) or `Some(Err)` (upstream failure) must
-    /// contribute nothing.
-    #[test]
-    fn only_delivered_batch_poll_is_counted_as_starved() {
-        let starved = NodeTime::wall(get_metrics_recorder(), "only_delivered", "starved", "");
-        let wait = |result: &Option<Result<(), ()>>| {
-            starved.open();
-            std::thread::sleep(Duration::from_millis(5));
-            end_input_wait(&starved, result);
-        };
-
-        let started = Instant::now();
-        wait(&None);
-        wait(&Some(Err(())));
-        // The 1s flusher can bank part of at most one of the two spans before
-        // it is discarded, so at least one whole span is dropped.
-        let discarded = starved.total();
-        assert!(
-            discarded + Duration::from_millis(5) <= started.elapsed(),
-            "{discarded:?}"
-        );
-        wait(&Some(Ok(())));
-        assert!(starved.total() >= discarded + Duration::from_millis(5));
-    }
-
     /// Records every row the inner sink actually receives.
     #[derive(Debug)]
     struct RecordingSink {
@@ -3023,6 +2952,57 @@ mod tests {
             starved < 20,
             "the input was ready during each write, got starved {starved}ms"
         );
+    }
+
+    /// A prefetching sink's hung write must show as `busy` while it hangs,
+    /// not as `starved` that turns into `busy` only when the write returns.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_hung_prefetching_sink_write_is_busy_while_it_hangs() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_hung_prefetching_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // The next batch is ready 5ms after the sink asks, while it writes.
+        let input = futures::stream::iter([test_batch(), test_batch()]).then(|batch| async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(batch)
+        });
+        let sink = WrappingDataSink::new(
+            Arc::new(PrefetchingSlowSink {
+                schema: schema.clone(),
+                per_chunk: Duration::from_millis(3_000),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        let context = Arc::new(TaskContext::default());
+        let (written, (busy, starved)) = tokio::join!(
+            sink.write_all(
+                Box::pin(RecordBatchStreamAdapter::new(schema, input)),
+                &context
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(2_300)).await;
+                (
+                    test_support::node_wait_ms(node_id, "busy", Some("")),
+                    test_support::node_wait_ms(node_id, "starved", Some("")),
+                )
+            }
+        );
+        assert!(
+            busy >= 1_000,
+            "the hung write must show as busy while it lasts, got {busy}ms"
+        );
+        assert!(
+            starved < 200,
+            "the input was ready 5ms into the write, got starved {starved}ms"
+        );
+        written.unwrap();
     }
 
     /// A wait must show while it lasts. Reporting it only when it ends hides a

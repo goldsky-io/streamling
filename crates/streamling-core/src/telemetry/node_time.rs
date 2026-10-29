@@ -44,6 +44,8 @@ enum Measure {
 #[derive(Debug, Default)]
 struct Clock {
     open_since: Option<Instant>,
+    /// The open span stopped accruing here, until it resumes or ends.
+    paused_at: Option<Instant>,
     work_mark: u64,
     banked: Duration,
     /// Banked by flushes in the open span: work recorded later in the span
@@ -164,60 +166,43 @@ impl NodeTime {
             let mut clock = self.clock.lock();
             self.bank(&mut clock);
             clock.open_since = None;
+            clock.paused_at = None;
             Self::take_whole_millis(&mut clock)
         };
         self.emit(ms);
     }
 
-    /// Start a span at `at`, an instant already past, with the work counter
-    /// read then. No-op while one is open.
-    pub(crate) fn open_at(&self, at: Instant, work_at: Option<u64>) {
+    /// Stop the open span accruing, keeping it open: whether it is reported
+    /// (`close`) or dropped (`discard`) is decided when it ends. Called from a
+    /// waker, on whatever thread wakes the task.
+    pub(crate) fn pause(&self) {
         let mut clock = self.clock.lock();
-        if clock.open_since.is_none() {
-            clock.open_since = Some(at.min(Instant::now()));
-            clock.work_mark = work_at.unwrap_or_else(|| self.work_nanos());
-            clock.span_banked = Duration::ZERO;
+        if clock.open_since.is_some() && clock.paused_at.is_none() {
+            clock.paused_at = Some(Instant::now());
         }
     }
 
-    /// End the open span at `at`, an instant already past, with the work
-    /// counter read then, and report it.
-    pub(crate) fn close_at(&self, at: Instant, work_at: Option<u64>) {
-        let ms = {
-            let mut clock = self.clock.lock();
-            let current = self.work_nanos();
-            match clock.open_since {
-                // A flush already banked past `at`: take that part back.
-                Some(since) if at < since => {
-                    let over = (since - at).min(clock.span_banked);
-                    clock.banked -= over;
-                    clock.span_banked -= over;
-                }
-                _ => {
-                    let (add, take_back) =
-                        self.unbanked(&clock, at.min(Instant::now()), work_at.unwrap_or(current));
-                    clock.banked = clock.banked + add - take_back;
-                    clock.span_banked = clock.span_banked + add - take_back;
-                }
-            }
-            clock.open_since = None;
-            clock.work_mark = current;
-            Self::take_whole_millis(&mut clock)
-        };
-        self.emit(ms);
+    /// Continue a paused span: the pause is not part of it.
+    pub(crate) fn resume(&self) {
+        let mut clock = self.clock.lock();
+        if let (Some(since), Some(paused_at)) = (clock.open_since, clock.paused_at.take()) {
+            clock.open_since = Some(since + paused_at.elapsed());
+        }
     }
 
     /// End the open span without reporting its unflushed part: the wait ended
     /// in end-of-stream or an error, so it was teardown, not a wait for data.
     pub fn discard(&self) {
-        self.clock.lock().open_since = None;
+        let mut clock = self.clock.lock();
+        clock.open_since = None;
+        clock.paused_at = None;
     }
 
     /// Everything accrued so far, the open span included. Not monotonic across
     /// [`Self::discard`], so readers keep a high-water mark.
     pub fn total(&self) -> Duration {
         let clock = self.clock.lock();
-        let (add, take_back) = self.unbanked(&clock, Instant::now(), self.work_nanos());
+        let (add, take_back) = self.unbanked(&clock, Self::now(&clock), self.work_nanos());
         clock.banked + add - take_back
     }
 
@@ -265,7 +250,7 @@ impl NodeTime {
     /// Bank the unbanked time. The work counter is read under the clock lock:
     /// a read taken before it could be older than `work_mark` and rewind it.
     fn bank(&self, clock: &mut Clock) {
-        let now = Instant::now();
+        let now = Self::now(clock);
         let work = self.work_nanos();
         let (add, take_back) = self.unbanked(clock, now, work);
         clock.banked = clock.banked + add - take_back;
@@ -274,6 +259,11 @@ impl NodeTime {
             clock.open_since = Some(now);
         }
         clock.work_mark = work;
+    }
+
+    /// The end of the time accrued so far: a paused span accrues nothing.
+    fn now(clock: &Clock) -> Instant {
+        clock.paused_at.unwrap_or_else(Instant::now)
     }
 
     fn take_whole_millis(clock: &mut Clock) -> u64 {
@@ -467,29 +457,6 @@ mod tests {
         compute.add_duration(Duration::from_secs(1));
         starved.close();
         assert_eq!(starved.total(), wait);
-    }
-
-    /// Closing at an instant before a flush takes back what the flush banked
-    /// after that instant.
-    #[test]
-    fn close_at_takes_back_time_flushed_after_it() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let id = "node_time::close_at";
-        init_recorder_with_node(id);
-        let timer = NodeTime::wall(get_metrics_recorder(), id, "starved", "");
-
-        timer.open();
-        std::thread::sleep(Duration::from_millis(10));
-        let ready = Instant::now();
-        std::thread::sleep(Duration::from_millis(30));
-        timer.flush();
-        timer.close_at(ready, None);
-
-        let total = timer.total();
-        assert!(
-            total >= Duration::from_millis(10) && total < Duration::from_millis(30),
-            "only the span up to `ready` counts, got {total:?}"
-        );
     }
 
     #[test]

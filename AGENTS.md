@@ -182,7 +182,7 @@ Who measures each state:
 
 A task-decoupled operator must claim the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext`, and bracket its input waits (`next`, `wait_input`) and sends (`send`); otherwise its work reads as `starved`. An operator that runs inner sources one after another reserves the meter (`TaskWaitMeter::reserve`) and lets each claim it in turn. The inner sources' own `WrappingExec`s share that reserved meter and emit no `node_wait`, so a hybrid source's whole triad is under its YAML name.
 
-Every series is a `NodeTime` (`telemetry/node_time.rs`): a process-wide flusher reports open spans every second, so a stalled wait shows while it lasts. An input wait ends when the input wakes the task (`telemetry/wake_timed.rs`), not when a prefetching consumer (`ready_chunks`) polls again: the gap is that consumer's `busy` (sink) or the edge's `blocked`. Whole milliseconds are emitted and the sub-millisecond remainder carries.
+Every series is a `NodeTime` (`telemetry/node_time.rs`): a process-wide flusher reports open spans every second, so a stalled wait shows while it lasts. An input wait pauses when the input wakes the task (`telemetry/wake_timed.rs`, switched in the waker so it shows live), not when a prefetching consumer (`ready_chunks`) polls again: the gap is that consumer's `busy` (sink) or the edge's `blocked`. Whole milliseconds are emitted and the sub-millisecond remainder carries.
 
 Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved`, `busy`, and unresolved `blocked`). Each partition of a node adds into the same series, so a node with N partitions can accrue N seconds per second: compare states as ratios, not as absolute rates.
 
