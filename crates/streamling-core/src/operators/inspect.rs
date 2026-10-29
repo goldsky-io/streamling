@@ -550,6 +550,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_singleton_behavior() {
+        // `INSTANCE` is a process-global `OnceLock` shared with every other test
+        // that touches `LiveDataInspect` — notably any `WrappingExec::execute`,
+        // which calls `get_instance()`. Whichever test initializes it first wins,
+        // so we cannot assume the config passed here actually takes effect.
         let instance1 = LiveDataInspect::create_instance(
             LiveDataInspectConfig {
                 records_per_topology_node: 5,
@@ -559,17 +563,11 @@ mod tests {
         );
         let instance2 = LiveDataInspect::get_instance();
 
+        // The core singleton invariant holds regardless of init order.
         assert!(
             std::ptr::eq(instance1, instance2),
             "Should return the same singleton instance"
         );
-
-        // Test that data persists across instance calls
-        let batch = create_test_batch(1, 10);
-        instance1.process("singleton_test", &batch).await;
-
-        // Should be able to access the same data from instance2
-        assert_eq!(instance2.get_stored_count("singleton_test"), 5);
     }
 
     #[tokio::test]
