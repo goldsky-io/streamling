@@ -318,7 +318,9 @@ fn flusher() -> &'static Mutex<Vec<Weak<NodeTime>>> {
     static TIMERS: Mutex<Vec<Weak<NodeTime>>> = Mutex::new(Vec::new());
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
-        std::thread::Builder::new()
+        // Without the flusher a span is still reported when it ends; only
+        // the live view of a long wait is lost.
+        let spawned = std::thread::Builder::new()
             .name("node-time-flush".into())
             .spawn(|| {
                 loop {
@@ -332,8 +334,12 @@ fn flusher() -> &'static Mutex<Vec<Weak<NodeTime>>> {
                         timer.flush();
                     }
                 }
-            })
-            .expect("spawn node-time flusher");
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "node-time flusher not started, open waits report only when they end: {e}"
+            );
+        }
     });
     &TIMERS
 }
