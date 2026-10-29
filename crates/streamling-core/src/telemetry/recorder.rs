@@ -1885,6 +1885,28 @@ mod tests {
     /// Tests for `merge_metadata_tags`. These tests touch the global
     /// `METRICS_RECORDER_INSTANCE`; a mutex serializes them so state from one test cannot
     /// bleed into another under parallel execution.
+    /// A user label named like a `node_wait` tag stays on every other metric;
+    /// on `node_wait` the per-call tag replaces it.
+    #[test]
+    fn node_wait_tags_replace_a_same_named_user_label() {
+        use crate::telemetry::recorder::test_support::{
+            TEST_LOCK, init_recorder_with_node, node_wait_ms,
+        };
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "recorder::state_label";
+        init_recorder_with_node(id);
+        merge_metadata_tags(id, vec![("state".into(), "prod".into())]);
+
+        get_metrics_recorder().record_count_w_tags(
+            "node_wait",
+            7,
+            vec![("state", "busy"), ("downstream_id", "")],
+            id,
+        );
+        assert_eq!(node_wait_ms(id, "busy", None), 7);
+        assert_eq!(node_wait_ms(id, "prod", None), 0);
+    }
+
     mod merge_metadata_tags_tests {
         use super::*;
         // Shared with the `WrappingExec`/`BroadcastStream` runtime metric tests

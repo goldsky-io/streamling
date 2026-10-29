@@ -137,7 +137,7 @@ sinks:
 Every source, transform, and sink accepts an optional `telemetry` block:
 
 - **`event_time`** — column that carries the record's event time; drives `streamling_event_time_watermark_milliseconds` and `streamling_event_time_lag_milliseconds` series. `unit` required for integer columns (`seconds`, `milliseconds`, `microseconds`).
-- **`labels`** — map of `key: value` identity labels attached to every metric this node emits. Use for dataset identity, tier/team tagging, destination tagging.
+- **`labels`** — map of `key: value` identity labels attached to every metric this node emits; on `node_wait`, a label named `state` or `downstream_id` is replaced by the metric's own tag. Use for dataset identity, tier/team tagging, destination tagging.
 
 Label constraints (enforced at config load):
 
