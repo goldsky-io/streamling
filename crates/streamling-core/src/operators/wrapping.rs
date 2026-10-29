@@ -895,6 +895,14 @@ impl ExecutionPlan for WrappingExec {
         });
 
         let schema = self.schema();
+        // A hybrid phase shares a meter that already holds the earlier
+        // phases' time; that time is not this phase's.
+        let fold_baseline = if inner_phase {
+            let totals = task_wait.totals();
+            totals.starved + totals.busy
+        } else {
+            Duration::ZERO
+        };
 
         let measured_stream = async_stream::stream! {
             // Lives as long as the stream: it accrues without spans.
@@ -904,7 +912,7 @@ impl ExecutionPlan for WrappingExec {
             // `folded_through` is the high-water mark of the accrued time
             // already folded.
             let mut fold = MillisAccumulator::default();
-            let mut folded_through = Duration::ZERO;
+            let mut folded_through = fold_baseline;
             let mut empty_batches =
                 EmptyBatchCounter::new(Arc::clone(&metrics_recorder), metric_metadata_id.clone());
             loop {
@@ -932,32 +940,30 @@ impl ExecutionPlan for WrappingExec {
                     }
                 }
 
-                let accrued = match &starved_time {
-                    Some(starved_time) => starved_time.total(),
-                    None => {
-                        let totals = task_wait.totals();
-                        totals.starved + totals.busy
-                    }
-                };
-                fold.add(accrued.saturating_sub(folded_through));
-                folded_through = folded_through.max(accrued);
-                let fold_ms = fold.take_whole_millis();
-                // A SQL transform folds a delivered batch's wait into that
+                // Only a delivered batch gets a sample: a terminal poll's wait
+                // belongs to no batch. A SQL transform folds the wait into that
                 // batch's compute delta (`record_execution_plan_metrics`), so
-                // the histogram keeps one observation per batch. A terminal poll
-                // records no batch, so its wait is folded on its own.
-                let sql_input_wait_ms =
-                    if has_own_work && matches!(batch_result, Some(Ok(_))) {
-                        fold_ms
-                    } else {
-                        0
+                // the histogram keeps one observation per batch.
+                let mut sql_input_wait_ms = 0;
+                if matches!(batch_result, Some(Ok(_))) {
+                    let accrued = match &starved_time {
+                        Some(starved_time) => starved_time.total(),
+                        None => {
+                            let totals = task_wait.totals();
+                            totals.starved + totals.busy
+                        }
                     };
-                let folded_ms = fold_ms - sql_input_wait_ms;
-                if folded_ms > 0 {
-                    metrics_recorder.record_elapsed_compute(
-                        Duration::from_millis(folded_ms),
-                        &metric_metadata_id,
-                    );
+                    fold.add(accrued.saturating_sub(folded_through));
+                    folded_through = folded_through.max(accrued);
+                    let fold_ms = fold.take_whole_millis();
+                    if has_own_work {
+                        sql_input_wait_ms = fold_ms;
+                    } else if fold_ms > 0 {
+                        metrics_recorder.record_elapsed_compute(
+                            Duration::from_millis(fold_ms),
+                            &metric_metadata_id,
+                        );
+                    }
                 }
 
                 let batch_result = match batch_result {
@@ -2269,8 +2275,8 @@ mod tests {
     }
 
     /// Task work that ends in an error is still the node's work: it is
-    /// `busy`, and the wrapper folds it into `elapsed_compute` on the terminal
-    /// poll, not only on polls that deliver a batch.
+    /// `busy`. A terminal poll delivers no batch, so it adds no
+    /// `elapsed_compute` sample.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
     async fn task_work_before_a_terminal_error_is_reported_as_busy() {
@@ -2305,9 +2311,51 @@ mod tests {
             busy >= 20,
             "30ms of task work before the error must be busy, got {busy}ms"
         );
+        assert_eq!(
+            elapsed_compute, 0,
+            "a terminal poll belongs to no batch, got {elapsed_compute}ms"
+        );
+    }
+
+    /// A hybrid phase's wrapper shares the hybrid's reserved meter. Its
+    /// `elapsed_compute` starts from the meter's total at that point: the
+    /// earlier phases' time is not this phase's.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_later_phase_does_not_fold_the_earlier_phases_time() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let parent_id = "phase_fold_parent";
+        let phase_id = "phase_fold_unbounded";
+        test_support::init_recorder_with_node(parent_id);
+        test_support::init_recorder_with_node(phase_id);
+
+        let ctx = SessionContext::new();
+        let (parent_ctx, _meter) =
+            TaskWaitMeter::install(&ctx.task_ctx(), get_metrics_recorder(), parent_id);
+        TaskWaitMeter::reserve(&parent_ctx);
+        // An earlier phase works for 50ms.
+        let earlier_phase = TaskWaitMeter::claim(&parent_ctx);
+        std::thread::sleep(Duration::from_millis(50));
+        drop(earlier_phase);
+
+        let mem_table = MemTable::try_new(test_schema(), vec![vec![test_batch()]]).unwrap();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let phase = Arc::new(WrappingExec::new(
+            source_exec,
+            phase_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+        let mut stream = phase.execute(0, parent_ctx).unwrap();
+        while stream.next().await.is_some() {}
+
+        let elapsed_compute = test_support::elapsed_compute_ms(phase_id);
         assert!(
-            elapsed_compute >= 20,
-            "the terminal poll must fold that work, got {elapsed_compute}ms"
+            elapsed_compute < 20,
+            "the earlier phase's 50ms must not land on this phase, got {elapsed_compute}ms"
         );
     }
 
