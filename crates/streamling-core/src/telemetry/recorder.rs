@@ -1758,6 +1758,8 @@ pub(crate) mod test_support {
     /// `state`, optionally also pinning `downstream_id`. Values are cumulative,
     /// so tests should use a unique node `id` to isolate from cross-test series.
     pub(crate) fn node_wait_ms(id: &str, state: &str, downstream_id: Option<&str>) -> u64 {
+        // Closed spans are banked, not emitted, until a flush.
+        crate::telemetry::node_time::flush_live();
         let mut rm = ResourceMetrics::default();
         harness()
             .reader

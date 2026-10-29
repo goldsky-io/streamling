@@ -1,10 +1,10 @@
 use crate::telemetry::recorder::MetricsRecorder;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use parking_lot::Mutex;
-use std::sync::{Arc, Once, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-/// How often open spans are reported while they are still running.
+/// How often banked time and open spans are reported.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One `node_wait{state, downstream_id}` series of one node stream.
@@ -12,7 +12,9 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// A span is reported as it accrues: a process-wide flusher banks every open
 /// span each [`FLUSH_INTERVAL`], so a stall shows on the dashboard while it
 /// lasts instead of as one spike when it ends (or never, if the pod dies
-/// first). Whole milliseconds are emitted and the sub-ms remainder carries.
+/// first). Only the flusher and `Drop` emit: a span's close just banks, so the
+/// data path never takes the recorder's locks. Whole milliseconds are emitted
+/// and the sub-ms remainder carries.
 pub struct NodeTime {
     recorder: Arc<MetricsRecorder>,
     metadata_id: String,
@@ -146,7 +148,7 @@ impl NodeTime {
             measure,
             clock: Mutex::new(Clock::default()),
         });
-        flusher().lock().push(Arc::downgrade(&timer));
+        register_live(&timer);
         timer
     }
 
@@ -160,16 +162,12 @@ impl NodeTime {
         }
     }
 
-    /// End the open span and report it.
+    /// End the open span; the next flush reports it.
     pub fn close(&self) {
-        let ms = {
-            let mut clock = self.clock.lock();
-            self.bank(&mut clock);
-            clock.open_since = None;
-            clock.paused_at = None;
-            Self::take_whole_millis(&mut clock)
-        };
-        self.emit(ms);
+        let mut clock = self.clock.lock();
+        self.bank(&mut clock);
+        clock.open_since = None;
+        clock.paused_at = None;
     }
 
     /// Stop the open span accruing, keeping it open: whether it is reported
@@ -303,35 +301,52 @@ impl Drop for NodeTime {
     }
 }
 
-/// The live timers, flushed by one background thread started on first use.
-fn flusher() -> &'static Mutex<Vec<Weak<NodeTime>>> {
-    static TIMERS: Mutex<Vec<Weak<NodeTime>>> = Mutex::new(Vec::new());
-    static STARTED: Once = Once::new();
-    STARTED.call_once(|| {
-        // Without the flusher a span is still reported when it ends; only
-        // the live view of a long wait is lost.
-        let spawned = std::thread::Builder::new()
+/// The live timers, flushed by one background thread.
+static LIVE: Mutex<Live> = Mutex::new(Live {
+    timers: Vec::new(),
+    flusher_started: false,
+});
+
+struct Live {
+    timers: Vec<Weak<NodeTime>>,
+    flusher_started: bool,
+}
+
+/// Track `timer` for the flusher, starting the flusher if it is not running.
+/// A failed start is retried by the next registration; until one succeeds,
+/// timers report only on `Drop`, when their stream ends.
+fn register_live(timer: &Arc<NodeTime>) {
+    let mut live = LIVE.lock();
+    if !live.flusher_started {
+        match std::thread::Builder::new()
             .name("node-time-flush".into())
             .spawn(|| {
                 loop {
                     std::thread::sleep(FLUSH_INTERVAL);
-                    let live: Vec<Arc<NodeTime>> = {
-                        let mut timers = TIMERS.lock();
-                        timers.retain(|timer| timer.strong_count() > 0);
-                        timers.iter().filter_map(Weak::upgrade).collect()
-                    };
-                    for timer in live {
-                        timer.flush();
-                    }
+                    flush_live();
                 }
-            });
-        if let Err(e) = spawned {
-            tracing::warn!(
-                "node-time flusher not started, open waits report only when they end: {e}"
-            );
+            }) {
+            Ok(_) => live.flusher_started = true,
+            Err(e) => tracing::warn!(
+                "node-time flusher not started, node_wait reports only when each stream ends: {e}"
+            ),
         }
-    });
-    &TIMERS
+    }
+    live.timers.retain(|timer| timer.strong_count() > 0);
+    live.timers.push(Arc::downgrade(timer));
+}
+
+/// Report every live timer's banked time and open spans.
+pub(crate) fn flush_live() {
+    let timers: Vec<Arc<NodeTime>> = LIVE
+        .lock()
+        .timers
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for timer in timers {
+        timer.flush();
+    }
 }
 
 #[cfg(test)]
