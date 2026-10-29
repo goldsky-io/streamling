@@ -23,7 +23,12 @@ For a normal single-consumer node, `WrappingExec` records:
 Every series is a `NodeTime`. A process-wide flusher reports each open span
 every second, so a wait shows while it lasts, not as one spike when it ends.
 The unflushed tail of a wait that ends in end-of-stream, an error, or
-cancellation is dropped.
+cancellation is dropped. A span's close only banks its time; the flusher and
+`Drop` emit, so the data path never takes the recorder's locks.
+
+DataFusion records a SQL transform's compute only when its poll ends. A flush
+during a poll banks `starved` only up to the poll's start, and the poll's
+`busy` shows when the poll ends.
 
 ### Task-decoupled operators
 
@@ -36,7 +41,8 @@ Such an operator claims the `TaskWaitMeter` its wrapper installs in the
 `TaskContext` and brackets its awaits:
 
 - input await (`next`, or `wait_input` for an external system) → `starved`;
-- output send await → neither (the edge's `blocked`, owned by the wrapper);
+- output send await → the edge's `blocked` (the wrapper hands its series to
+  the meter, and does not time `blocked` itself);
 - everything else in the task → `busy`.
 
 The meter then reports the node's `starved` and `busy`. A new task-decoupled operator must claim the
@@ -49,6 +55,10 @@ and decoding available data is `busy`. A hybrid source reserves the meter at
 `execute`, and each phase source claims it in turn; the latest claim owns it.
 Each phase's own `WrappingExec` shares the reserved meter and emits no
 `node_wait`, so the hybrid's triad is under its YAML name, not the phase ids.
+A phase's sends go to the hybrid driver, not the edge, so they are in no
+state. The driver times its own work (normalize) as `busy` and its edge sends
+as `blocked`. The phase and the driver run at the same time, so a hybrid's
+states can add up to more than its wall time.
 
 A plugin source cannot be split: the plugin fetches and decodes out of
 process, and the plugin protocol carries no wait signal. Its whole input poll
@@ -97,7 +107,12 @@ Each partition of a node runs its own `WrappingExec` stream, and all of them add
 into the same series: there is no partition label. A node with N partitions
 can accrue up to N seconds per second in each state. Compare a node's states
 as ratios (`state / (starved + busy + blocked)`); a ratio does not change with
-the partition count.
+the partition count. The states split one timeline per partition, so the
+ratios add up to 1, except where two timelines of one node overlap:
+
+- a hybrid source's phase and driver (see above);
+- a SQL transform's subtree compute that runs off its partition's task (a
+  repartition inside the subtree) while the wrapper is `blocked`.
 
 ### Sink service time
 
@@ -143,7 +158,8 @@ end-of-stream or an error is still dropped, not `starved`.
 
 Limits:
 
-- The gap includes scheduler delay between the wake and the task running.
+- The gap includes scheduler delay between the wake and the task running,
+  and tokio's cooperative yield, which defers a ready poll.
 - A connector that prefetches past end-of-stream writes its last chunk after
   the measured stream ended; that last write is not measured.
 - A wake that brings no batch (the next poll is `Pending` again) still
