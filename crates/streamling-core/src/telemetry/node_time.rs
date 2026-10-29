@@ -1,5 +1,5 @@
 use crate::telemetry::recorder::MetricsRecorder;
-use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet, Time};
 use parking_lot::Mutex;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -59,29 +59,32 @@ struct Clock {
 /// Cumulative `elapsed_compute` of one partition of a node's DataFusion subtree.
 #[derive(Debug, Clone)]
 pub struct OwnWork {
-    metrics: MetricsSet,
-    partition: usize,
+    /// This partition's compute timers, resolved once: they are shared
+    /// counters, so reading them stays live.
+    times: Arc<[Time]>,
 }
 
 impl OwnWork {
-    pub fn new(metrics: MetricsSet, partition: usize) -> Self {
-        Self { metrics, partition }
-    }
-
     /// Metrics without a partition are counted once, by partition 0. Exact
     /// when the subtree keeps its input partitioning; a repartition inside the
     /// subtree spreads one partition's work across others.
-    pub(crate) fn nanos(&self) -> u64 {
-        self.metrics
+    pub fn new(metrics: MetricsSet, partition: usize) -> Self {
+        let times = metrics
             .iter()
-            .filter(|metric| metric.partition().unwrap_or(0) == self.partition)
-            .map(|metric| match metric.value() {
-                MetricValue::ElapsedCompute(time) => time.value() as u64,
-                MetricValue::Time { name, time } if name == "elapsed_compute" => {
-                    time.value() as u64
-                }
-                _ => 0,
+            .filter(|metric| metric.partition().unwrap_or(0) == partition)
+            .filter_map(|metric| match metric.value() {
+                MetricValue::ElapsedCompute(time) => Some(time.clone()),
+                MetricValue::Time { name, time } if name == "elapsed_compute" => Some(time.clone()),
+                _ => None,
             })
+            .collect();
+        Self { times }
+    }
+
+    pub(crate) fn nanos(&self) -> u64 {
+        self.times
+            .iter()
+            .map(|time| time.value() as u64)
             .fold(0u64, u64::saturating_add)
     }
 }
