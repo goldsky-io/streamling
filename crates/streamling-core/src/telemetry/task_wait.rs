@@ -2,6 +2,7 @@ use crate::telemetry::node_time::NodeTime;
 use crate::telemetry::recorder::MetricsRecorder;
 use datafusion::execution::TaskContext;
 use futures::{Stream, StreamExt};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,10 +78,14 @@ impl TaskWaitMeter {
                 .session_config()
                 .clone()
                 .with_extension(Arc::clone(&meter)),
-            context.scalar_functions().clone(),
-            context.higher_order_functions().clone(),
-            context.aggregate_functions().clone(),
-            context.window_functions().clone(),
+            // ponytail: no function maps. Executing plans hold their resolved
+            // UDFs and nothing below a wrapper looks one up by name; copying
+            // ~450 keys per wrapper per partition bought nothing. A future
+            // `context.udf(name)` below a wrapper must copy them back.
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
             context.runtime_env(),
         );
         (Arc::new(child), meter)
