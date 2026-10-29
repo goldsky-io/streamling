@@ -1056,10 +1056,10 @@ pub fn initialize_metrics_recorder(
 ///
 /// # Compatibility
 ///
-/// This helper registers both `node_wait` and `elapsed_compute`. The input-wait
-/// fold into `elapsed_compute` is implemented in `WrappingExec` for dashboard
-/// compatibility; keep that runtime behavior separate from this registration
-/// helper.
+/// This helper registers both `node_wait` and `elapsed_compute`. The poll-time
+/// `elapsed_compute` of a non-SQL node is recorded in `WrappingExec` for
+/// dashboard compatibility; keep that runtime behavior separate from this
+/// registration helper.
 fn build_metrics_recorder(
     metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
 ) -> MetricsRecorder {
@@ -1829,9 +1829,7 @@ pub(crate) mod test_support {
     }
 
     /// Sum the `streamling_elapsed_compute` histogram's recorded values (in ms)
-    /// for the given node `id`. The input-wait span folded into
-    /// `elapsed_compute` must use the same remainder-carrying quantization as
-    /// `starved`, so the two never drift.
+    /// for the given node `id`.
     pub(crate) fn elapsed_compute_ms(id: &str) -> u64 {
         elapsed_compute_histogram(id).0
     }

@@ -8,7 +8,6 @@ use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, Share
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
-use crate::telemetry::MillisAccumulator;
 use crate::telemetry::node_time::{NodeTime, OwnWork};
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::task_wait::TaskWaitMeter;
@@ -867,27 +866,10 @@ impl ExecutionPlan for WrappingExec {
         let mut input = WakeTimed::new(data, starved_time.clone(), blocked_time.clone());
 
         let schema = self.schema();
-        // A hybrid phase shares a meter that already holds the earlier
-        // phases' time; that time is not this phase's.
-        let fold_baseline = if inner_phase {
-            let totals = task_wait.totals();
-            totals.starved + totals.busy
-        } else {
-            Duration::ZERO
-        };
 
         let measured_stream = async_stream::stream! {
             // Lives as long as the stream: it accrues without spans.
             let _busy_time = busy_time;
-            // Outside a SQL transform, `elapsed_compute` keeps its `main`
-            // meaning: the node's poll time, so `starved` (and a task
-            // operator's `busy`) is folded into it. A SQL transform's is its
-            // DataFusion compute alone. `folded_through` is the high-water mark
-            // of the accrued time already folded.
-            // TODO(node-wait stage 3): delete the fold once dashboards read
-            // `node_wait{state="busy"}` and a batch counter.
-            let mut fold = MillisAccumulator::default();
-            let mut folded_through = fold_baseline;
             let mut empty_batches =
                 EmptyBatchCounter::new(Arc::clone(&metrics_recorder), metric_metadata_id.clone());
             loop {
@@ -900,27 +882,16 @@ impl ExecutionPlan for WrappingExec {
 
                 // A downstream that polls again only after our input is
                 // ready holds us back from that wake: `blocked`.
+                let poll_start = Instant::now();
                 let batch_result = input.next().await;
 
-                // Only a delivered batch gets a sample: a terminal poll's wait
-                // belongs to no batch.
+                // `elapsed_compute` is this wrapper's poll time per delivered
+                // batch, as on `main`, unless the node is a SQL transform with
+                // subtree metrics: its observation is that compute alone.
+                // TODO(node-wait stage 3, STRM-6760): delete once dashboards
+                // read `node_wait{state="busy"}` and a batch counter.
                 if !has_own_work && matches!(batch_result, Some(Ok(_))) {
-                    let accrued = match &starved_time {
-                        Some(starved_time) => starved_time.total(),
-                        None => {
-                            let totals = task_wait.totals();
-                            totals.starved + totals.busy
-                        }
-                    };
-                    fold.add(accrued.saturating_sub(folded_through));
-                    folded_through = folded_through.max(accrued);
-                    let fold_ms = fold.take_whole_millis();
-                    if fold_ms > 0 {
-                        metrics_recorder.record_elapsed_compute(
-                            Duration::from_millis(fold_ms),
-                            &metric_metadata_id,
-                        );
-                    }
+                    metrics_recorder.record_elapsed_compute(poll_start.elapsed(), &metric_metadata_id);
                 }
 
                 let batch_result = match batch_result {
@@ -2268,45 +2239,115 @@ mod tests {
         );
     }
 
-    /// A hybrid phase's wrapper shares the hybrid's reserved meter. Its
-    /// `elapsed_compute` starts from the meter's total at that point: the
-    /// earlier phases' time is not this phase's.
+    /// Claims the meter like a task-decoupled operator (Kafka source,
+    /// handler): a spawned task reads the input, works `work` per batch, and
+    /// sends into a bounded channel the stream reads.
+    #[derive(Debug)]
+    struct BufferedWorkExec {
+        inner: Arc<dyn ExecutionPlan>,
+        work: Duration,
+    }
+
+    impl DisplayAs for BufferedWorkExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "BufferedWorkExec")
+        }
+    }
+
+    impl ExecutionPlan for BufferedWorkExec {
+        fn name(&self) -> &str {
+            "BufferedWorkExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(BufferedWorkExec {
+                inner: children.swap_remove(0),
+                work: self.work,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let mut input = self.inner.execute(partition, context)?;
+            let work = self.work;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            // Stands in for the operator's own task; the test owns its lifetime.
+            #[allow(clippy::disallowed_methods)]
+            tokio::spawn(async move {
+                while let Some(item) = task_wait.next(&mut input).await {
+                    tokio::time::sleep(work).await;
+                    if task_wait.send(tx.send(item)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let stream = async_stream::stream! {
+                while let Some(item) = rx.recv().await {
+                    yield item;
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                stream,
+            )))
+        }
+    }
+
+    /// Outside a SQL transform, `elapsed_compute` keeps its `main` meaning:
+    /// the wrapper's poll time per batch. A task operator that already
+    /// buffered its output answers each poll at once, whatever its task's
+    /// work, so the series must not carry that work.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
-    async fn a_later_phase_does_not_fold_the_earlier_phases_time() {
+    async fn task_operator_elapsed_compute_is_the_wrapper_poll_time() {
         use crate::telemetry::recorder::test_support;
 
         let _guard = test_support::TEST_LOCK.lock().unwrap();
-        let parent_id = "phase_fold_parent";
-        let phase_id = "phase_fold_unbounded";
-        test_support::init_recorder_with_node(parent_id);
-        test_support::init_recorder_with_node(phase_id);
+        let node_id = "buffered_task_poll_time";
+        test_support::init_recorder_with_node(node_id);
 
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(5).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
         let ctx = SessionContext::new();
-        let (parent_ctx, _meter) =
-            TaskWaitMeter::install(&ctx.task_ctx(), get_metrics_recorder(), parent_id);
-        TaskWaitMeter::reserve(&parent_ctx);
-        // An earlier phase works for 50ms.
-        let earlier_phase = TaskWaitMeter::claim(&parent_ctx);
-        std::thread::sleep(Duration::from_millis(50));
-        drop(earlier_phase);
-
-        let mem_table = MemTable::try_new(test_schema(), vec![vec![test_batch()]]).unwrap();
         let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
-        let phase = Arc::new(WrappingExec::new(
-            source_exec,
-            phase_id.to_string(),
+        let wrapping = Arc::new(WrappingExec::new(
+            Arc::new(BufferedWorkExec {
+                inner: source_exec,
+                work: Duration::from_millis(20),
+            }),
+            node_id.to_string(),
             vec![],
             vec![],
             None,
         ));
-        let mut stream = phase.execute(0, parent_ctx).unwrap();
-        while stream.next().await.is_some() {}
 
-        let elapsed_compute = test_support::elapsed_compute_ms(phase_id);
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        // The task works through every batch before the first poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(busy >= 80, "5 x 20ms task work is busy, got {busy}ms");
         assert!(
-            elapsed_compute < 20,
-            "the earlier phase's 50ms must not land on this phase, got {elapsed_compute}ms"
+            elapsed_compute < 10,
+            "every poll found a buffered batch, got elapsed_compute {elapsed_compute}ms"
         );
     }
 
@@ -2471,84 +2512,6 @@ mod tests {
         assert_eq!(
             test_support::counter_total("node_empty_batches", node_id),
             200
-        );
-    }
-
-    /// Regression: the input-wait span dual-emitted into `elapsed_compute` and
-    /// `node_wait{state="starved"}` must use identical quantization.
-    ///
-    /// `starved` carries the sub-ms remainder, so if
-    /// `elapsed_compute` instead floors each batch independently it drops that
-    /// remainder and its input-wait portion falls *below* `starved` — exactly
-    /// the case the accumulator was meant to fix. This node is a non-SQL source
-    /// with no subtree metrics, so `elapsed_compute` is only the folded
-    /// input-wait (series existence is seeded once per node at pipeline start,
-    /// not per batch):
-    ///
-    /// ```text
-    /// elapsed_compute == starved (folded input-wait)
-    /// ```
-    ///
-    /// Both series derive from the same integer whole-ms drains, so this holds
-    /// exactly regardless of scheduling jitter. Pre-fix, the floored input-wait
-    /// is strictly less than `starved` whenever any sub-ms remainder accrues, so
-    /// the equality fails.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
-    async fn elapsed_compute_input_wait_fold_matches_starved_quantization() {
-        use crate::telemetry::recorder::test_support;
-
-        let _guard = test_support::TEST_LOCK.lock().unwrap();
-        let node_id = "busy_quantization_source";
-        test_support::init_recorder_with_node(node_id);
-
-        const NUM_BATCHES: u64 = 30;
-
-        let schema = test_schema();
-        // Each batch carries a fractional-ms input wait (~1.5ms). Per-batch
-        // flooring would drop ~0.5ms every batch, so across many batches the
-        // dropped remainder accrues to several whole milliseconds — enough to
-        // pull a floored `elapsed_compute` below the remainder-carrying `starved`.
-        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch)
-            .take(NUM_BATCHES as usize)
-            .collect();
-        let mem_table = MemTable::try_new(schema.clone(), vec![batches]).unwrap();
-        let ctx = SessionContext::new();
-        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
-
-        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
-            inner: source_exec,
-            per_batch_delay: Duration::from_micros(1_500),
-        });
-
-        let wrapping = Arc::new(WrappingExec::new(
-            slow_input,
-            node_id.to_string(),
-            vec![],
-            vec![],
-            None,
-        ));
-
-        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
-        while let Some(batch) = stream.next().await {
-            batch.expect("batch must be Ok");
-        }
-
-        let starved = test_support::node_wait_ms(node_id, "starved", None);
-        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
-
-        // Real starvation must have been recorded, otherwise the comparison is
-        // vacuous (a stuck source would report 0 for both).
-        assert!(
-            starved >= 10,
-            "expected real starvation to be recorded, got starved={starved}ms"
-        );
-        // Folded input-wait must equal `starved` exactly (identical
-        // quantization), never corrupted by dropped sub-ms remainders.
-        assert_eq!(
-            elapsed_compute, starved,
-            "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms); \
-             a mismatch means the input-wait fold used a different quantization than starved"
         );
     }
 

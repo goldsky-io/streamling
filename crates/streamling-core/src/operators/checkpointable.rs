@@ -1568,9 +1568,9 @@ mod tests {
         );
     }
 
-    /// The input-wait fold must ride the SQL node's per-batch compute
-    /// observation, not add a second one: per-batch histogram panels (p50/p95,
-    /// `_sum / _count`) would otherwise mix compute samples with wait samples.
+    /// A SQL node records at most one `elapsed_compute` observation per batch,
+    /// its subtree compute: per-batch histogram panels (p50/p95,
+    /// `_sum / _count`) read it per batch.
     // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -1607,12 +1607,10 @@ mod tests {
             "expected at most one elapsed_compute observation per batch \
              ({NUM_BATCHES} batches), got {samples}"
         );
-        let starved = test_support::node_wait_ms(node_id, "starved", None);
         let elapsed_compute = test_support::elapsed_compute_ms(node_id);
         assert!(
-            elapsed_compute >= starved + 24,
-            "elapsed_compute ({elapsed_compute}ms) must carry the folded input wait \
-             (starved {starved}ms) plus the subtree compute"
+            elapsed_compute >= 24,
+            "elapsed_compute ({elapsed_compute}ms) must carry the subtree compute"
         );
     }
 

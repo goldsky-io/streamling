@@ -39,8 +39,7 @@ Such an operator claims the `TaskWaitMeter` its wrapper installs in the
 - output send await → neither (the edge's `blocked`, owned by the wrapper);
 - everything else in the task → `busy`.
 
-The meter then reports the node's `starved` and `busy`, and the wrapper only
-folds them into `elapsed_compute`. A new task-decoupled operator must claim the
+The meter then reports the node's `starved` and `busy`. A new task-decoupled operator must claim the
 meter, or its work reads as `starved`. Brackets end when their future is
 dropped, so a wait inside a losing `select!` branch still counts.
 
@@ -238,11 +237,11 @@ can duplicate the host-owned edge.
   service instances.
 - `downstream_id=""` is only the unresolved linear fallback. It should be rare.
 
-`elapsed_compute` retains historical semantics for `WrappingExec`: the node's
-`starved` time (and a task operator's `busy`) is folded into it, one
-observation per batch. A SQL transform's observation is its subtree compute
-only, as before `node_wait`. The fold is temporary: it goes once dashboards
-read `state="busy"` and a batch counter. Read busy from `state="busy"`, never as
+`elapsed_compute` keeps its `main` semantics for `WrappingExec`: one
+observation per delivered batch, the wrapper's input poll time. A SQL
+transform's observation is its subtree compute only (one without subtree
+metrics records poll time). The poll-time observation
+is temporary: it goes once dashboards read `state="busy"` and a batch counter. Read busy from `state="busy"`, never as
 `elapsed_compute - starved`. Sink connector service time is unaffected by this
 compatibility rule.
 
