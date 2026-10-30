@@ -1761,6 +1761,12 @@ pub(crate) mod test_support {
     pub(crate) fn node_wait_ms(id: &str, state: &str, downstream_id: Option<&str>) -> u64 {
         // Closed spans are banked, not emitted, until a flush.
         crate::telemetry::node_time::flush_live();
+        emitted_node_wait_ms(id, state, downstream_id)
+    }
+
+    /// Like [`node_wait_ms`], without flushing: only what the background
+    /// flusher or a `Drop` already emitted.
+    pub(crate) fn emitted_node_wait_ms(id: &str, state: &str, downstream_id: Option<&str>) -> u64 {
         let mut rm = ResourceMetrics::default();
         harness()
             .reader

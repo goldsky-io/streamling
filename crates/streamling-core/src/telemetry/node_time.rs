@@ -426,7 +426,7 @@ mod tests {
     use super::*;
     use crate::telemetry::recorder::get_metrics_recorder;
     use crate::telemetry::recorder::test_support::{
-        TEST_LOCK, init_recorder_with_node, node_wait_ms,
+        TEST_LOCK, emitted_node_wait_ms, init_recorder_with_node, node_wait_ms,
     };
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 
@@ -439,7 +439,8 @@ mod tests {
 
         timer.open();
         std::thread::sleep(FLUSH_INTERVAL * 2 + Duration::from_millis(300));
-        let while_open = node_wait_ms(id, "blocked", Some("down"));
+        // No manual flush: the background flusher reports the open span.
+        let while_open = emitted_node_wait_ms(id, "blocked", Some("down"));
         assert!(
             while_open >= FLUSH_INTERVAL.as_millis() as u64,
             "a stalled wait must show before it ends, got {while_open}ms"
