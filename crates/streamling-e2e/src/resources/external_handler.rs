@@ -186,13 +186,13 @@ impl ExternalHandlerResource {
         format!("{}/handler_slim_batch_envelope", self.url)
     }
 
-    /// Get the URL for the passthrough handler
     /// Set an artificial per-request processing delay, making this a
     /// deliberately slow handler. Takes effect for subsequent requests.
     pub fn set_delay(&self, delay: Duration) {
         *self.state.response_delay.lock().unwrap() = delay;
     }
 
+    /// Get the URL for the passthrough handler
     pub fn passthrough_handler_url(&self) -> String {
         format!("{}/handler_passthrough", self.url)
     }

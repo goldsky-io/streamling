@@ -1025,7 +1025,7 @@ impl DataSink for WrappingDataSink {
         // `starved`: the sink waiting on upstream, measured like
         // `WrappingExec`'s. `busy`: the sink holding a delivered batch until it
         // asks for the next one (connector write, and backpressure from the
-        // destination). No fold into `elapsed_compute`: a sink's is
+        // destination). Neither feeds `elapsed_compute`: a sink's is
         // connector-recorded service time.
         let starved_time = NodeTime::wall(
             Arc::clone(&metrics_recorder),

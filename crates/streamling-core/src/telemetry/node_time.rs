@@ -222,13 +222,15 @@ impl NodeTime {
         self.clock.lock().open_since = None;
     }
 
-    /// Everything accrued so far, the open span included. Not monotonic across
-    /// [`Self::discard`], so readers keep a high-water mark.
+    /// Everything accrued so far, the open span included: what a flush now
+    /// would bank, without banking it.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn total(&self) -> Duration {
         let clock = self.clock.lock();
-        let (now, work) = self.accrued_to(&clock);
-        let (add, take_back) = self.unbanked(&clock, now, work);
-        clock.banked + add - take_back
+        self.accrual(&clock)
+            .map_or(clock.banked, |(_, _, add, take_back)| {
+                clock.banked + add - take_back
+            })
     }
 
     fn work_nanos(&self) -> u64 {
@@ -266,18 +268,26 @@ impl NodeTime {
     /// Bank the unbanked time. The work counter is read under the clock lock:
     /// a read taken before it could be older than `work_mark` and rewind it.
     fn bank(&self, clock: &mut Clock) {
-        let (now, work) = self.accrued_to(clock);
-        if clock.open_since.is_some_and(|since| since > now) {
-            // The span opened after a running poll started: nothing accrued.
+        let Some((now, work, add, take_back)) = self.accrual(clock) else {
             return;
-        }
-        let (add, take_back) = self.unbanked(clock, now, work);
+        };
         clock.banked = clock.banked + add - take_back;
         clock.span_banked = clock.span_banked + add - take_back;
         if clock.open_since.is_some() {
             clock.open_since = Some(now);
         }
         clock.work_mark = work;
+    }
+
+    /// [`Self::unbanked`] up to [`Self::accrued_to`], with that end. `None`
+    /// when the span opened after a running poll started: nothing accrued.
+    fn accrual(&self, clock: &Clock) -> Option<(Instant, u64, Duration, Duration)> {
+        let (now, work) = self.accrued_to(clock);
+        if clock.open_since.is_some_and(|since| since > now) {
+            return None;
+        }
+        let (add, take_back) = self.unbanked(clock, now, work);
+        Some((now, work, add, take_back))
     }
 
     /// The end of the time accrued so far, with the work counter then:

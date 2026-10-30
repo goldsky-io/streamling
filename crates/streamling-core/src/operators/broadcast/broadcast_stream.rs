@@ -47,15 +47,13 @@ struct BroadcastState {
 
 /// A registered consumer plus the flag that poisons its stream when the
 /// broadcast abandons it (see `run_broadcast`'s failure handling).
-/// `downstream_id` names the sink/transform this consumer feeds so blocked-send
-/// time can be attributed; empty when attribution does not apply (passthrough
-/// output).
 #[derive(Clone, Debug)]
 struct ConsumerSlot {
     tx: Sender<DFResult<RecordBatch>>,
     abandoned: Arc<AtomicBool>,
-    /// This consumer's blocked-send time. One per consumer: two consumers can
-    /// feed the same downstream, and their sends overlap.
+    /// This consumer's blocked-send time, tagged with the downstream it feeds;
+    /// `None` when not attributed (see `add_consumer`). One per consumer: two
+    /// consumers can feed the same downstream, and their sends overlap.
     blocked_time: Option<Arc<NodeTime>>,
 }
 

@@ -66,3 +66,4 @@ lz4_flex.workspace = true
 mockito.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 streamling-state = { workspace = true, features = ["test-utils"] }
+streamling-core = { workspace = true, features = ["test-utils"] }

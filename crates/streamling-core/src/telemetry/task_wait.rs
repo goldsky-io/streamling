@@ -70,6 +70,7 @@ impl fmt::Debug for TaskWaitMeter {
 }
 
 /// Time accrued by a [`TaskWaitMeter`], open spans included.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TaskWaitTotals {
     pub starved: Duration,
@@ -212,6 +213,7 @@ impl TaskWaitMeter {
         self.timers.get().is_some()
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn totals(&self) -> TaskWaitTotals {
         self.timers
             .get()

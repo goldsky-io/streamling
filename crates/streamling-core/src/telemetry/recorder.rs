@@ -1889,9 +1889,6 @@ mod tests {
     use crate::node_context::{NodeContext, TopologyNodeType};
     use crate::telemetry::PipelineMetricMetadata;
 
-    /// Tests for `merge_metadata_tags`. These tests touch the global
-    /// `METRICS_RECORDER_INSTANCE`; a mutex serializes them so state from one test cannot
-    /// bleed into another under parallel execution.
     /// A user label named like a `node_wait` tag stays on every other metric;
     /// on `node_wait` the per-call tag replaces it.
     #[test]
@@ -1914,6 +1911,9 @@ mod tests {
         assert_eq!(node_wait_ms(id, "prod", None), 0);
     }
 
+    /// Tests for `merge_metadata_tags`. These tests touch the global
+    /// `METRICS_RECORDER_INSTANCE`; a mutex serializes them so state from one test cannot
+    /// bleed into another under parallel execution.
     mod merge_metadata_tags_tests {
         use super::*;
         // Shared with the `WrappingExec`/`BroadcastStream` runtime metric tests
