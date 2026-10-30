@@ -867,7 +867,11 @@ impl ExecutionPlan for WrappingExec {
         });
         // A task operator times `blocked` as its output send wait; otherwise
         // it is this wrapper's yield->resume.
-        let blocked_time = blocked_time.filter(|_| !task_claimed);
+        let (blocked_time, task_blocked) = if task_claimed {
+            (None, blocked_time)
+        } else {
+            (blocked_time, None)
+        };
 
         let mut input = WakeTimed::new(data, starved_time.clone(), blocked_time.clone());
 
@@ -907,6 +911,11 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
+                        // Our own work on the batch holds the task's send
+                        // back, not the downstream: in no state.
+                        if let Some(task_blocked) = &task_blocked {
+                            task_blocked.pause();
+                        }
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
@@ -960,6 +969,9 @@ impl ExecutionPlan for WrappingExec {
 
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
+                        if let Some(task_blocked) = &task_blocked {
+                            task_blocked.resume();
+                        }
                         // Until the downstream asks again, this node is blocked.
                         if let Some(blocked_time) = &blocked_time {
                             blocked_time.open();
@@ -2252,6 +2264,7 @@ mod tests {
     struct BufferedWorkExec {
         inner: Arc<dyn ExecutionPlan>,
         work: Duration,
+        capacity: usize,
     }
 
     impl DisplayAs for BufferedWorkExec {
@@ -2280,6 +2293,7 @@ mod tests {
             Ok(Arc::new(BufferedWorkExec {
                 inner: children.swap_remove(0),
                 work: self.work,
+                capacity: self.capacity,
             }))
         }
         fn execute(
@@ -2290,7 +2304,7 @@ mod tests {
             let task_wait = TaskWaitMeter::claim(&context);
             let mut input = self.inner.execute(partition, context)?;
             let work = self.work;
-            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(self.capacity);
             // Stands in for the operator's own task; the test owns its lifetime.
             #[allow(clippy::disallowed_methods)]
             tokio::spawn(async move {
@@ -2376,6 +2390,7 @@ mod tests {
                 Arc::new(BufferedWorkExec {
                     inner: source_exec,
                     work: Duration::from_millis(20),
+                    capacity: 16,
                 }),
                 node_id.to_string(),
                 vec![],
@@ -2400,6 +2415,60 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct SlowSideOutput(Duration);
+
+    #[async_trait]
+    impl SourceSideOutput for SlowSideOutput {
+        async fn process(&self, _batch: &RecordBatch) -> Result<()> {
+            tokio::time::sleep(self.0).await;
+            Ok(())
+        }
+    }
+
+    /// The wrapper's own work on a batch (side outputs) keeps it from taking
+    /// the next one, so a task operator's send waits. That wait is not the
+    /// downstream's doing, so it is not the edge's `blocked`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_task_operators_send_is_not_blocked_by_the_wrappers_own_work() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "task_send_waits_on_side_outputs";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(5).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(
+            WrappingExec::new(
+                Arc::new(BufferedWorkExec {
+                    inner: source_exec,
+                    work: Duration::ZERO,
+                    capacity: 1,
+                }),
+                node_id.to_string(),
+                vec![Arc::new(SlowSideOutput(Duration::from_millis(50)))],
+                vec![],
+                None,
+            )
+            .with_downstream_id("fast_sink".to_string()),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("fast_sink"));
+        assert!(
+            blocked < 30,
+            "the downstream polled at once; the send waited on side outputs, got blocked {blocked}ms"
+        );
+    }
+
     /// Outside a SQL transform, `elapsed_compute` keeps its `main` meaning:
     /// the wrapper's poll time per batch. A task operator that already
     /// buffered its output answers each poll at once, whatever its task's
@@ -2421,6 +2490,7 @@ mod tests {
             Arc::new(BufferedWorkExec {
                 inner: source_exec,
                 work: Duration::from_millis(20),
+                capacity: 16,
             }),
             node_id.to_string(),
             vec![],

@@ -24,7 +24,8 @@ use std::time::Duration;
 ///
 /// Time awaiting an output send is the edge's `blocked`: the wrapper hands its
 /// `blocked` series to the meter at install. A slow downstream holds the task
-/// back only once the output channel is full.
+/// back only once the output channel is full. The wrapper pauses that series
+/// while it works on a batch, which holds the task back too.
 pub struct TaskWaitMeter {
     recorder: Arc<MetricsRecorder>,
     metadata_id: String,

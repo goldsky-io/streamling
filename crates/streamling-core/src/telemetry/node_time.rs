@@ -46,7 +46,8 @@ enum Measure {
 #[derive(Debug, Default)]
 struct Clock {
     open_since: Option<Instant>,
-    /// The open span stopped accruing here, until it resumes or ends.
+    /// Nothing accrues from here until `resume`, whichever spans open or
+    /// close meanwhile.
     paused_at: Option<Instant>,
     /// A poll that runs the node's own work started here, with the work
     /// counter then. Its compute is recorded only when it ends, so nothing
@@ -163,7 +164,7 @@ impl NodeTime {
     pub fn open(&self) {
         let mut clock = self.clock.lock();
         if clock.open_since.is_none() {
-            clock.open_since = Some(Instant::now());
+            clock.open_since = Some(Self::now(&clock));
             clock.work_mark = self.work_nanos();
             clock.span_banked = Duration::ZERO;
         }
@@ -174,15 +175,14 @@ impl NodeTime {
         let mut clock = self.clock.lock();
         self.bank(&mut clock);
         clock.open_since = None;
-        clock.paused_at = None;
     }
 
-    /// Stop the open span accruing, keeping it open: whether it is reported
-    /// (`close`) or dropped (`discard`) is decided when it ends. Called from a
-    /// waker, on whatever thread wakes the task.
+    /// Stop accruing until `resume`. An open span stays open: whether it is
+    /// reported (`close`) or dropped (`discard`) is decided when it ends.
+    /// Called from a waker, on whatever thread wakes the task.
     pub(crate) fn pause(&self) {
         let mut clock = self.clock.lock();
-        if clock.open_since.is_some() && clock.paused_at.is_none() {
+        if clock.paused_at.is_none() {
             clock.paused_at = Some(Instant::now());
         }
     }
@@ -210,9 +210,7 @@ impl NodeTime {
     /// End the open span without reporting its unflushed part: the wait ended
     /// in end-of-stream or an error, so it was teardown, not a wait for data.
     pub fn discard(&self) {
-        let mut clock = self.clock.lock();
-        clock.open_since = None;
-        clock.paused_at = None;
+        self.clock.lock().open_since = None;
     }
 
     /// Everything accrued so far, the open span included. Not monotonic across

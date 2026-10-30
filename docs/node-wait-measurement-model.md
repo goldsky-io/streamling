@@ -43,7 +43,9 @@ Such an operator claims the `TaskWaitMeter` its wrapper installs in the
 
 - input await (`next`, or `wait_input` for an external system) → `starved`;
 - output send await → the edge's `blocked` (the wrapper hands its series to
-  the meter, and does not time `blocked` itself);
+  the meter, and does not time `blocked` itself). While the wrapper works on a
+  batch it took (side outputs, live inspect), it pauses that series: a send
+  held back by the wrapper is in no state;
 - everything else in the task → `busy`.
 
 The meter then reports the node's `starved` and `busy`. A new task-decoupled operator must claim the
