@@ -1,7 +1,8 @@
 use crate::telemetry::recorder::MetricsRecorder;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet, Time};
 use parking_lot::Mutex;
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 /// How often banked time and open spans are reported.
@@ -175,6 +176,7 @@ impl NodeTime {
 
     /// End the open span; the next flush reports it.
     pub fn close(&self) {
+        FLUSHER.ensure_started(spawn_flusher);
         let mut clock = self.clock.lock();
         self.bank(&mut clock);
         clock.open_since = None;
@@ -337,45 +339,80 @@ impl Drop for NodeTime {
 }
 
 /// The live timers, flushed by one background thread.
-static LIVE: Mutex<Live> = Mutex::new(Live {
-    timers: Vec::new(),
-    flusher_started: false,
-});
+static LIVE: Mutex<Vec<Weak<NodeTime>>> = Mutex::new(Vec::new());
 
-struct Live {
-    timers: Vec<Weak<NodeTime>>,
-    flusher_started: bool,
+static FLUSHER: Flusher = Flusher::new();
+
+/// Starts the flusher thread. Every timer registers at plan start, so a
+/// start that fails then is retried from `close`: one atomic load once it
+/// runs, and at most one spawn attempt per [`FLUSH_INTERVAL`] until it does.
+struct Flusher {
+    started: AtomicBool,
+    /// Milliseconds since [`Flusher::clock`] before which no attempt is made.
+    next_attempt_ms: AtomicU64,
 }
 
-/// Track `timer` for the flusher, starting the flusher if it is not running.
-/// A failed start is retried by the next registration; until one succeeds,
-/// timers report only on `Drop`, when their stream ends.
-fn register_live(timer: &Arc<NodeTime>) {
-    let mut live = LIVE.lock();
-    if !live.flusher_started {
-        match std::thread::Builder::new()
-            .name("node-time-flush".into())
-            .spawn(|| {
-                loop {
-                    std::thread::sleep(FLUSH_INTERVAL);
-                    flush_live();
-                }
-            }) {
-            Ok(_) => live.flusher_started = true,
+impl Flusher {
+    const fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            next_attempt_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn clock() -> u64 {
+        static START: OnceLock<Instant> = OnceLock::new();
+        u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn ensure_started(&self, spawn: fn() -> std::io::Result<()>) {
+        if self.started.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Self::clock();
+        let next = self.next_attempt_ms.load(Ordering::Acquire);
+        let retry_at = now.saturating_add(FLUSH_INTERVAL.as_millis() as u64);
+        if now < next
+            || self
+                .next_attempt_ms
+                .compare_exchange(next, retry_at, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        match spawn() {
+            Ok(()) => self.started.store(true, Ordering::Release),
             Err(e) => tracing::warn!(
-                "node-time flusher not started, node_wait reports only when each stream ends: {e}"
+                "node-time flusher not started, retrying; until then node_wait reports only when each stream ends: {e}"
             ),
         }
     }
-    live.timers.retain(|timer| timer.strong_count() > 0);
-    live.timers.push(Arc::downgrade(timer));
+}
+
+fn spawn_flusher() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("node-time-flush".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(FLUSH_INTERVAL);
+                flush_live();
+            }
+        })
+        .map(drop)
+}
+
+/// Track `timer` for the flusher, starting the flusher if it is not running.
+fn register_live(timer: &Arc<NodeTime>) {
+    FLUSHER.ensure_started(spawn_flusher);
+    let mut live = LIVE.lock();
+    live.retain(|timer| timer.strong_count() > 0);
+    live.push(Arc::downgrade(timer));
 }
 
 /// Report every live timer's banked time and open spans.
 pub(crate) fn flush_live() {
     let timers: Vec<Arc<NodeTime>> = LIVE
         .lock()
-        .timers
         .iter()
         .filter_map(Weak::upgrade)
         .collect();
@@ -536,6 +573,34 @@ mod tests {
             total >= waited && total < waited + Duration::from_millis(20),
             "waited {waited:?}, got {total:?}"
         );
+    }
+
+    /// A failed flusher start is retried later, at most once per interval,
+    /// and never again once it runs.
+    #[test]
+    fn a_failed_flusher_start_is_retried() {
+        static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+        fn fail() -> std::io::Result<()> {
+            ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::other("no threads"))
+        }
+        fn succeed() -> std::io::Result<()> {
+            ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        let flusher = Flusher::new();
+
+        flusher.ensure_started(fail);
+        flusher.ensure_started(succeed);
+        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1, "one attempt per interval");
+
+        std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(10));
+        flusher.ensure_started(succeed);
+        flusher.ensure_started(fail);
+        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
+        std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(10));
+        flusher.ensure_started(fail);
+        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2, "a running flusher is not restarted");
     }
 
     #[test]
