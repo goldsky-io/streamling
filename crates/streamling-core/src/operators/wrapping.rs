@@ -498,8 +498,8 @@ impl TableProvider for WrappingSourceTableProvider {
     }
 }
 
-/// How this node's `node_wait{state="blocked"}` (yield->resume suspension) is
-/// attributed. Stamped by the `DownstreamAttributionRule` pass (and, for
+/// How this node's `node_wait{state="blocked"}` (yield->resume suspension, or
+/// a claiming task operator's output send wait) is attributed. Stamped by the `DownstreamAttributionRule` pass (and, for
 /// scan-sharing producers, at construction). Only `blocked` consults this;
 /// `starved` is node-local and always emits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

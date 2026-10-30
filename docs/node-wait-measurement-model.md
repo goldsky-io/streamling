@@ -16,7 +16,8 @@ and the checks required when changing an operator or connector.
 For a normal single-consumer node, `WrappingExec` records:
 
 - `state="blocked"`: time between yielding a batch and being polled again by
-  the downstream consumer.
+  the downstream consumer. For a task-decoupled producer that claims the
+  `TaskWaitMeter` it is the task's output send wait instead (see below).
 - `state="starved"`: time spent awaiting the next input batch from upstream.
   End-of-stream is not counted as starvation.
 
@@ -91,9 +92,14 @@ The blocked series is attributed to the edge:
 id=<producer>, downstream_id=<immediate consumer>, state="blocked"
 ```
 
-This is a **poll-demand measurement**. A long yield-to-resume gap means the
-consumer stopped asking for more data. It does not prove what the consumer did
-during that gap.
+This is a **poll-demand measurement**. A long yield-to-resume gap (or send
+wait, for a claiming producer) means the consumer stopped asking for more
+data. It does not prove what the consumer did during that gap.
+
+An operator that decouples through a channel task but does not claim the
+meter (`CheckpointableExec` for a SQL transform, `PluginSourceExec`) keeps the
+wrapper's yield-to-resume `blocked`. Its task keeps working while the wrapper
+is `blocked`, until its output channel is full.
 
 ### Fan-out edges
 
@@ -212,11 +218,13 @@ without treating the change as a connector behavior change.
 
 Every edge must have one blocked emitter:
 
-- Linear edge: producer `WrappingExec`.
+- Linear edge: producer `WrappingExec` yield-to-resume, or the task's output
+  send when the producer claims the `TaskWaitMeter` (the wrapper hands its
+  series to the meter and does not time it).
 - Fan-out edge: per-consumer `BroadcastStream` send; producer wrapper
   suppressed.
-- Any future explicitly metered queue boundary: queue send; producer wrapper
-  must be suppressed for the same edge.
+- Any future explicitly metered queue boundary: queue send; the producer
+  wrapper's yield-to-resume must not time the same edge.
 
 If both wrapper suspension and queue send are emitted, the edge is
 double-counted. If suppression and replacement emission get out of sync, the
@@ -235,7 +243,9 @@ Plugins do not need to emit `node_wait` themselves:
 
 - Plugin sources and transforms are observed by host `WrappingExec` nodes. The
   host plugin transform operator claims the `TaskWaitMeter`, so time the plugin
-  spends on a batch is busy, not `starved`.
+  spends on a batch is busy, not `starved`, and its output send wait is the
+  edge's `blocked`. `PluginSourceExec` does not claim it: its edge's `blocked`
+  is the wrapper's yield-to-resume.
 - A plugin sink's feeding edge is observed by its upstream `WrappingExec`.
 - Plugin input/output channels are bounded, so channel saturation propagates
   backpressure to the host boundary.

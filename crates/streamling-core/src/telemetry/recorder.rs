@@ -1279,9 +1279,10 @@ fn build_metrics_recorder(
     // `state` tag into the starved/busy/blocked triad:
     //  - `state="blocked"` — held back by a downstream consumer; an edge
     //    property, so it also carries `downstream_id` (or "" when unresolved).
-    //    Exactly one emitter per edge: a single-downstream `WrappingExec`
-    //    emits its edge (yield->resume suspension), or a fan-out producer's
-    //    is suppressed while the `BroadcastStream` emits one edge per consumer
+    //    Exactly one emitter per edge: a single-downstream `WrappingExec`'s
+    //    series (yield->resume suspension, or the output send wait of an
+    //    operator that claims its `TaskWaitMeter`), or, for a fan-out
+    //    producer, the `BroadcastStream`'s one edge per consumer
     //    (blocked-send time). The two layers never coexist for a node, so
     //    `sum`/`max by (id)` and `... by (downstream_id)` don't double count.
     //  - `state="starved"` — waiting for input; node-local, so `downstream_id`
