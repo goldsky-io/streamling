@@ -4,7 +4,6 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -103,14 +102,10 @@ impl TaskWaitMeter {
                 .session_config()
                 .clone()
                 .with_extension(Arc::clone(&meter)),
-            // ponytail: no function maps. Executing plans hold their resolved
-            // UDFs and nothing below a wrapper looks one up by name; copying
-            // ~450 keys per wrapper per partition bought nothing. A future
-            // `context.udf(name)` below a wrapper must copy them back.
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            context.scalar_functions().clone(),
+            context.higher_order_functions().clone(),
+            context.aggregate_functions().clone(),
+            context.window_functions().clone(),
             context.runtime_env(),
         );
         (Arc::new(child), meter)
@@ -441,6 +436,28 @@ mod tests {
         let handle = TaskWaitMeter::claim(&child);
         assert!(meter.is_claimed());
         (meter, handle)
+    }
+
+    /// Operators below a wrapper look functions up by name
+    /// (`information_schema.routines` lists them from the task context).
+    #[test]
+    fn the_child_context_keeps_the_parents_functions() {
+        let ctx = SessionContext::new().task_ctx();
+        let (child, _meter) = install(&ctx);
+        assert!(!ctx.scalar_functions().is_empty());
+        assert_eq!(
+            child.scalar_functions().keys().collect::<std::collections::BTreeSet<_>>(),
+            ctx.scalar_functions().keys().collect()
+        );
+        assert_eq!(
+            child.higher_order_functions().len(),
+            ctx.higher_order_functions().len()
+        );
+        assert_eq!(
+            child.aggregate_functions().len(),
+            ctx.aggregate_functions().len()
+        );
+        assert_eq!(child.window_functions().len(), ctx.window_functions().len());
     }
 
     #[test]
