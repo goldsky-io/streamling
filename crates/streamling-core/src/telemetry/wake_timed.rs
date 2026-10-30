@@ -16,7 +16,8 @@ use std::task::{Context, Poll, Wake, Waker};
 /// consumer that stays busy long after the wake shows as such while it lasts.
 pub struct WakeTimed {
     inner: SendableRecordBatchStream,
-    wait: Arc<Wait>,
+    /// `None` when there is nothing to time: the input is polled as is.
+    wait: Option<Arc<Wait>>,
     waker: Option<(Waker, Waker)>,
 }
 
@@ -89,15 +90,18 @@ impl Wake for WakeRecorder {
 impl Drop for WakeTimed {
     /// A wait cut short by dropping the stream is teardown: discarded.
     fn drop(&mut self) {
-        let state = self.wait.state.lock();
+        let Some(wait) = &self.wait else {
+            return;
+        };
+        let state = wait.state.lock();
         if state.phase == Phase::Idle {
             return;
         }
-        if let Some(starved) = &self.wait.starved {
+        if let Some(starved) = &wait.starved {
             starved.discard();
         }
         if state.phase == Phase::Woken
-            && let Some(gap) = &self.wait.gap
+            && let Some(gap) = &wait.gap
         {
             gap.discard();
         }
@@ -110,13 +114,16 @@ impl WakeTimed {
         starved: Option<Arc<NodeTime>>,
         gap: Option<Arc<NodeTime>>,
     ) -> Self {
-        Self {
-            inner,
-            wait: Arc::new(Wait {
+        let wait = (starved.is_some() || gap.is_some()).then(|| {
+            Arc::new(Wait {
                 starved,
                 gap,
                 state: Mutex::new(WaitState::default()),
-            }),
+            })
+        });
+        Self {
+            inner,
+            wait,
             waker: None,
         }
     }
@@ -128,15 +135,18 @@ impl WakeTimed {
     }
 
     fn poll_timed(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+        let Some(wait) = self.wait.clone() else {
+            return self.inner.poll_next_unpin(cx);
+        };
         {
-            let mut state = self.wait.state.lock();
+            let mut state = wait.state.lock();
             if state.phase == Phase::Woken
-                && let Some(gap) = &self.wait.gap
+                && let Some(gap) = &wait.gap
             {
                 gap.close();
             }
             // The poll runs upstream work, so it is input wait again.
-            if let Some(starved) = &self.wait.starved {
+            if let Some(starved) = &wait.starved {
                 match state.phase {
                     Phase::Idle => starved.open(),
                     Phase::Woken => starved.resume(),
@@ -148,21 +158,21 @@ impl WakeTimed {
             state.woke_in_poll = false;
         }
         // Not under the state lock: the input may wake the task synchronously.
-        let waker = self.recording_waker(cx.waker());
+        let waker = self.recording_waker(cx.waker(), &wait);
         let poll = self.inner.poll_next_unpin(&mut Context::from_waker(&waker));
 
-        let mut state = self.wait.state.lock();
+        let mut state = wait.state.lock();
         state.polling = false;
         match poll {
             Poll::Pending => {
                 if state.woke_in_poll {
-                    self.wait.hand_over(&mut state);
+                    wait.hand_over(&mut state);
                 }
                 Poll::Pending
             }
             Poll::Ready(item) => {
                 state.phase = Phase::Idle;
-                if let Some(starved) = &self.wait.starved {
+                if let Some(starved) = &wait.starved {
                     if matches!(item, Some(Ok(_))) {
                         starved.close();
                     } else {
@@ -175,13 +185,13 @@ impl WakeTimed {
     }
 
     /// Reused while the task's waker stays the same.
-    fn recording_waker(&mut self, task: &Waker) -> Waker {
+    fn recording_waker(&mut self, task: &Waker, wait: &Arc<Wait>) -> Waker {
         match &self.waker {
             Some((cached_task, recording)) if cached_task.will_wake(task) => recording.clone(),
             _ => {
                 let recording = Waker::from(Arc::new(WakeRecorder {
                     task: task.clone(),
-                    wait: Arc::downgrade(&self.wait),
+                    wait: Arc::downgrade(wait),
                 }));
                 self.waker = Some((task.clone(), recording.clone()));
                 recording
@@ -312,5 +322,36 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(node_wait_ms(id, "starved", None), 0);
         drop(tx);
+    }
+
+    /// With no series to time, the input is polled with the task's own
+    /// waker: no recording waker, so no lock on any poll or wake.
+    #[test]
+    fn an_untimed_input_is_polled_with_the_tasks_own_waker() {
+        struct Task;
+        impl Wake for Task {
+            fn wake(self: Arc<Self>) {}
+        }
+        let task = &Waker::from(Arc::new(Task));
+        let own_waker = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&own_waker);
+        let probe = task.clone();
+        let mut input = WakeTimed::new(
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures::stream::poll_fn(move |cx| {
+                    *seen.lock() = Some(cx.waker().will_wake(&probe));
+                    Poll::<Option<Result<RecordBatch>>>::Pending
+                }),
+            )),
+            None,
+            None,
+        );
+        assert!(
+            input
+                .poll_timed(&mut Context::from_waker(task))
+                .is_pending()
+        );
+        assert_eq!(*own_waker.lock(), Some(true));
     }
 }
