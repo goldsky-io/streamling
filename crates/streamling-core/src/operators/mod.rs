@@ -20,11 +20,11 @@ pub mod unnest;
 pub mod wasm_runner;
 pub mod wrapping;
 
-use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::checkpoints::checkpoint_management::{
     CheckpointEpoch, CheckpointMessage, MarkerAligner, enrich_batch_metadata_with_checkpoints,
     extract_checkpoint_messages, last_marker_epoch, strip_checkpoint_messages,
 };
+use crate::telemetry::task_wait::TaskWaitMeter;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::error::Result;

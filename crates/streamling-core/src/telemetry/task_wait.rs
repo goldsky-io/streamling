@@ -446,7 +446,10 @@ mod tests {
         let (child, _meter) = install(&ctx);
         assert!(!ctx.scalar_functions().is_empty());
         assert_eq!(
-            child.scalar_functions().keys().collect::<std::collections::BTreeSet<_>>(),
+            child
+                .scalar_functions()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
             ctx.scalar_functions().keys().collect()
         );
         assert_eq!(
@@ -687,7 +690,10 @@ mod tests {
         assert!(handle.next(&mut input).await.unwrap().is_err());
         let at_error = meter.totals();
         // A flusher tick inside the wait may have banked part of it.
-        assert!(at_error.starved < Duration::from_millis(100), "{at_error:?}");
+        assert!(
+            at_error.starved < Duration::from_millis(100),
+            "{at_error:?}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(meter.totals().busy >= at_error.busy + Duration::from_millis(20));
     }

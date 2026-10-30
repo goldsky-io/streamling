@@ -303,10 +303,8 @@ mod tests {
         let id = "wake_timed::dropped";
         init_recorder_with_node(id);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
-        let (mut input, starved, gap) = timed(
-            futures::stream::poll_fn(move |cx| rx.poll_recv(cx)),
-            id,
-        );
+        let (mut input, starved, gap) =
+            timed(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)), id);
         drop((starved, gap));
         assert!(futures::poll!(std::pin::pin!(input.next())).is_pending());
         drop(input);
