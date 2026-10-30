@@ -19,7 +19,8 @@ For a normal single-consumer node, `WrappingExec` records:
   the downstream consumer. For a task-decoupled producer that claims the
   `TaskWaitMeter` it is the task's output send wait instead (see below).
 - `state="starved"`: time spent awaiting the next input batch from upstream.
-  End-of-stream is not counted as starvation.
+  A wait that ends in end-of-stream or an error is teardown: its unflushed
+  tail is dropped (see below).
 
 Every series is a `NodeTime`. A process-wide flusher reports each open span
 every second, so a wait shows while it lasts, not as one spike when it ends.

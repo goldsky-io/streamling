@@ -245,14 +245,21 @@ impl TaskWaitMeter {
 pub struct TaskWaitHandle(Option<(Arc<TaskWaitMeter>, u64)>);
 
 impl TaskWaitHandle {
-    /// Await the next input item. Only a delivered item counts as `starved`;
-    /// the wait that ends in end-of-stream is teardown, not starvation.
-    pub async fn next<S: Stream + Unpin>(&self, input: &mut S) -> Option<S::Item> {
+    /// Await the next input item. Only a wait that delivered data is
+    /// `starved`: one that ends in end-of-stream or an error is teardown, and
+    /// its unflushed part is dropped.
+    pub async fn next<S>(&self, input: &mut S) -> Option<S::Item>
+    where
+        S: Stream + Unpin,
+        S::Item: Delivery,
+    {
         let mut wait = self.bracket(Bracket::Input);
         let item = input.next().await;
-        if item.is_none() {
+        match &item {
             // The input is exhausted: the task has no more work to time.
-            wait.end = Bracket::Exhausted;
+            None => wait.end = Bracket::Exhausted,
+            Some(item) if !item.is_data() => wait.end = Bracket::Failed,
+            Some(_) => {}
         }
         item
     }
@@ -295,10 +302,28 @@ impl TaskWaitHandle {
                         send.open();
                     }
                 }
-                Bracket::Exhausted | Bracket::Untimed => {}
+                Bracket::Exhausted | Bracket::Failed | Bracket::Untimed => {}
             }
         }
         WaitGuard { handle: self, end }
+    }
+}
+
+/// What an input wait delivered: only data makes it `starved`.
+pub trait Delivery {
+    fn is_data(&self) -> bool;
+}
+
+impl<T, E> Delivery for Result<T, E> {
+    fn is_data(&self) -> bool {
+        self.is_ok()
+    }
+}
+
+/// A chunk of items (`ready_chunks`) delivered data if any item is data.
+impl<T: Delivery> Delivery for Vec<T> {
+    fn is_data(&self) -> bool {
+        self.iter().any(Delivery::is_data)
     }
 }
 
@@ -354,6 +379,8 @@ enum Bracket {
     Input,
     /// A wait for input that ended the input: teardown, and no work follows.
     Exhausted,
+    /// A wait for input that ended in an error: teardown; handling it is work.
+    Failed,
     /// An output send: the edge's `blocked`.
     Send,
     /// In no state.
@@ -374,6 +401,7 @@ impl Drop for WaitGuard<'_> {
         };
         match self.end {
             Bracket::Input => timers.starved.close(),
+            Bracket::Failed => timers.starved.discard(),
             Bracket::Exhausted => {
                 timers.starved.discard();
                 return;
@@ -494,13 +522,13 @@ mod tests {
     #[tokio::test]
     async fn splits_input_wait_work_and_send_wait() {
         let (meter, handle) = claimed_meter();
-        let input = futures::stream::iter([1]).then(|i| async move {
+        let input = futures::stream::iter([Ok::<_, ()>(1)]).then(|i| async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             i
         });
         let mut input = std::pin::pin!(input);
 
-        assert_eq!(handle.next(&mut input).await, Some(1));
+        assert_eq!(handle.next(&mut input).await, Some(Ok(1)));
         tokio::time::sleep(Duration::from_millis(30)).await; // work
         handle
             .send(tokio::time::sleep(Duration::from_millis(300)))
@@ -630,10 +658,27 @@ mod tests {
         );
     }
 
+    /// A wait that ends in an error is teardown, not starvation, as in
+    /// `WakeTimed`; handling the error is the task's work.
+    #[tokio::test]
+    async fn a_wait_ending_in_an_error_is_not_starved() {
+        let (meter, handle) = claimed_meter();
+        let mut input = std::pin::pin!(futures::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err::<(), _>("upstream failed")
+        }));
+        assert!(handle.next(&mut input).await.unwrap().is_err());
+        let at_error = meter.totals();
+        // A flusher tick inside the wait may have banked part of it.
+        assert!(at_error.starved < Duration::from_millis(100), "{at_error:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(meter.totals().busy >= at_error.busy + Duration::from_millis(20));
+    }
+
     #[tokio::test]
     async fn end_of_input_stops_the_busy_clock() {
         let (meter, handle) = claimed_meter();
-        let mut input = futures::stream::empty::<()>();
+        let mut input = futures::stream::empty::<Result<(), ()>>();
         assert_eq!(handle.next(&mut input).await, None);
         let at_eof = meter.totals();
         tokio::time::sleep(Duration::from_millis(20)).await;

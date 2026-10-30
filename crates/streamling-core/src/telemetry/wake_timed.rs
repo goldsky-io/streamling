@@ -122,7 +122,7 @@ impl WakeTimed {
     }
 
     /// The next batch. Only a wait that delivered a batch is `starved`: one
-    /// that ended in end-of-stream or an error is discarded.
+    /// that ended in end-of-stream or an error drops its unflushed part.
     pub async fn next(&mut self) -> Option<Result<RecordBatch>> {
         std::future::poll_fn(|cx| self.poll_timed(cx)).await
     }
