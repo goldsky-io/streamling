@@ -220,10 +220,10 @@ pub(super) async fn read_bounded_partition(
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
     // here does not block their consumption of the marker batch. A wait on the
-    // sinks, like a send, is neither starved nor busy.
+    // sinks is neither input, work, nor a send.
     if !reader
         .task_wait
-        .send(control.await_terminal_finalized_on_completion())
+        .untimed(control.await_terminal_finalized_on_completion())
         .await
     {
         // At least one live sink never confirmed its writes. Persisting would

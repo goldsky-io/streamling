@@ -46,6 +46,8 @@ Such an operator claims the `TaskWaitMeter` its wrapper installs in the
   the meter, and does not time `blocked` itself). While the wrapper works on a
   batch it took (side outputs, live inspect), it pauses that series: a send
   held back by the wrapper is in no state;
+- a wait on the sinks (`untimed`: the terminal checkpoint finalize) → no
+  state;
 - everything else in the task → `busy`.
 
 The meter then reports the node's `starved` and `busy`. A new task-decoupled operator must claim the

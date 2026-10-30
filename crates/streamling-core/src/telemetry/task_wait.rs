@@ -264,10 +264,17 @@ impl TaskWaitHandle {
         wait.await
     }
 
-    /// Await an output send. Excluded from both `starved` and `busy`.
+    /// Await an output send: the edge's `blocked`.
     pub async fn send<F: Future>(&self, send: F) -> F::Output {
         let _wait = self.bracket(Bracket::Send);
         send.await
+    }
+
+    /// Await something that is neither input, work, nor a send along the
+    /// edge (a wait on the sinks): in no state.
+    pub async fn untimed<F: Future>(&self, wait: F) -> F::Output {
+        let _wait = self.bracket(Bracket::Untimed);
+        wait.await
     }
 
     /// The meter's timers while this handle holds the latest claim.
@@ -288,7 +295,7 @@ impl TaskWaitHandle {
                         send.open();
                     }
                 }
-                Bracket::Exhausted => {}
+                Bracket::Exhausted | Bracket::Untimed => {}
             }
         }
         WaitGuard { handle: self, end }
@@ -349,6 +356,8 @@ enum Bracket {
     Exhausted,
     /// An output send: the edge's `blocked`.
     Send,
+    /// In no state.
+    Untimed,
 }
 
 /// Ends a bracketed await when it completes or is cancelled. A later claim
@@ -374,6 +383,7 @@ impl Drop for WaitGuard<'_> {
                     send.close();
                 }
             }
+            Bracket::Untimed => {}
         }
         timers.busy.open();
     }
@@ -561,6 +571,33 @@ mod tests {
         );
         let own_busy = reserved.0.as_ref().expect("a meter").busy.total();
         assert!(own_busy >= Duration::from_millis(30), "{own_busy:?}");
+    }
+
+    /// A wait on the sinks (terminal checkpoint finalize) is no send along
+    /// the edge and no work of the node.
+    #[tokio::test]
+    async fn an_untimed_wait_is_in_no_state() {
+        let ctx = SessionContext::new().task_ctx();
+        let edge = NodeTime::wall(get_metrics_recorder(), "task_wait::test", "blocked", "down");
+        let (child, meter) = TaskWaitMeter::install(
+            &ctx,
+            get_metrics_recorder(),
+            "task_wait::test",
+            Some(Arc::clone(&edge)),
+        );
+        let handle = TaskWaitMeter::claim(&child);
+        handle
+            .untimed(tokio::time::sleep(Duration::from_millis(100)))
+            .await;
+        let totals = meter.totals();
+        assert_eq!(edge.total(), Duration::ZERO);
+        assert!(totals.busy < Duration::from_millis(50), "{totals:?}");
+        assert_eq!(totals.starved, Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            meter.totals().busy >= totals.busy + Duration::from_millis(20),
+            "the busy clock restarts after the wait"
+        );
     }
 
     #[tokio::test]

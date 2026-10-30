@@ -1604,7 +1604,8 @@ async fn emit_terminal_checkpoint(
     flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
-    // here does not block their consumption of the marker batch.
+    // here does not block their consumption of the marker batch. The wait is
+    // in no state: the driver times only inside `ReservedMeter::work`/`send`.
     if !control.await_terminal_finalized_on_completion().await {
         let finalize_timeout = terminal_checkpoint_finalize_timeout();
         // At least one live sink never confirmed its writes. Do NOT emit the
