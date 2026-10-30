@@ -169,8 +169,10 @@ end-of-stream or an error is still dropped, not `starved`.
 
 Limits:
 
-- The gap includes scheduler delay between the wake and the task running,
-  and tokio's cooperative yield, which defers a ready poll.
+- The gap includes scheduler delay between the wake and the task running.
+- tokio's cooperative budget can return `Pending` for a ready input and
+  defer the wake until the task yields. That wait is booked `starved`,
+  though the batch was ready.
 - A connector that prefetches past end-of-stream writes its last chunk after
   the measured stream ended; that last write is not measured.
 - A wake that brings no batch (the next poll is `Pending` again) still
