@@ -114,12 +114,16 @@ Each partition of a node runs its own `WrappingExec` stream, and all of them add
 into the same series: there is no partition label. A node with N partitions
 can accrue up to N seconds per second in each state. Compare a node's states
 as ratios (`state / (starved + busy + blocked)`); a ratio does not change with
-the partition count. The states split one timeline per partition, so the
-ratios add up to 1, except where two timelines of one node overlap:
+the partition count. The states do not split one timeline: a node's work can
+run in another task while its wrapper waits, so the ratios can add up to more
+than 1. The overlaps:
 
 - a hybrid source's phase and driver (see above);
+- a SQL transform's subtree compute (`busy`), which runs in its forwarder
+  task: while the wrapper is `blocked`, the forwarder keeps computing until
+  its output channel (`internal_buffer_size`, 10 by default) is full;
 - a SQL transform's subtree compute that runs off its partition's task (a
-  repartition inside the subtree) while the wrapper is `blocked`.
+  repartition inside the subtree).
 
 ### Sink service time
 
