@@ -828,6 +828,12 @@ mod tests {
     struct ComputeExec {
         input: Arc<dyn ExecutionPlan>,
         per_batch_compute: Duration,
+        /// Waited before each input poll, outside the compute timer: the
+        /// transform's input wait.
+        input_delay: Duration,
+        /// Compute on the polling thread, as a real operator does, instead of
+        /// yielding to the runtime.
+        blocking: bool,
         metrics: ExecutionPlanMetricsSet,
     }
 
@@ -836,8 +842,20 @@ mod tests {
             Self {
                 input,
                 per_batch_compute,
+                input_delay: Duration::ZERO,
+                blocking: false,
                 metrics: ExecutionPlanMetricsSet::new(),
             }
+        }
+
+        fn blocking(mut self) -> Self {
+            self.blocking = true;
+            self
+        }
+
+        fn with_input_delay(mut self, input_delay: Duration) -> Self {
+            self.input_delay = input_delay;
+            self
         }
     }
 
@@ -864,10 +882,11 @@ mod tests {
             self: Arc<Self>,
             mut children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(ComputeExec::new(
-                children.swap_remove(0),
-                self.per_batch_compute,
-            )))
+            Ok(Arc::new(ComputeExec {
+                input: children.swap_remove(0),
+                metrics: ExecutionPlanMetricsSet::new(),
+                ..*self
+            }))
         }
         fn metrics(&self) -> Option<MetricsSet> {
             Some(self.metrics.clone_inner())
@@ -880,16 +899,26 @@ mod tests {
             let baseline = BaselineMetrics::new(&self.metrics, partition);
             let mut input = self.input.execute(partition, context)?;
             let compute = self.per_batch_compute;
+            let input_delay = self.input_delay;
+            let blocking = self.blocking;
             let schema = self.schema();
             let stream = async_stream::stream! {
-                while let Some(item) = input.next().await {
+                loop {
+                    if !input_delay.is_zero() {
+                        tokio::time::sleep(input_delay).await;
+                    }
+                    let Some(item) = input.next().await else {
+                        break;
+                    };
                     match item {
                         Ok(batch) => {
                             // The timer measures wall-clock exactly as a real
                             // operator's `elapsed_compute` does; the sleep
                             // simulates the transform's own compute.
                             let timer = baseline.elapsed_compute().timer();
-                            if !compute.is_zero() {
+                            if blocking {
+                                std::thread::sleep(compute);
+                            } else if !compute.is_zero() {
                                 tokio::time::sleep(compute).await;
                             }
                             timer.done();
@@ -1506,12 +1535,10 @@ mod tests {
     }
 
     /// End-to-end busy triad: for `WrappingExec -> CheckpointableExec ->
-    /// <compute-bound plan>`, `busy = elapsed_compute - starved` must reflect the
-    /// transform's compute instead of collapsing to the per-batch seed. The
-    /// `WrappingExec`'s `data.next().await` conflates the spawned compute task
-    /// with upstream wait (inflating `starved`), so the compute must be recovered
-    /// through `elapsed_compute` — which requires `CheckpointableExec::metrics`
-    /// to surface the deep-operator compute.
+    /// <compute-bound plan>`, `busy` must reflect the transform's compute. The
+    /// compute runs in the forwarder task the wrapper waits on, so it is recovered from
+    /// the subtree's DataFusion metrics — which requires
+    /// `CheckpointableExec::metrics` to surface the deep-operator compute.
     // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -1547,24 +1574,16 @@ mod tests {
         // blocked. `data.next().await` still absorbs the spawned compute task.
         drain(&wrapping).await;
 
-        let starved = test_support::node_wait_ms(node_id, "starved", None);
-        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
-        let busy = elapsed_compute.saturating_sub(starved);
-
-        // Pre-fix, the deep compute never reached `elapsed_compute`, so
-        // `elapsed_compute` was just the starved-fold plus per-batch seed and
-        // `busy` sat at ~NUM_BATCHES (the 1ms seed). With the fix it reflects the
-        // transform's real compute.
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
         assert!(
             busy >= 24,
-            "busy (elapsed_compute {elapsed_compute}ms - starved {starved}ms = {busy}ms) must \
-             reflect the compute-bound transform, not collapse to the per-batch seed"
+            "busy ({busy}ms) must reflect the deep operator's compute"
         );
     }
 
-    /// The input-wait fold must ride the SQL node's per-batch compute
-    /// observation, not add a second one: per-batch histogram panels (p50/p95,
-    /// `_sum / _count`) would otherwise mix compute samples with wait samples.
+    /// A SQL node records at most one `elapsed_compute` observation per batch,
+    /// its subtree compute: per-batch histogram panels (p50/p95,
+    /// `_sum / _count`) read it per batch.
     // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -1601,12 +1620,154 @@ mod tests {
             "expected at most one elapsed_compute observation per batch \
              ({NUM_BATCHES} batches), got {samples}"
         );
-        let starved = test_support::node_wait_ms(node_id, "starved", None);
         let elapsed_compute = test_support::elapsed_compute_ms(node_id);
         assert!(
-            elapsed_compute >= starved + 24,
-            "elapsed_compute ({elapsed_compute}ms) must carry the folded input wait \
-             (starved {starved}ms) plus the subtree compute"
+            elapsed_compute >= 24,
+            "elapsed_compute ({elapsed_compute}ms) must carry the subtree compute"
         );
+    }
+
+    /// The wrapper's input poll waits on the transform's own compute, so it
+    /// must be reported as `busy`, not `starved`. The input here is in memory,
+    /// so the real input wait is near zero.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sql_transform_compute_is_busy_not_starved() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_compute_is_busy";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let deep_compute = Arc::new(ComputeExec::new(
+            multi_batch_source(NUM_BATCHES).await,
+            Duration::from_millis(12),
+        ));
+        let checkpointable: Arc<dyn ExecutionPlan> = Arc::new(CheckpointableExec::new(
+            deep_compute,
+            1,
+            node_id.to_string(),
+        ));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        drain(&wrapping).await;
+        drop(wrapping);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        // Relative bounds: a loaded runner stretches the compute sleeps.
+        assert!(
+            starved < busy / 2,
+            "compute must not be counted as starved, got starved={starved}ms busy={busy}ms"
+        );
+        assert!(
+            busy >= 48,
+            "4 batches x 12ms compute must be busy, got {busy}ms"
+        );
+        assert!(
+            elapsed_compute <= starved + busy + NUM_BATCHES as u64,
+            "elapsed_compute must hold the compute once, got {elapsed_compute}ms \
+             (starved {starved}ms + busy {busy}ms)"
+        );
+    }
+
+    /// A SQL transform's `elapsed_compute` is its own compute only, as before
+    /// `node_wait`: its input wait is `starved`, not processing time.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sql_elapsed_compute_excludes_input_wait() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_compute_excludes_wait";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        const NUM_BATCHES: usize = 4;
+        let slow_input = Arc::new(
+            ComputeExec::new(
+                multi_batch_source(NUM_BATCHES).await,
+                Duration::from_millis(5),
+            )
+            .with_input_delay(Duration::from_millis(30)),
+        );
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(slow_input, 1, node_id.to_string()));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        drain(&wrapping).await;
+        drop(wrapping);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            starved >= 90,
+            "3+ x 30ms input waits must be starved, got {starved}ms"
+        );
+        assert!(
+            elapsed_compute <= busy + NUM_BATCHES as u64,
+            "elapsed_compute must be the compute only, got {elapsed_compute}ms \
+             (busy {busy}ms, starved {starved}ms)"
+        );
+    }
+
+    /// DataFusion records an operator's compute when its poll ends, and the
+    /// subtree's polls run in the forwarder task, not in the wrapper's poll.
+    /// A flush during a long compute must not report it as `starved`: the
+    /// later take-back cannot lower what was already emitted.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_flush_during_the_forwarders_compute_does_not_report_it_as_starved() {
+        use crate::telemetry::node_time::flush_live;
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_flush_mid_compute";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        let compute = Arc::new(
+            ComputeExec::new(multi_batch_source(1).await, Duration::from_millis(300)).blocking(),
+        );
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(compute, 1, node_id.to_string()));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        // Stands in for the pipeline's task; the test owns its lifetime.
+        #[allow(clippy::disallowed_methods)]
+        let drained = tokio::spawn(async move { drain(&wrapping).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        flush_live();
+        drained.await.unwrap();
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        assert!(
+            starved < 50,
+            "the wait was the forwarder's compute, got starved={starved}ms busy={busy}ms"
+        );
+        assert!(busy >= 250, "the compute is busy, got {busy}ms");
     }
 }

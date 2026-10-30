@@ -108,7 +108,7 @@ impl PrometheusResource {
     /// `downstream_id` each), so wrap this in `sum(...)` to get the node's total
     /// blocked time (i.e. backpressure from downstream).
     pub fn backpressure_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
-        Self::build_node_wait_query("blocked", "id", node_id, instance_id)
+        Self::build_node_wait_query("blocked", &[("id", node_id)], instance_id)
     }
 
     /// Build a query for the node-wait counter's `blocked` state filtered by the
@@ -118,29 +118,51 @@ impl PrometheusResource {
         downstream_id: &str,
         instance_id: Option<&str>,
     ) -> String {
-        Self::build_node_wait_query("blocked", "downstream_id", downstream_id, instance_id)
+        Self::build_node_wait_query("blocked", &[("downstream_id", downstream_id)], instance_id)
+    }
+
+    /// Build a query for one `producer -> consumer` blocked edge.
+    pub fn blocked_edge_query(
+        node_id: &str,
+        downstream_id: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        Self::build_node_wait_query(
+            "blocked",
+            &[("id", node_id), ("downstream_id", downstream_id)],
+            instance_id,
+        )
     }
 
     /// Build a query for the node-wait counter's `starved` state (time a node
-    /// waited on upstream for input) filtered by node `id`.
+    /// waited for input) filtered by node `id`.
     pub fn starved_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
-        Self::build_node_wait_query("starved", "id", node_id, instance_id)
+        Self::build_node_wait_query("starved", &[("id", node_id)], instance_id)
     }
 
-    /// Build `streamling_node_wait_milliseconds_total{state="<state>",<label>="<value>"[,instance="..."]}`.
-    /// `state`, `label_key`, `label_value`, and `instance_id` are trusted Prometheus
-    /// label fragments/values and must not contain unescaped quote characters.
+    /// Build a query for the node-wait counter's `busy` state (the node's own
+    /// work) filtered by node `id`.
+    pub fn busy_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_node_wait_query("busy", &[("id", node_id)], instance_id)
+    }
+
+    /// Build `streamling_node_wait_milliseconds_total{state="<state>",<labels>[,instance="..."]}`.
+    /// `instance_id` is the run's `instance` label (the test context's
+    /// `test_id`), so a query sees only its own run. All values are trusted
+    /// Prometheus label values and must not contain unescaped quote characters.
     fn build_node_wait_query(
         state: &str,
-        label_key: &str,
-        label_value: &str,
+        labels: &[(&str, &str)],
         instance_id: Option<&str>,
     ) -> String {
-        let mut labels = format!("state=\"{state}\",{label_key}=\"{label_value}\"");
-        if let Some(instance) = instance_id {
-            labels.push_str(&format!(",instance=\"{instance}\""));
+        let mut selector = format!("state=\"{state}\"");
+        for (key, value) in labels {
+            selector.push_str(&format!(",{key}=\"{value}\""));
         }
-        format!("streamling_node_wait_milliseconds_total{{{labels}}}")
+        if let Some(instance) = instance_id {
+            selector.push_str(&format!(",instance=\"{instance}\""));
+        }
+        format!("streamling_node_wait_milliseconds_total{{{selector}}}")
     }
 
     /// Build a query for a checkpoint coordinator metric (counter total).

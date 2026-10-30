@@ -14,6 +14,7 @@ use crate::formats::FromArrowConverter;
 use crate::formats::ipc::FromArrowToIpcConverter;
 use crate::formats::json::JsonToArrowConverter;
 use crate::operators::wasm_runner::transpiler::TsToJSTranspiler;
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::utils::batch::enrich_batch_with_metadata;
 use arrow_schema::SchemaRef;
 use arrow_schema::{DataType, Field, Schema};
@@ -34,7 +35,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use extism::{Manifest, Plugin, Wasm};
-use futures::StreamExt;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -356,6 +356,7 @@ impl ExecutionPlan for WasmRunnerExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let task_wait = TaskWaitMeter::claim(&context);
         let mut data = execute_input_stream(
             Arc::clone(&self.input),
             Arc::clone(&self.input.schema()),
@@ -386,7 +387,7 @@ impl ExecutionPlan for WasmRunnerExec {
             })??;
             let plugin = Arc::new(std::sync::Mutex::new(plugin));
 
-            while let Some(batch) = data.next().await {
+            while let Some(batch) = task_wait.next(&mut data).await {
                 let batch = batch?;
                 let plugin = Arc::clone(&plugin);
                 let batch_output_schema = Arc::clone(&output_schema);
@@ -409,12 +410,12 @@ impl ExecutionPlan for WasmRunnerExec {
 
                 match result {
                     Ok(batch) => {
-                        if tx.send(Ok(batch)).await.is_err() {
+                        if task_wait.send(tx.send(Ok(batch))).await.is_err() {
                             break;
                         }
                     }
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        let _ = task_wait.send(tx.send(Err(error))).await;
                         break;
                     }
                 }
@@ -701,6 +702,64 @@ mod tests {
             let expected_json: serde_json::Value = serde_json::from_str(expected).unwrap();
             assert_eq!(actual_json, expected_json);
         }
+    }
+
+    /// The script runs in the operator's spawned task, so its time must be the
+    /// node's `busy`: the operator claims the meter its wrapper installs.
+    #[tokio::test]
+    async fn test_wasm_reports_script_time_through_the_node_meter() {
+        use crate::telemetry::recorder::get_metrics_recorder;
+        use crate::telemetry::task_wait::TaskWaitMeter;
+        use futures::StreamExt;
+        use std::time::Duration;
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let mut input_converter = JsonToArrowConverter::new(input_schema, true, None);
+        input_converter.buffer(r#"{"id": 1}"#.to_string());
+        ctx.register_batch("meter_table", input_converter.convert_to_batch().unwrap())
+            .unwrap();
+        let wasm_node = WasmRunnerNode::new(
+            ctx.table("meter_table")
+                .await
+                .unwrap()
+                .into_optimized_plan()
+                .unwrap(),
+            "javascript".to_string(),
+            "function invoke(data) { return { id: data.id }; }".to_string(),
+            None,
+            1000,
+            None,
+        );
+        let plan = ctx
+            .execute_logical_plan(wasm_node.into())
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let (context, meter) =
+            TaskWaitMeter::install(&ctx.task_ctx(), get_metrics_recorder(), "wasm_meter", None);
+        let batches: Vec<_> = plan.execute(0, context).unwrap().collect().await;
+        assert!(batches.iter().all(Result::is_ok));
+        assert!(
+            meter.is_claimed(),
+            "the WASM operator must claim the node meter"
+        );
+        assert!(
+            meter.totals().busy > Duration::ZERO,
+            "the script's time must be busy: {:?}",
+            meter.totals()
+        );
     }
 
     /// The `process_batch` decode path must report an input-schema type arrow_json can't

@@ -3,7 +3,6 @@ use crate::operators::coalesce::StreamingCoalesceExec;
 use crate::operators::filter::StreamingFilterExec;
 use crate::operators::parallel_sink::ParallelSinkExec;
 use crate::operators::projection::StreamingProjectionExec;
-use crate::operators::rebatch::RebatchExec;
 use crate::operators::scan_sharing::BroadcastingExec;
 use crate::operators::unnest::StreamingUnnestExec;
 use crate::operators::wrapping::{BackpressureRole, WrappingDataSink, WrappingExec};
@@ -265,18 +264,6 @@ fn attribute_downstream(
         };
     }
 
-    // RebatchExec: a sink-local wrapper inserted above a sink's feeding transform
-    // when the sink sets `batch_size` (single-sink path). It is not itself an
-    // edge endpoint, so the named downstream passes through unchanged.
-    if let Some(rebatch) = node.downcast_ref::<RebatchExec>() {
-        let attributed_inner = attribute_downstream(
-            Arc::clone(rebatch.inner()),
-            named_downstream,
-            suppress_next_wrapping,
-        )?;
-        return Ok(Arc::new(rebatch.clone_with_inner(attributed_inner)));
-    }
-
     // DataSinkExec / ParallelSinkExec (root of a sink plan): the sink is the
     // named downstream for the topmost transform. Recover its plain name from
     // the WrappingDataSink. ParallelSinkExec is what streamling connectors
@@ -319,8 +306,8 @@ fn attribute_downstream(
 }
 
 /// Recover the sink's plain name from a `WrappingDataSink`, falling back to the
-/// inherited `named_downstream` (same fallback as the pre-#96 `DataSinkExec`
-/// branch). Shared by `DataSinkExec` and `ParallelSinkExec` roots.
+/// inherited `named_downstream`. Shared by `DataSinkExec` and `ParallelSinkExec`
+/// roots.
 fn wrapping_downstream_name(sink: &dyn DataSink, named_downstream: Option<&str>) -> Option<String> {
     sink.downcast_ref::<WrappingDataSink>()
         .map(|wrapping_sink| get_reference_name_from_metric_key(wrapping_sink.reference_name()))
@@ -514,8 +501,8 @@ mod attribution_tests {
         ))
     }
 
-    /// A single-sink `RebatchExec` (see-through `children()`, like the one the
-    /// webhook/single-sink path inserts above the feeding transform).
+    /// A single-sink `RebatchExec`, like the one the webhook/single-sink path
+    /// inserts above the feeding transform.
     fn rebatch(inner: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Arc::new(RebatchExec::new(inner, 8192, None, "rebatch".to_string()))
     }
@@ -562,7 +549,7 @@ mod attribution_tests {
         ))
     }
 
-    /// Production single-sink root after parallel-exec (#96): every streamling
+    /// Production single-sink root: every streamling
     /// `insert_into` returns `ParallelSinkExec` wrapping a `WrappingDataSink`.
     fn parallel_sink(
         input: Arc<dyn ExecutionPlan>,
@@ -828,8 +815,8 @@ mod attribution_tests {
 
     /// Regression (QA case B/D): a single-sink `RebatchExec` (inserted above the
     /// feeding transform when a sink sets `batch_size`) must not hide that
-    /// transform from attribution. The rule recurses into `inner`, preserving the
-    /// rebatch node while stamping the feeding transform with the sink name.
+    /// transform from attribution. The rule passes the sink name through the
+    /// rebatch node to the feeding transform.
     #[test]
     fn rebatch_before_sink_still_attributes_feeding_transform() {
         // DataSinkExec(web_sink) <- RebatchExec <- W(sql) <- mid <- W(source) <- leaf
@@ -841,12 +828,8 @@ mod attribution_tests {
 
         // The sink's child is the RebatchExec; get the transform it wraps.
         let rebatch_node = child(&optimized, 0);
-        let w_sql = Arc::clone(
-            rebatch_node
-                .downcast_ref::<RebatchExec>()
-                .expect("expected a RebatchExec")
-                .inner(),
-        );
+        assert!(rebatch_node.downcast_ref::<RebatchExec>().is_some());
+        let w_sql = child(&rebatch_node, 0);
         // The transform feeding the sink is attributed to the sink...
         assert_eq!(
             role_of(&w_sql),
@@ -870,12 +853,8 @@ mod attribution_tests {
         let optimized = run(plan);
 
         let rebatch_node = child(&optimized, 0);
-        let w_sql = Arc::clone(
-            rebatch_node
-                .downcast_ref::<RebatchExec>()
-                .expect("expected a RebatchExec")
-                .inner(),
-        );
+        assert!(rebatch_node.downcast_ref::<RebatchExec>().is_some());
+        let w_sql = child(&rebatch_node, 0);
         assert_eq!(
             role_of(&w_sql),
             BackpressureRole::Edge("web_sink".to_string())
@@ -884,12 +863,10 @@ mod attribution_tests {
         assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
     }
 
-    /// Regression (latent variant of bug 2): a single-sink `RebatchExec` directly
-    /// above a scan-sharing `BroadcastingExec` (a sink reading the shared source
-    /// directly with `batch_size` set, no transform between) must still attribute
-    /// the leaf to the sink. Before the `RebatchExec` branch, its see-through
-    /// `children()` exposed the leaf's *empty* children, so the generic traversal
-    /// returned early and the `BroadcastingExec` was never stamped (untagged).
+    /// A single-sink `RebatchExec` directly above a scan-sharing
+    /// `BroadcastingExec` (a sink reading the shared source directly with
+    /// `batch_size` set, no transform between) must still attribute the leaf to
+    /// the sink.
     #[test]
     fn rebatch_above_broadcasting_leaf_attributes_to_sink() {
         // DataSinkExec(pg_sink) <- RebatchExec <- BroadcastingExec (unstamped)
@@ -897,12 +874,8 @@ mod attribution_tests {
         let optimized = run(plan);
 
         let rebatch_node = child(&optimized, 0);
-        let broadcasting_out = Arc::clone(
-            rebatch_node
-                .downcast_ref::<RebatchExec>()
-                .expect("expected a RebatchExec")
-                .inner(),
-        );
+        assert!(rebatch_node.downcast_ref::<RebatchExec>().is_some());
+        let broadcasting_out = child(&rebatch_node, 0);
         let broadcasting_exec = broadcasting_out
             .downcast_ref::<BroadcastingExec>()
             .expect("expected a BroadcastingExec");

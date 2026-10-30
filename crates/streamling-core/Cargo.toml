@@ -89,6 +89,11 @@ tonic.workspace = true
 
 paste.workspace = true
 
+[features]
+# Exposes test-only readers (`TaskWaitMeter::totals`, `NodeTime::total`) to
+# other crates' tests.
+test-utils = []
+
 [dev-dependencies]
 rand.workspace = true
 # `experimental_metrics_custom_reader` exposes `ManualReader` + the `reader`
