@@ -4,7 +4,7 @@ use datafusion::error::Result;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 /// An input stream that times its consumer's wait for each batch.
@@ -66,9 +66,11 @@ impl Wait {
     }
 }
 
+/// The input may keep this waker after the stream is dropped, so it must not
+/// keep the wait alive.
 struct WakeRecorder {
     task: Waker,
-    wait: Arc<Wait>,
+    wait: Weak<Wait>,
 }
 
 impl Wake for WakeRecorder {
@@ -77,8 +79,28 @@ impl Wake for WakeRecorder {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.wait.wake();
+        if let Some(wait) = self.wait.upgrade() {
+            wait.wake();
+        }
         self.task.wake_by_ref();
+    }
+}
+
+impl Drop for WakeTimed {
+    /// A wait cut short by dropping the stream is teardown: discarded.
+    fn drop(&mut self) {
+        let state = self.wait.state.lock();
+        if state.phase == Phase::Idle {
+            return;
+        }
+        if let Some(starved) = &self.wait.starved {
+            starved.discard();
+        }
+        if state.phase == Phase::Woken
+            && let Some(gap) = &self.wait.gap
+        {
+            gap.discard();
+        }
     }
 }
 
@@ -159,7 +181,7 @@ impl WakeTimed {
             _ => {
                 let recording = Waker::from(Arc::new(WakeRecorder {
                     task: task.clone(),
-                    wait: Arc::clone(&self.wait),
+                    wait: Arc::downgrade(&self.wait),
                 }));
                 self.waker = Some((task.clone(), recording.clone()));
                 recording
@@ -267,5 +289,30 @@ mod tests {
             delivered >= Duration::from_millis(20) && delivered < Duration::from_millis(40),
             "{delivered:?}"
         );
+    }
+
+    /// The input keeps the last waker after the stream is gone (a tokio
+    /// channel's receiver slot, a broadcast slot). A dropped stream's open
+    /// wait must not keep accruing through it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_dropped_stream_stops_its_open_wait() {
+        use crate::telemetry::recorder::test_support::node_wait_ms;
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "wake_timed::dropped";
+        init_recorder_with_node(id);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
+        let (mut input, starved, gap) = timed(
+            futures::stream::poll_fn(move |cx| rx.poll_recv(cx)),
+            id,
+        );
+        drop((starved, gap));
+        assert!(futures::poll!(std::pin::pin!(input.next())).is_pending());
+        drop(input);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(node_wait_ms(id, "starved", None), 0);
+        drop(tx);
     }
 }
