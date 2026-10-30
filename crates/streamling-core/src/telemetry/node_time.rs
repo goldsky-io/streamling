@@ -231,15 +231,6 @@ impl NodeTime {
         clock.banked + add - take_back
     }
 
-    fn flush(&self) {
-        let ms = {
-            let mut clock = self.clock.lock();
-            self.bank(&mut clock);
-            Self::take_whole_millis(&mut clock)
-        };
-        self.emit(ms);
-    }
-
     fn work_nanos(&self) -> u64 {
         match &self.measure {
             Measure::Wall {
@@ -325,6 +316,17 @@ impl NodeTime {
     }
 }
 
+impl Flush for NodeTime {
+    fn flush(&self) {
+        let ms = {
+            let mut clock = self.clock.lock();
+            self.bank(&mut clock);
+            Self::take_whole_millis(&mut clock)
+        };
+        self.emit(ms);
+    }
+}
+
 impl Drop for NodeTime {
     /// Work already done is reported. An open wall span is not: it ends in
     /// cancellation, so it was teardown, like [`Self::discard`].
@@ -338,13 +340,64 @@ impl Drop for NodeTime {
     }
 }
 
-/// The live timers, flushed by one background thread.
-static LIVE: Mutex<Vec<Weak<NodeTime>>> = Mutex::new(Vec::new());
+/// A series the background flusher reports.
+trait Flush: Send + Sync {
+    fn flush(&self);
+}
+
+/// A count banked on the data path and reported with `node_wait`: by the
+/// flusher each [`FLUSH_INTERVAL`] and on `Drop`, so the data path never takes
+/// the recorder's locks.
+pub struct BankedCount {
+    recorder: Arc<MetricsRecorder>,
+    name: &'static str,
+    metadata_id: String,
+    pending: AtomicU64,
+}
+
+impl BankedCount {
+    pub fn new(recorder: Arc<MetricsRecorder>, name: &'static str, metadata_id: &str) -> Arc<Self> {
+        let count = Arc::new(Self {
+            recorder,
+            name,
+            metadata_id: metadata_id.to_string(),
+            pending: AtomicU64::new(0),
+        });
+        register_live(&count);
+        count
+    }
+
+    pub fn add(&self, n: u64) {
+        if n > 0 {
+            FLUSHER.ensure_started(spawn_flusher);
+            self.pending.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Flush for BankedCount {
+    fn flush(&self) {
+        let n = self.pending.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            self.recorder
+                .record_count_w_tags(self.name, n, vec![], &self.metadata_id);
+        }
+    }
+}
+
+impl Drop for BankedCount {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// The live series, flushed by one background thread.
+static LIVE: Mutex<Vec<Weak<dyn Flush>>> = Mutex::new(Vec::new());
 
 static FLUSHER: Flusher = Flusher::new();
 
-/// Starts the flusher thread. Every timer registers at plan start, so a
-/// start that fails then is retried from `close`: one atomic load once it
+/// Starts the flusher thread. Every series registers at plan start, so a
+/// start that fails then is retried from `close` and `add`: one atomic load once it
 /// runs, and at most one spawn attempt per [`FLUSH_INTERVAL`] until it does.
 struct Flusher {
     started: AtomicBool,
@@ -383,7 +436,7 @@ impl Flusher {
         match spawn() {
             Ok(()) => self.started.store(true, Ordering::Release),
             Err(e) => tracing::warn!(
-                "node-time flusher not started, retrying; until then node_wait reports only when each stream ends: {e}"
+                "node-time flusher not started, retrying; until then node_wait and node_empty_batches report only when each stream ends: {e}"
             ),
         }
     }
@@ -401,23 +454,27 @@ fn spawn_flusher() -> std::io::Result<()> {
         .map(drop)
 }
 
-/// Track `timer` for the flusher, starting the flusher if it is not running.
-fn register_live(timer: &Arc<NodeTime>) {
+/// Track `series` for the flusher, starting the flusher if it is not running.
+fn register_live<T: Flush + 'static>(series: &Arc<T>) {
     FLUSHER.ensure_started(spawn_flusher);
+    let series: Weak<dyn Flush> = Arc::downgrade(series) as Weak<T>;
     let mut live = LIVE.lock();
-    live.retain(|timer| timer.strong_count() > 0);
-    live.push(Arc::downgrade(timer));
+    live.retain(|series| series.strong_count() > 0);
+    live.push(series);
 }
 
-/// Report every live timer's banked time and open spans.
+/// Holds the flusher off while the guard lives. Take it after the series
+/// under test registered: registering needs the same lock.
+#[cfg(test)]
+pub(crate) fn hold_flusher() -> parking_lot::MutexGuard<'static, impl Sized> {
+    LIVE.lock()
+}
+
+/// Report every live series: banked time and open spans, banked counts.
 pub(crate) fn flush_live() {
-    let timers: Vec<Arc<NodeTime>> = LIVE
-        .lock()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect();
-    for timer in timers {
-        timer.flush();
+    let live: Vec<Arc<dyn Flush>> = LIVE.lock().iter().filter_map(Weak::upgrade).collect();
+    for series in live {
+        series.flush();
     }
 }
 
@@ -593,7 +650,11 @@ mod tests {
 
         flusher.ensure_started(fail);
         flusher.ensure_started(succeed);
-        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1, "one attempt per interval");
+        assert_eq!(
+            ATTEMPTS.load(Ordering::Relaxed),
+            1,
+            "one attempt per interval"
+        );
 
         std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(10));
         flusher.ensure_started(succeed);
@@ -601,7 +662,11 @@ mod tests {
         assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
         std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(10));
         flusher.ensure_started(fail);
-        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2, "a running flusher is not restarted");
+        assert_eq!(
+            ATTEMPTS.load(Ordering::Relaxed),
+            2,
+            "a running flusher is not restarted"
+        );
     }
 
     #[test]
