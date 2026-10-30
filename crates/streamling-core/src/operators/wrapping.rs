@@ -832,8 +832,8 @@ impl ExecutionPlan for WrappingExec {
         // `node_wait` series of this stream. A task-decoupled inner operator
         // claimed the meter in its `execute`, so the meter reports `starved`
         // and `busy`. Otherwise `starved` is this wrapper's input poll; for a
-        // SQL transform the poll also runs the transform's own operators, so
-        // their compute is `busy`, not `starved`.
+        // SQL transform it waits on the subtree's compute in the forwarder
+        // task, so that compute is `busy`, not `starved`.
         let task_claimed = task_wait.is_claimed();
         let own_work = metrics
             .as_ref()
@@ -854,6 +854,9 @@ impl ExecutionPlan for WrappingExec {
                 "",
             ),
         });
+        if has_own_work && let Some(starved) = &starved_time {
+            task_wait.time_subtree_polls(Arc::clone(starved));
+        }
         let busy_time = own_work.filter(|_| !task_claimed).map(|work| {
             NodeTime::work(
                 Arc::clone(&metrics_recorder),

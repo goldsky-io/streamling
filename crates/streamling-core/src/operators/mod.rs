@@ -20,6 +20,7 @@ pub mod unnest;
 pub mod wasm_runner;
 pub mod wrapping;
 
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::checkpoints::checkpoint_management::{
     CheckpointEpoch, CheckpointMessage, MarkerAligner, enrich_batch_metadata_with_checkpoints,
     extract_checkpoint_messages, last_marker_epoch, strip_checkpoint_messages,
@@ -114,12 +115,11 @@ pub(crate) fn spawn_marker_preserving_forwarder(
         input_partition,
         Arc::clone(context),
     )?;
+    let mut stream = TaskWaitMeter::mark_subtree_polls(context, data);
     let tx = builder.tx();
     let output_schema = Arc::clone(output_schema);
 
     builder.spawn(async move {
-        let mut stream = data;
-
         while let Some(batch) = stream.next().await {
             match batch {
                 Ok(batch) => {

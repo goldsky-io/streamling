@@ -831,6 +831,9 @@ mod tests {
         /// Waited before each input poll, outside the compute timer: the
         /// transform's input wait.
         input_delay: Duration,
+        /// Compute on the polling thread, as a real operator does, instead of
+        /// yielding to the runtime.
+        blocking: bool,
         metrics: ExecutionPlanMetricsSet,
     }
 
@@ -840,8 +843,14 @@ mod tests {
                 input,
                 per_batch_compute,
                 input_delay: Duration::ZERO,
+                blocking: false,
                 metrics: ExecutionPlanMetricsSet::new(),
             }
+        }
+
+        fn blocking(mut self) -> Self {
+            self.blocking = true;
+            self
         }
 
         fn with_input_delay(mut self, input_delay: Duration) -> Self {
@@ -873,10 +882,11 @@ mod tests {
             self: Arc<Self>,
             mut children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(
-                ComputeExec::new(children.swap_remove(0), self.per_batch_compute)
-                    .with_input_delay(self.input_delay),
-            ))
+            Ok(Arc::new(ComputeExec {
+                input: children.swap_remove(0),
+                metrics: ExecutionPlanMetricsSet::new(),
+                ..*self
+            }))
         }
         fn metrics(&self) -> Option<MetricsSet> {
             Some(self.metrics.clone_inner())
@@ -890,6 +900,7 @@ mod tests {
             let mut input = self.input.execute(partition, context)?;
             let compute = self.per_batch_compute;
             let input_delay = self.input_delay;
+            let blocking = self.blocking;
             let schema = self.schema();
             let stream = async_stream::stream! {
                 loop {
@@ -905,7 +916,9 @@ mod tests {
                             // operator's `elapsed_compute` does; the sleep
                             // simulates the transform's own compute.
                             let timer = baseline.elapsed_compute().timer();
-                            if !compute.is_zero() {
+                            if blocking {
+                                std::thread::sleep(compute);
+                            } else if !compute.is_zero() {
                                 tokio::time::sleep(compute).await;
                             }
                             timer.done();
@@ -1523,7 +1536,7 @@ mod tests {
 
     /// End-to-end busy triad: for `WrappingExec -> CheckpointableExec ->
     /// <compute-bound plan>`, `busy` must reflect the transform's compute. The
-    /// compute runs inside the wrapper's input poll, so it is recovered from
+    /// compute runs in the forwarder task the wrapper waits on, so it is recovered from
     /// the subtree's DataFusion metrics — which requires
     /// `CheckpointableExec::metrics` to surface the deep-operator compute.
     // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
@@ -1614,7 +1627,7 @@ mod tests {
         );
     }
 
-    /// The transform's own compute runs inside the wrapper's input poll, so it
+    /// The wrapper's input poll waits on the transform's own compute, so it
     /// must be reported as `busy`, not `starved`. The input here is in memory,
     /// so the real input wait is near zero.
     // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
@@ -1712,5 +1725,49 @@ mod tests {
             "elapsed_compute must be the compute only, got {elapsed_compute}ms \
              (busy {busy}ms, starved {starved}ms)"
         );
+    }
+
+    /// DataFusion records an operator's compute when its poll ends, and the
+    /// subtree's polls run in the forwarder task, not in the wrapper's poll.
+    /// A flush during a long compute must not report it as `starved`: the
+    /// later take-back cannot lower what was already emitted.
+    // See note on the wrapping.rs tests re: holding TEST_LOCK across awaits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_flush_during_the_forwarders_compute_does_not_report_it_as_starved() {
+        use crate::telemetry::node_time::flush_live;
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_flush_mid_compute";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        let compute = Arc::new(
+            ComputeExec::new(multi_batch_source(1).await, Duration::from_millis(300)).blocking(),
+        );
+        let checkpointable: Arc<dyn ExecutionPlan> =
+            Arc::new(CheckpointableExec::new(compute, 1, node_id.to_string()));
+        let wrapping: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
+            checkpointable,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        // Stands in for the pipeline's task; the test owns its lifetime.
+        #[allow(clippy::disallowed_methods)]
+        let drained = tokio::spawn(async move { drain(&wrapping).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        flush_live();
+        drained.await.unwrap();
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        assert!(
+            starved < 50,
+            "the wait was the forwarder's compute, got starved={starved}ms busy={busy}ms"
+        );
+        assert!(busy >= 250, "the compute is busy, got {busy}ms");
     }
 }

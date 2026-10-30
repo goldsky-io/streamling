@@ -1,7 +1,9 @@
 use crate::telemetry::node_time::NodeTime;
 use crate::telemetry::recorder::MetricsRecorder;
-use datafusion::execution::TaskContext;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -36,6 +38,18 @@ pub struct TaskWaitMeter {
     /// The edge's `blocked`, timed by output sends. `None` for a fan-out
     /// producer, whose broadcast times each edge.
     blocked: Option<Arc<NodeTime>>,
+    /// A SQL transform's subtree polls, which run in its forwarder task.
+    subtree: Mutex<SubtreePolls>,
+}
+
+/// DataFusion records an operator's compute when its poll ends, so a flush
+/// during a poll would bank that compute as the wrapper's `starved`. The
+/// forwarder marks each poll here; the wrapper binds its `starved` once it
+/// exists, which may be mid-poll.
+#[derive(Default)]
+struct SubtreePolls {
+    polling: bool,
+    starved: Option<Arc<NodeTime>>,
 }
 
 struct Timers {
@@ -79,6 +93,7 @@ impl TaskWaitMeter {
             generation: AtomicU64::new(0),
             reserved: AtomicBool::new(false),
             blocked,
+            subtree: Mutex::default(),
         });
         let child = TaskContext::new(
             context.task_id(),
@@ -153,6 +168,47 @@ impl TaskWaitMeter {
             .session_config()
             .get_extension::<TaskWaitMeter>()
             .filter(|meter| meter.reserved.load(Ordering::Acquire))
+    }
+
+    /// Wrapper side: `starved` excludes the subtree's compute, so it stops
+    /// accruing while a subtree poll runs.
+    pub fn time_subtree_polls(&self, starved: Arc<NodeTime>) {
+        let mut subtree = self.subtree.lock();
+        if subtree.polling {
+            starved.poll_started();
+        }
+        subtree.starved = Some(starved);
+    }
+
+    /// Operator side: `input` with each poll marked as running the node's own
+    /// subtree. A SQL transform's forwarder polls its subtree through this.
+    pub fn mark_subtree_polls(
+        context: &TaskContext,
+        mut input: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let Some(meter) = context.session_config().get_extension::<TaskWaitMeter>() else {
+            return input;
+        };
+        let schema = input.schema();
+        let polls = futures::stream::poll_fn(move |cx| {
+            meter.subtree_poll(true);
+            let poll = input.poll_next_unpin(cx);
+            meter.subtree_poll(false);
+            poll
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, polls))
+    }
+
+    fn subtree_poll(&self, polling: bool) {
+        let mut subtree = self.subtree.lock();
+        subtree.polling = polling;
+        if let Some(starved) = &subtree.starved {
+            if polling {
+                starved.poll_started();
+            } else {
+                starved.poll_ended();
+            }
+        }
     }
 
     /// Whether an operator took over this node's `starved` measurement.

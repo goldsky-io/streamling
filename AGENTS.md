@@ -174,7 +174,7 @@ Who measures each state:
 
 | Node | starved | busy |
 |------|---------|------|
-| SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute in it | that compute (`OwnWork`) |
+| SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute, which runs in the `CheckpointableExec` forwarder task | that compute (`OwnWork`) |
 | Handler / WASM / plugin transform | `TaskWaitMeter`: the task's input await | `TaskWaitMeter`: task time outside input and send awaits |
 | Kafka / ClickHouse / file / hybrid source | `TaskWaitMeter`: broker wait, failure backoff, idle file poll | `TaskWaitMeter`: fetch and decode |
 | Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | none |

@@ -26,9 +26,10 @@ The unflushed tail of a wait that ends in end-of-stream, an error, or
 cancellation is dropped. A span's close only banks its time; the flusher and
 `Drop` emit, so the data path never takes the recorder's locks.
 
-DataFusion records a SQL transform's compute only when its poll ends. A flush
-during a poll banks `starved` only up to the poll's start, and the poll's
-`busy` shows when the poll ends.
+DataFusion records a SQL transform's compute only when an operator's poll
+ends. The transform's forwarder task marks each poll of its subtree on the
+`TaskWaitMeter`, so a flush during that poll banks `starved` only up to the
+poll's start, and the poll's `busy` shows when the poll ends.
 
 ### Task-decoupled operators
 
@@ -64,12 +65,13 @@ A plugin source cannot be split: the plugin fetches and decodes out of
 process, and the plugin protocol carries no wait signal. Its whole input poll
 is `starved`, and its `busy` is zero.
 
-A SQL transform's forwarder task cannot use the meter: its input await drives
-the SQL subtree inline, so compute runs inside the await. The wrapper reads the
-subtree's DataFusion compute for its partition (`OwnWork`): that compute is
-`busy`, and it is subtracted from the poll's `starved`. The split is exact when
-the subtree keeps its input partitioning; a repartition inside the subtree
-spreads one partition's compute across others.
+A SQL transform's forwarder task cannot claim the meter: its input await
+drives the SQL subtree inline, so compute runs inside the await. The wrapper
+reads the subtree's DataFusion compute for its partition (`OwnWork`): that
+compute is `busy`, and it is subtracted from the wrapper's `starved`. The
+forwarder only marks its subtree polls on the meter (see above). The split is
+exact when the subtree keeps its input partitioning; a repartition inside the
+subtree spreads one partition's compute across others.
 
 ### Sinks
 
