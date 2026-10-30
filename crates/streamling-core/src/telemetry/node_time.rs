@@ -47,8 +47,8 @@ enum Measure {
 struct Clock {
     open_since: Option<Instant>,
     /// Nothing accrues from here until `resume`, whichever spans open or
-    /// close meanwhile.
-    paused_at: Option<Instant>,
+    /// close meanwhile; with the work counter then.
+    paused_at: Option<(Instant, u64)>,
     /// A poll that runs the node's own work started here, with the work
     /// counter then. Its compute is recorded only when it ends, so nothing
     /// past its start is banked before that.
@@ -164,8 +164,11 @@ impl NodeTime {
     pub fn open(&self) {
         let mut clock = self.clock.lock();
         if clock.open_since.is_none() {
-            clock.open_since = Some(Self::now(&clock));
-            clock.work_mark = self.work_nanos();
+            let (at, work) = clock
+                .paused_at
+                .unwrap_or_else(|| (Instant::now(), self.work_nanos()));
+            clock.open_since = Some(at);
+            clock.work_mark = work;
             clock.span_banked = Duration::ZERO;
         }
     }
@@ -183,7 +186,7 @@ impl NodeTime {
     pub(crate) fn pause(&self) {
         let mut clock = self.clock.lock();
         if clock.paused_at.is_none() {
-            clock.paused_at = Some(Instant::now());
+            clock.paused_at = Some((Instant::now(), self.work_nanos()));
         }
     }
 
@@ -199,11 +202,15 @@ impl NodeTime {
         self.clock.lock().poll = None;
     }
 
-    /// Continue a paused span: the pause is not part of it.
+    /// Accrue again: neither the pause nor the work done during it is part
+    /// of the open span.
     pub(crate) fn resume(&self) {
         let mut clock = self.clock.lock();
-        if let (Some(since), Some(paused_at)) = (clock.open_since, clock.paused_at.take()) {
-            clock.open_since = Some(since + paused_at.elapsed());
+        if let Some((paused_at, paused_work)) = clock.paused_at.take() {
+            if let Some(since) = clock.open_since {
+                clock.open_since = Some(since + paused_at.elapsed());
+            }
+            clock.work_mark += self.work_nanos().saturating_sub(paused_work);
         }
     }
 
@@ -217,7 +224,8 @@ impl NodeTime {
     /// [`Self::discard`], so readers keep a high-water mark.
     pub fn total(&self) -> Duration {
         let clock = self.clock.lock();
-        let (add, take_back) = self.unbanked(&clock, Self::now(&clock), self.work_nanos());
+        let (now, work) = self.accrued_to(&clock);
+        let (add, take_back) = self.unbanked(&clock, now, work);
         clock.banked + add - take_back
     }
 
@@ -265,10 +273,11 @@ impl NodeTime {
     /// Bank the unbanked time. The work counter is read under the clock lock:
     /// a read taken before it could be older than `work_mark` and rewind it.
     fn bank(&self, clock: &mut Clock) {
-        let (now, work) = match clock.poll {
-            Some((started, work)) => (started.min(Self::now(clock)), work),
-            None => (Self::now(clock), self.work_nanos()),
-        };
+        let (now, work) = self.accrued_to(clock);
+        if clock.open_since.is_some_and(|since| since > now) {
+            // The span opened after a running poll started: nothing accrued.
+            return;
+        }
         let (add, take_back) = self.unbanked(clock, now, work);
         clock.banked = clock.banked + add - take_back;
         clock.span_banked = clock.span_banked + add - take_back;
@@ -278,9 +287,16 @@ impl NodeTime {
         clock.work_mark = work;
     }
 
-    /// The end of the time accrued so far: a paused span accrues nothing.
-    fn now(clock: &Clock) -> Instant {
-        clock.paused_at.unwrap_or_else(Instant::now)
+    /// The end of the time accrued so far, with the work counter then:
+    /// nothing accrues while paused, nor past the start of a running poll.
+    fn accrued_to(&self, clock: &Clock) -> (Instant, u64) {
+        let end = clock
+            .paused_at
+            .unwrap_or_else(|| (Instant::now(), self.work_nanos()));
+        match clock.poll {
+            Some(poll) if poll.0 < end.0 => poll,
+            _ => end,
+        }
     }
 
     fn take_whole_millis(clock: &mut Clock) -> u64 {
@@ -491,6 +507,35 @@ mod tests {
         compute.add_duration(Duration::from_secs(1));
         starved.close();
         assert_eq!(starved.total(), wait);
+    }
+
+    /// A pause drops its wall time from the span, so the work done during it
+    /// must not be subtracted either.
+    #[test]
+    fn work_during_a_pause_is_not_subtracted() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let plan_metrics = ExecutionPlanMetricsSet::new();
+        let compute = MetricBuilder::new(&plan_metrics).elapsed_compute(0);
+        let starved = NodeTime::wall_excluding(
+            get_metrics_recorder(),
+            "node_time::pause_work",
+            "starved",
+            OwnWork::new(plan_metrics.clone_inner(), 0),
+        );
+
+        let started = Instant::now();
+        starved.open();
+        std::thread::sleep(Duration::from_millis(80));
+        let waited = started.elapsed();
+        starved.pause();
+        compute.add_duration(Duration::from_millis(300));
+        starved.resume();
+        starved.close();
+        let total = starved.total();
+        assert!(
+            total >= waited && total < waited + Duration::from_millis(20),
+            "waited {waited:?}, got {total:?}"
+        );
     }
 
     #[test]

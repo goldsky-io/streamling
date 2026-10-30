@@ -72,8 +72,9 @@ is `starved`, and its `busy` is zero.
 A SQL transform's forwarder task cannot claim the meter: its input await
 drives the SQL subtree inline, so compute runs inside the await. The wrapper
 reads the subtree's DataFusion compute for its partition (`OwnWork`): that
-compute is `busy`, and it is subtracted from the wrapper's `starved`. The
-forwarder only marks its subtree polls on the meter (see above). The split is
+compute is `busy`, and it is subtracted from the wrapper's `starved`, except
+compute recorded while that wait is paused at a wake (below). The forwarder
+only marks its subtree polls on the meter (see above). The split is
 exact when the subtree keeps its input partitioning; a repartition inside the
 subtree spreads one partition's compute across others.
 
