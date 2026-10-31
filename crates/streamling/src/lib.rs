@@ -931,29 +931,48 @@ fn wrap_multi_sink_with_repartition(
     }
 }
 
-/// Inserts a transform's exchange at its *input* — directly above the scan of
-/// the upstream node it reads.
+/// Inserts a transform's exchange at its *input* — directly above every scan of
+/// an upstream node it reads, so each branch of a `UNION` is widened too.
+///
+/// `upstream_keys` maps each pipeline node the SQL may read to that node's key.
+/// `key_columns` is the transform's own key, which names its OUTPUT columns. A
+/// column the SQL computes is not in the scan, so the placement is chosen per
+/// scan by [`transform_input_placement`].
 fn wrap_transform_input_with_repartition(
     sql_plan: LogicalPlan,
-    source_name: &str,
-    placement: &Placement,
+    upstream_keys: &HashMap<String, Option<Vec<String>>>,
+    key_columns: &[String],
     parallelism: usize,
     name: &str,
 ) -> Result<LogicalPlan> {
     let mut wrapped = 0;
     let plan = sql_plan
         .transform_up(|node| {
-            let reads_upstream = matches!(
-                &node,
-                LogicalPlan::TableScan(scan) if scan.table_name.table() == source_name
-            );
-            if !reads_upstream {
-                return Ok(Transformed::no(node));
-            }
+            let upstream_key = match &node {
+                LogicalPlan::TableScan(scan) => match upstream_keys.get(scan.table_name.table()) {
+                    Some(key) => key.as_deref(),
+                    None => return Ok(Transformed::no(node)),
+                },
+                _ => return Ok(Transformed::no(node)),
+            };
             wrapped += 1;
+            let input_field_names: Vec<String> = node
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let chosen = transform_input_placement(key_columns, upstream_key, &input_field_names);
+            if !chosen.generated_columns.is_empty() {
+                warn!(
+                    "{name}: primary key column(s) {:?} are produced by the SQL and are not in \
+                     its input schema; placing its input by {:?}",
+                    chosen.generated_columns, chosen.placement
+                );
+            }
             Ok(Transformed::yes(wrap_with_repartition(
                 node,
-                placement,
+                &chosen.placement,
                 Some(parallelism),
                 name.to_string(),
             )))
@@ -963,7 +982,7 @@ fn wrap_transform_input_with_repartition(
     if wrapped == 0 {
         streamling_user_bail!(
             "{name}: cannot apply parallelism {parallelism}, the transform's SQL \
-             has no scan of its source '{source_name}'"
+             has no scan of an upstream node"
         );
     }
     Ok(plan)
@@ -982,24 +1001,24 @@ fn pk_columns(pk_metadata: &Option<PrimaryKeyMetadata>) -> Vec<String> {
 /// asking for N streams needs the exchange to produce them. With neither, the
 /// plan is returned untouched and the sink simply inherits its input's width.
 /// The planner elides the node when the input already satisfies the placement.
-/// How a `script` transform's INPUT should be placed across streams.
+/// How a `script` or `sql` transform's INPUT should be placed across streams.
 #[derive(Debug, PartialEq)]
-struct ScriptInputPlacement {
+struct TransformInputPlacement {
     placement: Placement,
-    /// Declared key columns the script produces rather than receives, if those
+    /// Declared key columns the transform produces rather than receives, if those
     /// are what forced a different placement. Reported so the caller can warn.
     generated_columns: Vec<String>,
     /// True when placement fell back to the upstream node's own key.
     used_upstream_key: bool,
 }
 
-/// Chooses how a `script` transform's INPUT is placed across streams.
+/// Chooses how a transform's INPUT is placed across streams.
 ///
-/// A script's `primary_key` describes its OUTPUT — the columns the script
-/// produces, declared in its own `schema` block — so those columns need not
-/// exist upstream. Keying the input exchange by them fails planning ("cannot
-/// partition by primary key column '<c>', which is not in the input schema")
-/// for any script whose key includes a generated column.
+/// A transform's `primary_key` describes its OUTPUT — columns a script declares
+/// in its `schema` block, or columns a SQL query computes — so those columns
+/// need not exist upstream. Keying the input exchange by them fails planning
+/// ("cannot partition by primary key column '<c>', which is not in the input
+/// schema") for any transform whose key includes a generated column.
 ///
 /// Preference order:
 ///
@@ -1012,16 +1031,16 @@ struct ScriptInputPlacement {
 ///
 /// Falling straight to round-robin would scatter an entity's rows across
 /// streams, so step 2 keeps the useful property that step 1 was reaching for.
-fn script_input_placement(
+fn transform_input_placement(
     key_columns: &[String],
     upstream_key_columns: Option<&[String]>,
     input_field_names: &[String],
-) -> ScriptInputPlacement {
+) -> TransformInputPlacement {
     let resolvable =
         |cols: &[String]| !cols.is_empty() && cols.iter().all(|c| input_field_names.contains(c));
 
     if resolvable(key_columns) {
-        return ScriptInputPlacement {
+        return TransformInputPlacement {
             placement: Placement::ByKey(key_columns.to_vec()),
             generated_columns: Vec::new(),
             used_upstream_key: false,
@@ -1035,12 +1054,12 @@ fn script_input_placement(
         .collect();
 
     match upstream_key_columns {
-        Some(upstream) if resolvable(upstream) => ScriptInputPlacement {
+        Some(upstream) if resolvable(upstream) => TransformInputPlacement {
             placement: Placement::ByKey(upstream.to_vec()),
             generated_columns,
             used_upstream_key: true,
         },
-        _ => ScriptInputPlacement {
+        _ => TransformInputPlacement {
             placement: Placement::RoundRobin,
             generated_columns,
             used_upstream_key: false,
@@ -1828,15 +1847,27 @@ impl Streamling {
                     // An explicit `parallelism` widens the transform itself: the
                     // exchange goes under its SQL, so the filter/projection above
                     // run at the requested width. Keyed by the transform's
-                    // primary key, so per-key ordering survives the widening.
+                    // primary key, so per-key ordering survives the widening, or
+                    // by the upstream key when the SQL computes a key column.
                     let sql_plan = match sql_transform.parallelism {
-                        Some(parallelism) => wrap_transform_input_with_repartition(
-                            sql_plan,
-                            &source_name,
-                            &Placement::ByKey(pk_columns.clone()),
-                            parallelism,
-                            &reference_name,
-                        )?,
+                        Some(parallelism) => {
+                            let upstream_keys: HashMap<String, Option<Vec<String>>> =
+                                pipeline_topology
+                                    .sources
+                                    .keys()
+                                    .chain(pipeline_topology.transforms.keys())
+                                    .map(|node| {
+                                        (node.clone(), pk_registry.get(node).map(|m| m.columns))
+                                    })
+                                    .collect();
+                            wrap_transform_input_with_repartition(
+                                sql_plan,
+                                &upstream_keys,
+                                &pk_columns,
+                                parallelism,
+                                &reference_name,
+                            )?
+                        }
                         None => sql_plan,
                     };
 
@@ -2035,7 +2066,7 @@ impl Streamling {
                     // Read-only lookup: `propagate` would re-register the key under
                     // this node and clobber the script's own declared key.
                     let upstream_key = pk_registry.get(from.as_str()).map(|m| m.columns);
-                    let chosen = script_input_placement(
+                    let chosen = transform_input_placement(
                         &input_primary_key.columns,
                         upstream_key.as_deref(),
                         &input_field_names,
@@ -4155,7 +4186,7 @@ impl Streamling {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, Streamling, script_input_placement};
+    use super::{Placement, Streamling, transform_input_placement};
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -4187,7 +4218,7 @@ mod tests {
         let upstream_key = names(&["id"]);
         let upstream_schema = names(&["id", "hash", "chain_id", "label", "wallet", "value_rows"]);
 
-        let chosen = script_input_placement(&key, Some(&upstream_key), &upstream_schema);
+        let chosen = transform_input_placement(&key, Some(&upstream_key), &upstream_schema);
 
         assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
         assert!(chosen.used_upstream_key);
@@ -4204,7 +4235,7 @@ mod tests {
         let key = names(&["community_id"]);
         let upstream_schema = names(&["value_rows"]);
 
-        let chosen = script_input_placement(&key, None, &upstream_schema);
+        let chosen = transform_input_placement(&key, None, &upstream_schema);
 
         assert_eq!(chosen.placement, Placement::RoundRobin);
         assert!(!chosen.used_upstream_key);
@@ -4214,7 +4245,7 @@ mod tests {
     /// An upstream key that is itself absent from the schema is not usable either.
     #[test]
     fn unusable_upstream_key_falls_through_to_round_robin() {
-        let chosen = script_input_placement(
+        let chosen = transform_input_placement(
             &names(&["community_id"]),
             Some(&names(&["not_here"])),
             &names(&["value_rows"]),
@@ -4227,7 +4258,7 @@ mod tests {
     /// win over the upstream key.
     #[test]
     fn script_key_present_upstream_still_partitions_by_its_own_key() {
-        let chosen = script_input_placement(
+        let chosen = transform_input_placement(
             &names(&["id"]),
             Some(&names(&["other"])),
             &names(&["id", "other", "payload"]),
@@ -4240,7 +4271,8 @@ mod tests {
     /// A script with no declared key falls to the upstream key when one exists.
     #[test]
     fn script_without_a_key_uses_the_upstream_key() {
-        let chosen = script_input_placement(&[], Some(&names(&["id"])), &names(&["id", "payload"]));
+        let chosen =
+            transform_input_placement(&[], Some(&names(&["id"])), &names(&["id", "payload"]));
         assert_eq!(chosen.placement, Placement::ByKey(names(&["id"])));
         assert!(
             chosen.generated_columns.is_empty(),
@@ -4301,15 +4333,15 @@ mod tests {
             .register_table("blocks", Arc::new(source))
             .unwrap();
 
-        let (sql_plan, source_name) = session_manager
+        let (sql_plan, _) = session_manager
             .create_supported_logical_plan("select * from blocks where vid = 100".to_string())
             .await
             .unwrap();
 
         let sql_plan = wrap_transform_input_with_repartition(
             sql_plan,
-            &source_name,
-            &by_key(&["id"]),
+            &HashMap::from([("blocks".to_string(), None)]),
+            &names(&["id"]),
             4,
             "filter_blocks",
         )
@@ -4341,6 +4373,70 @@ mod tests {
                 "expected {expected:?} in plan:\n{rendered}"
             );
         }
+    }
+
+    /// Regression: a SQL transform's `primary_key` names its OUTPUT columns,
+    /// so a column the SQL computes (`'base' AS chain`) is not in the input it
+    /// scans. Keying the input exchange by it failed planning with "cannot
+    /// partition by primary key column 'chain', which is not in the input
+    /// schema". The upstream node's key places the input instead. Every
+    /// `UNION` branch gets its own exchange; only the first one used to.
+    #[tokio::test]
+    async fn transform_parallelism_widens_every_union_branch_by_the_upstream_key() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use streamling_core::dynamic_table::DynamicTableRegistry;
+        use streamling_core::session::SessionManager;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8, false),
+        ]));
+        let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 4).unwrap();
+        for table in ["base_balances", "bsc_balances"] {
+            let source =
+                datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![], vec![]])
+                    .unwrap();
+            session_manager
+                .session_context()
+                .register_table(table, Arc::new(source))
+                .unwrap();
+        }
+
+        let (sql_plan, _) = session_manager
+            .create_supported_logical_plan(
+                "select 'base' as chain, id from base_balances \
+                 union all select 'bsc' as chain, id from bsc_balances"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+
+        let upstream_keys = HashMap::from([
+            ("base_balances".to_string(), Some(names(&["id"]))),
+            ("bsc_balances".to_string(), Some(names(&["id"]))),
+        ]);
+        let sql_plan = wrap_transform_input_with_repartition(
+            sql_plan,
+            &upstream_keys,
+            &names(&["chain", "id"]),
+            4,
+            "clean",
+        )
+        .unwrap();
+        let physical_plan = session_manager
+            .new_df(sql_plan)
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(physical_plan.as_ref()).indent(true).to_string();
+        let exchanges = rendered
+            .matches("StreamingRepartitionExec: partitions=4, keys=[id@0]")
+            .count();
+        assert_eq!(
+            exchanges, 2,
+            "expected one keyed exchange per branch:\n{rendered}"
+        );
     }
 
     /// A handler transform's `parallelism` has to reach the HTTP calls
