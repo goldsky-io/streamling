@@ -4,7 +4,7 @@ use crate::{E2eError, Result};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
@@ -414,6 +414,50 @@ impl KafkaResource {
             self.topic
         );
         Ok(())
+    }
+
+    /// Wait until consumer group `group` is `Stable` with exactly `members`
+    /// members.
+    ///
+    /// Members of a parallel source join one by one, and each join reassigns
+    /// partitions. With no committed offsets the new owner re-reads a partition
+    /// from the start, so records produced before the group settles can be
+    /// read twice. Producing after this returns makes every record read once.
+    pub async fn wait_for_stable_group(
+        &self,
+        group: &str,
+        members: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        let broker = self.broker.clone();
+        let group = group.to_string();
+        tokio::task::spawn_blocking(move || {
+            let client: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &broker)
+                .create()
+                .map_err(|e| E2eError::Kafka(e.to_string()))?;
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let list = client
+                    .fetch_group_list(Some(&group), Duration::from_secs(5))
+                    .map_err(|e| E2eError::Kafka(e.to_string()))?;
+                if list
+                    .groups()
+                    .iter()
+                    .any(|g| g.state() == "Stable" && g.members().len() == members)
+                {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(E2eError::Kafka(format!(
+                        "consumer group {group} not Stable with {members} members within {timeout:?}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+        .await
+        .map_err(|e| E2eError::Kafka(e.to_string()))?
     }
 
     /// Inspect messages in an existing topic without creating it
