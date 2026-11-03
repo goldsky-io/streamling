@@ -102,7 +102,9 @@ jobs:
 
   # The release builds every workspace member for Windows and macOS; catch
   # platform-only code here instead of at release time. Linux is covered by
-  # build-release-main. Runners and native deps mirror streamling-release.yml.
+  # validate-and-test (clippy --all-targets). macOS Intel is skipped: no
+  # target_arch cfg exists, so arm64 sees the same code. Runners and native
+  # deps mirror streamling-release.yml.
   check-cross-platform:
     needs: [changes]
     if: needs.changes.outputs.core == 'true'
@@ -113,8 +115,6 @@ jobs:
         include:
           - runner: blacksmith-8vcpu-windows-2025
             os: windows
-          - runner: macos-15-intel
-            os: darwin-x86_64
           - runner: macos-14
             os: darwin-aarch64
     env:
