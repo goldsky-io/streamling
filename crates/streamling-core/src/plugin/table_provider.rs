@@ -1,5 +1,5 @@
 use crate::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage, SourceCommitGate,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
     report_marker_at_sink,
 };
@@ -211,6 +211,9 @@ impl ExecutionPlan for PluginSourceExec {
             ));
 
             let mut checkpoint_buffer: Vec<CheckpointMessage> = Vec::new();
+            // The plugin's own Finalizer (its commit) waits until a later
+            // marker proves the in-band copy reached every stage downstream.
+            let mut commit_gate = SourceCommitGate::new();
             // Track created_at_ms for epochs so we can preserve timing through plugin round-trip
             let mut epoch_created_at: std::collections::HashMap<u64, u64> =
                 std::collections::HashMap::new();
@@ -325,15 +328,17 @@ impl ExecutionPlan for PluginSourceExec {
                                         epoch: CheckpointEpoch(epoch.0),
                                         created_at_ms,
                                     });
+                                    commit_gate.marker_attached(&CheckpointEpoch(epoch.0));
                                 }
                                 Ok(PluginMsg::CheckpointFinalizer { epoch }) => {
+                                    // The host attached this epoch's Finalizer
+                                    // in-band when the coordinator broadcast it;
+                                    // the plugin's copy comes back one epoch
+                                    // later and would only duplicate it.
                                     debug!(
-                                        "Buffering checkpoint finalizer with epoch {} from plugin",
+                                        "Dropping the plugin's copy of checkpoint finalizer with epoch {}",
                                         epoch.0
                                     );
-                                    checkpoint_buffer.push(CheckpointMessage::Finalizer(
-                                        CheckpointEpoch(epoch.0),
-                                    ));
                                 }
                                 Ok(PluginMsg::Terminate) => {
                                     // Output-direction Terminate: the plugin
@@ -453,19 +458,31 @@ impl ExecutionPlan for PluginSourceExec {
                             .await?;
                         }
                         Ok(CheckpointMessage::Finalizer(epoch)) => {
+                            // Downstream gets the Finalizer in-band now, on
+                            // the next batch. The plugin's own commit for it
+                            // is held until a later marker's acks prove that
+                            // copy was processed downstream, so a crash can
+                            // never leave the source committed past a
+                            // transform (see `SourceCommitGate`).
+                            checkpoint_buffer.push(CheckpointMessage::Finalizer(epoch.clone()));
+                            let released = commit_gate.finalizer_attached(&epoch);
                             debug!(
-                                "Propagating checkpoint Finalizer with epoch {} to plugin",
-                                epoch.0
+                                "Attached checkpoint Finalizer with epoch {} in-band; releasing the plugin's commit for {:?} ({} held)",
+                                epoch.0,
+                                released,
+                                commit_gate.held()
                             );
-                            crate::plugin::send_to_plugin(
-                                &plugin_input_sender,
-                                NonExhaustive::new(PluginMsg::CheckpointFinalizer {
-                                    epoch: PluginCheckpointEpoch(epoch.0),
-                                }),
-                                &plugin_label,
-                                &instance_exit,
-                            )
-                            .await?;
+                            for epoch in released {
+                                crate::plugin::send_to_plugin(
+                                    &plugin_input_sender,
+                                    NonExhaustive::new(PluginMsg::CheckpointFinalizer {
+                                        epoch: PluginCheckpointEpoch(epoch.0),
+                                    }),
+                                    &plugin_label,
+                                    &instance_exit,
+                                )
+                                .await?;
+                            }
                         }
                         Ok(_) => {
                             // ignore other messages
@@ -1366,6 +1383,102 @@ mod tests {
             let rest: Vec<RecordBatch> = stream.map(|b| b.unwrap()).collect().await;
             assert!(rest.iter().all(|b| !marker_epochs(b).contains(&EPOCH)));
         }
+    }
+
+    /// The plugin's own Finalizer (its commit) is held until a later marker
+    /// finalizes, and the Finalizer goes in-band at once, ahead of that marker:
+    /// a crash can then never leave the source committed past a stateful
+    /// transform that commits on the in-band copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn source_commit_waits_for_a_later_marker_to_prove_the_finalizer_went_in_band() {
+        const FIRST: u64 = 90_101;
+        const SECOND: u64 = 90_102;
+        let source = describe(
+            "gated_source",
+            SOURCE,
+            PluginKind::Source,
+            &[(PREFERRED, "1")],
+        );
+        let exec = scan_source("gated_source", &source).await;
+        let mut stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let deadline = Instant::now() + EXIT_BOUND;
+        while !test_plugins::log("gated_source[0]").initialized {
+            assert!(Instant::now() < deadline, "instance never initialized");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Every checkpoint message the stream carried, in-band order.
+        let mut in_band: Vec<CheckpointMessage> = Vec::new();
+        async fn read_until(
+            stream: &mut SendableRecordBatchStream,
+            in_band: &mut Vec<CheckpointMessage>,
+            wanted: &dyn Fn(&CheckpointMessage) -> bool,
+        ) {
+            loop {
+                let batch = tokio::time::timeout(EXIT_BOUND, stream.next())
+                    .await
+                    .expect("the message must come back out")
+                    .unwrap()
+                    .unwrap();
+                let messages = extract_checkpoint_messages(batch.schema().metadata());
+                let found = messages.iter().any(wanted);
+                in_band.extend(messages);
+                if found {
+                    break;
+                }
+            }
+        }
+        fn is_marker(e: u64) -> impl Fn(&CheckpointMessage) -> bool {
+            move |m| matches!(m, CheckpointMessage::Marker { epoch, .. } if epoch.0 == e)
+        }
+        fn is_finalizer(e: u64) -> impl Fn(&CheckpointMessage) -> bool {
+            move |m| matches!(m, CheckpointMessage::Finalizer(epoch) if epoch.0 == e)
+        }
+
+        send(CHECKPOINT_COORDINATOR_CHANNEL, marker(FIRST)).unwrap();
+        read_until(&mut stream, &mut in_band, &is_marker(FIRST)).await;
+        send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Finalizer(CheckpointEpoch(FIRST)),
+        )
+        .unwrap();
+        read_until(&mut stream, &mut in_band, &is_finalizer(FIRST)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            test_plugins::log("gated_source[0]").finalizers.is_empty(),
+            "the plugin must not commit an epoch nothing downstream has proven"
+        );
+
+        send(CHECKPOINT_COORDINATOR_CHANNEL, marker(SECOND)).unwrap();
+        read_until(&mut stream, &mut in_band, &is_marker(SECOND)).await;
+        assert!(test_plugins::log("gated_source[0]").finalizers.is_empty());
+        send(
+            CHECKPOINT_COORDINATOR_CHANNEL,
+            CheckpointMessage::Finalizer(CheckpointEpoch(SECOND)),
+        )
+        .unwrap();
+        read_until(&mut stream, &mut in_band, &is_finalizer(SECOND)).await;
+        let deadline = Instant::now() + EXIT_BOUND;
+        while test_plugins::log("gated_source[0]").finalizers.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the plugin never received its finalizer"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            test_plugins::log("gated_source[0]").finalizers,
+            [FIRST],
+            "epoch {SECOND}'s acks prove epoch {FIRST}'s Finalizer went through; {SECOND} itself is still held"
+        );
+        let position = |wanted: &dyn Fn(&CheckpointMessage) -> bool| {
+            in_band.iter().position(wanted).expect("seen in-band")
+        };
+        assert!(
+            position(&is_finalizer(FIRST)) < position(&is_marker(SECOND)),
+            "the Finalizer must precede the marker that proves it: {in_band:?}"
+        );
+        shut_down(&source).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

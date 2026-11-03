@@ -26,6 +26,8 @@ pub struct CheckpointEpoch(pub u64);
 ///   Contains epoch and creation timestamp (ms since UNIX epoch) for propagation timing.
 /// - Ack: An acknowledgment for a checkpoint epoch. Sinks MUST flush/commit their state before sending this.
 /// - Finalizer: A message to finalize a checkpoint epoch. Should be used by sources/operators to flush/commit their state.
+///   A source attaches it in-band at once but commits its own position one epoch late, through
+///   [`SourceCommitGate`], so it is never committed past a transform that commits on the in-band copy.
 ///
 /// # Finalizer consumer contract (load-bearing — read before adding a connector)
 ///
@@ -260,6 +262,85 @@ fn required_copies(
         .filter(|last| last.as_ref().is_none_or(|last| last < epoch))
         .count();
     inputs.saturating_sub(finished_before).max(1)
+}
+
+/// Holds a source's own commit of a finalized epoch until that epoch's
+/// Finalizer has demonstrably passed every consumer downstream.
+///
+/// A source commits its position (offsets, the next slot to serve) on an
+/// epoch's Finalizer, which the coordinator hands it directly. A stateful
+/// transform commits its state on the same Finalizer, but sees it only
+/// in-band, behind whatever is buffered between the source and itself. A crash
+/// in between restarts the source at epoch `N` and the transform at `N-1`, and
+/// the rows between the two are served to a transform that never learned them;
+/// one that treats a position at or below its last as a redelivery loses them.
+///
+/// The gate orders the two commits by in-band position. The source attaches
+/// every Finalizer in-band the moment it arrives and records where, and records
+/// where every Marker went in-band. When a later epoch `M` finalizes, every
+/// sink has acked `M`'s marker, and each stage forwards a marker only after
+/// everything that preceded it on that stage's input (an aligner releases it
+/// only once every input delivered it), so every Finalizer attached before
+/// `M`'s marker has been processed downstream: those epochs' commits are
+/// released. A commit therefore lags one epoch, and a restart in the window
+/// resumes the source at or below every transform, which a transform's
+/// redelivery handling absorbs.
+#[derive(Debug, Default)]
+pub struct SourceCommitGate {
+    /// In-band position counter, one per attached checkpoint message.
+    next: u64,
+    /// In-band position of each marker not yet consumed as a barrier.
+    markers: BTreeMap<u64, u64>,
+    /// In-band position of each attached Finalizer whose commit is held.
+    held: BTreeMap<u64, u64>,
+}
+
+impl SourceCommitGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `epoch`'s marker is being attached in-band now.
+    pub fn marker_attached(&mut self, epoch: &CheckpointEpoch) {
+        let position = self.next;
+        self.next += 1;
+        self.markers.insert(epoch.0, position);
+    }
+
+    /// Record that `epoch`'s Finalizer is being attached in-band now, and
+    /// return the epochs whose commit it releases, in epoch order: every held
+    /// epoch whose Finalizer went in-band before `epoch`'s marker. `epoch`
+    /// itself is held until a later epoch finalizes. A marker this source never
+    /// attached (minted before it subscribed) releases nothing.
+    pub fn finalizer_attached(&mut self, epoch: &CheckpointEpoch) -> Vec<CheckpointEpoch> {
+        let released = match self.markers.get(&epoch.0).copied() {
+            Some(barrier) => {
+                let ready: Vec<u64> = self
+                    .held
+                    .iter()
+                    .filter(|(_, position)| **position < barrier)
+                    .map(|(held, _)| *held)
+                    .collect();
+                for held in &ready {
+                    self.held.remove(held);
+                }
+                // Markers go in-band in epoch order, so what is still held
+                // was attached after every marker up to this one.
+                self.markers.retain(|marker, _| *marker > epoch.0);
+                ready.into_iter().map(CheckpointEpoch).collect()
+            }
+            None => Vec::new(),
+        };
+        let position = self.next;
+        self.next += 1;
+        self.held.insert(epoch.0, position);
+        released
+    }
+
+    /// Epochs finalized but not yet committed by the source.
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
 }
 
 /// Tracks, per sink, how many concurrent write streams must flush an epoch
@@ -1394,6 +1475,66 @@ mod tests {
             vec![3],
             "with one input left a single copy completes the epoch"
         );
+    }
+
+    fn gate_epochs(epochs: Vec<CheckpointEpoch>) -> Vec<u64> {
+        epochs.into_iter().map(|e| e.0).collect()
+    }
+
+    /// A commit is released by the first later epoch whose marker went in-band
+    /// after the commit's Finalizer, one epoch behind in steady state.
+    #[test]
+    fn source_commit_gate_releases_a_commit_on_the_next_finalized_marker() {
+        let mut gate = SourceCommitGate::new();
+        gate.marker_attached(&CheckpointEpoch(1));
+        assert!(gate.finalizer_attached(&CheckpointEpoch(1)).is_empty());
+        assert_eq!(gate.held(), 1);
+        gate.marker_attached(&CheckpointEpoch(2));
+        assert_eq!(
+            gate_epochs(gate.finalizer_attached(&CheckpointEpoch(2))),
+            [1]
+        );
+        gate.marker_attached(&CheckpointEpoch(3));
+        assert_eq!(
+            gate_epochs(gate.finalizer_attached(&CheckpointEpoch(3))),
+            [2]
+        );
+        assert_eq!(gate.held(), 1);
+    }
+
+    /// A Finalizer that went in-band after a marker is not proven by that
+    /// marker's acks: it waits for the marker after it.
+    #[test]
+    fn source_commit_gate_needs_a_marker_attached_after_the_finalizer() {
+        let mut gate = SourceCommitGate::new();
+        gate.marker_attached(&CheckpointEpoch(1));
+        gate.marker_attached(&CheckpointEpoch(2));
+        assert!(gate.finalizer_attached(&CheckpointEpoch(1)).is_empty());
+        assert!(
+            gate.finalizer_attached(&CheckpointEpoch(2)).is_empty(),
+            "epoch 1's Finalizer went in-band after epoch 2's marker"
+        );
+        gate.marker_attached(&CheckpointEpoch(3));
+        assert_eq!(
+            gate_epochs(gate.finalizer_attached(&CheckpointEpoch(3))),
+            [1, 2],
+            "both were attached before epoch 3's marker"
+        );
+    }
+
+    /// A marker this source never attached proves nothing; the held commit
+    /// waits for one it did.
+    #[test]
+    fn source_commit_gate_ignores_a_marker_it_never_attached() {
+        let mut gate = SourceCommitGate::new();
+        assert!(gate.finalizer_attached(&CheckpointEpoch(5)).is_empty());
+        assert!(gate.finalizer_attached(&CheckpointEpoch(6)).is_empty());
+        gate.marker_attached(&CheckpointEpoch(7));
+        assert_eq!(
+            gate_epochs(gate.finalizer_attached(&CheckpointEpoch(7))),
+            [5, 6]
+        );
+        assert_eq!(gate.held(), 1);
     }
 
     #[test]

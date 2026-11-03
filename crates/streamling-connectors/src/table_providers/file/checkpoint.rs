@@ -9,7 +9,8 @@ use tokio::sync::mpsc::Sender;
 
 use streamling_core::checkpoints::channels::{SubscriberId, subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
-    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, enrich_batch_metadata_with_checkpoints,
+    CHECKPOINT_COORDINATOR_CHANNEL, CheckpointMessage, SourceCommitGate,
+    enrich_batch_metadata_with_checkpoints,
 };
 
 use super::reader::ReadPlan;
@@ -26,6 +27,9 @@ pub(super) struct CheckpointInbox {
     receiver: crossbeam::channel::Receiver<CheckpointMessage>,
     subscriber_id: SubscriberId,
     pub(super) buffer: Vec<CheckpointMessage>,
+    /// Progress persists one finalized epoch behind, once a later marker's
+    /// acks prove the Finalizer went through downstream.
+    gate: SourceCommitGate,
 }
 
 impl CheckpointInbox {
@@ -40,6 +44,7 @@ impl CheckpointInbox {
             receiver,
             subscriber_id,
             buffer: Vec::new(),
+            gate: SourceCommitGate::new(),
         }
     }
 
@@ -49,7 +54,7 @@ impl CheckpointInbox {
     pub(super) async fn drain<P: ReadPlan>(&mut self, plan: &mut P) -> DataFusionResult<bool> {
         let mut source_complete = false;
         while let Ok(message) = self.receiver.try_recv() {
-            source_complete |= handle_checkpoint_message(&message, plan).await?;
+            source_complete |= handle_checkpoint_message(&message, plan, &mut self.gate).await?;
             self.buffer.push(message);
         }
         Ok(source_complete)
@@ -71,16 +76,26 @@ impl Drop for CheckpointInbox {
 
 /// Handles one drained checkpoint message, mirroring the Kafka source's
 /// commit-on-finalize: a `Marker` snapshots the plan's progress for its epoch,
-/// and a `Finalizer` durably persists that snapshot. Returns `true` for
-/// `SourceComplete` so the caller can shut down. Other messages are no-ops here
-/// (they still propagate downstream via batch metadata).
+/// and a `Finalizer` durably persists the snapshots the gate releases (an
+/// epoch's own persist waits for a later marker's acks, see
+/// [`SourceCommitGate`]). Returns `true` for `SourceComplete` so the caller
+/// can shut down. Other messages are no-ops here (they still propagate
+/// downstream via batch metadata).
 pub(super) async fn handle_checkpoint_message<P: ReadPlan>(
     message: &CheckpointMessage,
     plan: &mut P,
+    gate: &mut SourceCommitGate,
 ) -> DataFusionResult<bool> {
     match message {
-        CheckpointMessage::Marker { epoch, .. } => plan.snapshot(epoch),
-        CheckpointMessage::Finalizer(epoch) => plan.persist(epoch).await?,
+        CheckpointMessage::Marker { epoch, .. } => {
+            plan.snapshot(epoch);
+            gate.marker_attached(epoch);
+        }
+        CheckpointMessage::Finalizer(epoch) => {
+            for released in gate.finalizer_attached(epoch) {
+                plan.persist(&released).await?;
+            }
+        }
         CheckpointMessage::SourceComplete(_) => return Ok(true),
         CheckpointMessage::Ack { .. } => {}
     }

@@ -588,12 +588,19 @@ mod tests {
         );
 
         // Finalizing mid-read must persist what the marker covered, rather than
-        // waiting for the source to reach the end of its queue.
-        streamling_core::checkpoints::channels::send(
-            CHANNEL,
+        // waiting for the source to reach the end of its queue. The persist is
+        // released by the next epoch's finalization, whose marker went in-band
+        // after epoch 1's Finalizer.
+        for message in [
             CheckpointMessage::Finalizer(CheckpointEpoch(1)),
-        )
-        .unwrap();
+            CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(2),
+                created_at_ms: now_ms(),
+            },
+            CheckpointMessage::Finalizer(CheckpointEpoch(2)),
+        ] {
+            streamling_core::checkpoints::channels::send(CHANNEL, message).unwrap();
+        }
         while let Some(batch) = stream.next().await {
             batch.unwrap();
         }

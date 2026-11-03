@@ -6,7 +6,7 @@ use streamling_config::{KafkaCompression, KafkaConfig};
 use streamling_core::checkpoints::channels::{subscribe_with_id, unsubscribe};
 use streamling_core::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointControl, CheckpointEpoch, CheckpointMessage,
-    enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
+    SourceCommitGate, enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
     report_marker_at_sink, send_checkpoint_ack,
 };
 use streamling_core::data::{COLUMN_NAME_OP, RowKind};
@@ -1973,6 +1973,11 @@ impl ExecutionPlan for KafkaSourceExec {
 
             // Collection to store checkpoint messages for batch enrichment
             let mut checkpoint_messages_buffer: Vec<CheckpointMessage> = Vec::new();
+            // Offsets commit one finalized epoch behind: a Finalizer goes
+            // in-band at once, and its commit waits until a later marker's
+            // acks prove every stage downstream processed that copy (see
+            // `SourceCommitGate`).
+            let mut commit_gate = SourceCommitGate::new();
             // Messages drained from the receiver inside the inner select (e.g.
             // the SourceComplete probe below) that still need full dispatch.
             // We never drop a CheckpointMessage from the receiver: anything
@@ -2135,6 +2140,7 @@ impl ExecutionPlan for KafkaSourceExec {
                         CheckpointMessage::Marker { epoch, created_at_ms } => {
                             debug!("Received epoch marker: {:?}", epoch);
                             checkpoint_messages_buffer.push(CheckpointMessage::Marker { epoch: epoch.clone(), created_at_ms });
+                            commit_gate.marker_attached(&epoch);
 
                             match consumer.position() {
                                 Ok(position) => {
@@ -2159,15 +2165,17 @@ impl ExecutionPlan for KafkaSourceExec {
                             // put; a backend gone THAT long should restart
                             // the pipeline rather than wedge this loop, which
                             // also serves the shutdown drain).
-                            let _ = Self::commit_offsets_for_finalized_epoch(
-                                &consumer,
-                                &state_backend,
-                                &reference_name,
-                                &mut consumer_offsets,
-                                &mut committed_offsets,
-                                &epoch,
-                                Duration::from_secs(60),
-                            ).await?;
+                            for released in commit_gate.finalizer_attached(&epoch) {
+                                let _ = Self::commit_offsets_for_finalized_epoch(
+                                    &consumer,
+                                    &state_backend,
+                                    &reference_name,
+                                    &mut consumer_offsets,
+                                    &mut committed_offsets,
+                                    &released,
+                                    Duration::from_secs(60),
+                                ).await?;
+                            }
                         }
                         // SourceComplete no longer arrives on the coordinator
                         // channel: record-limit sinks now request process-wide

@@ -30,7 +30,11 @@
 //!   is terminal — treat every marker identically.
 //! - **`process_checkpoint_finalizer` must be idempotent, non-blocking, and
 //!   must never wait for a specific epoch** (see the method docs). Use it for
-//!   commit-on-finalize bookkeeping only.
+//!   commit-on-finalize bookkeeping only. A SOURCE receives the Finalizer for
+//!   epoch `N` one epoch late, once a later epoch's acks prove every stage
+//!   downstream processed `N`'s Finalizer, so a crash can never leave the
+//!   source committed past a stateful transform. Resume at your committed
+//!   position and expect the slots after it to be redelivered.
 //! - **`terminate` / `is_running`** (`SupportsGracefulShutdown`): `terminate`
 //!   flips your running flag and releases what is WORTH releasing (see
 //!   below); the dispatcher then exits its loop. Data flushing should already

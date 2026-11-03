@@ -171,6 +171,41 @@ async fn handle_checkpoint_ack(
         .await
 }
 
+/// One control message, as the source loop handles it between batches.
+async fn handle_source_control_message(
+    msg: PluginMsg,
+    channels: &PluginChannels,
+    source_plugin: &Arc<dyn SourcePlugin>,
+    runtime: &PluginAsyncRuntimeObj,
+) -> Result<(), PluginError> {
+    match msg {
+        PluginMsg::Init => Err(PluginError::Execution(
+            "Received Init message after plugin was initialized".to_string(),
+        )),
+        PluginMsg::CheckpointMarker { epoch } => {
+            source_plugin
+                .process_checkpoint_marker(epoch.into())
+                .await?;
+            handle_checkpoint_marker(channels, epoch, runtime).await
+        }
+        PluginMsg::CheckpointFinalizer { epoch } => {
+            source_plugin
+                .process_checkpoint_finalizer(epoch.into())
+                .await?;
+            handle_checkpoint_finalizer(channels, epoch, runtime).await
+        }
+        PluginMsg::Terminate => {
+            source_plugin.terminate().await?;
+            // Bounded wait for tasks spawned via `shutdown::spawn` so
+            // buffered work they hold is flushed before the library goes
+            // quiet. No-op when nothing was tracked.
+            crate::shutdown::drain_tracked().await;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn handle_control_messages(
     channels: &PluginChannels,
     source_plugin: &Arc<dyn SourcePlugin>,
@@ -178,40 +213,24 @@ async fn handle_control_messages(
 ) -> Result<(), PluginError> {
     while !channels.input.receiver.is_empty() {
         match channels.input.receiver.recv().map(|m| m.into_enum()) {
-            Ok(Ok(PluginMsg::Init)) => {
-                return Err(PluginError::Execution(
-                    "Received Init message after plugin was initialized".to_string(),
-                ));
+            Ok(Ok(msg)) => {
+                handle_source_control_message(msg, channels, source_plugin, runtime).await?
             }
-            Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
-                source_plugin
-                    .process_checkpoint_marker(epoch.into())
-                    .await?;
-                handle_checkpoint_marker(channels, epoch, runtime).await?;
-            }
-            Ok(Ok(PluginMsg::CheckpointFinalizer { epoch })) => {
-                source_plugin
-                    .process_checkpoint_finalizer(epoch.into())
-                    .await?;
-                handle_checkpoint_finalizer(channels, epoch, runtime).await?;
-            }
-            Ok(Ok(PluginMsg::Terminate)) => {
-                source_plugin.terminate().await?;
-                // Bounded wait for tasks spawned via `shutdown::spawn` so
-                // buffered work they hold is flushed before the library goes
-                // quiet. No-op when nothing was tracked.
-                crate::shutdown::drain_tracked().await;
-            }
+            Ok(Err(_malformed)) => {}
             Err(e) => {
                 return Err(PluginError::Execution(format!(
                     "Error receiving message from input channel: {e}"
                 )));
             }
-            _ => {}
         }
     }
     Ok(())
 }
+
+/// Control messages that arrived while a generated batch was waiting on a full
+/// output channel, in arrival order. See the retry callback in
+/// [`SourcePluginDispatcher::start`].
+type DeferredControl = Arc<std::sync::Mutex<Vec<PluginMsg>>>;
 
 /// After a sink/transform plugin fails, keep consuming its input channel —
 /// dropping data batches and swallowing checkpoint messages WITHOUT acking or
@@ -347,16 +366,40 @@ impl SourcePluginDispatcher {
             let runtime_clone = runtime.clone();
             let channels_clone = self.channels.clone();
             let source_plugin_clone = self.source_plugin.clone();
+            let deferred: DeferredControl = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let deferred_clone = deferred.clone();
             let generate_batch_future = async move {
                 match source_plugin.generate_batch().await {
                     Ok(batch) => {
                         let retry_callback = || -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
                             let channels = channels_clone.clone();
                             let source_plugin = source_plugin_clone.clone();
-                            let runtime = runtime_clone.clone();
+                            let deferred = deferred_clone.clone();
                             Box::pin(async move {
-                                // Handle control messages in case the output channel is full
-                                let _ = handle_control_messages(&channels, &source_plugin, &runtime).await;
+                                // The output channel is full and this batch is still unsent. A
+                                // checkpoint marker handled here would overtake it: the source
+                                // records its position PAST the batch (`generate_batch` already
+                                // advanced it) while the marker goes out ahead of the batch, so
+                                // the epoch finalizes over data that reached downstream only
+                                // after the marker — and a restart from that epoch skips it.
+                                // Only Terminate is acted on while the send is blocked; every
+                                // other control message is replayed, in order, once the batch
+                                // is on the channel.
+                                while let Ok(msg) = channels.input.receiver.try_recv() {
+                                    match msg.into_enum() {
+                                        Ok(PluginMsg::Terminate) => {
+                                            if let Err(e) = source_plugin.terminate().await {
+                                                error!("Error terminating source plugin: {:?}", e);
+                                            }
+                                            crate::shutdown::drain_tracked().await;
+                                        }
+                                        Ok(other) => deferred
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .push(other),
+                                        Err(_malformed) => {}
+                                    }
+                                }
                                 // Check if plugin is still running
                                 source_plugin.is_running()
                             })
@@ -383,6 +426,33 @@ impl SourcePluginDispatcher {
             .into_ffi();
 
             runtime.spawn(generate_batch_future).await;
+
+            // Replay what the blocked send set aside, now that the batch is on
+            // the channel. If the send was abandoned on Terminate instead, the
+            // batch was dropped and these markers must not go out: an epoch
+            // covering dropped data must never finalize, so it stays
+            // uncommitted and the data replays on restart.
+            let deferred = std::mem::take(&mut *deferred.lock().unwrap_or_else(|p| p.into_inner()));
+            if self.source_plugin.is_running() {
+                for msg in deferred {
+                    if let Err(e) = handle_source_control_message(
+                        msg,
+                        &self.channels,
+                        &self.source_plugin,
+                        &runtime,
+                    )
+                    .await
+                    {
+                        return drain_discard_after_failure(
+                            &self.channels,
+                            &runtime,
+                            e,
+                            self.source_plugin.terminate(),
+                        )
+                        .await;
+                    }
+                }
+            }
 
             // A failing checkpoint hook must not exit with a possibly-full
             // input channel behind it — the host-side control writer would
@@ -1159,6 +1229,149 @@ mod tests {
             1,
             "terminate() must be called exactly once on Terminate-before-Init"
         );
+    }
+
+    /// A source that counts its batches and remembers how many had been generated when each
+    /// checkpoint marker reached it: the position a real source persists for that epoch.
+    #[derive(Default)]
+    struct CountingSource {
+        generated: AtomicUsize,
+        generated_at_marker: std::sync::Mutex<Vec<usize>>,
+        stopped: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for CountingSource {
+        fn is_running(&self) -> bool {
+            !self.stopped.load(Ordering::SeqCst)
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourcePlugin for CountingSource {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(empty_schema())
+        }
+        async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+            self.generated.fetch_add(1, Ordering::SeqCst);
+            Ok(RecordBatch::new_empty(empty_schema()))
+        }
+        async fn process_checkpoint_marker(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            self.generated_at_marker
+                .lock()
+                .unwrap()
+                .push(self.generated.load(Ordering::SeqCst));
+            Ok(())
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn kind(msg: crate::ffi::PluginMsg_NE) -> &'static str {
+        match msg.into_enum() {
+            Ok(PluginMsg::NextBatch { .. }) => "batch",
+            Ok(PluginMsg::CheckpointMarker { .. }) => "marker",
+            Ok(PluginMsg::Terminate) => "terminate",
+            other => panic!("unexpected output message: {other:?}"),
+        }
+    }
+
+    /// A checkpoint marker that arrives while a generated batch is waiting on a full output
+    /// channel must come out BEHIND that batch. The source records its position when the marker
+    /// is processed, and `generate_batch` has already moved it past the waiting batch, so a
+    /// marker forwarded ahead of the batch lets the epoch finalize with the source past data that
+    /// downstream only saw after the marker: a restart from that epoch skips it.
+    #[tokio::test]
+    async fn source_marker_does_not_overtake_a_batch_blocked_on_backpressure() {
+        let channels = PluginChannels {
+            input: PluginChannel::new(crossbeam_channel::bounded(8)),
+            output: PluginChannel::new(crossbeam_channel::bounded(1)),
+            metrics: PluginMetricsChannel::new(crossbeam_channel::bounded(64)),
+        };
+        let source = Arc::new(CountingSource::default());
+        let plugin: Arc<dyn SourcePlugin> = source.clone();
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), plugin);
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        let dispatch = tokio::spawn(async move { dispatcher.start(runtime).await });
+
+        // Batch 1 fills the channel; batch 2 is generated and blocks on it.
+        wait_until("the second batch to be generated", || {
+            source.generated.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::CheckpointMarker {
+                epoch: PluginCheckpointEpoch(7),
+            }))
+            .unwrap();
+        // Give the blocked send's retry path every chance to pick the marker up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            let msg = tokio::task::spawn_blocking({
+                let rx = channels.output.receiver.clone();
+                move || rx.recv().expect("output open")
+            })
+            .await
+            .unwrap();
+            order.push(kind(msg));
+        }
+        assert_eq!(
+            order,
+            vec!["batch", "batch", "marker"],
+            "the marker must not overtake the batch that was blocked when it arrived"
+        );
+        assert_eq!(
+            *source.generated_at_marker.lock().unwrap(),
+            vec![2],
+            "the position recorded for the epoch covers exactly the batches ahead of the marker"
+        );
+
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Terminate))
+            .unwrap();
+        // Keep the output drained until the dispatcher exits.
+        let rx = channels.output.receiver.clone();
+        let drain = tokio::task::spawn_blocking(move || {
+            while let Ok(_msg) = rx.recv_timeout(Duration::from_secs(2)) {}
+        });
+        dispatch.await.unwrap().unwrap();
+        drain.await.unwrap();
     }
 
     #[tokio::test]

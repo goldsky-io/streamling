@@ -83,6 +83,8 @@ pub(crate) struct InstanceLog {
     pub terminated: bool,
     pub ids: Vec<i64>,
     pub markers: Vec<u64>,
+    /// Finalizers the instance received, in order.
+    pub finalizers: Vec<u64>,
 }
 
 static LOGS: LazyLock<Mutex<HashMap<String, InstanceLog>>> =
@@ -379,7 +381,11 @@ impl SourcePlugin for TestSource {
     async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
         self.instance.checkpoint(epoch)
     }
-    async fn process_checkpoint_finalizer(&self, _: CheckpointEpoch) -> Result<(), PluginError> {
+    async fn process_checkpoint_finalizer(
+        &self,
+        epoch: CheckpointEpoch,
+    ) -> Result<(), PluginError> {
+        record(&self.instance.name, |log| log.finalizers.push(epoch.0));
         Ok(())
     }
 }

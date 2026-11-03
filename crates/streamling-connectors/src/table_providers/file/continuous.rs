@@ -292,7 +292,9 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use streamling_core::checkpoints::checkpoint_management::CheckpointMessage;
+    use streamling_core::checkpoints::checkpoint_management::{
+        CheckpointMessage, SourceCommitGate,
+    };
     use streamling_state::in_memory::InMemoryStateOperatorBackendFactory;
     use streamling_state::{StateOperatorBackend, StateOperatorBackendFactory};
     use tokio::time::timeout;
@@ -538,11 +540,17 @@ mod tests {
             panic!("expected a round of files");
         };
         plan.advance(&first);
-        let marker = CheckpointMessage::Marker {
-            epoch: CheckpointEpoch(1),
+        let mut gate = SourceCommitGate::new();
+        let marker = |epoch: u64| CheckpointMessage::Marker {
+            epoch: CheckpointEpoch(epoch),
             created_at_ms: 0,
         };
-        assert!(!handle_checkpoint_message(&marker, &mut plan).await.unwrap());
+        let finalizer = |epoch: u64| CheckpointMessage::Finalizer(CheckpointEpoch(epoch));
+        assert!(
+            !handle_checkpoint_message(&marker(1), &mut plan, &mut gate)
+                .await
+                .unwrap()
+        );
         assert!(
             persisted().await.is_none(),
             "a marker must not persist the watermark"
@@ -552,31 +560,55 @@ mod tests {
             panic!("expected a round of files");
         };
         plan.advance(&second);
-        handle_checkpoint_message(&CheckpointMessage::Finalizer(CheckpointEpoch(1)), &mut plan)
+        handle_checkpoint_message(&finalizer(1), &mut plan, &mut gate)
+            .await
+            .unwrap();
+        assert!(
+            persisted().await.is_none(),
+            "epoch 1's persist waits until a later marker proves its Finalizer went downstream"
+        );
+        handle_checkpoint_message(&marker(2), &mut plan, &mut gate)
+            .await
+            .unwrap();
+        handle_checkpoint_message(&finalizer(2), &mut plan, &mut gate)
             .await
             .unwrap();
         let first = FileKey::from(&first[0]);
         let expected = FileWatermark {
             last_modified_ms: first.last_modified_ms,
-            boundary_paths: vec![first.path],
+            boundary_paths: vec![first.path.clone()],
             committed_ahead: Vec::new(),
         };
         assert_eq!(
             persisted().await,
             Some(expected.clone()),
-            "finalize must persist only the files emitted before the marker"
+            "finalize must persist only the files emitted before epoch 1's marker"
         );
 
-        // A finalize for an epoch no marker was recorded for commits nothing new.
-        handle_checkpoint_message(&CheckpointMessage::Finalizer(CheckpointEpoch(7)), &mut plan)
+        // Epoch 8's acks release the two held epochs: 2 commits the file
+        // emitted before its marker, and 7, which no marker was recorded for,
+        // commits nothing new.
+        handle_checkpoint_message(&finalizer(7), &mut plan, &mut gate)
             .await
             .unwrap();
-        assert_eq!(persisted().await, Some(expected));
+        handle_checkpoint_message(&marker(8), &mut plan, &mut gate)
+            .await
+            .unwrap();
+        handle_checkpoint_message(&finalizer(8), &mut plan, &mut gate)
+            .await
+            .unwrap();
+        let persisted_now = persisted().await.expect("epochs 2 and 7 were released");
+        let mut paths = persisted_now.boundary_paths.clone();
+        paths.sort();
+        let mut want = vec![first.path.clone(), FileKey::from(&second[0]).path];
+        want.sort();
+        assert_eq!(paths, want);
+        assert!(persisted_now.committed_ahead.is_empty());
 
         // SourceComplete signals shutdown.
         let source_complete = CheckpointMessage::SourceComplete("src".to_string());
         assert!(
-            handle_checkpoint_message(&source_complete, &mut plan)
+            handle_checkpoint_message(&source_complete, &mut plan, &mut gate)
                 .await
                 .unwrap()
         );
