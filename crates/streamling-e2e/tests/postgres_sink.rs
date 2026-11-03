@@ -1661,6 +1661,15 @@ async fn test_keyed_sink_narrows_a_parallel_source() {
         value: format!("updated_{i}"),
         timestamp: 2000 + i,
     }));
+    // Keyed by `id`, so both copies of a key share a Kafka partition and reach
+    // one consumer instance in order. Streamling preserves per-key ordering from
+    // the source onward but cannot restore an order the source never had: with
+    // the default empty key, librdkafka partitions randomly and a key's two rows
+    // can arrive on unrelated streams with no defined relative order.
+    topic
+        .produce_avro_records_keyed(&records, |r| r.id.to_string())
+        .await
+        .expect("Failed to produce records");
 
     let pipeline = format!(
         r#"
@@ -1689,59 +1698,39 @@ sinks:
         topic = topic.topic,
     );
 
-    // Produce only once all 4 consumers have joined: a member joining after
-    // reading began takes partitions over and, with no committed offsets yet,
-    // re-reads them. Those repeats would count toward the record limit and stop
-    // the pipeline before every key was read.
+    // Stop on the final state, not a record limit: a source consumer joining
+    // late re-reads its new partitions before the first offset commit, and those
+    // repeats can use up a limit before every key is read. A key stuck on its
+    // first version runs out the wait and fails the assertions below.
     //
     // `batch_size: 1` so both copies of an id are written rather than collapsed
-    // by in-batch dedup — which would both hide the ordering property and make
-    // the record limit unreachable.
-    let pipeline_path = ctx.temp_dir.path().join("pipeline.yaml");
-    std::fs::write(&pipeline_path, &pipeline).expect("Failed to write pipeline file");
-    let mut env_vars = ctx.build_env_vars();
-    env_vars.extend([
-        (
-            "STREAMLING__NUM_RECORDS_BEFORE_STOP".to_string(),
-            records.len().to_string(),
-        ),
-        ("STREAMLING__RECORD_BATCH_SIZE".to_string(), "1".to_string()),
-    ]);
-    let binary_path = ctx.config.streamling_bin.clone();
-    let pipeline_task = tokio::spawn(async move {
-        streamling_e2e::streamling::run_streamling(
-            &pipeline_path,
-            binary_path.as_deref(),
-            &env_vars,
+    // by in-batch dedup, which would hide the ordering property.
+    let every_key_updated = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            let updated = ctx
+                .postgres
+                .count(
+                    "SELECT COUNT(*) FROM public.test_narrowing_sink \
+                     WHERE value = 'updated_' || id",
+                )
+                .await
+                .unwrap_or(0);
+            if updated == KEYS {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let (status, _) = ctx
+        .run_pipeline_with_sigterm_when(
+            &pipeline,
+            PipelineOpts::new().env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+            every_key_updated,
+            Duration::from_secs(30),
         )
         .await
-    });
-
-    // The source's group id is the context's group id plus the source name.
-    topic
-        .wait_for_stable_group(
-            &format!("e2e-test-{}-kafka_source", ctx.test_id),
-            4,
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("source consumers never settled into one stable group");
-
-    // Keyed by `id`, so both copies of a key share a Kafka partition and reach
-    // one consumer instance in order. Streamling preserves per-key ordering from
-    // the source onward but cannot restore an order the source never had: with
-    // the default empty key, librdkafka partitions randomly and a key's two rows
-    // can arrive on unrelated streams with no defined relative order.
-    topic
-        .produce_avro_records_keyed(&records, |r| r.id.to_string())
-        .await
-        .expect("Failed to produce records");
-
-    let status = tokio::time::timeout(Duration::from_secs(120), pipeline_task)
-        .await
-        .expect("pipeline did not finish within 120s")
-        .expect("pipeline task panicked")
-        .expect("Streamling execution failed");
+        .expect("Streamling must exit within 30s of SIGTERM");
     assert!(status.success(), "Streamling should exit successfully");
 
     let rows: Vec<(i64, String)> = ctx
