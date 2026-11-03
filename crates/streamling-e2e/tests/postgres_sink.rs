@@ -1698,19 +1698,39 @@ sinks:
         topic = topic.topic,
     );
 
+    // Stop on the final state, not a record limit: a source consumer joining
+    // late re-reads its new partitions before the first offset commit, and those
+    // repeats can use up a limit before every key is read. A key stuck on its
+    // first version runs out the wait and fails the assertions below.
+    //
     // `batch_size: 1` so both copies of an id are written rather than collapsed
-    // by in-batch dedup — which would both hide the ordering property and make
-    // the record limit unreachable.
-    let status = ctx
-        .run_pipeline_with_opts(
+    // by in-batch dedup, which would hide the ordering property.
+    let every_key_updated = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            let updated = ctx
+                .postgres
+                .count(
+                    "SELECT COUNT(*) FROM public.test_narrowing_sink \
+                     WHERE value = 'updated_' || id",
+                )
+                .await
+                .unwrap_or(0);
+            if updated == KEYS {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let (status, _) = ctx
+        .run_pipeline_with_sigterm_when(
             &pipeline,
-            PipelineOpts::new()
-                .record_limit(records.len() as u64)
-                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
-                .timeout(Duration::from_secs(120)),
+            PipelineOpts::new().env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+            every_key_updated,
+            Duration::from_secs(30),
         )
         .await
-        .expect("Streamling execution failed");
+        .expect("Streamling must exit within 30s of SIGTERM");
     assert!(status.success(), "Streamling should exit successfully");
 
     let rows: Vec<(i64, String)> = ctx
