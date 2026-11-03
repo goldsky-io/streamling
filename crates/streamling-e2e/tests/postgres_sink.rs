@@ -1629,6 +1629,7 @@ sinks:
 /// the second version may only win if both copies landed on the same write
 /// stream in order — if a key's two rows reached different streams they would
 /// race, and `original_i` could survive as the final value.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_keyed_sink_narrows_a_parallel_source() {
     init_tracing();
