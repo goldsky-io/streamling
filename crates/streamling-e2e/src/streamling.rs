@@ -253,6 +253,7 @@ pub async fn run_streamling_with_sigterm(
 /// Like [`run_streamling_with_sigterm`], but signals once `signal_when`
 /// resolves. Waiting on the pipeline's observed progress stops it at the same
 /// point on any machine, where a fixed delay a fast host outruns does not.
+#[cfg(unix)]
 pub async fn run_streamling_with_sigterm_when(
     pipeline_path: &Path,
     binary_path: Option<&Path>,
