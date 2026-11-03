@@ -558,6 +558,7 @@ impl TestContext {
     /// Like [`Self::run_pipeline_with_sigterm`], but signals once `signal_when`
     /// resolves. Wait on the pipeline's observed progress whenever a fixed delay
     /// would stop it somewhere else on a faster machine.
+    #[cfg(unix)]
     pub async fn run_pipeline_with_sigterm_when(
         &self,
         pipeline_yaml: &str,

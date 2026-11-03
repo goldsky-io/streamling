@@ -880,6 +880,7 @@ sinks:
 /// (The overlap width without 1B is one checkpoint interval's worth of
 /// records — dozens at this test's rates — so a regression fails loudly, not
 /// marginally.)
+#[cfg(unix)]
 #[tokio::test]
 async fn test_sigterm_terminal_checkpoint_prevents_tail_replay_on_restart() {
     init_tracing();
@@ -1226,6 +1227,7 @@ sinks:
 ///
 /// The chosen offset is logged and can be pinned for reproduction with
 /// `STREAMLING_E2E_CHAOS_SIGNAL_MS=<ms>`.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_sigterm_chaos_random_point_drains_and_exits_promptly() {
     init_tracing();
