@@ -100,6 +100,45 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: 0
         timeout-minutes: 15
 
+  # The release builds every workspace member for Windows and macOS; catch
+  # platform-only code here instead of at release time. Linux is covered by
+  # build-release-main. Runners and native deps mirror streamling-release.yml.
+  check-cross-platform:
+    needs: [changes]
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-windows-2025
+            os: windows
+          - runner: macos-15-intel
+            os: darwin-x86_64
+          - runner: macos-14
+            os: darwin-aarch64
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Configure Rust toolchain
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        with:
+          toolchain: 1.91.1
+      - name: Setup rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: "streamling-check-${{ matrix.os }}"
+          cache-on-failure: true
+      # Windows builds rdkafka with vendored OpenSSL, which needs NASM.
+      - name: Install NASM
+        if: matrix.os == 'windows'
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
+      - name: Check every workspace target
+        run: cargo check --workspace --all-targets --locked
+        env:
+          CARGO_INCREMENTAL: 0
+
   # ==========================================================================
   # Build release binary, share via artifact.
   # ==========================================================================
