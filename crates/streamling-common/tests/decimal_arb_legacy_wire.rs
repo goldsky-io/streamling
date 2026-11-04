@@ -15,7 +15,7 @@ use streamling_common::formats::{
     FromArrowConverter,
     avro::{
         FromArrowToAvroConverter, arrow_avro::ConfluentAvroDecoder,
-        post_process_avro_schema_for_writing, to_avro,
+        post_process_avro_schema_for_writing, try_to_avro,
     },
 };
 
@@ -109,7 +109,7 @@ fn legacy_u256_avro_bytes_contract() {
         .downcast_ref::<FixedSizeBinaryArray>()
         .unwrap();
     let converter = FromArrowToAvroConverter::new(input.schema(), "LegacyPluginV3".into());
-    let schema = to_avro("LegacyPluginV3", &input.schema().fields);
+    let schema = try_to_avro("LegacyPluginV3", &input.schema().fields).unwrap();
     let wrapped = post_process_avro_schema_for_writing(schema.clone(), None);
     let schema_json = serde_json::to_string(&schema).unwrap();
     // Record the existing wire contract explicitly: it is bytes, not an Avro numeric logical type.
@@ -211,7 +211,7 @@ fn legacy_u256_avro_slice_matrix() {
     for offset in 0..source.num_rows() {
         for len in 1..=source.num_rows() - offset {
             let b = source.slice(offset, len);
-            let s = to_avro("SliceV3", &b.schema().fields);
+            let s = try_to_avro("SliceV3", &b.schema().fields).unwrap();
             let converter = FromArrowToAvroConverter::new(b.schema(), "SliceV3".into());
             let values = converter.convert_from_batch(&b).unwrap();
             assert_eq!(values.len(), len);
@@ -268,7 +268,7 @@ fn companion_canton_native_decimal256_signed_avro() {
             (f, Arc::new(a.clone()))
         };
         let b = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
-        let s = to_avro("CantonV3", &b.schema().fields);
+        let s = try_to_avro("CantonV3", &b.schema().fields).unwrap();
         let converter = FromArrowToAvroConverter::new(b.schema(), "CantonV3".into());
         let mut reader = ConfluentAvroDecoder::new().with_reader_schema(&s).unwrap();
         reader

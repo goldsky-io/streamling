@@ -11,7 +11,7 @@ use datafusion::{
 };
 use std::sync::Arc;
 use streamling_common::{
-    formats::avro::{serialize, to_avro},
+    formats::avro::{serialize, try_to_avro},
     types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType},
 };
 use streamling_core::operators::{planner::StreamlingQueryPlanner, wasm_runner::WasmRunnerNode};
@@ -54,8 +54,8 @@ fn input(kind: &str) -> RecordBatch {
 }
 async fn echo(kind: &str) {
     let input = input(kind);
-    let expected_schema = to_avro("Test", input.schema().fields());
-    let expected = serialize(&expected_schema, &input);
+    let expected_schema = try_to_avro("Test", input.schema().fields()).unwrap();
+    let expected = serialize(&expected_schema, &input).unwrap();
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_query_planner(Arc::new(StreamlingQueryPlanner::new()))
@@ -81,7 +81,7 @@ async fn echo(kind: &str) {
         .unwrap();
     let actual: Vec<_> = batches
         .iter()
-        .flat_map(|b| serialize(&expected_schema, b))
+        .flat_map(|b| serialize(&expected_schema, b).unwrap())
         .collect();
     assert_eq!(
         actual, expected,

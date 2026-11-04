@@ -12,7 +12,9 @@ use std::{str::FromStr, sync::Arc};
 use streamling_common::{
     formats::{
         FromArrowConverter, ToArrowConverter,
-        avro::{FromArrowToAvroConverter, arrow_avro::ConfluentAvroDecoder, serialize, to_avro},
+        avro::{
+            FromArrowToAvroConverter, arrow_avro::ConfluentAvroDecoder, serialize, try_to_avro,
+        },
         json::{FromArrowToJsonConverter, JsonToArrowConverter},
     },
     types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue},
@@ -339,7 +341,7 @@ fn writer_schema_drift_is_detected_or_preserves_number() {
     let target = arb_batch(100, 0, &["1"]);
     let input = arb_batch(100, 2, &["1"]);
     let converter = FromArrowToAvroConverter::new(target.schema(), "BoundV3".into());
-    let schema = to_avro("BoundV3", &target.schema().fields);
+    let schema = try_to_avro("BoundV3", &target.schema().fields).unwrap();
     let encoded = converter.convert_from_batch(&input).unwrap();
     let wire = to_avro_datum(&schema, encoded[0].clone()).unwrap();
     let decoded = from_avro_datum(&schema, &mut wire.as_slice(), None).unwrap();
@@ -373,8 +375,9 @@ fn native_negative_scale_avro_diagnostic() {
             vec![Arc::new(arr)],
         )
         .unwrap();
-        let a = to_avro("NativeScaleV3", &b.schema().fields);
+        let a = try_to_avro("NativeScaleV3", &b.schema().fields).unwrap();
         let results = serialize(&a, &b)
+            .unwrap()
             .into_iter()
             .map(|v| {
                 to_avro_datum(&a, v)
