@@ -277,13 +277,17 @@ impl DynamicTableSideOutput {
     }
 }
 
+// TODO: override `placement` with `SideOutputPlacement::AfterSourceFilter`, so
+// a dynamic table over a filtered source stores only the rows the filter keeps,
+// like a table does. Nothing blocks it, but it changes what existing pipelines
+// store, so it waits for a breaking release.
 #[async_trait]
 impl SourceSideOutput for DynamicTableSideOutput {
     /// - If a filter expression is provided, it is applied first to filter the input batch.
     /// - Then the projection expression is applied to extract the values to be stored in the dynamic table.
     /// - The projection expression must result in a single string column.
     /// - The resulting values are appended to the dynamic table backend.
-    async fn process(&self, batch: &RecordBatch) -> Result<()> {
+    async fn process(&self, batch: &RecordBatch) -> Result<HashMap<String, String>> {
         let mut current_batch = batch.clone();
         let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
 
@@ -340,49 +344,7 @@ impl SourceSideOutput for DynamicTableSideOutput {
         self.backend.append(value).await.map_err(|e| {
             DataFusionError::from(streamling_err!("dynamic table append failed: {e}"))
         })?;
-        Ok(())
-    }
-}
-
-/// Extract expressions from a SQL query. Only Projection and Filter are supported.
-/// Returns a tuple of (projection expressions, optional filter expression)
-pub fn extract_expressions_from_sql_query(plan: &LogicalPlan) -> Result<(Vec<Expr>, Option<Expr>)> {
-    match plan {
-        LogicalPlan::Projection(projection) => {
-            let exprs = projection.expr.clone();
-            // Unwrap common wrapper nodes to find an optional Filter or base scan
-            let mut current = projection.input.as_ref();
-            let filter_expr: Option<Expr> = loop {
-                match current {
-                    LogicalPlan::Filter(filter) => break Some(filter.predicate.clone()),
-                    LogicalPlan::TableScan(_) => break None,
-                    LogicalPlan::SubqueryAlias(alias) => {
-                        current = alias.input.as_ref();
-                    }
-                    // Treat Extension as a valid base (e.g., custom table provider)
-                    LogicalPlan::Extension(_) => break None,
-                    _ => {
-                        return Err(streamling_user_err!(
-                            "only Projection and Filter SQL queries are supported for dynamic tables"
-                        )
-                        .into());
-                    }
-                }
-            };
-            Ok((exprs, filter_expr))
-        }
-        LogicalPlan::Filter(filter) => {
-            let filter_expr = filter.predicate.clone();
-            Ok((vec![], Some(filter_expr)))
-        }
-        // Allow top-level wrappers by delegating to their inputs
-        LogicalPlan::SubqueryAlias(alias) => {
-            extract_expressions_from_sql_query(alias.input.as_ref())
-        }
-        _ => Err(streamling_user_err!(
-            "only Projection and Filter SQL queries are supported for dynamic tables"
-        )
-        .into()),
+        Ok(HashMap::new())
     }
 }
 
@@ -968,188 +930,6 @@ mod tests {
         assert!(
             table_names.contains(&"table2".to_string()),
             "Should find table2"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_extract_expressions_from_sql_query_simple_select() {
-        let session_manager = create_test_session_manager();
-
-        // Register a test table
-        let schema = create_test_schema();
-        let empty_table = Arc::new(EmptyTable::new(schema));
-        session_manager
-            .register_table("test_table", empty_table)
-            .unwrap();
-
-        let sql = "SELECT * FROM test_table";
-        let plan = session_manager
-            .create_logical_plan(String::from(sql))
-            .await
-            .unwrap();
-        let result = extract_expressions_from_sql_query(&plan);
-
-        assert!(result.is_ok(), "Should successfully parse simple SELECT *");
-        let (projection_exprs, filter_expr) = result.unwrap();
-
-        // For SELECT *, we expect wildcard expressions for each column
-        assert!(
-            !projection_exprs.is_empty(),
-            "Should have projection expressions for SELECT *"
-        );
-        assert!(filter_expr.is_none(), "Should have no filter expression");
-    }
-
-    #[tokio::test]
-    async fn test_extract_expressions_from_sql_query_projection() {
-        let session_manager = create_test_session_manager();
-
-        // Register a test table
-        let schema = create_test_schema();
-        let empty_table = Arc::new(EmptyTable::new(schema));
-        session_manager
-            .register_table("test_table", empty_table)
-            .unwrap();
-
-        let sql = "SELECT id, name FROM test_table";
-        let plan = session_manager
-            .create_logical_plan(String::from(sql))
-            .await
-            .unwrap();
-        let result = extract_expressions_from_sql_query(&plan);
-
-        assert!(result.is_ok(), "Should successfully parse projection query");
-        let (projection_exprs, filter_expr) = result.unwrap();
-
-        assert_eq!(
-            projection_exprs.len(),
-            2,
-            "Should have 2 projection expressions"
-        );
-        assert!(filter_expr.is_none(), "Should have no filter expression");
-
-        // Verify the expressions are column references
-        match &projection_exprs[0] {
-            Expr::Column(_) => (),
-            _ => panic!("First expression should be a column reference"),
-        }
-        match &projection_exprs[1] {
-            Expr::Column(_) => (),
-            _ => panic!("Second expression should be a column reference"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_extract_expressions_from_sql_query_filter_only() {
-        let session_manager = create_test_session_manager();
-
-        // Register a test table
-        let schema = create_test_schema();
-        let empty_table = Arc::new(EmptyTable::new(schema));
-        session_manager
-            .register_table("test_table", empty_table)
-            .unwrap();
-
-        let sql = "SELECT * FROM test_table WHERE id > 10";
-        let plan = session_manager
-            .create_logical_plan(String::from(sql))
-            .await
-            .unwrap();
-        let result = extract_expressions_from_sql_query(&plan);
-
-        assert!(
-            result.is_ok(),
-            "Should successfully parse query with WHERE clause"
-        );
-        let (projection_exprs, filter_expr) = result.unwrap();
-
-        assert!(
-            !projection_exprs.is_empty(),
-            "Should have projection expressions"
-        );
-        assert!(filter_expr.is_some(), "Should have filter expression");
-
-        // Verify the filter expression is a binary expression
-        let filter = filter_expr.unwrap();
-        match filter {
-            Expr::BinaryExpr(_) => (),
-            _ => panic!("Filter expression should be a binary expression"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_extract_expressions_from_sql_query_projection_and_filter() {
-        let session_manager = create_test_session_manager();
-
-        // Register a test table
-        let schema = create_test_schema();
-        let empty_table = Arc::new(EmptyTable::new(schema));
-        session_manager
-            .register_table("test_table", empty_table)
-            .unwrap();
-
-        let sql = "SELECT id, name FROM test_table WHERE id > 10";
-        let plan = session_manager
-            .create_logical_plan(String::from(sql))
-            .await
-            .unwrap();
-        let result = extract_expressions_from_sql_query(&plan);
-
-        assert!(
-            result.is_ok(),
-            "Should successfully parse projection with WHERE clause"
-        );
-        let (projection_exprs, filter_expr) = result.unwrap();
-
-        assert_eq!(
-            projection_exprs.len(),
-            2,
-            "Should have 2 projection expressions"
-        );
-        assert!(filter_expr.is_some(), "Should have filter expression");
-
-        // Verify the projection expressions are column references
-        match &projection_exprs[0] {
-            Expr::Column(_) => (),
-            _ => panic!("First expression should be a column reference"),
-        }
-        match &projection_exprs[1] {
-            Expr::Column(_) => (),
-            _ => panic!("Second expression should be a column reference"),
-        }
-
-        // Verify the filter expression is a binary expression
-        let filter = filter_expr.unwrap();
-        match filter {
-            Expr::BinaryExpr(_) => (),
-            _ => panic!("Filter expression should be a binary expression"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_extract_expressions_from_sql_query_unsupported_query() {
-        let session_manager = create_test_session_manager();
-
-        // Register a test table
-        let schema = create_test_schema();
-        let empty_table = Arc::new(EmptyTable::new(schema));
-        session_manager
-            .register_table("test_table", empty_table)
-            .unwrap();
-
-        // Test an unsupported query type (GROUP BY)
-        let sql = "SELECT COUNT(*) FROM test_table GROUP BY id";
-        let plan = session_manager
-            .create_logical_plan(String::from(sql))
-            .await
-            .unwrap();
-        let result = extract_expressions_from_sql_query(&plan);
-
-        assert!(result.is_err(), "Should fail for unsupported query types");
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("only Projection and Filter SQL queries are supported"),
-            "Error should mention unsupported query type, got: {error_msg}"
         );
     }
 

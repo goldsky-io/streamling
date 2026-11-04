@@ -242,6 +242,11 @@ impl BroadcastingExec {
         })
     }
 
+    /// The shared plan, which isn't among this node's children.
+    pub fn base(&self) -> Arc<dyn ExecutionPlan> {
+        self.handle.base_exec()
+    }
+
     fn compute_properties(schema: SchemaRef, partitions: usize) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),

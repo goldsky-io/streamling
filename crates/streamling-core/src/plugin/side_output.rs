@@ -70,10 +70,13 @@ impl fmt::Debug for PluginSideOutputAdapter {
 
 #[async_trait]
 impl SourceSideOutput for PluginSideOutputAdapter {
-    async fn process(&self, batch: &RecordBatch) -> datafusion::common::Result<()> {
+    async fn process(
+        &self,
+        batch: &RecordBatch,
+    ) -> datafusion::common::Result<HashMap<String, String>> {
         let batch_data: SafeArrowArray = batch.clone().into();
         match (self.process_batch_fn)(RString::from(self.source_name.as_str()), batch_data) {
-            RResult::ROk(()) => Ok(()),
+            RResult::ROk(()) => Ok(HashMap::new()),
             RResult::RErr(msg) => Err(DataFusionError::Execution(format!(
                 "Side output plugin error: {}",
                 msg

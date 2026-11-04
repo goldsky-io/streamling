@@ -2,14 +2,17 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Word};
 use std::collections::{HashMap, VecDeque};
+use streamling_core::functions::lookup::LOOKUP_NAMES;
 use streamling_core::topology;
 use tracing::debug;
 
 /// Get priority for transform types (lower number = higher priority)
 fn get_transform_priority(transform: &topology::Transform) -> u8 {
     match transform {
-        topology::Transform::dynamic_table(_) => 0, // Highest priority
-        topology::Transform::plugin(_) => 1,        // Plugin transforms register tables
+        topology::Transform::dynamic_table(_)
+        | topology::Transform::table(_)
+        | topology::Transform::table_agg(_) => 0, // Highest priority
+        topology::Transform::plugin(_) => 1, // Plugin transforms register tables
         topology::Transform::sql(_) => 2,
         _ => 3, // Other transforms have equal lower priority
     }
@@ -33,9 +36,11 @@ pub fn sort_transforms(
     // Build dependency graph
     for (transform_name, transform) in transforms {
         let transform_dependencies: Vec<String> = match transform {
-            topology::Transform::sql(sql_transform) => {
+            topology::Transform::sql(topology::SqlTransform { sql, .. })
+            | topology::Transform::table(topology::TableTransform { sql, .. })
+            | topology::Transform::table_agg(topology::TableAggTransform { sql, .. }) => {
                 // Extract table references from SQL to find dependencies on other transforms
-                extract_sql_dependencies(&sql_transform.sql, transforms, existing_plans)
+                extract_sql_dependencies(sql, transforms, existing_plans)
             }
             // Dynamic tables may depend on other transforms if they have an associated SQL query
             topology::Transform::dynamic_table(dt) => {
@@ -133,6 +138,10 @@ struct SqlTokens {
     /// Lowercased multi-part dotted identifiers like `schema.table` or
     /// `receipt.value.logs`, reconstructed from consecutive Word.Word runs.
     dotted_sequences: Vec<String>,
+    /// Lowercased table names from lookup calls such as `lookup_eq('<table>',
+    /// ...)`. A string literal is not a word, so these are collected
+    /// separately.
+    lookup_tables: Vec<String>,
 }
 
 /// Tokenize SQL and collect both standalone words and dotted sequences.
@@ -153,9 +162,30 @@ fn extract_sql_tokens(sql: &str) -> SqlTokens {
             return SqlTokens {
                 standalone_words: Vec::new(),
                 dotted_sequences: Vec::new(),
+                lookup_tables: Vec::new(),
             };
         }
     };
+    let significant: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    let lookup_tables = significant
+        .windows(3)
+        .filter_map(|window| match window {
+            [
+                Token::Word(Word { value, .. }),
+                Token::LParen,
+                Token::SingleQuotedString(table),
+            ] if LOOKUP_NAMES
+                .iter()
+                .any(|name| value.eq_ignore_ascii_case(name)) =>
+            {
+                Some(table.to_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
 
     let mut standalone_words = Vec::new();
     let mut dotted_sequences = Vec::new();
@@ -230,6 +260,7 @@ fn extract_sql_tokens(sql: &str) -> SqlTokens {
     SqlTokens {
         standalone_words,
         dotted_sequences,
+        lookup_tables,
     }
 }
 
@@ -251,11 +282,14 @@ fn extract_sql_dependencies(
 
     for transform_name in transforms.keys() {
         let transform_lower = transform_name.to_lowercase();
-        if transform_lower.contains('.') {
-            if tokens.dotted_sequences.contains(&transform_lower) {
-                dependencies.push(transform_name.clone());
-            }
-        } else if tokens.standalone_words.contains(&transform_lower) {
+        let referenced = if tokens.lookup_tables.contains(&transform_lower) {
+            true
+        } else if transform_lower.contains('.') {
+            tokens.dotted_sequences.contains(&transform_lower)
+        } else {
+            tokens.standalone_words.contains(&transform_lower)
+        };
+        if referenced {
             dependencies.push(transform_name.clone());
         }
     }
@@ -280,6 +314,118 @@ mod tests {
             parallelism: None,
             telemetry: None,
         })
+    }
+
+    fn create_table_transform(sql: &str) -> topology::Transform {
+        topology::Transform::table(topology::TableTransform {
+            backend_type: streamling_config::TableBackendType::InMemory,
+            primary_key: "id".to_string(),
+            max_dead_ratio: topology::DEFAULT_MAX_DEAD_RATIO,
+            window: None,
+            sql: sql.to_string(),
+            telemetry: None,
+        })
+    }
+
+    #[test]
+    fn tables_sort_first_and_before_their_readers() {
+        let mut transforms = HashMap::new();
+        transforms.insert(
+            "a_sql".to_string(),
+            create_sql_transform("SELECT id FROM src"),
+        );
+        transforms.insert(
+            "z_table".to_string(),
+            create_table_transform("SELECT id FROM src"),
+        );
+        transforms.insert(
+            "reader".to_string(),
+            create_sql_transform("SELECT id FROM z_table"),
+        );
+
+        let order = sort_transforms(&transforms, &HashMap::new());
+
+        assert_eq!(order, ["z_table", "a_sql", "reader"]);
+    }
+
+    /// `enriched` sorts before `prep` by name, and `rates` only becomes ready
+    /// after `prep`, so only the lookup dependency puts `enriched` last.
+    #[test]
+    fn lookup_readers_sort_after_their_table() {
+        let mut transforms = HashMap::new();
+        transforms.insert(
+            "prep".to_string(),
+            create_sql_transform("SELECT address, amount FROM rates_src"),
+        );
+        transforms.insert(
+            "rates".to_string(),
+            create_table_transform("SELECT address, amount FROM prep"),
+        );
+        transforms.insert(
+            "enriched".to_string(),
+            create_sql_transform(
+                "SELECT id, LOOKUP_EQ( 'Rates', 'address', address, 'amount') AS amount FROM transactions",
+            ),
+        );
+
+        let order = sort_transforms(&transforms, &HashMap::new());
+
+        assert_eq!(order, ["prep", "rates", "enriched"]);
+    }
+
+    #[test]
+    fn row_and_exists_lookup_readers_sort_after_their_table() {
+        for lookup in [
+            "lookup_row('rates', 'address', address)",
+            "Lookup_Exists('Rates', 'address', address)",
+        ] {
+            let mut transforms = HashMap::new();
+            transforms.insert(
+                "prep".to_string(),
+                create_sql_transform("SELECT address, amount FROM rates_src"),
+            );
+            transforms.insert(
+                "rates".to_string(),
+                create_table_transform("SELECT address, amount FROM prep"),
+            );
+            transforms.insert(
+                "enriched".to_string(),
+                create_sql_transform(&format!(
+                    "SELECT id, {lookup} AS looked_up FROM transactions"
+                )),
+            );
+
+            let order = sort_transforms(&transforms, &HashMap::new());
+
+            assert_eq!(order, ["prep", "rates", "enriched"], "{lookup}");
+        }
+    }
+
+    /// By name, `a_volumes` sorts first and `b_reader` before `z_tokens`.
+    #[test]
+    fn table_aggs_sort_after_their_table_and_before_their_lookup_readers() {
+        let mut transforms = HashMap::new();
+        transforms.insert(
+            "a_volumes".to_string(),
+            topology::Transform::table_agg(topology::TableAggTransform {
+                sql: "SELECT address, count(*) AS n FROM z_tokens GROUP BY address".to_string(),
+                telemetry: None,
+            }),
+        );
+        transforms.insert(
+            "z_tokens".to_string(),
+            create_table_transform("SELECT id, address FROM src"),
+        );
+        transforms.insert(
+            "b_reader".to_string(),
+            create_sql_transform(
+                "SELECT id, lookup_eq('a_volumes', 'address', address, 'n') AS n FROM src",
+            ),
+        );
+
+        let order = sort_transforms(&transforms, &HashMap::new());
+
+        assert_eq!(order, ["z_tokens", "a_volumes", "b_reader"]);
     }
 
     fn create_handler_transform(from: &str, url: &str) -> topology::Transform {

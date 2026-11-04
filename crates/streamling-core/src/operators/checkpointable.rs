@@ -140,10 +140,11 @@ impl ExtensionPlanner for CheckpointableExtensionPlanner {
 /// - A nested [`CheckpointableExec`]: another transform's aggregation point
 ///   (its `metrics()` already covers its subtree).
 /// - A source-owned [`StreamingFilterExec`] / [`StreamingProjectionExec`]:
-///   `wrap_with_side_outputs_before_filter` re-applies a source's filter and
-///   projection ABOVE the source's `WrappingExec` (so side outputs observe
-///   pre-filter rows), which places those source-owned operators inside the
-///   consuming transform's subtree. Without stopping at them, an expensive
+///   `wrap_with_side_outputs` re-applies a source's filter and
+///   projection ABOVE the source's `WrappingExec` (so its metrics, and the
+///   side outputs placed before the filter, observe pre-filter rows), which
+///   places those source-owned operators inside the consuming transform's
+///   subtree. Without stopping at them, an expensive
 ///   source-level filter would be misattributed to the transform's compute.
 fn is_topology_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
     // Closed set: `topology_boundary_closed_set_matches_operator_execution_plans`
@@ -1021,7 +1022,6 @@ mod tests {
                 below,
                 "nested_upstream".to_string(),
                 vec![],
-                vec![],
                 None,
             ));
             // A zero-compute root above the boundary, so this transform's own
@@ -1048,7 +1048,6 @@ mod tests {
                 below,
                 "nested_upstream".to_string(),
                 vec![],
-                vec![],
                 None,
             ))
         })
@@ -1067,7 +1066,7 @@ mod tests {
 
     /// A *source-owned* `StreamingFilterExec` (a source's filter re-applied
     /// above the source's `WrappingExec` by
-    /// `wrap_with_side_outputs_before_filter`) must also act as a topology
+    /// `wrap_with_side_outputs`) must also act as a topology
     /// boundary: its compute belongs to the source, not to the consuming
     /// transform. A transform-owned filter (not marked) is still descended
     /// into.
@@ -1277,6 +1276,7 @@ mod tests {
         "MultiSinkExec",       // sink fan-out
         "StreamingUnnestExec", // this transform's own compute
         "BroadcastingExec",    // scan-sharing fan-out
+        "SideOutputExec",      // reports no metrics; its input is a boundary
         "ExternalHandlerExec", // this node's HTTP transform
         "RebatchExec",         // this node's rebatch; nested WrappingExec still bounds
         "WasmRunnerExec",      // this node's wasm transform

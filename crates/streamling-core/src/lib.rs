@@ -29,6 +29,7 @@ pub mod session;
 pub mod shutdown;
 pub mod side_output;
 pub mod sql_parse;
+pub mod table;
 pub mod telemetry;
 pub mod topology;
 pub mod topology_validation;
