@@ -8,9 +8,7 @@ use datafusion::{
 use futures::StreamExt;
 use futures::future;
 use futures::stream::Stream;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
@@ -19,7 +17,7 @@ use std::{
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use tracing::{info, warn};
 
-use crate::telemetry::MillisAccumulator;
+use crate::telemetry::node_time::NodeTime;
 
 /// How long a full consumer channel keeps being retried after shutdown has
 /// been requested before the broadcast drops that consumer. Sized like the
@@ -49,14 +47,14 @@ struct BroadcastState {
 
 /// A registered consumer plus the flag that poisons its stream when the
 /// broadcast abandons it (see `run_broadcast`'s failure handling).
-/// `downstream_id` names the sink/transform this consumer feeds so blocked-send
-/// time can be attributed; empty when attribution does not apply (passthrough
-/// output).
 #[derive(Clone, Debug)]
 struct ConsumerSlot {
-    downstream_id: Arc<str>,
     tx: Sender<DFResult<RecordBatch>>,
     abandoned: Arc<AtomicBool>,
+    /// This consumer's blocked-send time, tagged with the downstream it feeds;
+    /// `None` when not attributed (see `add_consumer`). One per consumer: two
+    /// consumers can feed the same downstream, and their sends overlap.
+    blocked_time: Option<Arc<NodeTime>>,
 }
 
 /// Why a send to one consumer gave up.
@@ -108,13 +106,8 @@ impl BroadcastStream {
         });
     }
 
-    /// Retry sending with fixed delay until success or channel closed.
-    ///
-    /// Returns the time spent blocked on a full consumer channel (the
-    /// backpressure that consumer exerted for this batch): ~zero on immediate
-    /// success, growing by the retry delay while full. Returning the `Duration`
-    /// (rather than only emitting a metric) keeps the blocking behavior
-    /// unit-testable by value, independent of the recorder.
+    /// Retry sending with fixed delay until success or channel closed. The
+    /// time this takes is the backpressure the consumer exerted for the batch.
     ///
     /// Once shutdown is requested the retry window becomes bounded: a consumer
     /// that is alive-but-stalled (e.g. a sink wedged against a sick backend)
@@ -127,8 +120,7 @@ impl BroadcastStream {
         batch_result: &DFResult<RecordBatch>,
         shutdown: &tokio::sync::watch::Receiver<bool>,
         stalled_window: tokio::time::Duration,
-    ) -> Result<Duration, SendFailure> {
-        let start = Instant::now();
+    ) -> Result<(), SendFailure> {
         let mut full_since: Option<tokio::time::Instant> = None;
         loop {
             let to_send = match batch_result {
@@ -137,7 +129,7 @@ impl BroadcastStream {
             };
 
             match tx.try_send(to_send) {
-                Ok(()) => return Ok(start.elapsed()),
+                Ok(()) => return Ok(()),
                 Err(TrySendError::Full(_)) => {
                     let since = *full_since.get_or_insert_with(tokio::time::Instant::now);
                     if *shutdown.borrow() && since.elapsed() >= stalled_window {
@@ -164,11 +156,6 @@ impl BroadcastStream {
         // `upstream_metadata_id` is always set; consumers with an empty
         // `downstream_id` (passthrough output, or a fan-out edge the rule couldn't
         // reach) are not attributed.
-        let data_plane_recorder = crate::telemetry::recorder::get_metrics_recorder();
-        let upstream_metadata_id = self.upstream_metadata_id.clone();
-        // Per-sink remainder so many sub-millisecond per-batch blocks accumulate
-        // into whole milliseconds instead of each truncating to zero.
-        let mut blocked_accumulators: HashMap<Arc<str>, MillisAccumulator> = HashMap::new();
         let shutdown = crate::shutdown::subscribe();
         loop {
             if self.stopped.load(Ordering::SeqCst) {
@@ -189,19 +176,26 @@ impl BroadcastStream {
                     let send_futures: Vec<_> = consumers
                         .iter()
                         .map(|slot| {
-                            let downstream_id = slot.downstream_id.clone();
-                            let tx = slot.tx.clone();
+                            let blocked_time = &slot.blocked_time;
                             let batch_result = &batch_result;
                             let shutdown = &shutdown;
                             async move {
+                                if let Some(blocked_time) = &blocked_time {
+                                    blocked_time.open();
+                                }
                                 let result = Self::try_send_batch_with_retry_forever(
-                                    &tx,
+                                    &slot.tx,
                                     batch_result,
                                     shutdown,
                                     SHUTDOWN_STALLED_CONSUMER_WINDOW,
                                 )
                                 .await;
-                                (downstream_id, result)
+                                // A consumer given up on still blocked the
+                                // producer until then.
+                                if let Some(blocked_time) = &blocked_time {
+                                    blocked_time.close();
+                                }
+                                result
                             }
                         })
                         .collect();
@@ -221,34 +215,9 @@ impl BroadcastStream {
                     // never deregistered, so its missing ack keeps the
                     // epoch from finalizing and the gap replays on restart.
                     let mut failed: Vec<ConsumerSlot> = Vec::new();
-                    for (slot, (downstream_id, result)) in consumers.iter().zip(results) {
+                    for (slot, result) in consumers.iter().zip(results) {
                         match result {
-                            Ok(blocked) => {
-                                // Not attributed: no producer id (tests only) or
-                                // an empty downstream id (passthrough output).
-                                let Some(metadata_id) = upstream_metadata_id.as_deref() else {
-                                    continue;
-                                };
-                                if downstream_id.is_empty() {
-                                    continue;
-                                }
-                                let acc = blocked_accumulators
-                                    .entry(downstream_id.clone())
-                                    .or_default();
-                                acc.add(blocked);
-                                let blocked_ms = acc.take_whole_millis();
-                                if blocked_ms > 0 {
-                                    data_plane_recorder.record_count_w_tags(
-                                        "node_wait",
-                                        blocked_ms,
-                                        vec![
-                                            ("state", "blocked"),
-                                            ("downstream_id", downstream_id.as_ref()),
-                                        ],
-                                        metadata_id,
-                                    );
-                                }
-                            }
+                            Ok(()) => {}
                             Err(SendFailure::Closed) => {
                                 warn!(
                                     "Consumer channel closed, removing from broadcast. If this happens outside of a shutdown, this is a bug."
@@ -289,12 +258,26 @@ impl BroadcastStream {
         // Each consumer gets its own bounded receiver
         let (tx, rx) = channel(self.channel_capacity);
         let abandoned = Arc::new(AtomicBool::new(false));
+        // Not attributed: no producer id (tests only) or an empty downstream id
+        // (passthrough output).
+        let blocked_time = self
+            .upstream_metadata_id
+            .as_deref()
+            .filter(|_| !downstream_id.is_empty())
+            .map(|metadata_id| {
+                NodeTime::wall(
+                    crate::telemetry::recorder::get_metrics_recorder(),
+                    metadata_id,
+                    "blocked",
+                    &downstream_id,
+                )
+            });
 
         let mut consumers = self.inner.consumers.lock().unwrap();
         consumers.push(ConsumerSlot {
-            downstream_id: Arc::from(downstream_id),
             tx,
             abandoned: abandoned.clone(),
+            blocked_time,
         });
 
         BroadcastConsumer {
@@ -406,6 +389,7 @@ impl RecordBatchStream for BroadcastConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn empty_batch() -> DFResult<RecordBatch> {
         let schema = Arc::new(arrow_schema::Schema::empty());
@@ -422,6 +406,7 @@ mod tests {
         batch_result: &DFResult<RecordBatch>,
     ) -> Result<Duration, SendFailure> {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = std::time::Instant::now();
         BroadcastStream::try_send_batch_with_retry_forever(
             tx,
             batch_result,
@@ -429,6 +414,7 @@ mod tests {
             tokio::time::Duration::from_secs(30),
         )
         .await
+        .map(|()| start.elapsed())
     }
 
     /// The abandonment contract: a consumer the broadcast gave up on must
@@ -826,6 +812,87 @@ mod tests {
         );
     }
 
+    /// A consumer that stops reading must show as `blocked` while it is stuck,
+    /// not only after it resumes.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_broadcast_reports_a_stuck_consumer_while_it_is_stuck() {
+        use crate::telemetry::recorder::test_support;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let producer_id = "bcast_producer_stuck";
+        test_support::init_recorder_with_node(producer_id);
+
+        let schema = one_row_batch().schema();
+        let broadcast = BroadcastStream::new(schema.clone(), 1)
+            .with_upstream_metadata_id(Some(Arc::from(producer_id)));
+        let mut stuck_consumer = broadcast.add_consumer("stuck_consumer".to_string());
+        let batches: Vec<DFResult<RecordBatch>> = (0..3).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source, &test_scope());
+
+        // The consumer reads nothing: the second send stays blocked.
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
+        let during_stall =
+            test_support::node_wait_ms(producer_id, "blocked", Some("stuck_consumer"));
+        assert!(
+            during_stall >= 1_000,
+            "the open blocked send must be reported while it lasts, got {during_stall}ms"
+        );
+        let mut received = 0;
+        while stuck_consumer.next().await.is_some() {
+            received += 1;
+        }
+        assert_eq!(received, 3);
+    }
+
+    /// Two consumers can feed the same downstream (a self-join). A fast twin
+    /// must not end the stuck twin's blocked span.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_broadcast_times_each_consumer_of_one_downstream_on_its_own() {
+        use crate::telemetry::recorder::test_support;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let producer_id = "bcast_producer_twins";
+        test_support::init_recorder_with_node(producer_id);
+
+        let schema = one_row_batch().schema();
+        let broadcast = BroadcastStream::new(schema.clone(), 1)
+            .with_upstream_metadata_id(Some(Arc::from(producer_id)));
+        // The stuck twin is polled first, so its span opens before the fast
+        // twin's send closes.
+        let mut stuck_twin = broadcast.add_consumer("self_join".to_string());
+        let mut fast_twin = broadcast.add_consumer("self_join".to_string());
+        let batches: Vec<DFResult<RecordBatch>> = (0..3).map(|_| Ok(one_row_batch())).collect();
+        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        broadcast.start(source, &test_scope());
+
+        // The stuck twin reads nothing, so the second send to it stays blocked
+        // while the fast twin takes its batches.
+        let (_, ()) = tokio::join!(
+            async {
+                fast_twin.next().await;
+                fast_twin.next().await;
+            },
+            tokio::time::sleep(Duration::from_millis(2_300)),
+        );
+        let during_stall = test_support::node_wait_ms(producer_id, "blocked", Some("self_join"));
+        assert!(
+            during_stall >= 1_000,
+            "the stuck twin's open send must be reported, got {during_stall}ms"
+        );
+        while stuck_twin.next().await.is_some() {}
+    }
+
     /// A closed consumer channel surfaces as `Err`, which `run_broadcast` logs
     /// (typically during shutdown) rather than attributing as backpressure.
     #[tokio::test]
@@ -879,9 +946,8 @@ mod tests {
                 1,
                 "the closed consumer must be pruned after its first failed send"
             );
-            assert_eq!(
-                remaining[0].downstream_id.as_ref(),
-                "live",
+            assert!(
+                !remaining[0].tx.is_closed(),
                 "the surviving consumer is the live one"
             );
         }

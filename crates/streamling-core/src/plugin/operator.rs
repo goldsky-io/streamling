@@ -7,6 +7,7 @@ use crate::checkpoints::checkpoint_management::{
 use crate::plugin::partitioned::{PluginInstance, PluginInstances};
 use crate::plugin::telemetry::process_plugin_metrics;
 use crate::telemetry::recorder::get_metrics_recorder;
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::utils::batch::enrich_batch_with_metadata;
 use abi_stable::nonexhaustive_enum::NonExhaustive;
 use arrow_schema::SchemaRef;
@@ -28,7 +29,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_input_stream,
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -347,6 +347,7 @@ impl ExecutionPlan for PluginExec {
                 self.instances.len()
             );
         };
+        let task_wait = TaskWaitMeter::claim(&context);
         let data = execute_input_stream(
             Arc::clone(&self.input),
             Arc::clone(&self.input.schema()),
@@ -392,7 +393,7 @@ impl ExecutionPlan for PluginExec {
 
             let mut stream = data;
 
-            'outer: while let Some(batch) = stream.next().await {
+            'outer: while let Some(batch) = task_wait.next(&mut stream).await {
                 match batch {
                     Ok(batch) => {
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
@@ -473,7 +474,10 @@ impl ExecutionPlan for PluginExec {
                                         checkpoint_buffer.clear();
                                     }
 
-                                    tx.send(Ok(processed_batch)).await.unwrap(); // handle send error
+                                    // A dropped receiver means the consumer is gone; stop.
+                                    if task_wait.send(tx.send(Ok(processed_batch))).await.is_err() {
+                                        break 'outer;
+                                    }
                                     break;
                                 }
                                 Ok(Ok(PluginMsg::CheckpointMarker { epoch })) => {
@@ -502,8 +506,8 @@ impl ExecutionPlan for PluginExec {
                                     // Buffered markers are dropped with the
                                     // stream: an epoch covering rows the
                                     // failed plugin lost must never finalize.
-                                    let _ = tx
-                                        .send(Err(crate::plugin::plugin_failure(&plugin_label, &message)))
+                                    let _ = task_wait
+                                        .send(tx.send(Err(crate::plugin::plugin_failure(&plugin_label, &message))))
                                         .await;
                                     break 'outer;
                                 }
@@ -512,8 +516,8 @@ impl ExecutionPlan for PluginExec {
                                 }
                                 // A clean end would read as completion downstream.
                                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                                    let _ = tx
-                                        .send(Err(crate::plugin::plugin_exited(&plugin_label)))
+                                    let _ = task_wait
+                                        .send(tx.send(Err(crate::plugin::plugin_exited(&plugin_label))))
                                         .await;
                                     break 'outer;
                                 }
@@ -523,7 +527,7 @@ impl ExecutionPlan for PluginExec {
                     }
                     Err(e) => {
                         debug!("PluginExec [{}]: Error from input stream, transform will terminate: {}", metric_metadata_id, e);
-                        let _ = tx.send(Err(e)).await;
+                        let _ = task_wait.send(tx.send(Err(e))).await;
                         break;
                     }
                 }
@@ -557,6 +561,7 @@ mod tests {
     use datafusion::datasource::{MemTable, provider_as_source};
     use datafusion::logical_expr::{Extension, LogicalPlanBuilder};
     use datafusion::physical_plan::displayable;
+    use futures::StreamExt;
     use std::time::Duration;
 
     const MARKER_EPOCH: u64 = 5;
@@ -850,6 +855,55 @@ mod tests {
                 [MARKER_EPOCH]
             );
         }
+        shut_down(&transform).await;
+    }
+
+    /// The plugin runs out of the operator's spawned task, so its time must be
+    /// the node's `busy`: the operator claims the meter its wrapper installs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transform_reports_plugin_time_through_the_node_meter() {
+        use crate::telemetry::recorder::get_metrics_recorder;
+        use crate::telemetry::task_wait::TaskWaitMeter;
+
+        let transform = describe("metered_transform", &[]);
+        let instances = transform
+            .instantiate(1, Some(source_schema()))
+            .await
+            .unwrap();
+        let exec = PluginExec::new(
+            test_plugins::input(vec![vec![batch(&[1, 2], &[]), batch(&[3], &[])]]),
+            transform.output_schema().unwrap(),
+            10,
+            instances,
+            metric_id("metered_transform"),
+            crate::shutdown::ComponentScope::detached("test"),
+        );
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "metered_transform",
+            None,
+        );
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, context)
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            batches.iter().flat_map(ids).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            meter.is_claimed(),
+            "the plugin operator must claim the node meter"
+        );
+        assert!(
+            meter.totals().busy > Duration::ZERO,
+            "the plugin's time must be busy: {:?}",
+            meter.totals()
+        );
         shut_down(&transform).await;
     }
 
