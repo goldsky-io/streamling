@@ -103,6 +103,24 @@ impl PrometheusResource {
         )
     }
 
+    /// Build a query for the node-wait counter's `blocked` state filtered by
+    /// producer `id`. A producer emits one blocked series per outgoing edge (one
+    /// `downstream_id` each), so wrap this in `sum(...)` to get the node's total
+    /// blocked time (i.e. backpressure from downstream).
+    pub fn backpressure_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_node_wait_query("blocked", "id", node_id, instance_id)
+    }
+
+    /// Build a query for the node-wait counter's `blocked` state filtered by the
+    /// downstream node it is attributed to (total ms a producer was held back by
+    /// that specific consumer, whether via suspension or a full fan-out channel).
+    pub fn backpressure_by_downstream_query(
+        downstream_id: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        Self::build_node_wait_query("blocked", "downstream_id", downstream_id, instance_id)
+    }
+
     /// Build a query for the node-wait counter's `starved` state (time a node
     /// waited on upstream for input) filtered by node `id`.
     pub fn starved_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
