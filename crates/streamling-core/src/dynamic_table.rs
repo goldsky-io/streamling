@@ -22,7 +22,7 @@ use crate::error::Result as StreamlingResult;
 use crate::{streamling_err, streamling_user_err};
 
 use crate::dynamic_table::postgres::PostgresDynamicTableBackendFactory;
-use crate::session::SessionManager;
+use crate::session::{SessionManager, create_simplified_physical_expr};
 use crate::side_output::SourceSideOutput;
 use crate::topology::{DynamicTableTransform, PipelineTopology, Transform};
 pub use in_memory::InMemoryDynamicTableBackend;
@@ -260,11 +260,18 @@ impl DynamicTableSideOutput {
             .into());
         }
 
-        let projection_expr =
-            session_state.create_physical_expr(projection_logical_exprs[0].clone(), df_schema)?;
+        let projection_expr = create_simplified_physical_expr(
+            session_state,
+            projection_logical_exprs[0].clone(),
+            df_schema,
+        )?;
 
         let filter_expr = if let Some(filter) = filter_logical_expr {
-            Some(session_state.create_physical_expr(filter, df_schema)?)
+            Some(create_simplified_physical_expr(
+                session_state,
+                filter,
+                df_schema,
+            )?)
         } else {
             None
         };
@@ -980,6 +987,53 @@ mod tests {
             .downcast_ref::<BooleanArray>()
             .unwrap();
         assert!(boolean_array.value(0), "Backend should contain 'Alice'");
+    }
+
+    /// `arrow_cast` fails if invoked: the simplifier rewrites it to a cast.
+    #[tokio::test]
+    async fn test_dynamic_table_side_output_applies_functions_the_simplifier_rewrites() {
+        let backend = Arc::new(InMemoryDynamicTableBackend::new(
+            "test_table".to_string(),
+            None,
+            None,
+            None,
+            1000, // max_batch_size
+        ));
+        let session_manager = create_test_session_manager();
+        let session_state = session_manager.session_state();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let df_schema = DFSchema::try_from(schema.clone()).unwrap();
+        let expr = |sql: &str| session_state.create_logical_expr(sql, &df_schema).unwrap();
+
+        let side_output = DynamicTableSideOutput::new(
+            backend.clone(),
+            vec![expr("arrow_cast(name, 'Utf8')")],
+            Some(expr("arrow_cast(id, 'Int32') > 1")),
+            &session_state,
+            &df_schema,
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        side_output.process(&batch).await.unwrap();
+
+        let contains = backend
+            .contains(Arc::new(StringArray::from(vec!["Alice", "Bob"])))
+            .await
+            .unwrap();
+        let contains = contains.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(contains, &BooleanArray::from(vec![false, true]));
     }
 
     #[tokio::test]

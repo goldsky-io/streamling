@@ -5,7 +5,7 @@
 //! sibling branch, even one reading the same source, reads the latest rows.
 
 use crate::checkpoints::checkpoint_management::{CheckpointMessage, extract_checkpoint_messages};
-use crate::session::SessionManager;
+use crate::session::{SessionManager, create_simplified_physical_expr};
 use crate::side_output::{SideOutputPlacement, SourceSideOutput};
 use crate::streamling_err;
 use crate::table::TableStore;
@@ -114,8 +114,7 @@ impl TableSideOutput {
         let df_schema =
             DFSchema::try_from_qualified_schema(self.upstream.as_str(), schema.as_ref())?;
         let compile = |expr: &Expr| {
-            self.session_state
-                .create_physical_expr(expr.clone(), &df_schema)
+            create_simplified_physical_expr(&self.session_state, expr.clone(), &df_schema)
         };
         Ok(CompiledQuery {
             fields: schema.fields().clone(),
@@ -287,5 +286,22 @@ mod tests {
         let output = side_output("SELECT id, name FROM src").await;
         output.process(&src_batch(&[])).await.unwrap();
         assert_eq!(names(&output.store.table(), &[1]), [None]);
+    }
+
+    /// `arrow_cast` fails if invoked: the simplifier rewrites it to a cast.
+    #[tokio::test]
+    async fn applies_functions_the_simplifier_rewrites() {
+        let output = side_output(
+            "SELECT id, arrow_cast(name, 'Utf8') AS name FROM src WHERE arrow_cast(id, 'Int32') > 1",
+        )
+        .await;
+        output
+            .process(&src_batch(&[(1, "a"), (2, "b")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&output.store.table(), &[1, 2]),
+            [None, Some("b".to_string())]
+        );
     }
 }
