@@ -2,6 +2,8 @@
 //! live in `streamling_e2e::table_scenarios`, so a table backend plugin runs
 //! them too.
 
+#![cfg(unix)]
+
 use streamling_e2e::table_scenarios::{self, TableBackend};
 
 #[tokio::test]
