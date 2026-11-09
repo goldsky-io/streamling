@@ -115,7 +115,7 @@ jobs:
         include:
           - runner: blacksmith-8vcpu-windows-2025
             os: windows
-          - runner: macos-14
+          - runner: macos-15
             os: darwin-aarch64
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
