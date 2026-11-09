@@ -165,9 +165,11 @@ fn normalize_backend_type(value: &str) -> String {
 /// Storage backend of a `table` transform. Separate from
 /// [`DynamicTableBackendType`], which defaults to Postgres and would accept
 /// backends a table does not implement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableBackendType {
     InMemory,
+    /// The id of a table backend a plugin library provides.
+    Plugin(String),
 }
 
 impl<'de> SerdeDeserialize<'de> for TableBackendType {
@@ -178,10 +180,10 @@ impl<'de> SerdeDeserialize<'de> for TableBackendType {
         let s: String = String::deserialize(deserializer)?;
         match normalize_backend_type(&s).as_str() {
             "inmemory" => Ok(TableBackendType::InMemory),
-            _ => Err(DeError::custom(format!(
-                "invalid table backend_type '{}' (expected 'in_memory')",
-                s
-            ))),
+            "" => Err(DeError::custom(
+                "table backend_type must be 'in_memory' or a table backend plugin's id",
+            )),
+            _ => Ok(TableBackendType::Plugin(s)),
         }
     }
 }
@@ -711,6 +713,10 @@ pub struct TableConfig {
     /// the cost of more passes.
     #[serde(deserialize_with = "deserialize_window_gc_interval")]
     pub window_gc_interval: Duration,
+    /// Settings of the table backends plugins provide, by backend id. Every
+    /// table on a backend gets its settings as the backend's options.
+    #[serde(default)]
+    pub backends: HashMap<String, HashMap<String, String>>,
 }
 
 /// The config crate doesn't attach the key path to deserialization errors, so
@@ -2129,14 +2135,20 @@ coerce_to: bigint_truncated
     }
 
     #[test]
-    fn table_backend_type_rejects_unknown_backends() {
-        let err = serde_yaml::from_str::<TableBackendType>("postgres")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("invalid table backend_type 'postgres'"),
-            "{err}"
+    fn table_backend_type_takes_any_other_id_as_a_plugins() {
+        let parsed: TableBackendType = serde_yaml::from_str("postgres").unwrap();
+        assert_eq!(parsed, TableBackendType::Plugin("postgres".to_string()));
+        assert!(serde_yaml::from_str::<TableBackendType>("''").is_err());
+    }
+
+    #[test]
+    fn table_backends_default_to_none_and_are_env_overridable() {
+        assert!(base_app_config().table.backends.is_empty());
+        let config = load_with_env("STREAMLING__TABLE__BACKENDS__POSTGRES__PASSWORD", "secret")
+            .expect("embedded defaults plus env overrides must load");
+        assert_eq!(
+            config.table.backends["postgres"].get("password"),
+            Some(&"secret".to_string())
         );
-        assert!(err.contains("expected 'in_memory'"), "{err}");
     }
 }

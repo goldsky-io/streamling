@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 
 use crate::error::ResultExt;
+use crate::table::{JournalTrim, OnSchemaChange, VersionRetention};
 use config::Config;
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
@@ -556,15 +557,25 @@ pub struct TableTransform {
     pub backend_type: TableBackendType,
     /// Comma-separated for composite keys.
     pub primary_key: String,
-    /// Storage stays within about (1 + max_dead_ratio) × the live rows. Lower
-    /// values use less memory and spend more time cleaning.
-    #[serde(default = "default_max_dead_ratio")]
-    pub max_dead_ratio: f64,
+    /// `in_memory` only, [`DEFAULT_MAX_DEAD_RATIO`] when unset. Storage stays
+    /// within about (1 + max_dead_ratio) × the live rows. Lower values use
+    /// less memory and spend more time cleaning.
+    pub max_dead_ratio: Option<f64>,
     /// SQL predicate over the table's columns, `__timestamp`, the wall-clock
     /// time a row was applied, and `watermark(column)`, the largest value of
     /// `column` stored. The table keeps the rows it is true for and
     /// garbage-collects the rest.
     pub window: Option<String>,
+    /// Which version lookups read.
+    #[serde(default)]
+    pub lookup_versions: VersionRetention,
+    /// When the journal of earlier versions is trimmed.
+    #[serde(default)]
+    pub journal_trim: JournalTrim,
+    /// What a backend that kept the table across a restart does when its
+    /// columns or primary key changed. `in_memory` never keeps it.
+    #[serde(default)]
+    pub on_schema_change: OnSchemaChange,
     /// Projection and filter over one source or transform.
     pub sql: String,
     pub telemetry: Option<Telemetry>,
@@ -802,10 +813,6 @@ fn default_on_conflict() -> String {
 
 /// Default for [`TableTransform::max_dead_ratio`].
 pub const DEFAULT_MAX_DEAD_RATIO: f64 = 0.25;
-
-fn default_max_dead_ratio() -> f64 {
-    DEFAULT_MAX_DEAD_RATIO
-}
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -3557,9 +3564,38 @@ sinks: {}
         };
         assert_eq!(table.backend_type, TableBackendType::InMemory);
         assert_eq!(table.primary_key, "chain, address");
-        assert_eq!(table.max_dead_ratio, DEFAULT_MAX_DEAD_RATIO);
+        assert_eq!(table.max_dead_ratio, None);
+        assert_eq!(table.on_schema_change, OnSchemaChange::Fail);
         assert_eq!(table.window, None);
+        assert_eq!(table.lookup_versions, VersionRetention::Journal);
+        assert_eq!(table.journal_trim, JournalTrim::OnFinalize);
         assert_eq!(topology.transforms["tokens"].parallelism(), None);
+    }
+
+    #[test]
+    fn table_transform_parses_lookup_versions_and_journal_trim() {
+        let parse = |fields: &str| {
+            PipelineTopology::load_from_string(&format!(
+                "sources:\n  src: {{ type: kafka, topic: t, primary_key: id }}\ntransforms:\n  tokens:\n    type: table\n    backend_type: in_memory\n    primary_key: id\n{fields}    sql: SELECT id FROM src\nsinks: {{}}\n"
+            ))
+        };
+        let topology = parse(
+            "    lookup_versions: latest\n    journal_trim: never\n    on_schema_change: reset\n",
+        )
+        .unwrap();
+        let Transform::table(table) = &topology.transforms["tokens"] else {
+            panic!("expected a table transform");
+        };
+        assert_eq!(table.lookup_versions, VersionRetention::Latest);
+        assert_eq!(table.journal_trim, JournalTrim::Never);
+        assert_eq!(table.on_schema_change, OnSchemaChange::Reset);
+        for invalid in [
+            "    lookup_versions: per_batch\n",
+            "    journal_trim: always\n",
+            "    on_schema_change: keep\n",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -3580,7 +3616,7 @@ sinks: {}
         let Transform::table(table) = &topology.transforms["tokens"] else {
             panic!("expected a table transform");
         };
-        assert_eq!(table.max_dead_ratio, 0.1);
+        assert_eq!(table.max_dead_ratio, Some(0.1));
     }
 
     #[test]

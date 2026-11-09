@@ -21,6 +21,8 @@ thread_local! {
     static PLUGIN_SIDE_OUTPUT_DESCRIPTOR_FNS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     static PLUGIN_DESCRIBE_PARTITIONED_COMPONENTS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     static PLUGIN_CREATE_PARTITIONED_COMPONENTS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    static PLUGIN_TABLE_BACKEND_COMPONENTS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    static PLUGIN_TABLE_BACKEND_DESCRIPTOR_FNS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
 }
 
 /// Joins the match arms accumulated in one of the thread-locals above.
@@ -736,6 +738,67 @@ pub fn register_plugin_side_output(input: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
+/// Registers a type implementing `TableBackendPlugin` as the table backend
+/// `id`, which tables select with `backend_type: <id>`.
+///
+/// Usage: `register_plugin_table_backend!("my_backend", MyBackend);`
+#[proc_macro]
+pub fn register_plugin_table_backend(input: TokenStream) -> TokenStream {
+    let TableBackendComponent { id, backend_type } =
+        parse_macro_input!(input as TableBackendComponent);
+    let suffix = backend_type.to_string().to_lowercase();
+    let create_fn = Ident::new(
+        &format!("plugin_table_backend_create_{suffix}"),
+        backend_type.span(),
+    );
+    let descriptor_fn = Ident::new(
+        &format!("plugin_table_backend_descriptor_{suffix}"),
+        backend_type.span(),
+    );
+
+    let component = quote! {
+        extern "C" fn #create_fn(
+            context: streamling_plugin::table_backend::PluginTableBackendContext,
+            options: streamling_plugin::PluginOptions,
+            // Calls run on a runtime the library owns, as `create_table_backend` explains.
+            _runtime: streamling_plugin::r#async::PluginAsyncRuntimeObj,
+            metrics: streamling_plugin::ffi::PluginMetricsRecorder,
+        ) -> streamling_plugin::table_backend::TableResult<streamling_plugin::table_backend::TableBackendFfiObj> {
+            streamling_plugin::table_backend::create_table_backend::<#backend_type>(context, options, metrics)
+        }
+
+        fn #descriptor_fn() -> streamling_plugin::table_backend::PluginTableBackendDescriptor {
+            streamling_plugin::table_backend::PluginTableBackendDescriptor {
+                id: RString::from(#id),
+                create: #create_fn,
+            }
+        }
+    };
+
+    PLUGIN_TABLE_BACKEND_COMPONENTS.with(|components| {
+        components.borrow_mut().push(component.to_string());
+    });
+    PLUGIN_TABLE_BACKEND_DESCRIPTOR_FNS.with(|fns| {
+        fns.borrow_mut().push(descriptor_fn.to_string());
+    });
+
+    TokenStream::new()
+}
+
+struct TableBackendComponent {
+    id: LitStr,
+    backend_type: Ident,
+}
+
+impl Parse for TableBackendComponent {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let id = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let backend_type = input.parse()?;
+        Ok(Self { id, backend_type })
+    }
+}
+
 #[proc_macro]
 pub fn init_plugin(_input: TokenStream) -> TokenStream {
     generate_init_plugin_code(false)
@@ -754,6 +817,7 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
     let describe_partitioned_components =
         combined_components(&PLUGIN_DESCRIBE_PARTITIONED_COMPONENTS);
     let create_partitioned_components = combined_components(&PLUGIN_CREATE_PARTITIONED_COMPONENTS);
+    let table_backend_components = combined_components(&PLUGIN_TABLE_BACKEND_COMPONENTS);
 
     let udf_descriptor_calls: Vec<proc_macro2::TokenStream> =
         PLUGIN_UDF_DESCRIPTOR_FNS.with(|fns| {
@@ -768,6 +832,17 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
 
     let side_output_descriptor_calls: Vec<proc_macro2::TokenStream> =
         PLUGIN_SIDE_OUTPUT_DESCRIPTOR_FNS.with(|fns| {
+            fns.borrow()
+                .iter()
+                .map(|fn_name| {
+                    let ident: proc_macro2::TokenStream = fn_name.parse().unwrap();
+                    quote! { #ident() }
+                })
+                .collect()
+        });
+
+    let table_backend_descriptor_calls: Vec<proc_macro2::TokenStream> =
+        PLUGIN_TABLE_BACKEND_DESCRIPTOR_FNS.with(|fns| {
             fns.borrow()
                 .iter()
                 .map(|fn_name| {
@@ -865,6 +940,7 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
 
         #udf_components
         #side_output_components
+        #table_backend_components
 
         extern "C" fn init(
             logging: PluginLogging,
@@ -905,6 +981,13 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
 
         #udf_descriptors_fn
         #side_output_descriptors_fn
+
+        extern "C" fn table_backend_descriptors() -> RResult<RVec<streamling_plugin::table_backend::PluginTableBackendDescriptor>, PluginInitializationError> {
+            let descriptors: Vec<streamling_plugin::table_backend::PluginTableBackendDescriptor> = vec![
+                #(#table_backend_descriptor_calls),*
+            ];
+            RResult::ROk(descriptors.into())
+        }
 
         extern "C" fn set_shutdown_signal(signal: streamling_plugin::shutdown::ShutdownSignalObj) {
             streamling_plugin::shutdown::install_shutdown_signal(signal);
@@ -952,6 +1035,7 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
                 set_shutdown_signal,
                 describe_partitioned,
                 create_partitioned,
+                table_backend_descriptors,
             }
             .leak_into_prefix()
         }

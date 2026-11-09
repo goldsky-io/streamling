@@ -34,8 +34,11 @@ use streamling_core::operators::external_handlers::{ExternalHandlerConfig, Exter
 use streamling_core::operators::wasm_runner::WasmRunnerNode;
 use streamling_core::session::{SessionManager, SubqueryHandling};
 use streamling_core::table::aggregate as table_aggregate;
+use streamling_core::table::backend::TableBackend;
+use streamling_core::table::in_memory::InMemoryBackend;
+use streamling_core::table::plugin::create_plugin_table_backend;
 use streamling_core::table::side_output::TableSideOutput;
-use streamling_core::table::{InMemoryTable, VersionRetention, WindowConfig};
+use streamling_core::table::{JournalTrim, TableStore, WindowConfig};
 use streamling_core::topology::PipelineTopology;
 use streamling_core::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use tokio::time::timeout;
@@ -1242,6 +1245,7 @@ impl Streamling {
         let mut pipeline_plans: HashMap<String, LogicalPlan> = HashMap::new();
         // (table name, plan) for each table's driver future.
         let mut table_drivers: Vec<(String, LogicalPlan)> = Vec::new();
+        let mut table_stores: Vec<Arc<TableStore>> = Vec::new();
 
         let node_contexts = Self::build_node_contexts(&pipeline_topology);
         let metric_metadata_mapping = Self::build_pipeline_metric_metadata(
@@ -1258,6 +1262,11 @@ impl Streamling {
         // Table drivers poll each partition in a task of this scope; the
         // tasks end when their streams end, which shutdown forces.
         let table_scope = shutdown_controller.scope("tables");
+        // Forwards plugin table backends' metrics until the plugins terminate.
+        let table_backend_scope = shutdown_controller.scope_at(
+            "plugin-table-backends",
+            streamling_core::shutdown::DrainStage::PostPlugin,
+        );
 
         // Whether a graceful shutdown drains and terminally checkpoints the
         // in-flight tail, or exits fast and lets it replay. Derived from the
@@ -1889,32 +1898,63 @@ impl Streamling {
                             upstream
                         );
                     };
-                    // Every source type rides the coordinator's checkpoint
-                    // markers on its batches, so finalized checkpoints collect
-                    // the version history.
-                    let retention = VersionRetention::PerBatch;
-                    let storage = match table.backend_type {
-                        TableBackendType::InMemory => Arc::new(InMemoryTable::try_new(
-                            &reference_name,
-                            sql_plan.schema().inner(),
-                            &primary_key,
-                            metric_metadata_id.clone(),
-                            table.max_dead_ratio,
-                            window,
-                            retention,
-                        )?),
+                    let backend: Arc<dyn TableBackend> = match &table.backend_type {
+                        TableBackendType::InMemory => {
+                            if table.journal_trim == JournalTrim::Never {
+                                warn!(
+                                    "{}: journal_trim: never keeps every version of an in_memory table in memory, so its memory grows without bound",
+                                    ctx.format()
+                                );
+                            }
+                            Arc::new(InMemoryBackend::try_new(
+                                &reference_name,
+                                table
+                                    .max_dead_ratio
+                                    .unwrap_or(topology::DEFAULT_MAX_DEAD_RATIO),
+                            )?)
+                        }
+                        TableBackendType::Plugin(id) => {
+                            if table.max_dead_ratio.is_some() {
+                                streamling_user_bail!(
+                                    "{}: max_dead_ratio only applies to backend_type: in_memory",
+                                    ctx.format()
+                                );
+                            }
+                            Arc::new(create_plugin_table_backend(
+                                id,
+                                &application_id,
+                                &reference_name,
+                                app_config
+                                    .table
+                                    .backends
+                                    .get(id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                metric_metadata_id.clone(),
+                                DEFAULT_PLUGIN_METRICS_CHANNEL_CAPACITY,
+                                &table_backend_scope,
+                            )?)
+                        }
                     };
-                    session_manager.tables().register(Arc::clone(&storage));
+                    let store = Arc::new(TableStore::try_new(
+                        &reference_name,
+                        sql_plan.schema().inner(),
+                        &primary_key,
+                        metric_metadata_id.clone(),
+                        window,
+                        table.lookup_versions,
+                        table.journal_trim,
+                        table.on_schema_change,
+                        backend,
+                    )?);
+                    session_manager.tables().register_store(Arc::clone(&store));
+                    table_stores.push(Arc::clone(&store));
 
-                    let side_output = TableSideOutput::try_new(
-                        storage,
-                        &sql_plan,
-                        upstream.clone(),
-                        session_state,
-                    )
-                    .streamling_with_context(|| {
-                        format!("{}: unsupported table SQL", ctx.format())
-                    })?;
+                    let side_output =
+                        TableSideOutput::try_new(store, &sql_plan, upstream.clone(), session_state)
+                            .streamling_with_context(|| {
+                                format!("{}: unsupported table SQL", ctx.format())
+                            })?;
                     upstream_operator.add_side_output(Arc::new(side_output));
 
                     // The side output already applied every row, so the table's
@@ -1978,6 +2018,7 @@ impl Streamling {
                     // acks the batches that update it.
                     table_aggregate::register(
                         &reference_name,
+                        sql,
                         &plan,
                         session_manager.tables(),
                         &session_manager.session_state(),
@@ -3345,6 +3386,12 @@ impl Streamling {
             sink_futures.push(Box::pin(sink_future));
         }
 
+        if !dry_run {
+            // Start every table store before data starts flowing.
+            for store in &table_stores {
+                store.start().await?;
+            }
+        }
         for (table_name, table_plan) in table_drivers {
             if dry_run {
                 // Catches type coercion and other SQL errors that only

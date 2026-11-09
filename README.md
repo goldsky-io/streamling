@@ -1151,10 +1151,12 @@ A `table` transform keeps the latest row per primary key, built from a stateless
 transforms:
   tokens:
     type: table
-    backend_type: in_memory # required
+    backend_type: in_memory # required: in_memory, or a table backend's id from a plugin library
     primary_key: address # required; comma-separated for composite keys
-    max_dead_ratio: 0.25 # optional, default 0.25
+    max_dead_ratio: 0.25 # optional, default 0.25; in_memory only
     window: block_time >= watermark(block_time) - interval '1 hour' # optional
+    lookup_versions: journal # optional: journal (default) or latest
+    journal_trim: on_finalize # optional: on_finalize (default) or never
     sql: SELECT address, symbol, decimals, block_time FROM token_events WHERE chain = 'eth'
 
 sinks:
@@ -1168,10 +1170,13 @@ sinks:
 
 | Field          | Notes                                                                                                         |
 | -------------- | ------------------------------------------------------------------------------------------------------------- |
-| `backend_type` | Required. `in_memory` is the only backend.                                                                    |
+| `backend_type` | Required. `in_memory`, or the id of a table backend a plugin library provides. See [Backends](#backends). |
 | `primary_key`  | Required. Key columns must be in the SQL output. A null key value fails the pipeline.                         |
-| `max_dead_ratio` | Default `0.25`. Storage stays within about (1 + `max_dead_ratio`) × the live rows. Each batch cleans up to (1 + 1/`max_dead_ratio`) stored rows per written row, at least 1024. Lower values use less memory and more CPU. |
+| `max_dead_ratio` | `in_memory` only; default `0.25`. Storage stays within about (1 + `max_dead_ratio`) × the live rows. Each batch cleans up to (1 + 1/`max_dead_ratio`) stored rows per written row, at least 1024. Lower values use less memory and more CPU. |
 | `window`       | Optional. A SQL predicate; the table keeps only the rows it is true for. See [Windows](#windows). |
+| `lookup_versions` | Default `journal`: a lookup reads the table as of its batch (see [Lookups](#lookups)). `latest`: every lookup reads the latest rows. |
+| `journal_trim` | Default `on_finalize`: the earlier versions lookups read are dropped once a checkpoint finalizes. `never` keeps every version; on `in_memory` the table's memory grows without bound, and startup logs a warning. A durable backend keeps them across restarts. |
+| `on_schema_change` | Default `fail`. What a backend that kept the table across a restart does when the table's columns or primary key changed: `fail` stops startup, `reset` drops the stored table and its aggregates, logs a warning and starts empty. Ignored by `in_memory`, which never keeps a table. |
 | `sql`          | Required. Projections and filters over one source or transform. Anything else, including `UNNEST`, `UNION`, joins and aggregations, is rejected. |
 | `telemetry`    | Optional. Standard rules.                                                                                     |
 
@@ -1229,7 +1234,8 @@ transforms:
   - With several input partitions, what the other partitions had applied depends on how their applies interleave, so results can differ between runs.
   - A script, handler or plugin transform with a `batch_size` or `batch_flush_interval` merges batches. A lookup that reads batches it merged after the table's input applied them reads the table as of the last batch merged, so a row also sees the batches merged after its own, up to that transform's `batch_size` rows or `batch_flush_interval`, whichever comes first.
 - Lookups from other inputs read the table's latest state, not synchronized with it: a row processed before its key reaches the table gets `NULL`. This includes rows processed right after startup, and a node that reads the same source as the table's input without reading through it. For example, when the table reads transform `clean`, a transform reading `clean`'s source directly isn't synchronized.
-- The table keeps the earlier versions of rows that changed, and the dropped chunks they live in, for a checkpoint interval plus the time to finalize the checkpoint. A checkpoint that doesn't finalize, such as one stuck on a slow sink, holds them until the next one does. No checkpoint finalizes after the final one starts, so a pipeline that keeps running past that point (one bounded source done, another still running) keeps every version until it stops. `table_versions` and `table_retired_bytes` show what's held.
+- With `lookup_versions: latest`, every lookup reads the latest rows instead, like a lookup from another input.
+- The table keeps the earlier versions of rows that changed, and the dropped chunks they live in, for a checkpoint interval plus the time to finalize the checkpoint (with `journal_trim: never`, for good). A checkpoint that doesn't finalize, such as one stuck on a slow sink, holds them until the next one does. No checkpoint finalizes after the final one starts, so a pipeline that keeps running past that point (one bounded source done, another still running) keeps every version until it stops. `table_versions` and `table_retired_bytes` show what's held.
 - After a restart, an `in_memory` table starts empty (see below), so a lookup of a key that hasn't been written since the last checkpoint returns `NULL` until the key is written again.
 
 ### Windows
@@ -1248,13 +1254,13 @@ window: block_time >= watermark(block_time) - interval '1 hour'
 - GC passes run as the table's input delivers batches:
   - with `watermark()`, inside every apply that stores rows, so a batch's rows are evicted as soon as they're outside the window;
   - for any window, at the end of an apply, at most once per `table.window_gc_interval` in the app config (default `1s`, override with `STREAMLING__TABLE__WINDOW_GC_INTERVAL`). An idle input still delivers empty batches, at least one per checkpoint, so collection doesn't wait for new data. Until a row is collected, a lookup can still return it.
-- Each stored batch keeps the min, max and null count of the columns the window reads, and a GC pass skips the batches that are wholly inside the window. This works when the window compares a column, or a `CAST` of one, with an expression of `now()` or `watermark()`:
+- A window that compares a column, or a `CAST` of one, with an expression of `now()` or `watermark()` is a range: a GC pass evicts the rows below the bound, and skips stored batches wholly inside the window by the min, max and null count each keeps of that column:
   - `block_time >= watermark(block_time) - interval '1 hour'` for a timestamp column
   - `block_timestamp >= watermark(block_timestamp) - 3600` for integer epoch seconds
   - `block_time >= now() - interval '1 hour'`
   - `block_timestamp >= extract(epoch from now() - interval '1 hour')`
 
-  A function of the column, such as `to_timestamp(block_timestamp) >= now() - interval '1 hour'`, still works, but every pass evaluates every stored row; startup logs a warning. Skipping pays off when rows arrive roughly in time order.
+  Any other window, such as a function of the column (`to_timestamp(block_timestamp) >= now() - interval '1 hour'`) or several comparisons, still works, but every pass evaluates every stored row; startup logs a warning. Skipping pays off when rows arrive roughly in time order.
 - Eviction only changes the table's storage. The table's SQL output, which other nodes read, doesn't emit anything for evicted rows.
 
 #### Event time (`watermark`)
@@ -1283,6 +1289,23 @@ With `window: block_time >= watermark(block_time) - interval '1 hour'`, applying
 ### Restarts (`in_memory`)
 
 The `in_memory` backend does not persist its contents. After a restart, the table starts empty and its source replays from the last committed offsets, so keys written before the last checkpoint are missing until they are written again.
+
+### Backends
+
+`in_memory` is built in. Other backends come from plugin libraries (see [Table Backends](#table-backends) under the plugin system): `backend_type` takes the backend's id, and its settings go in the app config, not the pipeline, so credentials stay out of pipelines:
+
+```yaml
+# config.yaml
+table:
+  backends:
+    postgres:
+      host: localhost
+      port: "5432"
+```
+
+Each key is passed to the backend as a string, and env vars override them: `STREAMLING__TABLE__BACKENDS__POSTGRES__PASSWORD`. Every table on a backend gets that backend's settings. A `backend_type` that no loaded plugin provides fails startup, listing the backends that are loaded.
+
+A backend may persist the table. After a restart it reopens the stored rows, and the source replays from its last committed offsets onto them. An aggregate whose SQL changed, or a new one, is rebuilt from the table's rows; a removed one's state is dropped. See `on_schema_change` for a changed table.
 
 ### Aggregates
 
@@ -2059,6 +2082,7 @@ Helper macros make it easy to implement the plugin interface:
 - `register_plugin_udf!(<ScalarUDFImpl>);` to register a UDF from a type implementing `ScalarUDFImpl` + `Default`.
 - `register_plugin_udf_fn!(<factory_fn>);` to register a UDF from a factory function returning `ScalarUDF`.
 - `register_plugin_side_output!("<id>", <SideOutputPlugin>);` to register a side output plugin.
+- `register_plugin_table_backend!("<id>", <TableBackendPlugin>);` to register a table backend; see [Table Backends](#table-backends).
 - `init_plugin!();` or `init_plugin_with_async_runtime!();` to finalize the plugin definition. The latter creates a plugin-specific Tokio runtime.
 
 Plugin id consists of a namespace (optional) and a name, separated by a dot (e.g., `basic_plugin.random_source`). The namespace allows grouping related plugins together, which can help avoid naming conflicts and organize plugins logically.
@@ -2088,6 +2112,24 @@ fn new(
     options: HashMap<String, String>,
 ) -> Self
 ```
+
+### Table Backends
+
+A table backend stores a [`table`](#tables) and its aggregates. The host does the rest: it parses the changelog, runs the window and maintains the aggregates, so a backend is a versioned keyed store. Implement `streamling_plugin::api::table::TableBackendPlugin` and register it with `register_plugin_table_backend!("<id>", <TableBackendPlugin>)`; tables with `backend_type: <id>` run on it, one instance per table, created with the app config's `table.backends.<id>` as options.
+
+A store holds namespaces: keyed sets of rows with a schema. Every apply is one transaction (`begin`, then `write`, `evict_below`, `scan`, `get` and `set_meta`, then `commit`), and gets the next version; the mark of version `v` is `v + 1`. The contract:
+
+1. **Atomicity.** A transaction's writes become visible at `commit` all at once, or never. Lookups never see uncommitted writes, and dropping a transaction rolls it back.
+2. **Ordering.** The host never begins two transactions on one store at once. Versions only increase, across restarts too; a rolled-back version may be reused.
+3. **As-of reads.** `lookup` at mark `M` returns each key's state before the first version at or after `M` that changed it, or its current row. Reads are repeatable.
+4. **Journal.** A versioned namespace journals each changed key once per transaction, with its row before it; evictions are journaled like deletes. Unversioned namespaces keep no journal.
+5. **Floor.** `finalize(horizon, trim: true)` drops the journal below `horizon` and raises the floor to it; a read below the floor fails, atomically with the read. Without `trim` the floor stays. The floor never goes down.
+6. **Single writer.** A durable backend never lets two processes write one store: `open` waits for the store, failing retriably, and an apply fails once another writer shows up.
+7. **Errors** carry a `retriable` flag. Connection failures are retriable. A retriable failure leaves the store as if the transaction never began, or, after an unknown commit outcome, committed: the host re-runs the same apply either way.
+8. **Meta** is opaque bytes per key, written in transactions and returned by `open`.
+9. **Durability.** Once `checkpoint(M)` returns, every version below `M` survives a crash. `open` returns a state with every version below the last checkpoint's mark.
+
+`streamling-core`'s `table/conformance.rs` checks the in-memory backend against this contract; copy its checks to test a plugin's backend.
 
 ### Partitioned Plugins
 
