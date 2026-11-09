@@ -35,6 +35,7 @@
 pub mod inspect;
 pub mod resources;
 pub mod streamling;
+#[cfg(unix)]
 pub mod table_scenarios;
 
 use resources::{
