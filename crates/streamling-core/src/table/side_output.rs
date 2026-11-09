@@ -8,7 +8,7 @@ use crate::checkpoints::checkpoint_management::{CheckpointMessage, extract_check
 use crate::session::SessionManager;
 use crate::side_output::{SideOutputPlacement, SourceSideOutput};
 use crate::streamling_err;
-use crate::table::InMemoryTable;
+use crate::table::TableStore;
 use crate::table::read::mark_stamps;
 use arrow::array::{AsArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 /// Applies each batch of the table's upstream to the table.
 pub struct TableSideOutput {
-    table: Arc<InMemoryTable>,
+    store: Arc<TableStore>,
     projection: Vec<Expr>,
     filter: Option<Expr>,
     /// The table SQL's output schema, which the table was built from.
@@ -48,14 +48,14 @@ impl TableSideOutput {
     /// `sql_plan` is the table's SQL over `upstream`: a projection with an
     /// optional filter.
     pub fn try_new(
-        table: Arc<InMemoryTable>,
+        store: Arc<TableStore>,
         sql_plan: &LogicalPlan,
         upstream: String,
         session_state: SessionState,
     ) -> Result<Self> {
         let (projection, filter) = SessionManager::extract_expressions_from_sql_query(sql_plan)?;
         Ok(Self {
-            table,
+            store,
             projection,
             filter,
             output_schema: Arc::clone(sql_plan.schema().inner()),
@@ -74,7 +74,7 @@ impl TableSideOutput {
                 let mask = mask.as_boolean_opt().ok_or_else(|| {
                     DataFusionError::from(streamling_err!(
                         "table '{}': the filter must return booleans, got {}",
-                        self.table.name,
+                        self.store.name(),
                         mask.data_type()
                     ))
                 })?;
@@ -135,7 +135,7 @@ impl SourceSideOutput for TableSideOutput {
                 _ => None,
             })
             .collect();
-        let marks = self.table.apply(&self.evaluate(batch)?, &epochs)?;
+        let marks = self.store.apply(&self.evaluate(batch)?, &epochs).await?;
         Ok(mark_stamps(marks))
     }
 
@@ -148,7 +148,7 @@ impl SourceSideOutput for TableSideOutput {
 impl fmt::Debug for TableSideOutput {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("TableSideOutput")
-            .field("table", &self.table.name)
+            .field("table", &self.store.name())
             .field("upstream", &self.upstream)
             .finish()
     }
@@ -159,8 +159,8 @@ mod tests {
     use super::*;
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
-    use crate::table::VersionRetention;
-    use crate::topology::DEFAULT_MAX_DEAD_RATIO;
+    use crate::table::testing::store;
+    use crate::table::{Table, VersionRetention};
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::empty::EmptyTable;
@@ -188,16 +188,15 @@ mod tests {
             .create_supported_logical_plan(sql.to_string())
             .await
             .unwrap();
-        let table = InMemoryTable::try_new(
+        let table = store(
             "t",
             plan.schema().inner(),
-            &["id".to_string()],
-            "app::t".to_string(),
-            DEFAULT_MAX_DEAD_RATIO,
+            &["id"],
             None,
             VersionRetention::Latest,
         )
         .unwrap();
+        table.start().await.unwrap();
         TableSideOutput::try_new(
             Arc::new(table),
             &plan,
@@ -220,7 +219,7 @@ mod tests {
         .unwrap()
     }
 
-    fn names(table: &InMemoryTable, ids: &[i64]) -> Vec<Option<String>> {
+    fn names(table: &Table, ids: &[i64]) -> Vec<Option<String>> {
         let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
         table
             .lookup(&[keys], "name", None)
@@ -239,7 +238,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            names(&output.table, &[1, 2]),
+            names(&output.store.table(), &[1, 2]),
             [Some("a2".to_string()), Some("b".to_string())]
         );
     }
@@ -251,7 +250,10 @@ mod tests {
             .process(&src_batch(&[(1, "a"), (2, "b")]))
             .await
             .unwrap();
-        assert_eq!(names(&output.table, &[1, 2]), [None, Some("b".to_string())]);
+        assert_eq!(
+            names(&output.store.table(), &[1, 2]),
+            [None, Some("b".to_string())]
+        );
     }
 
     /// An upstream may hand over its consumer's projection, in another order.
@@ -274,7 +276,7 @@ mod tests {
         output.process(&projected).await.unwrap();
         output.process(&src_batch(&[(6, "q")])).await.unwrap();
         assert_eq!(
-            names(&output.table, &[5, 6]),
+            names(&output.store.table(), &[5, 6]),
             [Some("p".to_string()), Some("q".to_string())]
         );
     }
@@ -284,6 +286,6 @@ mod tests {
     async fn applies_an_empty_batch() {
         let output = side_output("SELECT id, name FROM src").await;
         output.process(&src_batch(&[])).await.unwrap();
-        assert_eq!(names(&output.table, &[1]), [None]);
+        assert_eq!(names(&output.store.table(), &[1]), [None]);
     }
 }

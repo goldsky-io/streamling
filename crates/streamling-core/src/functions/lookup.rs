@@ -9,7 +9,7 @@
 //!   exists.
 
 use crate::table::read::TableFunction;
-use crate::table::{InMemoryTable, Mark, TableRegistry};
+use crate::table::{Mark, Table, TableRegistry};
 use crate::{streamling_user_bail, streamling_user_err};
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::compute::can_cast_types;
@@ -88,7 +88,7 @@ impl LookupFunc {
         }
     }
 
-    fn table_named(&self, name: &str) -> Result<Arc<InMemoryTable>> {
+    fn table_named(&self, name: &str) -> Result<Arc<Table>> {
         self.tables.get(name).ok_or_else(|| {
             streamling_user_err!("{}: no table named '{}'", self.result.name(), name).into()
         })
@@ -189,7 +189,7 @@ impl TableFunction for LookupFunc {
         }
     }
 
-    fn table(&self, literals: &[Option<&ScalarValue>]) -> crate::error::Result<Arc<InMemoryTable>> {
+    fn table(&self, literals: &[Option<&ScalarValue>]) -> crate::error::Result<Arc<Table>> {
         let name = self.string_literal(literals.first().copied().flatten(), "table name")?;
         Ok(self.table_named(name)?)
     }
@@ -230,7 +230,8 @@ mod tests {
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::session::SessionManager;
-    use crate::table::{InMemoryTable, VersionRetention};
+    use crate::table::testing::store;
+    use crate::table::{TableStore, VersionRetention};
     use arrow::array::{Array, AsArray, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Fields, Int64Type, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
@@ -248,14 +249,12 @@ mod tests {
     /// A session with table `rates` (key `address`) holding `0xa → 10`,
     /// table `balances` (key `address,token`) holding `(0xa, usdc) → 10` and
     /// `(0xb, usdc) → 20`, and a source `t` with one `address` column.
-    fn session(addresses: Vec<Option<&str>>) -> SessionManager {
+    async fn session(addresses: Vec<Option<&str>>) -> SessionManager {
         let schema = rates_schema(Field::new("amount", DataType::Int64, false));
-        let rates = InMemoryTable::try_new(
+        let rates = store(
             "rates",
             &schema,
-            &["address".to_string()],
-            "app::rates".to_string(),
-            crate::topology::DEFAULT_MAX_DEAD_RATIO,
+            &["address"],
             None,
             VersionRetention::Latest,
         )
@@ -273,10 +272,11 @@ mod tests {
                 .unwrap(),
                 &[],
             )
+            .await
             .unwrap();
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
-        session_manager.tables().register(Arc::new(rates));
-        session_manager.tables().register(Arc::new(balances()));
+        session_manager.tables().register_store(Arc::new(rates));
+        session_manager.tables().register_store(balances().await);
 
         let input_schema = Arc::new(Schema::new(vec![Field::new(
             "address",
@@ -307,13 +307,11 @@ mod tests {
         ]))
     }
 
-    fn balances() -> InMemoryTable {
-        let balances = InMemoryTable::try_new(
+    async fn balances() -> Arc<TableStore> {
+        let balances = store(
             "balances",
             &balances_schema(),
-            &["address".to_string(), "token".to_string()],
-            "app::balances".to_string(),
-            crate::topology::DEFAULT_MAX_DEAD_RATIO,
+            &["address", "token"],
             None,
             VersionRetention::Latest,
         )
@@ -332,8 +330,9 @@ mod tests {
                 .unwrap(),
                 &[],
             )
+            .await
             .unwrap();
-        balances
+        Arc::new(balances)
     }
 
     /// `(address, token)` pairs: two hits, a miss, and a NULL in each key
@@ -342,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn looks_up_by_a_composite_primary_key() {
-        let session_manager = session(vec![]);
+        let session_manager = session(vec![]).await;
         let batches = session_manager
             .session_context()
             .sql(&format!(
@@ -362,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn looks_up_rows_and_their_existence() {
-        let session_manager = session(vec![]);
+        let session_manager = session(vec![]).await;
         let df = session_manager
             .session_context()
             .sql(&format!(
@@ -442,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn looks_up_a_column_by_primary_key() {
-        let session_manager = session(vec![Some("0xa"), Some("0xb"), None]);
+        let session_manager = session(vec![Some("0xa"), Some("0xb"), None]).await;
         let batches = session_manager
             .session_context()
             .sql("SELECT lookup_eq('rates', 'address', address, 'amount') FROM t")
@@ -460,7 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_bad_calls_at_planning() {
-        let session_manager = session(vec![Some("0xa")]);
+        let session_manager = session(vec![Some("0xa")]).await;
         for (call, expected) in [
             (
                 "lookup_eq('missing', 'address', address, 'amount')",
@@ -535,18 +534,9 @@ mod tests {
             id.clone(),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
         ]));
-        let session_manager = session(vec![Some("0xa")]);
-        session_manager.tables().register(Arc::new(
-            InMemoryTable::try_new(
-                "ids",
-                &ids_schema,
-                &["id".to_string()],
-                "app::ids".to_string(),
-                crate::topology::DEFAULT_MAX_DEAD_RATIO,
-                None,
-                VersionRetention::Latest,
-            )
-            .unwrap(),
+        let session_manager = session(vec![Some("0xa")]).await;
+        session_manager.tables().register_store(Arc::new(
+            store("ids", &ids_schema, &["id"], None, VersionRetention::Latest).unwrap(),
         ));
         let values_schema = Arc::new(Schema::new(vec![
             DecimalArbType::field("same_scale", 78, 2, true).unwrap(),
@@ -584,14 +574,12 @@ mod tests {
     #[tokio::test]
     async fn returns_the_column_field_nullable_with_its_metadata() {
         let amount = DecimalArbType::field("amount", 78, 0, false).unwrap();
-        let session_manager = session(vec![Some("0xa")]);
-        session_manager.tables().register(Arc::new(
-            InMemoryTable::try_new(
+        let session_manager = session(vec![Some("0xa")]).await;
+        session_manager.tables().register_store(Arc::new(
+            store(
                 "decimals",
                 &rates_schema(amount.clone()),
-                &["address".to_string()],
-                "app::decimals".to_string(),
-                crate::topology::DEFAULT_MAX_DEAD_RATIO,
+                &["address"],
                 None,
                 VersionRetention::Latest,
             )

@@ -83,6 +83,11 @@ impl DirectTokioProxy {
         }
     }
 
+    /// The runtime's handle, to spawn on it directly.
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+
     pub fn into_async_runtime_obj(self) -> PluginAsyncRuntimeObj {
         PluginAsyncRuntime_TO::from_value(self, TD_Opaque)
     }

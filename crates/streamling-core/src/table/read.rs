@@ -4,8 +4,7 @@
 //! carries each table's latest mark), and physical planning appends a
 //! [`MarkExpr`] reading that stamp to every call of a [`TableFunction`].
 
-use super::InMemoryTable;
-use super::versions::{Mark, Marks, VersionRetention};
+use super::{Mark, Marks, Table, VersionRetention};
 use crate::error::Result;
 use crate::streamling_err;
 use arrow::array::RecordBatch;
@@ -37,7 +36,7 @@ fn mark_key(table: &str) -> String {
 pub fn mark_stamps(marks: Marks) -> HashMap<String, String> {
     marks
         .into_iter()
-        .map(|(table, Mark(mark))| (mark_key(&table), mark.to_string()))
+        .map(|(table, mark)| (mark_key(&table), mark.0.to_string()))
         .collect()
 }
 
@@ -138,7 +137,7 @@ pub trait TableFunction: Debug + Send + Sync + 'static {
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> DataFusionResult<FieldRef>;
 
     /// The table a call reads, from its literal arguments.
-    fn table(&self, literals: &[Option<&ScalarValue>]) -> Result<Arc<InMemoryTable>>;
+    fn table(&self, literals: &[Option<&ScalarValue>]) -> Result<Arc<Table>>;
 
     /// `mark` is the table's mark on the batch `args` come from, if any.
     fn invoke(
@@ -223,8 +222,8 @@ impl ScalarUDFImpl for TableUdf {
 }
 
 /// Appends the table's mark on the batch to each call in `expr` of a
-/// [`TableFunction`] whose table keeps versions per batch, so it reads the
-/// table as of that batch. Calls that already have it are left alone.
+/// [`TableFunction`] whose lookups read the journal, so it reads the table as
+/// of that batch. Calls that already have it are left alone.
 pub fn bind_table_marks(expr: Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
     expr.transform_up(|expr| {
         let Some(args) = bound_arguments(&expr)? else {
@@ -236,7 +235,7 @@ pub fn bind_table_marks(expr: Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn
 }
 
 /// `expr`'s arguments plus its mark, if it's an unbound call of a table
-/// function whose table keeps versions per batch.
+/// function whose lookups read the journal.
 fn bound_arguments(expr: &Arc<dyn PhysicalExpr>) -> Result<Option<Vec<Arc<dyn PhysicalExpr>>>> {
     let Some(call) = expr.downcast_ref::<ScalarFunctionExpr>() else {
         return Ok(None);
@@ -257,11 +256,11 @@ fn bound_arguments(expr: &Arc<dyn PhysicalExpr>) -> Result<Option<Vec<Arc<dyn Ph
         .map(|arg| arg.downcast_ref::<Literal>().map(Literal::value))
         .collect();
     let table = function.table(&literals)?;
-    if table.retention() != &VersionRetention::PerBatch {
+    if table.retention() != VersionRetention::Journal {
         return Ok(None);
     }
     let mut args = call.args().to_vec();
-    args.push(Arc::new(MarkExpr::new(&table.name)));
+    args.push(Arc::new(MarkExpr::new(table.name())));
     Ok(Some(args))
 }
 
@@ -278,7 +277,7 @@ mod tests {
     use crate::operators::projection::StreamingProjectionExec;
     use crate::session::SessionManager;
     use crate::side_output::with_metadata;
-    use crate::topology::DEFAULT_MAX_DEAD_RATIO;
+    use crate::table::testing::store;
     use crate::utils::batch_accumulator::{BatchAccumulator, merge_batches};
     use arrow::array::{AsArray, Int64Array, StringArray};
     use datafusion::common::DFSchema;
@@ -311,44 +310,33 @@ mod tests {
     /// A session with source `src` (`id`) and table `names` (key `id`),
     /// applied with `1 → a` and then `1 → b`. Returns the session and the two
     /// applies' marks.
-    fn session() -> (SessionManager, Vec<Marks>) {
-        session_with(&[(1, "a"), (1, "b")])
+    async fn session() -> (SessionManager, Vec<Marks>) {
+        session_with(&[(1, "a"), (1, "b")]).await
     }
 
     /// Like [`session`], with one apply per `(id, name)` of `applies`.
-    fn session_with(applies: &[(i64, &str)]) -> (SessionManager, Vec<Marks>) {
+    async fn session_with(applies: &[(i64, &str)]) -> (SessionManager, Vec<Marks>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
         ]));
-        let names = InMemoryTable::try_new(
-            "names",
-            &schema,
-            &["id".to_string()],
-            "app::names".to_string(),
-            DEFAULT_MAX_DEAD_RATIO,
-            None,
-            VersionRetention::PerBatch,
-        )
-        .unwrap();
-        let marks: Vec<Marks> = applies
-            .iter()
-            .map(|&(id, name)| {
-                let batch = RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(Int64Array::from(vec![id])),
-                        Arc::new(StringArray::from(vec![name])),
-                        Arc::new(StringArray::from(vec!["u"])),
-                    ],
-                )
-                .unwrap();
-                names.apply(&batch, &[]).unwrap()
-            })
-            .collect();
+        let names = store("names", &schema, &["id"], None, VersionRetention::Journal).unwrap();
+        let mut marks: Vec<Marks> = Vec::new();
+        for &(id, name) in applies {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(StringArray::from(vec![name])),
+                    Arc::new(StringArray::from(vec!["u"])),
+                ],
+            )
+            .unwrap();
+            marks.push(names.apply(&batch, &[]).await.unwrap());
+        }
         let session_manager = SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
-        session_manager.tables().register(Arc::new(names));
+        session_manager.tables().register_store(Arc::new(names));
         session_manager
             .session_context()
             .register_table(
@@ -392,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn projected_lookups_read_the_table_as_of_their_batch() {
-        let (session_manager, marks) = session();
+        let (session_manager, marks) = session().await;
         let plan = plan(
             &session_manager,
             &format!("SELECT id, {LOOKUP} AS name FROM src"),
@@ -431,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_and_exists_lookups_read_the_table_as_of_their_batch() {
-        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]);
+        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]).await;
         let plan = plan(
             &session_manager,
             "SELECT lookup_row('names', 'id', id)['name'] AS name, \
@@ -465,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn filtered_lookups_read_the_table_as_of_their_batch() {
-        let (session_manager, marks) = session();
+        let (session_manager, marks) = session().await;
         let plan = plan(
             &session_manager,
             &format!("SELECT id FROM src WHERE {LOOKUP} = 'a'"),
@@ -519,9 +507,9 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_merged_row_sees_its_own_batchs_apply() {
-        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]);
+    #[tokio::test]
+    async fn a_merged_row_sees_its_own_batchs_apply() {
+        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]).await;
         let batch = merged([
             ids_of(vec![1], Some(&marks[0])),
             ids_of(vec![2], Some(&marks[1])),
@@ -532,9 +520,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_merged_row_sees_the_applies_of_the_batches_merged_after_it() {
-        let (session_manager, marks) = session();
+    #[tokio::test]
+    async fn a_merged_row_sees_the_applies_of_the_batches_merged_after_it() {
+        let (session_manager, marks) = session().await;
         let batch = merged([ids(Some(&marks[0])), ids(Some(&marks[1]))]);
         assert_eq!(
             all_evaluated_names(&bound_lookup(&session_manager), &batch),
@@ -542,9 +530,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_split_batch_keeps_its_marks() {
-        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]);
+    #[tokio::test]
+    async fn a_split_batch_keeps_its_marks() {
+        let (session_manager, marks) = session_with(&[(1, "a"), (2, "b")]).await;
         let lookup = bound_lookup(&session_manager);
         let mut accumulator = BatchAccumulator::new(2, None);
         assert!(accumulator.push(ids_of(vec![1], Some(&marks[0]))).is_none());
@@ -596,9 +584,9 @@ mod tests {
         assert_eq!(extract_checkpoint_messages(metadata).len(), 2);
     }
 
-    #[test]
-    fn binding_is_idempotent() {
-        let (session_manager, _) = session();
+    #[tokio::test]
+    async fn binding_is_idempotent() {
+        let (session_manager, _) = session().await;
         let projection = Arc::new(
             project(
                 lookup_call(&session_manager),

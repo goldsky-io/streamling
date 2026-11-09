@@ -1,1012 +1,142 @@
 //! The `table` transform: the latest row per primary key, maintained from a
 //! changelog stream. The table is applied by its upstream's side output.
+//!
+//! A table's rows live in a [`TableBackend`]. The host ([`TableStore`])
+//! parses the changelog, runs the window and maintains the table's
+//! aggregates; the backend stores keyed rows and reads them as of a mark.
 
 pub mod aggregate;
+mod apply;
+pub mod backend;
+#[cfg(test)]
+mod conformance;
 pub mod driver;
+mod horizon;
+pub mod in_memory;
+pub mod plugin;
 pub mod read;
 pub mod side_output;
-mod versions;
 mod watermark;
+mod window;
 
-use aggregate::TableAggregate;
-use versions::{ChangeRef, Versions};
-pub use versions::{Mark, Marks, VersionRetention};
-use watermark::{WATERMARK_NAME, WatermarkFunc, Watermarks};
+pub use apply::TableStore;
+use apply::fingerprint;
+pub use backend::Mark;
+use backend::TableBackend;
+pub use window::{WALL_CLOCK_COLUMN, WindowConfig};
 
-use crate::checkpoints::checkpoint_management::CheckpointEpoch;
-
-use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt};
-use crate::telemetry::recorder::get_metrics_recorder;
+use crate::retry::retry_if_retriable_until_cancelled;
 use crate::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, StructArray, TimestampNanosecondArray,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, StructArray, UInt32Array,
 };
 use arrow::buffer::NullBuffer;
-use arrow::compute::{
-    cast, filter, filter_record_batch, interleave, interleave_record_batch, not,
-    prep_null_mask_filter,
-};
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
-use arrow::row::{RowConverter, Rows, SortField};
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, DFSchemaRef, ScalarValue};
-use datafusion::error::DataFusionError;
-use datafusion::execution::{FunctionRegistry, SessionState};
-use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion::logical_expr::{Accumulator, Expr, ExprSchemable, ScalarUDF, col};
-use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
-use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet, VecDeque};
+use arrow::compute::{cast, take, take_record_batch};
+use arrow::datatypes::{Field, FieldRef, Fields, Schema, SchemaRef};
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use parking_lot::RwLock;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use streamling_common::utils::parse_primary_key_columns;
-use tracing::warn;
+use tokio::runtime::{Handle, RuntimeFlavor};
 
-const OP_DELETE: &str = "d";
-const UPSERT_OPS: [&str; 4] = ["i", "c", "r", "u"];
-
-const LIVE_ROWS_GAUGE: &str = "table_live_rows";
-const MEMORY_BYTES_GAUGE: &str = "table_memory_bytes";
-const VERSIONS_GAUGE: &str = "table_versions";
-const RETIRED_BYTES_GAUGE: &str = "table_retired_bytes";
-
-/// Floor of a cleaning step's budget, so tiny batches still merge old chunks
-/// into chunks of a useful size.
-const MIN_CLEANING_ROWS: usize = 1024;
-
-/// The column a window reads for the wall-clock time a row was applied.
-pub const WALL_CLOCK_COLUMN: &str = "__timestamp";
-const WALL_CLOCK_TIME_ZONE: &str = "UTC";
-
-#[derive(Clone, Copy)]
-enum RowOp {
-    Upsert,
-    Delete,
+/// Which version lookups read.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionRetention {
+    /// As of the reader's mark, so a node downstream of the node whose side
+    /// output applies the table reads it as of its own batch.
+    #[default]
+    Journal,
+    /// The latest commit, whatever the reader's mark.
+    Latest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RowLocation {
-    chunk: usize,
-    row: usize,
+/// What a store that kept a table across a restart does when the table's
+/// columns or primary key changed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnSchemaChange {
+    /// Startup fails.
+    #[default]
+    Fail,
+    /// The stored table and its aggregates are dropped, and the table starts
+    /// empty.
+    Reset,
 }
 
-/// A live key's row and its newest change in the version history.
-#[derive(Clone, Copy)]
-struct IndexEntry {
-    location: RowLocation,
-    newest_change: Option<ChangeRef>,
+/// When a table's journal is trimmed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalTrim {
+    /// Below each finalized checkpoint's horizon.
+    #[default]
+    OnFinalize,
+    /// Never: every version stays readable.
+    Never,
 }
 
-struct Chunk {
-    batch: RecordBatch,
-    /// Rows of `batch` the index points to.
-    live_rows: usize,
-    /// History entries that point into `batch`, which keep it readable after
-    /// the cleaner drops the chunk.
-    held: usize,
-    /// Bounds of the window's columns over all of `batch`'s rows, in
-    /// `Window::columns` order. Empty without a window.
-    statistics: Vec<ColumnStatistics>,
-}
+/// The mark of each table an apply changed, the table and its aggregates'
+/// outputs, by name.
+pub type Marks = Vec<(String, Mark)>;
 
-#[derive(Debug, PartialEq)]
-struct ColumnStatistics {
-    min: ScalarValue,
-    max: ScalarValue,
-    null_count: usize,
-}
-
-struct TableState {
-    /// Oldest first. A chunk's id is its position plus `first_chunk_id`, so
-    /// ids stay valid while the cleaner drops chunks from the front.
-    chunks: VecDeque<Chunk>,
-    first_chunk_id: usize,
-    /// The front chunk's next row to clean.
-    cleaning_cursor: usize,
-    /// Primary key, encoded by the table's `RowConverter`, to its live row.
-    index: HashMap<Box<[u8]>, IndexEntry>,
-    total_rows: usize,
-    chunk_bytes: usize,
-    key_bytes: usize,
-    versions: Versions,
-    /// Chunks the cleaner dropped that history entries still point into, by
-    /// id, with how many do.
-    retired: HashMap<usize, (RecordBatch, usize)>,
-    retired_bytes: usize,
-}
-
-impl TableState {
-    fn new(retention: &VersionRetention) -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            first_chunk_id: 0,
-            cleaning_cursor: 0,
-            index: HashMap::new(),
-            total_rows: 0,
-            chunk_bytes: 0,
-            key_bytes: 0,
-            versions: Versions::new(retention),
-            retired: HashMap::new(),
-            retired_bytes: 0,
-        }
-    }
-
-    fn chunk(&self, id: usize) -> &Chunk {
-        &self.chunks[id - self.first_chunk_id]
-    }
-
-    fn chunk_mut(&mut self, id: usize) -> &mut Chunk {
-        &mut self.chunks[id - self.first_chunk_id]
-    }
-
-    /// The rows of a live or retired chunk.
-    fn batch(&self, id: usize) -> &RecordBatch {
-        match id.checked_sub(self.first_chunk_id) {
-            Some(offset) => &self.chunks[offset].batch,
-            None => &self.retired[&id].0,
-        }
-    }
-
-    /// How many history entries point into a live or retired chunk.
-    fn held_mut(&mut self, id: usize) -> &mut usize {
-        match id.checked_sub(self.first_chunk_id) {
-            Some(offset) => &mut self.chunks[offset].held,
-            None => {
-                &mut self
-                    .retired
-                    .get_mut(&id)
-                    .expect("a held chunk is live or retired")
-                    .1
-            }
-        }
-    }
-
-    fn hold(&mut self, location: RowLocation) {
-        *self.held_mut(location.chunk) += 1;
-    }
-
-    /// Frees a retired chunk once no history entry points into it.
-    fn unhold(&mut self, location: RowLocation) {
-        let held = self.held_mut(location.chunk);
-        *held -= 1;
-        if *held == 0
-            && let Some((batch, _)) = self.retired.remove(&location.chunk)
-        {
-            self.retired_bytes -= batch.get_array_memory_size();
-        }
-    }
-
-    /// Records a change of a key whose live row was `before` and whose
-    /// newest change was `previous`. Returns the new change, if recorded.
-    fn record(
-        &mut self,
-        previous: Option<ChangeRef>,
-        before: Option<RowLocation>,
-    ) -> Option<ChangeRef> {
-        let recorded = self.versions.record(previous, before);
-        if recorded.is_some()
-            && let Some(before) = before
-        {
-            self.hold(before);
-        }
-        recorded
-    }
-
-    /// Removes `key`'s live row, and returns it.
-    fn remove(&mut self, key: &[u8]) -> Option<RowLocation> {
-        let (key, entry) = self.index.remove_entry(key)?;
-        self.key_bytes -= key.len();
-        if let Some(change) = self.record(entry.newest_change, Some(entry.location)) {
-            self.versions.mark_removed(key, change);
-        }
-        self.release(entry.location);
-        Some(entry.location)
-    }
-
-    /// Drops the history up to the finalized `epoch`.
-    fn collect(&mut self, epoch: u64) {
-        for location in self.versions.collect(epoch) {
-            self.unhold(location);
-        }
-    }
-
-    fn next_chunk_id(&self) -> usize {
-        self.first_chunk_id + self.chunks.len()
-    }
-
-    fn push_chunk(
-        &mut self,
-        batch: RecordBatch,
-        live_rows: usize,
-        statistics: Vec<ColumnStatistics>,
-    ) {
-        self.total_rows += batch.num_rows();
-        self.chunk_bytes += batch.get_array_memory_size();
-        self.chunks.push_back(Chunk {
-            batch,
-            live_rows,
-            held: 0,
-            statistics,
-        });
-    }
-
-    /// Drops the front chunk, retiring it while history entries point into
-    /// it.
-    fn pop_front_chunk(&mut self) {
-        if let Some(chunk) = self.chunks.pop_front() {
-            let bytes = chunk.batch.get_array_memory_size();
-            self.total_rows -= chunk.batch.num_rows();
-            self.chunk_bytes -= bytes;
-            if chunk.held > 0 {
-                self.retired_bytes += bytes;
-                self.retired
-                    .insert(self.first_chunk_id, (chunk.batch, chunk.held));
-            }
-            self.first_chunk_id += 1;
-            self.cleaning_cursor = 0;
-        }
-    }
-
-    /// The row at `location` is no longer the live row of its key.
-    fn release(&mut self, location: RowLocation) {
-        self.chunk_mut(location.chunk).live_rows -= 1;
-    }
-
-    /// The stored rows at `locations`, in order.
-    fn rows_at(&self, schema: &SchemaRef, locations: &[RowLocation]) -> Result<RecordBatch> {
-        if locations.is_empty() {
-            return Ok(RecordBatch::new_empty(Arc::clone(schema)));
-        }
-        let mut sources: Vec<&RecordBatch> = Vec::new();
-        // Chunk number to its position in `sources`.
-        let mut chunk_sources: HashMap<usize, usize> = HashMap::new();
-        let mut indices = Vec::with_capacity(locations.len());
-        for location in locations {
-            let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
-                sources.push(self.batch(location.chunk));
-                sources.len() - 1
-            });
-            indices.push((source, location.row));
-        }
-        interleave_record_batch(&sources, &indices)
-            .streamling_context("failed to read the stored rows")
-    }
-}
-
-/// What an apply changes in the live rows, for the table's aggregates.
-struct LiveRowChanges {
-    /// Rows of earlier chunks that stopped being live.
-    removed: Vec<RowLocation>,
-    /// Whether each row of the new chunk is live.
-    added: Vec<bool>,
-}
-
-impl LiveRowChanges {
-    /// The row at `location` is no longer live. A row of the new chunk was
-    /// never live before the apply, so it's neither removed nor added.
-    fn release(&mut self, location: RowLocation, new_chunk: usize) {
-        if location.chunk == new_chunk {
-            self.added[location.row] = false;
-        } else {
-            self.removed.push(location);
-        }
-    }
-}
-
-/// `(chunk, rows, keys)`: rows of a chunk a GC pass found outside the window,
-/// and their primary keys.
-type OutsideRows = (usize, Vec<usize>, Rows);
-
-/// A table's `window`.
-pub struct WindowConfig<'a> {
-    /// SQL over the table's columns, [`WALL_CLOCK_COLUMN`] and
-    /// `watermark(column)`. The table keeps the rows it is true for.
-    pub predicate: &'a str,
-    pub session_state: &'a SessionState,
-    /// Minimum time between GC passes.
-    pub gc_interval: Duration,
-}
-
-/// A planned [`WindowConfig`].
-struct Window {
-    /// Type-coerced but not simplified, so each GC pass folds `now()` and
-    /// `watermark()` anew.
-    predicate: Expr,
-    /// True for the rows outside the window: `NOT predicate`, or a NULL in
-    /// any column the predicate reads. Pruned against chunk statistics.
-    outside: Expr,
-    /// The stored schema, which `predicate` reads.
-    schema: DFSchemaRef,
-    /// The columns `predicate` reads, by name and position in `schema`.
-    columns: Vec<(String, usize)>,
-    reads_wall_clock: bool,
-    /// The columns `watermark()` reads, by name and position in `columns`.
-    watermark_columns: Vec<(String, usize)>,
-    watermarks: Watermarks,
-    /// Knows `watermark()`, unlike the pipeline's session.
-    session_state: SessionState,
-    gc_interval: Duration,
-    /// When the last GC pass started. Locked while a pass runs.
-    last_pass: Mutex<Instant>,
-}
-
-/// A [`Window`] with `now()` folded to the current time and `watermark()` to
-/// the current watermarks.
-struct CompiledWindow {
-    predicate: Arc<dyn PhysicalExpr>,
-    /// Rules out the chunks without a row outside the window.
-    outside: PruningPredicate,
-}
-
-impl Window {
-    /// Plans `config.predicate` over `fields`, the stored columns, which get
-    /// [`WALL_CLOCK_COLUMN`] appended when the predicate reads it.
-    fn try_new(table: &str, config: &WindowConfig, fields: &Fields) -> Result<Self> {
-        if fields.find(WALL_CLOCK_COLUMN).is_some() {
-            streamling_user_bail!(
-                "table '{}': the SQL output cannot contain '{}', which a window reserves for the wall-clock time",
-                table,
-                WALL_CLOCK_COLUMN
-            );
-        }
-        let invalid = |err: DataFusionError| {
-            streamling_user_err!(
-                "table '{}': invalid window '{}': {}",
-                table,
-                config.predicate,
-                err
-            )
-        };
-        let wall_clock = Field::new(
-            WALL_CLOCK_COLUMN,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(WALL_CLOCK_TIME_ZONE.into())),
-            false,
-        );
-        let with_wall_clock = DFSchema::try_from(Schema::new(
-            fields
-                .iter()
-                .cloned()
-                .chain([Arc::new(wall_clock)])
-                .collect::<Fields>(),
-        ))?;
-        let watermarks = Watermarks::default();
-        let mut session_state = config.session_state.clone();
-        session_state.register_udf(Arc::new(ScalarUDF::from(WatermarkFunc::new(Arc::clone(
-            &watermarks,
-        )))))?;
-        let predicate = session_state
-            .create_logical_expr(config.predicate, &with_wall_clock)
-            .map_err(invalid)?;
-        let mut column_names: Vec<String> = predicate
-            .column_refs()
-            .into_iter()
-            .map(|column| column.name.clone())
-            .collect();
-        column_names.sort();
-        let reads_wall_clock = column_names.iter().any(|name| name == WALL_CLOCK_COLUMN);
-        let schema = Arc::new(if reads_wall_clock {
-            with_wall_clock
-        } else {
-            DFSchema::try_from(Schema::new(fields.clone()))?
-        });
-        let predicate = ExprSimplifier::new(Self::simplify_context(&session_state, &schema))
-            .coerce(predicate, &schema)
-            .map_err(invalid)?;
-        let data_type = predicate.get_type(&schema).map_err(invalid)?;
-        if data_type != DataType::Boolean {
-            streamling_user_bail!(
-                "table '{}': the window must be a boolean expression, got {}",
-                table,
-                data_type
-            );
-        }
-        let outside = column_names
-            .iter()
-            .fold(Expr::Not(Box::new(predicate.clone())), |outside, name| {
-                outside.or(col(Column::new_unqualified(name)).is_null())
-            });
-        let columns: Vec<(String, usize)> = column_names
-            .into_iter()
-            .map(|name| {
-                let index = schema.inner().index_of(&name)?;
-                Ok((name, index))
-            })
-            .collect::<Result<_>>()?;
-        let mut watermark_columns = Vec::new();
-        predicate
-            .apply(|expr| {
-                if let Expr::ScalarFunction(function) = expr
-                    && function.name() == WATERMARK_NAME
-                {
-                    let [Expr::Column(column)] = function.args.as_slice() else {
-                        return Err(DataFusionError::Plan(format!(
-                            "{WATERMARK_NAME}() takes one column of the table, got {expr}"
-                        )));
-                    };
-                    let position = columns
-                        .iter()
-                        .position(|(name, _)| *name == column.name)
-                        .expect("the predicate's columns include watermark()'s");
-                    watermark_columns.push((column.name.clone(), position));
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-            .map_err(invalid)?;
-        for (name, position) in &watermark_columns {
-            let data_type = schema.field(columns[*position].1).data_type();
-            watermarks
-                .lock()
-                .insert(name.clone(), ScalarValue::try_from(data_type)?);
-        }
-        let window = Self {
-            predicate,
-            outside,
-            schema,
-            columns,
-            reads_wall_clock,
-            watermark_columns,
-            watermarks,
-            session_state,
-            gc_interval: config.gc_interval,
-            last_pass: Mutex::new(Instant::now()),
-        };
-        if !window.prunable().map_err(invalid)? {
-            warn!(
-                "table '{}': window '{}' can't skip chunks by their min/max, so each GC pass evaluates every stored row. Compare a column, not a function of it, with an expression of now() or watermark(), such as `ts >= watermark(ts) - interval '1 hour'`",
-                table, config.predicate
-            );
-        }
-        Ok(window)
-    }
-
-    fn simplify_context(session_state: &SessionState, schema: &DFSchemaRef) -> SimplifyContext {
-        SimplifyContext::builder()
-            .with_schema(Arc::clone(schema))
-            .with_config_options(Arc::clone(session_state.config_options()))
-            .with_current_time()
-            .build()
-    }
-
-    /// Simplifying folds `now()`, and pushes `outside`'s `NOT` into the
-    /// comparisons, which `PruningPredicate` can't see through otherwise.
-    fn compile(&self) -> datafusion::common::Result<CompiledWindow> {
-        let simplifier =
-            ExprSimplifier::new(Self::simplify_context(&self.session_state, &self.schema));
-        let predicate = simplifier.simplify(self.predicate.clone())?;
-        let outside = simplifier.simplify(self.outside.clone())?;
-        Ok(CompiledWindow {
-            predicate: self
-                .session_state
-                .create_physical_expr(predicate, &self.schema)?,
-            outside: PruningPredicate::try_new(
-                self.session_state
-                    .create_physical_expr(outside, &self.schema)?,
-                Arc::clone(self.schema.inner()),
-            )?,
-        })
-    }
-
-    /// Whether chunk statistics can rule chunks out. A NULL watermark folds
-    /// the comparisons to NULL, which rules nothing out, so the check
-    /// substitutes zeros. Only called before the table is in use.
-    fn prunable(&self) -> datafusion::common::Result<bool> {
-        let watermarks = self.watermarks.lock().clone();
-        for (name, value) in &watermarks {
-            if let Ok(zero) = ScalarValue::new_zero(&value.data_type()) {
-                self.watermarks.lock().insert(name.clone(), zero);
-            }
-        }
-        let prunable = self
-            .compile()
-            .map(|compiled| !compiled.outside.always_true());
-        *self.watermarks.lock() = watermarks;
-        prunable
-    }
-
-    fn reads_watermark(&self) -> bool {
-        !self.watermark_columns.is_empty()
-    }
-
-    /// Raises each watermark to its column's max in a new chunk's
-    /// `statistics`.
-    fn advance_watermarks(&self, statistics: &[ColumnStatistics]) {
-        let mut watermarks = self.watermarks.lock();
-        for (name, position) in &self.watermark_columns {
-            let max = &statistics[*position].max;
-            let watermark = watermarks
-                .get_mut(name)
-                .expect("every watermark column has a watermark");
-            // A null max is less than any value, and equal to a null watermark.
-            if *max > *watermark {
-                *watermark = max.clone();
-            }
-        }
-    }
-
-    /// The bounds of `columns` in `batch`, a chunk in the stored schema.
-    fn statistics(&self, batch: &RecordBatch) -> datafusion::common::Result<Vec<ColumnStatistics>> {
-        self.columns
-            .iter()
-            .map(|(_, index)| {
-                let values = [Arc::clone(batch.column(*index))];
-                let mut min = MinAccumulator::try_new(values[0].data_type())?;
-                min.update_batch(&values)?;
-                let mut max = MaxAccumulator::try_new(values[0].data_type())?;
-                max.update_batch(&values)?;
-                Ok(ColumnStatistics {
-                    min: min.evaluate()?,
-                    max: max.evaluate()?,
-                    null_count: values[0].null_count(),
-                })
-            })
-            .collect()
-    }
-}
-
-/// The statistics of the chunks a GC pass prunes, one container per chunk.
-struct ChunkStatistics<'a> {
-    window: &'a Window,
-    chunks: &'a [&'a Chunk],
-}
-
-impl ChunkStatistics<'_> {
-    fn values(
-        &self,
-        column: &Column,
-        value: impl Fn(&ColumnStatistics) -> ScalarValue,
-    ) -> Option<ArrayRef> {
-        let position = self
-            .window
-            .columns
-            .iter()
-            .position(|(name, _)| *name == column.name)?;
-        // Unknown on error, which keeps every chunk.
-        ScalarValue::iter_to_array(
-            self.chunks
-                .iter()
-                .map(|chunk| value(&chunk.statistics[position])),
-        )
-        .ok()
-    }
-}
-
-impl PruningStatistics for ChunkStatistics<'_> {
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.values(column, |statistics| statistics.min.clone())
-    }
-
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.values(column, |statistics| statistics.max.clone())
-    }
-
-    fn num_containers(&self) -> usize {
-        self.chunks.len()
-    }
-
-    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
-        self.values(column, |statistics| {
-            ScalarValue::UInt64(Some(statistics.null_count as u64))
-        })
-    }
-
-    fn row_counts(&self) -> Option<ArrayRef> {
-        Some(Arc::new(UInt64Array::from_iter_values(
-            self.chunks
-                .iter()
-                .map(|chunk| chunk.batch.num_rows() as u64),
-        )))
-    }
-
-    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
-        None
-    }
-}
-
-/// A [`WALL_CLOCK_COLUMN`] array holding the current time.
-fn wall_clock(rows: usize) -> ArrayRef {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64;
-    Arc::new(TimestampNanosecondArray::from_value(now, rows).with_timezone(WALL_CLOCK_TIME_ZONE))
-}
-
-/// The `in_memory` backend of a `table` transform.
-///
-/// Storage is append-only, because Arrow arrays can't be edited in place:
-///
-/// - A chunk is one applied batch, stored without `_gs_op`.
-/// - The index maps each primary key to its live row, the key's latest
-///   version. Every other stored row (an older version, a deleted key's row,
-///   a delete row) is dead.
-/// - Each chunk counts its live rows, so a fully dead chunk is dropped
-///   without being read. Chunk ids keep growing, so dropping chunks from the
-///   front leaves the other ids valid.
-///
-/// [`Self::apply`] stores the batch as a new chunk, then goes through its
-/// rows in order. An upsert points the index at its row, and the key's
-/// previous row becomes dead. A delete removes the key from the index, and
-/// its row becomes dead. So the last row of a key in a batch wins. A lookup
-/// reads the row the index points to.
-///
-/// Every apply then cleans a little. While dead rows exceed `max_dead_ratio`
-/// of the live ones, the live rows of the oldest chunks, which are mostly
-/// dead, are copied into one new chunk, the index is pointed at the copies
-/// and the old chunks are dropped. A step visits a budget of rows
-/// proportional to the rows just written (`clean` explains the factor), so
-/// the work is spread over writes, and a step that runs out mid-chunk
-/// resumes there next time. Storage stays at about `1 + max_dead_ratio`
-/// times the live rows.
-///
-/// For example, with a `max_dead_ratio` of 0.25:
-///
-/// | Step              | Chunks                         | Index          | Stored / live / dead |
-/// |-------------------|--------------------------------|----------------|----------------------|
-/// | apply `A1 B2 C3`  | `c0:[A1 B2 C3]`                | A→c0 B→c0 C→c0 | 3 / 3 / 0            |
-/// | apply `A10 -B`    | `c0:[A1 B2 C3]` `c1:[A10 -B]`  | A→c1 C→c0      | 5 / 2 / 3            |
-/// | clean             | `c2:[C3 A10]`                  | A→c2 C→c2      | 2 / 2 / 0            |
-///
-/// With a window, a GC pass removes the keys whose live row the window's
-/// predicate isn't true for, and the cleaner reclaims their rows like any
-/// other dead rows. An apply ends with a pass when the window's GC interval
-/// has passed since the last one. A window that reads a watermark also runs
-/// one inside every apply that writes rows, under its write lock, so no
-/// lookup sees a row the batch pushed out of the window. Each chunk keeps the min, max and null count of the
-/// columns the predicate reads, so a pass skips the chunks they show to be
-/// wholly inside the window. A predicate that reads [`WALL_CLOCK_COLUMN`]
-/// makes each chunk store the time its rows were applied in that column.
-///
-/// Each [`TableAggregate`] reading the table gets every change to the live
-/// rows, from applies and GC passes, before the write lock is released.
-///
-/// With [`VersionRetention::PerBatch`], every change of a key (an upsert,
-/// a delete or an eviction) is recorded in a version history, in apply order
-/// across the input's partitions, with the key's live row before it, and so
-/// is every change to an aggregate's output. Each finished apply returns the
-/// history's end as its [`Mark`], for the table and its aggregates' outputs
-/// in one lock window. A lookup at a batch's mark undoes every change made
-/// after it, whatever its partition, so it sees the table and its aggregates
-/// as they were when the batch was applied. The dead rows such
-/// lookups need stay readable, even after the cleaner drops their chunk,
-/// until a finalized checkpoint collects them. Each change links to its
-/// key's previous change. A key's index entry points to its newest change,
-/// so a lookup of a live key probes the index once; a key without a live row
-/// keeps its newest change in a side map of the history until it's
-/// collected.
-///
-/// Nothing is persisted, so the table starts empty after a restart.
-pub struct InMemoryTable {
+/// Reads of one table, or of one aggregate's output: a namespace of a
+/// [`TableBackend`].
+pub struct Table {
     name: String,
-    metric_metadata_id: String,
-    /// The input schema without `_gs_op`, plus [`WALL_CLOCK_COLUMN`] when the
-    /// window reads it.
+    namespace: String,
+    backend: Arc<dyn TableBackend>,
+    /// The namespace's schema.
     schema: SchemaRef,
-    op_index: usize,
-    /// Input columns stored in `schema`, in order.
-    value_indices: Vec<usize>,
-    key_indices: Vec<usize>,
-    /// Primary key columns' positions in `schema`.
-    stored_key_indices: Vec<usize>,
     /// The primary key columns, in order.
     key_fields: Fields,
     primary_key: String,
-    converter: RowConverter,
-    /// Cleaning runs while dead rows exceed this fraction of the live rows.
-    max_dead_ratio: f64,
-    window: Option<Window>,
+    /// The columns lookups read, by position in `schema`.
+    readable: Vec<usize>,
     retention: VersionRetention,
-    /// Locked before `state`.
-    aggregates: RwLock<Vec<Arc<TableAggregate>>>,
-    /// Locked before the `state` of each aggregate's output.
-    state: RwLock<TableState>,
 }
 
-impl InMemoryTable {
-    /// `input_schema` is the table's SQL output schema. It must contain
-    /// `_gs_op` and every `primary_key` column. `max_dead_ratio` must be a
-    /// positive number.
-    pub fn try_new(
+impl Table {
+    /// `key` names columns of `schema`, which lookups read but for
+    /// `hidden`.
+    fn try_new(
         name: &str,
-        input_schema: &SchemaRef,
-        primary_key: &[String],
-        metric_metadata_id: String,
-        max_dead_ratio: f64,
-        window: Option<WindowConfig>,
+        namespace: &str,
+        backend: Arc<dyn TableBackend>,
+        schema: SchemaRef,
+        key: &[String],
+        hidden: Option<&str>,
         retention: VersionRetention,
     ) -> Result<Self> {
-        if !(max_dead_ratio.is_finite() && max_dead_ratio > 0.0) {
-            streamling_user_bail!(
-                "table '{}': max_dead_ratio must be a positive number, got {}",
-                name,
-                max_dead_ratio
-            );
-        }
-        let op_index = input_schema.index_of(COLUMN_NAME_OP).map_err(|_| {
-            streamling_user_err!(
-                "table '{}': the SQL output must contain the '{}' column",
-                name,
-                COLUMN_NAME_OP
-            )
-        })?;
-        if primary_key.iter().any(|column| column == COLUMN_NAME_OP) {
-            streamling_user_bail!(
-                "table '{}': the primary key cannot be '{}'",
-                name,
-                COLUMN_NAME_OP
-            );
-        }
-        let key_indices = primary_key
+        let key_fields = key
             .iter()
-            .map(|column| {
-                input_schema.index_of(column).map_err(|_| {
-                    streamling_user_err!(
-                        "table '{}': primary key column '{}' is not in the SQL output",
-                        name,
-                        column
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let converter = RowConverter::new(
-            key_indices
-                .iter()
-                .map(|&index| SortField::new(input_schema.field(index).data_type().clone()))
-                .collect(),
-        )
-        .map_err(|e| {
-            streamling_user_err!("table '{}': unsupported primary key type: {}", name, e)
-        })?;
-        let key_fields: Fields = key_indices
-            .iter()
-            .map(|&index| Arc::clone(&input_schema.fields()[index]))
-            .collect();
-        let value_indices: Vec<usize> = (0..input_schema.fields().len())
-            .filter(|&index| index != op_index)
-            .collect();
-        let value_fields: Fields = value_indices
-            .iter()
-            .map(|&index| Arc::clone(&input_schema.fields()[index]))
-            .collect();
-        let window = window
-            .map(|config| Window::try_new(name, &config, &value_fields))
-            .transpose()?;
-        let schema = match &window {
-            Some(window) => Arc::clone(window.schema.inner()),
-            None => Arc::new(Schema::new(value_fields)),
-        };
-        let stored_key_indices = key_indices
-            .iter()
-            .map(|&index| index - usize::from(index > op_index))
+            .map(|column| Ok(Arc::new(schema.field_with_name(column)?.clone())))
+            .collect::<Result<Fields>>()?;
+        let readable = (0..schema.fields().len())
+            .filter(|&index| Some(schema.field(index).name().as_str()) != hidden)
             .collect();
         Ok(Self {
             name: name.to_string(),
-            metric_metadata_id,
+            namespace: namespace.to_string(),
+            backend,
             schema,
-            op_index,
-            value_indices,
-            key_indices,
-            stored_key_indices,
             key_fields,
-            primary_key: primary_key.join(","),
-            converter,
-            max_dead_ratio,
-            window,
-            state: RwLock::new(TableState::new(&retention)),
+            primary_key: key.join(","),
+            readable,
             retention,
-            aggregates: RwLock::new(Vec::new()),
         })
-    }
-
-    /// Applies `batch` (the table's SQL output) in row order: an upsert
-    /// replaces its key's row, and a delete removes it. `epochs` are the
-    /// checkpoint markers the batch carried. Returns the marks the batch's
-    /// readers see the table and its aggregates' outputs at: the end of this
-    /// apply.
-    pub fn apply(&self, batch: &RecordBatch, epochs: &[CheckpointEpoch]) -> Result<Marks> {
-        self.begin();
-        self.write(batch)?;
-        // After the batch, so a pass evicts its rows too.
-        self.collect_garbage_if_due()?;
-        let marks = self.finish(epochs);
-        self.record_gauges();
-        Ok(marks)
-    }
-
-    /// Starts an apply on the table and on its aggregates' outputs,
-    /// collecting the history a finalized checkpoint freed.
-    fn begin(&self) {
-        let aggregates = self.aggregates.read();
-        let mut state = self.state.write();
-        if let Some(epoch) = state.versions.latest_finalized() {
-            state.collect(epoch);
-        }
-        for aggregate in aggregates.iter() {
-            aggregate.begin();
-        }
-    }
-
-    /// Finishes an apply of a batch that carried the markers of `epochs`,
-    /// on the table and on its aggregates' outputs, in one lock window, so
-    /// the batch's readers see them at the same moment.
-    fn finish(&self, epochs: &[CheckpointEpoch]) -> Marks {
-        let aggregates = self.aggregates.read();
-        let mut state = self.state.write();
-        let mut marks: Marks = state
-            .versions
-            .finish(epochs)
-            .map(|mark| (self.name.clone(), mark))
-            .into_iter()
-            .collect();
-        for aggregate in aggregates.iter() {
-            marks.extend(aggregate.finish(epochs));
-        }
-        marks
-    }
-
-    /// Applies `batch`, recording its changes in the version history.
-    fn write(&self, batch: &RecordBatch) -> Result<()> {
-        let ops = self.parse_ops(batch.column(self.op_index))?;
-        let key_columns: Vec<ArrayRef> = self
-            .key_indices
-            .iter()
-            .map(|&index| Arc::clone(batch.column(index)))
-            .collect();
-        if let Some(null_column) = key_columns
-            .iter()
-            .position(|column| column.null_count() > 0)
-        {
-            streamling_user_bail!(
-                "table '{}': primary key column '{}' contains a null value",
-                self.name,
-                batch.schema().field(self.key_indices[null_column]).name()
-            );
-        }
-        let keys = self
-            .converter
-            .convert_columns(&key_columns)
-            .streamling_context("failed to encode the primary key")?;
-        let mut columns: Vec<ArrayRef> = self
-            .value_indices
-            .iter()
-            .map(|&index| Arc::clone(batch.column(index)))
-            .collect();
-        if self.reads_wall_clock() {
-            columns.push(wall_clock(batch.num_rows()));
-        }
-        let values = RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .streamling_with_context(|| {
-                format!(
-                    "table '{}': batch does not match the table schema",
-                    self.name
-                )
-            })?;
-        let written_rows = values.num_rows();
-        let statistics = if written_rows > 0 {
-            self.chunk_statistics(&values)?
-        } else {
-            Vec::new()
-        };
-        if let Some(window) = &self.window
-            && window.reads_watermark()
-            && written_rows > 0
-        {
-            window.advance_watermarks(&statistics);
-        }
-
-        let aggregates = self.aggregates.read();
-        let mut changes = (!aggregates.is_empty()).then(|| LiveRowChanges {
-            removed: Vec::new(),
-            added: vec![false; written_rows],
-        });
-        let mut guard = self.state.write();
-        let state = &mut *guard;
-        let new_chunk = state.next_chunk_id();
-        // Stored before the loop, so a row the batch replaces in itself is
-        // released like any other.
-        if written_rows > 0 {
-            state.push_chunk(values, 0, statistics);
-        }
-        for (row, op) in ops.into_iter().enumerate() {
-            let key = keys.row(row);
-            match op {
-                RowOp::Upsert => {
-                    let location = RowLocation {
-                        chunk: new_chunk,
-                        row,
-                    };
-                    let replaced = match state.index.get_mut(key.as_ref()) {
-                        Some(entry) => {
-                            let replaced = std::mem::replace(&mut entry.location, location);
-                            // `TableState::record`, inlined: `entry` borrows the index.
-                            entry.newest_change =
-                                state.versions.record(entry.newest_change, Some(replaced));
-                            if entry.newest_change.is_some() {
-                                state.hold(replaced);
-                            }
-                            Some(replaced)
-                        }
-                        None => {
-                            state.key_bytes += key.as_ref().len();
-                            let previous = state.versions.take_removed(key.as_ref());
-                            let newest_change = state.record(previous, None);
-                            state.index.insert(
-                                key.as_ref().into(),
-                                IndexEntry {
-                                    location,
-                                    newest_change,
-                                },
-                            );
-                            None
-                        }
-                    };
-                    if let Some(replaced) = replaced {
-                        state.release(replaced);
-                        if let Some(changes) = &mut changes {
-                            changes.release(replaced, new_chunk);
-                        }
-                    }
-                    state.chunk_mut(new_chunk).live_rows += 1;
-                    if let Some(changes) = &mut changes {
-                        changes.added[row] = true;
-                    }
-                }
-                RowOp::Delete => {
-                    if let Some(stored) = state.remove(key.as_ref())
-                        && let Some(changes) = &mut changes
-                    {
-                        changes.release(stored, new_chunk);
-                    }
-                }
-            }
-        }
-        // The batch may have moved a watermark, or be older than it already.
-        // Evicting before the lock is released, and before the aggregates
-        // update, means no lookup sees the rows in between.
-        if let Some(window) = &self.window
-            && window.reads_watermark()
-            && written_rows > 0
-        {
-            let compiled = window.compile()?;
-            let chunks = self.chunks_to_evaluate(state, window, &compiled)?;
-            let outside_rows = self.outside_rows(&compiled, chunks)?;
-            for location in self.evict(state, &outside_rows) {
-                if let Some(changes) = &mut changes {
-                    changes.release(location, new_chunk);
-                }
-            }
-        }
-        // Before cleaning, which may drop the chunks of the removed rows.
-        if let Some(changes) = changes {
-            let removed = state.rows_at(&self.schema, &changes.removed)?;
-            let added = if written_rows > 0 {
-                filter_record_batch(state.batch(new_chunk), &BooleanArray::from(changes.added))?
-            } else {
-                RecordBatch::new_empty(Arc::clone(&self.schema))
-            };
-            for aggregate in aggregates.iter() {
-                aggregate.update(&removed, &added)?;
-            }
-        }
-
-        self.clean(state, written_rows)
-    }
-
-    pub fn retention(&self) -> &VersionRetention {
-        &self.retention
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Called before data flows, so the aggregate sees every change.
-    fn add_aggregate(&self, aggregate: Arc<TableAggregate>) {
-        self.aggregates.write().push(aggregate);
+    pub fn retention(&self) -> VersionRetention {
+        self.retention
     }
 
     /// The primary key's fields, if `key` names the table's whole primary
@@ -1043,46 +173,39 @@ impl InMemoryTable {
     /// the stored row with that primary key, or null when no row has it, as
     /// of `mark`, or the latest apply without one.
     pub fn lookup(&self, keys: &[ArrayRef], column: &str, mark: Option<Mark>) -> Result<ArrayRef> {
-        let column_index = self.column_index(column)?;
-        let encoded = self.encode_lookup_keys(keys)?;
-        let state = self.state.read();
-        let locations = self.locate(&state, &encoded, mark)?;
-        self.gather(&state, column_index, &locations)
+        let (rows, _) = self.read(keys, &[self.column_index(column)?], mark)?;
+        Ok(Arc::clone(rows.column(0)))
     }
 
     /// Like [`Self::lookup`], for every column [`Self::lookup`] can read at
     /// once, as a struct that is null when no row has the key.
     pub fn lookup_rows(&self, keys: &[ArrayRef], mark: Option<Mark>) -> Result<StructArray> {
-        let encoded = self.encode_lookup_keys(keys)?;
-        let state = self.state.read();
-        let locations = self.locate(&state, &encoded, mark)?;
-        let columns = self
-            .readable_columns()
-            .map(|(index, _)| self.gather(&state, index, &locations))
-            .collect::<Result<Vec<_>>>()?;
-        let found = NullBuffer::from_iter(locations.iter().map(Option::is_some));
-        StructArray::try_new(self.readable_fields(), columns, Some(found))
-            .streamling_context("failed to read the looked-up rows")
+        let (rows, found) = self.read(keys, &self.readable, mark)?;
+        StructArray::try_new(
+            self.readable_fields(),
+            rows.columns().to_vec(),
+            Some(NullBuffer::from(found.values().clone())),
+        )
+        .streamling_context("failed to read the looked-up rows")
     }
 
     /// For each row of `keys`, whether the table has a row with that primary
     /// key, as of `mark`, or the latest apply without one.
     pub fn lookup_exists(&self, keys: &[ArrayRef], mark: Option<Mark>) -> Result<BooleanArray> {
-        let encoded = self.encode_lookup_keys(keys)?;
-        let state = self.state.read();
-        let locations = self.locate(&state, &encoded, mark)?;
-        Ok(locations
-            .iter()
-            .map(|location| Some(location.is_some()))
-            .collect())
+        Ok(self.read(keys, &[], mark)?.1)
     }
 
-    /// `keys`, one array per primary key column, cast to the key's types and
-    /// encoded by the converter that encoded the index's keys in `apply`, so
-    /// an equal key yields equal bytes. A safe cast: a value that can't be
-    /// converted becomes null. A null encodes to bytes the index never holds,
-    /// because `apply` rejects null keys, so it misses.
-    fn encode_lookup_keys(&self, keys: &[ArrayRef]) -> Result<Rows> {
+    /// The `projection` columns of each key's row, and whether it has one.
+    ///
+    /// The keys are cast to the key's types, a safe cast: a value that can't
+    /// be converted becomes null. A key with a null in any column misses
+    /// without reaching the backend, which never sees null keys.
+    fn read(
+        &self,
+        keys: &[ArrayRef],
+        projection: &[usize],
+        mark: Option<Mark>,
+    ) -> Result<(RecordBatch, BooleanArray)> {
         if keys.len() != self.key_fields.len() {
             streamling_bail!(
                 "table '{}': the primary key '{}' has {} columns, got {} lookup key columns",
@@ -1092,6 +215,7 @@ impl InMemoryTable {
                 keys.len()
             );
         }
+        let rows = keys.first().map_or(0, |keys| keys.len());
         let keys = keys
             .iter()
             .zip(self.key_fields.iter())
@@ -1100,414 +224,278 @@ impl InMemoryTable {
                     .streamling_context("failed to cast the lookup keys to the primary key type")
             })
             .collect::<Result<Vec<_>>>()?;
-        self.converter
-            .convert_columns(&keys)
-            .streamling_context("failed to encode the lookup keys")
-    }
-
-    /// The location of each of `keys`' rows as of `mark`, or the latest apply
-    /// without one.
-    fn locate(
-        &self,
-        state: &TableState,
-        keys: &Rows,
-        mark: Option<Mark>,
-    ) -> Result<Vec<Option<RowLocation>>> {
-        state
-            .versions
-            .ensure_readable(mark)
-            .map_err(|e| streamling_err!("table '{}': {}", self.name, e))?;
-        Ok(keys
+        // A value that can't be cast is null.
+        let key_fields: Vec<_> = self
+            .key_fields
             .iter()
-            .map(|key| {
-                let (current, newest_change) = match state.index.get(key.as_ref()) {
-                    Some(entry) => (Some(entry.location), entry.newest_change),
-                    None if mark.is_some() => {
-                        (None, state.versions.removed_newest_change(key.as_ref()))
-                    }
-                    None => (None, None),
-                };
-                state.versions.resolve(mark, current, newest_change)
-            })
-            .collect())
-    }
-
-    /// The stored column at `column_index` of the rows at `locations`, null
-    /// where there is none.
-    fn gather(
-        &self,
-        state: &TableState,
-        column_index: usize,
-        locations: &[Option<RowLocation>],
-    ) -> Result<ArrayRef> {
-        let missing = new_null_array(self.schema.field(column_index).data_type(), 1);
-        // Source 0 is a single null for keys with no row. Each chunk a hit
-        // reads from is added once, so the cost follows hits, not chunk count.
-        let mut sources: Vec<&dyn Array> = vec![missing.as_ref()];
-        // Chunk number to its position in `sources`.
-        let mut chunk_sources: HashMap<usize, usize> = HashMap::new();
-        // One `(source, row)` per key, in input order. `interleave` copies
-        // `sources[source][row]` for each into the output.
-        let gather_indices: Vec<(usize, usize)> = locations
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect();
+        let keys = RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(key_fields)),
+            keys,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?;
+        let valid = keys.columns().iter().fold(None, |valid, keys| {
+            NullBuffer::union(valid.as_ref(), keys.logical_nulls().as_ref())
+        });
+        let Some(valid) = valid.filter(|valid| valid.null_count() > 0) else {
+            let found = self.backend_read(&keys, projection, mark)?;
+            return Ok((found.rows, found.found));
+        };
+        // Each key's position among the valid ones, null for the others.
+        let positions: UInt32Array = valid
             .iter()
-            .map(|location| match location {
-                Some(location) => {
-                    let source = *chunk_sources.entry(location.chunk).or_insert_with(|| {
-                        sources.push(state.batch(location.chunk).column(column_index).as_ref());
-                        sources.len() - 1
-                    });
-                    (source, location.row)
-                }
-                None => (0, 0),
+            .scan(0u32, |next, is_valid| {
+                Some(is_valid.then(|| {
+                    *next += 1;
+                    *next - 1
+                }))
             })
             .collect();
-        interleave(&sources, &gather_indices)
-            .streamling_context("failed to read the looked-up rows")
+        let valid_rows: UInt32Array = valid.valid_indices().map(|index| index as u32).collect();
+        let found = self.backend_read(&take_record_batch(&keys, &valid_rows)?, projection, mark)?;
+        let rows = RecordBatch::try_new_with_options(
+            found.rows.schema(),
+            found
+                .rows
+                .columns()
+                .iter()
+                .map(|column| take(column, &positions, None))
+                .collect::<std::result::Result<_, _>>()?,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?;
+        let found = take(&found.found, &positions, None)?;
+        let found = found
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("take keeps the type");
+        Ok((
+            rows,
+            found
+                .iter()
+                .map(|found| Some(found == Some(true)))
+                .collect(),
+        ))
     }
 
-    /// The stored columns lookups read, with their positions. A window's
-    /// wall clock is GC bookkeeping, not part of the SQL output, so lookups
-    /// can't read it.
-    fn readable_columns(&self) -> impl Iterator<Item = (usize, &FieldRef)> {
-        self.schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !(field.name() == WALL_CLOCK_COLUMN && self.reads_wall_clock()))
+    fn backend_read(
+        &self,
+        keys: &RecordBatch,
+        projection: &[usize],
+        mark: Option<Mark>,
+    ) -> Result<backend::LookupRows> {
+        bridge(&format!("table '{}' lookup", self.name), || {
+            self.backend.lookup(&self.namespace, keys, projection, mark)
+        })
     }
 
     fn readable_fields(&self) -> Fields {
-        self.readable_columns()
-            .map(|(_, field)| Arc::clone(field))
+        self.readable
+            .iter()
+            .map(|&index| Arc::clone(&self.schema.fields()[index]))
             .collect()
     }
 
-    /// The stored column a lookup reads.
+    /// The position of a column lookups read.
     fn column_index(&self, column: &str) -> Result<usize> {
-        self.readable_columns()
-            .find(|(_, field)| field.name() == column)
-            .map(|(index, _)| index)
+        self.readable
+            .iter()
+            .copied()
+            .find(|&index| self.schema.field(index).name() == column)
             .ok_or_else(|| streamling_user_err!("table '{}' has no column '{}'", self.name, column))
-    }
-
-    fn reads_wall_clock(&self) -> bool {
-        self.window
-            .as_ref()
-            .is_some_and(|window| window.reads_wall_clock)
-    }
-
-    fn chunk_statistics(&self, batch: &RecordBatch) -> Result<Vec<ColumnStatistics>> {
-        match &self.window {
-            Some(window) => Ok(window.statistics(batch)?),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn parse_ops(&self, column: &ArrayRef) -> Result<Vec<RowOp>> {
-        let ops = column.as_string_opt::<i32>().ok_or_else(|| {
-            streamling_user_err!(
-                "table '{}': column '{}' must be Utf8, got {}",
-                self.name,
-                COLUMN_NAME_OP,
-                column.data_type()
-            )
-        })?;
-        ops.iter()
-            .map(|op| match op {
-                Some(op) if op.eq_ignore_ascii_case(OP_DELETE) => Ok(RowOp::Delete),
-                Some(op)
-                    if UPSERT_OPS
-                        .iter()
-                        .any(|upsert| op.eq_ignore_ascii_case(upsert)) =>
-                {
-                    Ok(RowOp::Upsert)
-                }
-                other => Err(streamling_user_err!(
-                    "table '{}': unrecognized '{}' value {:?}",
-                    self.name,
-                    COLUMN_NAME_OP,
-                    other
-                )),
-            })
-            .collect()
-    }
-
-    /// Runs a GC pass when one is due and no other apply is running one.
-    fn collect_garbage_if_due(&self) -> Result<()> {
-        let Some(window) = &self.window else {
-            return Ok(());
-        };
-        let Some(mut last_pass) = window.last_pass.try_lock() else {
-            return Ok(());
-        };
-        if last_pass.elapsed() < window.gc_interval {
-            return Ok(());
-        }
-        *last_pass = Instant::now();
-        self.evict_outside(window)
-    }
-
-    /// Removes the keys whose live row the window's predicate isn't true
-    /// for. The predicate runs on a snapshot of the chunks, so lookups
-    /// aren't blocked meanwhile. A row an apply moves or replaces in the
-    /// meantime is no longer where the index points, so it stays until the
-    /// next pass.
-    fn evict_outside(&self, window: &Window) -> Result<()> {
-        let compiled = window.compile()?;
-        let chunks = self.chunks_to_evaluate(&self.state.read(), window, &compiled)?;
-        let outside_rows = self.outside_rows(&compiled, chunks)?;
-        let aggregates = self.aggregates.read();
-        let mut state = self.state.write();
-        let evicted = self.evict(&mut state, &outside_rows);
-        if !aggregates.is_empty() && !evicted.is_empty() {
-            let removed = state.rows_at(&self.schema, &evicted)?;
-            let added = RecordBatch::new_empty(Arc::clone(&self.schema));
-            for aggregate in aggregates.iter() {
-                aggregate.update(&removed, &added)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The rows of `chunks` outside the window, live or not.
-    fn outside_rows(
-        &self,
-        compiled: &CompiledWindow,
-        chunks: Vec<(usize, RecordBatch)>,
-    ) -> Result<Vec<OutsideRows>> {
-        let mut outside_rows = Vec::new();
-        for (chunk, batch) in chunks {
-            let inside = compiled
-                .predicate
-                .evaluate(&batch)?
-                .into_array(batch.num_rows())?;
-            let inside = inside.as_boolean_opt().ok_or_else(|| {
-                streamling_err!(
-                    "table '{}': the window must return booleans, got {}",
-                    self.name,
-                    inside.data_type()
-                )
-            })?;
-            // A null is outside the window. `prep_null_mask_filter` panics
-            // without a null buffer.
-            let outside = if inside.null_count() > 0 {
-                not(&prep_null_mask_filter(inside))?
-            } else {
-                not(inside)?
-            };
-            if !outside.has_true() {
-                continue;
-            }
-            let key_columns = self
-                .stored_key_indices
-                .iter()
-                .map(|&index| filter(batch.column(index), &outside))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let keys = self
-                .converter
-                .convert_columns(&key_columns)
-                .streamling_context("failed to encode the stored keys")?;
-            let rows: Vec<usize> = outside.values().set_indices().collect();
-            outside_rows.push((chunk, rows, keys));
-        }
-        Ok(outside_rows)
-    }
-
-    /// Removes the keys whose live row is among `outside_rows`, and returns
-    /// those rows.
-    fn evict(&self, state: &mut TableState, outside_rows: &[OutsideRows]) -> Vec<RowLocation> {
-        let mut evicted = Vec::new();
-        for (chunk, rows, keys) in outside_rows {
-            for (&row, key) in rows.iter().zip(keys.iter()) {
-                let location = RowLocation { chunk: *chunk, row };
-                if state
-                    .index
-                    .get(key.as_ref())
-                    .is_some_and(|entry| entry.location == location)
-                {
-                    state.remove(key.as_ref());
-                    evicted.push(location);
-                }
-            }
-        }
-        evicted
-    }
-
-    /// The chunks with a live row that their statistics don't show to be
-    /// wholly inside the window, by id. Their order of time doesn't matter,
-    /// but the more chunks cover narrow ranges, the more are skipped.
-    fn chunks_to_evaluate(
-        &self,
-        state: &TableState,
-        window: &Window,
-        compiled: &CompiledWindow,
-    ) -> Result<Vec<(usize, RecordBatch)>> {
-        let (ids, chunks): (Vec<usize>, Vec<&Chunk>) = (state.first_chunk_id..)
-            .zip(&state.chunks)
-            .filter(|(_, chunk)| chunk.live_rows > 0)
-            .unzip();
-        if chunks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let may_hold_outside_rows = compiled.outside.prune(&ChunkStatistics {
-            window,
-            chunks: &chunks,
-        })?;
-        Ok(ids
-            .into_iter()
-            .zip(chunks)
-            .zip(may_hold_outside_rows)
-            .filter(|(_, may_hold_outside_rows)| *may_hold_outside_rows)
-            .map(|((id, chunk), _)| (id, chunk.batch.clone()))
-            .collect())
-    }
-
-    /// While dead rows exceed `max_dead_ratio` of the live ones, moves the
-    /// live rows of the oldest chunks into one new chunk, visiting at most a
-    /// budget of rows. A chunk without live rows is dropped unvisited.
-    ///
-    /// Visiting k = 1 + 1/max_dead_ratio rows per written row reclaims dead
-    /// rows as fast as writes create them once they make up 1/k of storage,
-    /// which is max_dead_ratio of the live rows; the oldest chunks, cleaned
-    /// first, hold at least their share of dead rows.
-    ///
-    /// A chunk keeps its input's buffers alive. If upstream hands over slices
-    /// of larger buffers, memory exceeds what the row counts suggest. The
-    /// upgrade path is to trigger on `get_array_memory_size` instead.
-    ///
-    /// An error leaves the index pointing at dropped chunks. It fails the
-    /// pipeline through the side output, and an in_memory table starts empty
-    /// after a restart.
-    fn clean(&self, state: &mut TableState, written_rows: usize) -> Result<()> {
-        let rows_per_write = 1.0 + 1.0 / self.max_dead_ratio;
-        let budget =
-            ((written_rows as f64 * rows_per_write).ceil() as usize).max(MIN_CLEANING_ROWS);
-        let target = state.next_chunk_id();
-        // Moved rows as `(position in sources, row)`, in their order in `target`.
-        let mut sources: Vec<RecordBatch> = Vec::new();
-        let mut moved: Vec<(usize, usize)> = Vec::new();
-        let mut visited = 0;
-        // `moved` rows count toward storage: `target` will hold them.
-        while visited < budget
-            && self.too_many_dead_rows(state.total_rows + moved.len(), state.index.len())
-        {
-            let Some(front) = state.chunks.front() else {
-                break;
-            };
-            if front.live_rows == 0 {
-                state.pop_front_chunk();
-                continue;
-            }
-            let front_id = state.first_chunk_id;
-            let batch = front.batch.clone();
-            let start = state.cleaning_cursor;
-            let end = batch.num_rows().min(start.saturating_add(budget - visited));
-            let key_columns: Vec<ArrayRef> = self
-                .stored_key_indices
-                .iter()
-                .map(|&index| batch.column(index).slice(start, end - start))
-                .collect();
-            let keys = self
-                .converter
-                .convert_columns(&key_columns)
-                .streamling_context("failed to encode the stored keys")?;
-            let source = sources.len();
-            let mut moved_from_front = 0;
-            for (offset, key) in keys.iter().enumerate() {
-                let row = start + offset;
-                // A row is live if the index still points to it.
-                if let Some(entry) = state.index.get_mut(key.as_ref())
-                    && entry.location
-                        == (RowLocation {
-                            chunk: front_id,
-                            row,
-                        })
-                {
-                    entry.location = RowLocation {
-                        chunk: target,
-                        row: moved.len(),
-                    };
-                    moved.push((source, row));
-                    moved_from_front += 1;
-                }
-            }
-            visited += end - start;
-            let finished = end == batch.num_rows();
-            sources.push(batch);
-            state.chunk_mut(front_id).live_rows -= moved_from_front;
-            // The rest of a chunk without live rows is dead.
-            if finished || state.chunk(front_id).live_rows == 0 {
-                state.pop_front_chunk();
-            } else {
-                state.cleaning_cursor = end;
-            }
-        }
-        if !moved.is_empty() {
-            let sources: Vec<&RecordBatch> = sources.iter().collect();
-            let batch = interleave_record_batch(&sources, &moved)
-                .streamling_context("failed to move the live rows")?;
-            let statistics = self.chunk_statistics(&batch)?;
-            state.push_chunk(batch, moved.len(), statistics);
-        }
-        Ok(())
-    }
-
-    fn too_many_dead_rows(&self, total_rows: usize, live_rows: usize) -> bool {
-        total_rows.saturating_sub(live_rows) as f64 > self.max_dead_ratio * live_rows as f64
-    }
-
-    /// Records the gauges of the table and of its aggregates' outputs.
-    fn record_gauges(&self) {
-        let aggregates = self.aggregates.read();
-        {
-            let state = self.state.read();
-            let recorder = get_metrics_recorder();
-            for (gauge, value) in [
-                (LIVE_ROWS_GAUGE, state.index.len()),
-                (MEMORY_BYTES_GAUGE, state.chunk_bytes + state.key_bytes),
-                (VERSIONS_GAUGE, state.versions.count()),
-                (RETIRED_BYTES_GAUGE, state.retired_bytes),
-            ] {
-                recorder.record_gauge(gauge, value as u64, &self.metric_metadata_id);
-            }
-        }
-        for aggregate in aggregates.iter() {
-            aggregate.record_gauges();
-        }
     }
 }
 
-/// The pipeline's tables by name
+impl fmt::Debug for Table {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Table")
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .finish()
+    }
+}
+
+/// Runs a backend read from synchronous code: lookups run inside scalar UDFs.
+/// A read that completes on its first poll, as `in_memory` reads do, never
+/// blocks. Otherwise the thread blocks on it, which needs a multi-threaded
+/// runtime. Retriable errors are retried with backoff.
+fn bridge<'a, T>(
+    operation_name: &str,
+    mut operation: impl FnMut() -> BoxFuture<'a, Result<T>>,
+) -> Result<T> {
+    let mut first = operation();
+    let failed = match (&mut first).now_or_never() {
+        None => None,
+        Some(Err(err)) if err.is_retriable() => Some(err),
+        Some(result) => return result,
+    };
+    let handle = Handle::try_current()
+        .map_err(|_| streamling_err!("{}: table reads need a Tokio runtime", operation_name))?;
+    if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
+        streamling_bail!(
+            "{}: a table backend that reads asynchronously needs a multi-threaded Tokio runtime",
+            operation_name
+        );
+    }
+    tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            let result = match failed {
+                Some(err) => Err(err),
+                None => first.await,
+            };
+            match result {
+                Err(err) if err.is_retriable() => {
+                    retry_if_retriable_until_cancelled(
+                        operation,
+                        operation_name,
+                        &mut crate::shutdown::subscribe(),
+                    )
+                    .await
+                }
+                result => result,
+            }
+        })
+    })
+}
+
+/// The pipeline's tables by name, and the stores that apply them.
 #[derive(Clone, Default)]
-pub struct TableRegistry(Arc<RwLock<HashMap<String, Arc<InMemoryTable>>>>);
+pub struct TableRegistry(Arc<RwLock<Registry>>);
+
+#[derive(Default)]
+struct Registry {
+    tables: HashMap<String, Arc<Table>>,
+    stores: HashMap<String, Arc<TableStore>>,
+}
 
 impl TableRegistry {
-    pub fn register(&self, table: Arc<InMemoryTable>) {
-        self.0.write().insert(table.name.clone(), table);
+    pub fn register(&self, table: Arc<Table>) {
+        self.0.write().tables.insert(table.name.clone(), table);
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<InMemoryTable>> {
-        self.0.read().get(name).cloned()
+    /// Registers `store` and its table.
+    pub fn register_store(&self, store: Arc<TableStore>) {
+        let mut registry = self.0.write();
+        let table = store.table();
+        registry.tables.insert(table.name.clone(), table);
+        registry.stores.insert(store.name().to_string(), store);
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<Table>> {
+        self.0.read().tables.get(name).cloned()
+    }
+
+    pub fn store(&self, name: &str) -> Option<Arc<TableStore>> {
+        self.0.read().stores.get(name).cloned()
     }
 }
 
 impl fmt::Debug for TableRegistry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_set().entries(self.0.read().keys()).finish()
+        f.debug_set().entries(self.0.read().tables.keys()).finish()
+    }
+}
+
+/// Tables on `in_memory` backends, for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::in_memory::InMemoryBackend;
+    use super::*;
+
+    pub(crate) const MAX_DEAD_RATIO: f64 = 0.25;
+
+    /// Table `name` on a new `in_memory` backend, its journal trimmed on
+    /// finalization.
+    pub(crate) fn store(
+        name: &str,
+        input_schema: &SchemaRef,
+        primary_key: &[&str],
+        window: Option<WindowConfig>,
+        retention: VersionRetention,
+    ) -> Result<TableStore> {
+        store_trimmed(
+            name,
+            input_schema,
+            primary_key,
+            window,
+            retention,
+            JournalTrim::OnFinalize,
+        )
+    }
+
+    pub(crate) fn store_trimmed(
+        name: &str,
+        input_schema: &SchemaRef,
+        primary_key: &[&str],
+        window: Option<WindowConfig>,
+        retention: VersionRetention,
+        journal_trim: JournalTrim,
+    ) -> Result<TableStore> {
+        let backend = Arc::new(InMemoryBackend::try_new(name, MAX_DEAD_RATIO)?);
+        store_on(
+            name,
+            input_schema,
+            primary_key,
+            window,
+            retention,
+            journal_trim,
+            OnSchemaChange::Fail,
+            backend,
+        )
+    }
+
+    /// Table `name` on `backend`, which may hold what another store wrote,
+    /// as after a restart.
+    pub(crate) fn store_on(
+        name: &str,
+        input_schema: &SchemaRef,
+        primary_key: &[&str],
+        window: Option<WindowConfig>,
+        retention: VersionRetention,
+        journal_trim: JournalTrim,
+        on_schema_change: OnSchemaChange,
+        backend: Arc<dyn TableBackend>,
+    ) -> Result<TableStore> {
+        let primary_key: Vec<String> = primary_key
+            .iter()
+            .map(|column| column.to_string())
+            .collect();
+        TableStore::try_new(
+            name,
+            input_schema,
+            &primary_key,
+            format!("app::{name}"),
+            window,
+            retention,
+            journal_trim,
+            on_schema_change,
+            backend,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::backend::{
+        LookupRows, NamespaceSpec, NamespaceStats, StoredState, TableTransaction,
+    };
+    use super::in_memory::InMemoryBackend;
+    use super::testing::{MAX_DEAD_RATIO, store, store_on, store_trimmed};
     use super::*;
-    use arrow::array::{Int32Array, Int64Array, LargeBinaryArray, StringArray, StringViewArray};
-    use arrow::datatypes::{DataType, Field, Int64Type};
+    use crate::checkpoints::checkpoint_management::CheckpointEpoch;
+    use crate::data::COLUMN_NAME_OP;
+    use arrow::array::{
+        AsArray, Int32Array, Int64Array, LargeBinaryArray, StringArray, StringViewArray,
+        TimestampNanosecondArray,
+    };
+    use arrow::datatypes::{DataType, Int64Type, TimeUnit};
+    use async_trait::async_trait;
     use datafusion::prelude::SessionContext;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use streamling_common::types::decimal_arb::DecimalArbType;
+    use window::WALL_CLOCK_TIME_ZONE;
 
     const TABLE: &str = "tokens";
-    const METRIC_KEY: &str = "app::tokens";
-    const MAX_DEAD_RATIO: f64 = 0.25;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1529,132 +517,131 @@ mod tests {
         .unwrap()
     }
 
-    fn table() -> InMemoryTable {
-        InMemoryTable::try_new(
-            TABLE,
-            &schema(),
-            &["id".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
-            None,
-            VersionRetention::Latest,
-        )
-        .unwrap()
+    async fn table_with(retention: VersionRetention) -> TableStore {
+        let store = store(TABLE, &schema(), &["id"], None, retention).unwrap();
+        store.start().await.unwrap();
+        store
     }
 
-    /// Live contents as `(id, name)`, sorted by id.
-    fn contents(table: &InMemoryTable) -> Vec<(i64, String)> {
-        let state = table.state.read();
-        let gather: Vec<(usize, usize)> = state
-            .index
-            .values()
-            .map(|entry| {
-                (
-                    entry.location.chunk - state.first_chunk_id,
-                    entry.location.row,
-                )
-            })
-            .collect();
-        if gather.is_empty() {
-            return Vec::new();
-        }
-        let chunks: Vec<&RecordBatch> = state.chunks.iter().map(|chunk| &chunk.batch).collect();
-        let live = interleave_record_batch(&chunks, &gather).unwrap();
-        let ids = live
-            .column_by_name("id")
+    async fn table() -> TableStore {
+        table_with(VersionRetention::Journal).await
+    }
+
+    /// Applies `batch`, which carried the markers of `epochs`, and returns
+    /// the mark its readers see the table at.
+    async fn apply_marked(store: &TableStore, batch: &RecordBatch, epochs: &[u64]) -> Mark {
+        let epochs: Vec<CheckpointEpoch> = epochs.iter().copied().map(CheckpointEpoch).collect();
+        table_mark(store.apply(batch, &epochs).await.unwrap())
+    }
+
+    async fn apply(store: &TableStore, batch: &RecordBatch) -> Mark {
+        apply_marked(store, batch, &[]).await
+    }
+
+    fn table_mark(marks: Marks) -> Mark {
+        marks
+            .into_iter()
+            .find(|(table, _)| table == TABLE)
+            .map(|(_, mark)| mark)
+            .expect("the table's mark")
+    }
+
+    fn lookup_names_at(
+        store: &TableStore,
+        ids: &[i64],
+        mark: Option<Mark>,
+    ) -> Result<Vec<Option<String>>> {
+        let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
+        Ok(store
+            .table()
+            .lookup(&[keys], "name", mark)?
+            .as_string::<i32>()
+            .iter()
+            .map(|name| name.map(str::to_string))
+            .collect())
+    }
+
+    fn lookup_names(store: &TableStore, ids: &[Option<i64>]) -> Vec<Option<String>> {
+        let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
+        store
+            .table()
+            .lookup(&[keys], "name", None)
             .unwrap()
-            .as_primitive::<Int64Type>();
-        let names = live.column_by_name("name").unwrap().as_string::<i32>();
-        let mut contents: Vec<(i64, String)> = (0..live.num_rows())
-            .map(|i| (ids.value(i), names.value(i).to_string()))
-            .collect();
-        contents.sort();
-        contents
+            .as_string::<i32>()
+            .iter()
+            .map(|name| name.map(str::to_string))
+            .collect()
     }
 
-    /// Every chunk's live-row count matches the index.
-    fn assert_live_rows_match_the_index(table: &InMemoryTable) {
-        let state = table.state.read();
+    fn names(values: &[Option<&str>]) -> Vec<Option<String>> {
+        values.iter().map(|name| name.map(str::to_string)).collect()
+    }
+
+    #[tokio::test]
+    async fn upserts_replace_and_deletes_remove_by_primary_key() {
+        let table = table().await;
+        apply(
+            &table,
+            &batch(&[(1, "a", "i"), (2, "b", "c"), (3, "c", "r")]),
+        )
+        .await;
         assert_eq!(
-            state
-                .chunks
-                .iter()
-                .map(|chunk| chunk.live_rows)
-                .sum::<usize>(),
-            state.index.len()
+            lookup_names(&table, &[Some(1), Some(2), Some(3)]),
+            names(&[Some("a"), Some("b"), Some("c")])
         );
-    }
-
-    #[test]
-    fn upserts_replace_and_deletes_remove_by_primary_key() {
-        let table = table();
-        table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "c"), (3, "c", "r")]), &[])
-            .unwrap();
+        apply(
+            &table,
+            &batch(&[(1, "a2", "u"), (2, "b2", "C"), (3, "c2", "i")]),
+        )
+        .await;
         assert_eq!(
-            contents(&table),
-            vec![
-                (1, "a".to_string()),
-                (2, "b".to_string()),
-                (3, "c".to_string())
-            ]
+            lookup_names(&table, &[Some(1), Some(2), Some(3)]),
+            names(&[Some("a2"), Some("b2"), Some("c2")])
         );
-        table
-            .apply(
-                &batch(&[(1, "a2", "u"), (2, "b2", "C"), (3, "c2", "i")]),
-                &[],
-            )
-            .unwrap();
+        apply(&table, &batch(&[(1, "ignored", "d"), (2, "ignored", "D")])).await;
         assert_eq!(
-            contents(&table),
-            vec![
-                (1, "a2".to_string()),
-                (2, "b2".to_string()),
-                (3, "c2".to_string())
-            ]
+            lookup_names(&table, &[Some(1), Some(2), Some(3)]),
+            names(&[None, None, Some("c2")])
         );
-        table
-            .apply(&batch(&[(1, "ignored", "d"), (2, "ignored", "D")]), &[])
-            .unwrap();
-        assert_eq!(contents(&table), vec![(3, "c2".to_string())]);
-        assert_live_rows_match_the_index(&table);
+        assert_eq!(table.table_stats().await.live_rows, 1);
     }
 
-    #[test]
-    fn delete_of_an_unknown_key_changes_nothing() {
-        let table = table();
-        table.apply(&batch(&[(9, "incoming", "d")]), &[]).unwrap();
-        assert!(contents(&table).is_empty());
+    #[tokio::test]
+    async fn delete_of_an_unknown_key_changes_nothing() {
+        let table = table().await;
+        apply(&table, &batch(&[(9, "incoming", "d")])).await;
+        assert_eq!(lookup_names(&table, &[Some(9)]), [None]);
+        assert_eq!(table.table_stats().await.live_rows, 0);
     }
 
-    #[test]
-    fn later_rows_of_a_batch_win() {
-        let table = table();
-        table
-            .apply(
-                &batch(&[(1, "a", "i"), (1, "b", "u"), (2, "c", "i"), (2, "c", "d")]),
-                &[],
-            )
-            .unwrap();
-        assert_eq!(contents(&table), vec![(1, "b".to_string())]);
-        assert_live_rows_match_the_index(&table);
+    #[tokio::test]
+    async fn later_rows_of_a_batch_win() {
+        let table = table().await;
+        apply(
+            &table,
+            &batch(&[(1, "a", "i"), (1, "b", "u"), (2, "c", "i"), (2, "c", "d")]),
+        )
+        .await;
+        assert_eq!(
+            lookup_names(&table, &[Some(1), Some(2)]),
+            names(&[Some("b"), None])
+        );
+        assert_eq!(table.table_stats().await.live_rows, 1);
     }
 
-    #[test]
-    fn composite_primary_key() {
+    #[tokio::test]
+    async fn composite_primary_key() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chain", DataType::Utf8, false),
             Field::new("address", DataType::Utf8, false),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
         ]));
-        let table = InMemoryTable::try_new(
+        let table = store(
             TABLE,
             &schema,
-            &["chain".to_string(), "address".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
+            &["chain", "address"],
             None,
-            VersionRetention::Latest,
+            VersionRetention::Journal,
         )
         .unwrap();
         let input = |rows: &[(&str, &str, &str)]| {
@@ -1669,108 +656,50 @@ mod tests {
             .unwrap()
         };
 
-        table
-            .apply(&input(&[("eth", "0x1", "i"), ("sol", "0x1", "i")]), &[])
-            .unwrap();
-        assert_eq!(table.state.read().index.len(), 2);
-        table
-            .apply(&input(&[("eth", "0x1", "u"), ("eth", "0x2", "i")]), &[])
-            .unwrap();
-        assert_eq!(table.state.read().index.len(), 3);
-        assert_live_rows_match_the_index(&table);
+        apply(&table, &input(&[("eth", "0x1", "i"), ("sol", "0x1", "i")])).await;
+        assert_eq!(table.table_stats().await.live_rows, 2);
+        apply(&table, &input(&[("eth", "0x1", "u"), ("eth", "0x2", "i")])).await;
+        assert_eq!(table.table_stats().await.live_rows, 3);
     }
 
-    #[test]
-    fn field_metadata_survives_into_storage() {
+    #[tokio::test]
+    async fn field_metadata_survives_into_storage() {
         let amount = DecimalArbType::field("amount", 78, 0, true).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             amount.clone(),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
         ]));
-        let table = InMemoryTable::try_new(
-            TABLE,
-            &schema,
-            &["id".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
-            None,
-            VersionRetention::Latest,
+        let table = store(TABLE, &schema, &["id"], None, VersionRetention::Journal).unwrap();
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(LargeBinaryArray::from_iter_values([b"\x01".as_slice()])),
+                Arc::new(StringArray::from(vec!["i"])),
+            ],
         )
         .unwrap();
-        let input = |op: &str| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(vec![1])),
-                    Arc::new(LargeBinaryArray::from_iter_values([b"\x01".as_slice()])),
-                    Arc::new(StringArray::from(vec![op])),
-                ],
-            )
-            .unwrap()
-        };
-        table.apply(&input("i"), &[]).unwrap();
+        apply(&table, &input).await;
         assert_eq!(
-            table.schema.field_with_name("amount").unwrap().metadata(),
+            table
+                .stored_schema()
+                .field_with_name("amount")
+                .unwrap()
+                .metadata(),
             amount.metadata()
         );
         assert_eq!(
-            table.lookup_field("amount").unwrap().metadata(),
+            table.table().lookup_field("amount").unwrap().metadata(),
             amount.metadata()
         );
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let found = table.table().lookup(&[keys], "amount", None).unwrap();
+        assert_eq!(found.as_binary::<i64>().value(0), b"\x01");
     }
 
-    #[test]
-    fn cleaning_keeps_contents_and_remaps_the_index() {
-        let table = table();
-        table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), &[])
-            .unwrap();
-        // Each batch leaves 2 dead rows, more than a quarter of the 3 live ones,
-        // so every chunk holding a dead row is cleaned.
-        table
-            .apply(&batch(&[(1, "a2", "u"), (2, "b2", "u")]), &[])
-            .unwrap();
-        table
-            .apply(&batch(&[(1, "a3", "u"), (3, "c3", "u")]), &[])
-            .unwrap();
-
-        {
-            let state = table.state.read();
-            assert_eq!(state.first_chunk_id, 3);
-            assert_eq!(state.total_rows, 3);
-            assert_eq!(
-                state.chunk_bytes,
-                state
-                    .chunks
-                    .iter()
-                    .map(|chunk| chunk.batch.get_array_memory_size())
-                    .sum::<usize>()
-            );
-            assert_eq!(
-                state.key_bytes,
-                state.index.keys().map(|key| key.len()).sum::<usize>()
-            );
-        }
-        assert_eq!(
-            contents(&table),
-            vec![
-                (1, "a3".to_string()),
-                (2, "b2".to_string()),
-                (3, "c3".to_string())
-            ]
-        );
-        // Key 2 was moved by the cleaner; the delete releases it at its new place.
-        table.apply(&batch(&[(2, "x", "d")]), &[]).unwrap();
-        assert_eq!(
-            contents(&table),
-            vec![(1, "a3".to_string()), (3, "c3".to_string())]
-        );
-        assert_live_rows_match_the_index(&table);
-    }
-
-    #[test]
-    fn null_primary_key_is_rejected() {
+    #[tokio::test]
+    async fn null_primary_key_is_rejected() {
         let input = RecordBatch::try_new(
             schema(),
             vec![
@@ -1780,15 +709,20 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, &[]).unwrap_err().to_string();
+        let err = table()
+            .await
+            .apply(&input, &[])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("primary key column 'id' contains a null value"),
             "{err}"
         );
     }
 
-    #[test]
-    fn unrecognized_or_null_op_is_rejected() {
+    #[tokio::test]
+    async fn unrecognized_or_null_op_is_rejected() {
         for op in [Some("x"), None] {
             let input = RecordBatch::try_new(
                 schema(),
@@ -1799,7 +733,12 @@ mod tests {
                 ],
             )
             .unwrap();
-            let err = table().apply(&input, &[]).unwrap_err().to_string();
+            let err = table()
+                .await
+                .apply(&input, &[])
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("unrecognized '_gs_op' value"), "{err}");
         }
 
@@ -1817,12 +756,17 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, &[]).unwrap_err().to_string();
+        let err = table()
+            .await
+            .apply(&input, &[])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("column '_gs_op' must be Utf8"), "{err}");
     }
 
-    #[test]
-    fn batch_with_a_different_schema_is_rejected() {
+    #[tokio::test]
+    async fn batch_with_a_different_schema_is_rejected() {
         let other = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Int64, true),
@@ -1837,174 +781,42 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = table().apply(&input, &[]).unwrap_err().to_string();
+        let err = table()
+            .await
+            .apply(&input, &[])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not match the table schema"), "{err}");
     }
 
-    fn lookup_names(table: &InMemoryTable, ids: &[Option<i64>]) -> Vec<Option<String>> {
-        let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
-        table
-            .lookup(&[keys], "name", None)
-            .unwrap()
-            .as_string::<i32>()
-            .iter()
-            .map(|name| name.map(str::to_string))
-            .collect()
-    }
-
-    #[test]
-    fn lookup_reads_the_live_row_per_key() {
-        let table = table();
+    #[tokio::test]
+    async fn lookup_reads_the_live_row_per_key() {
+        let table = table().await;
         assert_eq!(lookup_names(&table, &[Some(1)]), [None], "empty table");
-        table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]), &[])
-            .unwrap();
-        table
-            .apply(&batch(&[(1, "a2", "u"), (2, "x", "d")]), &[])
-            .unwrap();
+        apply(
+            &table,
+            &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
+        )
+        .await;
+        apply(&table, &batch(&[(1, "a2", "u"), (2, "x", "d")])).await;
         assert_eq!(
             lookup_names(&table, &[Some(1), Some(2), Some(3), Some(9), None, Some(1)]),
-            [
-                Some("a2".to_string()),
-                None,
-                Some("c".to_string()),
-                None,
-                None,
-                Some("a2".to_string())
-            ]
+            names(&[Some("a2"), None, Some("c"), None, None, Some("a2")])
         );
     }
 
-    #[test]
-    fn lookup_follows_cleaning() {
-        let table = table();
-        table
-            .apply(&batch(&[(1, "a", "i"), (2, "b", "i")]), &[])
-            .unwrap();
-        table.apply(&batch(&[(1, "a2", "u")]), &[]).unwrap();
-        table
-            .apply(&batch(&[(1, "a3", "u"), (2, "b2", "u")]), &[])
-            .unwrap();
-        assert_eq!(table.state.read().first_chunk_id, 3);
-        assert_eq!(
-            lookup_names(&table, &[Some(2), Some(1)]),
-            [Some("b2".to_string()), Some("a3".to_string())]
-        );
-    }
-
-    #[test]
-    fn cleaning_keeps_dead_rows_within_the_ratio() {
-        const KEYS: i64 = 4096;
-        const BATCH: i64 = 512;
-        const UPDATE_BATCHES: i64 = 64;
-        // Coprime with KEYS, so updates sweep the keys in a scattered order.
-        const STRIDE: i64 = 2053;
-        let table = table();
-        for start in (0..KEYS).step_by(BATCH as usize) {
-            let inserts: Vec<(i64, &str, &str)> =
-                (start..start + BATCH).map(|id| (id, "a", "i")).collect();
-            table.apply(&batch(&inserts), &[]).unwrap();
-        }
-        for round in 0..UPDATE_BATCHES {
-            let updates: Vec<(i64, &str, &str)> = (0..BATCH)
-                .map(|i| (((round * BATCH + i) * STRIDE) % KEYS, "b", "u"))
-                .collect();
-            table.apply(&batch(&updates), &[]).unwrap();
-            let state = table.state.read();
-            let live = state.index.len();
-            let dead = state.total_rows - live;
-            assert!(
-                dead as f64 <= MAX_DEAD_RATIO * live as f64 + BATCH as f64,
-                "round {round}: {dead} dead rows for {live} live ones"
-            );
-        }
-    }
-
-    #[test]
-    fn hot_key_updates_drop_dead_chunks() {
-        const UPDATES: usize = 1000;
-        let table = table();
-        for _ in 0..UPDATES {
-            table.apply(&batch(&[(1, "a", "u")]), &[]).unwrap();
-            let state = table.state.read();
-            assert_eq!((state.chunks.len(), state.total_rows), (1, 1));
-        }
-    }
-
-    #[test]
-    fn cleaning_resumes_mid_chunk() {
-        const KEYS: i64 = 3000;
-        const UPDATE_BATCH: i64 = 100;
-        // 800 dead rows exceed a quarter of the 3000 live ones only after the
-        // last batch, whose cleaning budget is MIN_CLEANING_ROWS.
-        const UPDATE_BATCHES: i64 = 8;
-        let table = table();
-        let names: Vec<String> = (0..KEYS).map(|id| format!("v{id}")).collect();
-        let inserts: Vec<(i64, &str, &str)> = (0..KEYS)
-            .map(|id| (id, names[id as usize].as_str(), "i"))
-            .collect();
-        table.apply(&batch(&inserts), &[]).unwrap();
-        for start in (0..UPDATE_BATCH * UPDATE_BATCHES).step_by(UPDATE_BATCH as usize) {
-            let updates: Vec<(i64, &str, &str)> = (start..start + UPDATE_BATCH)
-                .map(|id| (id, "u", "u"))
-                .collect();
-            table.apply(&batch(&updates), &[]).unwrap();
-        }
-
-        {
-            let state = table.state.read();
-            assert_eq!(
-                state.first_chunk_id, 0,
-                "the insert chunk is partly cleaned"
-            );
-            assert_eq!(state.cleaning_cursor, MIN_CLEANING_ROWS);
-        }
-        // 900 was moved, 2900 is past the cursor, 5 was updated.
-        assert_eq!(
-            lookup_names(&table, &[Some(900), Some(2900), Some(5)]),
-            [
-                Some("v900".to_string()),
-                Some("v2900".to_string()),
-                Some("u".to_string())
-            ]
-        );
-        table
-            .apply(&batch(&[(900, "x", "d"), (2900, "x", "d")]), &[])
-            .unwrap();
-        assert_eq!(lookup_names(&table, &[Some(900), Some(2900)]), [None, None]);
-        assert_live_rows_match_the_index(&table);
-    }
-
-    #[test]
-    fn rejects_a_max_dead_ratio_that_is_not_a_positive_number() {
-        for ratio in [0.0, -0.5, f64::NAN, f64::INFINITY] {
-            let err = InMemoryTable::try_new(
-                TABLE,
-                &schema(),
-                &["id".to_string()],
-                METRIC_KEY.to_string(),
-                ratio,
-                None,
-                VersionRetention::Latest,
-            )
-            .err()
-            .expect("the ratio must be rejected")
-            .to_string();
-            assert!(
-                err.contains("max_dead_ratio must be a positive number"),
-                "{ratio}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn lookup_casts_keys_to_the_primary_key_type() {
-        let table = table();
-        table.apply(&batch(&[(7, "seven", "i")]), &[]).unwrap();
+    #[tokio::test]
+    async fn lookup_casts_keys_to_the_primary_key_type() {
+        let table = table().await;
+        apply(&table, &batch(&[(7, "seven", "i")])).await;
         let narrower: ArrayRef = Arc::new(Int32Array::from(vec![7]));
         let text: ArrayRef = Arc::new(StringViewArray::from(vec!["7"]));
         for keys in [narrower, text] {
-            let names = table.lookup(&[Arc::clone(&keys)], "name", None).unwrap();
+            let names = table
+                .table()
+                .lookup(&[Arc::clone(&keys)], "name", None)
+                .unwrap();
             assert_eq!(
                 names.as_string::<i32>().value(0),
                 "seven",
@@ -2014,34 +826,39 @@ mod tests {
         }
         let uncastable: ArrayRef = Arc::new(StringViewArray::from(vec!["seven"]));
         assert!(
-            !table.lookup_exists(&[uncastable], None).unwrap().value(0),
+            !table
+                .table()
+                .lookup_exists(&[uncastable], None)
+                .unwrap()
+                .value(0),
             "a value that can't be cast misses"
         );
     }
 
-    #[test]
-    fn lookups_must_use_the_whole_primary_key() {
-        let table = table();
+    #[tokio::test]
+    async fn lookups_must_use_the_whole_primary_key() {
+        let table = table().await;
+        let reads = table.table();
         assert_eq!(
-            table.lookup_key_fields(" id ").unwrap().as_ref(),
+            reads.lookup_key_fields(" id ").unwrap().as_ref(),
             schema().fields()[..1].as_ref(),
             "key names are trimmed like the table's primary_key"
         );
-        let err = table.lookup_key_fields("name").unwrap_err().to_string();
+        let err = reads.lookup_key_fields("name").unwrap_err().to_string();
         assert!(
             err.contains("lookups must use the primary key 'id', got 'name'"),
             "{err}"
         );
         for column in ["missing", COLUMN_NAME_OP] {
-            let err = table.lookup_field(column).unwrap_err().to_string();
+            let err = reads.lookup_field(column).unwrap_err().to_string();
             assert!(
                 err.contains(&format!("table 'tokens' has no column '{column}'")),
                 "{err}"
             );
         }
-        assert!(table.lookup_field("name").unwrap().is_nullable());
+        assert!(reads.lookup_field("name").unwrap().is_nullable());
 
-        let composite = balances();
+        let composite = balances().await.table();
         assert_eq!(
             composite.lookup_key_fields("chain, address").unwrap().len(),
             2
@@ -2068,15 +885,13 @@ mod tests {
 
     /// A table keyed by `(chain, address)` holding `(eth, 0x1) → 10` and
     /// `(sol, 0x1) → 20`.
-    fn balances() -> InMemoryTable {
-        let table = InMemoryTable::try_new(
+    async fn balances() -> TableStore {
+        let table = store(
             TABLE,
             &balances_schema(),
-            &["chain".to_string(), "address".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
+            &["chain", "address"],
             None,
-            VersionRetention::Latest,
+            VersionRetention::Journal,
         )
         .unwrap();
         let batch = RecordBatch::try_new(
@@ -2089,13 +904,13 @@ mod tests {
             ],
         )
         .unwrap();
-        table.apply(&batch, &[]).unwrap();
+        apply(&table, &batch).await;
         table
     }
 
-    #[test]
-    fn composite_key_lookups_match_every_key_column() {
-        let table = balances();
+    #[tokio::test]
+    async fn composite_key_lookups_match_every_key_column() {
+        let table = balances().await.table();
         let chains: ArrayRef = Arc::new(StringArray::from(vec![
             Some("eth"),
             Some("sol"),
@@ -2134,6 +949,13 @@ mod tests {
                 Some(false)
             ]
         );
+        let rows = table.lookup_rows(&keys, None).unwrap();
+        assert_eq!(
+            (0..rows.len())
+                .map(|row| rows.is_valid(row))
+                .collect::<Vec<_>>(),
+            [true, true, false, false, false]
+        );
 
         let err = table
             .lookup(&keys[..1], "amount", None)
@@ -2145,9 +967,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn row_lookups_read_every_column_once_per_key() {
-        let table = balances();
+    #[tokio::test]
+    async fn row_lookups_read_every_column_once_per_key() {
+        let table = balances().await.table();
         let keys: [ArrayRef; 2] = [
             Arc::new(StringArray::from(vec!["sol", "eth"])),
             Arc::new(StringArray::from(vec!["0x1", "0x2"])),
@@ -2182,34 +1004,22 @@ mod tests {
     #[test]
     fn sql_output_without_op_column_is_rejected() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let err = InMemoryTable::try_new(
-            TABLE,
-            &schema,
-            &["id".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
-            None,
-            VersionRetention::Latest,
-        )
-        .err()
-        .expect("a schema without _gs_op must be rejected")
-        .to_string();
+        let err = store(TABLE, &schema, &["id"], None, VersionRetention::Journal)
+            .expect_err("a schema without _gs_op must be rejected")
+            .to_string();
         assert!(err.contains("must contain the '_gs_op' column"), "{err}");
     }
 
     #[test]
     fn primary_key_naming_the_op_column_is_rejected() {
-        let err = InMemoryTable::try_new(
+        let err = store(
             TABLE,
             &schema(),
-            &[COLUMN_NAME_OP.to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
+            &[COLUMN_NAME_OP],
             None,
-            VersionRetention::Latest,
+            VersionRetention::Journal,
         )
-        .err()
-        .expect("a primary key on _gs_op must be rejected")
+        .expect_err("a primary key on _gs_op must be rejected")
         .to_string();
         assert!(err.contains("primary key cannot be '_gs_op'"), "{err}");
     }
@@ -2256,21 +1066,19 @@ mod tests {
         .unwrap()
     }
 
-    fn windowed_table(input_schema: &SchemaRef, predicate: &str) -> Result<InMemoryTable> {
-        windowed_table_with(input_schema, predicate, VersionRetention::Latest)
+    fn windowed(input_schema: &SchemaRef, predicate: &str) -> Result<TableStore> {
+        windowed_with(input_schema, predicate, VersionRetention::Journal)
     }
 
-    fn windowed_table_with(
+    fn windowed_with(
         input_schema: &SchemaRef,
         predicate: &str,
         retention: VersionRetention,
-    ) -> Result<InMemoryTable> {
-        InMemoryTable::try_new(
+    ) -> Result<TableStore> {
+        store(
             TABLE,
             input_schema,
-            &["id".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
+            &["id"],
             Some(WindowConfig {
                 predicate,
                 session_state: &SessionContext::new().state(),
@@ -2280,10 +1088,10 @@ mod tests {
         )
     }
 
-    fn evict_outside(table: &InMemoryTable) {
-        table
-            .evict_outside(table.window.as_ref().expect("a windowed table"))
-            .unwrap();
+    /// Runs a GC pass in an apply of nothing.
+    async fn evict_outside(table: &TableStore, input_schema: &SchemaRef) -> Mark {
+        table.make_gc_pass_due().await;
+        apply(table, &RecordBatch::new_empty(Arc::clone(input_schema))).await
     }
 
     fn now_nanos() -> i64 {
@@ -2293,200 +1101,179 @@ mod tests {
             .as_nanos() as i64
     }
 
-    #[test]
-    fn window_evicts_the_live_rows_it_is_not_true_for() {
-        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
+    #[tokio::test]
+    async fn window_evicts_the_live_rows_it_is_not_true_for() {
+        let table = windowed(&timed_schema(), KEEP_LAST_HOUR).unwrap();
         assert!(
-            table.schema.field_with_name(WALL_CLOCK_COLUMN).is_err(),
+            table
+                .stored_schema()
+                .field_with_name(WALL_CLOCK_COLUMN)
+                .is_err(),
             "a window that doesn't read the wall clock doesn't store it"
         );
         let now = now_nanos();
         let old = now - 2 * HOUR_NANOS;
-        table
-            .apply(
-                &timed_batch(&[
-                    (1, "old", Some(old)),
-                    (2, "new", Some(now)),
-                    (3, "null", None),
-                    (4, "old", Some(old)),
-                    (5, "new", Some(now)),
-                ]),
-                &[],
-            )
-            .unwrap();
+        apply(
+            &table,
+            &timed_batch(&[
+                (1, "old", Some(old)),
+                (2, "new", Some(now)),
+                (3, "null", None),
+                (4, "old", Some(old)),
+                (5, "new", Some(now)),
+            ]),
+        )
+        .await;
         // Key 4's live row is now inside the window, key 5's outside it.
-        table
-            .apply(
-                &timed_batch(&[(4, "new", Some(now)), (5, "old", Some(old))]),
-                &[],
-            )
-            .unwrap();
+        apply(
+            &table,
+            &timed_batch(&[(4, "new", Some(now)), (5, "old", Some(old))]),
+        )
+        .await;
 
-        evict_outside(&table);
+        evict_outside(&table, &timed_schema()).await;
 
         assert_eq!(
             lookup_names(&table, &[Some(1), Some(2), Some(3), Some(4), Some(5)]),
-            [
-                None,
-                Some("new".to_string()),
-                None,
-                Some("new".to_string()),
-                None
-            ]
+            names(&[None, Some("new"), None, Some("new"), None])
         );
-        assert_live_rows_match_the_index(&table);
-        table.apply(&timed_batch(&[]), &[]).unwrap();
-        assert_eq!(
-            table.state.read().total_rows,
-            2,
-            "the cleaner reclaims them"
-        );
+        assert_eq!(table.table_stats().await.live_rows, 2);
     }
 
-    #[test]
-    fn wall_clock_window_reads_the_apply_time() {
+    #[tokio::test]
+    async fn wall_clock_window_reads_the_apply_time() {
         let keep_last_hour = format!("{WALL_CLOCK_COLUMN} >= now() - interval '1 hour'");
         let keep_older = format!("{WALL_CLOCK_COLUMN} < now() - interval '1 hour'");
-        for (predicate, expected) in [(keep_last_hour, Some("a".to_string())), (keep_older, None)] {
-            let table = windowed_table(&schema(), &predicate).unwrap();
-            table.apply(&batch(&[(1, "a", "i")]), &[]).unwrap();
-            evict_outside(&table);
-            assert_eq!(lookup_names(&table, &[Some(1)]), [expected], "{predicate}");
+        for (predicate, expected) in [(keep_last_hour, Some("a")), (keep_older, None)] {
+            let table = windowed(&schema(), &predicate).unwrap();
+            apply(&table, &batch(&[(1, "a", "i")])).await;
+            evict_outside(&table, &schema()).await;
+            assert_eq!(
+                lookup_names(&table, &[Some(1)]),
+                names(&[expected]),
+                "{predicate}"
+            );
         }
     }
 
-    #[test]
-    fn apply_runs_a_gc_pass_once_it_is_due() {
-        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
+    #[tokio::test]
+    async fn apply_runs_a_gc_pass_once_it_is_due() {
+        let table = windowed(&timed_schema(), KEEP_LAST_HOUR).unwrap();
         let old = now_nanos() - 2 * HOUR_NANOS;
-        table
-            .apply(&timed_batch(&[(1, "old", Some(old))]), &[])
-            .unwrap();
-        table.apply(&timed_batch(&[]), &[]).unwrap();
-        assert_eq!(lookup_names(&table, &[Some(1)]), [Some("old".to_string())]);
+        apply(&table, &timed_batch(&[(1, "old", Some(old))])).await;
+        apply(&table, &timed_batch(&[])).await;
+        assert_eq!(lookup_names(&table, &[Some(1)]), names(&[Some("old")]));
 
-        let window = table.window.as_ref().unwrap();
-        *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
-        table.apply(&timed_batch(&[]), &[]).unwrap();
+        evict_outside(&table, &timed_schema()).await;
         assert_eq!(lookup_names(&table, &[Some(1)]), [None]);
     }
 
-    fn chunks_to_evaluate(table: &InMemoryTable) -> Vec<usize> {
-        let window = table.window.as_ref().expect("a windowed table");
-        table
-            .chunks_to_evaluate(&table.state.read(), window, &window.compile().unwrap())
-            .unwrap()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect()
-    }
-
+    /// The README's windows that skip stored rows wholly inside them, and
+    /// two that don't.
     #[test]
-    fn gc_pass_evaluates_only_the_chunks_that_may_hold_rows_outside_the_window() {
-        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
-        let now = now_nanos();
-        let old = now - 2 * HOUR_NANOS;
-        // Chunks 0 to 3: inside, straddling, outside, inside but with a null.
-        table
-            .apply(
-                &timed_batch(&[(1, "a", Some(now)), (2, "b", Some(now))]),
-                &[],
-            )
-            .unwrap();
-        table
-            .apply(
-                &timed_batch(&[(3, "c", Some(old)), (4, "d", Some(now))]),
-                &[],
-            )
-            .unwrap();
-        table
-            .apply(&timed_batch(&[(5, "e", Some(old))]), &[])
-            .unwrap();
-        table
-            .apply(&timed_batch(&[(6, "f", Some(now)), (7, "g", None)]), &[])
-            .unwrap();
-        assert_eq!(chunks_to_evaluate(&table), [1, 2, 3]);
-
-        evict_outside(&table);
-
-        assert_eq!(
-            lookup_names(&table, &(1..=7).map(Some).collect::<Vec<_>>()),
-            [
-                Some("a".to_string()),
-                Some("b".to_string()),
+    fn range_windows_compare_a_column_or_a_cast_of_one() {
+        let epoch_seconds = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("block_timestamp", DataType::Int64, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
+        ]));
+        let wall_clock = format!("{WALL_CLOCK_COLUMN} >= now() - interval '1 hour'");
+        for (input_schema, predicate, range_column) in [
+            (timed_schema(), KEEP_LAST_HOUR, Some("ts")),
+            (timed_schema(), KEEP_LAST_HOUR_OF_DATA, Some("ts")),
+            (
+                timed_schema(),
+                "ts >= least(watermark(ts), now()) - interval '1 hour'",
+                Some("ts"),
+            ),
+            (schema(), wall_clock.as_str(), Some(WALL_CLOCK_COLUMN)),
+            (
+                Arc::clone(&epoch_seconds),
+                "block_timestamp >= watermark(block_timestamp) - 3600",
+                Some("block_timestamp"),
+            ),
+            (
+                Arc::clone(&epoch_seconds),
+                "block_timestamp >= extract(epoch from now() - interval '1 hour')",
+                Some("block_timestamp"),
+            ),
+            (
+                timed_schema(),
+                "date_trunc('second', ts) >= now() - interval '1 hour'",
                 None,
-                Some("d".to_string()),
+            ),
+            (
+                Arc::clone(&epoch_seconds),
+                "block_timestamp >= 0 AND id > 0",
                 None,
-                Some("f".to_string()),
-                None
-            ]
-        );
-        assert_eq!(
-            chunks_to_evaluate(&table),
-            [1, 3],
-            "a chunk without live rows isn't evaluated, whatever its statistics"
-        );
-    }
-
-    #[test]
-    fn unprunable_window_evaluates_every_chunk() {
-        let unprunable = "date_trunc('second', ts) >= now() - interval '1 hour'";
-        for (predicate, expected) in [(KEEP_LAST_HOUR, vec![]), (unprunable, vec![0, 1])] {
-            let table = windowed_table(&timed_schema(), predicate).unwrap();
-            let now = now_nanos();
-            table
-                .apply(&timed_batch(&[(1, "a", Some(now))]), &[])
-                .unwrap();
-            table
-                .apply(&timed_batch(&[(2, "b", Some(now))]), &[])
-                .unwrap();
-            assert_eq!(chunks_to_evaluate(&table), expected, "{predicate}");
+            ),
+        ] {
+            let table = windowed(&input_schema, predicate).unwrap();
+            assert_eq!(table.range_column(), range_column, "{predicate}");
         }
     }
 
-    #[test]
-    fn cleaned_chunks_get_statistics() {
-        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR).unwrap();
-        let now = now_nanos();
-        table
-            .apply(
-                &timed_batch(&[
-                    (1, "a", Some(now - 4)),
-                    (2, "b", Some(now - 3)),
-                    (3, "c", Some(now - 2)),
-                    (4, "d", Some(now - 1)),
-                ]),
-                &[],
-            )
-            .unwrap();
-        // Dead rows exceed the ratio, so chunk 0's live rows move to chunk 2.
-        table
-            .apply(
-                &timed_batch(&[(1, "a", Some(now)), (2, "b", Some(now))]),
-                &[],
-            )
-            .unwrap();
-
-        let state = table.state.read();
-        assert_eq!((state.first_chunk_id, state.chunks.len()), (1, 2));
-        let window = table.window.as_ref().unwrap();
-        for chunk in &state.chunks {
-            assert_eq!(chunk.statistics.len(), 1);
-            assert_eq!(chunk.statistics, window.statistics(&chunk.batch).unwrap());
+    /// An integer column compared as a float evicts exactly the rows the
+    /// comparison is false for, whichever way the bound rounds.
+    #[tokio::test]
+    async fn range_windows_over_a_cast_keep_the_boundary_rows_the_predicate_keeps() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![7, 8, 9, 10])),
+                Arc::new(StringArray::from(vec!["7", "8", "9", "10"])),
+                Arc::new(Int64Array::from(vec![7, 8, 9, 10])),
+                Arc::new(StringArray::from(vec!["i"; 4])),
+            ],
+        )
+        .unwrap();
+        for (range, unprunable) in [
+            (
+                "CAST(n AS DOUBLE) >= watermark(n) - 2.5",
+                "CAST(n AS DOUBLE) + 0 >= watermark(n) - 2.5",
+            ),
+            (
+                "CAST(n AS DOUBLE) > watermark(n) - 2.5",
+                "CAST(n AS DOUBLE) + 0 > watermark(n) - 2.5",
+            ),
+            (
+                "CAST(n AS DOUBLE) >= watermark(n) - 2.0",
+                "CAST(n AS DOUBLE) + 0 >= watermark(n) - 2.0",
+            ),
+            (
+                "CAST(n AS DOUBLE) > watermark(n) - 2.0",
+                "CAST(n AS DOUBLE) + 0 > watermark(n) - 2.0",
+            ),
+        ] {
+            let mut kept = Vec::new();
+            for predicate in [range, unprunable] {
+                let table = windowed(&input_schema, predicate).unwrap();
+                assert_eq!(
+                    table.range_column(),
+                    (predicate == range).then_some("n"),
+                    "{predicate}"
+                );
+                apply(&table, &input).await;
+                kept.push(lookup_names(&table, &[Some(7), Some(8), Some(9), Some(10)]));
+            }
+            assert_eq!(kept[0], kept[1], "{range}");
         }
-        assert_eq!(
-            state.chunks[1].statistics[0].min,
-            ScalarValue::TimestampNanosecond(Some(now - 2), Some(WALL_CLOCK_TIME_ZONE.into()))
-        );
     }
 
-    #[test]
-    fn lookups_cannot_read_the_window_wall_clock() {
-        let windowed = windowed_table(
+    #[tokio::test]
+    async fn lookups_cannot_read_the_window_wall_clock() {
+        let windowed = windowed(
             &schema(),
             &format!("{WALL_CLOCK_COLUMN} >= now() - interval '1 hour'"),
         )
-        .unwrap();
+        .unwrap()
+        .table();
         let err = windowed
             .lookup_field(WALL_CLOCK_COLUMN)
             .unwrap_err()
@@ -2511,16 +1298,15 @@ mod tests {
             Field::new(WALL_CLOCK_COLUMN, DataType::Int64, true),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
         ]));
-        let unwindowed = InMemoryTable::try_new(
+        let unwindowed = store(
             TABLE,
             &with_wall_clock,
-            &["id".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
+            &["id"],
             None,
-            VersionRetention::Latest,
+            VersionRetention::Journal,
         )
-        .unwrap();
+        .unwrap()
+        .table();
         assert!(
             unwindowed.lookup_field(WALL_CLOCK_COLUMN).is_ok(),
             "without a window, '__timestamp' is an ordinary column"
@@ -2532,72 +1318,48 @@ mod tests {
 
     /// The README's walkthrough: every apply that writes rows runs a GC pass,
     /// whatever the GC interval.
-    #[test]
-    fn watermark_window_keeps_the_hour_before_the_largest_stored_time() {
-        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR_OF_DATA).unwrap();
+    #[tokio::test]
+    async fn watermark_window_keeps_the_hour_before_the_largest_stored_time() {
+        let table = windowed(&timed_schema(), KEEP_LAST_HOUR_OF_DATA).unwrap();
         let at = |hour: i64, minute: i64| Some(hour * HOUR_NANOS + minute * MINUTE_NANOS);
         let ids = [Some(1), Some(2), Some(3), Some(4), Some(5)];
 
-        table
-            .apply(
-                &timed_batch(&[(1, "a", at(10, 0)), (2, "b", at(10, 20))]),
-                &[],
-            )
-            .unwrap();
+        apply(
+            &table,
+            &timed_batch(&[(1, "a", at(10, 0)), (2, "b", at(10, 20))]),
+        )
+        .await;
         assert_eq!(
             lookup_names(&table, &ids),
-            [
-                Some("a".to_string()),
-                Some("b".to_string()),
-                None,
-                None,
-                None
-            ]
+            names(&[Some("a"), Some("b"), None, None, None])
         );
 
-        table
-            .apply(&timed_batch(&[(3, "c", at(11, 10))]), &[])
-            .unwrap();
+        apply(&table, &timed_batch(&[(3, "c", at(11, 10))])).await;
         assert_eq!(
             lookup_names(&table, &ids),
-            [
-                None,
-                Some("b".to_string()),
-                Some("c".to_string()),
-                None,
-                None
-            ],
+            names(&[None, Some("b"), Some("c"), None, None]),
             "the watermark moved to 11:10, so 10:00 is outside"
         );
 
-        table
-            .apply(&timed_batch(&[(4, "late", at(9, 30))]), &[])
-            .unwrap();
-        table
-            .apply(&timed_batch(&[(2, "b", at(10, 5))]), &[])
-            .unwrap();
+        apply(&table, &timed_batch(&[(4, "late", at(9, 30))])).await;
+        apply(&table, &timed_batch(&[(2, "b", at(10, 5))])).await;
         assert_eq!(
             lookup_names(&table, &ids),
-            [None, None, Some("c".to_string()), None, None],
+            names(&[None, None, Some("c"), None, None]),
             "a late row and an update to before 10:10 are evicted in their own apply"
         );
 
-        table
-            .apply(&timed_batch_of(&[(3, "c", at(11, 10))], "d"), &[])
-            .unwrap();
-        table
-            .apply(&timed_batch(&[(5, "e", at(10, 0))]), &[])
-            .unwrap();
+        apply(&table, &timed_batch_of(&[(3, "c", at(11, 10))], "d")).await;
+        apply(&table, &timed_batch(&[(5, "e", at(10, 0))])).await;
         assert_eq!(
             lookup_names(&table, &ids),
-            [None, None, None, None, None],
+            names(&[None, None, None, None, None]),
             "deleting the latest row doesn't move the watermark back"
         );
-        assert_live_rows_match_the_index(&table);
     }
 
-    #[test]
-    fn watermark_reads_integer_columns() {
+    #[tokio::test]
+    async fn watermark_reads_integer_columns() {
         const HOUR_SECS: i64 = 3600;
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -2605,7 +1367,7 @@ mod tests {
             Field::new("block_timestamp", DataType::Int64, true),
             Field::new(COLUMN_NAME_OP, DataType::Utf8, true),
         ]));
-        let table = windowed_table(
+        let table = windowed(
             &input_schema,
             "block_timestamp >= watermark(block_timestamp) - 3600",
         )
@@ -2620,47 +1382,34 @@ mod tests {
             ],
         )
         .unwrap();
-        table.apply(&input, &[]).unwrap();
+        apply(&table, &input).await;
         assert_eq!(
             lookup_names(&table, &[Some(1), Some(2)]),
-            [None, Some("new".to_string())]
+            names(&[None, Some("new")])
         );
     }
 
-    #[test]
-    fn least_with_now_guards_against_future_timestamps() {
+    #[tokio::test]
+    async fn least_with_now_guards_against_future_timestamps() {
         const DECADE_NANOS: i64 = 10 * 365 * 24 * HOUR_NANOS;
         let guarded = "ts >= least(watermark(ts), now()) - interval '1 hour'";
-        for (predicate, expected) in [
-            (KEEP_LAST_HOUR_OF_DATA, None),
-            (guarded, Some("now".to_string())),
-        ] {
-            let table = windowed_table(&timed_schema(), predicate).unwrap();
+        for (predicate, expected) in [(KEEP_LAST_HOUR_OF_DATA, None), (guarded, Some("now"))] {
+            let table = windowed(&timed_schema(), predicate).unwrap();
             let now = now_nanos();
-            table
-                .apply(
-                    &timed_batch(&[
-                        (1, "now", Some(now)),
-                        (2, "future", Some(now + DECADE_NANOS)),
-                    ]),
-                    &[],
-                )
-                .unwrap();
-            assert_eq!(lookup_names(&table, &[Some(1)]), [expected], "{predicate}");
+            apply(
+                &table,
+                &timed_batch(&[
+                    (1, "now", Some(now)),
+                    (2, "future", Some(now + DECADE_NANOS)),
+                ]),
+            )
+            .await;
+            assert_eq!(
+                lookup_names(&table, &[Some(1)]),
+                names(&[expected]),
+                "{predicate}"
+            );
         }
-    }
-
-    #[test]
-    fn watermark_window_prunes_chunks() {
-        let table = windowed_table(&timed_schema(), KEEP_LAST_HOUR_OF_DATA).unwrap();
-        assert!(table.window.as_ref().unwrap().prunable().unwrap());
-        table
-            .apply(&timed_batch(&[(1, "a", Some(0))]), &[])
-            .unwrap();
-        table
-            .apply(&timed_batch(&[(2, "b", Some(MINUTE_NANOS))]), &[])
-            .unwrap();
-        assert_eq!(chunks_to_evaluate(&table), Vec::<usize>::new());
     }
 
     #[test]
@@ -2670,9 +1419,8 @@ mod tests {
             "ts >= watermark()",
             "ts >= watermark(ts, ts)",
         ] {
-            let err = windowed_table(&timed_schema(), predicate)
-                .err()
-                .expect("the window must be rejected")
+            let err = windowed(&timed_schema(), predicate)
+                .expect_err("the window must be rejected")
                 .to_string();
             assert!(err.contains("invalid window"), "{predicate}: {err}");
         }
@@ -2707,78 +1455,28 @@ mod tests {
                 "the SQL output cannot contain '__timestamp'",
             ),
         ] {
-            let err = windowed_table(&input_schema, predicate)
-                .err()
-                .expect("the window must be rejected")
+            let err = windowed(&input_schema, predicate)
+                .expect_err("the window must be rejected")
                 .to_string();
             assert!(err.contains(expected), "{predicate}: {err}");
         }
     }
 
-    fn versioned_table() -> InMemoryTable {
-        InMemoryTable::try_new(
-            TABLE,
-            &schema(),
-            &["id".to_string()],
-            METRIC_KEY.to_string(),
-            MAX_DEAD_RATIO,
-            None,
-            VersionRetention::PerBatch,
-        )
-        .unwrap()
-    }
-
-    /// Applies `batch`, which carried the markers of `epochs`, and returns
-    /// the mark its readers see the table at.
-    fn apply_marked(table: &InMemoryTable, batch: &RecordBatch, epochs: &[u64]) -> Option<Mark> {
-        let epochs: Vec<CheckpointEpoch> = epochs.iter().copied().map(CheckpointEpoch).collect();
-        table_mark(table.apply(batch, &epochs).unwrap())
-    }
-
-    fn table_mark(marks: Marks) -> Option<Mark> {
-        marks
-            .into_iter()
-            .find(|(table, _)| table == TABLE)
-            .map(|(_, mark)| mark)
-    }
-
-    fn lookup_names_at(
-        table: &InMemoryTable,
-        ids: &[i64],
-        mark: Option<Mark>,
-    ) -> Result<Vec<Option<String>>> {
-        let keys: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
-        Ok(table
-            .lookup(&[keys], "name", mark)?
-            .as_string::<i32>()
-            .iter()
-            .map(|name| name.map(str::to_string))
-            .collect())
-    }
-
-    fn names(values: &[Option<&str>]) -> Vec<Option<String>> {
-        values.iter().map(|name| name.map(str::to_string)).collect()
-    }
-
-    #[test]
-    fn reads_at_a_mark_do_not_see_later_applies() {
-        let table = versioned_table();
-        let first = apply_marked(
+    #[tokio::test]
+    async fn reads_at_a_mark_do_not_see_later_applies() {
+        let table = table().await;
+        let first = apply(
             &table,
             &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
-            &[],
-        );
-        let second = apply_marked(&table, &batch(&[(1, "a2", "u"), (2, "b2", "u")]), &[]);
-        let third = apply_marked(&table, &batch(&[(1, "x", "d"), (3, "c3", "u")]), &[]);
-        assert!(
-            table.state.read().first_chunk_id > 0,
-            "the cleaner dropped chunks the history still points into"
-        );
+        )
+        .await;
+        let second = apply(&table, &batch(&[(1, "a2", "u"), (2, "b2", "u")])).await;
+        let third = apply(&table, &batch(&[(1, "x", "d"), (3, "c3", "u")])).await;
 
         for (mark, expected) in [
-            (first, [Some("a"), Some("b"), Some("c")]),
-            (second, [Some("a2"), Some("b2"), Some("c")]),
-            (third, [None, Some("b2"), Some("c3")]),
+            (Some(first), [Some("a"), Some("b"), Some("c")]),
+            (Some(second), [Some("a2"), Some("b2"), Some("c")]),
+            (Some(third), [None, Some("b2"), Some("c3")]),
             (None, [None, Some("b2"), Some("c3")]),
         ] {
             assert_eq!(
@@ -2789,19 +1487,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn row_and_exists_reads_at_a_mark_do_not_see_later_applies() {
-        let table = versioned_table();
-        let first = apply_marked(&table, &batch(&[(1, "a", "i"), (2, "b", "i")]), &[]);
-        let second = apply_marked(&table, &batch(&[(1, "x", "d"), (2, "b2", "u")]), &[]);
+    #[tokio::test]
+    async fn row_and_exists_reads_at_a_mark_do_not_see_later_applies() {
+        let table = table().await;
+        let first = apply(&table, &batch(&[(1, "a", "i"), (2, "b", "i")])).await;
+        let second = apply(&table, &batch(&[(1, "x", "d"), (2, "b2", "u")])).await;
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let reads = table.table();
 
         for (mark, expected) in [
-            (first, [Some("a"), Some("b")]),
-            (second, [None, Some("b2")]),
+            (Some(first), [Some("a"), Some("b")]),
+            (Some(second), [None, Some("b2")]),
             (None, [None, Some("b2")]),
         ] {
-            let rows = table.lookup_rows(&[Arc::clone(&keys)], mark).unwrap();
+            let rows = reads.lookup_rows(&[Arc::clone(&keys)], mark).unwrap();
             let row_names: Vec<Option<String>> = (0..rows.len())
                 .map(|row| {
                     rows.is_valid(row).then(|| {
@@ -2815,7 +1514,7 @@ mod tests {
                 .collect();
             assert_eq!(row_names, names(&expected), "{mark:?}");
             assert_eq!(
-                table
+                reads
                     .lookup_exists(&[Arc::clone(&keys)], mark)
                     .unwrap()
                     .iter()
@@ -2826,23 +1525,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn latest_only_tables_keep_no_versions() {
-        let table = table();
-        let marks = table
-            .apply(&batch(&[(1, "a", "i")]), &[CheckpointEpoch(1)])
-            .unwrap();
-        assert!(marks.is_empty());
-        table.apply(&batch(&[(1, "b", "u")]), &[]).unwrap();
+    /// `latest` only changes which version lookups read: applies journal and
+    /// return marks either way.
+    #[tokio::test]
+    async fn latest_tables_still_journal_and_get_marks() {
+        let table = table_with(VersionRetention::Latest).await;
+        let first = apply_marked(&table, &batch(&[(1, "a", "i")]), &[1]).await;
+        let second = apply(&table, &batch(&[(1, "b", "u")])).await;
+        assert!(second > first);
+        assert_eq!(table.table().retention(), VersionRetention::Latest);
         assert_eq!(
             lookup_names_at(&table, &[1], None).unwrap(),
             names(&[Some("b")])
         );
-        assert_eq!(table.state.read().versions.count(), 0);
+        assert_eq!(table.table_stats().await.journal_rows, 2);
     }
 
-    fn collected(table: &InMemoryTable, mark: Option<Mark>) -> bool {
-        match lookup_names_at(table, &[1], mark) {
+    #[tokio::test]
+    async fn an_empty_batch_without_a_gc_pass_commits_nothing() {
+        let table = table().await;
+        let mark = apply(&table, &batch(&[(1, "a", "i")])).await;
+        assert_eq!(apply(&table, &batch(&[])).await, mark);
+        assert_eq!(
+            apply_marked(&table, &batch(&[]), &[1]).await,
+            mark,
+            "a marker on an empty batch is recorded at the last mark"
+        );
+    }
+
+    fn collected(table: &TableStore, mark: Mark) -> bool {
+        match lookup_names_at(table, &[1], Some(mark)) {
             Ok(_) => false,
             Err(err) => {
                 assert!(err.is_internal(), "a bug, not bad input: {err}");
@@ -2855,50 +1567,58 @@ mod tests {
     /// Six batches, each changing key 1, from two partitions taking turns.
     /// Epoch 1's marker rides batches 1 and 2, epoch 2's batches 4 and 5.
     /// Returns the table and the batches' marks.
-    fn table_with_markers() -> (InMemoryTable, Vec<Option<Mark>>) {
-        let table = versioned_table();
-        let marks = [&[][..], &[1], &[1], &[], &[2], &[2]]
-            .iter()
-            .map(|epochs| apply_marked(&table, &batch(&[(1, "v", "u")]), epochs))
-            .collect();
+    async fn table_with_markers(journal_trim: JournalTrim) -> (TableStore, Vec<Mark>) {
+        let table = store_trimmed(
+            TABLE,
+            &schema(),
+            &["id"],
+            None,
+            VersionRetention::Journal,
+            journal_trim,
+        )
+        .unwrap();
+        let mut marks = Vec::new();
+        for epochs in [&[][..], &[1], &[1], &[], &[2], &[2]] {
+            marks.push(apply_marked(&table, &batch(&[(1, "v", "u")]), epochs).await);
+        }
         (table, marks)
     }
 
-    /// Epoch 1's cut is batch 1's mark, the earlier of its two marker
+    /// Epoch 1's horizon is batch 1's mark, the earlier of its two marker
     /// batches, so batch 2's change stays for a reader at batch 1.
-    #[test]
-    fn a_finalized_epoch_collects_up_to_its_earliest_marker_batch() {
-        let (table, marks) = table_with_markers();
-        table.state.write().collect(1);
+    #[tokio::test]
+    async fn a_finalized_epoch_collects_up_to_its_earliest_marker_batch() {
+        let (table, marks) = table_with_markers(JournalTrim::OnFinalize).await;
+        table.finalize_epoch(1).await.unwrap();
         assert_eq!(
             marks
                 .iter()
                 .map(|mark| collected(&table, *mark))
                 .collect::<Vec<_>>(),
             [true, false, false, false, false, false],
-            "a read at the cut is exact"
+            "a read at the horizon is exact"
         );
-        assert_eq!(table.state.read().versions.count(), 4);
+        assert_eq!(table.table_stats().await.journal_rows, 4);
 
         // A repeated finalizer changes nothing.
-        table.state.write().collect(1);
-        assert_eq!(table.state.read().versions.count(), 4);
+        table.finalize_epoch(1).await.unwrap();
+        assert_eq!(table.table_stats().await.journal_rows, 4);
     }
 
-    #[test]
-    fn a_lookup_of_no_keys_at_a_collected_mark_errors() {
-        let (table, marks) = table_with_markers();
-        table.state.write().collect(1);
+    #[tokio::test]
+    async fn a_lookup_of_no_keys_at_a_collected_mark_errors() {
+        let (table, marks) = table_with_markers(JournalTrim::OnFinalize).await;
+        table.finalize_epoch(1).await.unwrap();
         assert!(collected(&table, marks[0]));
-        let err = lookup_names_at(&table, &[], marks[0]).unwrap_err();
+        let err = lookup_names_at(&table, &[], Some(marks[0])).unwrap_err();
         assert!(err.to_string().contains("already collected"), "{err}");
     }
 
-    #[test]
-    fn a_later_finalized_epoch_covers_a_skipped_one() {
-        let (table, marks) = table_with_markers();
-        // Epoch 1's finalizer never came. Epoch 2's cut is batch 4's mark.
-        table.state.write().collect(2);
+    #[tokio::test]
+    async fn a_later_finalized_epoch_covers_a_skipped_one() {
+        let (table, marks) = table_with_markers(JournalTrim::OnFinalize).await;
+        // Epoch 1's finalizer never came. Epoch 2's horizon is batch 4's mark.
+        table.finalize_epoch(2).await.unwrap();
         assert_eq!(
             marks
                 .iter()
@@ -2906,131 +1626,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             [true, true, true, true, false, false]
         );
-        assert_eq!(table.state.read().versions.count(), 1);
+        assert_eq!(table.table_stats().await.journal_rows, 1);
     }
 
-    #[test]
-    fn history_holds_dropped_chunks_until_collected() {
-        let table = versioned_table();
-        let first = apply_marked(
-            &table,
-            &batch(&[(1, "a", "i"), (2, "b", "i"), (3, "c", "i")]),
-            &[],
-        );
-        let second = apply_marked(&table, &batch(&[(1, "a2", "u"), (2, "b2", "u")]), &[1]);
+    #[tokio::test]
+    async fn journal_trim_never_keeps_every_version() {
+        let (table, marks) = table_with_markers(JournalTrim::Never).await;
+        table.finalize_epoch(2).await.unwrap();
         assert!(
-            table.state.read().retired_bytes > 0,
-            "the cleaner dropped the first chunk, which a read at the first batch needs"
+            marks.iter().all(|mark| !collected(&table, *mark)),
+            "no version is collected"
         );
-        assert_eq!(
-            lookup_names_at(&table, &[1, 2, 3], first).unwrap(),
-            names(&[Some("a"), Some("b"), Some("c")])
-        );
-
-        table.state.write().collect(1);
-
-        assert_eq!(table.state.read().retired_bytes, 0);
-        assert_eq!(table.state.read().versions.count(), 0);
-        assert_eq!(
-            lookup_names_at(&table, &[1, 2, 3], second).unwrap(),
-            names(&[Some("a2"), Some("b2"), Some("c")])
-        );
+        assert_eq!(table.table_stats().await.journal_rows, 6);
     }
 
-    #[test]
-    fn a_retired_chunk_stays_until_its_last_change_is_collected() {
-        const KEYS: i64 = 10;
-        let table = versioned_table();
-        let rows: Vec<(i64, &str, &str)> = (1..=KEYS).map(|id| (id, "old", "i")).collect();
-        apply_marked(&table, &batch(&rows), &[]);
-        // Within the dead-row ratio, so the first chunk stays live.
-        let second = apply_marked(&table, &batch(&[(1, "new", "u")]), &[1]);
-        let rows: Vec<(i64, &str, &str)> = (2..=KEYS).map(|id| (id, "new", "u")).collect();
-        apply_marked(&table, &batch(&rows), &[2]);
-        assert!(
-            table.state.read().first_chunk_id > 0,
-            "the cleaner dropped the first chunk, held by the second and third batches' changes"
-        );
-
-        table.state.write().collect(1);
-        assert!(table.state.read().retired_bytes > 0);
-        assert_eq!(
-            lookup_names_at(&table, &[1, 2], second).unwrap(),
-            names(&[Some("new"), Some("old")])
-        );
-
-        table.state.write().collect(2);
-        assert_eq!(table.state.read().retired_bytes, 0);
-    }
-
-    #[test]
-    fn index_entries_take_24_bytes() {
-        const INDEX_ENTRY_BYTES: usize = 24;
-        const CHANGE_LINK_BYTES: usize = 8;
-        assert_eq!(size_of::<Option<ChangeRef>>(), CHANGE_LINK_BYTES);
-        assert_eq!(size_of::<IndexEntry>(), INDEX_ENTRY_BYTES);
-    }
-
-    #[test]
-    fn interval_window_evictions_are_versioned() {
+    #[tokio::test]
+    async fn interval_window_evictions_are_versioned() {
         let table =
-            windowed_table_with(&timed_schema(), KEEP_LAST_HOUR, VersionRetention::PerBatch)
-                .unwrap();
+            windowed_with(&timed_schema(), KEEP_LAST_HOUR, VersionRetention::Journal).unwrap();
         let old = now_nanos() - 2 * HOUR_NANOS;
-        let first = apply_marked(&table, &timed_batch(&[(1, "old", Some(old))]), &[]);
-        let window = table.window.as_ref().unwrap();
-        *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
-        let second = apply_marked(&table, &timed_batch(&[]), &[]);
+        let first = apply(&table, &timed_batch(&[(1, "old", Some(old))])).await;
+        let second = evict_outside(&table, &timed_schema()).await;
 
         assert_eq!(
-            lookup_names_at(&table, &[1], first).unwrap(),
+            lookup_names_at(&table, &[1], Some(first)).unwrap(),
             names(&[Some("old")])
         );
         assert_eq!(
-            lookup_names_at(&table, &[1], second).unwrap(),
+            lookup_names_at(&table, &[1], Some(second)).unwrap(),
             names(&[None])
         );
     }
 
-    /// Partition 1 applies between partition 0's write and the interval GC
-    /// pass at the end of the same apply: a reader of partition 1's batch
-    /// still sees the row the pass evicts, a reader of partition 0's doesn't.
-    #[test]
-    fn an_interval_gc_pass_is_inside_its_applys_moment() {
-        let table =
-            windowed_table_with(&timed_schema(), KEEP_LAST_HOUR, VersionRetention::PerBatch)
-                .unwrap();
-        let window = table.window.as_ref().unwrap();
-        let old = now_nanos() - 2 * HOUR_NANOS;
-        apply_marked(&table, &timed_batch(&[(1, "old", Some(old))]), &[]);
-
-        table.begin();
-        table.write(&timed_batch(&[])).unwrap();
-        let other_partition =
-            apply_marked(&table, &timed_batch(&[(2, "new", Some(now_nanos()))]), &[]);
-        *window.last_pass.lock() = Instant::now().checked_sub(GC_INTERVAL).unwrap();
-        table.collect_garbage_if_due().unwrap();
-        let own = table_mark(table.finish(&[]));
-
-        assert_eq!(
-            lookup_names_at(&table, &[1, 2], other_partition).unwrap(),
-            names(&[Some("old"), Some("new")])
-        );
-        assert_eq!(
-            lookup_names_at(&table, &[1, 2], own).unwrap(),
-            names(&[None, Some("new")])
-        );
-    }
-
     /// `#[serial]`: the coordinator channel is process-wide.
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn a_finalizer_from_the_coordinator_collects_on_the_next_apply() {
+    async fn a_finalizer_from_the_coordinator_collects_on_the_next_apply() {
         // Far above the epochs other tests record.
         const EPOCH: u64 = 1_000_000;
-        let table = versioned_table();
-        let first = apply_marked(&table, &batch(&[(1, "a", "i")]), &[]);
-        let second = apply_marked(&table, &batch(&[(1, "b", "u")]), &[EPOCH]);
+        let table = table().await;
+        let first = apply(&table, &batch(&[(1, "a", "i")])).await;
+        let second = apply_marked(&table, &batch(&[(1, "b", "u")]), &[EPOCH]).await;
         crate::checkpoints::channels::send(
             crate::checkpoints::checkpoint_management::CHECKPOINT_COORDINATOR_CHANNEL,
             crate::checkpoints::checkpoint_management::CheckpointMessage::Finalizer(
@@ -3040,9 +1676,380 @@ mod tests {
         .unwrap();
         assert!(!collected(&table, first));
 
-        apply_marked(&table, &batch(&[]), &[]);
+        apply(&table, &batch(&[])).await;
 
         assert!(collected(&table, first));
         assert!(!collected(&table, second));
+    }
+
+    /// An `in_memory` backend that records the checkpoints and
+    /// finalizations it's asked for.
+    #[derive(Debug)]
+    struct Recorder {
+        backend: InMemoryBackend,
+        calls: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                backend: InMemoryBackend::try_new(TABLE, MAX_DEAD_RATIO).unwrap(),
+                calls: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TableBackend for Recorder {
+        async fn open(&self) -> Result<StoredState> {
+            self.backend.open().await
+        }
+
+        async fn create_namespace(&self, spec: &NamespaceSpec) -> Result<()> {
+            self.backend.create_namespace(spec).await
+        }
+
+        async fn drop_namespace(&self, name: &str) -> Result<()> {
+            self.backend.drop_namespace(name).await
+        }
+
+        async fn begin(&self) -> Result<Box<dyn TableTransaction>> {
+            self.backend.begin().await
+        }
+
+        async fn lookup(
+            &self,
+            namespace: &str,
+            keys: &RecordBatch,
+            projection: &[usize],
+            mark: Option<Mark>,
+        ) -> Result<LookupRows> {
+            self.backend.lookup(namespace, keys, projection, mark).await
+        }
+
+        async fn checkpoint(&self, mark: Mark) -> Result<()> {
+            self.calls.lock().push(format!("checkpoint {}", mark.0));
+            self.backend.checkpoint(mark).await
+        }
+
+        async fn finalize(&self, horizon: Mark, trim: bool) -> Result<()> {
+            self.calls
+                .lock()
+                .push(format!("finalize {} {trim}", horizon.0));
+            self.backend.finalize(horizon, trim).await
+        }
+
+        async fn stats(&self) -> Result<Vec<NamespaceStats>> {
+            self.backend.stats().await
+        }
+    }
+
+    fn recorded(journal_trim: JournalTrim) -> (TableStore, Arc<Recorder>) {
+        let recorder = Recorder::new();
+        let table = store_on(
+            TABLE,
+            &schema(),
+            &["id"],
+            None,
+            VersionRetention::Journal,
+            journal_trim,
+            OnSchemaChange::Fail,
+            Arc::clone(&recorder) as Arc<dyn TableBackend>,
+        )
+        .unwrap();
+        (table, recorder)
+    }
+
+    #[tokio::test]
+    async fn a_batch_carrying_markers_returns_once_its_versions_are_checkpointed() {
+        let (table, recorder) = recorded(JournalTrim::OnFinalize);
+        apply(&table, &batch(&[(1, "a", "i")])).await;
+        assert!(
+            !recorder
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("checkpoint")),
+            "no markers, no checkpoint"
+        );
+        let mark = apply_marked(&table, &batch(&[(1, "b", "u")]), &[1]).await;
+        assert_eq!(
+            recorder.calls().last(),
+            Some(&format!("checkpoint {}", mark.0))
+        );
+        let idle = apply_marked(&table, &batch(&[]), &[2]).await;
+        assert_eq!(idle, mark);
+        assert_eq!(
+            recorder.calls().last(),
+            Some(&format!("checkpoint {}", mark.0)),
+            "an idle batch's markers checkpoint the last mark"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_trim_never_finalizes_every_cut_without_trimming() {
+        for (journal_trim, trim) in [(JournalTrim::OnFinalize, true), (JournalTrim::Never, false)] {
+            let (table, recorder) = recorded(journal_trim);
+            let first = apply(&table, &batch(&[(1, "a", "i")])).await;
+            apply_marked(&table, &batch(&[(1, "b", "u")]), &[1]).await;
+            table.finalize_epoch(1).await.unwrap();
+            let finalized: Vec<String> = recorder
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("finalize"))
+                .collect();
+            assert_eq!(
+                finalized,
+                [
+                    format!("finalize {} {trim}", first.0 - 1),
+                    format!("finalize {} {trim}", first.0 + 1),
+                ],
+                "at startup, then at the epoch's horizon"
+            );
+        }
+    }
+
+    /// A store that kept its rows, as a durable backend does across a
+    /// restart.
+    fn restarted(
+        backend: &Arc<dyn TableBackend>,
+        input_schema: &SchemaRef,
+        predicate: &str,
+    ) -> TableStore {
+        store_on(
+            TABLE,
+            input_schema,
+            &["id"],
+            Some(WindowConfig {
+                predicate,
+                session_state: &SessionContext::new().state(),
+                gc_interval: GC_INTERVAL,
+            }),
+            VersionRetention::Journal,
+            JournalTrim::OnFinalize,
+            OnSchemaChange::Fail,
+            Arc::clone(backend),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_restart_restores_the_watermarks() {
+        let backend: Arc<dyn TableBackend> =
+            Arc::new(InMemoryBackend::try_new(TABLE, MAX_DEAD_RATIO).unwrap());
+        let at = |hour: i64| Some(hour * HOUR_NANOS);
+        let before = restarted(&backend, &timed_schema(), KEEP_LAST_HOUR_OF_DATA);
+        apply(&before, &timed_batch(&[(1, "a", at(11))])).await;
+        drop(before);
+
+        let after = restarted(&backend, &timed_schema(), KEEP_LAST_HOUR_OF_DATA);
+        apply(&after, &timed_batch(&[(2, "late", at(9))])).await;
+        assert_eq!(
+            lookup_names(&after, &[Some(1), Some(2)]),
+            names(&[Some("a"), None]),
+            "the watermark is still 11:00, so 9:00 is outside"
+        );
+    }
+
+    /// The table on `backend`, with `schema()` instead of the windowed
+    /// tables' columns.
+    fn changed(backend: &Arc<dyn TableBackend>, on_schema_change: OnSchemaChange) -> TableStore {
+        store_on(
+            TABLE,
+            &schema(),
+            &["id"],
+            None,
+            VersionRetention::Journal,
+            JournalTrim::OnFinalize,
+            on_schema_change,
+            Arc::clone(backend),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_another_schema_fails_or_resets() {
+        let backend: Arc<dyn TableBackend> =
+            Arc::new(InMemoryBackend::try_new(TABLE, MAX_DEAD_RATIO).unwrap());
+        let before = restarted(&backend, &timed_schema(), KEEP_LAST_HOUR);
+        apply(&before, &timed_batch(&[(1, "a", Some(now_nanos()))])).await;
+        drop(before);
+        let after = restarted(&backend, &timed_schema(), KEEP_LAST_HOUR);
+        after.start().await.expect("the same shape restarts");
+        drop(after);
+
+        let err = changed(&backend, OnSchemaChange::Fail)
+            .start()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the stored table has another schema or primary key")
+                && err.contains("on_schema_change: reset"),
+            "{err}"
+        );
+
+        let reset = changed(&backend, OnSchemaChange::Reset);
+        reset.start().await.expect("reset drops the stored table");
+        assert_eq!(lookup_names(&reset, &[Some(1)]), [None], "it starts empty");
+        apply(&reset, &batch(&[(1, "b", "i")])).await;
+        assert_eq!(lookup_names(&reset, &[Some(1)]), names(&[Some("b")]));
+    }
+
+    /// An `in_memory` backend whose next commits fail retriably, rolling
+    /// their transactions back.
+    #[derive(Debug)]
+    struct Flaky {
+        backend: Arc<dyn TableBackend>,
+        failing_commits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct FlakyTransaction {
+        transaction: Box<dyn TableTransaction>,
+        failing_commits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableBackend for Flaky {
+        async fn open(&self) -> Result<StoredState> {
+            self.backend.open().await
+        }
+
+        async fn create_namespace(&self, spec: &NamespaceSpec) -> Result<()> {
+            self.backend.create_namespace(spec).await
+        }
+
+        async fn drop_namespace(&self, name: &str) -> Result<()> {
+            self.backend.drop_namespace(name).await
+        }
+
+        async fn begin(&self) -> Result<Box<dyn TableTransaction>> {
+            Ok(Box::new(FlakyTransaction {
+                transaction: self.backend.begin().await?,
+                failing_commits: Arc::clone(&self.failing_commits),
+            }))
+        }
+
+        async fn lookup(
+            &self,
+            namespace: &str,
+            keys: &RecordBatch,
+            projection: &[usize],
+            mark: Option<Mark>,
+        ) -> Result<LookupRows> {
+            self.backend.lookup(namespace, keys, projection, mark).await
+        }
+
+        async fn checkpoint(&self, mark: Mark) -> Result<()> {
+            self.backend.checkpoint(mark).await
+        }
+
+        async fn finalize(&self, horizon: Mark, trim: bool) -> Result<()> {
+            self.backend.finalize(horizon, trim).await
+        }
+
+        async fn stats(&self) -> Result<Vec<NamespaceStats>> {
+            self.backend.stats().await
+        }
+    }
+
+    #[async_trait]
+    impl TableTransaction for FlakyTransaction {
+        fn version(&self) -> backend::Version {
+            self.transaction.version()
+        }
+
+        async fn get(&mut self, namespace: &str, keys: &RecordBatch) -> Result<LookupRows> {
+            self.transaction.get(namespace, keys).await
+        }
+
+        async fn write(
+            &mut self,
+            namespace: &str,
+            upserts: &RecordBatch,
+            deletes: &RecordBatch,
+        ) -> Result<RecordBatch> {
+            self.transaction.write(namespace, upserts, deletes).await
+        }
+
+        async fn evict_below(
+            &mut self,
+            namespace: &str,
+            column: &str,
+            bound: &datafusion::common::ScalarValue,
+            inclusive: bool,
+            limit: usize,
+        ) -> Result<RecordBatch> {
+            self.transaction
+                .evict_below(namespace, column, bound, inclusive, limit)
+                .await
+        }
+
+        async fn scan(
+            &mut self,
+            namespace: &str,
+            cursor: Option<backend::ScanCursor>,
+            limit: usize,
+        ) -> Result<(RecordBatch, Option<backend::ScanCursor>)> {
+            self.transaction.scan(namespace, cursor, limit).await
+        }
+
+        async fn set_meta(&mut self, key: &str, value: Vec<u8>) -> Result<()> {
+            self.transaction.set_meta(key, value).await
+        }
+
+        async fn commit(self: Box<Self>) -> Result<()> {
+            use std::sync::atomic::Ordering;
+            if self
+                .failing_commits
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(crate::error::StreamlingError::from_parts(
+                    anyhow::anyhow!("connection reset"),
+                    true,
+                    false,
+                ));
+            }
+            self.transaction.commit().await
+        }
+    }
+
+    /// The apply's transaction is dropped and re-run whole, so what it stores
+    /// in meta, such as a moved watermark, survives the retry.
+    #[tokio::test]
+    async fn a_retriable_failure_reruns_the_whole_apply() {
+        let backend: Arc<dyn TableBackend> =
+            Arc::new(InMemoryBackend::try_new(TABLE, MAX_DEAD_RATIO).unwrap());
+        let failing_commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flaky: Arc<dyn TableBackend> = Arc::new(Flaky {
+            backend: Arc::clone(&backend),
+            failing_commits: Arc::clone(&failing_commits),
+        });
+        let at = |hour: i64| Some(hour * HOUR_NANOS);
+        let before = restarted(&flaky, &timed_schema(), KEEP_LAST_HOUR_OF_DATA);
+        before.start().await.unwrap();
+        failing_commits.store(1, std::sync::atomic::Ordering::SeqCst);
+        apply(&before, &timed_batch(&[(1, "a", at(11))])).await;
+        assert_eq!(
+            failing_commits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the first commit failed"
+        );
+        assert_eq!(lookup_names(&before, &[Some(1)]), names(&[Some("a")]));
+        drop(before);
+
+        let after = restarted(&backend, &timed_schema(), KEEP_LAST_HOUR_OF_DATA);
+        apply(&after, &timed_batch(&[(2, "late", at(9))])).await;
+        assert_eq!(
+            lookup_names(&after, &[Some(2)]),
+            [None],
+            "the retry stored the watermark the failed attempt moved"
+        );
     }
 }

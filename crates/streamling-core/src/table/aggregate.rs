@@ -2,15 +2,16 @@
 //! <key>` over a table's live rows, maintained incrementally and read by
 //! lookups.
 
-use super::{InMemoryTable, Marks, OP_DELETE, TableRegistry};
-use crate::checkpoints::checkpoint_management::CheckpointEpoch;
+use super::backend::{NamespaceSpec, TableTransaction};
+use super::{Table, TableRegistry, TableStore, fingerprint};
 use crate::data::COLUMN_NAME_OP;
 use crate::error::{Result, ResultExt, StreamlingError};
-use crate::topology::DEFAULT_MAX_DEAD_RATIO;
 use crate::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array, UInt64Array, new_empty_array,
+};
 use arrow::compute::{filter, filter_record_batch, is_not_null, take};
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt64Type};
 use arrow::row::{RowConverter, Rows, SortField};
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{Column, DFSchema, DFSchemaRef, ScalarValue, TableReference};
@@ -20,21 +21,31 @@ use datafusion::logical_expr::{Accumulator, Expr, LogicalPlan, Volatility};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::aggregate::{AggregateFunctionExpr, LoweredAggregateBuilder};
-use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// The aggregate functions whose accumulators retract exactly what they added.
 const SUPPORTED_FUNCTIONS: [&str; 3] = ["count", "sum", "avg"];
 const SQL_SHAPE: &str = "SELECT <key>, <aggregates> FROM <table> [WHERE ...] GROUP BY <key>";
-const OP_UPDATE: &str = "u";
+/// Groups whose state one `get` reads.
+const GROUPS_PER_READ: usize = 8192;
+/// Prefixes of an aggregate's namespaces, followed by its name.
+const OUTPUT_NAMESPACE_PREFIX: &str = "aggregate.";
+const STATE_NAMESPACE_PREFIX: &str = "aggregate_state.";
+/// Columns of the state namespace before the accumulators' states.
+const STATE_KEY: &str = "key";
+const STATE_ROWS: &str = "rows";
+const STATE_ROWS_INDEX: usize = 1;
+/// The first accumulator state column.
+const STATE_VALUES_INDEX: usize = 2;
 
 /// Registers the `table_agg` named `name`, whose SQL `plan` reads a table in
-/// `tables`: `tables` gets its output, which lookups read, and the table
-/// updates it on every change to its live rows.
+/// `tables`: `tables` gets its output, which lookups read, and the table's
+/// store maintains it on every change to its live rows.
 pub fn register(
     name: &str,
+    sql: &str,
     plan: &LogicalPlan,
     tables: &TableRegistry,
     session_state: &SessionState,
@@ -45,28 +56,35 @@ pub fn register(
         session_state.config_options(),
         |_, _| {},
     )?;
-    let (aggregate, base) =
-        TableAggregate::try_new(name, &plan, tables, session_state, metric_metadata_id)?;
-    tables.register(Arc::clone(&aggregate.output));
-    base.add_aggregate(Arc::new(aggregate));
+    let (aggregate, store) =
+        TableAggregate::try_new(name, sql, &plan, tables, session_state, metric_metadata_id)?;
+    tables.register(Arc::new(aggregate.output_table(&store)?));
+    store.add_aggregate(Arc::new(aggregate));
     Ok(())
 }
 
-struct Group {
-    /// The group's live rows in the table, rows with null arguments included.
-    rows: u64,
-    accumulators: Vec<Box<dyn Accumulator>>,
+/// The namespaces of the aggregate named `name`: its output, then its state.
+pub(super) fn namespaces(name: &str) -> [String; 2] {
+    [
+        format!("{OUTPUT_NAMESPACE_PREFIX}{name}"),
+        format!("{STATE_NAMESPACE_PREFIX}{name}"),
+    ]
 }
 
-/// A `table_agg`. Its table calls [`Self::update`] with every change to its
-/// live rows, under its write lock, so the groups always aggregate exactly
-/// the live rows. The groups are stored in `output`, an [`InMemoryTable`]
-/// keyed by the GROUP BY expression, which lookups read. `output` keeps its
-/// own version history, written and marked in the table's lock windows, so a
-/// batch's readers see `output` at the same moment as the table. The
-/// accumulators are never read as of a mark.
+/// A `table_agg`. Its store calls [`Self::apply`] with every change to the
+/// table's live rows, in the transaction of the apply that made it, so the
+/// groups always aggregate exactly the live rows.
+///
+/// Each group's accumulator state is stored in the state namespace, keyed by
+/// the GROUP BY expression, with the group's row count: an apply restores
+/// the groups it touches with `merge_batch`, updates and retracts them, and
+/// stores their `state()`. The group values go to the output namespace,
+/// which lookups read as of a mark like the table. The state is never read
+/// as of a mark.
 pub(super) struct TableAggregate {
     name: String,
+    sql: String,
+    metric_metadata_id: String,
     /// `filter`, `key` and `arguments` read the table's stored schema.
     filter: Option<Arc<dyn PhysicalExpr>>,
     key: Arc<dyn PhysicalExpr>,
@@ -77,10 +95,14 @@ pub(super) struct TableAggregate {
     /// The key, then each aggregate's value: what `projection` reads.
     aggregate_schema: SchemaRef,
     projection: Vec<Arc<dyn PhysicalExpr>>,
-    /// The projection's schema plus `_gs_op`.
+    /// The projection's schema: the output namespace's.
     output_schema: SchemaRef,
-    output: Arc<InMemoryTable>,
-    groups: Mutex<HashMap<Box<[u8]>, Group>>,
+    /// The column of `output_schema` that holds the key.
+    output_key: usize,
+    /// The key, the group's row count, then each aggregate's state.
+    state_schema: SchemaRef,
+    /// Each aggregate's state columns in `state_schema`.
+    state_columns: Vec<Range<usize>>,
 }
 
 /// One side of an update: the rows that count, their encoded keys and each
@@ -94,11 +116,12 @@ impl TableAggregate {
     /// `plan` is analyzed, so its expressions are type-coerced.
     fn try_new(
         name: &str,
+        sql: &str,
         plan: &LogicalPlan,
         tables: &TableRegistry,
         session_state: &SessionState,
         metric_metadata_id: String,
-    ) -> Result<(Self, Arc<InMemoryTable>)> {
+    ) -> Result<(Self, Arc<TableStore>)> {
         let unsupported = |plan: &LogicalPlan| {
             streamling_user_err!(
                 "table_agg '{}': unsupported {}; the SQL must be `{}`",
@@ -156,7 +179,7 @@ impl TableAggregate {
         }
         let (key_qualifier, key_field) = aggregate.schema.qualified_field(0);
         let key_column = Expr::Column(Column::from((key_qualifier, key_field)));
-        let Some(key_position) = projection
+        let Some(output_key) = projection
             .expr
             .iter()
             .position(|expr| expr.clone().unalias_nested().data == key_column)
@@ -166,8 +189,8 @@ impl TableAggregate {
                 name
             )
         };
-        let projected_fields = projection.schema.inner().fields();
-        if projected_fields.find(COLUMN_NAME_OP).is_some() {
+        let output_schema = Arc::clone(projection.schema.inner());
+        if output_schema.fields().find(COLUMN_NAME_OP).is_some() {
             streamling_user_bail!(
                 "table_agg '{}': the SQL output cannot contain a '{}' column",
                 name,
@@ -175,9 +198,10 @@ impl TableAggregate {
             );
         }
 
+        let stored_schema = base.stored_schema();
         let input_schema = Arc::new(DFSchema::try_from_qualified_schema(
             qualifier,
-            base.schema.as_ref(),
+            stored_schema.as_ref(),
         )?);
         let compile = |expr: &Expr, schema: &DFSchemaRef| -> Result<Arc<dyn PhysicalExpr>> {
             let expr = Self::simplifier(session_state, schema).simplify(expr.clone())?;
@@ -190,7 +214,7 @@ impl TableAggregate {
                 Ok(LoweredAggregateBuilder::new(
                     &expr,
                     &input_schema,
-                    base.schema.as_ref(),
+                    stored_schema.as_ref(),
                     session_state.execution_props(),
                 )
                 .build()?
@@ -198,15 +222,19 @@ impl TableAggregate {
             })
             .collect::<Result<Vec<_>>>()?;
         let aggregate_schema = Arc::clone(aggregate.schema.inner());
-        // A group's value must fit the column the projection reads it from.
-        for (aggregate, field) in aggregates
+        let mut state_fields = vec![
+            Field::new(STATE_KEY, key_field.data_type().clone(), false),
+            Field::new(STATE_ROWS, DataType::UInt64, false),
+        ];
+        let mut state_columns = Vec::with_capacity(aggregates.len());
+        for (position, (aggregate, field)) in aggregates
             .iter()
             .zip(aggregate_schema.fields().iter().skip(1))
+            .enumerate()
         {
-            let data_type = aggregate
-                .create_sliding_accumulator()?
-                .evaluate()?
-                .data_type();
+            let mut empty = aggregate.create_sliding_accumulator()?;
+            // A group's value must fit the column the projection reads it from.
+            let data_type = empty.evaluate()?.data_type();
             if data_type != *field.data_type() {
                 streamling_bail!(
                     "table_agg '{}': {} evaluates to {}, but its column is {}",
@@ -216,29 +244,26 @@ impl TableAggregate {
                     field.data_type()
                 );
             }
+            // The sliding accumulator's state can differ from the one
+            // `state_fields` describes, so its types come from an empty one.
+            let start = state_fields.len();
+            for (index, value) in empty.state()?.iter().enumerate() {
+                state_fields.push(Field::new(
+                    format!("{position}_{index}"),
+                    value.data_type(),
+                    true,
+                ));
+            }
+            state_columns.push(start..state_fields.len());
         }
-        let output_schema = Arc::new(Schema::new(
-            projected_fields
-                .iter()
-                .cloned()
-                .chain([Arc::new(Field::new(COLUMN_NAME_OP, DataType::Utf8, false))])
-                .collect::<Fields>(),
-        ));
-        let output = Arc::new(InMemoryTable::try_new(
-            name,
-            &output_schema,
-            &[projected_fields[key_position].name().clone()],
-            metric_metadata_id,
-            DEFAULT_MAX_DEAD_RATIO,
-            None,
-            base.retention().clone(),
-        )?);
         let converter = RowConverter::new(vec![SortField::new(key_field.data_type().clone())])
             .map_err(|e| {
                 streamling_user_err!("table_agg '{}': unsupported key type: {}", name, e)
             })?;
         let aggregate = Self {
             name: name.to_string(),
+            sql: sql.to_string(),
+            metric_metadata_id,
             filter: filter_expr
                 .map(|expr| compile(expr, &input_schema))
                 .transpose()?,
@@ -256,8 +281,9 @@ impl TableAggregate {
                 .collect::<Result<_>>()?,
             aggregate_schema,
             output_schema,
-            output,
-            groups: Mutex::new(HashMap::new()),
+            output_key,
+            state_schema: Arc::new(Schema::new(state_fields)),
+            state_columns,
         };
         Ok((aggregate, base))
     }
@@ -276,7 +302,7 @@ impl TableAggregate {
     fn base_table(
         input: &LogicalPlan,
         tables: &TableRegistry,
-    ) -> Option<(TableReference, Arc<InMemoryTable>)> {
+    ) -> Option<(TableReference, Arc<TableStore>)> {
         let LogicalPlan::SubqueryAlias(alias) = input else {
             return None;
         };
@@ -284,7 +310,9 @@ impl TableAggregate {
             LogicalPlan::SubqueryAlias(inner) => inner.alias.to_string(),
             _ => alias.alias.to_string(),
         };
-        tables.get(&table).map(|table| (alias.alias.clone(), table))
+        tables
+            .store(&table)
+            .map(|store| (alias.alias.clone(), store))
     }
 
     /// A row the table removes must pass the filter and land in the group it
@@ -374,10 +402,82 @@ impl TableAggregate {
         )
     }
 
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn metric_metadata_id(&self) -> &str {
+        &self.metric_metadata_id
+    }
+
+    fn output_namespace(&self) -> String {
+        let [output, _] = namespaces(&self.name);
+        output
+    }
+
+    fn state_namespace(&self) -> String {
+        let [_, state] = namespaces(&self.name);
+        state
+    }
+
+    fn output_key_name(&self) -> &String {
+        self.output_schema.field(self.output_key).name()
+    }
+
+    /// The output namespace, then the state namespace.
+    pub(super) fn namespace_specs(&self) -> [NamespaceSpec; 2] {
+        [
+            NamespaceSpec {
+                name: self.output_namespace(),
+                schema: Arc::clone(&self.output_schema),
+                key: vec![self.output_key_name().clone()],
+                versioned: true,
+                range_column: None,
+            },
+            NamespaceSpec {
+                name: self.state_namespace(),
+                schema: Arc::clone(&self.state_schema),
+                key: vec![STATE_KEY.to_string()],
+                versioned: false,
+                range_column: None,
+            },
+        ]
+    }
+
+    /// Changes when the SQL or the stored shapes do, which a stored state
+    /// can't be read back with.
+    pub(super) fn fingerprint(&self) -> String {
+        format!(
+            "{}\n{}\n{}",
+            self.sql,
+            fingerprint(&self.output_schema, &[self.output_key_name().clone()]),
+            fingerprint(&self.state_schema, &[STATE_KEY.to_string()])
+        )
+    }
+
+    /// The lookups' view of the output, on `store`'s backend.
+    fn output_table(&self, store: &TableStore) -> Result<Table> {
+        Table::try_new(
+            &self.name,
+            &self.output_namespace(),
+            Arc::clone(store.backend()),
+            Arc::clone(&self.output_schema),
+            &[self.output_key_name().clone()],
+            None,
+            store.retention(),
+        )
+    }
+
     /// Retracts `removed` and adds `added`, rows of the table's stored schema
-    /// that stopped and started being live, then applies the changed groups
-    /// to `output`: an update, or a delete for a group left without rows.
-    pub(super) fn update(&self, removed: &RecordBatch, added: &RecordBatch) -> Result<()> {
+    /// that stopped and started being live, in `transaction`: the changed
+    /// groups' states and output rows are updated, and a group left without
+    /// rows is deleted.
+    pub(super) async fn apply(
+        &self,
+        transaction: &mut dyn TableTransaction,
+        removed: &RecordBatch,
+        added: &RecordBatch,
+    ) -> Result<()> {
         let removed = self.group_inputs(removed)?;
         let added = self.group_inputs(added)?;
         // Each changed group's rows in `removed` and in `added`.
@@ -387,32 +487,64 @@ impl TableAggregate {
                 changes.entry(key.data()).or_default()[side].push(row as u32);
             }
         }
-        if changes.is_empty() {
-            return Ok(());
+        let changes: Vec<(&[u8], [Vec<u32>; 2])> = changes.into_iter().collect();
+        for groups in changes.chunks(GROUPS_PER_READ) {
+            self.apply_groups(transaction, groups, &removed, &added)
+                .await?;
         }
+        Ok(())
+    }
 
-        let mut groups = self.groups.lock();
-        let mut keys = Vec::with_capacity(changes.len());
+    /// Updates `groups`, each with its rows in `removed` and in `added`.
+    async fn apply_groups(
+        &self,
+        transaction: &mut dyn TableTransaction,
+        groups: &[(&[u8], [Vec<u32>; 2])],
+        removed: &GroupInputs,
+        added: &GroupInputs,
+    ) -> Result<()> {
+        let parser = self.converter.parser();
+        let mut keys = self
+            .converter
+            .convert_rows(groups.iter().map(|(key, _)| parser.parse(key)))
+            .streamling_context("failed to decode the group keys")?;
+        let keys = keys.remove(0);
+        let key_schema = Arc::new(self.state_schema.project(&[0])?);
+        let stored = transaction
+            .get(
+                &self.state_namespace(),
+                &RecordBatch::try_new(key_schema, vec![Arc::clone(&keys)])?,
+            )
+            .await?;
+        let stored_rows = stored
+            .rows
+            .column(STATE_ROWS_INDEX)
+            .as_primitive::<UInt64Type>();
+
         let mut values: Vec<Vec<ScalarValue>> =
-            vec![Vec::with_capacity(changes.len()); self.aggregates.len()];
-        let mut ops = Vec::with_capacity(changes.len());
-        for (key, [removed_rows, added_rows]) in changes {
-            let group = match groups.entry(key.into()) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(_) if !removed_rows.is_empty() => {
-                    streamling_bail!(
-                        "table_agg '{}': retracted rows from a group it doesn't have",
-                        self.name
-                    )
-                }
-                Entry::Vacant(entry) => entry.insert(self.new_group()?),
-            };
+            vec![Vec::with_capacity(groups.len()); self.aggregates.len()];
+        let mut rows = Vec::with_capacity(groups.len());
+        let mut states: Vec<Vec<ScalarValue>> = vec![
+            Vec::with_capacity(groups.len());
+            self.state_schema.fields().len()
+                - STATE_VALUES_INDEX
+        ];
+        for (group, (_, [removed_rows, added_rows])) in groups.iter().enumerate() {
+            let found = stored.found.value(group);
+            // A row can be added and removed in one apply, such as one the
+            // window evicts as it arrives.
+            if !found && removed_rows.len() > added_rows.len() {
+                streamling_bail!(
+                    "table_agg '{}': retracted rows from a group it doesn't have",
+                    self.name
+                );
+            }
             let (removed_rows, added_rows) = (
-                UInt32Array::from(removed_rows),
-                UInt32Array::from(added_rows),
+                UInt32Array::from(removed_rows.clone()),
+                UInt32Array::from(added_rows.clone()),
             );
-            for ((accumulator, removed_arguments), added_arguments) in group
-                .accumulators
+            let mut accumulators = self.accumulators(&stored.rows, found.then_some(group))?;
+            for ((accumulator, removed_arguments), added_arguments) in accumulators
                 .iter_mut()
                 .zip(&removed.arguments)
                 .zip(&added.arguments)
@@ -425,7 +557,8 @@ impl TableAggregate {
                         .retract_batch(&Self::take_rows(removed_arguments, &removed_rows)?)?;
                 }
             }
-            group.rows = (group.rows + added_rows.len() as u64)
+            let group_rows = if found { stored_rows.value(group) } else { 0 };
+            let group_rows = (group_rows + added_rows.len() as u64)
                 .checked_sub(removed_rows.len() as u64)
                 .ok_or_else(|| {
                     streamling_err!(
@@ -433,31 +566,63 @@ impl TableAggregate {
                         self.name
                     )
                 })?;
-            for (values, accumulator) in values.iter_mut().zip(&mut group.accumulators) {
+            for (values, accumulator) in values.iter_mut().zip(&mut accumulators) {
                 values.push(accumulator.evaluate()?);
             }
-            if group.rows == 0 {
-                groups.remove(key);
-                ops.push(OP_DELETE);
-            } else {
-                ops.push(OP_UPDATE);
+            rows.push(group_rows);
+            if group_rows > 0 {
+                let mut state = states.iter_mut();
+                for accumulator in &mut accumulators {
+                    for value in accumulator.state()? {
+                        state
+                            .next()
+                            .expect("the state schema has a column per state value")
+                            .push(value);
+                    }
+                }
             }
-            keys.push(key);
         }
 
-        let parser = self.converter.parser();
-        let mut columns = self
-            .converter
-            .convert_rows(keys.iter().map(|key| parser.parse(key)))
-            .streamling_context("failed to decode the group keys")?;
-        for values in values {
-            columns.push(ScalarValue::iter_to_array(values)?);
+        let live = BooleanArray::from_iter(rows.iter().map(|&rows| Some(rows > 0)));
+        let deleted = arrow::compute::not(&live)?;
+        let mut state_columns = vec![
+            filter(&keys, &live)?,
+            filter(&UInt64Array::from(rows), &live)?,
+        ];
+        for (values, field) in states
+            .into_iter()
+            .zip(self.state_schema.fields().iter().skip(STATE_VALUES_INDEX))
+        {
+            state_columns.push(Self::to_array(values, field.data_type())?);
+        }
+        let state_upserts = RecordBatch::try_new(Arc::clone(&self.state_schema), state_columns)
+            .streamling_with_context(|| {
+                format!("table_agg '{}': invalid group states", self.name)
+            })?;
+        let deleted_keys = filter(&keys, &deleted)?;
+        transaction
+            .write(
+                &self.state_namespace(),
+                &state_upserts,
+                &RecordBatch::try_new(
+                    Arc::new(self.state_schema.project(&[0])?),
+                    vec![Arc::clone(&deleted_keys)],
+                )?,
+            )
+            .await?;
+
+        let mut columns = vec![keys];
+        for (values, field) in values
+            .into_iter()
+            .zip(self.aggregate_schema.fields().iter().skip(1))
+        {
+            columns.push(Self::to_array(values, field.data_type())?);
         }
         let aggregated = RecordBatch::try_new(Arc::clone(&self.aggregate_schema), columns)
             .streamling_with_context(|| {
                 format!("table_agg '{}': invalid group values", self.name)
             })?;
-        let mut columns = self
+        let columns = self
             .projection
             .iter()
             .map(|expr| {
@@ -465,32 +630,57 @@ impl TableAggregate {
                     .into_array(aggregated.num_rows())
             })
             .collect::<datafusion::common::Result<Vec<_>>>()?;
-        columns.push(Arc::new(StringArray::from(ops)));
-        let changelog = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
+        let output = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
             .streamling_with_context(|| format!("table_agg '{}': invalid output", self.name))?;
-        self.output.write(&changelog)
+        let output_key_schema = Arc::new(self.output_schema.project(&[self.output_key])?);
+        transaction
+            .write(
+                &self.output_namespace(),
+                &filter_record_batch(&output, &live)?,
+                &RecordBatch::try_new(
+                    output_key_schema,
+                    vec![filter(output.column(self.output_key), &deleted)?],
+                )?,
+            )
+            .await?;
+        Ok(())
     }
 
-    /// Starts an apply of the table's batch on `output`.
-    pub(super) fn begin(&self) {
-        self.output.begin();
+    /// Fresh accumulators, restored from the state at `row` of `stored`
+    /// when the group has one.
+    fn accumulators(
+        &self,
+        stored: &RecordBatch,
+        row: Option<usize>,
+    ) -> Result<Vec<Box<dyn Accumulator>>> {
+        self.aggregates
+            .iter()
+            .zip(&self.state_columns)
+            .map(|(aggregate, columns)| {
+                let mut accumulator = aggregate.create_sliding_accumulator()?;
+                if let Some(row) = row {
+                    let state: Vec<ArrayRef> = stored.columns()[columns.clone()]
+                        .iter()
+                        .map(|column| column.slice(row, 1))
+                        .collect();
+                    accumulator.merge_batch(&state)?;
+                }
+                Ok(accumulator)
+            })
+            .collect()
     }
 
-    /// Finishes the table's apply of a batch that carried the markers of
-    /// `epochs` on `output`. Called under the table's lock, with the table's
-    /// own mark.
-    pub(super) fn finish(&self, epochs: &[CheckpointEpoch]) -> Marks {
-        self.output.finish(epochs)
-    }
-
-    pub(super) fn record_gauges(&self) {
-        self.output.record_gauges();
+    fn to_array(values: Vec<ScalarValue>, data_type: &DataType) -> Result<ArrayRef> {
+        if values.is_empty() {
+            return Ok(new_empty_array(data_type));
+        }
+        Ok(ScalarValue::iter_to_array(values)?)
     }
 
     /// The rows of `batch` that count: those the filter keeps, without a
     /// NULL key, which lookups can't find. Their keys are encoded as bytes
-    /// for the group map, next to each aggregate's evaluated arguments, in
-    /// the shape `update_batch` and `retract_batch` take.
+    /// for grouping, next to each aggregate's evaluated arguments, in the
+    /// shape `update_batch` and `retract_batch` take.
     fn group_inputs(&self, batch: &RecordBatch) -> Result<GroupInputs> {
         let batch = match &self.filter {
             Some(filter) => {
@@ -536,27 +726,27 @@ impl TableAggregate {
             .map(|column| take(column.as_ref(), rows, None))
             .collect::<std::result::Result<_, _>>()?)
     }
+}
 
-    fn new_group(&self) -> Result<Group> {
-        Ok(Group {
-            rows: 0,
-            accumulators: self
-                .aggregates
-                .iter()
-                .map(|aggregate| aggregate.create_sliding_accumulator())
-                .collect::<datafusion::common::Result<_>>()?,
-        })
+impl std::fmt::Debug for TableAggregate {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("TableAggregate")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoints::checkpoint_management::CheckpointEpoch;
     use crate::data::COLUMN_NAME_OP;
     use crate::dynamic_table::DynamicTableRegistry;
     use crate::session::SessionManager;
-    use crate::table::{InMemoryTable, Mark, VersionRetention, WindowConfig};
-    use crate::topology::DEFAULT_MAX_DEAD_RATIO;
+    use crate::table::backend::TableBackend;
+    use crate::table::in_memory::InMemoryBackend;
+    use crate::table::testing::{MAX_DEAD_RATIO, store_on};
+    use crate::table::{JournalTrim, Mark, Marks, OnSchemaChange, VersionRetention, WindowConfig};
     use arrow::array::{
         Array, ArrayRef, AsArray, Decimal128Array, Float64Array, Int64Array, LargeBinaryArray,
         RecordBatch, StringArray,
@@ -584,7 +774,7 @@ mod tests {
     /// and as a view of its SQL.
     struct Fixture {
         session_manager: SessionManager,
-        base: Arc<InMemoryTable>,
+        base: Arc<TableStore>,
         /// The table's SQL output schema, `_gs_op` included.
         input_schema: SchemaRef,
     }
@@ -599,6 +789,18 @@ mod tests {
             amount: Field,
             window: Option<&str>,
             retention: VersionRetention,
+        ) -> Self {
+            let backend = Arc::new(InMemoryBackend::try_new(BASE, MAX_DEAD_RATIO).unwrap());
+            Self::on_backend(amount, window, retention, backend).await
+        }
+
+        /// The table on `backend`, which may hold what another fixture
+        /// wrote, as after a restart.
+        async fn on_backend(
+            amount: Field,
+            window: Option<&str>,
+            retention: VersionRetention,
+            backend: Arc<dyn TableBackend>,
         ) -> Self {
             let session_manager =
                 SessionManager::new(100, 10, DynamicTableRegistry::new(), 1).unwrap();
@@ -620,22 +822,23 @@ mod tests {
             let input_schema = Arc::clone(plan.schema().inner());
             let session_state = session_manager.session_state();
             let base = Arc::new(
-                InMemoryTable::try_new(
+                store_on(
                     BASE,
                     &input_schema,
-                    &["id".to_string()],
-                    format!("app::{BASE}"),
-                    DEFAULT_MAX_DEAD_RATIO,
+                    &["id"],
                     window.map(|predicate| WindowConfig {
                         predicate,
                         session_state: &session_state,
                         gc_interval: Duration::ZERO,
                     }),
                     retention,
+                    JournalTrim::OnFinalize,
+                    OnSchemaChange::Fail,
+                    backend,
                 )
                 .unwrap(),
             );
-            session_manager.tables().register(Arc::clone(&base));
+            session_manager.tables().register_store(Arc::clone(&base));
             session_manager
                 .register_table(BASE, Arc::new(ViewTable::new(plan, None)))
                 .unwrap();
@@ -651,16 +854,21 @@ mod tests {
         }
 
         async fn register(&self, sql: &str) -> Result<()> {
+            self.register_as(AGGREGATE, sql).await
+        }
+
+        async fn register_as(&self, name: &str, sql: &str) -> Result<()> {
             let plan = self
                 .session_manager
                 .create_logical_plan(sql.to_string())
                 .await?;
             register(
-                AGGREGATE,
+                name,
+                sql,
                 &plan,
                 self.session_manager.tables(),
                 &self.session_manager.session_state(),
-                format!("app::{AGGREGATE}"),
+                format!("app::{name}"),
             )
         }
 
@@ -672,22 +880,22 @@ mod tests {
         }
 
         /// Applies `(id, address, amount, _gs_op)` rows to the base table.
-        fn apply(&self, rows: &[(i64, Option<&str>, Option<i64>, &str)]) {
-            self.apply_marked(rows, &[]);
+        async fn apply(&self, rows: &[(i64, Option<&str>, Option<i64>, &str)]) {
+            self.apply_marked(rows, &[]).await;
         }
 
         /// Applies a batch that carried the markers of `epochs`, and returns
         /// the marks its readers see.
-        fn apply_marked(
+        async fn apply_marked(
             &self,
             rows: &[(i64, Option<&str>, Option<i64>, &str)],
             epochs: &[u64],
         ) -> Marks {
             let amounts: ArrayRef = Arc::new(Int64Array::from_iter(rows.iter().map(|row| row.2)));
-            self.apply_columns(rows, amounts, epochs)
+            self.apply_columns(rows, amounts, epochs).await
         }
 
-        fn apply_decimals(&self, rows: &[(i64, Option<&str>, Option<&str>, &str)]) {
+        async fn apply_decimals(&self, rows: &[(i64, Option<&str>, Option<&str>, &str)]) {
             let mut amounts = DecimalArbArrayBuilder::with_capacity(
                 rows.len(),
                 "amount",
@@ -706,10 +914,10 @@ mod tests {
                 .iter()
                 .map(|row| (row.0, row.1, None::<i64>, row.3))
                 .collect();
-            self.apply_columns(&rows, Arc::new(amounts), &[]);
+            self.apply_columns(&rows, Arc::new(amounts), &[]).await;
         }
 
-        fn apply_columns(
+        async fn apply_columns(
             &self,
             rows: &[(i64, Option<&str>, Option<i64>, &str)],
             amounts: ArrayRef,
@@ -727,7 +935,7 @@ mod tests {
             .unwrap();
             let epochs: Vec<CheckpointEpoch> =
                 epochs.iter().copied().map(CheckpointEpoch).collect();
-            self.base.apply(&batch, &epochs).unwrap()
+            self.base.apply(&batch, &epochs).await.unwrap()
         }
 
         fn lookup(&self, keys: &[&str], column: &str) -> ArrayRef {
@@ -806,11 +1014,13 @@ mod tests {
             .await
             .unwrap();
 
-        fixture.apply(&[
-            (1, Some("a"), Some(10), "i"),
-            (2, Some("a"), Some(5), "i"),
-            (3, Some("b"), Some(7), "i"),
-        ]);
+        fixture
+            .apply(&[
+                (1, Some("a"), Some(10), "i"),
+                (2, Some("a"), Some(5), "i"),
+                (3, Some("b"), Some(7), "i"),
+            ])
+            .await;
 
         assert_eq!(
             fixture.ints(&["a", "b", "c"], "total"),
@@ -827,7 +1037,9 @@ mod tests {
     async fn lookup_row_and_lookup_exists_read_the_groups() {
         let fixture = Fixture::with_int_amounts(None).await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
-        fixture.apply(&[(1, Some("a"), Some(10), "i"), (2, Some("a"), Some(5), "i")]);
+        fixture
+            .apply(&[(1, Some("a"), Some(10), "i"), (2, Some("a"), Some(5), "i")])
+            .await;
 
         let batches = fixture
             .session_manager
@@ -858,18 +1070,22 @@ mod tests {
     async fn upserts_and_deletes_retract_the_rows_they_replace() {
         let fixture = Fixture::with_int_amounts(None).await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
-        fixture.apply(&[
-            (1, Some("a"), Some(10), "i"),
-            (2, Some("a"), Some(5), "i"),
-            (3, Some("b"), Some(7), "i"),
-        ]);
+        fixture
+            .apply(&[
+                (1, Some("a"), Some(10), "i"),
+                (2, Some("a"), Some(5), "i"),
+                (3, Some("b"), Some(7), "i"),
+            ])
+            .await;
 
         // 3 moves from b to a, which empties b.
-        fixture.apply(&[
-            (1, Some("a"), Some(20), "u"),
-            (2, None, None, "d"),
-            (3, Some("a"), Some(1), "u"),
-        ]);
+        fixture
+            .apply(&[
+                (1, Some("a"), Some(20), "u"),
+                (2, None, None, "d"),
+                (3, Some("a"), Some(1), "u"),
+            ])
+            .await;
 
         assert_eq!(fixture.ints(&["a", "b"], "total"), [Some(21), None]);
         assert_eq!(fixture.ints(&["a", "b"], "n"), [Some(2), None]);
@@ -880,12 +1096,14 @@ mod tests {
         let fixture = Fixture::with_int_amounts(None).await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
 
-        fixture.apply(&[
-            (1, Some("a"), Some(10), "i"),
-            (1, Some("a"), Some(30), "u"),
-            (2, Some("b"), Some(4), "i"),
-            (2, None, None, "d"),
-        ]);
+        fixture
+            .apply(&[
+                (1, Some("a"), Some(10), "i"),
+                (1, Some("a"), Some(30), "u"),
+                (2, Some("b"), Some(4), "i"),
+                (2, None, None, "d"),
+            ])
+            .await;
 
         assert_eq!(fixture.ints(&["a", "b"], "total"), [Some(30), None]);
         assert_eq!(fixture.ints(&["a", "b"], "n"), [Some(1), None]);
@@ -898,14 +1116,16 @@ mod tests {
             .register("SELECT address, sum(amount) AS total, count(*) AS n FROM transfers WHERE amount > 5 GROUP BY address")
             .await
             .unwrap();
-        fixture.apply(&[(1, Some("a"), Some(3), "i"), (2, Some("a"), Some(10), "i")]);
+        fixture
+            .apply(&[(1, Some("a"), Some(3), "i"), (2, Some("a"), Some(10), "i")])
+            .await;
         assert_eq!(fixture.ints(&["a"], "total"), [Some(10)]);
 
         // Removing a row the filter rejected retracts nothing.
-        fixture.apply(&[(1, None, None, "d")]);
+        fixture.apply(&[(1, None, None, "d")]).await;
         assert_eq!(fixture.ints(&["a"], "n"), [Some(1)]);
 
-        fixture.apply(&[(2, Some("a"), Some(4), "u")]);
+        fixture.apply(&[(2, Some("a"), Some(4), "u")]).await;
         assert_eq!(fixture.ints(&["a"], "n"), [None]);
     }
 
@@ -917,7 +1137,7 @@ mod tests {
             .await
             .unwrap();
 
-        fixture.apply(&[(1, Some("a"), None, "i")]);
+        fixture.apply(&[(1, Some("a"), None, "i")]).await;
 
         assert_eq!(fixture.ints(&["a"], "total"), [None]);
         assert_eq!(fixture.ints(&["a"], "counted"), [Some(0)]);
@@ -929,8 +1149,10 @@ mod tests {
         let fixture = Fixture::with_int_amounts(None).await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
 
-        fixture.apply(&[(1, None, Some(5), "i"), (2, Some("a"), Some(1), "i")]);
-        fixture.apply(&[(1, None, None, "d")]);
+        fixture
+            .apply(&[(1, None, Some(5), "i"), (2, Some("a"), Some(1), "i")])
+            .await;
+        fixture.apply(&[(1, None, None, "d")]).await;
 
         assert_eq!(fixture.ints(&["a"], "total"), [Some(1)]);
     }
@@ -942,7 +1164,9 @@ mod tests {
 
         // A GC pass runs at the end of an apply, so it evicts the apply's rows
         // too.
-        fixture.apply(&[(1, Some("a"), Some(5), "i"), (2, Some("a"), Some(20), "i")]);
+        fixture
+            .apply(&[(1, Some("a"), Some(5), "i"), (2, Some("a"), Some(20), "i")])
+            .await;
         assert_eq!(fixture.ints(&["a"], "total"), [Some(20)]);
         assert_eq!(fixture.ints(&["a"], "n"), [Some(1)]);
     }
@@ -961,7 +1185,7 @@ mod tests {
             (5, 10, 1),
             (6, 125, 2),
         ] {
-            fixture.apply(&[(id, Some("a"), Some(amount), "i")]);
+            fixture.apply(&[(id, Some("a"), Some(amount), "i")]).await;
             assert_eq!(
                 fixture.ints(&["a"], "n"),
                 [Some(expected)],
@@ -981,7 +1205,7 @@ mod tests {
         let fixture = Fixture::with_retention(
             Field::new("amount", DataType::Int64, true),
             window,
-            VersionRetention::PerBatch,
+            VersionRetention::Journal,
         )
         .await;
         fixture.register(SUM_AND_COUNT).await.unwrap();
@@ -1001,12 +1225,14 @@ mod tests {
             (5, 10, 1),
             (6, 125, 2),
         ];
-        let marks: Vec<Marks> = applies
-            .iter()
-            .map(|(id, amount, _)| {
-                fixture.apply_marked(&[(*id, Some("a"), Some(*amount), "i")], &[])
-            })
-            .collect();
+        let mut marks: Vec<Marks> = Vec::new();
+        for (id, amount, _) in applies {
+            marks.push(
+                fixture
+                    .apply_marked(&[(id, Some("a"), Some(amount), "i")], &[])
+                    .await,
+            );
+        }
         for ((_, amount, expected), marks) in applies.iter().zip(&marks) {
             assert_eq!(
                 fixture.ints_at(&["a"], "n", marks),
@@ -1020,9 +1246,15 @@ mod tests {
     #[tokio::test]
     async fn a_removed_group_reads_as_missing_in_between() {
         let fixture = versioned_fixture(None).await;
-        let inserted = fixture.apply_marked(&[(1, Some("a"), Some(5), "i")], &[]);
-        let deleted = fixture.apply_marked(&[(1, Some("a"), Some(5), "d")], &[]);
-        let reinserted = fixture.apply_marked(&[(2, Some("a"), Some(7), "i")], &[]);
+        let inserted = fixture
+            .apply_marked(&[(1, Some("a"), Some(5), "i")], &[])
+            .await;
+        let deleted = fixture
+            .apply_marked(&[(1, Some("a"), Some(5), "d")], &[])
+            .await;
+        let reinserted = fixture
+            .apply_marked(&[(2, Some("a"), Some(7), "i")], &[])
+            .await;
 
         assert_eq!(fixture.ints_at(&["a"], "total", &inserted), [Some(5)]);
         assert_eq!(fixture.ints_at(&["a"], "total", &deleted), [None]);
@@ -1057,11 +1289,15 @@ mod tests {
         // Far above the epochs other tests record.
         const EPOCH: u64 = 2_000_000;
         let fixture = versioned_fixture(None).await;
-        let first = fixture.apply_marked(&[(1, Some("a"), Some(5), "i")], &[]);
-        let second = fixture.apply_marked(&[(1, Some("a"), Some(6), "u")], &[EPOCH]);
+        let first = fixture
+            .apply_marked(&[(1, Some("a"), Some(5), "i")], &[])
+            .await;
+        let second = fixture
+            .apply_marked(&[(1, Some("a"), Some(6), "u")], &[EPOCH])
+            .await;
         finalize(EPOCH);
 
-        fixture.apply_marked(&[], &[]);
+        fixture.apply_marked(&[], &[]).await;
 
         assert_aggregate_collected(&fixture, &first);
         assert_eq!(fixture.ints_at(&["a"], "total", &second), [Some(6)]);
@@ -1077,7 +1313,7 @@ mod tests {
     /// the others, as a topic keyed by id would place them; group `a` gets
     /// rows from both. `epochs`' markers ride partition 1's first batch and
     /// partition 0's second.
-    fn apply_two_partitions(fixture: &Fixture, epochs: &[u64]) -> Vec<Marks> {
+    async fn apply_two_partitions(fixture: &Fixture, epochs: &[u64]) -> Vec<Marks> {
         let batches: [(&[Row], &[u64]); 6] = [
             (
                 &[(1, Some("a"), Some(10), "i"), (2, Some("b"), Some(20), "i")],
@@ -1098,10 +1334,11 @@ mod tests {
             (&[(6, Some("b"), Some(100), "i")], &[]),
             (&[(4, None, None, "d")], &[]),
         ];
-        batches
-            .into_iter()
-            .map(|(rows, epochs)| fixture.apply_marked(rows, epochs))
-            .collect()
+        let mut marks = Vec::new();
+        for (rows, epochs) in batches {
+            marks.push(fixture.apply_marked(rows, epochs).await);
+        }
+        marks
     }
 
     /// Asserts that the aggregate, as a reader of the batch that returned
@@ -1113,9 +1350,14 @@ mod tests {
         let base_mark = mark_of(marks, BASE);
         let addresses = fixture
             .base
+            .table()
             .lookup(&[Arc::clone(&ids)], "address", base_mark)
             .unwrap();
-        let amounts = fixture.base.lookup(&[ids], "amount", base_mark).unwrap();
+        let amounts = fixture
+            .base
+            .table()
+            .lookup(&[ids], "amount", base_mark)
+            .unwrap();
         let mut expected: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
         for (address, amount) in addresses
             .as_string::<i32>()
@@ -1149,7 +1391,7 @@ mod tests {
     #[tokio::test]
     async fn the_aggregate_and_its_table_agree_after_every_batch_across_partitions() {
         let fixture = versioned_fixture(None).await;
-        for marks in apply_two_partitions(&fixture, &[]) {
+        for marks in apply_two_partitions(&fixture, &[]).await {
             assert_matches_the_table_at(&fixture, &marks);
         }
     }
@@ -1161,11 +1403,11 @@ mod tests {
         // Far above the epochs other tests record.
         const EPOCH: u64 = 3_000_000;
         let fixture = versioned_fixture(None).await;
-        // The cut is partition 1's first batch's mark, so reads from it on
+        // The horizon is partition 1's first batch's mark, so reads from it on
         // still work.
-        let marks = apply_two_partitions(&fixture, &[EPOCH]);
+        let marks = apply_two_partitions(&fixture, &[EPOCH]).await;
         finalize(EPOCH);
-        let next = fixture.apply_marked(&[], &[]);
+        let next = fixture.apply_marked(&[], &[]).await;
 
         assert_aggregate_collected(&fixture, &marks[0]);
         for marks in marks[1..].iter().chain([&next]) {
@@ -1181,7 +1423,9 @@ mod tests {
             .await
             .unwrap();
 
-        fixture.apply(&[(1, Some("A"), Some(1), "i"), (2, Some("a"), Some(2), "i")]);
+        fixture
+            .apply(&[(1, Some("A"), Some(1), "i"), (2, Some("a"), Some(2), "i")])
+            .await;
 
         assert_eq!(fixture.ints(&["a", "A"], "doubled"), [Some(6), None]);
     }
@@ -1197,13 +1441,17 @@ mod tests {
             .register("SELECT address, sum(amount) AS total, avg(amount) AS mean FROM transfers GROUP BY address")
             .await
             .unwrap();
-        fixture.apply_decimals(&[
-            (1, Some("a"), Some("1.10"), "i"),
-            (2, Some("a"), Some("2.20"), "i"),
-        ]);
+        fixture
+            .apply_decimals(&[
+                (1, Some("a"), Some("1.10"), "i"),
+                (2, Some("a"), Some("2.20"), "i"),
+            ])
+            .await;
         assert_eq!(fixture.decimals(&["a"], "total"), [decimal("3.30")]);
 
-        fixture.apply_decimals(&[(1, Some("a"), Some("0.05"), "u"), (2, None, None, "d")]);
+        fixture
+            .apply_decimals(&[(1, Some("a"), Some("0.05"), "u"), (2, None, None, "d")])
+            .await;
 
         assert_eq!(fixture.decimals(&["a"], "total"), [decimal("0.05")]);
     }
@@ -1236,7 +1484,7 @@ mod tests {
                     rows.push((id, address, amount, "u"));
                 }
             }
-            fixture.apply(&rows);
+            fixture.apply(&rows).await;
             // The apply's GC pass evicts what it left outside.
             live.retain(|_, (_, amount)| amount.is_some_and(|amount| amount >= WINDOW_MIN_AMOUNT));
 
@@ -1404,6 +1652,7 @@ mod tests {
                 .unwrap();
             let (aggregate, _) = TableAggregate::try_new(
                 AGGREGATE,
+                ROUND_TRIP,
                 &plan,
                 fixture.session_manager.tables(),
                 &session_state,
@@ -1458,5 +1707,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A restart on a store that kept its rows: an unchanged aggregate keeps
+    /// its groups, a new one is rebuilt from the table's rows, and a removed
+    /// one's namespaces are dropped.
+    #[tokio::test]
+    async fn a_restart_rebuilds_new_aggregates_and_drops_removed_ones() {
+        const KEPT: &str = "kept";
+        const REMOVED: &str = "removed";
+        const ADDED: &str = "added";
+        const COUNTS: &str = "SELECT address, count(*) AS n FROM transfers GROUP BY address";
+        let amount = || Field::new("amount", DataType::Int64, true);
+        let backend: Arc<dyn TableBackend> =
+            Arc::new(InMemoryBackend::try_new(BASE, MAX_DEAD_RATIO).unwrap());
+        let before = Fixture::on_backend(
+            amount(),
+            None,
+            VersionRetention::Journal,
+            Arc::clone(&backend),
+        )
+        .await;
+        before.register_as(KEPT, SUM_AND_COUNT).await.unwrap();
+        before.register_as(REMOVED, COUNTS).await.unwrap();
+        before
+            .apply(&[(1, Some("a"), Some(10), "i"), (2, Some("a"), Some(5), "i")])
+            .await;
+        drop(before);
+
+        let after = Fixture::on_backend(
+            amount(),
+            None,
+            VersionRetention::Journal,
+            Arc::clone(&backend),
+        )
+        .await;
+        after.register_as(KEPT, SUM_AND_COUNT).await.unwrap();
+        after.register_as(ADDED, COUNTS).await.unwrap();
+        after.base.start().await.unwrap();
+
+        let read = |name: &str, column: &str| {
+            let keys: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+            after
+                .session_manager
+                .tables()
+                .get(name)
+                .unwrap()
+                .lookup(&[keys], column, None)
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0)
+        };
+        assert_eq!(read(KEPT, "total"), 15);
+        assert_eq!(read(ADDED, "n"), 2, "rebuilt from the table");
+        let stored: Vec<String> = backend
+            .stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stats| stats.namespace)
+            .collect();
+        for namespace in namespaces(REMOVED) {
+            assert!(!stored.contains(&namespace), "{namespace} is dropped");
+        }
+
+        after.apply(&[(3, Some("a"), Some(1), "i")]).await;
+        assert_eq!((read(KEPT, "n"), read(ADDED, "n")), (3, 3));
     }
 }

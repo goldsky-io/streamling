@@ -39,7 +39,9 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 crossbeam.workspace = true
 once_cell.workspace = true
-parking_lot.workspace = true
+# `arc_lock` and `send_guard`: an in-memory table transaction holds its
+# store's write lock across the awaits of an apply.
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 delegate.workspace = true
 regex.workspace = true
 itertools.workspace = true

@@ -320,8 +320,11 @@ mod tests {
         topology::Transform::table(topology::TableTransform {
             backend_type: streamling_config::TableBackendType::InMemory,
             primary_key: "id".to_string(),
-            max_dead_ratio: topology::DEFAULT_MAX_DEAD_RATIO,
+            max_dead_ratio: None,
             window: None,
+            lookup_versions: Default::default(),
+            journal_trim: Default::default(),
+            on_schema_change: Default::default(),
             sql: sql.to_string(),
             telemetry: None,
         })
