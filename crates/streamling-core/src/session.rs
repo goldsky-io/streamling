@@ -7,14 +7,16 @@ use crate::types::bigint_sql_preprocessor::preprocess_bigint_sql;
 use crate::{streamling_err, streamling_user_err};
 use datafusion::catalog::memory::MemorySchemaProvider;
 use datafusion::catalog::{SchemaProvider, Session, TableProvider};
-use datafusion::common::{Column, config::ConfigExtension, extensions_options};
+use datafusion::common::{Column, DFSchema, config::ConfigExtension, extensions_options};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateDefaults;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{FunctionRegistry, SessionState, SessionStateBuilder};
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::planner::ExprPlanner;
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, col};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, cast, col};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
@@ -40,6 +42,25 @@ fn decimal_arb_expr_planners() -> Vec<Arc<dyn ExprPlanner>> {
     let mut planners: Vec<Arc<dyn ExprPlanner>> = vec![Arc::new(DecimalArbExprPlanner::new())];
     planners.extend(SessionStateDefaults::default_expr_planners());
     planners
+}
+
+/// Compiles `expr` over `schema` the way a query plan's expressions are compiled.
+/// `SessionState::create_physical_expr` only coerces types, and some functions, such as
+/// `arrow_cast`, fail if invoked before the simplifier rewrites them.
+pub fn create_simplified_physical_expr(
+    session_state: &SessionState,
+    expr: Expr,
+    schema: &DFSchema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let schema = Arc::new(schema.clone());
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::clone(&schema))
+            .with_config_options(Arc::clone(session_state.config_options()))
+            .build(),
+    );
+    let expr = simplifier.simplify(simplifier.coerce(expr, &schema)?)?;
+    session_state.create_physical_expr(expr, &schema)
 }
 
 /// SessionManager is a thin wrapper around a DataFusion SessionContext that provides
@@ -254,7 +275,7 @@ impl SessionManager {
         // Ensure _gs_op transparently propagates through SQL projections
         let logical_plan = Self::append_gs_op_to_projection_if_missing(logical_plan);
 
-        let logical_plan = self.declare_resolved_decimal_arb_fields(logical_plan)?;
+        let logical_plan = self.declare_resolved_fields(logical_plan)?;
 
         Self::validate_plan_and_extract_source_name(&logical_plan, SubqueryHandling::Recurse)
             .map(|name| (logical_plan, name))
@@ -274,10 +295,24 @@ impl SessionManager {
     /// on top of the declared plan. It passes the bytes through untouched, so it only changes the
     /// declared field. Likewise, a column declared with decimal_arb metadata it does not produce
     /// (a cast of decimal_arb to `BIGINT`, `DOUBLE`, `DECIMAL(p, s)` or `TEXT`) gets the metadata
-    /// dropped with `decimal_arb_strip_meta`. A plan that needs no relabelling is returned as is.
-    fn declare_resolved_decimal_arb_fields(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    /// dropped with `decimal_arb_strip_meta`.
+    ///
+    /// Any other column declared with a type it isn't produced with gets a cast to the produced
+    /// type. A UNION is declared with its first input's types, while execution coerces each
+    /// column to a type every input converts to: `Utf8` and `Utf8View` inputs give `Utf8View`.
+    /// The cast matches the column execution already produces, so it changes only the declared
+    /// field. A plan that needs no relabelling is returned as is.
+    fn declare_resolved_fields(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        // Resolve the plan as a node inside a pipeline produces it: `expand_views_at_output`
+        // only casts view types at the root of the plan being executed, which a transform isn't.
+        let mut state = self.ctx.state();
+        state
+            .config_mut()
+            .options_mut()
+            .optimizer
+            .expand_views_at_output = false;
         // A plan that cannot be resolved fails later with its usual context, not from here.
-        let Ok(resolved) = self.ctx.state().optimize(&plan) else {
+        let Ok(resolved) = state.optimize(&plan) else {
             return Ok(plan);
         };
         let declared = plan.schema();
@@ -302,16 +337,23 @@ impl SessionManager {
                     // lowered cast produces none. Drop it from the declared field, or a reader
                     // of the metadata alone would take an `Int64` or a `Utf8` for a
                     // decimal_arb. Only the `LargeBinary` storage can carry the metadata.
-                    if declared_field.data_type() != &arrow::datatypes::DataType::LargeBinary
+                    let strips_meta = declared_field.data_type()
+                        != &arrow::datatypes::DataType::LargeBinary
                         && DecimalArbType::without_decimal_arb_metadata(declared_field.metadata())
-                            .is_some()
-                    {
-                        relabelled = true;
-                        return strip_meta
-                            .call(vec![column])
-                            .alias_qualified(qualifier.cloned(), declared_field.name());
+                            .is_some();
+                    let casts = declared_field.data_type() != resolved_field.data_type();
+                    if !strips_meta && !casts {
+                        return column;
                     }
-                    return column;
+                    relabelled = true;
+                    let mut expr = column;
+                    if strips_meta {
+                        expr = strip_meta.call(vec![expr]);
+                    }
+                    if casts {
+                        expr = cast(expr, resolved_field.data_type().clone());
+                    }
+                    return expr.alias_qualified(qualifier.cloned(), declared_field.name());
                 };
                 let hint = DecimalArbType::native_int_kind_from_field(resolved_field)
                     .filter(|_| scale == 0);
@@ -949,6 +991,42 @@ mod tests {
                 expected_val,
                 "wrong result for `{sql}`"
             );
+        }
+    }
+
+    /// The SQL planner types a UNION's columns after its first input, while execution
+    /// coerces them to a type every input converts to: here `Utf8` and `CAST(.. AS VARCHAR)`'s
+    /// `Utf8View` give `Utf8View`. A transform must be declared with the latter, or a reader
+    /// that trusts the declared schema, such as a table's side output, gets batches that
+    /// don't match it.
+    #[tokio::test]
+    async fn union_is_declared_with_the_types_it_produces() {
+        use arrow::array::StringArray;
+        use datafusion::datasource::MemTable;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a"]))])
+                .unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        sm.register_table("t", Arc::new(table)).unwrap();
+
+        let sql = "SELECT name FROM t UNION ALL SELECT CAST(NULL AS VARCHAR) AS name FROM t";
+        let (plan, _) = sm.create_supported_logical_plan(sql.into()).await.unwrap();
+        // Executed as a node inside a pipeline, not as the root whose view types are
+        // expanded at output.
+        let mut state = sm.session_state();
+        state
+            .config_mut()
+            .options_mut()
+            .optimizer
+            .expand_views_at_output = false;
+        let batches = DataFrame::new(state, plan.clone()).collect().await.unwrap();
+
+        assert_eq!(plan.schema().field(0).data_type(), &DataType::Utf8View);
+        for batch in batches {
+            assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8View);
         }
     }
 
