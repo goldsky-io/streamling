@@ -949,3 +949,80 @@ sinks:
         "only rows with any member element should pass"
     );
 }
+
+/// A permanent query error (here 42883: `integer = text`) must fail the
+/// pipeline instead of retrying forever. The retry loop used to keep the pod
+/// Running with no output and no restarts, hiding the failure.
+#[tokio::test]
+async fn test_uncached_contains_permanent_error_fails_fast() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("failed to create test context");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("failed to register schema");
+    ctx.postgres
+        .execute("CREATE TABLE public.int_members (value INTEGER PRIMARY KEY)")
+        .await
+        .expect("failed to create backing table");
+    ctx.kafka
+        .produce_avro_records(&[record("member")])
+        .await
+        .expect("failed to produce record");
+
+    let pipeline_yaml = format!(
+        r#"
+sources:
+  input:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  membership:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: int_members
+    schema: public
+    column: value
+  matched:
+    type: sql
+    sql: "SELECT id FROM input WHERE dynamic_table_check('membership', id)"
+    primary_key: id
+
+sinks:
+  matched_output:
+    type: postgres
+    from: matched
+    table: int_members_output
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let output = ctx
+        .run_pipeline_raw(
+            &pipeline_yaml,
+            cached_postgres_opts(&ctx, 1, Duration::from_secs(30)),
+        )
+        .await
+        .expect("a permanent query error must fail instead of timing out");
+
+    assert!(
+        !output.status.success(),
+        "permanent query error should fail"
+    );
+    let logs = format!("{}\n{}", output.stdout, output.stderr);
+    assert!(
+        logs.contains("operator does not exist"),
+        "error should surface the Postgres cause:\n{logs}"
+    );
+}
