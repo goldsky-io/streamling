@@ -614,22 +614,8 @@ impl CheckpointControl {
             return Vec::new();
         };
         let expected: HashSet<String> = self.expected_sinks.lock().clone();
-        let mut pending: Vec<String> = {
-            let epochs = self.epochs.lock();
-            match epochs.get(&epoch) {
-                Some(EpochState::Finalized) => Vec::new(),
-                Some(EpochState::InProgress { acked_sinks, .. }) => expected
-                    .iter()
-                    .filter(|s| !acked_sinks.contains(*s))
-                    .cloned()
-                    .collect(),
-                // No acks yet (or the epoch is gone): every live sink is
-                // still outstanding.
-                Some(EpochState::Started { .. }) | None => expected.into_iter().collect(),
-            }
-        };
-        pending.sort();
-        pending
+        let epochs = self.epochs.lock();
+        unacked_sinks(epochs.get(&epoch), &expected)
     }
 
     /// Returns true if a terminal checkpoint was begun and has finalized.
@@ -644,6 +630,34 @@ impl CheckpointControl {
             None => false,
             Some(epoch) => matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized)),
         }
+    }
+}
+
+/// Expected sinks that have not acked an epoch in `state`, sorted. A missing
+/// epoch (no acks yet, or already removed) counts as unacked by every sink.
+fn unacked_sinks(state: Option<&EpochState>, expected: &HashSet<String>) -> Vec<String> {
+    let mut pending: Vec<String> = match state {
+        Some(EpochState::Finalized) => Vec::new(),
+        Some(EpochState::InProgress { acked_sinks, .. }) => expected
+            .iter()
+            .filter(|s| !acked_sinks.contains(*s))
+            .cloned()
+            .collect(),
+        Some(EpochState::Started { .. }) | None => expected.iter().cloned().collect(),
+    };
+    pending.sort();
+    pending
+}
+
+/// Count a failed epoch against every sink that never acked it, so a stuck
+/// sink is identifiable while `checkpoint_epochs_failed` stays one per epoch.
+fn record_unacked_by_sink(metrics_recorder: &ControlPlaneMetricsRecorder, sinks: &[String]) {
+    for sink_id in sinks {
+        metrics_recorder.record_count_w_tags(
+            "checkpoint_epochs_unacked_by_sink",
+            1,
+            vec![("sink_id", sink_id.as_str())],
+        );
     }
 }
 
@@ -801,7 +815,11 @@ impl CheckpointCoordinator {
                         }
 
                         // Record ack received metric
-                        metrics_recorder.record_count("checkpoint_acks_received", 1);
+                        metrics_recorder.record_count_w_tags(
+                            "checkpoint_acks_received",
+                            1,
+                            vec![("sink_id", sink_id.as_str())],
+                        );
 
                         let mut finalized_epoch_duration = None;
 
@@ -1136,6 +1154,7 @@ impl CheckpointCoordinator {
         // them (at-least-once preserved). The terminal epoch is exempt — its
         // lifecycle is owned by the shutdown path's bounded wait.
         let epochs = Arc::clone(&self.epochs);
+        let expected_sinks_timeout = Arc::clone(&expected_sinks);
         let running = Arc::clone(&self.running);
         let terminal_epoch_for_timeout = Arc::clone(&self.terminal_epoch);
         let timeout_duration = Duration::from_secs(self.timeout_sec);
@@ -1179,25 +1198,33 @@ impl CheckpointCoordinator {
                         timeout_duration,
                         terminal.as_ref(),
                     );
-                    for epoch in &timed_out {
-                        epochs_guard.remove(epoch);
-                    }
+                    // epochs -> expected_sinks is the sanctioned lock order.
+                    let expected = expected_sinks_timeout.lock().clone();
+                    let removed: Vec<(CheckpointEpoch, Vec<String>)> = timed_out
+                        .into_iter()
+                        .map(|epoch| {
+                            let unacked = unacked_sinks(epochs_guard.get(&epoch), &expected);
+                            epochs_guard.remove(&epoch);
+                            (epoch, unacked)
+                        })
+                        .collect();
                     let in_flight = epochs_guard
                         .values()
                         .filter(|s| !matches!(s, EpochState::Finalized))
                         .count();
-                    (timed_out, in_flight)
+                    (removed, in_flight)
                 };
                 metrics_recorder.record_gauge("checkpoint_epochs_in_flight", in_flight as u64);
 
-                for epoch in &removed {
+                for (epoch, unacked) in &removed {
                     warn!(
-                        "Checkpoint epoch {} timed out after {:?}; removed so a fresh epoch can be \
-                         minted (its Marker may never have reached a live source — late acks for it \
-                         will be ignored, and its offsets stay uncommitted until the next finalized \
-                         epoch covers them)",
-                        epoch.0, timeout_duration
+                        "Checkpoint epoch {} timed out after {:?} waiting on sink(s) {:?}; removed so a \
+                         fresh epoch can be minted (its Marker may never have reached a live source — \
+                         late acks for it will be ignored, and its offsets stay uncommitted until the \
+                         next finalized epoch covers them)",
+                        epoch.0, timeout_duration, unacked
                     );
+                    record_unacked_by_sink(&metrics_recorder, unacked);
                 }
 
                 if !removed.is_empty() {
@@ -1229,14 +1256,21 @@ impl CheckpointCoordinator {
         // terminal_epoch guard BEFORE locking epochs (see
         // is_terminal_finalized for why).
         let terminal = self.terminal_epoch.lock().clone();
-        if let Some(epoch) = terminal
-            && !matches!(self.epochs.lock().get(&epoch), Some(EpochState::Finalized))
-        {
-            warn!(
-                "Terminal checkpoint epoch {} never finalized before coordinator stop; recording it as failed (offsets stay uncommitted; the tail replays on restart)",
-                epoch.0
-            );
-            get_checkpoint_metrics_recorder().record_count("checkpoint_epochs_failed", 1);
+        if let Some(epoch) = terminal {
+            let expected: HashSet<String> = self.expected_sinks.lock().clone();
+            let unacked = match self.epochs.lock().get(&epoch) {
+                Some(EpochState::Finalized) => None,
+                state => Some(unacked_sinks(state, &expected)),
+            };
+            if let Some(unacked) = unacked {
+                warn!(
+                    "Terminal checkpoint epoch {} never finalized before coordinator stop (unacked sink(s): {:?}); recording it as failed (offsets stay uncommitted; the tail replays on restart)",
+                    epoch.0, unacked
+                );
+                let metrics_recorder = get_checkpoint_metrics_recorder();
+                metrics_recorder.record_count("checkpoint_epochs_failed", 1);
+                record_unacked_by_sink(&metrics_recorder, &unacked);
+            }
         }
 
         // The subscriber task has exited and dropped its receiver; remove the
@@ -1925,6 +1959,45 @@ mod tests {
             removed_no_terminal,
             vec![CheckpointEpoch(1), CheckpointEpoch(2), CheckpointEpoch(5)],
             "without a terminal epoch, every stale epoch is removed"
+        );
+    }
+
+    #[test]
+    fn test_unacked_sinks_blames_only_sinks_that_did_not_ack() {
+        let expected: HashSet<String> = ["full_block", "traces_by_block", "logs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let now = Instant::now();
+
+        let partial = EpochState::InProgress {
+            acked_sinks: HashSet::from(["full_block".to_string(), "logs".to_string()]),
+            created_at: now,
+        };
+        assert_eq!(
+            unacked_sinks(Some(&partial), &expected),
+            vec!["traces_by_block".to_string()],
+            "only the sink that never acked is blamed"
+        );
+
+        let all = vec![
+            "full_block".to_string(),
+            "logs".to_string(),
+            "traces_by_block".to_string(),
+        ];
+        assert_eq!(
+            unacked_sinks(Some(&EpochState::Started { created_at: now }), &expected),
+            all,
+            "a Started epoch has no acks: every expected sink is unacked"
+        );
+        assert_eq!(
+            unacked_sinks(None, &expected),
+            all,
+            "a missing epoch counts as unacked by all"
+        );
+        assert!(
+            unacked_sinks(Some(&EpochState::Finalized), &expected).is_empty(),
+            "a finalized epoch blames no sink"
         );
     }
 
