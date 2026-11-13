@@ -61,6 +61,7 @@ fn is_metric_denied(metric_name: &str) -> bool {
 /// wall-clock suppression (via `resolve_is_sql_node`) and the subtree-delta
 /// export in `record_execution_plan_metrics`; the two must never drift apart.
 const SQL_OPERATOR_TYPE: &str = "sql";
+const HYBRID_OPERATOR_TYPE: &str = "hybrid";
 
 /// Prefix for metric names sourced from a SQL transform's DataFusion subtree
 /// (`subtree_delta_metric_values`). Namespacing them keeps operator-internal
@@ -659,6 +660,20 @@ impl MetricsRecorder {
                     metric_metadata_tags.clone(),
                 ));
 
+                // A source's WrappingExec sits below its topology `filter:`, so this is pre-filter.
+                // The outer hybrid node is skipped: its bounded/unbounded phase nodes count the rows.
+                if metric_metadata.node_context.node_type == TopologyNodeType::Source
+                    && metric_metadata.node_context.operator_type != HYBRID_OPERATOR_TYPE
+                {
+                    all_metric_data.push(MetricData::new_with_owned_tags(
+                        vec![MetricValue::Count {
+                            name: "input_rows_delta".into(),
+                            count: output_rows_count.clone(),
+                        }],
+                        metric_metadata_tags.clone(),
+                    ));
+                }
+
                 for child_metric_metadata_id in &metric_metadata.children_metadata_ids {
                     let child_metric_metadata = self
                         .metric_metadata_registry
@@ -1050,6 +1065,14 @@ pub fn initialize_metrics_recorder(
             .u64_counter(input_rows_name)
             .with_description(
                 "Indicates the number of rows produced as output from a specific query execution.",
+            )
+            .build());
+
+        let input_rows_delta_name = add_service_prefix("input_rows_delta");
+        count_registry.insert(String::from("input_rows_delta"), delta_meter
+            .u64_counter(input_rows_delta_name)
+            .with_description(
+                "Indicates the number of rows a source reads before its topology filter (Delta temporality).",
             )
             .build());
 
@@ -2560,6 +2583,143 @@ mod tests {
 
             drop(first);
             assert_eq!(exported_partitions(&provider, &exporter), ["2"]);
+        }
+    }
+
+    mod input_rows_delta_tests {
+        use super::*;
+        use opentelemetry::metrics::MeterProvider;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData as OtelMetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, InMemoryMetricExporterBuilder, PeriodicReader,
+            SdkMeterProvider, Temporality,
+        };
+        use std::collections::BTreeMap;
+
+        const NAMES: [&str; 4] = [
+            "output_rows",
+            "output_rows_delta",
+            "input_rows",
+            "input_rows_delta",
+        ];
+
+        fn recorder_with_nodes(
+            nodes: &[(&str, TopologyNodeType, &str)],
+        ) -> (MetricsRecorder, SdkMeterProvider, InMemoryMetricExporter) {
+            let exporter = InMemoryMetricExporterBuilder::new()
+                .with_temporality(Temporality::Delta)
+                .build();
+            let reader = PeriodicReader::builder(exporter.clone())
+                .with_interval(Duration::from_secs(3600))
+                .build();
+            let provider = SdkMeterProvider::builder().with_reader(reader).build();
+            let meter = provider.meter("test");
+            let recorder = MetricsRecorder::default();
+            {
+                let mut counts = recorder.count_registry.lock().unwrap();
+                for name in NAMES {
+                    counts.insert(name.to_string(), meter.u64_counter(name).build());
+                }
+            }
+            for (id, node_type, operator_type) in nodes {
+                let metadata = PipelineMetricMetadata {
+                    node_context: NodeContext::new(node_type.clone(), operator_type, id),
+                    service_instance_id: "app".to_string(),
+                    additional_tags: BTreeMap::new(),
+                    children_metadata_ids: vec![],
+                };
+                recorder
+                    .metric_metadata_tags_registry
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), metadata.to_tags());
+                recorder
+                    .metric_metadata_registry
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), metadata);
+            }
+            (recorder, provider, exporter)
+        }
+
+        /// Sum of every exported point of `name` whose `id` tag equals `id`.
+        fn exported_sum(
+            provider: &SdkMeterProvider,
+            exporter: &InMemoryMetricExporter,
+            name: &str,
+            id: &str,
+        ) -> u64 {
+            provider.force_flush().expect("flush");
+            let mut total = 0;
+            for resource in exporter.get_finished_metrics().expect("metrics") {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics().filter(|m| m.name() == name) {
+                        if let AggregatedMetrics::U64(OtelMetricData::Sum(sum)) = metric.data() {
+                            total += sum
+                                .data_points()
+                                .filter(|p| {
+                                    p.attributes().any(|kv| {
+                                        kv.key.as_str() == "id" && kv.value.to_string() == id
+                                    })
+                                })
+                                .map(|p| p.value())
+                                .sum::<u64>();
+                        }
+                    }
+                }
+            }
+            total
+        }
+
+        #[test]
+        fn source_batch_emits_input_rows_delta() {
+            let (recorder, provider, exporter) =
+                recorder_with_nodes(&[("src", TopologyNodeType::Source, "kafka")]);
+            recorder.record_execution_plan_metrics(
+                "src",
+                10,
+                RowCountMeasurementType::OutputRowCount,
+                None,
+            );
+            recorder.record_execution_plan_metrics(
+                "src",
+                5,
+                RowCountMeasurementType::OutputRowCount,
+                None,
+            );
+            assert_eq!(
+                exported_sum(&provider, &exporter, "input_rows_delta", "src"),
+                15
+            );
+        }
+
+        #[test]
+        fn non_source_and_outer_hybrid_nodes_skip_input_rows_delta() {
+            let (recorder, provider, exporter) = recorder_with_nodes(&[
+                ("xform", TopologyNodeType::Transform, "sql"),
+                ("hyb", TopologyNodeType::Source, "hybrid"),
+                ("hyb_unbounded", TopologyNodeType::Source, "kafka"),
+            ]);
+            for id in ["xform", "hyb", "hyb_unbounded"] {
+                recorder.record_execution_plan_metrics(
+                    id,
+                    7,
+                    RowCountMeasurementType::OutputRowCount,
+                    None,
+                );
+            }
+            assert_eq!(
+                exported_sum(&provider, &exporter, "input_rows_delta", "xform"),
+                0
+            );
+            assert_eq!(
+                exported_sum(&provider, &exporter, "input_rows_delta", "hyb"),
+                0
+            );
+            assert_eq!(
+                exported_sum(&provider, &exporter, "input_rows_delta", "hyb_unbounded"),
+                7
+            );
         }
     }
 }
