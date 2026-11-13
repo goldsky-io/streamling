@@ -2432,6 +2432,8 @@ Streamling exports two variants of the `output_rows` metric with different tempo
 
 - **`output_rows_delta`** (Delta): Reports incremental rows since the last export interval. Use this for billing and aggregation use cases in time-series databases like ClickHouse, where you can simply `SUM()` the values without worrying about resets or lag compensation.
 
+Source nodes also export **`input_rows_delta`** (Delta): rows the source reads before its `filter:` is applied. A hybrid source reports it on its bounded and unbounded phase nodes, not on the hybrid node itself. A ClickHouse source pushes its filter into the query, so it counts the rows ClickHouse returns.
+
 ### Adding Telemetry to Custom Operators
 
 #### For Execution Plans (Sources and Transforms)
