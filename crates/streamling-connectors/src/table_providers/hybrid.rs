@@ -30,6 +30,7 @@ use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
 use streamling_core::telemetry::provider::{
     metric_key, metric_key_hybrid_src_bounded, metric_key_hybrid_src_unbounded,
 };
+use streamling_core::telemetry::task_wait::TaskWaitMeter;
 use streamling_core::topology::{
     HybridBoundedSource, HybridOffsetTable, HybridUnboundedSource, Telemetry,
 };
@@ -1100,6 +1101,10 @@ impl ExecutionPlan for HybridSourceExec {
         let schema = self.schema();
         let builder = RecordBatchReceiverStreamBuilder::new(schema.clone(), 16);
         let tx = builder.tx();
+        // Each phase source claims the node's meter when it executes; reserve
+        // it now so the wrapper never times the phases' channel as `starved`.
+        // This driver's own work (normalize) and edge sends are the node's too.
+        let reserved_meter = TaskWaitMeter::reserve(&context);
         let provider = self.provider.clone();
         let context_clone = context.clone();
         let projection = self.projection.clone();
@@ -1285,7 +1290,7 @@ impl ExecutionPlan for HybridSourceExec {
                     match batch_result {
                         Ok(batch) => {
                             let schema_clone = schema_for_main.clone();
-                            let normalized = match run_blocking(move || {
+                            let normalized = match reserved_meter.work(run_blocking(move || {
                                 // Inner phases do not reliably honor the pushed-down
                                 // projection (the bounded ClickHouse scan ignores it
                                 // and emits every column, in ClickHouse order), so
@@ -1301,7 +1306,7 @@ impl ExecutionPlan for HybridSourceExec {
                                     &batch,
                                     &schema_clone,
                                 )
-                            })
+                            }))
                             .await
                             {
                                 Ok(b) => b,
@@ -1311,7 +1316,7 @@ impl ExecutionPlan for HybridSourceExec {
                                 }
                             };
                             let merged = merge_pending_markers(normalized, &pending_for_main);
-                            if tx.send(Ok(merged)).await.is_err() {
+                            if reserved_meter.send(tx.send(Ok(merged))).await.is_err() {
                                 break 'outer;
                             }
                         }
@@ -1608,7 +1613,8 @@ async fn emit_terminal_checkpoint(
     flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
-    // here does not block their consumption of the marker batch.
+    // here does not block their consumption of the marker batch. The wait is
+    // in no state: the driver times only inside `ReservedMeter::work`/`send`.
     if !control.await_terminal_finalized_on_completion().await {
         let finalize_timeout = terminal_checkpoint_finalize_timeout();
         // At least one live sink never confirmed its writes. Do NOT emit the
@@ -3134,6 +3140,179 @@ mod tests {
         assert!(
             state.completed_phases.iter().all(|&c| c),
             "All bounded phases should be marked complete"
+        );
+    }
+
+    /// The wrapper decides once, at `execute`, whether it or the operator
+    /// measures `starved`. Phases claim the meter later, inside the spawned
+    /// task, so the hybrid source must reserve it up front.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_source_reserves_the_node_meter_at_execute() {
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend =
+            create_state_backend("test_hybrid_source_reserves_the_node_meter_at_execute").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_reserves_meter".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+        let plan = hybrid_provider
+            .scan(&SESSION_MANAGER.session_state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "test_reserves_meter",
+            None,
+        );
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        assert!(meter.is_claimed(), "reserved before any phase runs");
+        let _: Vec<_> = stream.collect().await;
+    }
+
+    /// A phase source that claims its node meter and works for 40ms.
+    #[derive(Debug)]
+    struct ClaimingMockProvider;
+
+    #[async_trait]
+    impl TableProvider for ClaimingMockProvider {
+        fn schema(&self) -> SchemaRef {
+            create_test_schema()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = create_test_schema();
+            Ok(Arc::new(ClaimingMockExec {
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+                schema,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClaimingMockExec {
+        schema: SchemaRef,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ClaimingMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ClaimingMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ClaimingMockExec {
+        fn name(&self) -> &str {
+            "ClaimingMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let work = futures::stream::once(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                drop(task_wait);
+            })
+            .filter_map(|()| futures::future::ready(None));
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    work,
+                ),
+            ))
+        }
+    }
+
+    /// Phases run behind their own `WrappingExec`, which must not shadow the
+    /// meter the hybrid reserved: the phase work is the hybrid node's `busy`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_phase_work_reaches_the_hybrid_node_meter() {
+        use streamling_core::operators::wrapping::WrappingSourceTableProvider;
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let phase = |name: &str| -> Arc<dyn TableProvider> {
+            Arc::new(WrappingSourceTableProvider::new(
+                Arc::new(ClaimingMockProvider),
+                name.to_string(),
+                None,
+                None,
+            ))
+        };
+        let config = HybridSourceConfig {
+            bounded_sources: vec![phase("phase_meter_bounded_0")],
+            unbounded_source: phase("phase_meter_unbounded"),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend =
+            create_state_backend("test_hybrid_phase_work_reaches_the_hybrid_node_meter").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "phase_meter".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+        let plan = hybrid_provider
+            .scan(&SESSION_MANAGER.session_state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "phase_meter",
+            None,
+        );
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        let _: Vec<_> = stream.collect().await;
+        let busy = meter.totals().busy;
+        assert!(
+            busy >= Duration::from_millis(40),
+            "the bounded phase's 40ms of work must be the hybrid node's busy, got {busy:?}"
         );
     }
 
