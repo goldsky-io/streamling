@@ -8,15 +8,21 @@ use crate::checkpoints::checkpoint_management::{
     CheckpointMessage, enrich_batch_metadata_with_checkpoints, now_ms,
 };
 use crate::operators::coalesce::test_util::MarkerSourceExec;
+use crate::table::backend::{TableBackend, TableTransaction};
 use arrow::array::{Array, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::common::ScalarValue;
 use datafusion::physical_plan::ExecutionPlan;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::Duration;
+use streamling_plugin::api::table::{
+    LookupRows, Mark, NamespaceSpec, NamespaceStats, ScanCursor, StoredState, TableBackendContext,
+    TableBackendError, TableBackendPlugin, TableBackendResult, TableTransactionPlugin, Version,
+};
 use streamling_plugin::api::{PluginStateBackendFactory, SupportsGracefulShutdown};
 use streamling_plugin::ffi::PluginMetricsRecorder;
 use streamling_plugin::{
@@ -25,7 +31,8 @@ use streamling_plugin::{
     PluginLabel, SinkDescription, SinkPlugin, SourceDescription, SourcePlugin,
     TransformDescription, TransformPlugin, init_plugin, partition_instance_name,
     register_partitioned_plugin_sink, register_partitioned_plugin_source,
-    register_partitioned_plugin_transform, register_plugin_sink, register_plugin_transform,
+    register_partitioned_plugin_transform, register_plugin_sink, register_plugin_table_backend,
+    register_plugin_transform,
 };
 
 pub(crate) const SOURCE: &str = "test.partitioned_source";
@@ -33,6 +40,11 @@ pub(crate) const TRANSFORM: &str = "test.partitioned_transform";
 pub(crate) const SINK: &str = "test.partitioned_sink";
 pub(crate) const LEGACY_TRANSFORM: &str = "test.legacy_transform";
 pub(crate) const LEGACY_SINK: &str = "test.legacy_sink";
+pub(crate) const TABLE_BACKEND: &str = "test.table_backend";
+/// `retriable` or `fatal`: the table backend's `open` fails that way.
+pub(crate) const FAIL_OPEN: &str = "fail_open";
+/// When set, the table backend's `stats` panics.
+pub(crate) const PANIC_STATS: &str = "panic_stats";
 
 /// Name the node's instances record their observations under.
 pub(crate) const NODE: &str = "node";
@@ -615,6 +627,165 @@ impl PartitionedSinkPlugin for TestSink {
     }
 }
 
+/// An `in_memory` table, served as a plugin's table backend.
+struct TestTableBackend {
+    backend: crate::table::in_memory::InMemoryBackend,
+    options: HashMap<String, String>,
+}
+
+/// The host's error as the SDK's, keeping its retriable flag.
+fn table_backend_error(error: crate::error::StreamlingError) -> TableBackendError {
+    TableBackendError {
+        message: error.to_string(),
+        retriable: error.is_retriable(),
+    }
+}
+
+#[async_trait]
+impl TableBackendPlugin for TestTableBackend {
+    fn create(
+        context: TableBackendContext,
+        options: HashMap<String, String>,
+        _: PluginMetricsRecorder,
+    ) -> TableBackendResult<Self> {
+        Ok(Self {
+            backend: crate::table::in_memory::InMemoryBackend::try_new(
+                &context.table,
+                crate::topology::DEFAULT_MAX_DEAD_RATIO,
+            )
+            .map_err(table_backend_error)?,
+            options,
+        })
+    }
+
+    async fn open(&self) -> TableBackendResult<StoredState> {
+        match self.options.get(FAIL_OPEN).map(String::as_str) {
+            Some("retriable") => Err(TableBackendError::retriable("connection refused")),
+            Some(_) => Err(TableBackendError::fatal("bad credentials")),
+            None => self.backend.open().await.map_err(table_backend_error),
+        }
+    }
+
+    async fn create_namespace(&self, spec: &NamespaceSpec) -> TableBackendResult<()> {
+        self.backend
+            .create_namespace(spec)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn drop_namespace(&self, name: &str) -> TableBackendResult<()> {
+        self.backend
+            .drop_namespace(name)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn begin(&self) -> TableBackendResult<Box<dyn TableTransactionPlugin>> {
+        let transaction = self.backend.begin().await.map_err(table_backend_error)?;
+        Ok(Box::new(TestTableTransaction(transaction)))
+    }
+
+    async fn lookup(
+        &self,
+        namespace: &str,
+        keys: &RecordBatch,
+        projection: &[usize],
+        mark: Option<Mark>,
+    ) -> TableBackendResult<LookupRows> {
+        self.backend
+            .lookup(namespace, keys, projection, mark)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn checkpoint(&self, mark: Mark) -> TableBackendResult<()> {
+        self.backend
+            .checkpoint(mark)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn finalize(&self, horizon: Mark, trim: bool) -> TableBackendResult<()> {
+        self.backend
+            .finalize(horizon, trim)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn stats(&self) -> TableBackendResult<Vec<NamespaceStats>> {
+        if self.options.contains_key(PANIC_STATS) {
+            panic!("stats blew up");
+        }
+        self.backend.stats().await.map_err(table_backend_error)
+    }
+}
+
+struct TestTableTransaction(Box<dyn TableTransaction>);
+
+#[async_trait]
+impl TableTransactionPlugin for TestTableTransaction {
+    fn version(&self) -> Version {
+        self.0.version()
+    }
+
+    async fn get(&mut self, namespace: &str, keys: &RecordBatch) -> TableBackendResult<LookupRows> {
+        self.0
+            .get(namespace, keys)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn write(
+        &mut self,
+        namespace: &str,
+        upserts: &RecordBatch,
+        deletes: &RecordBatch,
+    ) -> TableBackendResult<RecordBatch> {
+        self.0
+            .write(namespace, upserts, deletes)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn evict_below(
+        &mut self,
+        namespace: &str,
+        column: &str,
+        bound: &ScalarValue,
+        inclusive: bool,
+        limit: usize,
+    ) -> TableBackendResult<RecordBatch> {
+        self.0
+            .evict_below(namespace, column, bound, inclusive, limit)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn scan(
+        &mut self,
+        namespace: &str,
+        cursor: Option<ScanCursor>,
+        limit: usize,
+    ) -> TableBackendResult<(RecordBatch, Option<ScanCursor>)> {
+        self.0
+            .scan(namespace, cursor, limit)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn set_meta(&mut self, key: &str, value: Vec<u8>) -> TableBackendResult<()> {
+        self.0
+            .set_meta(key, value)
+            .await
+            .map_err(table_backend_error)
+    }
+
+    async fn commit(self: Box<Self>) -> TableBackendResult<()> {
+        self.0.commit().await.map_err(table_backend_error)
+    }
+}
+
+register_plugin_table_backend!("test.table_backend", TestTableBackend);
 register_partitioned_plugin_source!("test", "partitioned_source", TestSource);
 register_partitioned_plugin_transform!("test", "partitioned_transform", TestTransform);
 register_partitioned_plugin_sink!("test", "partitioned_sink", TestSink);

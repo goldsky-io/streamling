@@ -2,18 +2,21 @@ use crate::dynamic_table::DynamicTableRegistry;
 use crate::functions::StreamlingFunctions;
 use crate::operators::planner::StreamlingQueryPlanner;
 use crate::optimizer::StreamlingPhysicalOptimizerRules;
+use crate::table::TableRegistry;
 use crate::types::bigint_sql_preprocessor::preprocess_bigint_sql;
 use crate::{streamling_err, streamling_user_err};
 use datafusion::catalog::memory::MemorySchemaProvider;
 use datafusion::catalog::{SchemaProvider, Session, TableProvider};
-use datafusion::common::{Column, config::ConfigExtension, extensions_options};
+use datafusion::common::{Column, DFSchema, config::ConfigExtension, extensions_options};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateDefaults;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{FunctionRegistry, SessionState, SessionStateBuilder};
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::planner::ExprPlanner;
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, col};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, cast, col};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
@@ -41,12 +44,32 @@ fn decimal_arb_expr_planners() -> Vec<Arc<dyn ExprPlanner>> {
     planners
 }
 
+/// Compiles `expr` over `schema` the way a query plan's expressions are compiled.
+/// `SessionState::create_physical_expr` only coerces types, and some functions, such as
+/// `arrow_cast`, fail if invoked before the simplifier rewrites them.
+pub fn create_simplified_physical_expr(
+    session_state: &SessionState,
+    expr: Expr,
+    schema: &DFSchema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let schema = Arc::new(schema.clone());
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::clone(&schema))
+            .with_config_options(Arc::clone(session_state.config_options()))
+            .build(),
+    );
+    let expr = simplifier.simplify(simplifier.coerce(expr, &schema)?)?;
+    session_state.create_physical_expr(expr, &schema)
+}
+
 /// SessionManager is a thin wrapper around a DataFusion SessionContext that provides
 /// catalog DDL methods and other functionality.
 /// A clone of a SessionManager is a shallow copy of a SessionContext with the same session id and state.
 #[derive(Clone)]
 pub struct SessionManager {
     ctx: SessionContext,
+    tables: TableRegistry,
 }
 
 #[derive(Clone, Copy)]
@@ -194,7 +217,8 @@ impl SessionManager {
         register_json_functions(&ctx)?;
         register_string_aliases(&ctx)?;
 
-        for udf in StreamlingFunctions::functions(dynamic_table_registry) {
+        let tables = TableRegistry::default();
+        for udf in StreamlingFunctions::functions(dynamic_table_registry, tables.clone()) {
             // This can override a built-in function with the same name
             ctx.register_udf(udf);
         }
@@ -218,7 +242,7 @@ impl SessionManager {
 
         crate::plugin::udf::register_plugin_udfs(&ctx);
 
-        Ok(SessionManager { ctx })
+        Ok(SessionManager { ctx, tables })
     }
 
     /// Registers a table with the given name and provider in the default catalog and the default OR custom schema.
@@ -251,7 +275,7 @@ impl SessionManager {
         // Ensure _gs_op transparently propagates through SQL projections
         let logical_plan = Self::append_gs_op_to_projection_if_missing(logical_plan);
 
-        let logical_plan = self.declare_resolved_decimal_arb_fields(logical_plan)?;
+        let logical_plan = self.declare_resolved_fields(logical_plan)?;
 
         Self::validate_plan_and_extract_source_name(&logical_plan, SubqueryHandling::Recurse)
             .map(|name| (logical_plan, name))
@@ -271,10 +295,24 @@ impl SessionManager {
     /// on top of the declared plan. It passes the bytes through untouched, so it only changes the
     /// declared field. Likewise, a column declared with decimal_arb metadata it does not produce
     /// (a cast of decimal_arb to `BIGINT`, `DOUBLE`, `DECIMAL(p, s)` or `TEXT`) gets the metadata
-    /// dropped with `decimal_arb_strip_meta`. A plan that needs no relabelling is returned as is.
-    fn declare_resolved_decimal_arb_fields(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    /// dropped with `decimal_arb_strip_meta`.
+    ///
+    /// Any other column declared with a type it isn't produced with gets a cast to the produced
+    /// type. A UNION is declared with its first input's types, while execution coerces each
+    /// column to a type every input converts to: `Utf8` and `Utf8View` inputs give `Utf8View`.
+    /// The cast matches the column execution already produces, so it changes only the declared
+    /// field. A plan that needs no relabelling is returned as is.
+    fn declare_resolved_fields(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        // Resolve the plan as a node inside a pipeline produces it: `expand_views_at_output`
+        // only casts view types at the root of the plan being executed, which a transform isn't.
+        let mut state = self.ctx.state();
+        state
+            .config_mut()
+            .options_mut()
+            .optimizer
+            .expand_views_at_output = false;
         // A plan that cannot be resolved fails later with its usual context, not from here.
-        let Ok(resolved) = self.ctx.state().optimize(&plan) else {
+        let Ok(resolved) = state.optimize(&plan) else {
             return Ok(plan);
         };
         let declared = plan.schema();
@@ -299,16 +337,23 @@ impl SessionManager {
                     // lowered cast produces none. Drop it from the declared field, or a reader
                     // of the metadata alone would take an `Int64` or a `Utf8` for a
                     // decimal_arb. Only the `LargeBinary` storage can carry the metadata.
-                    if declared_field.data_type() != &arrow::datatypes::DataType::LargeBinary
+                    let strips_meta = declared_field.data_type()
+                        != &arrow::datatypes::DataType::LargeBinary
                         && DecimalArbType::without_decimal_arb_metadata(declared_field.metadata())
-                            .is_some()
-                    {
-                        relabelled = true;
-                        return strip_meta
-                            .call(vec![column])
-                            .alias_qualified(qualifier.cloned(), declared_field.name());
+                            .is_some();
+                    let casts = declared_field.data_type() != resolved_field.data_type();
+                    if !strips_meta && !casts {
+                        return column;
                     }
-                    return column;
+                    relabelled = true;
+                    let mut expr = column;
+                    if strips_meta {
+                        expr = strip_meta.call(vec![expr]);
+                    }
+                    if casts {
+                        expr = cast(expr, resolved_field.data_type().clone());
+                    }
+                    return expr.alias_qualified(qualifier.cloned(), declared_field.name());
                 };
                 let hint = DecimalArbType::native_int_kind_from_field(resolved_field)
                     .filter(|_| scale == 0);
@@ -407,6 +452,42 @@ impl SessionManager {
                 }
             }
             _ => Err(streamling_user_err!("unsupported plan: {}", plan.display()).into()),
+        }
+    }
+
+    /// Extract expressions from a SQL query. Only Projection and Filter are supported.
+    /// Returns a tuple of (projection expressions, optional filter expression)
+    pub fn extract_expressions_from_sql_query(
+        plan: &LogicalPlan,
+    ) -> Result<(Vec<Expr>, Option<Expr>)> {
+        match plan {
+            LogicalPlan::Projection(projection) => {
+                let exprs = projection.expr.clone();
+                // Unwrap common wrapper nodes to find an optional Filter or base scan
+                let mut current = projection.input.as_ref();
+                let filter_expr: Option<Expr> = loop {
+                    match current {
+                        LogicalPlan::Filter(filter) => break Some(filter.predicate.clone()),
+                        LogicalPlan::TableScan(_) => break None,
+                        LogicalPlan::SubqueryAlias(alias) => {
+                            current = alias.input.as_ref();
+                        }
+                        // Treat Extension as a valid base (e.g., custom table provider)
+                        LogicalPlan::Extension(_) => break None,
+                        _ => return Err(unsupported_query().into()),
+                    }
+                };
+                Ok((exprs, filter_expr))
+            }
+            LogicalPlan::Filter(filter) => {
+                let filter_expr = filter.predicate.clone();
+                Ok((vec![], Some(filter_expr)))
+            }
+            // Allow top-level wrappers by delegating to their inputs
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::extract_expressions_from_sql_query(alias.input.as_ref())
+            }
+            _ => Err(unsupported_query().into()),
         }
     }
 
@@ -545,6 +626,11 @@ impl SessionManager {
         self.ctx.clone()
     }
 
+    /// The `table` and `table_agg` transforms lookups can read.
+    pub fn tables(&self) -> &TableRegistry {
+        &self.tables
+    }
+
     /// Registers a schema with the given name in the default catalog (or returns it if it already exists).
     fn register_or_get_schema(&self, schema_name: &str) -> Result<Arc<dyn SchemaProvider>> {
         let catalog = self.ctx.catalog(DEFAULT_CATALOG_NAME).ok_or_else(|| {
@@ -583,6 +669,10 @@ impl SessionManager {
             None => (DEFAULT_SCHEMA_NAME, full_table_name),
         }
     }
+}
+
+fn unsupported_query() -> crate::error::StreamlingError {
+    streamling_user_err!("only Projection and Filter SQL queries are supported")
 }
 
 // TODO: more test coverage
@@ -902,5 +992,177 @@ mod tests {
                 "wrong result for `{sql}`"
             );
         }
+    }
+
+    /// The SQL planner types a UNION's columns after its first input, while execution
+    /// coerces them to a type every input converts to: here `Utf8` and `CAST(.. AS VARCHAR)`'s
+    /// `Utf8View` give `Utf8View`. A transform must be declared with the latter, or a reader
+    /// that trusts the declared schema, such as a table's side output, gets batches that
+    /// don't match it.
+    #[tokio::test]
+    async fn union_is_declared_with_the_types_it_produces() {
+        use arrow::array::StringArray;
+        use datafusion::datasource::MemTable;
+
+        let sm = SessionManager::new(8192, 10, DynamicTableRegistry::new(), 1).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a"]))])
+                .unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        sm.register_table("t", Arc::new(table)).unwrap();
+
+        let sql = "SELECT name FROM t UNION ALL SELECT CAST(NULL AS VARCHAR) AS name FROM t";
+        let (plan, _) = sm.create_supported_logical_plan(sql.into()).await.unwrap();
+        // Executed as a node inside a pipeline, not as the root whose view types are
+        // expanded at output.
+        let mut state = sm.session_state();
+        state
+            .config_mut()
+            .options_mut()
+            .optimizer
+            .expand_views_at_output = false;
+        let batches = DataFrame::new(state, plan.clone()).collect().await.unwrap();
+
+        assert_eq!(plan.schema().field(0).data_type(), &DataType::Utf8View);
+        for batch in batches {
+            assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8View);
+        }
+    }
+
+    async fn plan_over_test_table(sql: &str) -> LogicalPlan {
+        let session_manager = SessionManager::new(1000, 10, DynamicTableRegistry::new(), 1)
+            .expect("test session manager initialisation failed");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        session_manager
+            .register_table(
+                "test_table",
+                Arc::new(datafusion::datasource::empty::EmptyTable::new(schema)),
+            )
+            .unwrap();
+        session_manager
+            .create_logical_plan(String::from(sql))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_simple_select() {
+        let plan = plan_over_test_table("SELECT * FROM test_table").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(result.is_ok(), "Should successfully parse simple SELECT *");
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        // For SELECT *, we expect wildcard expressions for each column
+        assert!(
+            !projection_exprs.is_empty(),
+            "Should have projection expressions for SELECT *"
+        );
+        assert!(filter_expr.is_none(), "Should have no filter expression");
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_projection() {
+        let plan = plan_over_test_table("SELECT id, name FROM test_table").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(result.is_ok(), "Should successfully parse projection query");
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        assert_eq!(
+            projection_exprs.len(),
+            2,
+            "Should have 2 projection expressions"
+        );
+        assert!(filter_expr.is_none(), "Should have no filter expression");
+
+        // Verify the expressions are column references
+        match &projection_exprs[0] {
+            Expr::Column(_) => (),
+            _ => panic!("First expression should be a column reference"),
+        }
+        match &projection_exprs[1] {
+            Expr::Column(_) => (),
+            _ => panic!("Second expression should be a column reference"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_filter_only() {
+        let plan = plan_over_test_table("SELECT * FROM test_table WHERE id > 10").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(
+            result.is_ok(),
+            "Should successfully parse query with WHERE clause"
+        );
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        assert!(
+            !projection_exprs.is_empty(),
+            "Should have projection expressions"
+        );
+        assert!(filter_expr.is_some(), "Should have filter expression");
+
+        // Verify the filter expression is a binary expression
+        let filter = filter_expr.unwrap();
+        match filter {
+            Expr::BinaryExpr(_) => (),
+            _ => panic!("Filter expression should be a binary expression"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_projection_and_filter() {
+        let plan = plan_over_test_table("SELECT id, name FROM test_table WHERE id > 10").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(
+            result.is_ok(),
+            "Should successfully parse projection with WHERE clause"
+        );
+        let (projection_exprs, filter_expr) = result.unwrap();
+
+        assert_eq!(
+            projection_exprs.len(),
+            2,
+            "Should have 2 projection expressions"
+        );
+        assert!(filter_expr.is_some(), "Should have filter expression");
+
+        // Verify the projection expressions are column references
+        match &projection_exprs[0] {
+            Expr::Column(_) => (),
+            _ => panic!("First expression should be a column reference"),
+        }
+        match &projection_exprs[1] {
+            Expr::Column(_) => (),
+            _ => panic!("Second expression should be a column reference"),
+        }
+
+        // Verify the filter expression is a binary expression
+        let filter = filter_expr.unwrap();
+        match filter {
+            Expr::BinaryExpr(_) => (),
+            _ => panic!("Filter expression should be a binary expression"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_expressions_from_sql_query_unsupported_query() {
+        // Test an unsupported query type (GROUP BY)
+        let plan = plan_over_test_table("SELECT COUNT(*) FROM test_table GROUP BY id").await;
+        let result = SessionManager::extract_expressions_from_sql_query(&plan);
+
+        assert!(result.is_err(), "Should fail for unsupported query types");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("only Projection and Filter SQL queries are supported"),
+            "Error should mention unsupported query type, got: {error_msg}"
+        );
     }
 }
