@@ -669,7 +669,7 @@ impl ExecutionPlan for WrappingExec {
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::OutputRowCount,
                             metrics.as_ref(),
                         );
@@ -812,7 +812,7 @@ impl DataSink for WrappingDataSink {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
                         );
@@ -848,6 +848,7 @@ impl DataSink for WrappingDataSink {
                             }
                         };
 
+                        metrics_recorder.record_sink_output_bytes(&deduped_batch, &metric_metadata_id);
                         yield Ok(deduped_batch);
                     }
                     Err(e) => {
@@ -1321,6 +1322,56 @@ mod tests {
             "Expected filter's child to be WrappingExec, got: {}",
             filter_children[0].name()
         );
+    }
+
+    /// The source `WrappingExec` records the source's output rows (and with them
+    /// `input_rows_delta`); it must see every pre-filter row while the filter
+    /// still drops rows downstream of it.
+    #[tokio::test]
+    async fn test_source_wrapper_counts_rows_before_source_filter() {
+        let schema = test_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from(
+                    (0..10).map(|i| i * 1000).collect::<Vec<i64>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    (0..10).map(|i| i < 3).collect::<Vec<bool>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = FilterExec::try_new(predicate, source_exec).unwrap();
+        let streaming_filter =
+            Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
+
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            streaming_filter,
+            "test_source",
+            vec![Arc::new(CountingSideOutput {
+                rows_seen: rows_seen.clone(),
+            })],
+            None,
+        );
+
+        let output = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let output_rows: usize = output.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows_seen.load(Ordering::Relaxed),
+            10,
+            "pre-filter rows at the source wrapper"
+        );
+        assert_eq!(output_rows, 3, "filter still applied above the wrapper");
     }
 
     #[test]
