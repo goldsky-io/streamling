@@ -949,3 +949,119 @@ sinks:
         "only rows with any member element should pass"
     );
 }
+
+/// Postgres TEXT cannot hold U+0000, so binding such a value fails with
+/// `invalid byte sequence for encoding "UTF8": 0x00` (22021) on every retry.
+/// Prod incident 2026-11-13: one chain-data value with a NUL wedged every
+/// uncached `dynamic_table_check` pipeline reading that chain.
+#[tokio::test]
+async fn test_uncached_contains_treats_nul_values_as_absent() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("failed to create test context");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("failed to register schema");
+    ctx.postgres
+        .execute("CREATE TABLE public.nul_members (value TEXT PRIMARY KEY)")
+        .await
+        .expect("failed to create backing table");
+    ctx.postgres
+        .execute("INSERT INTO public.nul_members (value) VALUES ('member'), ('nul')")
+        .await
+        .expect("failed to seed backing table");
+    ctx.kafka
+        .produce_avro_records(&[record("member"), record("nul\0member"), record("stranger")])
+        .await
+        .expect("failed to produce records");
+
+    let pipeline_yaml = format!(
+        r#"
+sources:
+  input:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+
+transforms:
+  membership:
+    type: dynamic_table
+    backend_type: Postgres
+    backend_entity_name: nul_members
+    schema: public
+    column: value
+  matched:
+    type: sql
+    sql: "SELECT id FROM input WHERE dynamic_table_check('membership', id)"
+    primary_key: id
+
+sinks:
+  matched_output:
+    type: postgres
+    from: matched
+    table: nul_members_output
+    schema: public
+    primary_key: id
+    on_conflict: update
+    batch_size: 1
+    batch_flush_interval: 100ms
+  source_drain:
+    type: blackhole
+    from: input
+"#,
+        topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline_yaml,
+            cached_postgres_opts(&ctx, 3, Duration::from_secs(60)),
+        )
+        .await
+        .expect("pipeline failed");
+    assert!(status.success(), "pipeline should exit successfully");
+    assert_eq!(output_ids(&ctx, "nul_members_output").await, vec!["member"]);
+}
+
+/// Same Postgres limit on the write side: a NUL value can never be stored,
+/// so `append` drops it instead of retrying the batch forever.
+#[tokio::test]
+async fn test_append_drops_nul_values() {
+    init_tracing();
+
+    let ctx = TestContext::new()
+        .await
+        .expect("failed to create test context");
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("failed to register schema");
+    ctx.postgres
+        .execute("CREATE TABLE public.nul_appends (value TEXT PRIMARY KEY)")
+        .await
+        .expect("failed to create backing table");
+    ctx.kafka
+        .produce_avro_records(&[record("kept"), record("dropped\0value")])
+        .await
+        .expect("failed to produce records");
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &append_pipeline(&ctx, "nul_appends", false),
+            cached_postgres_opts(&ctx, 2, Duration::from_secs(60)),
+        )
+        .await
+        .expect("pipeline failed");
+    assert!(status.success(), "pipeline should exit successfully");
+    assert_eq!(
+        ctx.postgres
+            .query::<(String,)>("SELECT value FROM public.nul_appends")
+            .await
+            .expect("failed to read backing table"),
+        [("kept".to_string(),)]
+    );
+}
