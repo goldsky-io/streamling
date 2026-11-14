@@ -669,7 +669,7 @@ impl ExecutionPlan for WrappingExec {
                         // Process telemetry
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::OutputRowCount,
                             metrics.as_ref(),
                         );
@@ -812,7 +812,7 @@ impl DataSink for WrappingDataSink {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
                         );
@@ -848,6 +848,7 @@ impl DataSink for WrappingDataSink {
                             }
                         };
 
+                        metrics_recorder.record_sink_output_bytes(&deduped_batch, &metric_metadata_id);
                         yield Ok(deduped_batch);
                     }
                     Err(e) => {
