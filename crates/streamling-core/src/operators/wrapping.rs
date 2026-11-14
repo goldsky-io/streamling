@@ -731,18 +731,12 @@ impl ExecutionPlan for WrappingExec {
                         }
 
                         // Process telemetry
-                        if role != WrappingRole::SourceInput {
-                            metrics_recorder.record_execution_plan_metrics(
-                                metric_metadata_id.as_str(),
-                                batch.num_rows(),
-                                RowCountMeasurementType::OutputRowCount,
-                                metrics.as_ref(),
-                            );
-                        }
-                        if role == WrappingRole::SourceOutput {
-                            yield Ok(batch);
-                            continue;
-                        }
+                        metrics_recorder.record_execution_plan_metrics(
+                            metric_metadata_id.as_str(),
+                            &batch,
+                            RowCountMeasurementType::OutputRowCount,
+                            metrics.as_ref(),
+                        );
 
                         // Record checkpoint marker arrival time for transforms
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
@@ -882,7 +876,7 @@ impl DataSink for WrappingDataSink {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
                         );
@@ -918,6 +912,7 @@ impl DataSink for WrappingDataSink {
                             }
                         };
 
+                        metrics_recorder.record_sink_output_bytes(&deduped_batch, &metric_metadata_id);
                         yield Ok(deduped_batch);
                     }
                     Err(e) => {
