@@ -30,10 +30,12 @@ use crate::retry::retry_if_retriable_until_cancelled;
 use crate::{streamling_bail, streamling_err, streamling_user_bail, streamling_user_err};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, StructArray, UInt32Array,
+    UInt32Builder,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::{cast, take, take_record_batch};
 use arrow::datatypes::{Field, FieldRef, Fields, Schema, SchemaRef};
+use arrow::row::{RowConverter, SortField};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
@@ -94,6 +96,8 @@ pub struct Table {
     schema: SchemaRef,
     /// The primary key columns, in order.
     key_fields: Fields,
+    /// Encodes lookup keys, so each distinct key is read once.
+    key_converter: RowConverter,
     primary_key: String,
     /// The columns lookups read, by position in `schema`.
     readable: Vec<usize>,
@@ -116,6 +120,13 @@ impl Table {
             .iter()
             .map(|column| Ok(Arc::new(schema.field_with_name(column)?.clone())))
             .collect::<Result<Fields>>()?;
+        let key_converter = RowConverter::new(
+            key_fields
+                .iter()
+                .map(|field| SortField::new(field.data_type().clone()))
+                .collect(),
+        )
+        .streamling_with_context(|| format!("table '{name}': unsupported primary key type"))?;
         let readable = (0..schema.fields().len())
             .filter(|&index| Some(schema.field(index).name().as_str()) != hidden)
             .collect();
@@ -125,6 +136,7 @@ impl Table {
             backend,
             schema,
             key_fields,
+            key_converter,
             primary_key: key.join(","),
             readable,
             retention,
@@ -199,7 +211,8 @@ impl Table {
     ///
     /// The keys are cast to the key's types, a safe cast: a value that can't
     /// be converted becomes null. A key with a null in any column misses
-    /// without reaching the backend, which never sees null keys.
+    /// without reaching the backend, which never sees null keys, and each
+    /// distinct key reaches it once.
     fn read(
         &self,
         keys: &[ArrayRef],
@@ -238,22 +251,33 @@ impl Table {
         let valid = keys.columns().iter().fold(None, |valid, keys| {
             NullBuffer::union(valid.as_ref(), keys.logical_nulls().as_ref())
         });
-        let Some(valid) = valid.filter(|valid| valid.null_count() > 0) else {
+        let encoded = self
+            .key_converter
+            .convert_columns(keys.columns())
+            .streamling_context("failed to encode the lookup keys")?;
+        // Each row's position among the distinct keys, null for a key with a
+        // null, and the row each distinct key first appears in.
+        let mut distinct: HashMap<&[u8], u32> = HashMap::with_capacity(rows);
+        let mut first_rows: Vec<u32> = Vec::new();
+        let mut positions = UInt32Builder::with_capacity(rows);
+        for row in 0..rows {
+            if valid.as_ref().is_some_and(|valid| valid.is_null(row)) {
+                positions.append_null();
+                continue;
+            }
+            let position = *distinct.entry(encoded.row(row).data()).or_insert_with(|| {
+                first_rows.push(row as u32);
+                first_rows.len() as u32 - 1
+            });
+            positions.append_value(position);
+        }
+        if first_rows.len() == rows {
             let found = self.backend_read(&keys, projection, mark)?;
             return Ok((found.rows, found.found));
-        };
-        // Each key's position among the valid ones, null for the others.
-        let positions: UInt32Array = valid
-            .iter()
-            .scan(0u32, |next, is_valid| {
-                Some(is_valid.then(|| {
-                    *next += 1;
-                    *next - 1
-                }))
-            })
-            .collect();
-        let valid_rows: UInt32Array = valid.valid_indices().map(|index| index as u32).collect();
-        let found = self.backend_read(&take_record_batch(&keys, &valid_rows)?, projection, mark)?;
+        }
+        let positions = positions.finish();
+        let distinct_keys = take_record_batch(&keys, &UInt32Array::from(first_rows))?;
+        let found = self.backend_read(&distinct_keys, projection, mark)?;
         let rows = RecordBatch::try_new_with_options(
             found.rows.schema(),
             found
@@ -1683,11 +1707,12 @@ mod tests {
     }
 
     /// An `in_memory` backend that records the checkpoints and
-    /// finalizations it's asked for.
+    /// finalizations it's asked for, and the keys of each lookup.
     #[derive(Debug)]
     struct Recorder {
         backend: InMemoryBackend,
         calls: parking_lot::Mutex<Vec<String>>,
+        lookups: parking_lot::Mutex<Vec<RecordBatch>>,
     }
 
     impl Recorder {
@@ -1695,11 +1720,16 @@ mod tests {
             Arc::new(Self {
                 backend: InMemoryBackend::try_new(TABLE, MAX_DEAD_RATIO).unwrap(),
                 calls: parking_lot::Mutex::new(Vec::new()),
+                lookups: parking_lot::Mutex::new(Vec::new()),
             })
         }
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().clone()
+        }
+
+        fn lookups(&self) -> Vec<RecordBatch> {
+            self.lookups.lock().clone()
         }
     }
 
@@ -1728,6 +1758,7 @@ mod tests {
             projection: &[usize],
             mark: Option<Mark>,
         ) -> Result<LookupRows> {
+            self.lookups.lock().push(keys.clone());
             self.backend.lookup(namespace, keys, projection, mark).await
         }
 
@@ -1762,6 +1793,34 @@ mod tests {
         )
         .unwrap();
         (table, recorder)
+    }
+
+    #[tokio::test]
+    async fn each_distinct_key_reaches_the_backend_once() {
+        let (table, recorder) = recorded(JournalTrim::OnFinalize);
+        apply(&table, &batch(&[(1, "a", "i"), (2, "b", "i")])).await;
+        assert_eq!(
+            lookup_names(
+                &table,
+                &[Some(1), Some(2), Some(1), None, Some(9), Some(2), Some(1)]
+            ),
+            names(&[
+                Some("a"),
+                Some("b"),
+                Some("a"),
+                None,
+                None,
+                Some("b"),
+                Some("a")
+            ])
+        );
+        let lookups = recorder.lookups();
+        assert_eq!(lookups.len(), 1);
+        assert_eq!(
+            lookups[0].column(0).as_primitive::<Int64Type>().values(),
+            &[1, 2, 9],
+            "null keys miss without reaching the backend"
+        );
     }
 
     #[tokio::test]
