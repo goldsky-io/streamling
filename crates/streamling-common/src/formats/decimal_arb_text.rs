@@ -105,7 +105,10 @@ pub(crate) fn decimal_arb_to_strings(field: &Field, array: &ArrayRef) -> Result<
 /// or nested inside Struct / List / LargeList / FixedSizeList / Map — becomes a
 /// Utf8 canonical-decimal string as canonical decimal text. Non-decimal_arb leaves and
 /// containers without any decimal_arb descendant are returned unchanged.
-pub fn decimal_arb_leaves_to_text(field: &Field, array: &ArrayRef) -> Result<(Field, ArrayRef)> {
+pub(crate) fn decimal_arb_leaves_to_text(
+    field: &Field,
+    array: &ArrayRef,
+) -> Result<(Field, ArrayRef)> {
     if DecimalArbType::is_decimal_arb_field(field) {
         let strings = decimal_arb_to_strings(field, array)?;
         return Ok((
@@ -252,7 +255,7 @@ pub fn decimal_arb_leaves_to_text(field: &Field, array: &ArrayRef) -> Result<(Fi
 /// `"001000"` became `0x00 0x10 0x00` = 4096 instead of one thousand, and
 /// `"12.34"` failed outright as invalid hex. Only top-level fields were
 /// rewritten before, so exactly the nested leaves fell into that path.
-pub fn decimal_arb_leaves_as_text_field(field: &Field) -> Field {
+pub(crate) fn decimal_arb_leaves_as_text_field(field: &Field) -> Field {
     if DecimalArbType::is_decimal_arb_field(field) {
         return Field::new(field.name(), DataType::Utf8, field.is_nullable());
     }
@@ -349,7 +352,7 @@ pub(crate) fn overlay_decimal_arb_metadata(source: &Field, target: &Field) -> Fi
 
 /// Inverse of [`decimalize_for_json`]: rebuild every `decimal_arb` leaf of
 /// `target` from the canonical-decimal strings the reader produced.
-pub fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> Result<ArrayRef> {
+pub(crate) fn decimal_arb_leaves_from_text(target: &Field, array: &ArrayRef) -> Result<ArrayRef> {
     let downcast_err = |what: &str| {
         DataFusionError::from(streamling_err!(
             "expected {} for field '{}', got {:?}",
