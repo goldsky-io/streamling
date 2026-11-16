@@ -53,7 +53,7 @@ use streamling_core::formats::{FromArrowConverter, ToArrowConverter};
 use streamling_core::operators::filter::StreamingFilterExec;
 use streamling_core::operators::projection::StreamingProjectionExec;
 use streamling_core::schema::arrow_schema_from_type_map;
-use streamling_core::session::SessionManager;
+use streamling_core::session::{SessionManager, create_simplified_physical_expr};
 use streamling_core::topology::SchemaIdOverride;
 use streamling_state::StateBackendErrorKind;
 use streamling_state::StateKey;
@@ -2800,7 +2800,7 @@ impl KafkaSourceTableProvider {
         let logical_expr = session_state.create_logical_expr(filter_expr, &df_schema)?;
         Self::validate_filter_columns(&logical_expr, schema)?;
 
-        session_state.create_physical_expr(logical_expr, &df_schema)
+        create_simplified_physical_expr(&session_state, logical_expr, &df_schema)
     }
 
     fn validate_filter_columns(expr: &Expr, schema: &SchemaRef) -> Result<()> {
@@ -4513,6 +4513,35 @@ mod tests {
                 .unwrap();
             let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
             assert_eq!(result, &BooleanArray::from(vec![false, true, false]));
+        }
+
+        /// `arrow_cast` fails if invoked: the simplifier rewrites it to a cast.
+        #[tokio::test]
+        async fn filter_applies_functions_the_simplifier_rewrites() {
+            use arrow::array::{Array, BooleanArray, Int64Array, RecordBatch};
+
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "status",
+                DataType::Int64,
+                false,
+            )]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                    .unwrap();
+
+            let predicate = KafkaSourceTableProvider::prepare_filter_expression(
+                "arrow_cast(status, 'Int32') = 1",
+                &schema,
+                &test_session_manager(),
+            )
+            .unwrap();
+            let result = predicate
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(result, &BooleanArray::from(vec![true, false]));
         }
 
         #[tokio::test]

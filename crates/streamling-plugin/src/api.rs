@@ -62,6 +62,8 @@
 //! fast remote releases → exit. Anything slower than a second or two in
 //! `terminate()` is usually a bug.
 
+pub mod table;
+
 use crate::r#async::PluginAsyncRuntimeObj;
 use crate::ffi::PluginMetricsRecorder;
 use crate::{

@@ -38,8 +38,7 @@ impl PhysicalOptimizerRule for StreamingFilterRewritePhysicalOptimizerRule {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|input_plan| {
             if let Some(original_filter) = input_plan.downcast_ref::<FilterExec>() {
-                let streaming_filter =
-                    StreamingFilterExec::from_original(original_filter.clone()).unwrap();
+                let streaming_filter = StreamingFilterExec::from_original(original_filter.clone())?;
                 Ok(Transformed::yes(Arc::new(streaming_filter)))
             } else {
                 Ok(Transformed::no(input_plan))
@@ -82,7 +81,7 @@ impl PhysicalOptimizerRule for StreamingProjectionRewritePhysicalOptimizerRule {
         plan.transform_down(|input_plan| {
             if let Some(original_projection) = input_plan.downcast_ref::<ProjectionExec>() {
                 let streaming_projection =
-                    StreamingProjectionExec::from_original(original_projection.clone()).unwrap();
+                    StreamingProjectionExec::from_original(original_projection.clone())?;
                 Ok(Transformed::yes(Arc::new(streaming_projection)))
             } else {
                 Ok(Transformed::no(input_plan))

@@ -8,6 +8,7 @@ use async_ffi::FutureExt;
 use streamling_plugin::api::PluginStateBackendFactory;
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::ffi::SafeArrowSchema;
+use streamling_plugin::table_backend::PluginTableBackendDescriptor;
 use streamling_plugin::{
     PartitionedPluginDescription, PluginChannels, PluginInitializationError, PluginInstanceContext,
     PluginLogging, PluginModule, PluginModuleRef, PluginOptions, PluginResult,
@@ -125,6 +126,12 @@ extern "C" fn create_partitioned(
     Err(PluginInitializationError::NotImplemented).into_c()
 }
 
+/// This library provides no table backends.
+extern "C" fn table_backend_descriptors(
+) -> RResult<RVec<PluginTableBackendDescriptor>, PluginInitializationError> {
+    RResult::ROk(RVec::new())
+}
+
 #[export_root_module]
 pub fn get_module() -> PluginModuleRef {
     PluginModule {
@@ -135,6 +142,7 @@ pub fn get_module() -> PluginModuleRef {
         set_shutdown_signal,
         describe_partitioned,
         create_partitioned,
+        table_backend_descriptors,
     }
     .leak_into_prefix()
 }

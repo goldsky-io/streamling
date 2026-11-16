@@ -5,6 +5,7 @@ pub mod r#async;
 mod dispatch;
 pub mod ffi;
 pub mod shutdown;
+pub mod table_backend;
 
 use crate::api::PluginStateBackendFactory;
 pub use crate::api::{
@@ -1712,6 +1713,14 @@ pub struct PluginModule {
         state_backend_config: PluginStateBackendConfig,
         message_channels: PluginChannels,
     ) -> RResult<PluginResult, PluginInitializationError>,
+
+    /// Returns the table backends this plugin provides. Can return an empty
+    /// vector. Absent (`None` accessor) for libraries built before table
+    /// backends, which provide none.
+    pub table_backend_descriptors: extern "C" fn() -> RResult<
+        RVec<table_backend::PluginTableBackendDescriptor>,
+        PluginInitializationError,
+    >,
 }
 
 impl RootModule for PluginModuleRef {

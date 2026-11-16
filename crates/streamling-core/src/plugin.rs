@@ -4,9 +4,9 @@ pub mod partitioned;
 mod preprocessor;
 pub mod side_output;
 pub mod table_provider;
-mod telemetry;
+pub(crate) mod telemetry;
 #[cfg(test)]
-mod test_plugins;
+pub(crate) mod test_plugins;
 pub mod udf;
 
 pub use preprocessor::build_plugin_preprocessors;
@@ -474,6 +474,27 @@ fn register_plugin_library(library: InitializedPluginLibrary) -> Result<()> {
         }
     }
 
+    // Absent for libraries built before table backends, which provide none.
+    if let Some(table_backend_descriptors_fn) = plugin_module.table_backend_descriptors() {
+        match table_backend_descriptors_fn() {
+            ROk(descriptors) => {
+                info!(
+                    "Loaded {} table backend(s) from plugin: {:?}",
+                    descriptors.len(),
+                    path
+                );
+                crate::table::plugin::store_plugin_table_backends(descriptors);
+            }
+            RErr(e) => {
+                streamling_user_bail!(
+                    "Failed to load table backend descriptors from {:?}: {:?}",
+                    path,
+                    e
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -501,6 +522,11 @@ fn require_plugin(plugin_id: &PluginId) -> Result<Arc<PluginModuleRef>> {
             registered_plugin_ids().join(", ")
         )
     })
+}
+
+/// The host's runtime, as plugins take it.
+pub(crate) fn host_async_runtime() -> PluginAsyncRuntimeObj {
+    create_plugin_async_runtime(Handle::current())
 }
 
 fn create_plugin_async_runtime(handle: Handle) -> PluginAsyncRuntimeObj {

@@ -19,6 +19,8 @@ use datafusion::physical_plan::{
 };
 use delegate::delegate;
 
+use crate::table::read::bind_table_marks;
+
 use futures::stream::{Stream, StreamExt};
 use tracing::log::trace;
 
@@ -43,7 +45,7 @@ pub struct StreamingProjectionExec {
     original_projection: ProjectionExec,
     /// True when this projection belongs to an upstream source node and was
     /// re-applied above the source's `WrappingExec` (see
-    /// `wrap_with_side_outputs_before_filter`). Marks a topology boundary for
+    /// `wrap_with_side_outputs`). Marks a topology boundary for
     /// downstream metric aggregation.
     source_owned: bool,
 }
@@ -52,14 +54,17 @@ impl StreamingProjectionExec {
     /// NOTE: always resets `source_owned` to `false`. A rebuild path that
     /// routes a source-owned projection through here silently drops the
     /// topology boundary mark — callers must re-apply it via
-    /// [`Self::with_source_owned`] (see `wrap_with_side_outputs_before_filter`).
+    /// [`Self::with_source_owned`] (see `wrap_with_side_outputs`).
     pub fn from_original(original_projection: ProjectionExec) -> Result<Self> {
         Ok(Self {
             expr: original_projection
                 .expr()
                 .iter()
-                .map(|pe| (pe.expr.clone(), pe.alias.clone()))
-                .collect(),
+                .map(|pe| {
+                    let expr = bind_table_marks(pe.expr.clone())?;
+                    Ok((expr, pe.alias.clone()))
+                })
+                .collect::<Result<_>>()?,
             schema: original_projection.schema(),
             input: original_projection.input().clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -74,7 +79,7 @@ impl StreamingProjectionExec {
     /// `source_owned` field.
     ///
     /// Crate-internal: the mark is only set by
-    /// `wrap_with_side_outputs_before_filter` (and tests that model that path).
+    /// `wrap_with_side_outputs` (and tests that model that path).
     pub(crate) fn is_source_owned(&self) -> bool {
         self.source_owned
     }
@@ -82,7 +87,7 @@ impl StreamingProjectionExec {
     /// Consume `self`, returning it marked as owned by an upstream source
     /// node (see the `source_owned` field).
     ///
-    /// Crate-internal: only `wrap_with_side_outputs_before_filter` should set
+    /// Crate-internal: only `wrap_with_side_outputs` should set
     /// this mark (tests may model that path).
     pub(crate) fn with_source_owned(mut self) -> Self {
         self.source_owned = true;
