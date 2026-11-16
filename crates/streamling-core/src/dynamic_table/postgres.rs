@@ -1,9 +1,8 @@
 use crate::dynamic_table::key_set::ArrowKeySet;
 use crate::dynamic_table::{DynamicTableBackend, DynamicTableBackendError, extract_string_values};
 use crate::error::Result as StreamlingResult;
-use crate::error::ResultExt;
 use crate::error::StreamlingError;
-use crate::retry::{retry_forever_with_backoff_until_cancelled_returning, retry_if_retriable};
+use crate::retry::{retry_if_retriable, retry_if_retriable_until_cancelled};
 use crate::streamling_user_err;
 use async_trait::async_trait;
 use datafusion::arrow::array::builder::{BooleanBuilder, LargeStringBuilder};
@@ -31,15 +30,14 @@ const CACHE_LOAD_PAGE_SIZE: usize = 1_000;
 /// Statement timeout for each individual database query (30 seconds)
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// PostgreSQL error codes that indicate a transient infrastructure failure
-/// rather than a permanent configuration problem: connection exceptions
-/// (08000-08006), admin/cluster shutdown (57P01-57P03), and
-/// too-many-connections (53300).
+/// SQLSTATE classes a retry can plausibly recover from: connection exception
+/// (08), transaction rollback such as serialization failure or deadlock (40),
+/// insufficient resources (53), operator intervention including
+/// statement_timeout and shutdowns (57), and system error (58). Every other
+/// class (data exception 22, syntax/access 42, ...) fails the same way on
+/// every attempt.
 fn pg_code_is_transient(code: &str) -> bool {
-    matches!(
-        code,
-        "08000" | "08001" | "08003" | "08004" | "08006" | "57P01" | "57P02" | "57P03" | "53300"
-    )
+    matches!(code.get(..2), Some("08" | "40" | "53" | "57" | "58"))
 }
 
 /// True when a sqlx error is transient infrastructure trouble (lost
@@ -50,6 +48,29 @@ fn sqlx_error_is_transient(e: &sqlx::Error) -> bool {
         sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => true,
         sqlx::Error::Database(db) => db.code().is_some_and(|c| pg_code_is_transient(&c)),
         _ => false,
+    }
+}
+
+/// Wrap a query error with context, retriable only when transient, so the
+/// retry loops fail fast on permanent errors instead of wedging the pipeline.
+trait SqlxResultExt<T> {
+    fn classify_with_context<C, F>(self, f: F) -> StreamlingResult<T>
+    where
+        C: std::fmt::Display + Send + Sync + 'static,
+        F: FnOnce() -> C;
+}
+
+impl<T> SqlxResultExt<T> for Result<T, sqlx::Error> {
+    fn classify_with_context<C, F>(self, f: F) -> StreamlingResult<T>
+    where
+        C: std::fmt::Display + Send + Sync + 'static,
+        F: FnOnce() -> C,
+    {
+        self.map_err(|e| {
+            let transient = sqlx_error_is_transient(&e);
+            let err = StreamlingError::with_cause(f(), e);
+            if transient { err.mark_retriable() } else { err }
+        })
     }
 }
 
@@ -353,8 +374,8 @@ impl PostgresDynamicTableBackend {
         }
     }
 
-    /// Retries with backoff until it succeeds or shutdown is requested (same drain
-    /// rationale as `contains_batch`).
+    /// Retries transient errors until success or shutdown (same drain rationale
+    /// as `contains_batch`); permanent errors fail fast.
     async fn latest_update(
         &self,
         pool: Arc<PgPool>,
@@ -368,7 +389,7 @@ impl PostgresDynamicTableBackend {
         let operation_name = format!("DynamicTable latest_update ({})", self.full_table_name);
         let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_until_cancelled_returning(
+        retry_if_retriable_until_cancelled(
             || {
                 let pool = pool.clone();
                 let query = query.clone();
@@ -377,7 +398,7 @@ impl PostgresDynamicTableBackend {
                     sqlx::query_scalar::<_, Option<String>>(query.as_ref())
                         .fetch_one(pool.as_ref())
                         .await
-                        .streamling_with_context(|| {
+                        .classify_with_context(|| {
                             format!("failed to read latest update from table {full_table_name}")
                         })
                 }
@@ -386,13 +407,11 @@ impl PostgresDynamicTableBackend {
             &mut shutdown,
         )
         .await
-        .ok_or_else(|| {
-            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
-        })
+        .map_err(|e| DynamicTableBackendError::Query(format!("{operation_name}: {e}")))
     }
 
-    /// Retries with backoff until it succeeds or shutdown is requested (same drain
-    /// rationale as `contains_batch`).
+    /// Retries transient errors until success or shutdown (same drain rationale
+    /// as `contains_batch`); permanent errors fail fast.
     async fn load_cache(
         &self,
         pool: Arc<PgPool>,
@@ -434,7 +453,7 @@ impl PostgresDynamicTableBackend {
         let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
         let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_until_cancelled_returning(
+        retry_if_retriable_until_cancelled(
             || {
                 let pool = pool.clone();
                 let max_query = max_query.clone();
@@ -443,20 +462,20 @@ impl PostgresDynamicTableBackend {
                 let updated_since = updated_since.clone();
                 let full_table_name = full_table_name.clone();
                 async move {
-                    let mut transaction = pool.begin().await.streamling_with_context(|| {
+                    let mut transaction = pool.begin().await.classify_with_context(|| {
                         format!("failed to begin cache load for table {full_table_name}")
                     })?;
                     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                         .execute(&mut *transaction)
                         .await
-                        .streamling_with_context(|| {
+                        .classify_with_context(|| {
                             format!("failed to configure cache load for table {full_table_name}")
                         })?;
 
                     let updated_at = sqlx::query_scalar::<_, Option<String>>(max_query.as_ref())
                         .fetch_one(&mut *transaction)
                         .await
-                        .streamling_with_context(|| {
+                        .classify_with_context(|| {
                             format!("failed to read cache version from table {full_table_name}")
                         })?;
 
@@ -469,7 +488,7 @@ impl PostgresDynamicTableBackend {
                     cursor_query
                         .execute(&mut *transaction)
                         .await
-                        .streamling_with_context(|| {
+                        .classify_with_context(|| {
                             format!("failed to open cache cursor for table {full_table_name}")
                         })?;
 
@@ -479,7 +498,7 @@ impl PostgresDynamicTableBackend {
                         let page: Vec<String> = sqlx::query_scalar(fetch_page_query.as_ref())
                             .fetch_all(&mut *transaction)
                             .await
-                            .streamling_with_context(|| {
+                            .classify_with_context(|| {
                                 format!("failed to fetch cache page from table {full_table_name}")
                             })?;
                         if page.is_empty() {
@@ -491,7 +510,7 @@ impl PostgresDynamicTableBackend {
                         }
                     }
 
-                    transaction.commit().await.streamling_with_context(|| {
+                    transaction.commit().await.classify_with_context(|| {
                         format!("failed to finish cache load for table {full_table_name}")
                     })?;
                     Ok((updated_at, builder.finish(), pages_loaded))
@@ -501,9 +520,7 @@ impl PostgresDynamicTableBackend {
             &mut shutdown,
         )
         .await
-        .ok_or_else(|| {
-            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
-        })
+        .map_err(|e| DynamicTableBackendError::Query(format!("{operation_name}: {e}")))
     }
 
     /// Returns true when the caller should run the freshness check now.
@@ -659,9 +676,11 @@ impl PostgresDynamicTableBackend {
     }
 
     /// Check if a batch of values exist in the table (internal method that doesn't split batches)
-    /// Retries with exponential backoff until it succeeds or shutdown is requested — SQL
+    /// Retries transient errors with exponential backoff until success or shutdown — SQL
     /// transforms reach this through the dynamic-table UDF via `block_in_place`, so an
-    /// uncancellable retry loop here used to pin the drain forever against a sick backend. Statement timeout bounds individual queries.
+    /// uncancellable retry loop here used to pin the drain forever against a sick backend.
+    /// Permanent errors fail fast: retrying them wedged pipelines with no output and no
+    /// restarts. Statement timeout bounds individual queries.
     /// Uses Arc to wrap values so retry clones are cheap (reference count increment only).
     async fn contains_batch(
         &self,
@@ -679,7 +698,7 @@ impl PostgresDynamicTableBackend {
         let operation_name = format!("DynamicTable contains_batch ({})", self.full_table_name);
         let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_until_cancelled_returning(
+        retry_if_retriable_until_cancelled(
             || {
                 // Arc clones are cheap (just incrementing reference counts)
                 let pool = pool.clone();
@@ -711,7 +730,7 @@ impl PostgresDynamicTableBackend {
                     let existing_values: Vec<String> = sqlx_query
                         .fetch_all(pool.as_ref())
                         .await
-                        .streamling_with_context(|| {
+                        .classify_with_context(|| {
                             format!(
                                 "failed to check if values exist in table {}",
                                 full_table_name
@@ -728,16 +747,14 @@ impl PostgresDynamicTableBackend {
             &mut shutdown,
         )
         .await
-        .ok_or_else(|| {
-            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
-        })
+        .map_err(|e| DynamicTableBackendError::Query(format!("{operation_name}: {e}")))
     }
 
     /// Append a batch of values to the table (internal method that doesn't split
-    /// batches). Retries forever with exponential backoff — it only returns when
-    /// the batch is committed (or the task is torn down), so callers may treat
-    /// its return as commit-success when deciding whether to mirror the keys
-    /// into the in-memory cache. Statement timeout prevents individual queries
+    /// batches). Retries transient errors with exponential backoff; permanent
+    /// errors fail fast. It returns `Ok` only when the batch is committed, so
+    /// callers may treat `Ok` as commit-success when deciding whether to mirror
+    /// the keys into the in-memory cache. Statement timeout prevents individual queries
     /// from hanging. Uses Arc to wrap values so retry clones are cheap
     /// (reference count increment only).
     async fn append_batch(
@@ -759,7 +776,7 @@ impl PostgresDynamicTableBackend {
         let operation_name = format!("DynamicTable append_batch ({})", self.full_table_name);
         let mut shutdown = crate::shutdown::subscribe();
 
-        retry_forever_with_backoff_until_cancelled_returning(
+        retry_if_retriable_until_cancelled(
             || {
                 // Arc clones are cheap (just incrementing reference counts)
                 let pool = pool.clone();
@@ -807,7 +824,7 @@ impl PostgresDynamicTableBackend {
                     }
 
                     if serialize_write {
-                        let mut transaction = pool.begin().await.streamling_with_context(|| {
+                        let mut transaction = pool.begin().await.classify_with_context(|| {
                             format!("failed to begin cached write to table {full_table_name}")
                         })?;
 
@@ -817,7 +834,7 @@ impl PostgresDynamicTableBackend {
                             .bind(full_table_name.as_ref())
                             .execute(&mut *transaction)
                             .await
-                            .streamling_with_context(|| {
+                            .classify_with_context(|| {
                                 format!(
                                     "failed to serialize cached writes to table {full_table_name}"
                                 )
@@ -826,17 +843,17 @@ impl PostgresDynamicTableBackend {
                         sqlx_query
                             .execute(&mut *transaction)
                             .await
-                            .streamling_with_context(|| {
+                            .classify_with_context(|| {
                                 format!("failed to append values to table {full_table_name}")
                             })?;
-                        transaction.commit().await.streamling_with_context(|| {
+                        transaction.commit().await.classify_with_context(|| {
                             format!("failed to commit cached write to table {full_table_name}")
                         })?;
                     } else {
                         sqlx_query
                             .execute(pool.as_ref())
                             .await
-                            .streamling_with_context(|| {
+                            .classify_with_context(|| {
                                 format!("failed to append values to table {full_table_name}")
                             })?;
                     }
@@ -848,9 +865,7 @@ impl PostgresDynamicTableBackend {
             &mut shutdown,
         )
         .await
-        .ok_or_else(|| {
-            DynamicTableBackendError::Query(format!("{} cancelled by shutdown", operation_name))
-        })?;
+        .map_err(|e| DynamicTableBackendError::Query(format!("{operation_name}: {e}")))?;
 
         trace!(
             "[append_batch] for table name '{}' with {} values",
@@ -1123,7 +1138,7 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
 
         // Keep this pipeline's own writes visible without waiting for the next
         // freshness check: insert the keys we just committed to postgres into the
-        // cached set. Safe because `append_batch` retries forever until the batch
+        // cached set. Safe because `append_batch` returns `Ok` only once the batch
         // commits (see its doc), so any key reaching this point is persisted —
         // this can never produce a false positive. `updated_at` is deliberately
         // left untouched, so the next real refresh still fetches everything since
@@ -1342,11 +1357,17 @@ mod tests {
         assert!(sqlx_error_is_transient(&sqlx::Error::PoolTimedOut));
         assert!(sqlx_error_is_transient(&sqlx::Error::PoolClosed));
 
-        // PostgreSQL connection exceptions and shutdowns are transient.
+        // Connection, rollback, resource, operator and system classes are transient.
         assert!(pg_code_is_transient("08000"));
         assert!(pg_code_is_transient("08006"));
-        assert!(pg_code_is_transient("57P01"));
+        assert!(pg_code_is_transient("40001")); // serialization failure
+        assert!(pg_code_is_transient("40P01")); // deadlock
         assert!(pg_code_is_transient("53300"));
+        assert!(pg_code_is_transient("57014")); // statement_timeout
+        assert!(pg_code_is_transient("57P01"));
+        assert!(pg_code_is_transient("58030"));
+        assert!(!pg_code_is_transient("22021")); // invalid byte sequence (NUL)
+        assert!(!pg_code_is_transient(""));
 
         // Permanent SQL errors (permissions, missing column, bad operator)
         // stay Initialization so init fails fast.
