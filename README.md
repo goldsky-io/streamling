@@ -2432,11 +2432,20 @@ Streamling exports two variants of the `output_rows` metric with different tempo
 
 - **`output_rows_delta`** (Delta): Reports incremental rows since the last export interval. Use this for billing and aggregation use cases in time-series databases like ClickHouse, where you can simply `SUM()` the values without worrying about resets or lag compensation.
 
-Source nodes also export **`input_rows_delta`** and **`input_bytes_delta`** (Delta): the rows a source outputs, and their bytes, before its `filter:` is applied. A hybrid source reports them on its bounded and unbounded phase nodes, not on the hybrid node itself. A ClickHouse source pushes its filter into the query, so it counts the rows ClickHouse returns.
+`input_rows` has the same pair: **`input_rows_total`** (Cumulative) and **`input_rows_delta`** (Delta). Both count the rows entering a node:
 
-Sink nodes export **`output_bytes_delta`** (Delta): the bytes of the rows each sink receives, after primary-key deduplication.
+- Source: the rows the source outputs, before its `filter:` and before any pushed-down projection. A hybrid source counts on its bounded and unbounded phase nodes, not on the hybrid node itself. A ClickHouse source pushes its filter into the query, so it counts the rows ClickHouse returns.
+- Transform: the `output_rows` of its upstream nodes. Below a source with a `filter:`, that is the pre-filter count.
+- Sink: the rows it receives, before primary-key deduplication.
 
-Both byte counts are the Arrow size of the rows' columns, not wire or storage bytes. A slice counts only its own rows.
+Filter on `topology_node_type` when you sum them, because a row counts once on every node it enters.
+
+Byte metrics (Delta):
+
+- **`input_bytes_delta`** on sources: the bytes of the same rows as the source's `input_rows_delta`, including columns that a pushed-down projection drops later.
+- **`output_bytes_delta`** on sinks: the bytes of the rows each sink receives, after primary-key deduplication.
+
+A byte count is the size the rows would have if copied into fresh Arrow arrays of the same types, not wire or storage bytes. A slice counts only its own rows at every nesting level. Dictionary and run-end encoded columns count their decoded values.
 
 ### Adding Telemetry to Custom Operators
 

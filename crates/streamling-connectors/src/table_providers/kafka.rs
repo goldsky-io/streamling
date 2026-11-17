@@ -2066,7 +2066,6 @@ impl ExecutionPlan for KafkaSourceExec {
                                     converter.decode_and_buffer(&message).await?;
                                     watchdog.on_record();
                                     batch_row_count += 1;
-                                    metrics_recorder.record_count("input_rows", 1, metric_metadata_id.as_str());
                                     if batch_row_count >= batch_size_limit {
                                         break;
                                     }

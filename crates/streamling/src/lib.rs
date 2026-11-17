@@ -26,7 +26,9 @@ use streamling_core::checkpoints::checkpoint_management::{
     CheckpointControl, CheckpointCoordinator,
 };
 use streamling_core::error::{Result, ResultExt};
-use streamling_core::node_context::{NodeContext, TopologyNodeType, init_node_registry};
+use streamling_core::node_context::{
+    HYBRID_SOURCE_OPERATOR_TYPE, NodeContext, TopologyNodeType, init_node_registry,
+};
 use streamling_core::operators::broadcast::{MultiSinkEntry, MultiSinkLogicalNode};
 use streamling_core::operators::checkpointable::CheckpointableNode;
 use streamling_core::operators::external_handlers::{ExternalHandlerConfig, ExternalHandlerNode};
@@ -3901,7 +3903,7 @@ impl Streamling {
             let operator_type = match source {
                 topology::Source::kafka(_) => "kafka",
                 topology::Source::clickhouse(_) => "clickhouse",
-                topology::Source::hybrid(_) => "hybrid",
+                topology::Source::hybrid(_) => HYBRID_SOURCE_OPERATOR_TYPE,
                 topology::Source::file(_) => "file",
                 topology::Source::plugin(_) => "plugin",
             };

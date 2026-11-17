@@ -1,9 +1,10 @@
+use crate::node_context::HYBRID_SOURCE_OPERATOR_TYPE;
+use crate::telemetry::arrow_bytes::batch_data_bytes;
 use crate::telemetry::types::{
     MetricData, RowCountMeasurementType, create_count_with_value, create_gauge_with_value,
     create_time_from_duration,
 };
 use crate::telemetry::{PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags};
-use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::metrics::{Count, MetricValue, MetricsSet};
 use once_cell::sync::Lazy;
@@ -63,34 +64,39 @@ fn is_metric_denied(metric_name: &str) -> bool {
 /// wall-clock suppression (via `resolve_is_sql_node`) and the subtree-delta
 /// export in `record_execution_plan_metrics`; the two must never drift apart.
 const SQL_OPERATOR_TYPE: &str = "sql";
-const HYBRID_OPERATOR_TYPE: &str = "hybrid";
 
-/// Bytes of the rows in `batch`, so a slice counts only its own rows and not the buffers it
-/// shares. A view-typed column counts its 16-byte views plus the out-of-line value bytes.
-pub(crate) fn batch_data_bytes(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|column| {
-            let views = column
-                .as_string_view_opt()
-                .map(|a| a.views())
-                .or_else(|| column.as_binary_view_opt().map(|a| a.views()));
-            if let Some(views) = views {
-                let out_of_line: usize = views
-                    .iter()
-                    .map(|view| *view as u32 as usize)
-                    .filter(|&len| len > 12)
-                    .sum();
-                let nulls = column.nulls().map_or(0, |n| n.len().div_ceil(8));
-                return views.len() * 16 + out_of_line + nulls;
-            }
-            column
-                .to_data()
-                .get_slice_memory_size()
-                .unwrap_or_else(|_| column.get_array_memory_size())
-        })
-        .sum()
+/// `input_rows` and its delta twin `input_rows_delta`: the rows entering a node. Every node that
+/// counts input rows emits both, so the two series always measure the same rows.
+fn input_rows_values(rows: &Count) -> Vec<MetricValue> {
+    vec![
+        MetricValue::Count {
+            name: "input_rows".into(),
+            count: rows.clone(),
+        },
+        MetricValue::Count {
+            name: "input_rows_delta".into(),
+            count: rows.clone(),
+        },
+    ]
+}
+
+/// A `name` count of the Arrow bytes of `batch`. A batch that cannot be sized emits nothing
+/// rather than a wrong number.
+fn data_bytes_metric(
+    name: &'static str,
+    batch: &RecordBatch,
+    metadata_id: &str,
+) -> Option<MetricValue> {
+    match batch_data_bytes(batch) {
+        Ok(bytes) => Some(MetricValue::Count {
+            name: name.into(),
+            count: create_count_with_value(bytes),
+        }),
+        Err(e) => {
+            warn!("Skipping {name} for {metadata_id}: cannot size the batch: {e}");
+            None
+        }
+    }
 }
 
 /// Prefix for metric names sourced from a SQL transform's DataFusion subtree
@@ -432,13 +438,12 @@ impl MetricsRecorder {
         else {
             return;
         };
-        self.record_metric_data(MetricData::new_with_owned_tags(
-            vec![MetricValue::Count {
-                name: "output_bytes_delta".into(),
-                count: create_count_with_value(batch_data_bytes(batch)),
-            }],
-            metric_metadata_tags,
-        ));
+        if let Some(output_bytes) = data_bytes_metric("output_bytes_delta", batch, metadata_id) {
+            self.record_metric_data(MetricData::new_with_owned_tags(
+                vec![output_bytes],
+                metric_metadata_tags,
+            ));
+        }
     }
 
     pub fn record_elapsed_compute(&self, duration: Duration, metadata_id: &str) {
@@ -655,6 +660,7 @@ impl MetricsRecorder {
     /// This method dispatches count recorded as part of `TelemetryExec` wrapping of `ExecutionPlan`s
     /// for sources, transforms the `batch_count` is recorded as `output_rows` metric
     /// for sinks the `batch_count` is recorded as `input_rows` metric since we wrap the input stream in `TelemetryDataSink`
+    /// for sources, the same rows are also recorded as the source's own `input_rows` (pre-filter)
     /// Datafusion's `ExecutionPlanMetricsSet` is also recorded but only for transforms
     /// for transforms, we also emit `batch_count` as children node's `input_row` count
     /// under the assumption that output for a transform node is input for it's downstream nodes
@@ -711,22 +717,16 @@ impl MetricsRecorder {
                     metric_metadata_tags.clone(),
                 ));
 
-                // A source's WrappingExec sits below its topology `filter:`, so this is pre-filter.
-                // The outer hybrid node is skipped: its bounded/unbounded phase nodes count the rows.
+                // A source's WrappingExec sits below its topology `filter:`, so the rows entering
+                // the source node are counted before the filter. The outer hybrid node is skipped:
+                // its bounded/unbounded phase nodes count the rows.
                 if metric_metadata.node_context.node_type == TopologyNodeType::Source
-                    && metric_metadata.node_context.operator_type != HYBRID_OPERATOR_TYPE
+                    && metric_metadata.node_context.operator_type != HYBRID_SOURCE_OPERATOR_TYPE
                 {
+                    let mut source_input = input_rows_values(&output_rows_count);
+                    source_input.extend(data_bytes_metric("input_bytes_delta", batch, metadata_id));
                     all_metric_data.push(MetricData::new_with_owned_tags(
-                        vec![
-                            MetricValue::Count {
-                                name: "input_rows_delta".into(),
-                                count: output_rows_count.clone(),
-                            },
-                            MetricValue::Count {
-                                name: "input_bytes_delta".into(),
-                                count: create_count_with_value(batch_data_bytes(batch)),
-                            },
-                        ],
+                        source_input,
                         metric_metadata_tags.clone(),
                     ));
                 }
@@ -752,26 +752,16 @@ impl MetricsRecorder {
                         .get(child_metric_metadata_id.as_str())
                         .cloned()
                     {
-                        let metric_value = MetricValue::Count {
-                            name: "input_rows".into(),
-                            count: output_rows_count.clone(),
-                        };
                         all_metric_data.push(MetricData::new_with_owned_tags(
-                            vec![metric_value],
+                            input_rows_values(&output_rows_count),
                             child_metric_metadata_tags,
                         ));
                     }
                 }
             }
             RowCountMeasurementType::InputRowCount => {
-                let input_rows_count = Count::new();
-                input_rows_count.add(batch_count);
-                let input_rows_metric_value = MetricValue::Count {
-                    name: "input_rows".into(),
-                    count: input_rows_count,
-                };
                 all_metric_data.push(MetricData::new_with_owned_tags(
-                    vec![input_rows_metric_value],
+                    input_rows_values(&create_count_with_value(batch_count)),
                     metric_metadata_tags.clone(),
                 ));
             }
@@ -2662,7 +2652,7 @@ mod tests {
 
     mod pipeline_io_delta_tests {
         use super::*;
-        use datafusion::arrow::array::{Int64Array, StringArray, StringViewArray};
+        use datafusion::arrow::array::Int64Array;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use opentelemetry::metrics::MeterProvider;
         use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData as OtelMetricData};
@@ -2692,7 +2682,7 @@ mod tests {
         }
 
         fn recorder_with_nodes(
-            nodes: &[(&str, TopologyNodeType, &str)],
+            nodes: &[(&str, TopologyNodeType, &str, &[&str])],
         ) -> (MetricsRecorder, SdkMeterProvider, InMemoryMetricExporter) {
             let exporter = InMemoryMetricExporterBuilder::new()
                 .with_temporality(Temporality::Delta)
@@ -2709,12 +2699,12 @@ mod tests {
                     counts.insert(name.to_string(), meter.u64_counter(name).build());
                 }
             }
-            for (id, node_type, operator_type) in nodes {
+            for (id, node_type, operator_type, children) in nodes {
                 let metadata = PipelineMetricMetadata {
                     node_context: NodeContext::new(node_type.clone(), operator_type, id),
                     service_instance_id: "app".to_string(),
                     additional_tags: BTreeMap::new(),
-                    children_metadata_ids: vec![],
+                    children_metadata_ids: children.iter().map(|c| c.to_string()).collect(),
                 };
                 recorder
                     .metric_metadata_tags_registry
@@ -2762,7 +2752,7 @@ mod tests {
         #[test]
         fn source_batch_emits_input_rows_and_bytes_delta() {
             let (recorder, provider, exporter) =
-                recorder_with_nodes(&[("src", TopologyNodeType::Source, "kafka")]);
+                recorder_with_nodes(&[("src", TopologyNodeType::Source, "kafka", &[])]);
             for rows in [10, 5] {
                 recorder.record_execution_plan_metrics(
                     "src",
@@ -2771,10 +2761,13 @@ mod tests {
                     None,
                 );
             }
-            assert_eq!(
-                exported_sum(&provider, &exporter, "input_rows_delta", "src"),
-                15
-            );
+            for name in ["input_rows", "input_rows_delta"] {
+                assert_eq!(
+                    exported_sum(&provider, &exporter, name, "src"),
+                    15,
+                    "{name}"
+                );
+            }
             assert_eq!(
                 exported_sum(&provider, &exporter, "input_bytes_delta", "src"),
                 15 * 8
@@ -2784,9 +2777,9 @@ mod tests {
         #[test]
         fn non_source_and_outer_hybrid_nodes_skip_input_delta() {
             let (recorder, provider, exporter) = recorder_with_nodes(&[
-                ("xform", TopologyNodeType::Transform, "sql"),
-                ("hyb", TopologyNodeType::Source, "hybrid"),
-                ("hyb_unbounded", TopologyNodeType::Source, "kafka"),
+                ("xform", TopologyNodeType::Transform, "sql", &[]),
+                ("hyb", TopologyNodeType::Source, "hybrid", &[]),
+                ("hyb_unbounded", TopologyNodeType::Source, "kafka", &[]),
             ]);
             for id in ["xform", "hyb", "hyb_unbounded"] {
                 recorder.record_execution_plan_metrics(
@@ -2810,10 +2803,43 @@ mod tests {
             }
         }
 
+        /// `input_rows_delta` is the delta twin of `input_rows` on every node kind that counts
+        /// input rows: a source (its own pre-filter rows), a transform (its parent's output
+        /// rows) and a sink (the rows it receives).
+        #[test]
+        fn input_rows_delta_matches_input_rows_on_every_node() {
+            let (recorder, provider, exporter) = recorder_with_nodes(&[
+                ("src", TopologyNodeType::Source, "kafka", &["xform", "snk"]),
+                ("xform", TopologyNodeType::Transform, "sql", &[]),
+                ("snk", TopologyNodeType::Sink, "postgres", &[]),
+            ]);
+            recorder.record_execution_plan_metrics(
+                "src",
+                &int_batch(6),
+                RowCountMeasurementType::OutputRowCount,
+                None,
+            );
+            recorder.record_execution_plan_metrics(
+                "snk",
+                &int_batch(4),
+                RowCountMeasurementType::InputRowCount,
+                None,
+            );
+            for (id, rows) in [("src", 6), ("xform", 6), ("snk", 4)] {
+                for name in ["input_rows", "input_rows_delta"] {
+                    assert_eq!(
+                        exported_sum(&provider, &exporter, name, id),
+                        rows,
+                        "{name} of {id}"
+                    );
+                }
+            }
+        }
+
         #[test]
         fn sink_output_bytes_delta_counts_received_batches() {
             let (recorder, provider, exporter) =
-                recorder_with_nodes(&[("snk", TopologyNodeType::Sink, "postgres")]);
+                recorder_with_nodes(&[("snk", TopologyNodeType::Sink, "postgres", &[])]);
             recorder.record_sink_output_bytes(&int_batch(3), "snk");
             recorder.record_sink_output_bytes(&int_batch(4), "snk");
             recorder.record_sink_output_bytes(&int_batch(4), "unregistered");
@@ -2821,32 +2847,6 @@ mod tests {
                 exported_sum(&provider, &exporter, "output_bytes_delta", "snk"),
                 7 * 8
             );
-        }
-
-        #[test]
-        fn batch_data_bytes_counts_only_the_sliced_rows() {
-            assert_eq!(batch_data_bytes(&int_batch(100).slice(10, 20)), 20 * 8);
-
-            let strings = StringArray::from(vec![Some("aaaa"), None, Some("bbbbbbbb"), Some("cc")]);
-            let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(strings)]).unwrap();
-            // Rows 1..3: two i32 offsets, 8 value bytes, one validity byte.
-            assert_eq!(batch_data_bytes(&batch.slice(1, 2)), 2 * 4 + 8 + 1);
-        }
-
-        #[test]
-        fn batch_data_bytes_counts_out_of_line_view_values() {
-            let long = "x".repeat(40);
-            let views = StringViewArray::from(vec!["short", long.as_str(), long.as_str()]);
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "s",
-                DataType::Utf8View,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(views)]).unwrap();
-            // "short" is inlined in its view; each 40-byte value lives out of line.
-            assert_eq!(batch_data_bytes(&batch), 3 * 16 + 2 * 40);
-            assert_eq!(batch_data_bytes(&batch.slice(0, 1)), 16);
         }
     }
 }
