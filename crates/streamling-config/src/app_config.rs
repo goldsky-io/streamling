@@ -40,6 +40,10 @@ pub struct PostgresStateBackendConfig {
     /// always reportable inside the drain window — sqlx's own 30s default
     /// out-waits every budget below ~42s of grace.
     pub acquire_timeout_secs: Option<u64>,
+    /// Ceiling on a single state statement, in seconds, enforced on the
+    /// client; a statement that exceeds it is retried once on a fresh
+    /// connection. Defaults to 60 s in the backend.
+    pub statement_timeout_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresStateBackendConfig {
@@ -59,6 +63,8 @@ impl std::fmt::Debug for PostgresStateBackendConfig {
             .field("max_connections", &self.max_connections)
             .field("state_schema_name", &self.state_schema_name)
             .field("state_table_name", &self.state_table_name)
+            .field("acquire_timeout_secs", &self.acquire_timeout_secs)
+            .field("statement_timeout_secs", &self.statement_timeout_secs)
             .finish()
     }
 }

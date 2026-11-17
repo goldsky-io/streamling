@@ -12,6 +12,7 @@ use arrow::array::RecordBatch;
 use async_ffi::FutureExt;
 use crossbeam_channel::TryRecvError;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -175,6 +176,7 @@ async fn handle_control_messages(
     channels: &PluginChannels,
     source_plugin: &Arc<dyn SourcePlugin>,
     runtime: &PluginAsyncRuntimeObj,
+    host_terminated: &AtomicBool,
 ) -> Result<(), PluginError> {
     while !channels.input.receiver.is_empty() {
         match channels.input.receiver.recv().map(|m| m.into_enum()) {
@@ -196,6 +198,7 @@ async fn handle_control_messages(
                 handle_checkpoint_finalizer(channels, epoch, runtime).await?;
             }
             Ok(Ok(PluginMsg::Terminate)) => {
+                host_terminated.store(true, Ordering::SeqCst);
                 source_plugin.terminate().await?;
                 // Bounded wait for tasks spawned via `shutdown::spawn` so
                 // buffered work they hold is flushed before the library goes
@@ -330,6 +333,7 @@ impl SourcePluginDispatcher {
         }
         self.source_plugin.initialize().await?;
         let mut beacon = LivenessBeacon::new(&self.channels);
+        let host_terminated = Arc::new(AtomicBool::new(false));
 
         loop {
             beacon.beat();
@@ -347,6 +351,7 @@ impl SourcePluginDispatcher {
             let runtime_clone = runtime.clone();
             let channels_clone = self.channels.clone();
             let source_plugin_clone = self.source_plugin.clone();
+            let host_terminated_clone = host_terminated.clone();
             let generate_batch_future = async move {
                 match source_plugin.generate_batch().await {
                     Ok(batch) => {
@@ -354,9 +359,10 @@ impl SourcePluginDispatcher {
                             let channels = channels_clone.clone();
                             let source_plugin = source_plugin_clone.clone();
                             let runtime = runtime_clone.clone();
+                            let host_terminated = host_terminated_clone.clone();
                             Box::pin(async move {
                                 // Handle control messages in case the output channel is full
-                                let _ = handle_control_messages(&channels, &source_plugin, &runtime).await;
+                                let _ = handle_control_messages(&channels, &source_plugin, &runtime, &host_terminated).await;
                                 // Check if plugin is still running
                                 source_plugin.is_running()
                             })
@@ -388,8 +394,13 @@ impl SourcePluginDispatcher {
             // input channel behind it — the host-side control writer would
             // stay blocked and the drain would wedge (same rationale as the
             // sink/transform hook paths above).
-            if let Err(e) =
-                handle_control_messages(&self.channels, &self.source_plugin, &runtime).await
+            if let Err(e) = handle_control_messages(
+                &self.channels,
+                &self.source_plugin,
+                &runtime,
+                &host_terminated,
+            )
+            .await
             {
                 return drain_discard_after_failure(
                     &self.channels,
@@ -401,15 +412,21 @@ impl SourcePluginDispatcher {
             }
         }
 
+        // Terminate during process shutdown: the host stopped reading output
+        // at the signal, so the send can only block on a full channel until
+        // the drain deadline. Outside shutdown the host still reads and uses
+        // this message to tell a clean exit from an unexpected one.
+        if host_terminated.load(Ordering::SeqCst) && crate::shutdown::is_shutting_down() {
+            return Ok(());
+        }
+
         // The source stopped on its own (`is_running()` went false — bounded
-        // work complete, or a Terminate was processed). Tell the host so it
-        // can end this source's record-batch stream: without the signal a
-        // bounded job's sinks never see end-of-stream and the pipeline cannot
-        // complete. Output-direction Terminate is the completion signal (see
-        // its doc on `PluginMsg` for why no new variant can be added). Best
-        // effort — on the host-initiated Terminate path the stream is already
-        // being torn down and the message is redundant; a host predating this
-        // meaning ignores it.
+        // work complete). Tell the host so it can end this source's
+        // record-batch stream: without the signal a bounded job's sinks never
+        // see end-of-stream and the pipeline cannot complete. Output-direction
+        // Terminate is the completion signal (see its doc on `PluginMsg` for
+        // why no new variant can be added). A host predating this meaning
+        // ignores it.
         if let Err(e) = self
             .channels
             .output
@@ -1158,6 +1175,76 @@ mod tests {
             recorder.terminate_count(),
             1,
             "terminate() must be called exactly once on Terminate-before-Init"
+        );
+    }
+
+    /// Bounded source that finishes on its own after one batch.
+    struct SelfCompletingSource {
+        running: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for SelfCompletingSource {
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+        async fn terminate(&self) -> Result<(), PluginError> {
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourcePlugin for SelfCompletingSource {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(empty_schema())
+        }
+        async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+            self.running.store(false, Ordering::SeqCst);
+            Ok(RecordBatch::new_empty(empty_schema()))
+        }
+        async fn process_checkpoint_marker(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+        async fn process_checkpoint_finalizer(
+            &self,
+            _epoch: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn self_completing_source_still_sends_completion() {
+        let channels = make_channels();
+        let plugin: Arc<dyn SourcePlugin> = Arc::new(SelfCompletingSource {
+            running: AtomicBool::new(true),
+        });
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Init))
+            .unwrap();
+
+        let runtime = DirectTokioProxy::new().into_async_runtime_obj();
+        SourcePluginDispatcher::new(channels.clone(), plugin)
+            .start(runtime)
+            .await
+            .unwrap();
+
+        let mut last = None;
+        while let Ok(m) = channels.output.receiver.try_recv() {
+            last = Some(m.into_enum());
+        }
+        assert!(
+            matches!(last, Some(Ok(PluginMsg::Terminate))),
+            "bounded source must signal completion with output Terminate, got {last:?}"
         );
     }
 

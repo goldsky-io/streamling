@@ -146,6 +146,9 @@ impl StateBackendFactories {
                             postgres_config
                                 .acquire_timeout_secs
                                 .map(std::time::Duration::from_secs),
+                            postgres_config
+                                .statement_timeout_secs
+                                .map(std::time::Duration::from_secs),
                         )
                         .await?,
                     ))
