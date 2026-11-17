@@ -7,5 +7,11 @@
       "workspace_repo": "goldsky-io/streamling-workspace",
       "workspace_ref": "main"
     }
+  },
+  "review": {
+    "external_prs": true
+  },
+  "security": {
+    "trusted_author_associations": ["OWNER", "MEMBER"]
   }
 }
