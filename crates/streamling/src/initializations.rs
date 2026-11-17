@@ -40,14 +40,12 @@ pub fn initialize_live_data_inspect(
         pipeline_topology
             .sources
             .keys()
-            .cloned()
             .map(|key| metric_key(application_id, key.as_str())),
     );
     topology_node_keys.extend(
         pipeline_topology
             .transforms
             .keys()
-            .cloned()
             .map(|key| metric_key(application_id, key.as_str())),
     );
 
