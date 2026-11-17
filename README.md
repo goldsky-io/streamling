@@ -2442,10 +2442,15 @@ Filter on `topology_node_type` when you sum them, because a row counts once on e
 
 Byte metrics (Delta):
 
-- **`input_bytes_delta`** on sources: the bytes of the same rows as the source's `input_rows_delta`, including columns that a pushed-down projection drops later.
-- **`output_bytes_delta`** on sinks: the bytes of the rows each sink receives, after primary-key deduplication.
+- **`input_bytes_delta`** on sources: the bytes the source reads, whatever columns the pipeline selects and whatever its `filter:`:
+  - Kafka: the payload bytes of each consumed message.
+  - ClickHouse: the HTTP response body of each emitted page; a page re-read after an overflow counts once.
+  - File: each file's full size, once the file is fully read.
+  - Plugin: the Arrow size of the plugin's batches (see below), because a plugin exposes no wire bytes.
+  - Hybrid: its Kafka and ClickHouse phases report on the hybrid node itself, not on the phase nodes.
+- **`output_bytes_delta`** on sinks: the Arrow size of the rows each sink receives, after primary-key deduplication.
 
-A byte count is the size the rows would have if copied into fresh Arrow arrays of the same types, not wire or storage bytes. A slice counts only its own rows at every nesting level. Dictionary and run-end encoded columns count their decoded values.
+An Arrow size is the size the rows would have if copied into fresh Arrow arrays of the same types. A slice counts only its own rows at every nesting level. Dictionary and run-end encoded columns count their decoded values.
 
 ### Adding Telemetry to Custom Operators
 

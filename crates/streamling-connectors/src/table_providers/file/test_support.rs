@@ -54,6 +54,7 @@ pub(super) async fn continuous_provider(
     let session_manager = session_manager();
     let provider = FileSourceTableProvider::try_new(
         name,
+        name.to_string(),
         path,
         FileSourceFormat::Csv,
         FileSourceReadMode::Continuous {
@@ -83,6 +84,7 @@ pub(super) async fn bounded_provider(
     let session_manager = session_manager();
     let provider = FileSourceTableProvider::try_new(
         name,
+        name.to_string(),
         &format!("{}/", dir.to_str().unwrap()),
         FileSourceFormat::Csv,
         FileSourceReadMode::Bounded {

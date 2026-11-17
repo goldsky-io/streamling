@@ -620,6 +620,7 @@ async fn build_source_providers(
             }
             topology::Source::file(file) => {
                 let file = file.clone();
+                let metric_id = metric_key(application_id, reference_name.as_str());
                 let session_manager = session_manager.clone();
                 let state_backend_factory = Arc::clone(state_backend_factory);
                 let namespace = app_config.state_backend_namespace().to_string();
@@ -662,6 +663,7 @@ async fn build_source_providers(
                     };
                     let provider: Arc<dyn TableProvider> = FileSourceTableProvider::try_new(
                         &name,
+                        metric_id,
                         &file.path,
                         file.format,
                         mode,

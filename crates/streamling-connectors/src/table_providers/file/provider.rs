@@ -83,6 +83,8 @@ pub enum FileSourceReadMode {
 /// The `file` source in either read mode; see the module docs.
 pub struct FileSourceTableProvider {
     reference_name: String,
+    /// Telemetry id the source's wire `input_bytes_delta` is recorded under.
+    metric_metadata_id: String,
     pub(super) discovery: FileDiscovery,
     file_source: Arc<dyn FileSource>,
     /// Published schema: file columns, partition columns, then a synthesized
@@ -103,6 +105,7 @@ pub struct FileSourceTableProvider {
 impl FileSourceTableProvider {
     pub async fn try_new(
         reference_name: &str,
+        metric_metadata_id: String,
         path: &str,
         format: FileSourceFormat,
         mode: FileSourceReadMode,
@@ -214,6 +217,7 @@ impl FileSourceTableProvider {
 
         Ok(Arc::new(Self {
             reference_name: reference_name.to_string(),
+            metric_metadata_id,
             discovery: FileDiscovery {
                 table_url,
                 file_extension,
@@ -465,6 +469,7 @@ pub(super) enum ExecMode {
 
 pub(super) struct FileSourceExec {
     reference_name: String,
+    metric_metadata_id: String,
     discovery: FileDiscovery,
     file_source: Arc<dyn FileSource>,
     output_schema: SchemaRef,
@@ -507,6 +512,7 @@ impl FileSourceExec {
         ));
         Ok(Self {
             reference_name: provider.reference_name.clone(),
+            metric_metadata_id: provider.metric_metadata_id.clone(),
             discovery: provider.discovery.clone(),
             file_source,
             output_schema,
@@ -604,6 +610,7 @@ impl FileSourceExec {
 
         let reader = PartitionReader {
             reference_name: self.reference_name.clone(),
+            metric_metadata_id: self.metric_metadata_id.clone(),
             object_store_url: self.discovery.table_url.object_store(),
             file_source: self.file_source.clone(),
             projection: self.projection.clone(),

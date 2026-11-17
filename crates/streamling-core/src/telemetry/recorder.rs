@@ -427,8 +427,9 @@ impl MetricsRecorder {
         }
     }
 
-    /// Records `output_bytes_delta`: the bytes of a batch handed to a sink, i.e. leaving the pipeline.
-    pub fn record_sink_output_bytes(&self, batch: &RecordBatch, metadata_id: &str) {
+    /// Records the Arrow bytes of `batch` as the `name` counter: `output_bytes_delta` for a batch
+    /// handed to a sink, `input_bytes_delta` for a plugin source, which has no wire bytes.
+    pub fn record_data_bytes(&self, name: &'static str, batch: &RecordBatch, metadata_id: &str) {
         let Some(metric_metadata_tags) = self
             .metric_metadata_tags_registry
             .lock()
@@ -438,9 +439,9 @@ impl MetricsRecorder {
         else {
             return;
         };
-        if let Some(output_bytes) = data_bytes_metric("output_bytes_delta", batch, metadata_id) {
+        if let Some(bytes) = data_bytes_metric(name, batch, metadata_id) {
             self.record_metric_data(MetricData::new_with_owned_tags(
-                vec![output_bytes],
+                vec![bytes],
                 metric_metadata_tags,
             ));
         }
@@ -719,14 +720,13 @@ impl MetricsRecorder {
 
                 // A source's WrappingExec sits below its topology `filter:`, so the rows entering
                 // the source node are counted before the filter. The outer hybrid node is skipped:
-                // its bounded/unbounded phase nodes count the rows.
+                // its bounded/unbounded phase nodes count the rows. Source input bytes are wire
+                // bytes, recorded by each connector.
                 if metric_metadata.node_context.node_type == TopologyNodeType::Source
                     && metric_metadata.node_context.operator_type != HYBRID_SOURCE_OPERATOR_TYPE
                 {
-                    let mut source_input = input_rows_values(&output_rows_count);
-                    source_input.extend(data_bytes_metric("input_bytes_delta", batch, metadata_id));
                     all_metric_data.push(MetricData::new_with_owned_tags(
-                        source_input,
+                        input_rows_values(&output_rows_count),
                         metric_metadata_tags.clone(),
                     ));
                 }
@@ -1126,7 +1126,7 @@ pub fn initialize_metrics_recorder(
         count_registry.insert(String::from("input_bytes_delta"), delta_meter
             .u64_counter(add_service_prefix("input_bytes_delta"))
             .with_description(
-                "Indicates the Arrow bytes of the rows a source reads before its topology filter (Delta temporality).",
+                "Indicates the bytes a source reads: Kafka payloads, ClickHouse response bodies, file sizes, Arrow bytes for plugins (Delta temporality).",
             )
             .build());
 
@@ -2749,8 +2749,10 @@ mod tests {
             total
         }
 
+        /// The source wrapper counts pre-filter rows; source bytes are wire bytes, which each
+        /// connector records, so the wrapper must not add Arrow bytes on top.
         #[test]
-        fn source_batch_emits_input_rows_and_bytes_delta() {
+        fn source_batch_emits_input_rows_but_not_bytes() {
             let (recorder, provider, exporter) =
                 recorder_with_nodes(&[("src", TopologyNodeType::Source, "kafka", &[])]);
             for rows in [10, 5] {
@@ -2770,7 +2772,7 @@ mod tests {
             }
             assert_eq!(
                 exported_sum(&provider, &exporter, "input_bytes_delta", "src"),
-                15 * 8
+                0
             );
         }
 
@@ -2795,11 +2797,6 @@ mod tests {
                 assert_eq!(
                     exported_sum(&provider, &exporter, "input_rows_delta", id),
                     rows,
-                    "{id}"
-                );
-                assert_eq!(
-                    exported_sum(&provider, &exporter, "input_bytes_delta", id),
-                    rows * 8,
                     "{id}"
                 );
             }
@@ -2842,9 +2839,9 @@ mod tests {
         fn sink_output_bytes_delta_counts_received_batches() {
             let (recorder, provider, exporter) =
                 recorder_with_nodes(&[("snk", TopologyNodeType::Sink, "postgres", &[])]);
-            recorder.record_sink_output_bytes(&int_batch(3), "snk");
-            recorder.record_sink_output_bytes(&int_batch(4), "snk");
-            recorder.record_sink_output_bytes(&int_batch(4), "unregistered");
+            recorder.record_data_bytes("output_bytes_delta", &int_batch(3), "snk");
+            recorder.record_data_bytes("output_bytes_delta", &int_batch(4), "snk");
+            recorder.record_data_bytes("output_bytes_delta", &int_batch(4), "unregistered");
             assert_eq!(
                 exported_sum(&provider, &exporter, "output_bytes_delta", "snk"),
                 7 * 8

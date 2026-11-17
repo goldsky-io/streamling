@@ -193,6 +193,8 @@ impl ExecutionPlan for PluginSourceExec {
         let metrics_receiver = instance.channels.metrics.receiver.clone();
         let metrics_recorder = get_metrics_recorder();
         let metric_metadata_id = self.metric_metadata_id.clone();
+        let input_bytes_recorder = metrics_recorder.clone();
+        let input_bytes_id = metric_metadata_id.clone();
         let plugin_label = instance.key.clone();
         let forwarder_scope = self.scope.clone();
         let projection = self.projection.clone();
@@ -253,6 +255,13 @@ impl ExecutionPlan for PluginSourceExec {
                             match message.into_enum() {
                                 Ok(PluginMsg::NextBatch { data }) => {
                                     let mut record_batch: RecordBatch = data.into();
+                                    // Sized before the projection: a plugin has no wire bytes,
+                                    // and the full row is what it read.
+                                    input_bytes_recorder.record_data_bytes(
+                                        "input_bytes_delta",
+                                        &record_batch,
+                                        &input_bytes_id,
+                                    );
                                     // The plugin emits full rows; apply the scan's column
                                     // projection so batches match the declared (projected)
                                     // schema. `RecordBatch::project` preserves schema
