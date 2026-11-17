@@ -40,9 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.96.1
         with:
-          toolchain: 1.91.1
+          toolchain: 1.96.1
           components: clippy, rustfmt
       # kache setup mirrors streamling.yml (see the comment there).
       - name: Setup kache
@@ -89,9 +89,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.96.1
         with:
-          toolchain: 1.91.1
+          toolchain: 1.96.1
       - name: Resolve version from Cargo metadata
         id: resolve
         run: |
@@ -148,9 +148,9 @@ jobs:
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.96.1
         with:
-          toolchain: 1.91.1
+          toolchain: 1.96.1
       - name: Setup kache
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
@@ -214,9 +214,9 @@ jobs:
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.96.1
         with:
-          toolchain: 1.91.1
+          toolchain: 1.96.1
       - name: Setup rust cache
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -259,9 +259,9 @@ jobs:
           key: release-opt-bin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
       - name: Configure Rust toolchain
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.96.1
         with:
-          toolchain: 1.91.1
+          toolchain: 1.96.1
       - name: Setup rust cache
         if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -365,9 +365,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure Rust toolchain
-        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.91.1
+        uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07 # 1.96.1
         with:
-          toolchain: 1.91.1
+          toolchain: 1.96.1
       - name: Setup rust cache
         uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
         with:
