@@ -3,11 +3,11 @@
 
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, GenericByteViewArray, GenericListArray, GenericListViewArray,
-    OffsetSizeTrait, RunArray, UInt64Array,
+    OffsetSizeTrait, RunArray, UInt64Array, UnionArray,
 };
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{
-    ByteViewType, DataType, Int16Type, Int32Type, Int64Type, RunEndIndexType,
+    ByteViewType, DataType, Int16Type, Int32Type, Int64Type, RunEndIndexType, UnionFields,
 };
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -83,7 +83,7 @@ fn array_bytes(array: &dyn Array) -> Result<usize, ArrowError> {
             .try_fold(validity, |total, field| {
                 Ok(total + array_bytes(field.as_ref())?)
             }),
-        DataType::Union(..) => union_bytes(array),
+        DataType::Union(fields, _) => union_bytes(array.as_union(), fields),
         DataType::Dictionary(..) => {
             let dictionary = array.as_any_dictionary();
             array_bytes(take(dictionary.values().as_ref(), dictionary.keys(), None)?.as_ref())
@@ -123,51 +123,51 @@ fn list_bytes<O: OffsetSizeTrait>(list: &GenericListArray<O>) -> Result<usize, A
     Ok(list.len() * size_of::<O>() + array_bytes(values.as_ref())?)
 }
 
-/// The offsets and sizes of the rows, plus each valid row's child values.
+/// The offsets and sizes of the rows, plus the child values the valid rows reference.
 fn list_view_bytes<O: OffsetSizeTrait>(
     list: &GenericListViewArray<O>,
 ) -> Result<usize, ArrowError> {
-    let values = list.values();
-    (0..list.len()).filter(|&row| list.is_valid(row)).try_fold(
-        list.len() * 2 * size_of::<O>(),
-        |total, row| {
-            let row_values = values.slice(
-                list.value_offsets()[row].as_usize(),
-                list.value_sizes()[row].as_usize(),
-            );
-            Ok(total + array_bytes(row_values.as_ref())?)
-        },
-    )
+    let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
+    let referenced: UInt64Array = (0..list.len())
+        .filter(|&row| list.is_valid(row))
+        .flat_map(|row| {
+            let start = offsets[row].as_usize();
+            start as u64..(start + sizes[row].as_usize()) as u64
+        })
+        .collect();
+    Ok(list.len() * 2 * size_of::<O>() + taken_bytes(list.values(), &referenced)?)
 }
 
-/// One type id per row; a dense union adds an offset per row and only the referenced child
-/// values, a sparse union every child sliced to the rows.
-fn union_bytes(array: &dyn Array) -> Result<usize, ArrowError> {
-    let union = array.as_union();
-    let type_ids = union.len();
+/// One type id per row; a dense union adds an offset per row and only the child values its rows
+/// reference, a sparse union every child sliced to the rows.
+fn union_bytes(union: &UnionArray, fields: &UnionFields) -> Result<usize, ArrowError> {
+    let len = union.len();
     match union.offsets() {
-        // ponytail: one child slice per row; group rows per child if dense unions get hot.
-        Some(_) => (0..union.len()).try_fold(type_ids * (1 + size_of::<i32>()), |total, row| {
-            let child = union.child(union.type_id(row));
-            Ok(total + array_bytes(child.slice(union.value_offset(row), 1).as_ref())?)
+        Some(offsets) => fields
+            .iter()
+            .try_fold(len * (1 + size_of::<i32>()), |total, (id, _)| {
+                let referenced: UInt64Array = (0..len)
+                    .filter(|&row| union.type_id(row) == id)
+                    .map(|row| offsets[row] as u64)
+                    .collect();
+                Ok(total + taken_bytes(union.child(id), &referenced)?)
+            }),
+        None => fields.iter().try_fold(len, |total, (id, _)| {
+            Ok(total + array_bytes(union.child(id).as_ref())?)
         }),
-        None => {
-            let DataType::Union(fields, _) = union.data_type() else {
-                unreachable!("as_union only returns union arrays")
-            };
-            fields.iter().try_fold(type_ids, |total, (type_id, _)| {
-                Ok(total + array_bytes(union.child(type_id).as_ref())?)
-            })
-        }
     }
+}
+
+/// Bytes of the rows of `values` at `indices`, gathered into one fresh array.
+fn taken_bytes(values: &ArrayRef, indices: &UInt64Array) -> Result<usize, ArrowError> {
+    array_bytes(take(values.as_ref(), indices, None)?.as_ref())
 }
 
 fn run_end_bytes<R: RunEndIndexType>(run: &RunArray<R>) -> Result<usize, ArrowError> {
     let physical: UInt64Array = (0..run.len())
         .map(|row| run.get_physical_index(row) as u64)
         .collect();
-    let decoded: ArrayRef = take(run.values().as_ref(), &physical, None)?;
-    array_bytes(decoded.as_ref())
+    taken_bytes(run.values(), &physical)
 }
 
 #[cfg(test)]
@@ -175,7 +175,8 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{
         DictionaryArray, FixedSizeListBuilder, Int32Builder, Int64Array, Int64Builder, ListBuilder,
-        MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray, UnionArray,
+        ListViewArray, MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
+        UnionArray,
     };
     use datafusion::arrow::datatypes::{Field, UnionFields};
     use std::sync::Arc;
@@ -330,6 +331,36 @@ mod tests {
         .unwrap();
         // Rows 1..3: two type ids, two Int64 and two strings ("bbbb", "cc").
         assert_eq!(bytes(Arc::new(union.slice(1, 2))), 2 + 2 * 8 + 2 * 4 + 6);
+    }
+
+    /// Child values of many rows count one validity bitmap, not a validity byte per row.
+    #[test]
+    fn dense_union_counts_one_child_validity_bitmap() {
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["unused"]));
+        let union = UnionArray::try_new(
+            union_fields(),
+            vec![0_i8; 16].into(),
+            Some((0..16).map(|row| row % 2).collect::<Vec<i32>>().into()),
+            vec![ints, strings],
+        )
+        .unwrap();
+        // 16 type ids and offsets, 16 Int64 values (half null), a 2-byte validity bitmap.
+        assert_eq!(bytes(Arc::new(union)), 16 * (1 + 4) + 16 * 8 + 2);
+    }
+
+    #[test]
+    fn list_view_counts_one_child_validity_bitmap() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        let list = ListViewArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            vec![0_i32; 8].into(),
+            vec![2_i32; 8].into(),
+            values,
+            None,
+        );
+        // 8 offsets and sizes, 16 Int64 values, a 2-byte validity bitmap.
+        assert_eq!(bytes(Arc::new(list)), 8 * 2 * 4 + 16 * 8 + 2);
     }
 
     fn union_fields() -> UnionFields {

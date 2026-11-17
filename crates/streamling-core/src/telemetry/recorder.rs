@@ -1111,7 +1111,7 @@ pub fn initialize_metrics_recorder(
         count_registry.insert(String::from("input_rows"), meter
             .u64_counter(input_rows_name)
             .with_description(
-                "Indicates the number of rows produced as output from a specific query execution.",
+                "Indicates the number of rows entering a node; a source counts them before its topology filter.",
             )
             .build());
 
@@ -1119,7 +1119,7 @@ pub fn initialize_metrics_recorder(
         count_registry.insert(String::from("input_rows_delta"), delta_meter
             .u64_counter(input_rows_delta_name)
             .with_description(
-                "Indicates the number of rows a source reads before its topology filter (Delta temporality).",
+                "Indicates the number of rows entering a node; a source counts them before its topology filter (Delta temporality).",
             )
             .build());
 
@@ -2774,8 +2774,10 @@ mod tests {
             );
         }
 
+        /// A node's own output never counts as its input: only a source's pre-filter rows do.
+        /// (A transform still gets `input_rows_delta` as the child of an upstream node.)
         #[test]
-        fn non_source_and_outer_hybrid_nodes_skip_input_delta() {
+        fn transform_and_outer_hybrid_outputs_are_not_source_input() {
             let (recorder, provider, exporter) = recorder_with_nodes(&[
                 ("xform", TopologyNodeType::Transform, "sql", &[]),
                 ("hyb", TopologyNodeType::Source, "hybrid", &[]),
