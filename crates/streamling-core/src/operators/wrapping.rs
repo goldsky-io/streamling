@@ -235,6 +235,31 @@ impl WrappingSourceTableProvider {
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
     ) -> Arc<dyn ExecutionPlan> {
+        let below_filter = Self::wrap_below_filter(
+            inner_exec,
+            reference_name,
+            side_outputs,
+            event_time_instrumentation,
+        );
+        // The rows the source node outputs, after its filter: what downstream nodes receive.
+        Arc::new(
+            WrappingExec::new(
+                below_filter,
+                reference_name.to_string(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .with_role(WrappingRole::SourceOutput),
+        )
+    }
+
+    fn wrap_below_filter(
+        inner_exec: Arc<dyn ExecutionPlan>,
+        reference_name: &str,
+        side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+        event_time_instrumentation: Option<EventTimeInstrumentation>,
+    ) -> Arc<dyn ExecutionPlan> {
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -247,13 +272,16 @@ impl WrappingSourceTableProvider {
                 .downcast_ref::<StreamingFilterExec>()
         {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-                source_exec,
-                reference_name.to_string(),
-                side_outputs.clone(),
-                Vec::new(),
-                event_time_instrumentation.clone(),
-            ));
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
+                WrappingExec::new(
+                    source_exec,
+                    reference_name.to_string(),
+                    side_outputs.clone(),
+                    Vec::new(),
+                    event_time_instrumentation.clone(),
+                )
+                .with_role(WrappingRole::SourceInput),
+            );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
             // consumer's plan subtree, and must act as a topology boundary so
@@ -279,13 +307,16 @@ impl WrappingSourceTableProvider {
 
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-                source_exec,
-                reference_name.to_string(),
-                side_outputs.clone(),
-                Vec::new(),
-                event_time_instrumentation.clone(),
-            ));
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
+                WrappingExec::new(
+                    source_exec,
+                    reference_name.to_string(),
+                    side_outputs.clone(),
+                    Vec::new(),
+                    event_time_instrumentation.clone(),
+                )
+                .with_role(WrappingRole::SourceInput),
+            );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
             // `WrappingExec` and must bound downstream metric aggregation.
@@ -299,23 +330,29 @@ impl WrappingSourceTableProvider {
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(WrappingExec::new(
-                        inner_exec,
-                        reference_name.to_string(),
-                        side_outputs,
-                        Vec::new(),
-                        event_time_instrumentation,
-                    ))
+                    Arc::new(
+                        WrappingExec::new(
+                            inner_exec,
+                            reference_name.to_string(),
+                            side_outputs,
+                            Vec::new(),
+                            event_time_instrumentation,
+                        )
+                        .with_role(WrappingRole::SourceInput),
+                    )
                 }
             }
         } else {
-            Arc::new(WrappingExec::new(
-                inner_exec,
-                reference_name.to_string(),
-                side_outputs,
-                Vec::new(),
-                event_time_instrumentation,
-            ))
+            Arc::new(
+                WrappingExec::new(
+                    inner_exec,
+                    reference_name.to_string(),
+                    side_outputs,
+                    Vec::new(),
+                    event_time_instrumentation,
+                )
+                .with_role(WrappingRole::SourceInput),
+            )
         }
     }
 }
@@ -484,6 +521,20 @@ pub struct WrappingExec {
     /// reconstruction so per-source watermark state survives DataFusion
     /// optimizer rewrites.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
+    role: WrappingRole,
+}
+
+/// What a `WrappingExec` measures for its topology node.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WrappingRole {
+    /// A transform: its output rows, plus compute, checkpoint and live-inspect telemetry.
+    Node,
+    /// Directly above a source's connector, below its filter: side outputs, event-time
+    /// freshness and compute observe every row pulled in. Rows are not counted here.
+    SourceInput,
+    /// The top of a source's plan, above its filter: the rows the source outputs, which
+    /// downstream nodes count as their input.
+    SourceOutput,
 }
 
 impl crate::operators::TopologyBoundary for WrappingExec {
@@ -533,7 +584,13 @@ impl WrappingExec {
             forced_non_null_columns,
             adjusted_schema,
             event_time_instrumentation,
+            role: WrappingRole::Node,
         }
+    }
+
+    pub fn with_role(mut self, role: WrappingRole) -> Self {
+        self.role = role;
+        self
     }
 }
 
@@ -587,13 +644,16 @@ impl ExecutionPlan for WrappingExec {
         // SAME watermark state Arc — without this, DataFusion optimizer
         // rewrites would silently start a fresh watermark for every
         // reconstruction.
-        Ok(Arc::new(WrappingExec::new(
-            new_inner,
-            self.reference_name.clone(),
-            self.side_outputs.clone(),
-            self.forced_non_null_columns.clone(),
-            self.event_time_instrumentation.clone(),
-        )))
+        Ok(Arc::new(
+            WrappingExec::new(
+                new_inner,
+                self.reference_name.clone(),
+                self.side_outputs.clone(),
+                self.forced_non_null_columns.clone(),
+                self.event_time_instrumentation.clone(),
+            )
+            .with_role(self.role),
+        ))
     }
 
     fn execute(
@@ -637,10 +697,14 @@ impl ExecutionPlan for WrappingExec {
         // whose input is directly the upstream topology boundary), the delta
         // path can never emit, so wall-clock stays on as the only available
         // signal rather than leaving the series dead.
-        let record_wall_clock_compute = should_record_wall_clock_compute(
-            metrics.is_some(),
-            metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
-        );
+        let role = self.role;
+        // The output counter above a source's filter only counts rows: the input wrapper
+        // below it already records this node's compute and checkpoint telemetry.
+        let record_wall_clock_compute = role != WrappingRole::SourceOutput
+            && should_record_wall_clock_compute(
+                metrics.is_some(),
+                metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
+            );
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
@@ -667,12 +731,18 @@ impl ExecutionPlan for WrappingExec {
                         }
 
                         // Process telemetry
-                        metrics_recorder.record_execution_plan_metrics(
-                            metric_metadata_id.as_str(),
-                            batch.num_rows(),
-                            RowCountMeasurementType::OutputRowCount,
-                            metrics.as_ref(),
-                        );
+                        if role != WrappingRole::SourceInput {
+                            metrics_recorder.record_execution_plan_metrics(
+                                metric_metadata_id.as_str(),
+                                batch.num_rows(),
+                                RowCountMeasurementType::OutputRowCount,
+                                metrics.as_ref(),
+                            );
+                        }
+                        if role == WrappingRole::SourceOutput {
+                            yield Ok(batch);
+                            continue;
+                        }
 
                         // Record checkpoint marker arrival time for transforms
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
@@ -1285,6 +1355,13 @@ mod tests {
             None,
         );
 
+        // The source's output counter sits on top, above its filter.
+        let output_counter = result
+            .downcast_ref::<WrappingExec>()
+            .expect("top-level plan is the source output counter");
+        assert_eq!(output_counter.role, WrappingRole::SourceOutput);
+        let result = output_counter.inner.clone();
+
         // Order must be projection -> filter -> wrapper -> source, so side
         // outputs / event-time observe every pre-filter row (R7). Both
         // rebuilt nodes must keep the source-owned topology-boundary mark.
@@ -1350,6 +1427,13 @@ mod tests {
             vec![side_output],
             None,
         );
+
+        // The source's output counter sits on top, above its filter.
+        let output_counter = result
+            .downcast_ref::<WrappingExec>()
+            .expect("top-level plan is the source output counter");
+        assert_eq!(output_counter.role, WrappingRole::SourceOutput);
+        let result = output_counter.inner.clone();
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
         let rebuilt_filter = result
