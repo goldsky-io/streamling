@@ -131,13 +131,10 @@ async fn process_checkpoint_messages_with_truncation(
                     &context.metric_metadata_id,
                 );
             }
-            CheckpointMessage::Finalizer(epoch) => {
-                // Handle truncation for finalized epochs
-                // NOTE: this is currently a BLOCKING operation. We can consider making it run concurrently
-                if context.checkpoint_truncation && epoch.0 > 0 {
-                    let truncate_epoch = epoch.0 - 1; // Truncate N-1 when Finalizer(N) received
-                    handle_checkpoint_truncation(context, truncate_epoch).await;
-                }
+            // NOTE: truncation is currently a BLOCKING operation. We can consider making it run concurrently
+            CheckpointMessage::Finalizer(epoch) if context.checkpoint_truncation && epoch.0 > 0 => {
+                let truncate_epoch = epoch.0 - 1; // Truncate N-1 when Finalizer(N) received
+                handle_checkpoint_truncation(context, truncate_epoch).await;
             }
             _ => {}
         }

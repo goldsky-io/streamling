@@ -3204,11 +3204,7 @@ impl KafkaSink {
             total_bytes += bytes.len();
             encoded_payloads.push(bytes);
         }
-        let avg_msg_bytes = if num_rows > 0 {
-            total_bytes / num_rows
-        } else {
-            0
-        };
+        let avg_msg_bytes = total_bytes.checked_div(num_rows).unwrap_or(0);
         debug!(
             "Encoded {} rows for topic: {} ({} bytes total, {} bytes/msg avg)",
             num_rows, self.topic, total_bytes, avg_msg_bytes,
