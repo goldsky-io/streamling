@@ -77,7 +77,8 @@ impl DataSink for BlackholeSink {
                 .rows_received
                 .fetch_add(num_rows_in_batch as u64, Ordering::SeqCst)
                 + num_rows_in_batch as u64;
-            metrics_recorder.record_output_rows_count(
+            metrics_recorder.record_sink_write(
+                &batch,
                 num_rows_in_batch as u64,
                 self.metric_metadata_id.as_str(),
             );

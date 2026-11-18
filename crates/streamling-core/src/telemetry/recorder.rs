@@ -4,6 +4,7 @@ use crate::telemetry::types::{
     create_time_from_duration,
 };
 use crate::telemetry::{PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags};
+use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::metrics::{Count, MetricValue, MetricsSet};
 use once_cell::sync::Lazy;
@@ -444,8 +445,48 @@ impl MetricsRecorder {
         ));
     }
 
-    /// Records the Arrow bytes of `batch` as the `name` counter: `output_bytes_delta` for a batch
-    /// handed to a sink, `input_bytes_delta` for a plugin source, which has no wire bytes.
+    /// Records a confirmed sink write of `delivered_rows` rows of `batch`: `output_rows`,
+    /// `output_rows_delta` and `output_bytes_delta`. Call it only after the destination
+    /// confirmed the write.
+    pub fn record_sink_write(&self, batch: &RecordBatch, delivered_rows: u64, metadata_id: &str) {
+        self.record_sink_delivery(
+            delivered_rows,
+            batch.num_rows() as u64,
+            batch_data_bytes(batch),
+            metadata_id,
+        );
+    }
+
+    /// [`Self::record_sink_write`] for a batch sized with [`batch_data_bytes`] before the sink
+    /// gave it away: `delivered_rows` of its `batch_rows` rows landed. A partial delivery counts
+    /// the same share of the bytes.
+    pub fn record_sink_delivery(
+        &self,
+        delivered_rows: u64,
+        batch_rows: u64,
+        batch_bytes: Result<usize, ArrowError>,
+        metadata_id: &str,
+    ) {
+        self.record_output_rows_count(delivered_rows, metadata_id);
+        let batch_bytes = match batch_bytes {
+            Ok(bytes) => bytes as u64,
+            Err(e) => {
+                warn!("Skipping output_bytes_delta for {metadata_id}: cannot size the batch: {e}");
+                return;
+            }
+        };
+        let bytes = if delivered_rows >= batch_rows {
+            batch_bytes
+        } else {
+            (batch_bytes as u128 * delivered_rows as u128 / batch_rows as u128) as u64
+        };
+        if bytes > 0 {
+            self.record_count("output_bytes_delta", bytes, metadata_id);
+        }
+    }
+
+    /// Records the Arrow bytes of `batch` as the `name` counter. Used for the
+    /// `input_bytes_delta` of a plugin source, which has no wire bytes.
     pub fn record_data_bytes(&self, name: &'static str, batch: &RecordBatch, metadata_id: &str) {
         let Some(metric_metadata_tags) = self
             .metric_metadata_tags_registry
@@ -2865,15 +2906,20 @@ mod tests {
         }
 
         #[test]
-        fn sink_output_bytes_delta_counts_received_batches() {
+        fn sink_write_counts_delivered_rows_and_bytes() {
             let (recorder, provider, exporter) =
                 recorder_with_nodes(&[("snk", TopologyNodeType::Sink, "postgres", &[])]);
-            recorder.record_data_bytes("output_bytes_delta", &int_batch(3), "snk");
-            recorder.record_data_bytes("output_bytes_delta", &int_batch(4), "snk");
-            recorder.record_data_bytes("output_bytes_delta", &int_batch(4), "unregistered");
+            recorder.record_sink_write(&int_batch(3), 3, "snk");
+            // 2 of 4 rows delivered: half the batch's bytes.
+            recorder.record_sink_write(&int_batch(4), 2, "snk");
+            recorder.record_sink_delivery(0, 4, Ok(32), "snk");
+            recorder.record_sink_write(&int_batch(4), 4, "unregistered");
+            for name in ["output_rows", "output_rows_delta"] {
+                assert_eq!(exported_sum(&provider, &exporter, name, "snk"), 5, "{name}");
+            }
             assert_eq!(
                 exported_sum(&provider, &exporter, "output_bytes_delta", "snk"),
-                7 * 8
+                5 * 8
             );
         }
     }

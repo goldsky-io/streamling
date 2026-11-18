@@ -60,6 +60,7 @@ use streamling_state::StateKey;
 use streamling_state::StateOperatorBackend;
 
 use apache_avro::types::Value::Union;
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::dml::InsertOp;
@@ -94,6 +95,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
+use streamling_core::telemetry::arrow_bytes::batch_data_bytes;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::{MetricsRecorder, SnapshotGauge, get_metrics_recorder};
 use streamling_core::topology::Telemetry;
@@ -132,13 +134,16 @@ impl KafkaProducerContext {
 impl ClientContext for KafkaProducerContext {}
 
 impl rdkafka::producer::ProducerContext for KafkaProducerContext {
-    type DeliveryOpaque = ();
+    type DeliveryOpaque = Arc<BatchDelivery>;
 
     fn delivery(
         &self,
         result: &rdkafka::producer::DeliveryResult<'_>,
-        _opaque: Self::DeliveryOpaque,
+        batch: Self::DeliveryOpaque,
     ) {
+        if result.is_ok() {
+            batch.delivered.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err((e, msg)) = result {
             let topic = msg.topic();
             error!("Kafka delivery failed for topic {}: {}", topic, e);
@@ -151,6 +156,46 @@ impl rdkafka::producer::ProducerContext for KafkaProducerContext {
 }
 
 type KafkaThreadedProducer = ThreadedProducer<KafkaProducerContext>;
+
+/// One sink batch on its way to the broker. Every message of the batch holds a reference;
+/// the last one released (by its delivery callback, or by a send that never queued it)
+/// records the rows the broker acknowledged and their share of the batch's bytes.
+struct BatchDelivery {
+    metrics_recorder: Arc<MetricsRecorder>,
+    metric_metadata_id: String,
+    batch_rows: u64,
+    batch_bytes: Option<std::result::Result<usize, ArrowError>>,
+    delivered: AtomicU64,
+}
+
+impl BatchDelivery {
+    fn new(
+        batch: &RecordBatch,
+        metrics_recorder: Arc<MetricsRecorder>,
+        metric_metadata_id: &str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            metrics_recorder,
+            metric_metadata_id: metric_metadata_id.to_string(),
+            batch_rows: batch.num_rows() as u64,
+            batch_bytes: Some(batch_data_bytes(batch)),
+            delivered: AtomicU64::new(0),
+        })
+    }
+}
+
+impl Drop for BatchDelivery {
+    fn drop(&mut self) {
+        if let Some(batch_bytes) = self.batch_bytes.take() {
+            self.metrics_recorder.record_sink_delivery(
+                *self.delivered.get_mut(),
+                self.batch_rows,
+                batch_bytes,
+                &self.metric_metadata_id,
+            );
+        }
+    }
+}
 
 static CONSUMER_SEEK_TIMEOUT_SEC: u64 = 60;
 static CONSUMER_ASSIGNMENT_TIMEOUT_SEC: u64 = 60;
@@ -3058,7 +3103,7 @@ impl KafkaSink {
     /// as before.
     fn send_record_absorbing_queue_full<K, P>(
         producer: &KafkaThreadedProducer,
-        mut record: BaseRecord<'_, K, P>,
+        mut record: BaseRecord<'_, K, P, Arc<BatchDelivery>>,
         topic: &str,
         shutdown: &tokio::sync::watch::Receiver<bool>,
         shutdown_retry_window: StdDuration,
@@ -3172,6 +3217,7 @@ impl KafkaSink {
         converter: &FromArrowToAvroConverter,
         encoder: &AvroEncoder<'_>,
         metrics_recorder: Arc<MetricsRecorder>,
+        delivery: &Arc<BatchDelivery>,
     ) -> streamling_core::error::Result<()> {
         let num_rows = batch.num_rows();
 
@@ -3214,7 +3260,13 @@ impl KafkaSink {
             num_rows, self.topic, total_bytes, avg_msg_bytes,
         );
 
-        self.send_payloads_to_producer(encoded_payloads, &row_kinds, keys.as_ref(), producer)
+        self.send_payloads_to_producer(
+            encoded_payloads,
+            &row_kinds,
+            keys.as_ref(),
+            producer,
+            delivery,
+        )
     }
 
     /// Extract keys from batch based on primary key column names
@@ -3254,6 +3306,7 @@ impl KafkaSink {
         batch: &RecordBatch,
         producer: &KafkaThreadedProducer,
         converter: &FromArrowToJsonConverter,
+        delivery: &Arc<BatchDelivery>,
     ) -> streamling_core::error::Result<()> {
         let num_rows = batch.num_rows();
 
@@ -3272,7 +3325,13 @@ impl KafkaSink {
             None
         };
 
-        self.send_payloads_to_producer(serialized_values, &row_kinds, keys.as_ref(), producer)
+        self.send_payloads_to_producer(
+            serialized_values,
+            &row_kinds,
+            keys.as_ref(),
+            producer,
+            delivery,
+        )
     }
 
     /// Send pre-serialized payloads to Kafka producers with key-based partitioning,
@@ -3284,6 +3343,7 @@ impl KafkaSink {
         row_kinds: &[RowKind],
         keys: Option<&Vec<String>>,
         producer: &KafkaThreadedProducer,
+        delivery: &Arc<BatchDelivery>,
     ) -> streamling_core::error::Result<()> {
         let topic = &self.topic;
         let shutdown = streamling_core::shutdown::subscribe();
@@ -3298,7 +3358,7 @@ impl KafkaSink {
                     value: Some(op.as_str()),
                 });
 
-                let mut record = BaseRecord::to(topic)
+                let mut record = BaseRecord::with_opaque_to(topic, delivery.clone())
                     .payload(&encoded_bytes)
                     .headers(headers);
 
@@ -3518,6 +3578,9 @@ impl DataSink for KafkaSink {
 
             if batch.num_rows() != 0 {
                 let start_at = Instant::now();
+                // Counted by the broker's delivery acks, not here.
+                let delivery =
+                    BatchDelivery::new(&batch, metrics_recorder.clone(), &self.metric_metadata_id);
                 match &sink_converter {
                     KafkaSinkConverter::Avro { converter, encoder } => {
                         self.send_batch_to_kafka_as_avro(
@@ -3526,11 +3589,12 @@ impl DataSink for KafkaSink {
                             converter,
                             encoder,
                             metrics_recorder.clone(),
+                            &delivery,
                         )
                         .await?;
                     }
                     KafkaSinkConverter::Json { converter } => {
-                        self.send_batch_to_kafka_as_json(&batch, producer, converter)?;
+                        self.send_batch_to_kafka_as_json(&batch, producer, converter, &delivery)?;
                     }
                 }
                 metrics_recorder.record_time(
@@ -3540,10 +3604,6 @@ impl DataSink for KafkaSink {
                 );
                 metrics_recorder
                     .record_elapsed_compute(start_at.elapsed(), self.metric_metadata_id.as_str());
-                metrics_recorder.record_output_rows_count(
-                    batch.num_rows() as u64,
-                    self.metric_metadata_id.as_str(),
-                )
             }
 
             row_count += batch.num_rows();
@@ -4011,6 +4071,11 @@ mod tests {
         assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
     }
 
+    fn test_delivery() -> Arc<BatchDelivery> {
+        let batch = RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
+        BatchDelivery::new(&batch, get_metrics_recorder().clone(), "test")
+    }
+
     fn unreachable_broker_producer(extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
         let mut config = test_kafka_config();
         // Port 1 never hosts a broker; producer creation is offline so this
@@ -4082,7 +4147,10 @@ mod tests {
     fn flush_gives_up_between_attempts_once_shutdown_requested() {
         let producer = unreachable_broker_producer(&[]);
         producer
-            .send(BaseRecord::<str, str>::to("flush-topic").payload("payload"))
+            .send(
+                BaseRecord::<str, str, _>::with_opaque_to("flush-topic", test_delivery())
+                    .payload("payload"),
+            )
             .map_err(|(e, _)| e)
             .expect("send only queues locally");
 
@@ -4108,7 +4176,10 @@ mod tests {
     fn queue_full_retry_gives_up_after_shutdown_window() {
         let producer = unreachable_broker_producer(&[("queue.buffering.max.messages", "1")]);
         producer
-            .send(BaseRecord::<str, str>::to("qf-topic").payload("fills-the-queue"))
+            .send(
+                BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                    .payload("fills-the-queue"),
+            )
             .map_err(|(e, _)| e)
             .expect("first send fits the single-slot queue");
 
@@ -4116,7 +4187,8 @@ mod tests {
         let start = StdInstant::now();
         let result = KafkaSink::send_record_absorbing_queue_full(
             &producer,
-            BaseRecord::<str, str>::to("qf-topic").payload("overflows"),
+            BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                .payload("overflows"),
             "qf-topic",
             &shutdown_rx,
             StdDuration::from_millis(300),
@@ -4139,7 +4211,10 @@ mod tests {
     fn queue_full_retry_keeps_retrying_without_shutdown() {
         let producer = unreachable_broker_producer(&[("queue.buffering.max.messages", "1")]);
         producer
-            .send(BaseRecord::<str, str>::to("qf-topic").payload("fills-the-queue"))
+            .send(
+                BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                    .payload("fills-the-queue"),
+            )
             .map_err(|(e, _)| e)
             .expect("first send fits the single-slot queue");
 
@@ -4153,7 +4228,8 @@ mod tests {
         let start = StdInstant::now();
         let result = KafkaSink::send_record_absorbing_queue_full(
             &producer,
-            BaseRecord::<str, str>::to("qf-topic").payload("overflows"),
+            BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                .payload("overflows"),
             "qf-topic",
             &shutdown_rx,
             StdDuration::from_millis(0),
