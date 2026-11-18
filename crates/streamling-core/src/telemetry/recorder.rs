@@ -1,4 +1,3 @@
-use crate::node_context::HYBRID_SOURCE_OPERATOR_TYPE;
 use crate::telemetry::arrow_bytes::batch_data_bytes;
 use crate::telemetry::types::{
     MetricData, RowCountMeasurementType, create_count_with_value, create_gauge_with_value,
@@ -661,7 +660,7 @@ impl MetricsRecorder {
     /// This method dispatches count recorded as part of `TelemetryExec` wrapping of `ExecutionPlan`s
     /// for sources, transforms the `batch_count` is recorded as `output_rows` metric
     /// for sinks the `batch_count` is recorded as `input_rows` metric since we wrap the input stream in `TelemetryDataSink`
-    /// for sources, the same rows are also recorded as the source's own `input_rows` (pre-filter)
+    /// for sources, `SourceInputRowCount` records the rows pulled in (before the filter) as `input_rows`
     /// Datafusion's `ExecutionPlanMetricsSet` is also recorded but only for transforms
     /// for transforms, we also emit `batch_count` as children node's `input_row` count
     /// under the assumption that output for a transform node is input for it's downstream nodes
@@ -718,19 +717,6 @@ impl MetricsRecorder {
                     metric_metadata_tags.clone(),
                 ));
 
-                // A source's WrappingExec sits below its topology `filter:`, so the rows entering
-                // the source node are counted before the filter. The outer hybrid node is skipped:
-                // its bounded/unbounded phase nodes count the rows. Source input bytes are wire
-                // bytes, recorded by each connector.
-                if metric_metadata.node_context.node_type == TopologyNodeType::Source
-                    && metric_metadata.node_context.operator_type != HYBRID_SOURCE_OPERATOR_TYPE
-                {
-                    all_metric_data.push(MetricData::new_with_owned_tags(
-                        input_rows_values(&output_rows_count),
-                        metric_metadata_tags.clone(),
-                    ));
-                }
-
                 for child_metric_metadata_id in &metric_metadata.children_metadata_ids {
                     let child_metric_metadata = self
                         .metric_metadata_registry
@@ -759,7 +745,10 @@ impl MetricsRecorder {
                     }
                 }
             }
-            RowCountMeasurementType::InputRowCount => {
+            // A sink's received rows, or the rows a source pulls in before its filter (source
+            // input bytes are wire bytes, recorded by each connector).
+            RowCountMeasurementType::InputRowCount
+            | RowCountMeasurementType::SourceInputRowCount => {
                 all_metric_data.push(MetricData::new_with_owned_tags(
                     input_rows_values(&create_count_with_value(batch_count)),
                     metric_metadata_tags.clone(),
@@ -2749,55 +2738,63 @@ mod tests {
             total
         }
 
-        /// The source wrapper counts pre-filter rows; source bytes are wire bytes, which each
-        /// connector records, so the wrapper must not add Arrow bytes on top.
+        /// A source's input wrapper counts the rows it pulls in as input only: source bytes are
+        /// wire bytes, which each connector records, and its output is counted above the filter.
         #[test]
-        fn source_batch_emits_input_rows_but_not_bytes() {
+        fn source_input_counts_rows_but_not_bytes_or_output() {
             let (recorder, provider, exporter) =
                 recorder_with_nodes(&[("src", TopologyNodeType::Source, "kafka", &[])]);
             for rows in [10, 5] {
                 recorder.record_execution_plan_metrics(
                     "src",
                     &int_batch(rows),
-                    RowCountMeasurementType::OutputRowCount,
+                    RowCountMeasurementType::SourceInputRowCount,
                     None,
                 );
             }
-            for name in ["input_rows", "input_rows_delta"] {
+            for (name, rows) in [
+                ("input_rows", 15),
+                ("input_rows_delta", 15),
+                ("input_bytes_delta", 0),
+                ("output_rows_delta", 0),
+            ] {
                 assert_eq!(
                     exported_sum(&provider, &exporter, name, "src"),
-                    15,
+                    rows,
                     "{name}"
                 );
             }
-            assert_eq!(
-                exported_sum(&provider, &exporter, "input_bytes_delta", "src"),
-                0
-            );
         }
 
-        /// A node's own output never counts as its input: only a source's pre-filter rows do.
-        /// (A transform still gets `input_rows_delta` as the child of an upstream node.)
+        /// A source that pulls in 10 rows and keeps 4 after its filter: the source's input is
+        /// 10, its output is 4, and the transform below it receives (and counts) 4.
         #[test]
-        fn transform_and_outer_hybrid_outputs_are_not_source_input() {
+        fn filtered_source_output_is_its_childs_input() {
             let (recorder, provider, exporter) = recorder_with_nodes(&[
+                ("src", TopologyNodeType::Source, "kafka", &["xform"]),
                 ("xform", TopologyNodeType::Transform, "sql", &[]),
-                ("hyb", TopologyNodeType::Source, "hybrid", &[]),
-                ("hyb_unbounded", TopologyNodeType::Source, "kafka", &[]),
             ]);
-            for id in ["xform", "hyb", "hyb_unbounded"] {
-                recorder.record_execution_plan_metrics(
-                    id,
-                    &int_batch(7),
-                    RowCountMeasurementType::OutputRowCount,
-                    None,
-                );
-            }
-            for (id, rows) in [("xform", 0), ("hyb", 0), ("hyb_unbounded", 7)] {
+            recorder.record_execution_plan_metrics(
+                "src",
+                &int_batch(10),
+                RowCountMeasurementType::SourceInputRowCount,
+                None,
+            );
+            recorder.record_execution_plan_metrics(
+                "src",
+                &int_batch(4),
+                RowCountMeasurementType::OutputRowCount,
+                None,
+            );
+            for (name, id, rows) in [
+                ("input_rows_delta", "src", 10),
+                ("output_rows_delta", "src", 4),
+                ("input_rows_delta", "xform", 4),
+            ] {
                 assert_eq!(
-                    exported_sum(&provider, &exporter, "input_rows_delta", id),
+                    exported_sum(&provider, &exporter, name, id),
                     rows,
-                    "{id}"
+                    "{name} of {id}"
                 );
             }
         }
@@ -2812,12 +2809,12 @@ mod tests {
                 ("xform", TopologyNodeType::Transform, "sql", &[]),
                 ("snk", TopologyNodeType::Sink, "postgres", &[]),
             ]);
-            recorder.record_execution_plan_metrics(
-                "src",
-                &int_batch(6),
+            for measurement in [
+                RowCountMeasurementType::SourceInputRowCount,
                 RowCountMeasurementType::OutputRowCount,
-                None,
-            );
+            ] {
+                recorder.record_execution_plan_metrics("src", &int_batch(6), measurement, None);
+            }
             recorder.record_execution_plan_metrics(
                 "snk",
                 &int_batch(4),

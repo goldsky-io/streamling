@@ -174,6 +174,8 @@ impl PipelineMetricMetadata {
 pub enum RowCountMeasurementType {
     OutputRowCount,
     InputRowCount,
+    /// The rows a source pulls in, before its topology filter.
+    SourceInputRowCount,
 }
 
 #[derive(Debug, Clone)]

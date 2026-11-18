@@ -2434,9 +2434,11 @@ Streamling exports two variants of the `output_rows` metric with different tempo
 
 `input_rows` has the same pair: **`input_rows_total`** (Cumulative) and **`input_rows_delta`** (Delta). Both count the rows entering a node:
 
-- Source: the rows the source outputs, before its `filter:` and before any pushed-down projection. A hybrid source counts on its bounded and unbounded phase nodes, not on the hybrid node itself. A ClickHouse source pushes its filter into the query, so it counts the rows ClickHouse returns.
-- Transform: the `output_rows` of its upstream nodes. Below a source with a `filter:`, that is the pre-filter count.
+- Source: the rows the source pulls in, before its `filter:`. A ClickHouse source pushes its filter into the query, so it counts only the rows ClickHouse returns. A hybrid source counts the rows of its bounded and unbounded phases on the hybrid node itself.
+- Transform: the `output_rows` of its upstream nodes, which is what it receives.
 - Sink: the rows it receives, before primary-key deduplication.
+
+A source's `output_rows` counts the rows it emits after its `filter:`, so `input_rows` minus `output_rows` is what the filter dropped.
 
 Filter on `topology_node_type` when you sum them, because a row counts once on every node it enters.
 
@@ -2447,7 +2449,7 @@ Byte metrics (Delta):
   - ClickHouse: the HTTP response body of each emitted page; a page re-read after an overflow counts once.
   - File: each file's full size, once the file is fully read.
   - Plugin: the Arrow size of the plugin's batches (see below), because a plugin exposes no wire bytes.
-  - Hybrid: its Kafka and ClickHouse phases report on the hybrid node itself, not on the phase nodes.
+  - Hybrid: its Kafka and ClickHouse phases report on the hybrid node itself.
 - **`output_bytes_delta`** on sinks: the Arrow size of the rows each sink receives, after primary-key deduplication.
 
 An Arrow size is the size the rows would have if copied into fresh Arrow arrays of the same types. A slice counts only its own rows at every nesting level. Dictionary and run-end encoded columns count their decoded values.

@@ -19,10 +19,6 @@ impl fmt::Display for TopologyNodeType {
     }
 }
 
-/// The `operator_type` of a hybrid source's outer node. Its bounded and unbounded phase nodes
-/// carry their own connector's operator type.
-pub const HYBRID_SOURCE_OPERATOR_TYPE: &str = "hybrid";
-
 /// Context identifying a topology node, used for error messages and as the
 /// source of truth for node identity across the system.
 #[derive(Debug, Clone, PartialOrd, PartialEq, Hash, Eq)]

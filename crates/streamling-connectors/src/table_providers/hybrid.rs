@@ -275,6 +275,8 @@ impl HybridTableProvider {
         let mut bounded_table_providers = Vec::new();
 
         let application_id = app_config.application_id.clone();
+        // Both phases count the rows they pull in as the hybrid node's input.
+        let input_rows_id = Some(metric_key(&application_id, &reference_name));
 
         let unbounded_source_topic = unbounded_source.topic.clone();
         let unbounded_table_provider: Arc<dyn TableProvider> =
@@ -319,12 +321,15 @@ impl HybridTableProvider {
                         })?
                         .with_scope(scope.clone()),
                     );
-                    Arc::new(WrappingSourceTableProvider::new(
-                        kafka_table_provider,
-                        metric_key_hybrid_src_unbounded(&application_id, reference_name.as_str()),
-                        None,
-                        telemetry,
-                    ))
+                    Arc::new(
+                        WrappingSourceTableProvider::new(
+                            kafka_table_provider,
+                            metric_key_hybrid_src_unbounded(&application_id, &reference_name),
+                            None,
+                            telemetry,
+                        )
+                        .with_input_rows_id(input_rows_id.clone()),
+                    )
                 }
                 _ => {
                     return Err(streamling_core::streamling_user_err!(
@@ -383,16 +388,19 @@ impl HybridTableProvider {
                         clickhouse_provider.schema()
                     );
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        clickhouse_provider,
-                        metric_key_hybrid_src_bounded(
-                            &application_id,
-                            reference_name.as_str(),
-                            idx,
-                        ),
-                        None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
-                        telemetry,
-                    ));
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            clickhouse_provider,
+                            metric_key_hybrid_src_bounded(
+                                &application_id,
+                                reference_name.as_str(),
+                                idx,
+                            ),
+                            None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
+                            telemetry,
+                        )
+                        .with_input_rows_id(input_rows_id.clone()),
+                    );
                     bounded_table_providers.push(provider_with_telemetry as Arc<dyn TableProvider>);
                 }
                 _ => {

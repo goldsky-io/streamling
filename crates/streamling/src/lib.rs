@@ -26,9 +26,7 @@ use streamling_core::checkpoints::checkpoint_management::{
     CheckpointControl, CheckpointCoordinator,
 };
 use streamling_core::error::{Result, ResultExt};
-use streamling_core::node_context::{
-    HYBRID_SOURCE_OPERATOR_TYPE, NodeContext, TopologyNodeType, init_node_registry,
-};
+use streamling_core::node_context::{NodeContext, TopologyNodeType, init_node_registry};
 use streamling_core::operators::broadcast::{MultiSinkEntry, MultiSinkLogicalNode};
 use streamling_core::operators::checkpointable::CheckpointableNode;
 use streamling_core::operators::external_handlers::{ExternalHandlerConfig, ExternalHandlerNode};
@@ -1473,15 +1471,19 @@ impl Streamling {
                             .with_shutdown(shutdown_rx.clone()),
                     );
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        hybrid_source_provider.clone(),
-                        metric_key(&application_id, reference_name.as_str()),
-                        scan_sharing.clone(),
-                        // Outer wrapping passes None — telemetry is handled
-                        // by the per-phase inner providers above; emitting
-                        // here would double-count.
-                        None,
-                    ));
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            hybrid_source_provider.clone(),
+                            metric_key(&application_id, reference_name.as_str()),
+                            scan_sharing.clone(),
+                            // Outer wrapping passes None — telemetry is handled
+                            // by the per-phase inner providers above; emitting
+                            // here would double-count.
+                            None,
+                        )
+                        // The phases count the rows they pull in as this node's input.
+                        .with_input_rows_id(None),
+                    );
                     hybrid_providers
                         .push((hybrid_source_provider, provider_with_telemetry.clone()));
 
@@ -3905,7 +3907,7 @@ impl Streamling {
             let operator_type = match source {
                 topology::Source::kafka(_) => "kafka",
                 topology::Source::clickhouse(_) => "clickhouse",
-                topology::Source::hybrid(_) => HYBRID_SOURCE_OPERATOR_TYPE,
+                topology::Source::hybrid(_) => "hybrid",
                 topology::Source::file(_) => "file",
                 topology::Source::plugin(_) => "plugin",
             };
