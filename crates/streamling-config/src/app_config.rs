@@ -99,23 +99,14 @@ pub struct StateBackendConfig {
 impl StateBackendConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self.backend_type {
-            StateBackendType::Postgres => {
-                if self.postgres.is_none() {
-                    return Err(ConfigError::Message(
-                        "Postgres backend type requires postgres configuration".to_string(),
-                    ));
-                }
-            }
-            StateBackendType::Sqlite => {
-                if self.sqlite.is_none() {
-                    return Err(ConfigError::Message(
-                        "Sqlite backend type requires sqlite configuration".to_string(),
-                    ));
-                }
-            }
-            _ => {}
+            StateBackendType::Postgres if self.postgres.is_none() => Err(ConfigError::Message(
+                "Postgres backend type requires postgres configuration".to_string(),
+            )),
+            StateBackendType::Sqlite if self.sqlite.is_none() => Err(ConfigError::Message(
+                "Sqlite backend type requires sqlite configuration".to_string(),
+            )),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
