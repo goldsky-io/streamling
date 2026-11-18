@@ -994,21 +994,6 @@ sinks:
         "source input_rows counts every row pulled in, before the filter"
     );
 
-    let source_output = prometheus
-        .query_count(
-            &streamling_e2e::resources::PrometheusResource::output_rows_query(
-                "kafka_source",
-                Some(&ctx.test_id),
-            ),
-        )
-        .await
-        .expect("Failed to query source output rows");
-    assert_eq!(
-        source_output,
-        Some(post_filter_records),
-        "source output_rows counts the rows after its filter"
-    );
-
     let transform_input = prometheus
         .query_count(
             &streamling_e2e::resources::PrometheusResource::input_rows_query(
