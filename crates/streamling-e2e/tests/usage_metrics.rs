@@ -527,3 +527,86 @@ sinks:
     }
     assert!(delta("streamling_input_bytes_delta", "ch_source") > 0);
 }
+
+/// Kafka sink counts at broker ack. The same source feeds a Kafka sink and a
+/// blackhole sink, so both receive the same batches: the Kafka sink's acked rows
+/// and bytes must equal what the blackhole counted on receipt.
+#[tokio::test]
+async fn kafka_sink_counts_acknowledged_rows_and_bytes() {
+    init_tracing();
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let capture = OtlpCaptureResource::new()
+        .await
+        .expect("Failed to start OTLP capture");
+    let output_topic = ctx
+        .create_kafka_topic("output")
+        .await
+        .expect("Failed to create output topic");
+
+    let records: Vec<JsonRecord> = (1..=6).map(json_record).collect();
+    ctx.kafka
+        .produce_json_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {topic}
+    starting_offsets: earliest
+    primary_key: id
+    data_format: json
+    schema:
+      id: int64
+      name: string
+
+transforms: {{}}
+
+sinks:
+  kafka_sink:
+    type: kafka
+    from: kafka_source
+    topic: {output_topic}
+    topic_partitions: 1
+    data_format: json
+  blackhole_sink:
+    type: blackhole
+    from: kafka_source
+"#,
+        topic = ctx.kafka_topic,
+        output_topic = output_topic.topic,
+    );
+
+    let opts = opts_with(
+        &capture,
+        &ctx.test_id,
+        PipelineOpts::new()
+            .record_limit(6)
+            .timeout(Duration::from_secs(90)),
+    );
+    let status = ctx
+        .run_pipeline_with_opts(&pipeline, opts)
+        .await
+        .expect("Pipeline failed");
+    assert!(status.success(), "pipeline should exit cleanly");
+
+    let delta = |metric: &str, id: &str| sum(&capture.node_points(metric, id));
+    for id in ["kafka_sink", "blackhole_sink"] {
+        assert_eq!(
+            delta("streamling_output_rows_delta", id),
+            6,
+            "output_rows_delta of {id}"
+        );
+    }
+    let kafka_bytes = delta("streamling_output_bytes_delta", "kafka_sink");
+    assert!(kafka_bytes > 0, "the Kafka sink reports acked bytes");
+    assert_eq!(
+        kafka_bytes,
+        delta("streamling_output_bytes_delta", "blackhole_sink"),
+        "acked bytes = bytes of the same batches counted on receipt"
+    );
+}

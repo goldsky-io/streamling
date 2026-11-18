@@ -62,6 +62,7 @@ use streamling_core::node_context::get_node_context;
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
+use streamling_core::telemetry::arrow_bytes::batch_data_bytes;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
@@ -1341,6 +1342,7 @@ impl DataSink for ClickHouseSinkExec {
             }
 
             let start_at = Instant::now();
+            let batch_bytes = batch_data_bytes(&batch);
 
             let normalized_schema_clone = normalized_schema.clone();
             let normalized_batch = match run_blocking(move || {
@@ -1498,7 +1500,12 @@ impl DataSink for ClickHouseSinkExec {
             );
 
             let num_rows = num_rows as u64;
-            metrics_recorder.record_output_rows_count(num_rows, &metric_metadata_id);
+            metrics_recorder.record_sink_delivery(
+                num_rows,
+                num_rows,
+                batch_bytes,
+                &metric_metadata_id,
+            );
             metrics_recorder.record_elapsed_compute(start_at.elapsed(), &metric_metadata_id);
 
             row_count += num_rows as usize;

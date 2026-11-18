@@ -947,7 +947,6 @@ impl DataSink for WrappingDataSink {
                             }
                         };
 
-                        metrics_recorder.record_data_bytes("output_bytes_delta", &deduped_batch, &metric_metadata_id);
                         yield Ok(deduped_batch);
                     }
                     Err(e) => {

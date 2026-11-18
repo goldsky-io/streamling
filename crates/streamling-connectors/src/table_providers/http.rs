@@ -1,6 +1,6 @@
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::error::Result as ArrowResult;
 use datafusion::catalog::Session;
 use datafusion::common::not_impl_err;
 use datafusion::datasource::sink::DataSink;
@@ -26,6 +26,7 @@ use streamling_core::operators::external_handlers::{
     ExternalHandlerClient, ExternalHandlerExecutionOutcome,
 };
 use streamling_core::operators::wrapping::WrappingDataSink;
+use streamling_core::telemetry::arrow_bytes::batch_data_bytes;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
 use streamling_core::topology::Telemetry;
@@ -121,29 +122,29 @@ impl DataSink for HttpSink {
 
             let batches_futures =
                 futures::future::join_all(batches.into_iter().map(|item| async {
-                    let data: datafusion::common::Result<(Option<RecordBatch>, u64, u64)> =
+                    let data: datafusion::common::Result<(u64, u64, u64, ArrowResult<usize>)> =
                         match item {
                             Ok(batch) => {
                                 let batch_count = batch.num_rows() as u64;
+                                let batch_bytes = batch_data_bytes(&batch);
                                 if batch_count > 0 {
                                     let start_at = Instant::now();
-                                    let result =
-                                        self.client.execute_with_stats(batch.clone()).await;
+                                    let result = self.client.execute_with_stats(batch).await;
                                     metrics_recorder.record_elapsed_compute(
                                         start_at.elapsed(),
                                         self.metric_metadata_id.as_str(),
                                     );
                                     result.map(
                                         |ExternalHandlerExecutionOutcome {
-                                             batch,
                                              delivered_rows,
                                              skipped_rows,
+                                             ..
                                          }| {
-                                            (batch, delivered_rows, skipped_rows)
+                                            (delivered_rows, skipped_rows, batch_count, batch_bytes)
                                         },
                                     )
                                 } else {
-                                    Ok((Some(batch), 0, 0))
+                                    Ok((0, 0, 0, batch_bytes))
                                 }
                             }
                             Err(e) => Err(e),
@@ -155,14 +156,16 @@ impl DataSink for HttpSink {
             let batches = batches_futures.await;
             for item in batches {
                 match item {
-                    Ok((_batch_opt, delivered_rows, skipped_rows)) => {
+                    Ok((delivered_rows, skipped_rows, batch_rows, batch_bytes)) => {
                         row_count += delivered_rows + skipped_rows;
                         self.rows_received.fetch_add(
                             delivered_rows + skipped_rows,
                             std::sync::atomic::Ordering::SeqCst,
                         );
-                        metrics_recorder.record_output_rows_count(
+                        metrics_recorder.record_sink_delivery(
                             delivered_rows,
+                            batch_rows,
+                            batch_bytes,
                             self.metric_metadata_id.as_str(),
                         );
                     }

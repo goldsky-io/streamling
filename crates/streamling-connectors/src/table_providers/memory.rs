@@ -130,7 +130,8 @@ impl DataSink for MemorySink {
             let checkpoint_messages = {
                 let mut storage = self.storage.lock().unwrap();
                 storage.push(batch.clone());
-                metrics_recorder.record_output_rows_count(
+                metrics_recorder.record_sink_write(
+                    &batch,
                     row_count_in_batch as u64,
                     self.metric_metadata_id.as_str(),
                 );
