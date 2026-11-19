@@ -171,6 +171,14 @@ pub(super) async fn read_rounds<P: ReadPlan>(
             .limit
             .map(|limit| limit.saturating_sub(partition_emitted));
         let mut stream = reader.open_round(round.clone(), round_limit)?;
+        // Wire bytes: each file's full size when the round opens it. Like its rows,
+        // a round re-read after a stop or restart counts again.
+        let round_bytes: u64 = round.iter().map(|file| file.object_meta.size).sum();
+        get_metrics_recorder().record_count(
+            "input_bytes_delta",
+            round_bytes,
+            &reader.metric_metadata_id,
+        );
         while let Some(batch) = stream.next().await {
             let source_complete = inbox.drain(plan).await?;
             let batch = inbox.attach(build_output_batch(
@@ -196,14 +204,6 @@ pub(super) async fn read_rounds<P: ReadPlan>(
         if reader.limit.is_some_and(|limit| partition_emitted >= limit) {
             return Ok(ReadEnd::Exhausted);
         }
-        // Wire bytes: each file's full size, once its round is fully read. A round
-        // cut short above is re-read later and counts then.
-        let round_bytes: u64 = round.iter().map(|file| file.object_meta.size).sum();
-        get_metrics_recorder().record_count(
-            "input_bytes_delta",
-            round_bytes,
-            &reader.metric_metadata_id,
-        );
         plan.advance(&round);
     }
 }

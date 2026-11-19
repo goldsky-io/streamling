@@ -432,3 +432,90 @@ sinks:
         }
     }
 }
+
+/// A ClickHouse source counts the rows ClickHouse returned, before its version
+/// dedup: 5 raw versions of 3 keys are 5 input rows and 3 output rows.
+#[tokio::test]
+async fn clickhouse_source_counts_input_before_version_dedup() {
+    init_tracing();
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let capture = OtlpCaptureResource::new()
+        .await
+        .expect("Failed to start OTLP capture");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE usage_dedup (
+                block Int64,
+                id String,
+                payload String,
+                version UInt64
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+    // Separate parts with merges stopped, so ClickHouse returns every version.
+    for statement in [
+        "SYSTEM STOP MERGES usage_dedup",
+        "INSERT INTO usage_dedup VALUES (1, 'a', 'a1', 1), (2, 'b', 'b1', 1), (3, 'c', 'c1', 1)",
+        "INSERT INTO usage_dedup VALUES (1, 'a', 'a2', 2), (2, 'b', 'b2', 2)",
+    ] {
+        clickhouse
+            .execute(statement)
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: usage_dedup
+    columns: "block,id,payload"
+    primary_key: id
+
+transforms: {}
+
+sinks:
+  blackhole_sink:
+    type: blackhole
+    from: ch_source
+"#;
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            opts_with(
+                &capture,
+                &ctx.test_id,
+                PipelineOpts::new()
+                    .record_limit(5)
+                    .timeout(Duration::from_secs(60)),
+            ),
+        )
+        .await
+        .expect("Pipeline failed");
+    assert!(status.success(), "pipeline should exit cleanly");
+
+    let delta = |metric: &str, id: &str| sum(&capture.node_points(metric, id));
+    for (metric, id, expected) in [
+        ("streamling_input_rows_delta", "ch_source", 5),
+        ("streamling_input_rows", "ch_source", 5),
+        ("streamling_output_rows_delta", "ch_source", 3),
+        ("streamling_input_rows_delta", "blackhole_sink", 3),
+    ] {
+        let got = if metric.ends_with("_delta") {
+            delta(metric, id)
+        } else {
+            capture
+                .node_points(metric, id)
+                .last()
+                .map_or(0, |p| p.value)
+        };
+        assert_eq!(got, expected, "{metric} of {id}");
+    }
+    assert!(delta("streamling_input_bytes_delta", "ch_source") > 0);
+}

@@ -2434,7 +2434,7 @@ Streamling exports two variants of the `output_rows` metric with different tempo
 
 `input_rows` has the same pair: **`input_rows_total`** (Cumulative) and **`input_rows_delta`** (Delta). Both count the rows entering a node:
 
-- Source: the rows the source pulls in, before its `filter:`. A ClickHouse source pushes its filter into the query, so it counts only the rows ClickHouse returns. A hybrid source counts the rows of its bounded and unbounded phases on the hybrid node itself.
+- Source: the rows the source pulls in, before its `filter:`. A ClickHouse source pushes its filter into the query, so it counts only the rows ClickHouse returns, before the source deduplicates them by version. A hybrid source counts the rows of its bounded and unbounded phases on the hybrid node itself.
 - Transform: the `output_rows` of its upstream nodes, which is what it receives.
 - Sink: the rows it receives, before primary-key deduplication.
 
@@ -2447,7 +2447,7 @@ Byte metrics (Delta):
 - **`input_bytes_delta`** on sources: the bytes the source reads, whatever columns the pipeline selects and whatever its `filter:`:
   - Kafka: the payload bytes of each consumed message.
   - ClickHouse: the HTTP response body of each emitted page; a page re-read after an overflow counts once.
-  - File: each file's full size, once the file is fully read.
+  - File: each file's full size when the source opens it. A file re-read after a stop or restart counts again, as its rows do.
   - Plugin: the Arrow size of the plugin's batches (see below), because a plugin exposes no wire bytes.
   - Hybrid: its Kafka and ClickHouse phases report on the hybrid node itself.
 - **`output_bytes_delta`** on sinks: the Arrow size of the rows each sink receives, after primary-key deduplication.

@@ -1431,9 +1431,9 @@ mod tests {
         );
     }
 
-    /// The source `WrappingExec` records the source's output rows (and with them
-    /// `input_rows_delta`); it must see every pre-filter row while the filter
-    /// still drops rows downstream of it.
+    /// Side outputs at the source wrapper see every pre-filter row, while the
+    /// filter still drops rows above it. The row metrics are covered in
+    /// `recorder::pipeline_io_delta_tests`.
     #[tokio::test]
     async fn test_source_wrapper_counts_rows_before_source_filter() {
         let schema = test_schema();

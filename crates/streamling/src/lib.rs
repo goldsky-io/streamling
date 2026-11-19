@@ -1400,12 +1400,17 @@ impl Streamling {
                     );
                     let extracted_pk = clickhouse_source_provider.get_extracted_primary_key();
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        clickhouse_source_provider,
-                        metric_key(&application_id, reference_name.as_str()),
-                        scan_sharing.clone(),
-                        clickhouse.telemetry.as_ref(),
-                    ));
+                    // The ClickHouse exec counts its input rows itself, before its
+                    // version dedup.
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            clickhouse_source_provider,
+                            metric_key(&application_id, reference_name.as_str()),
+                            scan_sharing.clone(),
+                            clickhouse.telemetry.as_ref(),
+                        )
+                        .with_input_rows_id(None),
+                    );
 
                     self.register_operator_for_side_outputs(
                         reference_name.as_str(),

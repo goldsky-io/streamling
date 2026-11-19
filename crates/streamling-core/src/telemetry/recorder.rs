@@ -426,6 +426,24 @@ impl MetricsRecorder {
         }
     }
 
+    /// Records `input_rows` and `input_rows_delta` for a source that counts the rows it pulls in
+    /// itself, because it drops rows before its wrapper sees them.
+    pub fn record_input_rows_count(&self, value: u64, metadata_id: &str) {
+        let Some(metric_metadata_tags) = self
+            .metric_metadata_tags_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(metadata_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.record_metric_data(MetricData::new_with_owned_tags(
+            input_rows_values(&create_count_with_value(value as usize)),
+            metric_metadata_tags,
+        ));
+    }
+
     /// Records the Arrow bytes of `batch` as the `name` counter: `output_bytes_delta` for a batch
     /// handed to a sink, `input_bytes_delta` for a plugin source, which has no wire bytes.
     pub fn record_data_bytes(&self, name: &'static str, batch: &RecordBatch, metadata_id: &str) {
@@ -2763,6 +2781,20 @@ mod tests {
                     rows,
                     "{name}"
                 );
+            }
+        }
+
+        /// A source that drops rows before its wrapper sees them (ClickHouse version dedup)
+        /// counts its own input pair.
+        #[test]
+        fn self_counted_source_input_emits_both_series() {
+            let (recorder, provider, exporter) =
+                recorder_with_nodes(&[("src", TopologyNodeType::Source, "clickhouse", &[])]);
+            recorder.record_input_rows_count(6, "src");
+            recorder.record_input_rows_count(3, "src");
+            recorder.record_input_rows_count(9, "unregistered");
+            for name in ["input_rows", "input_rows_delta"] {
+                assert_eq!(exported_sum(&provider, &exporter, name, "src"), 9, "{name}");
             }
         }
 

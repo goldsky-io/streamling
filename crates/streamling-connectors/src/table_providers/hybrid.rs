@@ -399,7 +399,8 @@ impl HybridTableProvider {
                             None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
                             telemetry,
                         )
-                        .with_input_rows_id(input_rows_id.clone()),
+                        // The ClickHouse exec counts its input rows on the hybrid node itself.
+                        .with_input_rows_id(None),
                     );
                     bounded_table_providers.push(provider_with_telemetry as Arc<dyn TableProvider>);
                 }
