@@ -742,7 +742,11 @@ impl ExecutionPlan for WrappingExec {
                 // state can share the same key set. Only a delivered batch
                 // (`Some(Ok)`) counts; a `None` poll is EOF and a `Some(Err)`
                 // is an upstream failure — attribute nothing for either.
-                starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
+                // A source's `SourceOutput` wrapper waits on its `SourceInput` wrapper,
+                // which already measures this node's input wait.
+                if role != WrappingRole::SourceOutput {
+                    starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
+                }
                 // After a successful drain only a <1ms remainder remains; EOF/error polls
                 // add zero, so they cannot emit a carried whole millisecond.
                 let starved_ms = starved.take_whole_millis();
@@ -780,7 +784,9 @@ impl ExecutionPlan for WrappingExec {
                         // A SQL transform with subtree metrics folds it into the
                         // batch's compute delta (`record_execution_plan_metrics`)
                         // so the histogram keeps one observation per batch.
-                        let sql_input_wait_ms = if !record_wall_clock_compute {
+                        let sql_input_wait_ms = if role == WrappingRole::SourceOutput {
+                            0
+                        } else if !record_wall_clock_compute {
                             starved_ms
                         } else {
                             // No whole starved millisecond this batch: keep #85's
@@ -2019,6 +2025,58 @@ mod tests {
         assert!(
             starved >= 10,
             "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
+        );
+    }
+
+    /// A filtered source has two wrappers: `SourceInput` below the filter and
+    /// `SourceOutput` above it, both under the source's id. The `SourceOutput`
+    /// wrapper's input wait is the `SourceInput` wrapper's wait plus the filter,
+    /// so it must emit neither `starved` nor a folded input wait; otherwise the
+    /// source's starved and elapsed_compute count the connector wait twice.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn source_output_wrapper_records_no_input_wait() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "source_output_no_wait";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(10),
+        });
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = Arc::new(
+            StreamingFilterExec::from_original(FilterExec::try_new(predicate, slow_input).unwrap())
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let output_counter = Arc::new(
+            WrappingExec::new(filter, node_id.to_string(), vec![], vec![], None)
+                .with_role(WrappingRole::SourceOutput),
+        );
+        let mut stream = output_counter.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+        }
+
+        assert_eq!(test_support::node_wait_ms(node_id, "starved", None), 0);
+        // ~30ms of input wait would show here if folded; the filter's own
+        // compute over three tiny batches stays far below that.
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            elapsed_compute < 10,
+            "SourceOutput folded its input wait into elapsed_compute: {elapsed_compute}ms"
         );
     }
 
