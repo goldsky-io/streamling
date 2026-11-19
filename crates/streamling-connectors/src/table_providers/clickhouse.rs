@@ -216,6 +216,87 @@ fn project_out_column(
         .collect();
     RecordBatch::try_new(target_schema, kept).map_err(Into::into)
 }
+
+/// Merge a fully read page into one batch, ordered by the table's sorting
+/// keys. When a ReplacingMergeTree version column was inferred, first
+/// deduplicate by max version keyed on the full ORDER BY (versions of one key
+/// can be split across the page's IPC blocks, so per-batch dedup would miss
+/// them); keys whose winner is a tombstone (`_gs_op='d'`) are dropped
+/// (ReplacingMergeTree FINAL).
+///
+/// The page query has no `ORDER BY` (see `ClickHouseQueryBuilder`), so
+/// ClickHouse returns rows in arbitrary order. Downstream keep-last dedup (the
+/// sink's primary-key dedup) and sink insert order treat stream order as
+/// version order, so the page is sorted here, off the ClickHouse side, where a
+/// projection can still serve the scan. Every sorting key must be a selected
+/// column (see [`ensure_sorting_keys_selected`]).
+fn assemble_page(
+    batches: &[RecordBatch],
+    dedup_version_column: Option<&str>,
+    sorting_keys: &[String],
+) -> streamling_core::error::Result<RecordBatch> {
+    let page = match dedup_version_column {
+        Some(version_col) => deduplicate_record_batches_by_version(
+            batches,
+            &sorting_keys.join(","),
+            version_col,
+            Some(&TombstoneRule {
+                column: "_gs_op".to_string(),
+                value: "d".to_string(),
+            }),
+        )?,
+        None => arrow::compute::concat_batches(&batches[0].schema(), batches)
+            .streamling_context("failed to concatenate ClickHouse page")?,
+    };
+    let sort_columns = sorting_keys
+        .iter()
+        .map(|key| {
+            page.column_by_name(key)
+                .map(|values| arrow::compute::SortColumn {
+                    values: Arc::clone(values),
+                    options: None,
+                })
+                .ok_or_else(|| {
+                    streamling_err!("sorting key '{}' missing from ClickHouse page", key)
+                })
+        })
+        .collect::<streamling_core::error::Result<Vec<_>>>()?;
+    if page.num_rows() < 2 {
+        return Ok(page);
+    }
+    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
+        .streamling_context("failed to sort ClickHouse page by sorting keys")?;
+    arrow::compute::take_record_batch(&page, &indices)
+        .streamling_context("failed to reorder ClickHouse page")
+}
+
+/// Reject a source whose scan cannot carry the table's whole sorting key.
+/// Pages are ordered by every sorting key; without one (not selected, or an
+/// expression such as `toStartOfDay(ts)` rather than a column), ties on it
+/// would reach downstream keep-last dedup in arbitrary order and an older row
+/// could win.
+fn ensure_sorting_keys_selected(
+    sorting_keys: &[String],
+    scan_schema: &Schema,
+    table: &str,
+) -> streamling_core::error::Result<()> {
+    let missing: Vec<&str> = sorting_keys
+        .iter()
+        .filter(|key| scan_schema.field_with_name(key).is_err())
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(streamling_err!(
+        "ClickHouse source table {} has sorting key(s) {:?} that are not selected columns; \
+         every ORDER BY key must be a plain column included in `columns` so rows can be \
+         emitted in sort-key order (expression keys are not supported)",
+        table,
+        missing
+    ))
+}
+
 /// Version / is_deleted columns inferred from a ReplacingMergeTree-family
 /// `engine_full` string. Either may be `None` (e.g. plain `ReplacingMergeTree()`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,6 +744,11 @@ impl ClickHouseTableProvider {
             )
             .into());
         }
+        ensure_sorting_keys_selected(
+            &sorting_keys,
+            &scan_schema,
+            &format!("{database_name}.{table_name}"),
+        )?;
 
         let pagination_config = ClickHousePaginationConfig {
             sorting_keys: sorting_keys.clone(),
@@ -1638,7 +1724,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
         // dedup key is the table's full ORDER BY, so all duplicate versions of a
         // key share a `block_number` and land in the same page.
         let dedup_version_column = source_params.dedup_version_column.clone();
-        let dedup_key = source_params.sorting_keys.join(",");
+        let page_sorting_keys = source_params.sorting_keys.clone();
         let project_out_version_index = source_params.project_out_version_index;
         let empty_batch_schema = schema.clone();
 
@@ -2019,48 +2105,29 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 receiver_dropped = true;
                             }
                         } else {
-                            // When a version column was inferred, coalesce the
-                            // whole page and deduplicate by max version before
-                            // emitting: versions of one ORDER BY key can be split
-                            // across the page's IPC blocks, so per-batch dedup
-                            // would miss them. Keys whose winner is a tombstone
-                            // (_gs_op='d') are dropped (ReplacingMergeTree FINAL).
+                            let page_sorting_keys = page_sorting_keys.clone();
+                            let dedup_version_column = dedup_version_column.clone();
                             let (mut emit_batches, deduped_to_empty): (Vec<RecordBatch>, bool) =
-                                match &dedup_version_column {
-                                    Some(version_col) => {
-                                        let dedup_key_owned = dedup_key.clone();
-                                        let version_col_owned = version_col.clone();
-                                        match run_blocking(move || {
-                                            deduplicate_record_batches_by_version(
-                                                &batches,
-                                                &dedup_key_owned,
-                                                &version_col_owned,
-                                                Some(&TombstoneRule {
-                                                    column: "_gs_op".to_string(),
-                                                    value: "d".to_string(),
-                                                }),
-                                            )
-                                        })
-                                        .await
-                                        {
-                                            Ok(deduped) if deduped.num_rows() == 0 => {
-                                                (Vec::new(), true)
-                                            }
-                                            Ok(deduped) => (vec![deduped], false),
-                                            Err(e) => {
-                                                let _ = tx
-                                                    .send(Err(DataFusionError::from(
-                                                        streamling_err!(
-                                                            "ClickHouse source dedup failed: {}",
-                                                            e
-                                                        ),
-                                                    )))
-                                                    .await;
-                                                break;
-                                            }
-                                        }
+                                match run_blocking(move || {
+                                    assemble_page(
+                                        &batches,
+                                        dedup_version_column.as_deref(),
+                                        &page_sorting_keys,
+                                    )
+                                })
+                                .await
+                                {
+                                    Ok(page) if page.num_rows() == 0 => (Vec::new(), true),
+                                    Ok(page) => (vec![page], false),
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::from(streamling_err!(
+                                                "ClickHouse source page assembly failed: {}",
+                                                e
+                                            ))))
+                                            .await;
+                                        break;
                                     }
-                                    None => (batches, false),
                                 };
 
                             if deduped_to_empty {
@@ -3971,6 +4038,94 @@ mod tests {
         assert_eq!(
             initial_range_width(None, Some(10), 1_000_000, 10_000_000),
             (1_000_000_f64 * RangeController::grow_ceiling()) as i128
+        );
+    }
+
+    /// Regression: the page query has no `ORDER BY` (650ee65), so ClickHouse
+    /// returns a page's rows in arbitrary order. Two rows that share the sink's
+    /// primary key but differ in `block_number` are distinct ORDER BY keys, so
+    /// the source keeps both. The sink's keep-last dedup then picked whichever
+    /// arrived last, letting an older block overwrite a newer one.
+    #[test]
+    fn assemble_page_orders_rows_by_sorting_keys_so_latest_block_wins_at_sink() {
+        use arrow::array::{StringArray, UInt64Array};
+        use streamling_core::utils::dedup::deduplicate_record_batch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("amount", DataType::UInt64, false),
+            Field::new("insert_timestamp", DataType::UInt64, false),
+        ]));
+        let id =
+            "0x781c870be75e9b7c77017cfebf8f79ef2ac9e64f_0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+        let row = |block: u64, amount: u64, inserted: u64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![id])),
+                    Arc::new(UInt64Array::from(vec![block])),
+                    Arc::new(UInt64Array::from(vec![amount])),
+                    Arc::new(UInt64Array::from(vec![inserted])),
+                ],
+            )
+            .expect("valid batch")
+        };
+        // ClickHouse delivered the newer block first.
+        let page = [
+            row(45_875_305, 0, 1_787_675_648),
+            row(45_873_617, 980_000, 1_787_675_475),
+        ];
+        let sorting_keys = vec!["block_number".to_string(), "id".to_string()];
+
+        for version_column in [None, Some("insert_timestamp")] {
+            let assembled =
+                assemble_page(&page, version_column, &sorting_keys).expect("page assembles");
+            let at_sink = deduplicate_record_batch(&assembled, "id").expect("sink dedup");
+
+            assert_eq!(at_sink.num_rows(), 1);
+            let block = at_sink
+                .column_by_name("block_number")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .expect("block_number column")
+                .value(0);
+            assert_eq!(
+                block, 45_875_305,
+                "older block won at the sink (version_column={version_column:?})"
+            );
+        }
+    }
+
+    /// A sorting key that is not a selected column (unselected, or an
+    /// expression key) cannot order the page, so ties on it would reach the
+    /// sink in arbitrary order. The source must refuse to start.
+    #[test]
+    fn ensure_sorting_keys_selected_rejects_unselected_and_expression_keys() {
+        let schema = Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("log_index", DataType::UInt32, false),
+            Field::new("id", DataType::Utf8, false),
+        ]);
+        let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+
+        ensure_sorting_keys_selected(&keys(&["block_number", "log_index", "id"]), &schema, "db.t")
+            .expect("all keys selected");
+
+        let err = ensure_sorting_keys_selected(
+            &keys(&[
+                "block_number",
+                "transaction_index",
+                "toStartOfDay(ts)",
+                "id",
+            ]),
+            &schema,
+            "db.t",
+        )
+        .expect_err("unselected and expression keys must be rejected")
+        .to_string();
+        assert!(
+            err.contains("\"transaction_index\"") && err.contains("\"toStartOfDay(ts)\""),
+            "error must name every missing key: {err}"
         );
     }
 
