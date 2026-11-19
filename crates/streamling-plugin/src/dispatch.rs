@@ -649,6 +649,7 @@ impl SinkPluginDispatcher {
                 Ok(Ok(PluginMsg::NextBatch { data })) => {
                     let batch: RecordBatch = data.into();
                     let num_rows = batch.num_rows();
+                    let batch_bytes = crate::arrow_bytes::batch_data_bytes(&batch);
                     let plugin_process_batch = std::time::Instant::now();
                     let result = self.sink_plugin.process_batch(batch).await;
                     let duration = plugin_process_batch.elapsed();
@@ -656,6 +657,14 @@ impl SinkPluginDispatcher {
                         Ok(()) => {
                             self.plugin_metrics_recorder
                                 .record_count("output_rows", num_rows as u64);
+                            match batch_bytes {
+                                Ok(bytes) => self
+                                    .plugin_metrics_recorder
+                                    .record_count("output_bytes_delta", bytes as u64),
+                                Err(e) => {
+                                    warn!("Skipping output_bytes_delta: cannot size the batch: {e}")
+                                }
+                            }
                             self.plugin_metrics_recorder
                                 .record_latency("elapsed_compute", duration);
                         }

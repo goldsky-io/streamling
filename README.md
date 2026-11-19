@@ -2450,7 +2450,9 @@ Byte metrics (Delta):
   - File: each file's full size when the source opens it, even when Parquet row-group pruning or a record limit reads less of it. A file re-read after a stop or restart counts again, as its rows do.
   - Plugin: the Arrow size of the plugin's batches (see below), because a plugin exposes no wire bytes.
   - Hybrid: its Kafka and ClickHouse phases report on the hybrid node itself.
-- **`output_bytes_delta`** on sinks: the Arrow size of the rows each sink receives, after primary-key deduplication.
+- **`output_bytes_delta`** on sinks: the Arrow size of the rows each sink wrote, after primary-key deduplication.
+
+A sink counts `output_rows` and `output_bytes_delta` only after the destination confirms the write: a committed ClickHouse or Postgres write, an HTTP delivery, a Kafka broker ack (`acks=all`), or a plugin's successful `process_batch`. When only part of a batch lands (skipped HTTP deliveries, failed Kafka messages), the sink counts the delivered rows and the same share of the batch's bytes.
 
 An Arrow size is the size the rows would have if copied into fresh Arrow arrays of the same types. A slice counts only its own rows at every nesting level. Dictionary and run-end encoded columns count their decoded values.
 
