@@ -137,6 +137,16 @@ Attribution and measurement are separate concerns:
 
 A correctly named edge can still have a misleading magnitude.
 
+## Filtered sources
+
+A source has two `WrappingExec` nodes under one id: `SourceInput` below its
+filter and `SourceOutput` above it.
+
+- `SourceInput` measures every `node_wait` state and carries the edge and
+  fan-out stamps. Its `blocked` includes the filter's work.
+- `SourceOutput` counts output rows only. `DownstreamAttributionRule` passes
+  through it.
+
 ## Plugin boundaries
 
 Plugins do not need to emit `node_wait` themselves:

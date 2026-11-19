@@ -6,7 +6,7 @@ use crate::operators::projection::StreamingProjectionExec;
 use crate::operators::rebatch::RebatchExec;
 use crate::operators::scan_sharing::BroadcastingExec;
 use crate::operators::unnest::StreamingUnnestExec;
-use crate::operators::wrapping::{BackpressureRole, WrappingDataSink, WrappingExec};
+use crate::operators::wrapping::{BackpressureRole, WrappingDataSink, WrappingExec, WrappingRole};
 use crate::session::StreamlingConfig;
 use crate::telemetry::provider::get_reference_name_from_metric_key;
 use datafusion::common::Result;
@@ -209,6 +209,22 @@ fn attribute_downstream(
             .map(|child| attribute_downstream(Arc::clone(child), None, true))
             .collect::<Result<Vec<_>>>()?;
         return node.with_new_children(new_children);
+    }
+
+    // A filtered source's `SourceOutput` wrapper only counts rows; its
+    // `SourceInput` wrapper below the filter takes the source's edge.
+    if let Some(wrapping) = node.downcast_ref::<WrappingExec>()
+        && *wrapping.role() == WrappingRole::SourceOutput
+    {
+        let attributed_inner = attribute_downstream(
+            Arc::clone(wrapping.inner()),
+            named_downstream,
+            suppress_next_wrapping,
+        )?;
+        return Ok(Arc::new(wrapping.clone_with_role_and_inner(
+            wrapping.backpressure_role().clone(),
+            attributed_inner,
+        )));
     }
 
     // WrappingExec: stamp this node's role, then recurse with this node as the
@@ -685,6 +701,74 @@ mod attribution_tests {
                 .inner(),
         );
         assert_eq!(role_of(&w_src), BackpressureRole::Edge("sql".to_string()));
+    }
+
+    /// A filtered source: `SourceOutput` above its filter, `SourceInput` below it,
+    /// both under the source's id.
+    fn filtered_source(metric_key_name: &str) -> Arc<dyn ExecutionPlan> {
+        let source_input =
+            WrappingExec::new(leaf(), metric_key_name.to_string(), vec![], vec![], None).with_role(
+                WrappingRole::SourceInput {
+                    input_rows_id: None,
+                },
+            );
+        Arc::new(
+            WrappingExec::new(
+                mid(Arc::new(source_input)),
+                metric_key_name.to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .with_role(WrappingRole::SourceOutput),
+        )
+    }
+
+    fn source_input_role(source_output: &Arc<dyn ExecutionPlan>) -> BackpressureRole {
+        let filter = Arc::clone(
+            source_output
+                .downcast_ref::<WrappingExec>()
+                .expect("expected the SourceOutput WrappingExec")
+                .inner(),
+        );
+        role_of(&child(&filter, 0))
+    }
+
+    /// The `SourceInput` wrapper measures a filtered source's `blocked`, so it
+    /// takes the consumer's edge, not one named after its own `SourceOutput`.
+    #[test]
+    fn filtered_source_input_wrapper_gets_consumer_edge() {
+        let plan = sink(
+            wrap(mid(filtered_source("app::kafka_source")), "app::sql"),
+            "app::pg_sink",
+        );
+        let optimized = run(plan);
+        let source_output = child(&child(&optimized, 0), 0);
+        assert_eq!(
+            source_input_role(&source_output),
+            BackpressureRole::Edge("sql".to_string())
+        );
+    }
+
+    /// A multi-sink producer's suppression reaches the `SourceInput` wrapper of a
+    /// filtered source, so its `blocked` does not double the `BroadcastStream`'s.
+    #[test]
+    fn multi_sink_suppresses_filtered_source_input_wrapper() {
+        let multi: Arc<dyn ExecutionPlan> = Arc::new(MultiSinkExec::new(
+            filtered_source("app::kafka_source"),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            1,
+            Some(Arc::from("app::kafka_source")),
+            crate::shutdown::ComponentScope::detached("test"),
+        ));
+        let optimized = run(multi);
+        assert_eq!(
+            source_input_role(&child(&optimized, 0)),
+            BackpressureRole::FanOutProducer
+        );
     }
 
     /// A `MultiSinkExec` boundary suppresses the producer `WrappingExec` (the
