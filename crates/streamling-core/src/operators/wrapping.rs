@@ -248,30 +248,49 @@ impl WrappingSourceTableProvider {
             reference_name,
             side_outputs,
             event_time_instrumentation,
+            suppress_backpressure,
         );
         // The rows the source node outputs, after its filter: what downstream nodes receive.
-        // Its output edge is where the source is blocked, so it carries the fan-out stamp.
-        let output = WrappingExec::new(
-            below_filter,
-            reference_name.to_string(),
-            Vec::new(),
-            Vec::new(),
-            None,
+        Arc::new(
+            WrappingExec::new(
+                below_filter,
+                reference_name.to_string(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .with_role(WrappingRole::SourceOutput),
         )
-        .with_role(WrappingRole::SourceOutput);
-        Arc::new(if suppress_backpressure {
-            output.suppress_backpressure()
-        } else {
-            output
-        })
     }
 
+    /// The source's `SourceInput` wrapper measures its `node_wait` states, so it
+    /// carries the fan-out stamp.
     fn wrap_below_filter(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        suppress_backpressure: bool,
     ) -> Arc<dyn ExecutionPlan> {
+        let source_input = |inner: Arc<dyn ExecutionPlan>,
+                            side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+                            instrumentation: Option<EventTimeInstrumentation>|
+         -> Arc<dyn ExecutionPlan> {
+            let exec = WrappingExec::new(
+                inner,
+                reference_name.to_string(),
+                side_outputs,
+                Vec::new(),
+                instrumentation,
+            )
+            .with_role(WrappingRole::SourceInput);
+            Arc::new(if suppress_backpressure {
+                exec.suppress_backpressure()
+            } else {
+                exec
+            })
+        };
+
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -284,15 +303,10 @@ impl WrappingSourceTableProvider {
                 .downcast_ref::<StreamingFilterExec>()
         {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
-                WrappingExec::new(
-                    source_exec,
-                    reference_name.to_string(),
-                    side_outputs.clone(),
-                    Vec::new(),
-                    event_time_instrumentation.clone(),
-                )
-                .with_role(WrappingRole::SourceInput),
+            let wrapped_source = source_input(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
             );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
@@ -319,15 +333,10 @@ impl WrappingSourceTableProvider {
 
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
-                WrappingExec::new(
-                    source_exec,
-                    reference_name.to_string(),
-                    side_outputs.clone(),
-                    Vec::new(),
-                    event_time_instrumentation.clone(),
-                )
-                .with_role(WrappingRole::SourceInput),
+            let wrapped_source = source_input(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
             );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
@@ -342,29 +351,11 @@ impl WrappingSourceTableProvider {
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(
-                        WrappingExec::new(
-                            inner_exec,
-                            reference_name.to_string(),
-                            side_outputs,
-                            Vec::new(),
-                            event_time_instrumentation,
-                        )
-                        .with_role(WrappingRole::SourceInput),
-                    )
+                    source_input(inner_exec, side_outputs, event_time_instrumentation)
                 }
             }
         } else {
-            Arc::new(
-                WrappingExec::new(
-                    inner_exec,
-                    reference_name.to_string(),
-                    side_outputs,
-                    Vec::new(),
-                    event_time_instrumentation,
-                )
-                .with_role(WrappingRole::SourceInput),
-            )
+            source_input(inner_exec, side_outputs, event_time_instrumentation)
         }
     }
 }
@@ -666,6 +657,10 @@ impl WrappingExec {
     pub fn with_role(mut self, role: WrappingRole) -> Self {
         self.role = role;
         self
+    }
+
+    pub fn role(&self) -> WrappingRole {
+        self.role
     }
 
     /// The node's `reference_name` (metric_key form `"{app}::{name}"`). The
@@ -972,6 +967,7 @@ impl ExecutionPlan for WrappingExec {
                                 sql_input_wait_ms,
                             );
                         }
+                        // The `SourceInput` wrapper below measures the source's blocked.
                         if role == WrappingRole::SourceOutput {
                             yield Ok(batch);
                             continue;
@@ -2267,6 +2263,45 @@ mod tests {
             starved >= 10,
             "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
         );
+    }
+
+    /// A filtered source's `node_wait` states are measured by its `SourceInput`
+    /// wrapper, so only that wrapper emits `blocked`; the `SourceOutput` wrapper
+    /// above the filter emits none, or the source's blocked would count twice.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn only_source_input_wrapper_records_blocked() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        for (role, node_id, expect_blocked) in [
+            (WrappingRole::SourceInput, "blocked_source_input", true),
+            (WrappingRole::SourceOutput, "blocked_source_output", false),
+        ] {
+            test_support::init_recorder_with_node(node_id);
+            let mem_table = MemTable::try_new(
+                test_schema(),
+                vec![vec![test_batch(), test_batch(), test_batch()]],
+            )
+            .unwrap();
+            let ctx = SessionContext::new();
+            let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+            let wrapping = Arc::new(
+                WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                    .with_role(role),
+            );
+            let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+            while let Some(batch) = stream.next().await {
+                batch.expect("batch must be Ok");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let blocked = test_support::node_wait_ms(node_id, "blocked", Some(""));
+            assert_eq!(
+                blocked >= 10,
+                expect_blocked,
+                "{role:?} recorded blocked={blocked}ms"
+            );
+        }
     }
 
     /// A filtered source has two wrappers: `SourceInput` below the filter and
