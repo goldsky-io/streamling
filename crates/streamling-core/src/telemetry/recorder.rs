@@ -1490,6 +1490,12 @@ impl ControlPlaneMetricsRecorder {
             .record_count_w_tags(name, value, vec![], &self.component_id);
     }
 
+    /// Record a counter metric with extra tags.
+    pub fn record_count_w_tags(&self, name: &str, value: u64, tags: Vec<(&str, &str)>) {
+        self.inner
+            .record_count_w_tags(name, value, tags, &self.component_id);
+    }
+
     /// Record a gauge metric.
     pub fn record_gauge(&self, name: &str, value: u64) {
         self.inner
