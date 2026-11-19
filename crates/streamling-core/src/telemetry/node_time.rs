@@ -628,18 +628,21 @@ mod tests {
             OwnWork::new(plan_metrics.clone_inner(), 0),
         );
 
-        let started = Instant::now();
+        // The span lies between `inner` and `outer`, whatever the scheduling.
+        let before_open = Instant::now();
         starved.open();
+        let after_open = Instant::now();
         std::thread::sleep(Duration::from_millis(80));
-        let waited = started.elapsed();
+        let inner = after_open.elapsed();
         starved.pause();
         compute.add_duration(Duration::from_millis(300));
         starved.resume();
         starved.close();
+        let outer = before_open.elapsed();
         let total = starved.total();
         assert!(
-            total >= waited && total < waited + Duration::from_millis(20),
-            "waited {waited:?}, got {total:?}"
+            total >= inner && total <= outer,
+            "span between {inner:?} and {outer:?}, got {total:?}"
         );
     }
 
