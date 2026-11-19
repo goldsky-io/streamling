@@ -505,7 +505,10 @@ sinks:
             PipelineOpts::new()
                 .env("STREAMLING__APPLICATION_ID", &application_id)
                 .env("STREAMLING__RECORD_BATCH_SIZE", "100")
-                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1"),
+                .env("STREAMLING__CHECKPOINT_INTERVAL_SEC", "1")
+                // The scan observes shutdown only between pages; at the default
+                // page size the whole table is one page and cannot end early.
+                .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1000"),
             std::time::Duration::from_secs(6),
             std::time::Duration::from_secs(30),
         )
