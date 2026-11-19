@@ -203,7 +203,15 @@ pub(super) async fn read_bounded_partition(
             (control, epoch)
         });
     let messages = std::mem::take(&mut inbox.buffer);
-    if !send_checkpoint_messages(&tx, &reader.output_schema, messages).await {
+    if !reader
+        .task_wait
+        .send(send_checkpoint_messages(
+            &tx,
+            &reader.output_schema,
+            messages,
+        ))
+        .await
+    {
         return Ok(());
     }
     let Some((control, epoch)) = terminal else {
@@ -211,8 +219,13 @@ pub(super) async fn read_bounded_partition(
     };
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
-    // here does not block their consumption of the marker batch.
-    if !control.await_terminal_finalized_on_completion().await {
+    // here does not block their consumption of the marker batch. A wait on the
+    // sinks is neither input, work, nor a send.
+    if !reader
+        .task_wait
+        .untimed(control.await_terminal_finalized_on_completion())
+        .await
+    {
         // At least one live sink never confirmed its writes. Persisting would
         // advance progress past unconfirmed files and a restart would skip them,
         // so persist nothing and withhold the Finalizer; the files replay.
@@ -233,12 +246,14 @@ pub(super) async fn read_bounded_partition(
         "File source '{}': terminal epoch {} finalized; progress persisted",
         reader.reference_name, epoch.0
     );
-    send_checkpoint_messages(
-        &tx,
-        &reader.output_schema,
-        vec![CheckpointMessage::Finalizer(epoch)],
-    )
-    .await;
+    reader
+        .task_wait
+        .send(send_checkpoint_messages(
+            &tx,
+            &reader.output_schema,
+            vec![CheckpointMessage::Finalizer(epoch)],
+        ))
+        .await;
     Ok(())
 }
 

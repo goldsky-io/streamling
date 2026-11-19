@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use streamling_plugin::api::{SupportsGracefulShutdown, PluginStateBackendFactory};
 use streamling_plugin::r#async::PluginAsyncRuntimeObj;
 use streamling_plugin::{CheckpointEpoch, PluginError, TransformPlugin};
@@ -17,7 +17,9 @@ pub struct FilterTransform {
     schema: SchemaRef,
     options: HashMap<String, String>,
     running: Arc<AtomicBool>,
-    metrics_recorder: PluginMetricsRecorder
+    metrics_recorder: PluginMetricsRecorder,
+    /// Simulated CPU work per non-empty batch (option `work_ms`), for tests.
+    work: Duration,
 }
 
 impl FilterTransform {
@@ -26,10 +28,14 @@ impl FilterTransform {
         _rt: PluginAsyncRuntimeObj,
         _state_backend_factory: PluginStateBackendFactory,
         metrics_recorder: PluginMetricsRecorder,
-        options: HashMap<String, String>,
+        mut options: HashMap<String, String>,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
-        FilterTransform { schema, options, running, metrics_recorder }
+        let work = options
+            .remove("work_ms")
+            .and_then(|ms| ms.parse().ok())
+            .map_or(Duration::ZERO, Duration::from_millis);
+        FilterTransform { schema, options, running, metrics_recorder, work }
     }
 }
 
@@ -70,6 +76,8 @@ impl TransformPlugin for FilterTransform {
         let start_at = Instant::now();
 
         debug!("Processing batch with {} rows", batch.num_rows());
+        // Blocks like CPU-bound work would.
+        std::thread::sleep(self.work);
 
         // If no filter conditions are specified, return the original batch
         if self.options.is_empty() {

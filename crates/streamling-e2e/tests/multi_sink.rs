@@ -280,21 +280,13 @@ async fn test_multi_sink_backpressure_attribution() {
 
     use streamling_e2e::resources::{PrometheusResource, WebhookResource};
 
-    let ctx = match TestContext::with_options(TestContextOptions::new().with_prometheus()).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
-    };
-
-    let prometheus = match &ctx.prometheus {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
-    };
+    let ctx = TestContext::with_options(TestContextOptions::new().with_prometheus())
+        .await
+        .expect("Failed to create test context");
+    let prometheus = ctx
+        .prometheus
+        .as_ref()
+        .expect("Prometheus must be configured");
 
     ctx.kafka
         .register_schema(TEST_SCHEMA)
@@ -402,7 +394,7 @@ sinks:
     // add to the total and cannot mask this run's backpressure.
     let blocked_webhook_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_downstream_query("webhook_sink", None)
+        PrometheusResource::backpressure_by_downstream_query("webhook_sink", Some(&ctx.test_id))
     );
     let blocked_webhook = prometheus
         .wait_for_metric_at_least(&blocked_webhook_query, 50, 30, 500)
@@ -419,7 +411,7 @@ sinks:
     // to recover the node-level total.
     let source_backpressure_query = format!(
         "sum({})",
-        PrometheusResource::backpressure_by_id_query("kafka_source", None)
+        PrometheusResource::backpressure_by_id_query("kafka_source", Some(&ctx.test_id))
     );
     let source_backpressure = prometheus
         .wait_for_metric_at_least(&source_backpressure_query, 1, 30, 500)
