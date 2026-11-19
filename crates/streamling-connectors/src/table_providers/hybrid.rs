@@ -1864,12 +1864,25 @@ impl ClickHouseSchemaAdapter {
         target_schema: &SchemaRef,
         primary_key_columns: &[String],
     ) -> Result<Vec<String>, DataFusionError> {
-        // Probe every column `system.columns` knows about: a `SELECT *` probe
-        // omits MATERIALIZED and ALIAS columns, which would make a real column
-        // look absent and get null-filled instead of read.
-        let table_schema = self.client.fetch_full_schema(table_name).map_err(|e| {
+        let table_schema = self
+            .client
+            .fetch_schema(table_name, None, None)
+            .map_err(|e| {
+                streamling_err!(
+                    "failed to fetch schema from ClickHouse for table '{}': {}",
+                    table_name,
+                    e
+                )
+            })?;
+        // `SELECT *` omits MATERIALIZED and ALIAS columns, so a name missing
+        // from `table_schema` is not proof of absence: cross-check against
+        // `system.columns` before treating a column as null-fillable.
+        let table_column_names = futures::executor::block_on(
+            self.client.fetch_table_column_names(table_name),
+        )
+        .map_err(|e| {
             streamling_err!(
-                "failed to fetch schema from ClickHouse for table '{}': {}",
+                "failed to list columns of ClickHouse table '{}': {}",
                 table_name,
                 e
             )
@@ -1893,6 +1906,7 @@ impl ClickHouseSchemaAdapter {
             &table_schema,
             target_schema,
             primary_key_columns,
+            &table_column_names,
         )?;
         debug!(
             "Hybrid source bounded source (ClickHouse table '{}') selected columns matching unbounded schema ({}): {:?}",
@@ -2005,6 +2019,7 @@ impl ClickHouseSchemaAdapter {
         table_schema: &SchemaRef,
         target_schema: &SchemaRef,
         primary_key_columns: &[String],
+        table_column_names: &[String],
     ) -> Result<Vec<String>, DataFusionError> {
         let table_fields: HashMap<&str, &Arc<Field>> = table_schema
             .fields()
@@ -2026,6 +2041,19 @@ impl ClickHouseSchemaAdapter {
                     } else {
                         columns.push(Self::convert_field_type(table_field, target_field));
                     }
+                }
+                None if table_column_names.iter().any(|n| n == target_field.name()) => {
+                    // Present in the table but invisible to the `SELECT *`
+                    // probe: a MATERIALIZED or ALIAS column. The bounded scan
+                    // reads through a `SELECT *` CTE, so it cannot select one
+                    // either — null-filling real data would be silent loss.
+                    streamling_user_bail!(
+                        "column '{}' of ClickHouse table '{}' is a MATERIALIZED or ALIAS column, \
+                         which the bounded scan cannot read; it must be a stored column to be \
+                         backfilled",
+                        target_field.name(),
+                        table_name
+                    );
                 }
                 None if target_field.is_nullable() => {
                     if primary_key_columns.iter().any(|k| k == target_field.name()) {
@@ -2582,6 +2610,7 @@ mod tests {
             &table_schema,
             &target_schema,
             &[],
+            &[],
         )
         .expect("nullable column absent from ClickHouse must not fail");
 
@@ -2651,6 +2680,7 @@ mod tests {
             &table_schema,
             &target_schema,
             &[],
+            &[],
         )
         .expect_err("a non-nullable column cannot be backfilled with nulls");
         assert!(
@@ -2675,6 +2705,7 @@ mod tests {
             &table_schema,
             &target_schema,
             &["user_id".to_string()],
+            &[],
         )
         .expect_err("an absent primary-key column cannot be backfilled with nulls");
         assert!(
@@ -2683,6 +2714,33 @@ mod tests {
             "got: {err}"
         );
         assert!(err.to_string().contains("primary_key"), "got: {err}");
+    }
+
+    #[test]
+    fn select_columns_rejects_materialized_column() {
+        // Present in system.columns but invisible to the SELECT * probe: a
+        // MATERIALIZED/ALIAS column. Null-filling it would be silent data
+        // loss, and the bounded scan's SELECT * CTE cannot select it either,
+        // so the build must fail loudly.
+        let table_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+
+        let err = ClickHouseSchemaAdapter::select_columns(
+            "raw_traces",
+            &table_schema,
+            &target_schema,
+            &[],
+            &["id".to_string(), "region".to_string()],
+        )
+        .expect_err("a MATERIALIZED/ALIAS column cannot be read by the bounded scan");
+        assert!(
+            err.to_string()
+                .contains("column 'region' of ClickHouse table 'raw_traces' is a MATERIALIZED"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2705,6 +2763,7 @@ mod tests {
             "raw_traces",
             &table_schema,
             &target_schema,
+            &[],
             &[],
         )
         .expect_err("a table sharing no columns with the source schema cannot backfill");

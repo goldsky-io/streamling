@@ -2230,8 +2230,9 @@ sinks:
 // ============================================================================
 
 /// Nullable `region` field backed by a MATERIALIZED column in ClickHouse.
-/// `SELECT *` omits MATERIALIZED columns, so the schema probe used to miss
-/// them and the bounded phase null-filled a column that actually has data.
+/// `SELECT *` omits MATERIALIZED columns, so the schema probe cannot see the
+/// column even though it holds real data — null-filling it would be silent
+/// loss, so the pipeline must fail loudly instead.
 const MATERIALIZED_FIELD_SCHEMA: &str = r#"{"type":"record","name":"TestMessageMaterialized","fields":[
     {"name":"block","type":"long"},
     {"name":"id","type":"string"},
@@ -2249,10 +2250,11 @@ struct TestRecordMaterialized {
     region: Option<String>,
 }
 
-/// Bounded-phase records must read the MATERIALIZED column's real value
-/// instead of null-filling it; unbounded Kafka records pass through untouched.
+/// A target field backed by a MATERIALIZED ClickHouse column must fail the
+/// pipeline at startup with an accurate error — not silently backfill NULLs
+/// over data that exists, and not fail with the misleading "column not found".
 #[tokio::test]
-async fn test_hybrid_clickhouse_reads_materialized_column() {
+async fn test_hybrid_clickhouse_fails_loudly_on_materialized_column() {
     init_tracing();
 
     let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
@@ -2261,7 +2263,7 @@ async fn test_hybrid_clickhouse_reads_materialized_column() {
 
     let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
 
-    // `region` is MATERIALIZED from `zone`: a real, readable column that
+    // `region` is MATERIALIZED from `zone`: a real, populated column that
     // `SELECT *` does not list.
     clickhouse
         .execute(
@@ -2293,22 +2295,13 @@ async fn test_hybrid_clickhouse_reads_materialized_column() {
         .await
         .expect("Failed to register schema");
 
-    let kafka_records: Vec<TestRecordMaterialized> = vec![
-        TestRecordMaterialized {
-            block: 201,
-            id: "kafka_region_1".to_string(),
-            data: "kafka_data_1".to_string(),
-            timestamp: 3001,
-            region: Some("kafka-eu".to_string()),
-        },
-        TestRecordMaterialized {
-            block: 202,
-            id: "kafka_region_2".to_string(),
-            data: "kafka_data_2".to_string(),
-            timestamp: 3002,
-            region: None,
-        },
-    ];
+    let kafka_records: Vec<TestRecordMaterialized> = vec![TestRecordMaterialized {
+        block: 201,
+        id: "kafka_region_1".to_string(),
+        data: "kafka_data_1".to_string(),
+        timestamp: 3001,
+        region: Some("kafka-eu".to_string()),
+    }];
 
     ctx.kafka
         .produce_avro_records(&kafka_records)
@@ -2363,53 +2356,26 @@ sinks:
         .run_pipeline_with_opts(
             &pipeline,
             PipelineOpts::new()
-                .record_limit(5) // 3 from ClickHouse + 2 from Kafka
+                .record_limit(4)
                 .timeout(std::time::Duration::from_secs(120)),
         )
         .await
         .expect("Streamling execution failed");
 
     assert!(
-        status.success(),
-        "Pipeline must read a MATERIALIZED column that SELECT * does not list"
+        !status.success(),
+        "Pipeline must fail loudly when a target field is backed by a MATERIALIZED ClickHouse \
+         column, instead of null-filling data that exists"
     );
 
-    let rows: Vec<(String, Option<String>)> = ctx
+    // No silent backfill happened: the sink table never receives rows.
+    let written = ctx
         .postgres
-        .query("SELECT id, region FROM public.hybrid_materialized_results ORDER BY id")
+        .count("SELECT COUNT(*) FROM public.hybrid_materialized_results")
         .await
-        .expect("Failed to query postgres");
-
-    let by_id: std::collections::HashMap<String, Option<String>> = rows.into_iter().collect();
-
-    // Bounded (ClickHouse) records carry the MATERIALIZED column's real
-    // value — not the NULLs a probe that misses MATERIALIZED columns would
-    // have produced.
+        .unwrap_or(0);
     assert_eq!(
-        by_id.get("Mat_A"),
-        Some(&Some("eu-1".to_string())),
-        "ClickHouse record 'Mat_A' must read the MATERIALIZED region value"
-    );
-    assert_eq!(
-        by_id.get("Mat_B"),
-        Some(&Some("us-1".to_string())),
-        "ClickHouse record 'Mat_B' must read the MATERIALIZED region value"
-    );
-    assert_eq!(
-        by_id.get("Mat_C"),
-        Some(&Some("ap-1".to_string())),
-        "ClickHouse record 'Mat_C' must read the MATERIALIZED region value"
-    );
-
-    // Unbounded (Kafka) records: the field passes through untouched.
-    assert_eq!(
-        by_id.get("kafka_region_1"),
-        Some(&Some("kafka-eu".to_string())),
-        "Kafka region must survive the pipeline"
-    );
-    assert_eq!(
-        by_id.get("kafka_region_2"),
-        Some(&None),
-        "Kafka region=null must survive the pipeline"
+        written, 0,
+        "no rows may reach the sink when the bounded phase cannot read a MATERIALIZED column"
     );
 }
