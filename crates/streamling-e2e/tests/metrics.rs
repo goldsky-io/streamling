@@ -903,6 +903,128 @@ sinks:
     );
 }
 
+/// `input_rows` counts the rows that enter a node. A source counts its rows
+/// before its `filter:` (all 10 were pulled in), but a transform below that
+/// source must count only the rows the filter lets through (4).
+#[tokio::test]
+async fn test_transform_input_rows_count_post_filter_rows() {
+    let ctx = match setup_with_prometheus().await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("Skipping test - could not create context: {}", e);
+            return;
+        }
+    };
+    let prometheus = match &ctx.prometheus {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test - Prometheus not configured");
+            return;
+        }
+    };
+
+    let total_records = 10u64;
+    let post_filter_records = 4u64; // ids 7, 8, 9, 10 pass `id > 6`
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    let records: Vec<TestRecord> = (1..=total_records as i64)
+        .map(|i| TestRecord {
+            id: i,
+            data: format!("data_{}", i),
+            timestamp: 1_700_000_000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline_yaml = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {}
+    primary_key: id
+    filter: "id > 6"
+
+transforms:
+  sql_transform:
+    type: sql
+    sql: "SELECT id, data, _gs_op FROM kafka_source"
+    primary_key: id
+
+sinks:
+  postgres_sink:
+    type: postgres
+    from: sql_transform
+    table: test_transform_input_rows_post_filter
+    schema: public
+    on_conflict: update
+"#,
+        ctx.kafka_topic
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline_yaml,
+            PipelineOpts::new().record_limit(post_filter_records),
+        )
+        .await
+        .expect("Failed to run pipeline");
+    assert!(status.success(), "Pipeline should complete successfully");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let source_input = prometheus
+        .query_count(
+            &streamling_e2e::resources::PrometheusResource::input_rows_query(
+                "kafka_source",
+                Some(&ctx.test_id),
+            ),
+        )
+        .await
+        .expect("Failed to query source input rows");
+    assert_eq!(
+        source_input,
+        Some(total_records),
+        "source input_rows counts every row pulled in, before the filter"
+    );
+
+    let source_output = prometheus
+        .query_count(
+            &streamling_e2e::resources::PrometheusResource::output_rows_query(
+                "kafka_source",
+                Some(&ctx.test_id),
+            ),
+        )
+        .await
+        .expect("Failed to query source output rows");
+    assert_eq!(
+        source_output,
+        Some(post_filter_records),
+        "source output_rows counts the rows after its filter"
+    );
+
+    let transform_input = prometheus
+        .query_count(
+            &streamling_e2e::resources::PrometheusResource::input_rows_query(
+                "sql_transform",
+                Some(&ctx.test_id),
+            ),
+        )
+        .await
+        .expect("Failed to query transform input rows");
+    assert_eq!(
+        transform_input,
+        Some(post_filter_records),
+        "transform input_rows must count only the rows the source filter lets through"
+    );
+}
+
 /// Backwards-compat: pipeline without `telemetry` configured emits no
 /// event-time series. R11 — strictly additive.
 #[tokio::test]
