@@ -1211,27 +1211,57 @@ impl PipelineTopology {
 
     pub fn redacted_for_logging(&self) -> Self {
         let mut redacted = self.clone();
+        for (_name, source) in redacted.sources.iter_mut() {
+            if let Source::plugin(plugin) = source {
+                redact_plugin_options(&mut plugin.options);
+            }
+        }
         // Redact headers in transforms
         for (_name, transform) in redacted.transforms.iter_mut() {
-            if let Transform::handler(handler) = transform
-                && let Some(h) = handler.headers.as_mut()
-            {
-                for (_k, v) in h.iter_mut() {
-                    *v = "[REDACTED]".to_string();
+            match transform {
+                Transform::handler(handler) => {
+                    if let Some(h) = handler.headers.as_mut() {
+                        for (_k, v) in h.iter_mut() {
+                            *v = "[REDACTED]".to_string();
+                        }
+                    }
                 }
+                Transform::plugin(plugin) => redact_plugin_options(&mut plugin.options),
+                _ => {}
             }
         }
         // Redact headers and credentials in sinks
         for (_name, sink) in redacted.sinks.iter_mut() {
-            if let Sink::webhook(webhook) = sink
-                && let Some(h) = webhook.headers.as_mut()
-            {
-                for (_k, v) in h.iter_mut() {
-                    *v = "[REDACTED]".to_string();
+            match sink {
+                Sink::webhook(webhook) => {
+                    if let Some(h) = webhook.headers.as_mut() {
+                        for (_k, v) in h.iter_mut() {
+                            *v = "[REDACTED]".to_string();
+                        }
+                    }
                 }
+                Sink::plugin(plugin) => redact_plugin_options(&mut plugin.options),
+                _ => {}
             }
         }
         redacted
+    }
+}
+
+// Plugin options are opaque to the host, so any string in them may be a credential.
+fn redact_plugin_options(options: &mut Option<HashMap<String, serde_yaml::Value>>) {
+    for value in options.iter_mut().flat_map(|o| o.values_mut()) {
+        redact_yaml_strings(value);
+    }
+}
+
+fn redact_yaml_strings(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::String(s) => *s = "[REDACTED]".to_string(),
+        serde_yaml::Value::Sequence(seq) => seq.iter_mut().for_each(redact_yaml_strings),
+        serde_yaml::Value::Mapping(map) => map.values_mut().for_each(redact_yaml_strings),
+        serde_yaml::Value::Tagged(tagged) => redact_yaml_strings(&mut tagged.value),
+        _ => {}
     }
 }
 
@@ -1607,6 +1637,45 @@ sinks:
             sink.options.is_none(),
             "a misplaced parallelism must not reach the plugin"
         );
+    }
+
+    #[test]
+    fn test_redacted_for_logging_hides_plugin_options() {
+        let yaml = r#"
+sources:
+  src:
+    type: test_source_plugin
+    options:
+      rpc_url: https://user:src-secret@rpc.example.com
+      start_block: 100
+transforms:
+  xform:
+    type: test_transform_plugin
+    from: src
+    rpc_api_key: xform-secret
+    auth:
+      headers: [Bearer xform-nested-secret]
+sinks:
+  out:
+    type: test_sink_plugin
+    from: xform
+    options:
+      connection_string: postgres://admin:sink-secret@db/data
+"#;
+        let topology = PipelineTopology::load_from_string(yaml).unwrap();
+        let logged = format!("{:?}", topology.redacted_for_logging());
+
+        for secret in [
+            "src-secret",
+            "xform-secret",
+            "xform-nested-secret",
+            "sink-secret",
+        ] {
+            assert!(!logged.contains(secret), "{secret} leaked: {logged}");
+        }
+        for key in ["rpc_url", "start_block", "rpc_api_key", "connection_string"] {
+            assert!(logged.contains(key), "option key {key} missing: {logged}");
+        }
     }
 
     // PluginSource has NO typed batch fields, so `batch_size` /
