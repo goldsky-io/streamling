@@ -3675,6 +3675,97 @@ mod tests {
         );
     }
 
+    fn single_bounded_hybrid(
+        offset_provider: Arc<dyn OffsetProvider>,
+        state_backend: Arc<dyn StateOperatorBackend<HybridSourceState>>,
+    ) -> HybridTableProvider {
+        HybridTableProvider::new(
+            "test_hybrid".to_string(),
+            HybridSourceConfig {
+                bounded_sources: vec![Arc::new(MockTableProvider::new("bounded1".to_string()))],
+                unbounded_source: Arc::new(MockTableProvider::new("unbounded".to_string())),
+                offset_provider: Some(offset_provider),
+                job_mode: false,
+            },
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+    }
+
+    /// A restart mid-scan must keep the snapshot taken before the scan first
+    /// started: the archive position read at restart is ahead of rows the
+    /// scan has already passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_persisted_snapshot_is_kept_across_restart() {
+        let state_backend = create_state_backend("test_persisted_snapshot_is_kept").await;
+
+        let first_run = single_bounded_hybrid(
+            Arc::new(MockOffsetProvider::new(HashMap::from([(0, 10)]))),
+            state_backend.clone(),
+        );
+        first_run.load_state().await.unwrap();
+        first_run.snapshot_unbounded_offsets().await.unwrap();
+
+        let restarted = single_bounded_hybrid(
+            Arc::new(MockOffsetProvider::new(HashMap::from([(0, 99)]))),
+            state_backend,
+        );
+        restarted.load_state().await.unwrap();
+        restarted.snapshot_unbounded_offsets().await.unwrap();
+
+        assert_eq!(
+            restarted.state.read().await.unbounded_offsets,
+            Some(HashMap::from([(0, 10)]))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_snapshot_propagates_offset_provider_failure() {
+        let hybrid_provider = single_bounded_hybrid(
+            Arc::new(FailingOffsetProvider),
+            create_state_backend("test_snapshot_propagates_failure").await,
+        );
+
+        let err = hybrid_provider
+            .snapshot_unbounded_offsets()
+            .await
+            .expect_err("a failed snapshot must not let the bounded scan start");
+        assert!(
+            err.to_string().contains("injected offset provider failure"),
+            "got: {err}"
+        );
+        assert!(
+            hybrid_provider
+                .state
+                .read()
+                .await
+                .unbounded_offsets
+                .is_none()
+        );
+    }
+
+    /// Without a snapshot the handoff has no safe Kafka position; it must
+    /// fail instead of reading the provider's current position.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handoff_without_snapshot_is_an_error() {
+        let hybrid_provider = single_bounded_hybrid(
+            Arc::new(MockOffsetProvider::new(HashMap::from([(0, 10)]))),
+            create_state_backend("test_handoff_without_snapshot").await,
+        );
+
+        let err = hybrid_provider
+            .advance_to_next_phase()
+            .await
+            .expect_err("handoff must require the snapshot");
+        assert!(
+            err.to_string()
+                .contains("no unbounded offset snapshot at the handoff"),
+            "got: {err}"
+        );
+    }
+
     use streamling_state::testing::{FailCondition, FailableStateBackend};
 
     // ========================================================================
@@ -3719,10 +3810,18 @@ mod tests {
         )
         .unwrap();
 
-        let result = hybrid_provider.advance_to_next_phase().await;
+        // The snapshot's own save hits the same injected fault, so set it
+        // in memory: the handoff must reach its save_state.
+        hybrid_provider.state.write().await.unbounded_offsets =
+            Some(HashMap::from([(0, 1000), (1, 2000)]));
+
+        let err = hybrid_provider
+            .advance_to_next_phase()
+            .await
+            .expect_err("save_state should fail due to injected fault");
         assert!(
-            result.is_err(),
-            "save_state should fail due to injected fault"
+            err.to_string().contains("state backend error"),
+            "expected the save_state failure, got: {err}"
         );
 
         // FM6: in-memory phase advanced despite save failure
@@ -4095,6 +4194,10 @@ mod tests {
         .unwrap();
 
         provider.load_state().await.unwrap();
+        provider
+            .snapshot_unbounded_offsets()
+            .await
+            .expect("job_mode must not call the offset provider for a snapshot");
         // Advance past the single bounded phase (0 -> 1 == bounded_sources.len()),
         // the unbounded transition. In job_mode it must skip the offset provider.
         let result = provider.advance_to_next_phase().await;
