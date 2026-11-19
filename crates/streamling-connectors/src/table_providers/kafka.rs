@@ -96,6 +96,7 @@ use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::{MetricsRecorder, SnapshotGauge, get_metrics_recorder};
+use streamling_core::telemetry::task_wait::TaskWaitMeter;
 use streamling_core::topology::Telemetry;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
@@ -1663,13 +1664,16 @@ impl ExecutionPlan for KafkaSourceExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             self.full_schema_projected.clone(),
             self.internal_buffer_size as usize,
         );
         let tx = builder.tx();
+        // The consume loop runs in a spawned task: waiting on the broker is
+        // `starved`, decoding is `busy`.
+        let task_wait = TaskWaitMeter::claim(&context);
 
         let state_backend = self.state_backend.clone();
 
@@ -1857,7 +1861,10 @@ impl ExecutionPlan for KafkaSourceExec {
             // Unfortunately, the high-level StreamConsumer doesn't expose this method
             // So, instead, we trigger it indirectly by calling "next" on the stream
             // We'll seek to the correct position afterward based on state backend or config
-            if let Err(e) = Self::wait_for_initial_assignment_or_message(&consumer, &topic).await {
+            if let Err(e) = task_wait
+                .wait_input(Self::wait_for_initial_assignment_or_message(&consumer, &topic))
+                .await
+            {
                 // A shutdown requested while this instance was still starting
                 // (e.g. the record-limit stop path firing off a sibling
                 // instance's records) is a graceful stop, not a pipeline
@@ -1879,7 +1886,8 @@ impl ExecutionPlan for KafkaSourceExec {
             }
 
             // A blocking call to wait for the assignment to finish
-            let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
+            let kafka_topic_partition_list =
+                task_wait.wait_input(Self::wait_for_assignment(&consumer)).await?;
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
@@ -2042,7 +2050,7 @@ impl ExecutionPlan for KafkaSourceExec {
                             }
                         },
                         // Await the next record
-                        messge = consumer.recv() => {
+                        messge = task_wait.wait_input(consumer.recv()) => {
                             match messge {
                                 Ok(message) => {
                                     if should_enrich_op_column {
@@ -2180,7 +2188,7 @@ impl ExecutionPlan for KafkaSourceExec {
                     }
                 }
 
-                match tx.send(Ok(record_batch)).await {
+                match task_wait.send(tx.send(Ok(record_batch))).await {
                     Ok(_) => {}
                     Err(e) => {
                         // this could simply mean shutdown
@@ -2242,7 +2250,7 @@ impl ExecutionPlan for KafkaSourceExec {
                     full_schema.clone(),
                 );
                 if let Some(batch) = flush_batch
-                    && tx.send(Ok(batch)).await.is_err()
+                    && task_wait.send(tx.send(Ok(batch))).await.is_err()
                 {
                     warn!(
                         "Kafka source '{}': receiver dropped before final checkpoint flush",
@@ -2265,9 +2273,13 @@ impl ExecutionPlan for KafkaSourceExec {
                 // "committed in" is the broker commit + state-backend
                 // persistence that follows.
                 let wait_started = std::time::Instant::now();
-                if tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
-                    .await
-                    .is_ok()
+                // A wait on the sinks is neither input, work, nor a send.
+                if tokio::time::timeout(
+                    finalize_timeout,
+                    task_wait.untimed(control.await_terminal_finalized()),
+                )
+                .await
+                .is_ok()
                 {
                     let waited = wait_started.elapsed();
                     let commit_started = std::time::Instant::now();
